@@ -1435,8 +1435,8 @@ surface.)*
 
 ### Signals
 
-**Interactive defaults** — the shell owns these at the prompt, and none of them
-kill your session:
+**Interactive defaults** — the shell owns these at the prompt. The *keyboard*
+signals never end your session; only a lost terminal (SIGHUP) does:
 
 - **`Ctrl-C` / SIGINT** — at the prompt, **abandon the current input** and draw a
   fresh prompt (never exits the shell). While a foreground command runs, SIGINT
@@ -1450,8 +1450,9 @@ kill your session:
 - **`Ctrl-\` / SIGQUIT** — ignored at the prompt; delivered to the foreground job.
 - **SIGWINCH** (resize) — the [line editor](#line-editing) reflows and redraws the
   (possibly multi-line) prompt.
-- **SIGHUP** (terminal closed) — the shell exits and HUPs its jobs unless they were
-  `disown`ed; **SIGTERM** is ignored interactively (as bash does).
+- **SIGHUP** (terminal closed) — the shell exits and HUPs its jobs; **SIGTERM** is
+  ignored interactively (as bash does). (A `disown` exemption from the HUP arrives
+  with `disown` itself, which is [deferred](#job-control).)
 
 **User handlers are keyed hook maps, not bash's `trap`.** `$sh.signal.<NAME>` is an
 insertion-ordered map of named callables — the *same shape* as `$sh.preprompt` and
@@ -1461,7 +1462,7 @@ with no new `trap` builtin:
 ```
 $sh.signal.INT.note  = func() { puts "interrupted" }
 $sh.signal.TERM.save = save-state                 # by name
-$sh.signal.USR1.reload = func() { source $sh.rc }
+$sh.signal.USR1.reload = reload-config             # a command/function, late-bound
 unset $sh.signal.INT.note                          # remove one
 ```
 
