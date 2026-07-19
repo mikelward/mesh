@@ -1236,7 +1236,7 @@ $precmd.jobs   = publish-jobs                    # by name
 $postcd.fetch  = func() { vcs auto-fetch & }     # arrived in a new dir — the PWD-gate is now the event itself
 $precd.save    = func(to) { save-dir-state }     # about to leave: act while still in the old dir
 $preexec.timer = func(cmd) { timer-start }       # start the clock…
-$postexec.timer = func(cmd status ms) { last-cmd-time = $ms }   # …stop it; feeds the prompt's timing
+$postexec.timer = func(cmd, status, ms) { global last-cmd-time = $ms }   # …stop it; `global` so it survives to feed the prompt
 unset $precmd.jobs                               # remove one
 ```
 
@@ -1252,12 +1252,16 @@ string** (or `""` to contribute nothing); the shell joins the non-empty ones in
 key order:
 
 ```
-prompt.host = host-seg                            # named, ordered segments
-prompt.dir  = func() { inside-project() and $(vcs prompt-info):raw or tilde-pwd() }
-prompt.auth = func() { ssh-id-missing() and yellow("no-ssh-id") or "" }
-prompt.dir  = my-dir-seg                          # swap ONE segment by name
-unset prompt.auth                                 # drop the auth warning
+$prompt.host = host-seg                           # named, ordered segments
+$prompt.dir  = func() { if inside-project() { $(vcs prompt-info):raw } else { tilde-pwd() } }
+$prompt.auth = func() { if ssh-id-missing() { yellow("no-ssh-id") } }   # no else → "" → segment omitted
+$prompt.dir  = my-dir-seg                          # swap ONE segment by name
+unset $prompt.auth                                 # drop the auth warning
 ```
+
+(The segments use `if` *expressions* to pick a string — not `and`/`or`, which
+combine bools, not values — and the `auth` segment leans on the decided
+no-`else`-yields-`""` rule so "not applicable" is just an empty contribution.)
 
 The payoff is the requirement, met directly: **the external base renderer is
 just one named segment** (`$(vcs prompt-info)`), sitting among peers, so
