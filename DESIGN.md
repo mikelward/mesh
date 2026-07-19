@@ -1523,10 +1523,26 @@ runtime entries.
 The MVP built-in set is deliberately small — most "commands" are external
 programs or user functions:
 
-- **Navigation** — `cd` (`cd -` toggles to the previous dir, no arg → `$env.HOME`,
-  searches `CDPATH`); the block form `in DIR { }` covers scoped `pushd`/`popd`.
-- **I/O** — `puts` (write a line — mesh's `echo`) and `gets` (read a line into a
-  variable).
+- **Navigation**
+  - **`cd [DIR]`** — change directory. No arg → `$env.HOME`; **`cd -`** → the
+    previous dir (`$env.OLDPWD`); a *relative* `DIR` is searched in `CDPATH`. It
+    updates `$env.PWD` / `$env.OLDPWD` and fires the
+    [`precd` / `postcd`](#hooks-and-the-prompt) hooks. Logical by default;
+    **`--physical` / `-P`** resolves symlinks first. The block form `in DIR { }` is
+    the scoped `pushd` / `popd`.
+  - **`pwd`** — print the working directory (`$env.PWD`), logical by default;
+    **`--physical` / `-P`** prints the symlink-resolved path.
+- **I/O**
+  - **`puts [args…]`** — write to stdout: the arguments joined by a single space,
+    then a newline (**`--no-newline` / `-n`** suppresses it); a list spreads
+    (`puts ...$xs`). It is mesh's `echo`, but *without* echo's portability
+    footguns — there is no `-e` / `\n` reinterpretation, because escapes are
+    already resolved by the [string literal](#quoting-and-escaping), so `puts`
+    never re-parses its input.
+  - **`gets [var]`** — read one line from stdin into `var`, trailing newline
+    stripped; it returns that line as its value and a **non-zero
+    [status](#variables-and-assignment) at EOF** (so `while gets line { … }`
+    terminates cleanly). With no `var` it just yields the line.
 - **Formatting** — `style` (produce a [styled value](#hooks-and-the-prompt) for
   the prompt); it must be a built-in because a structured return value can't come
   from an external command.
