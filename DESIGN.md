@@ -1732,6 +1732,18 @@ for the count, `$sh.args[0]` for the first — none of `$1` / `$@` / `$#`), and
 **`$sh.name`** is the shell-or-script name (bash's `$0`). Both are read-only
 runtime entries.
 
+*(TODO: **am-I-sourced, and the current source file.** A file needs to know both
+that it is being **`source`d** (vs run as a script vs typed interactively) and the
+**path of the file currently being sourced** — bash's `${BASH_SOURCE[0]}` and the
+`[[ "${BASH_SOURCE[0]}" != "$0" ]]` idiom, which real rc files use to locate
+sibling files and to guard "only when executed directly" blocks. Candidates: a
+read-only **`$sh.source`** (the path of the file being evaluated, empty for
+interactive input) and **`$sh.sourced`** (bool), or a small `$sh` context record
+(source path + execution mode: interactive / script / sourced). `$sh.name`
+(bash's `$0`) is not enough — it doesn't change on `source` and can't locate the
+sourced file. Decide whether `$sh.source` nests (a stack, for a file that sources
+another) or reports only the innermost.)*
+
 *(deferred: system-wide `/etc/mesh/*` files; mutating positional args
 (`shift` / `set --`); and whether a non-login, non-interactive script should skip
 `env.mesh` for speed.)*
