@@ -1653,15 +1653,27 @@ search** — with a prefix already typed, `Up` walks the most recent commands th
 *start with* it (an empty buffer just steps chronologically). So typing `git ` then
 `Up` cycles your recent `git …` lines — the friendly default.
 
+**Recall and expansion are scoped to the current session.** `Up`, `Ctrl-R`, and the
+`!!` / `!$` / `!string` expansions resolve against *this* session's rows, so a
+command typed in another terminal never becomes your "previous" command. The store
+stays **shared** — `history` lists and searches across every session — but "most
+recent" *for recall* means *your* most recent. (A global/shared-recall mode is a
+deferred opt-in.)
+
 **The MVP surface is a `history` built-in** that lists entries (newest last), and
 **`history | grep foo`** is the MVP search — the whole point of a real store is
 that richer queries (by cwd, by exit status, by time) can come later without
 changing how entries are written. So `list | grep` is enough to ship. Only the **current session's own in-flight command** is excluded from what
 `history` lists: its row is *recorded* at `preexec` (to capture `start` / `cwd` /
 `tty`) but hidden until it completes, so `history | grep foo` never matches its own
-pipeline. A row left incomplete by a crash, kill, or power loss — its session no
-longer live — is **finalized at startup** (shown with a null `status` / `duration`)
-rather than hidden forever, so no real command is lost.
+pipeline. A row left incomplete — its owning session no longer live — is
+**finalized at startup** (a null `status` / `duration`) rather than hidden forever,
+so no real command is lost. **Liveness** is tracked by a `sessions` record: each
+session registers its `pid` + boot time (an identity a recycled PID can't
+counterfeit) and holds an OS **advisory lock** on that record for its lifetime. A
+session is *live* iff its lock is held, so startup recovery finalizes an incomplete
+row only when its session's lock is unheld — a still-running session's in-flight row
+is never mistaken for a crash.
 
 *(deferred: an atuin-style fuzzy / interactive search over the columns; a
 `$sh.history` value accessor for scripting; cross-session and cross-host sync;
@@ -1672,8 +1684,9 @@ the dedup policy; secret redaction; and import from bash/zsh history files.)*
 For quick keyboard recall mesh keeps bash's `!` history expansion — but
 **interactive-only and quote-safe**. It is a pre-parse pass that rewrites the input
 line *before* parsing and runs **only in an interactive shell** (a script never
-expands `!`), so it can never surprise non-interactive code. It reads from the same
-[history store](#interactive-history).
+expands `!`), so it can never surprise non-interactive code. It reads from **this
+session's** rows in the [history store](#interactive-history) (the session scoping
+above), so another terminal's commands are never your `!!`.
 
 - **`!!`** — the previous command line.
 - **`!string`** — the most recent command that *starts with* `string`
