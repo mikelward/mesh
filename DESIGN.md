@@ -266,6 +266,26 @@ files = *.txt             # binds the glob result (a list) to `files`
 n = 42
 ```
 
+**`$` reads, bare binds or runs.** A leading `$` means *read this variable*
+(`$x`, `$f:stem`). A **bare** name is either being *bound* — the left of `=`, a
+`for` binder, a function parameter — or, in command position, is a *command or
+function to run*. So the same name changes form with what you do to it:
+
+```
+f = report.txt            # bind f        (bare, LHS of =)
+echo $f                   # read f        ($)
+for f in *(f) { … $f … }  # bind f, then read $f  (same as = / $x)
+
+if ready { … }            # run the `ready` command/predicate, branch on status
+if $ready { … }           # read the variable `ready`, branch on its bool
+```
+
+This is the familiar shell split, kept deliberately: the only names *without* a
+`$` are the ones you are defining or the commands you are calling. Its one
+hazard — forgetting the `$` and running a command by accident — is softened
+because an unknown bareword is a **command-not-found error**, not a silent
+misread.
+
 - **Scope.** Bindings are **function-local by default.** A name assigned
   inside a `func` body does not leak out. Top-level (rc-file) bindings are
   session-global. *(open: an explicit `local` / block-scoped form, if we ever
@@ -433,8 +453,10 @@ empty = [:]               # the empty map  (`[]` is the empty list)
 ```
 
 Precisely: a `[...]` literal is a **map** iff it contains at least one
-`key: value` pair, and then **every** entry must be a pair — mixing pair and
-bare-value entries (`[a: 1 lone]`) is an error, not a hybrid. A list element
+`key: value` pair **or is the empty-map form `[:]`**, and then **every** entry
+must be a pair — mixing pair and bare-value entries (`[a: 1 lone]`) is an error,
+not a hybrid. `[:]` is the sole zero-entry map (a bare `:` standing in for "the
+pairs that would be here"); `[]` is the empty list. A list element
 that needs a literal colon is quoted (`["http:" 80]`), which also keeps this
 rule from colliding with the modifier `:` (only a modifier *keyword* after `:`
 triggers a modifier; `key: value` has a value, so it stays a pair).
@@ -452,8 +474,15 @@ $ports[https] = 8443      # set / update
 | `$m:keys` | list | keys (insertion order preserved) |
 | `$m:values` | list | values |
 | `$m:len` | int | entry count (same word as lists) |
-| `$m:has KEY` | bool | membership *(open: `:has` vs a `?` postfix)* |
+| `$m:has KEY` | bool | membership — the decided spelling |
 | `$m:get KEY default` | value | total lookup — `default` when absent |
+
+**Membership is `:has`.** The terser `?` postfix (`$m[key]?`) was considered and
+dropped — it fights the "words, not punctuation" grain the modifiers are built
+on, and spends a `?` symbol that optional/error-handling will likely want. *(to
+do: consider an infix `in` operator — `if https in $ports { … }` — as an
+additional, English-reading spelling alongside `:has`; familiar from Python, but
+it adds a second way to phrase the same test, so weigh it before adding.)*
 
 **Missing keys** follow the same strict/total split as list access, since mesh
 has no null: `$m[absent]` is an **error** (a bad key is usually a typo in
@@ -614,13 +643,23 @@ Rules:
   function **early**, carrying the result so far; `return val` exits early
   **with a value**. That is the whole return mechanism — implicit last
   expression, `return`/`return val` for early exit.
-- **Exit status is a view of the result** — not a separate channel. It derives
-  from the result value: a **command** result carries its own exit status, and a
-  **bool maps `true` → `0`** (success) **and `false` → `1`** (the Unix
-  inversion). That is exactly what makes a predicate work without any special
-  declaration: `have_command` ends in a test whose bool result becomes the
-  status, so `if have_command fzf { … }` reads correctly. `return $cond` in a
-  predicate therefore exits with `0`/`1` per the same mapping.
+- **Exit status is a view of the result** — not a separate channel — and it is
+  defined for *every* result type, so a function used in command position
+  (`if f { … }`) always has one:
+
+  | Result type | Exit status |
+  | --- | --- |
+  | command | its own exit status |
+  | int | the integer itself — `0` success (the shell `return N`) |
+  | bool | `true` → `0`, `false` → `1` (the Unix inversion) |
+  | string / list / map (incl. empty) | `0` — producing a value *is* success |
+
+  So `have_command` ends in a test whose bool becomes the status and
+  `if have_command fzf { … }` reads correctly; `return $cond` exits `0`/`1`;
+  `return 2` exits `2`; and a function that returns a string or a list is a
+  success (`0`) when its status is observed. Failure is only ever signalled by a
+  command's own status, a `false`, or an explicit nonzero `int` — never by the
+  mere *shape* of a returned value.
 - **Output is stdout.** Independently of its result, whatever a `func` writes to
   stdout *is* its output stream, exactly like an external command, so functions
   compose in byte-stream pipes with everything else.
@@ -826,11 +865,12 @@ Two notes flagged as *(open)*:
 - **String modifier set** — beyond `:strip` / `:replace`.
 - **Predicate qualifier syntax** — confirm `size>` / `age<` / `mtime<` forms.
 - **Arrays / maps / functions / `if` / loops** — core surface now sketched
-  above. Remaining sub-questions: `:has` vs a `?` membership postfix; a `local`
-  binding narrower than function scope; the **file-test modifier set**
-  (`$f:type` and friends); and a **postfix guard** (`continue if …`). (Decided:
-  expression-`if` with no `else` yields `""`; in-place append/merge is `+=`,
-  defined over both operand types; loops are brace-delimited with no
+  above. Remaining sub-questions: an infix **`in`** operator as a second
+  membership spelling alongside `:has`; a `local` binding narrower than function
+  scope; the **file-test modifier set** (`$f:type` and friends); and a **postfix
+  guard** (`continue if …`). (Decided: expression-`if` with no `else` yields
+  `""`; in-place append/merge is `+=`, defined over both operand types;
+  membership is `:has` (`?` postfix rejected); loops are brace-delimited with no
   `do`/`done` — `for` iterates, `while` tests, `loop` repeats, keeping a
   separate `while` rather than Go-unifying into `for`.)
 - **Value vs stream reconciliation** *(narrowed)* — the return *syntax* is
