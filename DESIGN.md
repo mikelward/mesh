@@ -349,18 +349,31 @@ misread.
 
   Reading resolves **outward** (local → global); an **unbound** name is an
   **error**, not empty — the always-on `set -u` that the *no null* rule below
-  already implies. (A defaulting read for a maybe-unset name — common for env
-  like `$EDITOR` — uses the same total form as `:get`; spelling tracked with the
-  absent-value question.)
-- **No block scope; `unset` removes.** Control-flow blocks
+  already implies. The **total read** for a maybe-unset name is the same `:get`
+  that maps use, because the **environment is a first-class map named `env`**:
+
+  ```
+  editor = env:get EDITOR vim   # total: value, or "vim" if unset — never errors
+  $env[EDITOR]                  # strict: errors if unset (like any $m[key])
+  if env:has SSH_AUTH_SOCK { … }
+  ```
+
+  So `$EDITOR` (a strict read) errors when unset, and `env:get EDITOR vim` is the
+  safe defaulting form — no new syntax, just the map surface applied to the
+  environment.
+- **No block scope; `unset` removes a scope's binding.** Control-flow blocks
   (`if` / `for` / `while` / `loop`) do **not** open a new scope, so
   `if c { x = 1 }` then `$x` works and a loop binder is an ordinary binding in
   the enclosing scope (readable after the loop, holding the last value) — the
-  model stays two levels, no more. **`unset name`** removes a binding (an
-  exported name leaves the environment too); the name is then unbound and reading
-  it errors until it is bound again. Note `unset x` differs from `x = ""`: the
-  latter is *bound to the empty string*, the former is *unbound* — the two
-  states that stand in for a missing null.
+  model stays two levels, no more. **`unset name`** removes the binding **in the
+  current scope**: inside a function it drops the local, and if that local was
+  shadowing a global the global becomes visible again (reads resolve outward as
+  usual) — so plain `unset` never reaches through to mutate a global, matching
+  the `global`-to-escape rule. To remove a session-global from within a function,
+  **`global unset name`** (symmetric with `global name = value`). A read errors
+  only when the name is unbound in *every* visible scope. `unset x` differs from
+  `x = ""`: the latter is *bound to the empty string*, the former *unbound* — the
+  two states that stand in for a missing null.
 - **Command/function names resolve at call time** — a separate namespace from
   variables. A bare word in command position (`g` inside `func f { g }`) is a
   *command or function* looked up **when `f` runs**, not when `f` is defined. So
@@ -380,6 +393,19 @@ misread.
   error, not a silent truncation. This keeps the rich types honest: they live
   *in* the shell, and the boundary to external programs is always
   (NUL-free) bytes.
+
+  **Export is a global effect on the `env` map**, not a local-by-default
+  binding: `export NAME = value` (even inside a function) writes the session
+  environment and **persists after return** — export exists precisely to change
+  what *children* inherit, so scoping it locally would defeat the point. This is
+  the one deliberate exception to local-by-default, and it is explicit (you typed
+  `export`). A plain **local shadow does not touch the environment**: inside a
+  function, `PATH = …` binds an in-shell local that only that function sees;
+  children still inherit the *exported* `env[PATH]` until you `export` (or
+  `global`-assign an already-exported name). For a **temporary** env change
+  around a single command, `env NAME=val cmd` stays the idiom; a whole function
+  scoping-and-restoring the environment is the deferred *isolation* question
+  (see [Open questions](#open-questions)).
 - **Types are inferred, not declared.** `x = foo` is a string, `x = [a b c]` a
   list, `x = [a: 1]` a map. There is no type sigil (`@`, `%`) on the *name* —
   a variable just holds whatever value it was given, and `$x` reads it back.
