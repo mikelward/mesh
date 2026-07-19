@@ -247,8 +247,12 @@ n = 42
   children. **Only byte-strings can be exported** — the environment is a flat
   `KEY=bytes` table, so a list or map cannot cross an `exec` boundary. Exporting
   a list is an error with a clear message (join it first: `export P =
-  $dirs:join ":"`). This keeps the rich types honest: they live *in* the shell,
-  and the boundary to external programs is always bytes.
+  $dirs:join ":"`). One further restriction: environment entries are
+  **NUL-terminated**, so a byte-string containing an embedded NUL (which a
+  `$(cmd):raw` capture can) **cannot** be exported either — that too is a hard
+  error, not a silent truncation. This keeps the rich types honest: they live
+  *in* the shell, and the boundary to external programs is always
+  (NUL-free) bytes.
 - **Types are inferred, not declared.** `x = foo` is a string, `x = [a b c]` a
   list, `x = [a: 1]` a map. There is no type sigil (`@`, `%`) on the *name* —
   a variable just holds whatever value it was given, and `$x` reads it back.
@@ -321,15 +325,24 @@ on top of the spread form for interactive brevity.)*
 
 ### Maps (associative arrays)
 
-A map literal is a **comma-separated** list of `key: value` pairs. The comma is
-what distinguishes a map from a space-separated list, and `key: value` survives
-the modifier-disambiguation rule untouched: `:` is only a modifier when a
-modifier *keyword* immediately follows it, and here a space (then a value) does.
+A map literal is a bracket literal whose entries are **`key: value` pairs**,
+comma-separated. The discriminator between a map and a list is the **pair
+syntax**, not the comma — so a singleton `[a: 1]` is unambiguously a map. The
+comma is merely the separator *between* entries; the space separates *list*
+elements.
 
 ```
 ports = [http: 80, https: 443, ssh: 22]
+one   = [a: 1]            # a map: the `key: value` pair makes it one
 empty = [:]               # the empty map  (`[]` is the empty list)
 ```
+
+Precisely: a `[...]` literal is a **map** iff it contains at least one
+`key: value` pair, and then **every** entry must be a pair — mixing pair and
+bare-value entries (`[a: 1 lone]`) is an error, not a hybrid. A list element
+that needs a literal colon is quoted (`["http:" 80]`), which also keeps this
+rule from colliding with the modifier `:` (only a modifier *keyword* after `:`
+triggers a modifier; `key: value` has a value, so it stays a pair).
 
 Access mirrors list indexing exactly — `$m[key]` for a string key is the same
 shape as `$arr[0]` for an integer index:
@@ -379,8 +392,24 @@ external program is bytes, not mesh values:
   spread it with ...$flags or join it with $flags:join"*). mesh refuses to
   silently pick a separator — that guess is exactly the bash footgun. The two
   explicit outs are `...$flags` (one argv entry per element) and `$flags:join
-  SEP` (one byte-string). A scalar string variable, of course, passes straight
-  through as one argv entry.
+  SEP` (one byte-string).
+
+The general rule at the bytes boundary — **a value renders to argv iff it has a
+*canonical* byte form; if rendering it would require a *guess*, that is an
+error**:
+
+| Value | Crosses to argv as | Why |
+| --- | --- | --- |
+| string | itself | already bytes |
+| int (`$xs:len`, `n = 42`) | decimal digits — `echo $xs:len` → `4` | decimal is canonical, not a choice |
+| bool (a switch, a comparison) | `true` / `false` | two fixed spellings, unambiguous |
+| **list** | **error** — spread or `:join` | no canonical separator (space? tab? `,`?) |
+| **map** | **error** — render it explicitly | no canonical flattening at all |
+
+So `echo $xs:len` prints `4` and `echo $found` prints `true`, but `echo $xs`
+(a list) and `echo $m` (a map) are errors that name the fix. The dividing line
+is "is there one obviously-right rendering?" — ints and bools have one, a list's
+separator and a map's shape do not.
 
 ### Functions
 
@@ -456,11 +485,29 @@ Rules:
   (`...$xs`, one argv entry per element) or join it (`$xs:join ","`, one
   string). The shell never guesses a serialization (see
   [Spread](#spread--flattening)).
-- **Return / output.** A function's *stdout is its output*, exactly like an
+- **Return / output.** A plain `func`'s *stdout is its output*, exactly like an
   external command, so functions compose in byte-stream pipes with everything
-  else. *(open: an explicit `return <value>` that yields a rich list/map to a
-  caller in the same shell, vs. always going through bytes — the
-  structured-return question is the one genuinely unresolved corner here.)*
+  else.
+
+  **TODO — structured return.** Some functions want to hand a real list/map
+  back to an in-shell caller without a bytes round-trip (`config = load-env()`).
+  The current lean is to make this a **function-declaration modifier** rather
+  than an in-body `return <value>` statement — i.e. the *signature* declares
+  "this returns a mesh value," so the two kinds of function are distinguishable
+  at the call site and by the reader:
+
+  ```
+  func fetch(url) { curl -sS $url }          # streams bytes (a command)
+  <mod> func load-env(path) { … a map … }    # returns a mesh value
+  ```
+
+  Open sub-points: (a) the modifier keyword — `raw func` was floated, but `raw`
+  already means *unsplit bytes* as a modifier (`$(cmd):raw`), i.e. the opposite
+  of "rich value," so it would need a different word (`val`/`pure`/`fn`/`ret`
+  are candidates); (b) whether a value-function may still stream to stdout or is
+  value-only; (c) how its value-returning body reads — which is where
+  [`if` as an expression](#conditionals-if-is-an-expression) below does a lot
+  of the work.
 
 **Prior art surveyed** (all shell-adjacent, all validate the same four
 signature roles): Elvish `{|a b &opt=default @rest|}`, Nushell
@@ -470,18 +517,75 @@ PowerShell `param()` with `[Parameter(ValueFromRemainingArguments)]`. mesh
 takes the *semantics* these agree on and dresses them in the `func name(...)`
 syntax above.
 
+### Conditionals: `if` is an expression
+
+`if` **yields a value** — it is an expression, not just a statement (Rust,
+Kotlin, Nix). So the same construct that branches control flow also *produces*
+the branch's value, which is what lets a value-returning function (the
+[structured-return TODO](#functions) above) have a natural body and kills a
+whole category of `x = $(if … )` scaffolding.
+
+```
+# statement position — run a branch for effect
+if have_command fzf {
+  bind-key ctrl-r fzf-history
+} else if have_command atuin {
+  atuin init mesh | source
+}
+
+# expression position — the taken branch's value becomes the result
+glyph = if connected_remotely { "⇄" } else { "•" }
+tag   = if $root { "[root]" } else { "" }
+```
+
+Decisions:
+
+- **The condition is a bool or a command.** A boolean value (`$root`, a
+  comparison like `$n > 0`, a `:has` test) branches on its truth; a bare
+  command branches on its **exit status** (`0` → true), preserving the
+  `if grep -q foo file { … }` reflex. This is why the [predicate
+  vocabulary](#requirements-carried-over-from-existing-configs)
+  (`have_command`, `inside_project`, …) is just commands/functions — they slot
+  straight into `if` with no `[ … ]` / `test`.
+- **No `then` / `fi`.** Brace-delimited blocks, same as `func` bodies; chain
+  with `else if`. The POSIX `then`/`elif`/`fi` scaffolding is dropped (clean
+  break).
+- **The value is the taken branch's trailing expression.** A block evaluates to
+  its last expression — a bare value, a `[…]` literal, a `$(…)` capture, a
+  value-function call, or a nested `if`. In *statement* position that value is
+  simply discarded and any commands in the branch stream to stdout exactly as
+  today; the expression behavior is a superset, not a mode switch.
+- **A missing `else` yields empty.** In expression position, a false condition
+  with no `else` produces the empty value (empty string / empty list as context
+  demands). Both branches are expected to yield the same *shape*; mesh does not
+  coerce one branch to match the other. *(open: whether expression position
+  should instead **require** `else`, Rust-style, and make a lone `if` a
+  statement only.)*
+- **`match` later, not now.** A `match`/`case` expression is the obvious
+  companion but is deferred — `if`/`else if` covers the rc-file need first.
+
+The deep seam — what a branch's value *is* when its tail is a byte-streaming
+external command rather than a mesh value — is the same bytes-vs-values
+question as the structured-return TODO, and is tracked there rather than
+re-litigated here.
+
 ## Open questions
 
 - **Name** — smash vs mesh (below).
 - **`~` as a terse alias for exclusion `-`?** Or keep `-` only.
 - **String modifier set** — beyond `:strip` / `:replace`.
 - **Predicate qualifier syntax** — confirm `size>` / `age<` / `mtime<` forms.
-- **Arrays / maps / functions** — core surface now sketched above. Remaining
-  sub-questions: in-place append (`+=` / `push`) vs spread-only; `:has` vs a
-  `?` membership postfix; and a `local` binding narrower than function scope.
-- **Structured return** — a function's output is its stdout bytes (composes in
-  pipes); do we also want an explicit `return <value>` that hands a rich
-  list/map to an in-shell caller without a bytes round-trip?
+- **Arrays / maps / functions / `if`** — core surface now sketched above.
+  Remaining sub-questions: in-place append (`+=` / `push`) vs spread-only;
+  `:has` vs a `?` membership postfix; a `local` binding narrower than function
+  scope; and whether expression-position `if` should require `else`.
+- **Structured return** *(TODO, leaning decided)* — a plain `func` outputs
+  stdout bytes; a **function-declaration modifier** (keyword TBD — not `raw`,
+  which is taken) marks a function that returns a rich list/map to an in-shell
+  caller without a bytes round-trip. Sub-points tracked in
+  [Functions](#functions).
+- **`match` expression** — the companion to expression-`if`; deferred until the
+  rc-file need is real.
 - **Hook API** — how override hooks compose over a base (possibly external)
   prompt renderer.
 
