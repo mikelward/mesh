@@ -950,6 +950,13 @@ Named **`:match`** (not `:matches`), the unanchored scripting-world sense — Ru
 with the [`match`](#matching-match) statement and the `~` test, one regex story
 under one word.
 
+*(TODO: **consolidate `~ /re/` and `:match /re/`?** They already overlap — since
+`:match` is falsey on a miss, `if $str:match /re/` covers the yes/no case that `~`
+exists for, so `~` is arguably sugar for `:match`'s truthiness. Keep both for now
+(`~` reads better as a bare predicate, `:match` when you want the captures), but
+revisit whether one should be defined in terms of the other, or dropped, before
+first release.)*
+
 *(deferred: **map destructuring** — `[name: n, age: a] = $m` binding by key — a
 natural extension of the same idea; and nested patterns (`[a [b c]] = …`).)*
 
