@@ -122,7 +122,7 @@ There are three kinds of modifier, and the difference matters:
 - **Value modifiers** (path and string — `:stem`, `:dir`, `:strip`, …) transform
   a value, and **map over a list** automatically (applied to each element).
 - **Collection modifiers** (`:len :first :last :rest :init :keys :values
-  :join`) consume a list or map **as a whole** — they do *not* map element-wise
+  :has :join`) consume a list or map **as a whole** — they do *not* map element-wise
   — and return either a scalar (`:len` → int, `:join` → one byte-string) or a
   derived collection (`:rest`, `:keys`). This is the category that answers "how
   long," "the last one," and "flatten to a string." `:join SEP` is the fold
@@ -474,7 +474,22 @@ Rules:
   **switch**, false unless passed. `--tag = default` is a **valued flag**.
   Flags may appear in any order at the call site and are *not* consumed as
   positionals — this is why a shell wants real flag parsing in the signature
-  rather than hand-rolled `case $1` juggling.
+  rather than hand-rolled `case $1` juggling. An argument that begins with `--`
+  but names **no declared flag** is an **error**, not a silently-forwarded
+  positional — a typo'd flag should fail loudly, not vanish into `...rest`.
+- **`--` ends flag parsing** (the universal Unix terminator, kept). Everything
+  after a bare `--` is positional/rest, even if it begins with `--`. This is
+  how a value that literally looks like a flag reaches a rest parameter:
+
+  ```
+  run --verbose -- --force ./x    # --verbose is run's flag;
+                                  # ["--force" "./x"] are positionals -> ...rest
+  wrap -- ...$argv                # forward argv verbatim, flags and all
+  ```
+
+  A single `--` element produced by a spread (`...$argv` where `$argv` contains
+  `--`) terminates parsing the same way; to pass a *literal* `--` as data,
+  place it after an earlier `--`.
 - **Rest** (`...name`, at most one, last) collects the leftover positionals
   into a list. This is the "flattening" you asked about — the same slurpy/`@rest`
   concept as Raku's `*@rest`, Elvish's `@rest`, Nushell's `...rest`, Tcl's
@@ -555,12 +570,17 @@ Decisions:
   value-function call, or a nested `if`. In *statement* position that value is
   simply discarded and any commands in the branch stream to stdout exactly as
   today; the expression behavior is a superset, not a mode switch.
-- **A missing `else` yields empty.** In expression position, a false condition
-  with no `else` produces the empty value (empty string / empty list as context
-  demands). Both branches are expected to yield the same *shape*; mesh does not
-  coerce one branch to match the other. *(open: whether expression position
-  should instead **require** `else`, Rust-style, and make a lone `if` a
-  statement only.)*
+- **A missing `else` yields the empty string.** In expression position, a false
+  condition with no `else` produces **`""`** — one concrete value, not a
+  context-dependent "empty string or empty list." mesh infers types and does not
+  carry a contextual target type back into the branch, so there is nothing to
+  pick an empty *list* from; the empty string is the universal shell "nothing"
+  and is what an interpolation like `prompt = "$(if $root { "[root]" })…"` wants.
+  Both branches (when both exist) are expected to yield the same *shape*; mesh
+  does not coerce one to match the other. *(open — a genuine fork for you: keep
+  this lenient "no-else → `""`" rule, or **require** `else` in expression
+  position Rust-style and make a lone `if` a statement only. Leaning lenient for
+  interactive brevity.)*
 - **`match` later, not now.** A `match`/`case` expression is the obvious
   companion but is deferred — `if`/`else if` covers the rc-file need first.
 
