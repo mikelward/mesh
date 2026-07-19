@@ -833,6 +833,46 @@ PowerShell `param()` with `[Parameter(ValueFromRemainingArguments)]`. mesh
 takes the *semantics* these agree on and dresses them in the `func name(...)`
 syntax above.
 
+### Isolation and subshells
+
+**A plain `func` does not isolate process state.** cwd, umask, and the `env`
+map are OS process state, not mesh values, so a `func` runs *in the current
+process* and its `cd` (or `export`) **persists after return** — exactly like
+bash, and exactly what navigation helpers want:
+
+```
+proj(name) { cd ~/work/$name }     # moving your shell is the point
+```
+
+The decisive reason to keep persist as the default (over auto-restoring cwd the
+way local-by-default does for variables): **it makes extraction refactor-safe.**
+You can lift any run of lines out of a function body into a helper `func` and
+call it, and behavior is unchanged — an auto-restoring boundary would silently
+alter cwd/state at the new call edge. Isolation is therefore **explicit**, in
+three grades:
+
+```
+( cd build; make )                 # subshell: forks; cwd/env/umask/vars all
+                                   #   isolated, and a nonzero exit can't kill
+                                   #   the outer shell
+build() ( cd build; make )         # a func whose *body* is a subshell — the
+                                   #   `( )` body (vs `{ }`) is the isolation flag
+                                   #   (bash/POSIX already spell it this way)
+in dist { rm -rf * }               # scoped cwd: run the block there, restore
+                                   #   after — NO fork (cheaper than a subshell)
+```
+
+A **subshell forks**, so — like `export` — only **bytes** cross back out (its
+stdout); rich list/map values do not survive the process boundary. `in DIR { }`
+does not fork: it is the lightweight "do this over there without stranding me,"
+covering the common `pushd`/`popd` pattern with a block.
+
+*(open, deferred cluster: lambdas, and whether a `func` defined inside a `func`
+is visible only there. Also a **TODO — dynamic scope**: the same
+"extract a chunk into a subfunction" goal that motivates persist would be served
+further by letting an extracted helper see the caller's locals; worth weighing
+dynamic (or opt-in dynamic) scope against the lexical default decided above.)*
+
 ### Conditionals: `if` is an expression
 
 `if` **yields a value** — it is an expression, not just a statement (Rust,
@@ -886,13 +926,93 @@ Decisions:
   only — was considered and dropped: it buys parse-time "you forgot the else"
   safety but costs the terse `tag = if $root { "[root]" }` one-liner, and
   interactive brevity wins here.)
-- **`match` later, not now.** A `match`/`case` expression is the obvious
-  companion but is deferred — `if`/`else if` covers the rc-file need first.
+- **`match`** is the multi-way companion — its own section below.
+
+**Postfix guard.** A single statement may carry a trailing `if` (or `unless`)
+guard — the Ruby/Perl statement modifier — for the very common one-line skip:
+
+```
+continue if $f ~ *.tmp
+release $tag if $tag ~ /^v[0-9]+/
+return unless $args:len > 0
+```
+
+This is the shortest guarded form. It is deliberately limited to a **single
+statement** — no `else`, no block — so the block `if cond { … }` stays the form
+for anything larger; the two do not overlap (guard for one-liners, block for
+bodies). It pairs naturally with `~` (`continue if $f ~ *.tmp`) and the file-test
+modifiers (`skip $p unless $p:exists`).
 
 The deep seam — what a branch's value *is* when its tail is a byte-streaming
 external command rather than a mesh value — is the same bytes-vs-values
 question as the structured-return TODO, and is tracked there rather than
 re-litigated here.
+
+### Matching: `match`
+
+`match` is a pattern-matching switch and, like `if`, an **expression** — it
+tests a value against patterns top to bottom, runs the first arm that matches,
+and yields that arm's value. It **replaces bash `case`** with less ceremony (no
+`in` / `)` / `;;` / `esac`) and it returns a value:
+
+```
+kind = match $file {
+  *.md | *.markdown   { markdown }     # glob patterns, alternation with `|`
+  *.txt               { text }
+  /^README/           { readme }       # a /regex/ arm (slash-delimited)
+  .git                { special }      # a literal
+  _                   { other }        # `_` is the default (the old `*)` )
+}
+```
+
+Arm patterns, in one vocabulary:
+
+| Pattern | Matches | Notes |
+| --- | --- | --- |
+| `foo`, `42` | a literal value | exact |
+| `*.txt`, `foo*` | a **glob** | fnmatch, same syntax as [Globbing](#globbing) |
+| `/re/` | a **regex** | slash-delimited; this is mesh's whole regex story (no separate `=~`) |
+| `a \| b` | either | alternation |
+| `1..=9` | a **range** | the `..` / `..=` from slices |
+| `_` | anything | the default; put it last |
+
+Rules:
+
+- **First match wins**, top to bottom; `_` is the catch-all and conventionally
+  last. Whether non-`_`-exhaustive matches must be total is *(open)* — leaning
+  lenient (a `match` with no arm hit yields `""`, like a no-`else` `if`).
+- **It is an expression**: `x = match … { … }` binds the winning arm's value;
+  in statement position the value is discarded and arms run for effect.
+- **Regex captures** *(open)*: a `/re/` arm likely exposes its groups (e.g. as a
+  list) to that arm's body; spelling TBD.
+- Later: **destructuring** list/map shapes in patterns (`[a, b]`, `[k: v]`),
+  deferred until the need is real.
+
+### Tests and comparisons
+
+This is the surface that replaces bash `[[ … ]]` — the pieces a condition needs,
+each a plain value expression (usable in `if`, `while`, `match` guards, or bound
+to a bool):
+
+- **Compare** with `==` `!=` `<` `<=` `>` `>=`. Comparison is **type-directed**:
+  on ints it is numeric, on strings lexical — so mesh needs no `-lt`-vs-`<`
+  split (`$n > 5` numeric, `$a < $b` lexical, decided by the operands' types).
+- **Pattern-match** with `~` / `!~`: `$f ~ *.txt` is a bool "does the string
+  match this glob," and `$f ~ /re/` the regex form — the one-line boolean twin
+  of a `match` arm (`!~` negates). This is bash's `[[ $f == *.glob ]]` and
+  `[[ $s =~ re ]]`, unified.
+- **File tests** are the scalar cousins of the `:files`/`:f` filter modifiers,
+  answering bash's `-f -d -e -x`: `$p:type` yields the `find -type` word
+  (`file`/`dir`/`link`/…) so `$p:type == dir` is `-d`; `$p:exists` is `-e`;
+  `$p:exec` is `-x`. (`-z`/`-n` are just `$s == ""` / `$s:len > 0`.)
+- **Combine** bools with the words `and` / `or` / `not` (`if $a:exists and not
+  $b:exists { … }`). These join *values*; the byte-stream **command** chains
+  `&&` / `||` (run-next-on-success/failure, by exit status) are kept separately
+  and unchanged — two different jobs that bash blurs.
+
+So `case` → `match`, and every `[[ … ]]` job maps to a comparison, a `~`
+pattern-match, a file-test modifier, or an `and`/`or`/`not` of those — no
+special `[[` context, and none of its word-splitting quirks.
 
 ### Loops (`for`, `while`, `loop`)
 
@@ -1000,50 +1120,43 @@ familiarity outranks shaving a keyword. `loop` fills Go's bare-`for {}` niche
 without overloading `for`. So three keywords, each doing one obvious thing —
 `for` iterates, `while` tests, `loop` repeats.
 
-Two notes flagged as *(open)*:
-
-- **`$f:type`** — a path modifier yielding the `find -type` word
-  (`file`/`dir`/`link`/…), the single-value cousin of the glob `(f d l)`
-  qualifiers. The full file-test modifier set (`:type`, maybe `:exists`,
-  `:isdir`) is sketched here but not yet pinned, like the string-modifier set.
-- **A postfix guard** — `continue if $f:type == dir` (Ruby/Perl statement
-  modifier) reads well for one-line skips; whether to add it on top of the block
-  `if` is an ergonomics call, not yet made.
+The one-line skip idiom is the **postfix guard** (`continue if $f:type == dir`),
+now decided — see [Conditionals](#conditionals-if-is-an-expression). The
+file-test modifiers it leans on (`$f:type` / `:exists` / `:exec`) are settled in
+[Tests and comparisons](#tests-and-comparisons).
 
 ## Open questions
 
 - **Name** — smash vs mesh (below).
-- **`~` as a terse alias for exclusion `-`?** Or keep `-` only.
+- **Exclusion `~` alias** — resolved by elimination: `~` / `!~` is now the
+  **pattern-match** operator ([Tests and comparisons](#tests-and-comparisons)),
+  so glob exclusion keeps the spaced infix `-` only.
 - **String modifier set** — beyond `:strip` / `:replace`.
 - **Predicate qualifier syntax** — confirm `size>` / `age<` / `mtime<` forms.
-- **Arrays / maps / functions / `if` / loops / scope** — core surface now
-  sketched above. Remaining sub-questions: an infix **`in`** operator as a
-  second membership spelling alongside `:has`; a single-value **`$f:type`**
-  path modifier (the file-*type filter* modifiers `:files`/`:f` etc. are now
-  decided, but a scalar "what type is this one path" word is separate); and a
-  **postfix guard** (`continue if …`). (Decided: expression-`if` with no `else`
-  yields `""`; in-place append/merge is `+=`, defined over both operand types;
-  membership is `:has` (`?` postfix rejected); loops are brace-delimited with no
-  `do`/`done` — `for` iterates, `while` tests, `loop` repeats; **scope** is two
-  levels, lexical, local-by-default with `global` to escape, no block scope,
-  `unset` to remove, and command names resolve at call time; **type filters**
-  have both `*:f`/`*:files` and `*(f)` spellings.)
+- **Core surface** (arrays / maps / functions / `if` / `match` / loops / scope /
+  tests / isolation) — sketched above. Remaining sub-questions: an infix **`in`**
+  operator as a second membership spelling alongside `:has`; **regex captures**
+  from a `/re/` `match` arm; and whether non-`_` `match` must be **exhaustive**
+  (leaning lenient → `""`). Decided this pass: **`match`** replaces `case`
+  (literal/glob/`/regex/`/range/`_` arms; no single-arm sugar — `~` covers the
+  one-test case); **tests** replace `[[ ]]` (`~`/`!~` pattern-match, type-directed
+  comparisons, `$p:type`/`:exists`/`:exec` file tests, `and`/`or`/`not` vs command
+  `&&`/`||`); the **postfix guard** `stmt if/unless cond` is the one-line form;
+  **isolation** is explicit — plain `func` persists cwd/state, `( )` /
+  `func f() ( )` subshell-isolate, `in DIR { }` scopes cwd without forking.
 - **Value vs stream reconciliation** *(narrowed)* — how a function *produces* a
   value is settled (last expression, or `return val`); still open are the
   **value-call grammar** (likely a parenthesized `x = f($arg)`, since a bare
   word on an assignment RHS is a literal string) and whether such a call yields
   the returned value or captured stdout — leaning **call-context**. Tracked in
   [Functions](#functions).
-- **`match` expression** — the companion to expression-`if`; deferred until the
-  rc-file need is real.
-- **Function isolation (deferred cluster)** — a set of related questions about
-  how much a `func` isolates from its caller, to be taken as one pass:
-  **lambdas** (anonymous functions for `map`/`each`/callbacks, and their
-  syntax); whether **function *definitions*** are themselves locally scoped (a
-  `func` defined inside a `func` visible only there); whether a function
-  **restores `PWD`** (and other process state) on return or lets a `cd` persist;
-  and whether mesh has **subshells** (`( … )` isolating cwd/env/vars in a child)
-  — the last two are the same "does this run isolated?" question.
+- **Function-body helpers (remainder of the isolation cluster)** — **lambdas**
+  (anonymous functions for `map`/`each`/callbacks, and their syntax, tied to the
+  value-call grammar above) and whether a **`func` defined inside a `func`** is
+  visible only there. *(TODO — dynamic scope:* the same "extract a chunk into a
+  subfunction" goal that fixed cwd as *persist* would be served further by
+  letting an extracted helper see the caller's locals; weigh dynamic — or opt-in
+  dynamic — scope against the lexical default.*)*
 - **Hook API** — how override hooks compose over a base (possibly external)
   prompt renderer.
 
