@@ -179,6 +179,18 @@ $(cmd):raw          # no split; raw bytes including the trailing newline
 $(cmd):split ":"    # split on an arbitrary separator
 ```
 
+The delimiter is a **terminator, not a separator**: **trailing empty fields are
+dropped** — any run of delimiters at the very end contributes nothing. So
+`find -print0` (which ends every path, including the last, with NUL) yields
+exactly the paths — `a\0b\0` → `[a b]` — and a stray blank line at the end of
+output never becomes a phantom element. This generalizes the default newline
+split's trailing trim. **Interior** empty fields are *kept* (`a\0\0b\0` →
+`[a "" b]`), so structure in the middle survives; an **empty capture** — or one
+that is nothing but delimiters — is the empty list `[]`. `:words` is the
+exception that ignores whitespace entirely — leading, trailing, and runs — so it
+never yields empty elements (the classic IFS word-split). `:raw` does not split
+at all (it is the [no-split capture member](#modifiers), one byte-string).
+
 **Path components** — for `a/b/foo.tar.gz`:
 
 | Modifier | Result | Meaning |
@@ -475,6 +487,15 @@ that needs a literal colon is quoted (`["http:" 80]`), which also keeps this
 rule from colliding with the modifier `:` (only a modifier *keyword* after `:`
 triggers a modifier; `key: value` has a value, so it stays a pair).
 
+**Keys are byte-strings**, always — the same type the environment and argv use,
+so there is no key-equality question to answer and no list/map keys to compare
+structurally. A key in a literal is a bareword or quoted string (`http`,
+`"a b"`); a numeric-looking key is just those bytes (`[200: ok]` keys on the
+string `"200"`, and `$m[200]` looks up the same); and an interpolation in key
+position uses its **string value** (`[$name: 1]`, `$m[$k]`). A non-string value
+used as a key — a list or map — is an **error**, not silently stringified. This
+keeps maps to the one job an rc file needs: string-keyed lookup tables.
+
 Access mirrors list indexing exactly — `$m[key]` for a string key is the same
 shape as `$arr[0]` for an integer index:
 
@@ -682,20 +703,33 @@ Rules:
   success (`0`) when its status is observed. Failure is only ever signalled by a
   command's own status, a `false`, or an explicit nonzero `int` — never by the
   mere *shape* of a returned value.
+
+  A status is the OS's **8-bit** process status, so an out-of-range int is
+  **masked to `0`–`255`** (`return 256` → `0`, `return -1` → `255`, matching
+  `exit`) — an in-process call and a process-backed one then report the *same*
+  status. The full integer survives as the function's **value** (`n = f()`);
+  only the *status view* is 8-bit.
 - **Output is stdout.** Independently of its result, whatever a `func` writes to
   stdout *is* its output stream, exactly like an external command, so functions
   compose in byte-stream pipes with everything else.
 
-  **TODO — value vs stream reconciliation.** With `return val` and
-  last-expression results, the *syntax* for handing back a real list/map is
-  settled (`config = load-env()` where `load-env` ends in / returns a map). The
-  genuinely open part is how a value coexists with stdout streaming: in
-  `x = f()`, does `x` get `f`'s **returned value** or its **captured stdout**?
-  Candidate answers: decide by **call context** (value context takes the return
-  value, command/pipe context takes the stream — no declaration needed), or mark
-  value-returning functions with a **declaration modifier** (keyword TBD — not
-  `raw`, which already means *unsplit bytes*). Leaning toward call-context now
-  that `return val` exists, since it avoids a second function flavor.
+  **TODO — value vs stream reconciliation.** `return val` and last-expression
+  results settle how a function *produces* a value; what is still open is how a
+  caller *asks* for one, and that is bound up with a grammar gap. Invocation so
+  far is **command-style** (`greet world`), and on an assignment RHS a bare word
+  is a *literal string* (`x = greet` binds the string `"greet"`, per the
+  bash-style assignment rule) — so calling a function *for its value* needs a
+  form distinct from both. The likely answer is a **parenthesized value-call**,
+  `x = f($arg)` / `config = load-env($path)` — parens (already the signature's
+  delimiter) marking "call and take the result," versus command-style
+  `f world` in statement position taking the stream. That leaves the core
+  question: in `x = f($arg)`, is the result the **returned value** or the
+  **captured stdout**? Candidates: decide by **call context** (a value-call
+  takes the return value; command/pipe position takes the stream — no
+  declaration needed), or mark value-returning functions with a **declaration
+  modifier** (keyword TBD — not `raw`, which already means *unsplit bytes*).
+  Leaning call-context — but the value-call grammar above is part of what has to
+  be pinned down with it, so it is *illustrative here, not yet decided*.
 
 **Prior art surveyed** (all shell-adjacent, all validate the same four
 signature roles): Elvish `{|a b &opt=default @rest|}`, Nushell
@@ -895,10 +929,11 @@ Two notes flagged as *(open)*:
   membership is `:has` (`?` postfix rejected); loops are brace-delimited with no
   `do`/`done` — `for` iterates, `while` tests, `loop` repeats, keeping a
   separate `while` rather than Go-unifying into `for`.)
-- **Value vs stream reconciliation** *(narrowed)* — the return *syntax* is
-  settled (last expression, or `return val`); the open part is whether `x = f()`
-  captures a function's returned value or its stdout, resolved by **call
-  context** (leaning) or a **declaration modifier**. Tracked in
+- **Value vs stream reconciliation** *(narrowed)* — how a function *produces* a
+  value is settled (last expression, or `return val`); still open are the
+  **value-call grammar** (likely a parenthesized `x = f($arg)`, since a bare
+  word on an assignment RHS is a literal string) and whether such a call yields
+  the returned value or captured stdout — leaning **call-context**. Tracked in
   [Functions](#functions).
 - **`match` expression** — the companion to expression-`if`; deferred until the
   rc-file need is real.
