@@ -1644,15 +1644,15 @@ expands `!`), so it can never surprise non-interactive code. It reads from the s
 - **`!$`** — the last argument of the previous command (`mkdir foo; cd !$`).
   (`!*` for all args, and `!n` / `!-n` by index, are natural extensions — deferred.)
 - **Substitution** — two spellings: the terse **`^old^new`** for the everyday
-  "fix my last command" (line-start; previous command; first match), and a general
+  "fix my last command" (line-start; previous command), and a general
   **`:old=new`** modifier on *any* history reference (`!!:foo=bar`,
   `!git:foo=bar`). The `old=new` form reads as a *mapping* rather than importing
   sed's `s///` (which mesh uses nowhere else), and it **chains** like every other
-  mesh `:` modifier — `!git:foo=bar:x=y` applies both substitutions in order. Split
-  is on the **first `=`** (so `new` may contain `=`; a literal `=` in `old` escapes
-  as `\=`), first match by default. `^old^new` is just shorthand for `!!:old=new`.
-  *(open: the global-replace spelling, and a delimited/quoted form for patterns
-  containing spaces or `:`.)*
+  mesh `:` modifier — `!git:foo=bar:x=y` applies both in order. Replacement is
+  **global** — every occurrence. The separator is the first *unquoted* `=`; for a
+  pattern with spaces or a literal `=` / `:`, **quote each side**
+  (`!git:"old thing"="new thing"`) or **backslash-escape**
+  (`!git:old\ thing=new\ thing`). `^old^new` is just shorthand for `!!:old=new`.
 
 **The `!` clash is resolved lexically:** `!` introduces an expansion only when
 immediately followed by a **designator** — `!`, `$`, `-`, a digit, or a word char —
@@ -1836,10 +1836,10 @@ set — `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settl
   interactive-only, quote-safe `!!` / `!string` / `!$` (with `!*` / `!n` deferred);
   the `!` clash resolved lexically (a designator must follow, so `!=` / `!~` and a
   lone `!` are untouched); both quotes make `!` literal, `\!` escapes, and
-  `$sh.options.histexpand = off` disables it. Substitution is a chainable
-  **`:old=new`** modifier on any history reference (`!git:foo=bar:x=y`), with
-  **`^old^new`** as shorthand for `!!:old=new`. Remaining: the global-replace
-  spelling and a delimited form for patterns with spaces / `:`.
+  `$sh.options.histexpand = off` disables it. Substitution is a chainable,
+  **global** **`:old=new`** modifier on any history reference (`!git:foo=bar:x=y`;
+  quote each side or backslash-escape for spaces / specials), with **`^old^new`**
+  as shorthand for `!!:old=new`.
 - **Interactive history (store & recall) — decided**
   ([Interactive history](#interactive-history)): a **SQLite** store at
   `$XDG_STATE_HOME/mesh/history.db` with rich per-entry columns
