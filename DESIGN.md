@@ -1474,8 +1474,12 @@ the EXIT-pseudo-signal trap (bash's `trap … EXIT`), already defined with the
 rule); assigning a handler for them is an error. A user handler runs *in addition
 to* the shell's interactive default where both apply — the shell keeps terminal
 control (the line-cancel / redraw still happens) and the handler runs for its
-effect; handlers fire for signals delivered while a script, function, or command is
-running, matching where bash traps fire.
+effect. **The handler runs first and the shell's terminal redraw is its final
+step** — so any output a handler writes (`puts "interrupted"`) appears *before* the
+fresh prompt is drawn, never stranded after it, and the line editor's displayed
+buffer / cursor stay consistent (a WINCH handler's output likewise precedes the
+reflow). Handlers fire for signals delivered while a script, function, or command
+is running, matching where bash traps fire.
 
 *(deferred: whether a handler may **suppress** a default (e.g. swallow `Ctrl-C`);
 exact SIGINT delivery mid-pipeline; and per-signal masking during handler
