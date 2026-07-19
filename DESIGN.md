@@ -214,14 +214,227 @@ and likely `:upper` / `:lower`. To be fleshed out.
 - **ksh extended globs** (`!(…)`, `@(…)`, `+(…)`) — **dropped.** Cryptic, and
   their jobs are covered by braces + exclusion.
 
+### Variables and assignment
+
+Assignment is `name = value`, **with surrounding spaces** — the same
+"operators need space" rule that governs glob exclusion (see
+[Globbing](#globbing)). That single rule pays off again here: the spaces are
+what separate an *assignment* from a *command with a `k=v` argument*, so mesh
+needs no `set` / `let` / `var` keyword for the common case.
+
+```
+x = hello                 # assignment: bind x
+env FOO=1 cmd             # NOT assignment: `env` runs with a literal `FOO=1` arg
+files = *.txt             # binds the glob result (a list) to `files`
+n = 42
+```
+
+- **Scope.** Bindings are **function-local by default.** A name assigned
+  inside a `func` body does not leak out. Top-level (rc-file) bindings are
+  session-global. *(open: an explicit `local` / block-scoped form, if we ever
+  want a name narrower than the enclosing function.)*
+- **Export.** `export NAME = value` puts a name in the process environment for
+  children. **Only byte-strings can be exported** — the environment is a flat
+  `KEY=bytes` table, so a list or map cannot cross an `exec` boundary. Exporting
+  a list is an error with a clear message (join it first: `export P =
+  $dirs:join ":"`). This keeps the rich types honest: they live *in* the shell,
+  and the boundary to external programs is always bytes.
+- **Types are inferred, not declared.** `x = foo` is a string, `x = [a b c]` a
+  list, `x = [a: 1]` a map. There is no type sigil (`@`, `%`) on the *name* —
+  a variable just holds whatever value it was given, and `$x` reads it back.
+
+### Arrays (lists)
+
+The list is mesh's core value — command substitutions already produce lists
+(see [Command substitution](#command-substitution)) and value modifiers already
+map over them. This section pins down the *literal*, *indexing*, and *slicing*
+surface.
+
+```
+xs = [a b c d]            # literal: space-separated, like nushell / elvish
+empty = []
+one = [solo]             # a 1-element list, never collapsed to a scalar
+```
+
+**Zero-based**, always — matching bash/Python/Rust and rejecting zsh's
+1-based indexing (the single biggest cross-shell gotcha). Negative indices
+count from the end.
+
+```
+$xs[0]                    # a           first
+$xs[-1]                   # d           last  (negative index)
+$xs[1]                    # b
+```
+
+**Ergonomic length and ends** are *words*, consistent with the modifier system
+— no `${#arr[@]}` and no `$#arr`:
+
+| Form | Result | Notes |
+| --- | --- | --- |
+| `$xs:len` | `4` | element count |
+| `$xs:first` | `a` | same as `$xs[0]` |
+| `$xs:last` | `d` | same as `$xs[-1]`; the two spellings coexist on purpose |
+| `$xs:rest` | `[b c d]` | all but the first |
+| `$xs:init` | `[a b c]` | all but the last |
+
+`last` gets **two spellings** deliberately: `$xs[-1]` for anyone with the
+Python/zsh reflex, `$xs:last` for readability and for the case where `$xs` is
+itself an expression you don't want to index twice.
+
+**Slices** use ranges. mesh is written in Rust, so it adopts Rust's range
+spelling directly — `..` is **half-open** (end-exclusive), `..=` is inclusive:
+
+```
+$xs[1..3]                 # [b c]       indices 1,2   (half-open)
+$xs[1..=3]                # [b c d]     indices 1,2,3 (inclusive)
+$xs[..2]                  # [a b]       first two
+$xs[2..]                  # [c d]       from 2 to end
+$xs[-2..]                 # [c d]       last two
+```
+
+Half-open is the default because `[..n]` then reads as "the first `n`", and
+`[i..j]` has length `j - i` — the two properties that make off-by-one bugs
+rare. Reach for `..=` when you literally mean "up to and including."
+
+**Build and append** go through the spread operator `...` (see
+[Spread](#spread--flattening) below) rather than a mutation verb, so there is
+one primitive to learn:
+
+```
+xs = [...$xs e]           # append e
+xs = [pre ...$xs]         # prepend
+both = [...$a ...$b]      # concatenate
+```
+
+*(open: whether a terse in-place `xs += [e]` / a `push` builtin is worth having
+on top of the spread form for interactive brevity.)*
+
+### Maps (associative arrays)
+
+A map literal is a **comma-separated** list of `key: value` pairs. The comma is
+what distinguishes a map from a space-separated list, and `key: value` survives
+the modifier-disambiguation rule untouched: `:` is only a modifier when a
+modifier *keyword* immediately follows it, and here a space (then a value) does.
+
+```
+ports = [http: 80, https: 443, ssh: 22]
+empty = [:]               # the empty map  (`[]` is the empty list)
+```
+
+Access mirrors list indexing exactly — `$m[key]` for a string key is the same
+shape as `$arr[0]` for an integer index:
+
+```
+$ports[https]             # 443
+$ports[https] = 8443      # set / update
+```
+
+| Form | Result | Meaning |
+| --- | --- | --- |
+| `$m:keys` | list | keys (insertion order preserved) |
+| `$m:values` | list | values |
+| `$m:len` | int | entry count (same word as lists) |
+| `$m:has KEY` | bool | membership *(open: `:has` vs a `?` postfix)* |
+
+Insertion order is **preserved** (like Python dict / a `Vec<(K,V)>` behind the
+scenes) so `for k in $m:keys` is deterministic — important for an rc file that
+builds, say, an ordered alias table.
+
+### Spread / flattening
+
+`...` is the one operator that moves between "a list" and "several arguments,"
+in both directions:
+
+- **At a call site**, `...$xs` **explodes** a list into separate arguments.
+- **In a signature**, `...name` **collects** trailing arguments into a list.
+
+```
+git log ...$flags         # each element of $flags becomes its own argv entry
+cp ...$srcs $dest         # spread in the middle is fine
+```
+
+This is the crux of mesh's **no-word-splitting** promise: a bare `$xs` passed
+to a command is **one argument that happens to be a list**, and it stays whole;
+flattening into argv only happens where you *write* `...`. That inverts the
+bash default (everything splits unless you fight it with quotes) into
+opt-in — the footgun becomes a deliberate keystroke.
+
+### Functions
+
+```
+func greet(name) {
+  echo "hi, $name"
+}
+
+greet world               # -> hi, world
+```
+
+Paren-delimited, `func name(params) { … }` — C/Go/JS muscle memory, and unlike
+Elvish's `{|a b| … }` or Nushell's `def f [a b] { … }` it puts the signature
+where a reader already looks for it. Parameters are **named**: inside the body
+you reference `$name`, never `$1`. This is the fish `--argument-names` idea
+promoted to the declaration itself.
+
+The signature borrows Nushell's/Elvish's proven vocabulary — *positional*,
+*optional-with-default*, *flag*, and *rest*:
+
+```
+func deploy(env, region = us-west, --force, --tag = latest, ...hosts) {
+  # $env     required positional
+  # $region  optional positional, defaults to us-west
+  # $force   boolean switch: true iff --force was passed
+  # $tag     valued flag,   defaults to latest
+  # $hosts   list of any remaining positionals   (rest / "flattening")
+}
+
+deploy prod --force web1 web2
+#   $env=prod  $region=us-west  $force=true  $tag=latest  $hosts=[web1 web2]
+
+deploy prod eu-west --tag=v9 ...$fleet
+#   $region=eu-west  $tag=v9  $hosts = the spread-in elements of $fleet
+```
+
+Rules:
+
+- **Positionals** bind left to right. A parameter with `= default` is optional;
+  once one parameter has a default, later positionals should too (no gap).
+- **Flags** are declared with a leading `--`. `--force` (no `=`) is a boolean
+  **switch**, false unless passed. `--tag = default` is a **valued flag**.
+  Flags may appear in any order at the call site and are *not* consumed as
+  positionals — this is why a shell wants real flag parsing in the signature
+  rather than hand-rolled `case $1` juggling.
+- **Rest** (`...name`, at most one, last) collects everything left over into a
+  list. This is the "flattening" you asked about — the same slurpy/`@rest`
+  concept as Raku's `*@rest`, Elvish's `@rest`, Nushell's `...rest`, Tcl's
+  `args`.
+- **Arguments do not word-split.** A list argument arrives as one list value
+  (see [Spread](#spread--flattening)); use `...` to flatten deliberately.
+- **Return / output.** A function's *stdout is its output*, exactly like an
+  external command, so functions compose in byte-stream pipes with everything
+  else. *(open: an explicit `return <value>` that yields a rich list/map to a
+  caller in the same shell, vs. always going through bytes — the
+  structured-return question is the one genuinely unresolved corner here.)*
+
+**Prior art surveyed** (all shell-adjacent, all validate the same four
+signature roles): Elvish `{|a b &opt=default @rest|}`, Nushell
+`def f [a, b?, --sw, --n = d, ...rest]`, fish `function f --argument-names …`,
+Raku signatures (`$x = 5`, `*@rest`), Tcl `proc` (`{b 5}`, `args`),
+PowerShell `param()` with `[Parameter(ValueFromRemainingArguments)]`. mesh
+takes the *semantics* these agree on and dresses them in the `func name(...)`
+syntax above.
+
 ## Open questions
 
 - **Name** — smash vs mesh (below).
 - **`~` as a terse alias for exclusion `-`?** Or keep `-` only.
 - **String modifier set** — beyond `:strip` / `:replace`.
 - **Predicate qualifier syntax** — confirm `size>` / `age<` / `mtime<` forms.
-- **Arrays** — literal syntax, indexing, slicing, append.
-- **Functions / variables / export** — declaration and scoping syntax.
+- **Arrays / maps / functions** — core surface now sketched above. Remaining
+  sub-questions: in-place append (`+=` / `push`) vs spread-only; `:has` vs a
+  `?` membership postfix; and a `local` binding narrower than function scope.
+- **Structured return** — a function's output is its stdout bytes (composes in
+  pipes); do we also want an explicit `return <value>` that hands a rich
+  list/map to an in-shell caller without a bytes round-trip?
 - **Hook API** — how override hooks compose over a base (possibly external)
   prompt renderer.
 
