@@ -1478,7 +1478,9 @@ readline is avoided as GPL.
 **MVP: bindings are hardcoded emacs/friendly** — `Ctrl-A`/`Ctrl-E` for line ends,
 `Ctrl-B`/`Ctrl-F` and arrows to move, `Ctrl-W` / `Alt-Backspace` word-kill,
 `Ctrl-U`/`Ctrl-K` line-kill, `Ctrl-Y` yank, `Ctrl-R` reverse history search,
-up/down for history, `Tab` to complete, `Ctrl-L` to clear. **Multi-line
+up/down for **prefix** history search (a typed prefix filters the walk; see
+[Interactive history](#interactive-history)), `Tab` to complete, `Ctrl-L` to
+clear. **Multi-line
 continuation** is driven by **parser incompleteness** — the editor asks the
 parser whether the buffer is a complete command and, if not, reads a continuation
 line — so *every* unfinished form is covered uniformly rather than by an
@@ -1582,6 +1584,45 @@ Auto-generation stays the zero-config default; this is where a *dynamic* complet
 *(deferred: the exact spec-file format; the function-docstring format; dynamic
 value providers; recursive per-subcommand `--help` probing; and shared/remote spec
 repos. The match/menu UI itself is the [line editor](#line-editing)'s.)*
+
+### Interactive history
+
+This is the history **store and recall** — distinct from the history *expansion*
+syntax (`!!` / `^old^new`), which stays an [open question](#open-questions).
+
+**The store is SQLite** at `$XDG_STATE_HOME/mesh/history.db` (`$XDG_STATE_HOME`
+defaulting to `~/.local/state` — history is per-machine *state*, not cache or
+config). A flat history *file* would force `grep` for everything; a small database
+gives structured columns now and real search later, without committing to a query
+UI yet.
+
+**Every entry is rich, and the [hooks](#hooks-and-the-prompt) already populate it**
+— history is just a built-in consumer of `preexec` / `postexec`, no new machinery:
+
+| Column | Filled at | From |
+| --- | --- | --- |
+| `command` | `preexec` | the submitted command line |
+| `cwd` | `preexec` | `$env.PWD` at submit |
+| `tty` | `preexec` | the session's terminal |
+| `session` | `preexec` | the interactive session id |
+| `start` | `preexec` | submit timestamp |
+| `duration` | `postexec` | how long it ran |
+| `status` | `postexec` | the [exit status](#variables-and-assignment) |
+
+**Recall** is the [line editor](#line-editing)'s, reading from this store, with two
+motions: **`Ctrl-R`** does reverse *substring* search, and **up/down do prefix
+search** — with a prefix already typed, `Up` walks the most recent commands that
+*start with* it (an empty buffer just steps chronologically). So typing `git ` then
+`Up` cycles your recent `git …` lines — the friendly default.
+
+**The MVP surface is a `history` built-in** that lists entries (newest last), and
+**`history | grep foo`** is the MVP search — the whole point of a real store is
+that richer queries (by cwd, by exit status, by time) can come later without
+changing how entries are written. So `list | grep` is enough to ship.
+
+*(deferred: an atuin-style fuzzy / interactive search over the columns; a
+`$sh.history` value accessor for scripting; cross-session and cross-host sync;
+the dedup policy; secret redaction; and import from bash/zsh history files.)*
 
 ### Hooks and the prompt
 
@@ -1763,10 +1804,13 @@ set — `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settl
   style `old=new`. Decide the spelling (a `^old^new` quick form vs. a `:s`
   modifier on a history reference) and how it reads against mesh's `:`-modifier
   grammar.
-- **Interactive history (store & recall) — TODO.** Separate from the expansion
-  syntax above: the history *store* and *recall* — up/down and `Ctrl-R` search
-  (wired through the [line editor](#line-editing)), on-disk persistence (path,
-  format — plain file vs. SQLite), and the dedup / cross-session-sharing policy.
+- **Interactive history (store & recall) — decided**
+  ([Interactive history](#interactive-history)): a **SQLite** store at
+  `$XDG_STATE_HOME/mesh/history.db` with rich per-entry columns
+  (command / cwd / tty / session / start / duration / status) populated by
+  `preexec` / `postexec`; recall via up/down and `Ctrl-R`; a `history` built-in
+  plus `history | grep` as the MVP search. Remaining: fuzzy search, a
+  `$sh.history` accessor, cross-session sync, dedup policy, and secret redaction.
 - **Interactive signals — TODO.** `Ctrl-C` (SIGINT cancels the current line /
   interrupts the foreground job but never kills the interactive shell), `Ctrl-D`
   (EOF → `exit` on an empty line), and `SIGWINCH` (resize → prompt redraw), plus
