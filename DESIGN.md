@@ -1534,6 +1534,17 @@ programs or user functions:
     the scoped `pushd` / `popd`.
   - **`pwd`** — print the working directory (`$env.PWD`), logical by default;
     **`--physical` / `-P`** prints the symlink-resolved path.
+  - **Autocd** — a bare word in command position that is a **directory path ending
+    in `/`** (`src/`, `../`, `/tmp/`) is a `cd` into it, no `cd` keyword needed. The
+    **trailing slash is the signal** — and it's what makes this safe where zsh's
+    slashless autocd isn't: a slashless `src` stays an ordinary command lookup (so a
+    command that shares a directory's name is never shadowed), and only the explicit
+    `src/` means "go there." Because it *is* a `cd`, a relative target honours
+    [`CDPATH`](#variables-and-assignment) — `proj/` resolves through `CDPATH`
+    exactly as `cd proj` would. It fires for a **lone** word only (`src/ x` runs
+    `src/` as a command); a trailing-slash word whose target isn't a directory is a
+    *no-such-directory* error, not command-not-found. On by default —
+    `$sh.options.autocd = off` disables it.
 - **I/O**
   - **`puts [args…]`** — write to stdout: the arguments joined by a single space,
     then a newline (**`--no-newline` / `-n`** suppresses it); a list spreads
