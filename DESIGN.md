@@ -44,6 +44,15 @@ precedence among the three.
 - A **clean-break syntax**: keep the muscle memory that is worth keeping, fix
   the parts that are genuinely bad, and do not carry POSIX warts forward.
 - First-class prompt hooks, session management, and job control.
+- **Correctness and a simple, clear implementation over micro-performance.** When
+  a choice is between an obviously-correct, easy-to-read implementation and a
+  faster but subtler one, take the former; a shell's interactive latency is
+  dominated by the programs it launches and by I/O, not by shaving cycles off the
+  language runtime. Small performance differences never justify a design that is
+  harder to reason about or a behavior that is harder to specify. (Genuine
+  interactive responsiveness — startup time, prompt render, completion latency —
+  still matters and is an ergonomics concern; this goal is about not trading
+  clarity for *marginal* speed.)
 
 ### Non-goals
 
@@ -515,6 +524,17 @@ settings map, the `$sh.complete` [completion-override](#completion) map, and the
 `$sh.signal` [signal-handler](#signals) map.
 (This is the one place the general map rules are constrained — individual keys
 carry a mutability flag.)
+
+*(TODO: **indirect / by-name variable access.** Real configs reach a value through
+a *computed* name — fish's `my_set_color` does `eval "printf \$$arg"` to read the
+variable named by `$arg` (`bold`, `blue`, …); bash/zsh have the `${!var}` /
+`declare -n` / `${(P)var}` family. mesh has **no** by-name access to the variable
+namespace, deliberately so far — the intended answer is to put such values in a
+**map** and index it (`$colors[$name]`), which is first-class and needs no `eval`.
+Because `$env` / `$sh` are already maps, indirect *environment* access falls out
+for free (`$env[$name]`). Open question: is a map always enough, or is a narrow
+by-name facility (read, perhaps write) warranted for genuine metaprogramming?
+Leaning: maps only — revisit only if a real need survives the reframe.)*
 
 ### Quoting and escaping
 
@@ -1118,28 +1138,27 @@ PowerShell `param()` with `[Parameter(ValueFromRemainingArguments)]`. mesh
 takes the *semantics* these agree on and dresses them in the `func name(...)`
 syntax above.
 
-*(TODO: **aliases, wrappers, and dynamic definition.** mesh has no `alias` or
-`eval` yet, but real configs lean on both — the `conf`/`scripts` repos wrap a
-tool's every subcommand at load time (`for c in $(vcs --list-commands) { <define c
-as a forwarder to `vcs $c ...$args`> }`) and alias short names to commands. Open
-questions:*
-  - *A lightweight **alias/wrapper** form for the common "rename or prefix a
-    command" case — `alias ll = ls -l` for the literal case, and a **forwarding
-    wrapper** that passes args through (something like `wrap co = vcs checkout` so
-    `co -b x` runs `vcs checkout -b x`) — without reaching for string `eval`.*
-  - ***`sudo`-style alias expansion.** In bash/zsh an alias whose value ends in a
-    space makes the shell expand the **next** word as an alias too — the classic
-    `alias sudo='sudo '` so `sudo ll` still resolves `ll`. mesh should decide this
-    deliberately: pick a clean way to say "expand this command's first argument as
-    a command/alias in its own right" (the sudo/`command`/`xargs`/`watch` case)
-    rather than inheriting bash's trailing-space-is-significant trick, which is
-    invisible and error-prone.*
-  - *Whether to expose **dynamic `func` definition** (a function whose name is
-    computed) at all — it fights static [completion](#completion) and readability,
-    so the forwarding-wrapper form above may cover the real need; if a general
-    escape hatch is wanted, prefer a **scoped** primitive over bash's
-    string-concatenating `eval`. Leaning: ship aliases + forwarding wrappers with
-    a defined arg-expansion rule, defer general dynamic definition.)*
+*(TODO: **wrappers, forwarding, and dynamic definition.** [No aliases](#built-ins)
+is *decided* — a `func` replaces `alias ll`. But real configs still need things a
+plain `func` doesn't yet give cleanly; these are open:*
+  - *A **terse forwarding wrapper.** `func co(...args) { vcs checkout ...$args }`
+    works but is tedious to repeat for a tool's every subcommand (the `conf`/
+    `scripts` configs generate these in a loop over `$(vcs --list-commands)`). A
+    shorthand — `wrap co = vcs checkout`, or a loop-friendly definer — would cover
+    "prefix/rename a command, pass the rest through." It must forward flags
+    **transparently**: nushell's plain `def` wrapper rejects `co -m msg` as an
+    "unknown flag" unless declared (`def --wrapped`) — the exact trap to avoid.*
+  - ***Running a wrapper under `sudo` / `xargs` / `watch`.** Because mesh commands
+    are functions, not aliases or `PATH` binaries, `sudo ll` can't see `ll` — bash
+    papers over this with the invisible `alias sudo='sudo '` trailing-space trick.
+    mesh should offer a deliberate way to say "expand this command's first argument
+    as a mesh command" instead.*
+  - *Whether to expose **dynamic definition** (a function whose name is computed —
+    the `set_up_ssh_aliases` `eval` loop) at all; it fights static
+    [completion](#completion), so the wrapper shorthand may cover the real need. If
+    a general escape hatch is wanted, prefer a **scoped** primitive over bash's
+    string-concatenating `eval`. Leaning: a forwarding-wrapper shorthand with
+    transparent flag passthrough, defer general dynamic definition.)*
 
 ### Isolation and subshells
 
@@ -2181,15 +2200,22 @@ each paired with the mesh decision that defuses it. Several are drawn from real
 workarounds in the author's own `bash` / `fish` / `nushell` configs — where a
 comment in those files documents a hack, that hack marks the footgun.
 
+Most of these defenses are **settled** decisions elsewhere in this document. A few
+rely on mechanisms still being designed; those are marked ***(planned)*** and link
+to the open TODO, so this section reads as "things we avoid" and "things we *intend*
+to avoid" rather than promising the latter as done.
+
 ### bash / POSIX
 
 - **A pipeline's `while read` silently loses its variables.** `cmd | while read x
   { n = $((n+1)) }; echo $n` prints `0` — the loop ran in a forked subshell, so
-  `n` never escaped. mesh removes the trap two ways: a [command
-  substitution](#command-substitution) is a real list you iterate *in the current
-  scope* (`for line in $(cmd) { n += 1 }` leaves `n` set), and the **last stage of
-  a pipeline runs in the current shell**, not a subshell — bash's opt-in
-  `lastpipe`, made the default.
+  `n` never escaped. mesh's **settled** answer is to not pipe into a loop at all: a
+  [command substitution](#command-substitution) is a real list you iterate *in the
+  current scope* — `for line in $(cmd) { n += 1 }` leaves `n` set, no subshell
+  involved. ***(planned)*** for the literal `cmd | while gets line { … }` form to
+  persist too, the **last stage of a `|` pipeline** would run in the current shell
+  rather than a forked subshell — bash's opt-in `lastpipe`, intended as mesh's
+  unconditional default; not yet written into [Redirection](#redirection).
 - **Unquoted `$var` word-splits and globs.** `rm $file` breaks on a space; `[ $x =
   y ]` becomes a parse error when `$x` is empty. The single most common bash bug.
   mesh has **no word splitting and no implicit globbing of a value** — `$x` is
@@ -2231,10 +2257,15 @@ comment in those files documents a hack, that hack marks the footgun.
   defense is `| string collect`, which appears dozens of times in the author's
   `config.fish` purely to keep a result (e.g. an empty `projectroot`) a *string*
   rather than an empty list that breaks the next comparison. mesh makes splitting
-  **explicit and stable** — default newline split, opt-in `:words` / `:nulls` /
-  `:tabs` / `:split`, `:raw` for exact bytes, a defined [trailing-empty-field
-  rule](#modifiers) — and, by [no null](#variables-and-assignment), an empty result
-  is the scalar `""`, not a shape that needs a `string collect` guard.
+  **explicit and stable**, and makes the **list-vs-scalar choice part of the
+  capture** rather than a post-hoc rescue: `$(cmd)` is a list (default newline
+  split, opt-in `:words` / `:nulls` / `:tabs` / `:split`, a defined
+  [trailing-empty-field rule](#modifiers)), and `$(cmd):raw` is one string. You ask
+  for the shape you want up front, so a value is never auto-split against your
+  intent and then un-split with `string collect`. The empty cases are each clean
+  and stated ([Modifiers](#modifiers)): an empty list capture is `[]`, and an empty
+  `:raw` (scalar) capture is `""` — [no null](#variables-and-assignment) either
+  way, so neither needs a guard.
 - **Non-POSIX breaks muscle memory.** fish dropped `$(...)`, `&&` / `||` (for
   years), `export`, and more; nushell can't even source a `brew shellenv` snippet
   (the author's `config.nu` reimplements it by hand). mesh keeps the POSIX spine —
@@ -2246,11 +2277,14 @@ comment in those files documents a hack, that hack marks the footgun.
   arms directly.
 - **`eval` for dynamic definition and indirect variables.** fish resorts to
   `eval "function $alias; ssh_to $alias \$argv; end"` to synthesize per-host
-  functions, and `eval "printf ... \$$arg"` for indirect variable access. mesh
-  treats both as first-class design questions rather than string-`eval`: see the
-  alias/wrapper/dynamic-definition TODO in [Functions](#functions), and note that
-  indirect access is just [map indexing](#maps-associative-arrays)
-  (`$colors[$name]`), no `eval`.
+  functions, and `eval "printf ... \$$arg"` for indirect variable access. mesh's
+  direction is to make both first-class rather than string-`eval`, but ***(planned)***
+  — neither is settled: dynamic definition is the wrapper/forwarding TODO in
+  [Functions](#functions), and by-name variable access is its own open question in
+  [Variables](#variables-and-assignment) (the intended answer is a
+  [map](#maps-associative-arrays) indexed by the computed name, `$colors[$name]`,
+  rather than reaching into the variable namespace — but that reframe isn't yet a
+  settled feature).
 
 ### elvish / nushell (rich-value shells)
 
