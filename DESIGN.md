@@ -577,10 +577,12 @@ Decisions:
   pick an empty *list* from; the empty string is the universal shell "nothing"
   and is what an interpolation like `prompt = "$(if $root { "[root]" })…"` wants.
   Both branches (when both exist) are expected to yield the same *shape*; mesh
-  does not coerce one to match the other. *(open — a genuine fork for you: keep
-  this lenient "no-else → `""`" rule, or **require** `else` in expression
-  position Rust-style and make a lone `if` a statement only. Leaning lenient for
-  interactive brevity.)*
+  does not coerce one to match the other. **Decided: lenient** — a lone `if` is
+  a valid expression and the no-`else` case is `""`. (The stricter Rust-style
+  alternative — *require* `else` in expression position, lone `if` as statement
+  only — was considered and dropped: it buys parse-time "you forgot the else"
+  safety but costs the terse `tag = if $root { "[root]" }` one-liner, and
+  interactive brevity wins here.)
 - **`match` later, not now.** A `match`/`case` expression is the obvious
   companion but is deferred — `if`/`else if` covers the rc-file need first.
 
@@ -597,8 +599,8 @@ re-litigated here.
 - **Predicate qualifier syntax** — confirm `size>` / `age<` / `mtime<` forms.
 - **Arrays / maps / functions / `if`** — core surface now sketched above.
   Remaining sub-questions: in-place append (`+=` / `push`) vs spread-only;
-  `:has` vs a `?` membership postfix; a `local` binding narrower than function
-  scope; and whether expression-position `if` should require `else`.
+  `:has` vs a `?` membership postfix; and a `local` binding narrower than
+  function scope. (Expression-`if` with no `else` is now decided: yields `""`.)
 - **Structured return** *(TODO, leaning decided)* — a plain `func` outputs
   stdout bytes; a **function-declaration modifier** (keyword TBD — not `raw`,
   which is taken) marks a function that returns a rich list/map to an in-shell
