@@ -28,11 +28,13 @@ interactive shells worse than they need to be:
 
 ### Goals
 
-Every syntax decision is weighed against three tests, in this order:
-**familiar, consistent, concise** — reuse what people already know, make it
-compose the same way everywhere, then trim. (The *e* in mesh is for
-*ergonomic*.) When these pull apart, familiarity and consistency win over pure
-brevity.
+The overriding goal is **ergonomics** — interactive use comes first (the *e* in
+mesh is for *ergonomic*). In service of that, syntax aims to be **familiar,
+consistent, and concise** at once: reuse what people already know, make it
+compose the same way everywhere, and keep it short. These are *facets* of good
+ergonomics, not a ranked checklist — when they pull apart, the tie-breaker is
+whichever is better **to use interactively**, decided case by case, not a fixed
+precedence among the three.
 
 - Excellent interactive ergonomics: completion, history, line editing, prompt.
 - **Byte-stream pipes** — external commands and coreutils work exactly as they
