@@ -253,17 +253,30 @@ and likely `:upper` / `:lower`. To be fleshed out.
 
 ### Variables and assignment
 
-Assignment is `name = value`, **with surrounding spaces** — the same
-"operators need space" rule that governs glob exclusion (see
-[Globbing](#globbing)). That single rule pays off again here: the spaces are
-what separate an *assignment* from a *command with a `k=v` argument*, so mesh
-needs no `set` / `let` / `var` keyword for the common case.
+Assignment is `name=value`, the **bash spelling** — the most ingrained shell
+reflex, kept. A bare `name=value` (a statement that is *just* that) binds a
+variable, unspaced, exactly like bash. The identical `word=value` token as an
+**argument** — anywhere after a command word — stays an ordinary literal
+(`git commit --author=me`, `env FOO=1 cmd`), so **position** separates
+assignment from data, precisely as shell users already expect. No
+`set` / `let` / `var` keyword needed.
+
+A **spaced** `name = value` is also accepted, and is the form to reach for when
+the value has internal spaces — a list, a glob, an `if` — where the unspaced
+form would be awkward to read. Two things mesh does *not* fold in, to stay
+unambiguous: bash's prefix-env form (`FOO=1 cmd` in one breath) is written
+`env FOO=1 cmd` here, and a bare leading `name=value` is always a *shell*
+binding, never a one-command temporary.
 
 ```
-x = hello                 # assignment: bind x
-env FOO=1 cmd             # NOT assignment: `env` runs with a literal `FOO=1` arg
-files = *.txt             # binds the glob result (a list) to `files`
-n = 42
+foo=bar                   # assignment — bash-style, unspaced
+n=42
+env FOO=1 cmd             # NOT assignment: FOO=1 is a literal arg to `env`
+git commit --author=me    # NOT assignment: a k=v arg after the command word
+
+xs = [a b c]              # spaced form for a compound value (list)
+files = *.txt             # a glob result (list)
+greeting = if $french { bonjour } else { hi }
 ```
 
 **`$` reads, bare binds or runs.** A leading `$` means *read this variable*
@@ -407,6 +420,7 @@ answer:
 | map | non-map | **error** | no key to merge a bare value under |
 | string | string | **concatenate** | |
 | int | int | **add** | |
+| bool | bool | **error** | `+=` has no meaning on bools — use `or` / `and` |
 | scalar | mismatched scalar type | **error** | no coercion (`n += "x"` fails) |
 
 ```
@@ -614,6 +628,10 @@ Rules:
   rather than hand-rolled `case $1` juggling. An argument that begins with `--`
   but names **no declared flag** is an **error**, not a silently-forwarded
   positional — a typo'd flag should fail loudly, not vanish into `...rest`.
+  When a flag is given **more than once** (directly or via a spread), the
+  **last occurrence wins** for a valued flag (`--tag=v1 --tag=v2` binds `v2`, the
+  universal CLI convention that makes a forwarded default overridable), and a
+  repeated switch is simply still true (idempotent) — neither repeat is an error.
 - **`--` ends flag parsing** (the universal Unix terminator, kept). Everything
   after a bare `--` is positional/rest, even if it begins with `--`. This is
   how a value that literally looks like a flag reaches a rest parameter:
@@ -642,7 +660,11 @@ Rules:
   No explicit `return` is needed to produce it. `return` on its own exits the
   function **early**, carrying the result so far; `return val` exits early
   **with a value**. That is the whole return mechanism — implicit last
-  expression, `return`/`return val` for early exit.
+  expression, `return`/`return val` for early exit. A function with **no
+  expression to yield** — an empty body, or a bare `return` before anything
+  ran — results in the **empty string with status `0`**, the same "nothing
+  produced, nothing failed" answer a no-`else` `if` gives; there is no null to
+  invent.
 - **Exit status is a view of the result** — not a separate channel — and it is
   defined for *every* result type, so a function used in command position
   (`if f { … }`) always has one:
