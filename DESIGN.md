@@ -807,23 +807,13 @@ Rules:
   stdout *is* its output stream, exactly like an external command, so functions
   compose in byte-stream pipes with everything else.
 
-  **TODO — value vs stream reconciliation.** `return val` and last-expression
-  results settle how a function *produces* a value; what is still open is how a
-  caller *asks* for one, and that is bound up with a grammar gap. Invocation so
-  far is **command-style** (`greet world`), and on an assignment RHS a bare word
-  is a *literal string* (`x = greet` binds the string `"greet"`, per the
-  bash-style assignment rule) — so calling a function *for its value* needs a
-  form distinct from both. The likely answer is a **parenthesized value-call**,
-  `x = f($arg)` / `config = load-env($path)` — parens (already the signature's
-  delimiter) marking "call and take the result," versus command-style
-  `f world` in statement position taking the stream. That leaves the core
-  question: in `x = f($arg)`, is the result the **returned value** or the
-  **captured stdout**? Candidates: decide by **call context** (a value-call
-  takes the return value; command/pipe position takes the stream — no
-  declaration needed), or mark value-returning functions with a **declaration
-  modifier** (keyword TBD — not `raw`, which already means *unsplit bytes*).
-  Leaning call-context — but the value-call grammar above is part of what has to
-  be pinned down with it, so it is *illustrative here, not yet decided*.
+  **Value vs stream — resolved** (see [Calling for a value, and
+  lambdas](#calling-for-a-value-and-lambdas)). `return val` / last-expression
+  settle how a function *produces* a value; the caller chooses which channel it
+  reads **by syntax**: `f(arg)` (parens attached) takes the **return value**,
+  `$(f arg)` takes the **stdout bytes**, bare `f arg` runs it. No declaration
+  modifier and no context magic — the parens are forced anyway, since a bare RHS
+  word is a literal string.
 
 **Prior art surveyed** (all shell-adjacent, all validate the same four
 signature roles): Elvish `{|a b &opt=default @rest|}`, Nushell
@@ -841,25 +831,28 @@ process* and its `cd` (or `export`) **persists after return** — exactly like
 bash, and exactly what navigation helpers want:
 
 ```
-proj(name) { cd ~/work/$name }     # moving your shell is the point
+func proj(name) { cd ~/work/$name }     # moving your shell is the point
 ```
 
 The decisive reason to keep persist as the default (over auto-restoring cwd the
-way local-by-default does for variables): **it makes extraction refactor-safe.**
-You can lift any run of lines out of a function body into a helper `func` and
-call it, and behavior is unchanged — an auto-restoring boundary would silently
-alter cwd/state at the new call edge. Isolation is therefore **explicit**, in
-three grades:
+way local-by-default does for variables): **it keeps the *process-state*
+boundary refactor-safe.** Lift a run of lines out of a function body into a
+helper `func` and the `cd`/`export`/umask effects behave identically at the new
+call edge — an auto-restoring boundary would silently restore cwd there instead.
+(This is only about process state; extracting lines that read a caller-*local*
+variable would still break under lexical scope — that is exactly what the
+dynamic-scope TODO below is about — and moving a `return`/`break` retargets it,
+as in any language.) Isolation is therefore **explicit**, in three grades:
 
 ```
-( cd build; make )                 # subshell: forks; cwd/env/umask/vars all
-                                   #   isolated, and a nonzero exit can't kill
-                                   #   the outer shell
-build() ( cd build; make )         # a func whose *body* is a subshell — the
-                                   #   `( )` body (vs `{ }`) is the isolation flag
-                                   #   (bash/POSIX already spell it this way)
-in dist { rm -rf * }               # scoped cwd: run the block there, restore
-                                   #   after — NO fork (cheaper than a subshell)
+( cd build; make )                      # subshell: forks; cwd/env/umask/vars
+                                        #   isolated, nonzero exit can't kill
+                                        #   the outer shell
+func build() ( cd build; make )         # a func whose *body* is a subshell — the
+                                        #   `( )` body (vs `{ }`) is the isolation
+                                        #   flag (bash/POSIX spell it this way)
+in dist { rm -rf * }                    # scoped cwd: run the block there, restore
+                                        #   after — NO fork (cheaper than subshell)
 ```
 
 A **subshell forks**, so — like `export` — only **bytes** cross back out (its
@@ -867,11 +860,68 @@ stdout); rich list/map values do not survive the process boundary. `in DIR { }`
 does not fork: it is the lightweight "do this over there without stranding me,"
 covering the common `pushd`/`popd` pattern with a block.
 
-*(open, deferred cluster: lambdas, and whether a `func` defined inside a `func`
-is visible only there. Also a **TODO — dynamic scope**: the same
-"extract a chunk into a subfunction" goal that motivates persist would be served
-further by letting an extracted helper see the caller's locals; worth weighing
-dynamic (or opt-in dynamic) scope against the lexical default decided above.)*
+*(open, deferred cluster: whether a `func` defined inside a `func` is visible
+only there. Also a **TODO — dynamic scope**: the same "extract a chunk into a
+subfunction" goal that motivates persist would be served further for *variables*
+by letting an extracted helper see the caller's locals; worth weighing dynamic —
+or opt-in dynamic — scope against the lexical default decided above.)*
+
+### Calling for a value, and lambdas
+
+A `func` has two outputs — the **bytes** it writes to stdout (composes in pipes,
+like any command) and the **value** it returns (last expression / `return val`,
+a rich list/map/scalar). Which one you get is chosen by **how you write the
+call**, not by context — and it *has* to be syntactic, because a bare word on an
+assignment RHS is already a [literal string](#variables-and-assignment)
+(`x = greet` binds `"greet"`), so reaching a function's value needs an explicit
+marker. That marker is **parens attached to the name** (the C/JS/Python call
+shape):
+
+| Form | Purpose | Yields |
+| --- | --- | --- |
+| `f arg` (bare, command-style) | **run it** — for effect or in a pipe | stdout streams; exit status = result-as-status |
+| `$(f arg)` | **capture its stdout** (bytes) | a list (or `:raw`, one string) — works on externals too |
+| `f(arg)` (parens, attached) | **use its return value** (rich) | the mesh value |
+
+```
+config = load-env($path)          # value call: the returned map
+n      = add($a $b)               # args are SPACE-separated, exactly like a
+                                  #   command call — parens only mean "value call"
+deploy(prod --force ...$hosts)    # flags and ... spread work the same way
+config = load-config()            # zero args still needs () — bare name is a string
+```
+
+Rules:
+
+- **Args inside `f(…)` use the same space-separated grammar as a command call** —
+  positionals, `--flags`, `...spread`. The parens add nothing but "take the
+  return value"; there is no second argument syntax to learn.
+- **The channels are independent.** During `x = f(…)`, whatever `f` writes to
+  stdout still goes wherever stdout goes — the value call reads the *return*
+  value, it does not capture or suppress output. A well-behaved value function
+  simply does not print; one that legitimately does both streams *and* returns.
+- **Externals have no return value**, so `grep(foo)` is a **runtime error** that
+  points you at `$(grep foo)`. Rich values stay in-shell — the same bytes-only
+  boundary as `export` and subshells. (`f` resolves at call time, so this is a
+  runtime, not parse, distinction.)
+
+**Lambdas** are then just anonymous functions — the `func` declaration minus the
+name, reusing its whole signature grammar (defaults, `--flags`, `...rest`) — and
+they are value-called the same way:
+
+```
+double = func(x) { $x * 2 }       # a function value bound to a variable
+y = $double(5)                    # value-call it through the variable
+
+evens = $xs:filter func(x) { $x % 2 == 0 }
+stems = $files:map func(f) { $f:stem }     # :map / :filter / :each take a lambda
+```
+
+`func(params) { … }` (over an Elvish-style `{|params| …}`) keeps **one parameter
+syntax** for named and anonymous functions, and the transform modifiers
+(`:map` / `:filter` / `:each` / `:sort …`) are where lambdas earn their keep,
+complementing the auto-mapping value modifiers for the cases a bare modifier
+can't express.
 
 ### Conditionals: `if` is an expression
 
@@ -1001,18 +1051,25 @@ to a bool):
   match this glob," and `$f ~ /re/` the regex form — the one-line boolean twin
   of a `match` arm (`!~` negates). This is bash's `[[ $f == *.glob ]]` and
   `[[ $s =~ re ]]`, unified.
-- **File tests** are the scalar cousins of the `:files`/`:f` filter modifiers,
-  answering bash's `-f -d -e -x`: `$p:type` yields the `find -type` word
+- **File tests** are the scalar cousins of the `:files`/`:f` filter modifiers.
+  The type/permission axis is words: `$p:type` yields the `find -type` word
   (`file`/`dir`/`link`/…) so `$p:type == dir` is `-d`; `$p:exists` is `-e`;
-  `$p:exec` is `-x`. (`-z`/`-n` are just `$s == ""` / `$s:len > 0`.)
+  `$p:exec` / `$p:read` / `$p:write` are `-x` / `-r` / `-w`. (`-z`/`-n` are just
+  `$s == ""` / `$s:len > 0`.) The **binary** file relations `-nt` / `-ot` / `-ef`
+  (newer / older / same-inode) are the same comparison family as the
+  [predicate qualifiers](#globbing) (`age<`) and are *(open)* alongside them —
+  likely `$a:mtime > $b:mtime` and a `$a:same $b` rather than cryptic digraphs.
 - **Combine** bools with the words `and` / `or` / `not` (`if $a:exists and not
   $b:exists { … }`). These join *values*; the byte-stream **command** chains
   `&&` / `||` (run-next-on-success/failure, by exit status) are kept separately
   and unchanged — two different jobs that bash blurs.
 
-So `case` → `match`, and every `[[ … ]]` job maps to a comparison, a `~`
+So `case` → `match`, and the everyday `[[ … ]]` jobs map to a comparison, a `~`
 pattern-match, a file-test modifier, or an `and`/`or`/`not` of those — no
-special `[[` context, and none of its word-splitting quirks.
+special `[[` context, and none of its word-splitting quirks. The stragglers are
+tracked, not hand-waved: the binary file relations (`-nt`/`-ot`/`-ef`) sit with
+the predicate-qualifier open question, and regex **captures** (bash's
+`BASH_REMATCH`) with the `match`-arm capture question above.
 
 ### Loops (`for`, `while`, `loop`)
 
@@ -1144,19 +1201,17 @@ file-test modifiers it leans on (`$f:type` / `:exists` / `:exec`) are settled in
   `&&`/`||`); the **postfix guard** `stmt if/unless cond` is the one-line form;
   **isolation** is explicit — plain `func` persists cwd/state, `( )` /
   `func f() ( )` subshell-isolate, `in DIR { }` scopes cwd without forking.
-- **Value vs stream reconciliation** *(narrowed)* — how a function *produces* a
-  value is settled (last expression, or `return val`); still open are the
-  **value-call grammar** (likely a parenthesized `x = f($arg)`, since a bare
-  word on an assignment RHS is a literal string) and whether such a call yields
-  the returned value or captured stdout — leaning **call-context**. Tracked in
-  [Functions](#functions).
-- **Function-body helpers (remainder of the isolation cluster)** — **lambdas**
-  (anonymous functions for `map`/`each`/callbacks, and their syntax, tied to the
-  value-call grammar above) and whether a **`func` defined inside a `func`** is
-  visible only there. *(TODO — dynamic scope:* the same "extract a chunk into a
-  subfunction" goal that fixed cwd as *persist* would be served further by
-  letting an extracted helper see the caller's locals; weigh dynamic — or opt-in
-  dynamic — scope against the lexical default.*)*
+- **Value calls & lambdas — decided** ([section](#calling-for-a-value-and-lambdas)):
+  `f(arg)` (parens attached, space-separated args) takes a function's **return
+  value**, `$(f arg)` its **stdout**, bare `f arg` runs it; stdout streams during
+  a value call (independent channels); externals have no return value (runtime
+  error → `$(…)`). Lambdas are `func(params) { … }` (anonymous, one param
+  grammar), passed to `:map` / `:filter` / `:each`.
+- **Remaining function questions** — whether a **`func` defined inside a `func`**
+  is visible only there; and a **TODO — dynamic scope**: the "extract a chunk
+  into a subfunction" goal that fixed cwd as *persist* would be served further by
+  letting an extracted helper see the caller's locals — weigh dynamic (or opt-in
+  dynamic) scope against the lexical default.
 - **Hook API** — how override hooks compose over a base (possibly external)
   prompt renderer.
 
