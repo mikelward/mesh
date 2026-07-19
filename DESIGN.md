@@ -1623,8 +1623,8 @@ repos. The match/menu UI itself is the [line editor](#line-editing)'s.)*
 
 ### Interactive history
 
-This is the history **store and recall** — distinct from the history *expansion*
-syntax (`!!` / `^old^new`), which stays an [open question](#open-questions).
+This is the history **store and recall**; the history *expansion* syntax
+(`!!` / `^old^new`) is specified in [History expansion](#history-expansion) below.
 
 **The store is SQLite** at `$XDG_STATE_HOME/mesh/history.db` (`$XDG_STATE_HOME`
 defaulting to `~/.local/state` — history is per-machine *state*, not cache or
@@ -1637,7 +1637,7 @@ UI yet.
 
 | Column | Filled at | From |
 | --- | --- | --- |
-| `command` | `preexec` | the submitted command line |
+| `command` | `preexec` | the command line **after history expansion** — what actually ran, so `!!` never stores literally `!!` |
 | `cwd` | `preexec` | `$env.PWD` at submit |
 | `tty` | `preexec` | the session's terminal |
 | `session` | `preexec` | the interactive session id |
@@ -1654,11 +1654,12 @@ search** — with a prefix already typed, `Up` walks the most recent commands th
 **The MVP surface is a `history` built-in** that lists entries (newest last), and
 **`history | grep foo`** is the MVP search — the whole point of a real store is
 that richer queries (by cwd, by exit status, by time) can come later without
-changing how entries are written. So `list | grep` is enough to ship. The
-**currently-executing command is excluded** from what `history` lists: its row is
-*recorded* at `preexec` (to capture `start` / `cwd` / `tty`) but not *visible* to
-`history` until it completes, so `history | grep foo` never matches its own
-pipeline — a command never sees itself.
+changing how entries are written. So `list | grep` is enough to ship. Only the **current session's own in-flight command** is excluded from what
+`history` lists: its row is *recorded* at `preexec` (to capture `start` / `cwd` /
+`tty`) but hidden until it completes, so `history | grep foo` never matches its own
+pipeline. A row left incomplete by a crash, kill, or power loss — its session no
+longer live — is **finalized at startup** (shown with a null `status` / `duration`)
+rather than hidden forever, so no real command is lost.
 
 *(deferred: an atuin-style fuzzy / interactive search over the columns; a
 `$sh.history` value accessor for scripting; cross-session and cross-host sync;
@@ -1675,7 +1676,10 @@ expands `!`), so it can never surprise non-interactive code. It reads from the s
 - **`!!`** — the previous command line.
 - **`!string`** — the most recent command that *starts with* `string`
   (`!git` → your last `git …`).
-- **`!$`** — the last argument of the previous command (`mkdir foo; cd !$`).
+- **`!$`** — the last argument of the previous command *line*. Because expansion
+  reads the stored history (not the current input), it refers to a *separately
+  submitted* line: run `mkdir foo`, then on the next line `cd !$` → `foo` (not the
+  same-line `mkdir foo; cd !$`, where `mkdir foo` isn't in history yet).
   (`!*` for all args, and `!n` / `!-n` by index, are natural extensions — deferred.)
 - **Substitution** — two spellings: the terse **`^old^new`** for the everyday
   "fix my last command" (line-start; previous command), and a general
