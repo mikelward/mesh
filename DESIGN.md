@@ -1532,14 +1532,17 @@ programs or user functions:
     [`precd` / `postcd`](#hooks-and-the-prompt) hooks. Logical by default;
     **`--physical` / `-P`** resolves symlinks first. The block form `in DIR { }` is
     the scoped `pushd` / `popd`.
-  - **`pwd`** — print the working directory (`$env.PWD`), logical by default;
-    **`--physical` / `-P`** prints the symlink-resolved path.
+  - **`pwd`** — print the working directory. The shell **maintains the logical cwd
+    itself** (updated by `cd` / autocd), so `pwd` reports *that* shell-owned value —
+    validated against the real directory and recomputed if a stale or forged
+    `$env.PWD` has diverged, so `pwd` can't lie. **`--physical` / `-P`** calls
+    `getcwd` for the symlink-resolved path.
   - **Autocd** — a bare word in command position that is a **directory path ending
     in `/`** (`src/`, `../`, `/tmp/`) is a `cd` into it, no `cd` keyword needed. The
     **trailing slash is the signal** — and it's what makes this safe where zsh's
     slashless autocd isn't: a slashless `src` stays an ordinary command lookup (so a
     command that shares a directory's name is never shadowed), and only the explicit
-    `src/` means "go there." Because it *is* a `cd`, a relative target honours
+    `src/` means "go there." Because it *is* a `cd`, a relative target honors
     [`CDPATH`](#variables-and-assignment) — `proj/` resolves through `CDPATH`
     exactly as `cd proj` would. It fires for a **lone** word only (`src/ x` runs
     `src/` as a command); a trailing-slash word whose target isn't a directory is a
@@ -1554,10 +1557,12 @@ programs or user functions:
   - **`print [args…]`** — the same, but with **no trailing newline** — for partial
     lines and hand-built prompts. The `puts` / `print` pair replaces `echo -n`,
     keeping both flag-free.
-  - **`gets [var]`** — read one line from stdin into `var`, trailing newline
-    stripped; it returns that line as its value and a **non-zero
-    [status](#variables-and-assignment) at EOF** (so `while gets line { … }`
-    terminates cleanly). With no `var` it just yields the line.
+  - **`gets [var]`** — read one line from stdin into `var` (trailing newline
+    stripped) and return that line as its value. **At EOF it returns `false`**
+    (whose [status](#variables-and-assignment) is `1`) and leaves `var` unchanged,
+    so `while gets line { … }` terminates. An empty line still reads as a truthy
+    `""` — only EOF is `false` — so blank lines don't end the loop. With no `var`
+    it just yields the line (or `false`).
 - **Formatting** — `style` (produce a [styled value](#hooks-and-the-prompt) for
   the prompt); it must be a built-in because a structured return value can't come
   from an external command.
