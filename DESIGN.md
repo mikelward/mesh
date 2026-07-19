@@ -703,9 +703,10 @@ external command rather than a mesh value — is the same bytes-vs-values
 question as the structured-return TODO, and is tracked there rather than
 re-litigated here.
 
-### Loops (`for`, `while`)
+### Loops (`for`, `while`, `loop`)
 
-Same brace-delimited shape as `func` and `if` — **no `do` / `done`**:
+Same brace-delimited shape as `func` and `if` — **no `do` / `done`**. The header
+carries no parentheses, Go-style:
 
 ```
 for f in * {
@@ -787,14 +788,26 @@ stems = $files:stem       # not: stems = []; for f in $files { stems += [$f:stem
 ```
 
 **`while`** is the same shape, with an `if`-style condition (a bool or a
-command's exit status):
+command's exit status); **`loop`** is the infinite form, exited with `break`
+(clearer than `while true`, borrowed from Rust):
 
 ```
 while $queue:len > 0 {
   handle ($queue:first)
   queue = $queue:rest
 }
+
+loop {
+  if deploy-succeeded { break }   # run until a condition breaks out
+  sleep 5
+}
 ```
+
+mesh deliberately keeps a **separate `while`** rather than folding it into `for`
+the way Go does: `while` is muscle memory every shell user already has, and
+familiarity outranks shaving a keyword. `loop` fills Go's bare-`for {}` niche
+without overloading `for`. So three keywords, each doing one obvious thing —
+`for` iterates, `while` tests, `loop` repeats.
 
 Two notes flagged as *(open)*:
 
@@ -817,8 +830,9 @@ Two notes flagged as *(open)*:
   binding narrower than function scope; the **file-test modifier set**
   (`$f:type` and friends); and a **postfix guard** (`continue if …`). (Decided:
   expression-`if` with no `else` yields `""`; in-place append/merge is `+=`,
-  defined over both operand types; `for`/`while` are brace-delimited, no
-  `do`/`done`.)
+  defined over both operand types; loops are brace-delimited with no
+  `do`/`done` — `for` iterates, `while` tests, `loop` repeats, keeping a
+  separate `while` rather than Go-unifying into `for`.)
 - **Value vs stream reconciliation** *(narrowed)* — the return *syntax* is
   settled (last expression, or `return val`); the open part is whether `x = f()`
   captures a function's returned value or its stdout, resolved by **call
