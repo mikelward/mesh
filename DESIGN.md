@@ -365,14 +365,14 @@ hyphen between — the third payoff of that one spacing rule.
   that maps use, because the **environment is a first-class map named `env`**:
 
   ```
-  editor = env:get EDITOR vim   # total: value, or "vim" if unset — never errors
-  $env[EDITOR]                  # strict: errors if unset (like any $m[key])
-  if env:has SSH_AUTH_SOCK { … }
+  editor = $env:get EDITOR vim  # total: value, or "vim" if unset — never errors
+  $env.EDITOR                   # strict: errors if unset (like any $m.key)
+  if $env:has SSH_AUTH_SOCK { … }
   ```
 
-  So `$EDITOR` (a strict read) errors when unset, and `env:get EDITOR vim` is the
-  safe defaulting form — no new syntax, just the map surface applied to the
-  environment.
+  So `$env.EDITOR` (a strict read) errors when unset, and `$env:get EDITOR vim`
+  is the safe defaulting form — no new syntax, just the map surface applied to
+  the environment.
 - **No block scope; `unset` removes a scope's binding.** Control-flow blocks
   (`if` / `for` / `while` / `loop`) do **not** open a new scope, so
   `if c { x = 1 }` then `$x` works and a loop binder is an ordinary binding in
@@ -462,7 +462,11 @@ top-level is **yours**; the built-ins hang off two reserved roots:
   "guarded, deduped PATH" requirement. Because the OS environment is bytes, a
   path-type entry is `:`-joined on the way out and split on the way in (see the
   [export exception](#variables-and-assignment) below); other `:`-delimited path
-  vars (`MANPATH`, `CDPATH`, …) are lists too.
+  vars (`MANPATH`, `CDPATH`, …) are lists too. Path-var splitting is
+  **exact** — it keeps *every* empty component (leading, interior, trailing),
+  *not* the trailing-empty-trimming [capture split](#modifiers), because an empty
+  component is meaningful (`PATH=/usr/bin:` means "…and the cwd") and a
+  split→join round-trip must be byte-faithful.
 - **`$sh`** — everything else the shell owns, **flat**: runtime values —
   **`$sh.status`** (last exit, int `0`–`255`, the readable replacement for `$?`),
   **`$sh.pipestatus`** (a **list** of the last pipeline's stage statuses, where
@@ -475,6 +479,14 @@ So there are exactly **two reserved names** (`env`, `sh`); every other lowercase
 name is entirely yours — a var called `status`, `prompt`, or `path` never
 clashes. Access is strict [map access](#maps-associative-arrays), so `$sh:keys`
 lists the whole surface and a mistyped key fails loud.
+
+**Read-only vs. writable within `$sh`.** The **runtime** entries (`$sh.status`,
+`$sh.pipestatus`, `$sh.pid`, `$sh.version`, `$sh.interactive`) are the shell's
+authoritative state — **read-only**: assigning or `unset`ting one is an error, so
+config can't corrupt an invariant. The **configuration** entries are yours to
+write: the hook maps (`$sh.prompt`, `$sh.precmd`, …) and the `$sh.options`
+settings map. (This is the one place the general map rules are constrained —
+individual keys carry a mutability flag.)
 
 ### Arrays (lists)
 
@@ -1315,7 +1327,7 @@ a handler's own commands don't re-fire them. Without this, `$sh.preexec.timer`'s
 `func`), `postcd` *after* (in the new dir) — with the same guard that a `cd`
 performed *by a hook handler* doesn't re-dispatch. A `func` that `cd`s internally
 therefore fires them per change; if a handler only cares about net movement it
-gates on `$PWD` itself (the one-line `precd`/`postcd` PWD-check that today's
+gates on `$env.PWD` itself (the one-line `precd`/`postcd` PWD-check that today's
 config hand-rolls). Per-`cd` is the right default because `precd`'s "old dir"
 contract can't hold if the hooks are deferred to function return. The pending
 `cd` target is **resolved to an absolute path *before* `precd` runs**, so a
