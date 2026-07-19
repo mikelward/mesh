@@ -136,7 +136,7 @@ A **postfix modifier** transforms a value. The operator is `:`, followed by a
 readable keyword. This is the zsh history-modifier idea (`:h :t :r :e`) but with
 *words instead of cryptic letters*.
 
-There are three kinds of modifier, and the difference matters:
+There are four kinds of modifier, and the difference matters:
 
 - **Split modifiers** (`:lines :words :nulls :tabs :split`) turn a command
   substitution's **raw byte capture** into a list. They *replace* the default
@@ -157,8 +157,14 @@ There are three kinds of modifier, and the difference matters:
   element and errors on a nested list or map (there is no implicit deep
   flattening — spell it out). The full list/map surface is in
   [Arrays](#arrays-lists) and [Maps](#maps-associative-arrays).
+- **Filter modifiers** (`:files`/`:f`, `:dirs`/`:d`, `:links`/`:l`,
+  `:exec`/`:x`) keep the list elements matching a **file-type predicate** and
+  drop the rest — a subset, not a transform. They **chain for AND** (`:f:x` =
+  executable files) and are the `:` spelling of the glob type qualifiers
+  (`*:f` ≡ `*(f)`, see [Globbing](#globbing)); on a glob the engine fuses the
+  filter into matching, but they work on any path list too (`$paths:files`).
 
-All three kinds:
+All four kinds:
 
 - **chain**: `$f:stem:stem`, `$(cmd):nulls` then value modifiers over each item,
   `$xs:rest:last` (collection modifiers compose too).
@@ -225,23 +231,35 @@ and likely `:upper` / `:lower`. To be fleshed out.
 
 - `**` — recursive, **on by default** (no `globstar`-style opt-in).
 - `*/`, `**/` — directories (trailing slash, existing muscle memory).
-- **Type qualifiers** in `(...)`, borrowed from `find -type` rather than zsh
-  punctuation, so "plain file" is the logical `(f)` and not an arbitrary `(.)`:
+- **Type qualifiers** — **two equivalent spellings**. The `:`-modifier form
+  `*:files` / `*:f` (a readable word *or* the terse letter, exactly like every
+  other `:` modifier) is the idiom for the common single-type filter; the
+  `(...)` form `*(f)` (from `find -type`, not zsh punctuation) is retained and
+  is the general form for ANDed sets and arg-carrying predicates. They coincide
+  for a single type:
 
   ```
-  *(f)              plain files            (find -type f)
-  *(fx) == *(f x)   executable files       (single letters may concatenate)
-  *(d)              directories
-  *(l)              symlinks
+  *:f       ==  *(f)         # plain files             (find -type f)
+  *:files   ==  *(f)         #   ...spelled out
+  *:d       ==  *(d)         # directories
+  *:l       ==  *(l)         # symlinks
+  *:f:x     ==  *(f x)       # chain for AND: executable files
+  **:files  ==  **(f)        # recursive, files only
   ```
 
-  Qualifiers are a **space-separated list, ANDed** together; bare single-letter
-  type codes may be run together as sugar. Type letters follow `find -type`
-  (`f d l p s b c`) plus `x` (executable), with more predicates to come.
+  Type letters follow `find -type` (`f d l p s b c`) plus `x` (executable),
+  each with a word alias (`files dirs links … exec`); in `(...)` they are a
+  space-separated ANDed list (bare letters may run together, `*(fx)`). The `:`
+  forms are **filter modifiers** (see [Modifiers](#modifiers)) — they select a
+  path list by a file-type predicate, so they also work on a plain list
+  (`$paths:files`), and on a glob the engine **fuses** the filter into matching,
+  so `**:files` never materializes non-files.
 
-- **Predicate qualifiers** *(open — direction)*: space-separated, comparison
-  based, e.g. `*(f size>1M)`, `*(f age<1d)`, `*(f empty)`. Comparisons
-  (`>` / `<`) read better than zsh's `+/-` age codes.
+- **Predicate qualifiers** *(open — direction)*: the arg-carrying predicates
+  (`size>1M`, `age<1d`, `empty`) stay in `(...)` since they do not fit a bare
+  `:word` — `*(f size>1M)`, `*(f age<1d)`. Comparisons (`>` / `<`) read better
+  than zsh's `+/-` age codes; whether these also grow `:word arg` modifier
+  spellings is folded into this open question.
 
 - **Exclusion** — a spaced infix `-`:
 
@@ -311,10 +329,47 @@ hazard — forgetting the `$` and running a command by accident — is softened
 because an unknown bareword is a **command-not-found error**, not a silent
 misread.
 
-- **Scope.** Bindings are **function-local by default.** A name assigned
-  inside a `func` body does not leak out. Top-level (rc-file) bindings are
-  session-global. *(open: an explicit `local` / block-scoped form, if we ever
-  want a name narrower than the enclosing function.)*
+- **Scope — two levels, lexical.** There are exactly two variable scopes: the
+  **session-global** scope (top-level rc and interactive bindings) and a fresh
+  **function-local** scope per `func` call. The environment (exported names) is
+  a separate axis. Scoping is **lexical**: a function sees its own locals, its
+  parameters, and the globals — never its *caller's* locals (no dynamic scope,
+  the classic shell footgun). Inside a function, `x = 5` binds a **local by
+  default**, shadowing any global rather than clobbering it — the deliberate
+  inverse of bash's assign-to-global default. To write a session-global from
+  within a function, say so explicitly:
+
+  ```
+  count = 0                 # global (top level)
+  func tick() {
+    n = 1                   # a NEW function-local, gone on return
+    global count = $count + 1   # explicitly updates the session-global
+  }
+  ```
+
+  Reading resolves **outward** (local → global); an **unbound** name is an
+  **error**, not empty — the always-on `set -u` that the *no null* rule below
+  already implies. (A defaulting read for a maybe-unset name — common for env
+  like `$EDITOR` — uses the same total form as `:get`; spelling tracked with the
+  absent-value question.)
+- **No block scope; `unset` removes.** Control-flow blocks
+  (`if` / `for` / `while` / `loop`) do **not** open a new scope, so
+  `if c { x = 1 }` then `$x` works and a loop binder is an ordinary binding in
+  the enclosing scope (readable after the loop, holding the last value) — the
+  model stays two levels, no more. **`unset name`** removes a binding (an
+  exported name leaves the environment too); the name is then unbound and reading
+  it errors until it is bound again. Note `unset x` differs from `x = ""`: the
+  latter is *bound to the empty string*, the former is *unbound* — the two
+  states that stand in for a missing null.
+- **Command/function names resolve at call time** — a separate namespace from
+  variables. A bare word in command position (`g` inside `func f { g }`) is a
+  *command or function* looked up **when `f` runs**, not when `f` is defined. So
+  definition order is irrelevant: define helpers in any order, forward-reference
+  freely, mutual recursion just works, and an rc file reads top-to-bottom with no
+  forward declarations. If `g` is still undefined when `f` actually runs, that is
+  the ordinary command-not-found **error** at that point. Only *variable* scope
+  is lexical; the value namespace and the command namespace are distinct, as in
+  every shell.
 - **Export.** `export NAME = value` puts a name in the process environment for
   children. **Only byte-strings can be exported** — the environment is a flat
   `KEY=bytes` table, so a list or map cannot cross an `exec` boundary. Exporting
@@ -935,15 +990,18 @@ Two notes flagged as *(open)*:
 - **`~` as a terse alias for exclusion `-`?** Or keep `-` only.
 - **String modifier set** — beyond `:strip` / `:replace`.
 - **Predicate qualifier syntax** — confirm `size>` / `age<` / `mtime<` forms.
-- **Arrays / maps / functions / `if` / loops** — core surface now sketched
-  above. Remaining sub-questions: an infix **`in`** operator as a second
-  membership spelling alongside `:has`; a `local` binding narrower than function
-  scope; the **file-test modifier set** (`$f:type` and friends); and a **postfix
-  guard** (`continue if …`). (Decided: expression-`if` with no `else` yields
-  `""`; in-place append/merge is `+=`, defined over both operand types;
+- **Arrays / maps / functions / `if` / loops / scope** — core surface now
+  sketched above. Remaining sub-questions: an infix **`in`** operator as a
+  second membership spelling alongside `:has`; a single-value **`$f:type`**
+  path modifier (the file-*type filter* modifiers `:files`/`:f` etc. are now
+  decided, but a scalar "what type is this one path" word is separate); and a
+  **postfix guard** (`continue if …`). (Decided: expression-`if` with no `else`
+  yields `""`; in-place append/merge is `+=`, defined over both operand types;
   membership is `:has` (`?` postfix rejected); loops are brace-delimited with no
-  `do`/`done` — `for` iterates, `while` tests, `loop` repeats, keeping a
-  separate `while` rather than Go-unifying into `for`.)
+  `do`/`done` — `for` iterates, `while` tests, `loop` repeats; **scope** is two
+  levels, lexical, local-by-default with `global` to escape, no block scope,
+  `unset` to remove, and command names resolve at call time; **type filters**
+  have both `*:f`/`*:files` and `*(f)` spellings.)
 - **Value vs stream reconciliation** *(narrowed)* — how a function *produces* a
   value is settled (last expression, or `return val`); still open are the
   **value-call grammar** (likely a parenthesized `x = f($arg)`, since a bare
@@ -952,6 +1010,14 @@ Two notes flagged as *(open)*:
   [Functions](#functions).
 - **`match` expression** — the companion to expression-`if`; deferred until the
   rc-file need is real.
+- **Function isolation (deferred cluster)** — a set of related questions about
+  how much a `func` isolates from its caller, to be taken as one pass:
+  **lambdas** (anonymous functions for `map`/`each`/callbacks, and their
+  syntax); whether **function *definitions*** are themselves locally scoped (a
+  `func` defined inside a `func` visible only there); whether a function
+  **restores `PWD`** (and other process state) on return or lets a `cd` persist;
+  and whether mesh has **subshells** (`( … )` isolating cwd/env/vars in a child)
+  — the last two are the same "does this run isolated?" question.
 - **Hook API** — how override hooks compose over a base (possibly external)
   prompt renderer.
 
