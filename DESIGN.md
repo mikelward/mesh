@@ -1546,12 +1546,14 @@ programs or user functions:
     *no-such-directory* error, not command-not-found. On by default —
     `$sh.options.autocd = off` disables it.
 - **I/O**
-  - **`puts [args…]`** — write to stdout: the arguments joined by a single space,
-    then a newline (**`--no-newline` / `-n`** suppresses it); a list spreads
-    (`puts ...$xs`). It is mesh's `echo`, but *without* echo's portability
-    footguns — there is no `-e` / `\n` reinterpretation, because escapes are
-    already resolved by the [string literal](#quoting-and-escaping), so `puts`
-    never re-parses its input.
+  - **`puts [args…]`** — write the arguments joined by a single space, then a
+    newline (a list spreads: `puts ...$xs`). It takes **no flags** — none of
+    `echo`'s `-e` / `-n` reinterpretation, because escapes are already resolved by
+    the [string literal](#quoting-and-escaping), so `puts` never re-parses its
+    input.
+  - **`print [args…]`** — the same, but with **no trailing newline** — for partial
+    lines and hand-built prompts. The `puts` / `print` pair replaces `echo -n`,
+    keeping both flag-free.
   - **`gets [var]`** — read one line from stdin into `var`, trailing newline
     stripped; it returns that line as its value and a **non-zero
     [status](#variables-and-assignment) at EOF** (so `while gets line { … }`
