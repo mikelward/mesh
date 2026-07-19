@@ -169,9 +169,9 @@ All four kinds:
 - **chain**: `$f:stem:stem`, `$(cmd):nulls` then value modifiers over each item,
   `$xs:rest:last` (collection modifiers compose too).
 - **Disambiguation:** `:` is a modifier only when immediately followed by a
-  known modifier keyword. `$dir:$PATH` keeps `:` literal (the token after `:`
-  is an expansion, not a keyword), so the classic `PATH` construction is
-  unaffected.
+  known modifier keyword. `$host:$port` keeps `:` literal (the token after `:`
+  is an expansion, not a keyword), so building `host:port`-style strings — or
+  any `a:b` construction — is unaffected.
 
 **Split modifiers** (choose the separator). These bind to a substitution's raw
 byte capture and replace the default newline split:
@@ -388,7 +388,7 @@ hyphen between — the third payoff of that one spacing rule.
   two states that stand in for a missing null. **`unset` also deletes a
   collection element** — `unset $m[key]` / `unset $m.key` removes that map entry
   (and `unset $xs[i]` removes the element and closes the gap); deleting a missing
-  key is a **no-op**, not an error, so `unset $hooks.prompt.auth` is idempotent whether
+  key is a **no-op**, not an error, so `unset $sh.prompt.auth` is idempotent whether
   or not the segment was registered.
 - **Command/function names resolve at call time** — a separate namespace from
   variables. A bare word in command position (`g` inside `func f { g }`) is a
@@ -403,7 +403,11 @@ hyphen between — the third payoff of that one spacing rule.
   children. **Only byte-strings can be exported** — the environment is a flat
   `KEY=bytes` table, so a list or map cannot cross an `exec` boundary. Exporting
   a list is an error with a clear message (join it first: `export P =
-  $dirs:join ":"`). One further restriction: environment entries are
+  $dirs:join ":"`). **The one exception is path-type variables** —
+  `$env.PATH` and friends are lists *by design* and the shell **auto-`:`-joins**
+  them on export (splitting on read); that is a defined serialization for the
+  known `:`-delimited path vars, not a general "lists become strings" rule, so an
+  arbitrary list still errors. One further restriction: environment entries are
   **NUL-terminated**, so a byte-string containing an embedded NUL (which a
   `$(cmd):raw` capture can) **cannot** be exported either — that too is a hard
   error, not a silent truncation. This keeps the rich types honest: they live
@@ -448,44 +452,29 @@ hyphen between — the third payoff of that one spacing rule.
   back for, e.g., "key present but unset"? Current answer: no; `:has` +
   `:get default` cover it.)*
 
-**Special variables live in namespaces** — the *(decided)* answer to keeping the
-shell's built-in state from colliding with your own names. The whole lowercase
-top-level namespace is **yours**; the built-ins hang off exactly three reserved
-roots, each a map:
+**Special variables live in two namespace maps** — the *(decided)* way to keep
+the shell's built-in state out of your variable namespace. The whole lowercase
+top-level is **yours**; the built-ins hang off two reserved roots:
 
-- **`$env`** — the process environment. `$env.EDITOR`, `$env.HOME`, and
-  **`$env.PATH` is a list** (mesh splits the `:`-string in / joins it out, so
-  `$env.PATH += [/opt/bin]`, `:dedup`, `:has /usr/bin` all just work — the
-  "guarded, deduped PATH" requirement; the other `:`-delimited path vars are
-  lists too).
-- **`$sh`** — runtime state: **`$sh.status`** (last exit status, int `0`–`255`,
-  the readable replacement for `$?`), **`$sh.pipestatus`** (a **list** of the
-  last pipeline's per-stage statuses — real lists beat bash's `PIPESTATUS`),
-  `$sh.interactive`, `$sh.pid`, …
-- **`$hooks`** — the hook points ([Hooks and the prompt](#hooks-and-the-prompt)):
-  `$hooks.precmd`, `$hooks.prompt`, …
+- **`$env`** — the process environment, accessed by name: `$env.EDITOR`,
+  `$env.HOME`. **`$env.PATH` is a list** — `$env.PATH += [/opt/bin]`,
+  `$env.PATH:dedup`, `$env.PATH:has /usr/bin` all just work, which is the
+  "guarded, deduped PATH" requirement. Because the OS environment is bytes, a
+  path-type entry is `:`-joined on the way out and split on the way in (see the
+  [export exception](#variables-and-assignment) below); other `:`-delimited path
+  vars (`MANPATH`, `CDPATH`, …) are lists too.
+- **`$sh`** — everything else the shell owns, **flat**: runtime values —
+  **`$sh.status`** (last exit, int `0`–`255`, the readable replacement for `$?`),
+  **`$sh.pipestatus`** (a **list** of the last pipeline's stage statuses, where
+  real lists beat bash's `PIPESTATUS`), `$sh.pid`, `$sh.version`, `$sh.options`,
+  `$sh.interactive`; **and the hooks** — `$sh.prompt`, `$sh.precmd`,
+  `$sh.preexec` / `$sh.postexec`, `$sh.precd` / `$sh.postcd`, `$sh.exit`
+  ([Hooks and the prompt](#hooks-and-the-prompt)).
 
-The win is **not** "fail-loud on typo" — a mistyped *plain* variable read errors
-too. It is that a built-in and a user variable **can never share a namespace**,
-so there is no collision to slip into: your `status` var and `$sh.status` are
-unrelated. (A bare-reserved-name scheme is fail-loud *except* precisely when you
-also have a same-base-name var — and its `$PATH`/`$Path` pair is worse, since
-both are *bound*, so a case-slip hands you the wrong **type** with no error.)
-Namespacing also lists what exists (`$sh:keys`) and reuses the map/dot features
-rather than adding rules.
-
-**Bare UPPERCASE names alias into `$env`** — so the muscle memory survives:
-`$PATH` *is* `$env.PATH`, `$EDITOR` *is* `$env.EDITOR`. Uppercase reads as
-"environment" (the author's long-standing convention), and it is just sugar for
-the map, so `$PATH` is the same list as `$env.PATH`. lowercase names are never
-touched, so a var called `path`, `status`, or `prompt` is entirely yours.
-
-*(Considered and dropped: a **three-tier case** scheme — `$Status` / `$Path`
-Initial-Cap for reserved — was elegant and prefix-free, but it separates three
-namespaces by *case alone*: a typo'd `$status` for `$Status` (when you also have
-a `status` var) reads the wrong one silently, it capitalizes hook names shells
-lowercase (`$Preexec`), and it isn't introspectable. A silent case-collision is
-the same class of footgun mesh exists to remove, so the fail-loud namespace won.)*
+So there are exactly **two reserved names** (`env`, `sh`); every other lowercase
+name is entirely yours — a var called `status`, `prompt`, or `path` never
+clashes. Access is strict [map access](#maps-associative-arrays), so `$sh:keys`
+lists the whole surface and a mistyped key fails loud.
 
 ### Arrays (lists)
 
@@ -1275,13 +1264,13 @@ mesh models a hook point as an **insertion-ordered [map](#maps-associative-array
 of named callables** — the key is the handler's *identity*. That one choice
 solves the composition requirement and the worst hook footgun at once:
 
-- **Re-source-safe by construction.** `$hooks.precmd.git = …` is *keyed*, so running
+- **Re-source-safe by construction.** `$sh.precmd.git = …` is *keyed*, so running
   your rc file again **replaces** the `git` handler instead of stacking a
   duplicate — the bane of bash `PROMPT_COMMAND` (which appends) and zsh's
   `add-zsh-hook` (which needs manual dedup). The identity is what lets you
   re-source freely.
-- **Update or drop one by name** — reassign `$hooks.precmd.git`, or `unset $hooks.precmd.git`
-  — without touching the others; `$hooks.precmd:keys` introspects.
+- **Update or drop one by name** — reassign `$sh.precmd.git`, or `unset $sh.precmd.git`
+  — without touching the others; `$sh.precmd:keys` introspects.
 - **Deterministic order** — maps preserve insertion order, so handlers run
   (and segments render) in the order registered.
 - **Compose, never replace** — adding a key leaves every other handler intact.
@@ -1300,12 +1289,12 @@ given the target) / **`postcd`** (after, now in the new dir, given the previous
 dir), and `exit`:
 
 ```
-$hooks.precmd.jobs   = publish-jobs                    # by name
-$hooks.postcd.fetch  = func() { vcs auto-fetch & }     # arrived in a new dir — the PWD-gate is now the event itself
-$hooks.precd.save    = func(to) { save-dir-state }     # about to leave: act while still in the old dir
-$hooks.preexec.timer = func(cmd) { timer-start }       # start the clock…
-$hooks.postexec.timer = func(cmd, status, ms) { global last-cmd-time = $ms }   # …stop it; `global` so it survives to feed the prompt
-unset $hooks.precmd.jobs                               # remove one
+$sh.precmd.jobs   = publish-jobs                    # by name
+$sh.postcd.fetch  = func() { vcs auto-fetch & }     # arrived in a new dir — the PWD-gate is now the event itself
+$sh.precd.save    = func(to) { save-dir-state }     # about to leave: act while still in the old dir
+$sh.preexec.timer = func(cmd) { timer-start }       # start the clock…
+$sh.postexec.timer = func(cmd, status, ms) { global last-cmd-time = $ms }   # …stop it; `global` so it survives to feed the prompt
+unset $sh.precmd.jobs                               # remove one
 ```
 
 The `pre`/`post` split (rather than a single after-the-fact hook) is what lets a
@@ -1318,7 +1307,7 @@ casing.
 **Command hooks fire for the outer interactive command only.** `preexec` /
 `postexec` fire once for the command line you submit at the prompt — *not* for
 commands run inside a function, a script, a `$(…)`, or a hook handler itself, and
-a handler's own commands don't re-fire them. Without this, `$hooks.preexec.timer`'s
+a handler's own commands don't re-fire them. Without this, `$sh.preexec.timer`'s
 `timer-start` would dispatch `preexec` again forever.
 
 **Directory hooks fire around each actual `cd`** — `precd` *before* the
@@ -1328,7 +1317,10 @@ performed *by a hook handler* doesn't re-dispatch. A `func` that `cd`s internall
 therefore fires them per change; if a handler only cares about net movement it
 gates on `$PWD` itself (the one-line `precd`/`postcd` PWD-check that today's
 config hand-rolls). Per-`cd` is the right default because `precd`'s "old dir"
-contract can't hold if the hooks are deferred to function return.
+contract can't hold if the hooks are deferred to function return. The pending
+`cd` target is **resolved to an absolute path *before* `precd` runs**, so a
+handler that itself `cd`s elsewhere (allowed — its change just doesn't
+re-dispatch) can't make a *relative* outer `cd` land somewhere unintended.
 
 **Status is snapshotted across hook dispatch.** The submitted command's exit
 status (and pipeline stage statuses) are captured before `postexec` / `precmd`
@@ -1342,11 +1334,11 @@ string** (or `""` to contribute nothing); the shell joins the non-empty ones in
 key order:
 
 ```
-$hooks.prompt.host = host-seg                     # named, ordered segments
-$hooks.prompt.dir  = func() { if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() } }
-$hooks.prompt.auth = func() { if ssh-id-missing() { yellow("no-ssh-id") } }   # no else → "" → segment omitted
-$hooks.prompt.dir  = my-dir-seg                   # swap ONE segment by name
-unset $hooks.prompt.auth                          # drop the auth warning
+$sh.prompt.host = host-seg                     # named, ordered segments
+$sh.prompt.dir  = func() { if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() } }
+$sh.prompt.auth = func() { if ssh-id-missing() { yellow("no-ssh-id") } }   # no else → "" → segment omitted
+$sh.prompt.dir  = my-dir-seg                   # swap ONE segment by name
+unset $sh.prompt.auth                          # drop the auth warning
 ```
 
 (The segments use `if` *expressions* to pick a string — not `and`/`or`, which
