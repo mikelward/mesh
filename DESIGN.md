@@ -149,14 +149,18 @@ There are four kinds of modifier, and the difference matters:
 - **Value modifiers** (path and string — `:stem`, `:dir`, `:strip`, …) transform
   a value, and **map over a list** automatically (applied to each element).
 - **Collection modifiers** (`:len :first :last :rest :init :keys :values
-  :has :get :join`) consume a list or map **as a whole** — they do *not* map element-wise
+  :has :get :join :dedup`) consume a list or map **as a whole** — they do *not* map element-wise
   — and return either a scalar (`:len` → int, `:join` → one byte-string) or a
-  derived collection (`:rest`, `:keys`). This is the category that answers "how
+  derived collection (`:rest`, `:keys`, `:dedup`). This is the category that answers "how
   long," "the last one," and "flatten to a string." `:join SEP` is the fold
   that turns a list back into bytes (`$dirs:join ":"`); it stringifies each
   element and errors on a nested list or map (there is no implicit deep
-  flattening — spell it out). The full list/map surface is in
-  [Arrays](#arrays-lists) and [Maps](#maps-associative-arrays).
+  flattening — spell it out). **`:dedup`** returns the list with duplicate
+  elements removed — **keep-first, order-preserving**, equality by value — so
+  `$env.PATH:dedup` is the guarded, deduped PATH; unlike Unix `uniq(1)` it drops
+  *non-adjacent* duplicates and needs no prior sort. It is **pure** (returns a new
+  list — `$env.PATH = $env.PATH:dedup` to store) and lists-only. The full list/map
+  surface is in [Arrays](#arrays-lists) and [Maps](#maps-associative-arrays).
 - **Filter modifiers** (`:files`/`:f`, `:dirs`/`:d`, `:links`/`:l`,
   `:exec`/`:x`) keep the list elements matching a **file-type predicate** and
   drop the rest — a subset, not a transform. They **chain for AND** (`:f:x` =
@@ -407,7 +411,17 @@ hyphen between — the third payoff of that one spacing rule.
   `$env.PATH` and friends are lists *by design* and the shell **auto-`:`-joins**
   them on export (splitting on read); that is a defined serialization for the
   known `:`-delimited path vars, not a general "lists become strings" rule, so an
-  arbitrary list still errors. One further restriction: environment entries are
+  arbitrary list still errors. The path-type set is a **fixed built-in list** —
+  `PATH`, `MANPATH`, `CDPATH`, `INFOPATH`, `LD_LIBRARY_PATH`, `PYTHONPATH`, and
+  the like — plus an **opt-in** for any other name: **`export --list NAME`** marks
+  a name as a `:`-delimited list, so it is split-on-import and joined-on-export
+  just like the built-ins (`export --list MY_TOOL_PATH` reclassifies an inbound
+  value in place; `export --list MY_TOOL_PATH = [/a /b]` declares and sets). The
+  separator is fixed to `:`. *(TODO: consider a dedicated `declare --list NAME`
+  spelling instead — it reads as its own statement, at the cost of adding a
+  builtin; `export --list` is chosen for now because it needs no new builtin and
+  lives exactly where the join-on-export exception already does.)* One further
+  restriction: environment entries are
   **NUL-terminated**, so a byte-string containing an embedded NUL (which a
   `$(cmd):raw` capture can) **cannot** be exported either — that too is a hard
   error, not a silent truncation. This keeps the rich types honest: they live
@@ -461,8 +475,9 @@ top-level is **yours**; the built-ins hang off two reserved roots:
   `$env.PATH:dedup`, `$env.PATH:has /usr/bin` all just work, which is the
   "guarded, deduped PATH" requirement. Because the OS environment is bytes, a
   path-type entry is `:`-joined on the way out and split on the way in (see the
-  [export exception](#variables-and-assignment) below); other `:`-delimited path
-  vars (`MANPATH`, `CDPATH`, …) are lists too. Path-var splitting is
+  [export exception](#variables-and-assignment) below); the other built-in path
+  vars (`MANPATH`, `CDPATH`, `INFOPATH`, `LD_LIBRARY_PATH`, `PYTHONPATH`, …) are
+  lists too, and `export --list NAME` opts any other name in. Path-var splitting is
   **exact** — it keeps *every* empty component (leading, interior, trailing),
   *not* the trailing-empty-trimming [capture split](#modifiers), because an empty
   component is meaningful (`PATH=/usr/bin:` means "…and the cwd") and a
