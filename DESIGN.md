@@ -1297,6 +1297,96 @@ now decided — see [Conditionals](#conditionals-if-is-an-expression). The
 file-test modifiers it leans on (`$f:type` / `:exists` / `:exec`) are settled in
 [Tests and comparisons](#tests-and-comparisons).
 
+### Redirection
+
+Redirection is **basically bash** — the operators are too familiar and too
+ergonomic to reinvent, and they plumb a command's byte streams, which is
+orthogonal to mesh's value model. The same set:
+
+```
+cmd > file          # stdout, truncate
+cmd >> file         # stdout, append
+cmd < file          # stdin
+cmd 2> file         # stderr
+cmd 2>&1            # stderr to wherever stdout currently goes
+cmd &> file         # both stdout and stderr (>& also accepted)
+cmd 2>> file        # stderr, append
+cmd > /dev/null     # discard
+cmd << END … END    # here-document
+cmd <<< "text"      # here-string
+cmd 3< file         # explicit fd; n>&m dup, n>&- close
+diff <(a) <(b)      # process substitution (a filename/fd, bash-compatible)
+```
+
+Two mesh notes, neither a behavior change:
+
+- A redirection operator is its **own lexical token**, so it is **exempt from the
+  [operators-need-spaces](#globbing) rule** — `cmd 2>&1` and `cmd >file` both
+  parse as in bash; the spacing rule is only about word operators like `-`.
+- Redirection moves **bytes to/from files and fds** — it does *not* interact with
+  the rich value channel. A list or map is not "redirected"; you print it
+  (`puts $xs > file`) and the command's stdout is what lands. This is the same
+  bytes-vs-values split as [command substitution](#command-substitution) and
+  [export](#variables-and-assignment).
+
+*(open: `noclobber` and the `>|` override; whether `&>>` append-both is worth a
+spelling.)*
+
+### Job control
+
+Job control is table stakes for an interactive shell, and mesh's one improvement
+over bash/zsh is that **jobs are first-class values**, not an opaque table you
+reach only through the `%n` sigil and scrape out of `jobs` text.
+
+**`$sh.jobs` is an insertion-ordered map keyed by a small stable job id**, each
+value a record:
+
+```
+$sh.jobs
+# [ 1: [pid: 48213, cmd: "make -j8", state: running, status: ""],
+#   2: [pid: 49001, cmd: "vim notes", state: stopped, status: ""] ]
+
+$sh.jobs:len              # 2   — this is `publish-jobs`, now one word in a prompt segment
+$sh.jobs.2.state          # stopped
+$sh.jobs:values:filter func(j) { $j.state == running }
+```
+
+`state` is `running` / `stopped` / `done`; `status` fills in when a job finishes
+(the same 8-bit view as [`$sh.status`](#variables-and-assignment)).
+
+**`&` backgrounds and yields a job handle.** `j = make -j8 &` binds the record,
+so `$j.pid` is mesh's replacement for bash's `$!` and `$j` is the thing you
+`fg` / `kill` / `wait`. A bare `make &` just registers the job in `$sh.jobs`.
+
+**The interactive verbs are the familiar ones:**
+
+| Action | Spelling |
+| --- | --- |
+| suspend the foreground job | Ctrl-Z → a `stopped` job |
+| foreground | `fg` (most recent) · `fg 2` · `fg %2` · `fg $j` |
+| resume in background | `bg` · `bg 2` · `bg %2` |
+| list | `jobs` (pretty-prints `$sh.jobs`) |
+| signal | `kill $j` · `kill $sh.jobs.2` · `kill %2` — but `kill 49001` is still a **PID** |
+| wait for it | `wait $j` |
+
+**Job references — three ways, no ambiguity.** `fg` / `bg` only ever take a job,
+so a **bare id** there (`fg 2`) is unambiguous. The **handle** (`$sh.jobs.2`, or
+`$j` from `j = cmd &`) is the value-model reference and is what disambiguates
+`kill` from a PID. And the **`%n` sigil is kept as sugar** for muscle memory —
+`%2` (by id), **`%+`** / **`%%`** (current job), **`%-`** (previous job), and
+`%string` (most recent whose command starts with `string`).
+
+**Completion is reported before the next prompt** (like bash's `[2]+ Done`), and
+the finished job's record carries its final `status` at that point before leaving
+`$sh.jobs`.
+
+*(deferred past the spike: `disown` / nohup-style persistence past shell exit;
+`wait` with no args / multiple jobs and its aggregate status; the fuzzy
+`%?string` (substring) reference; per-stage `pipestatus` on a backgrounded
+pipeline; and a `jobdone` hook to fire on completion. Terminal plumbing —
+process groups, `tcsetpgrp`, `SIGTSTP`/`SIGCONT` — is implementation, not
+surface.)*
+
 ### Hooks and the prompt
 
 The requirement (from [Requirements](#requirements-carried-over-from-existing-configs)):
@@ -1467,6 +1557,16 @@ set — `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settl
   so glob exclusion keeps the spaced infix `-` only.
 - **String modifier set** — beyond `:strip` / `:replace`.
 - **Predicate qualifier syntax** — confirm `size>` / `age<` / `mtime<` forms.
+- **History expansion — TODO.** Whether to support bash-style `!!` (last command),
+  `!$` (last arg), `!n` / `!-n`, `!string` (last starting with `string`), and the
+  `:` word/`:s` modifiers — and which subset, given modern Ctrl-R/arrow recall
+  makes some of it vestigial. Watch the clash with the existing `!~` / `!=`
+  operators (history `!` is a word-leading prefix; `!=`/`!~` are spaced infix).
+- **History run with substitution — TODO.** Re-run a past command with a
+  substitution — bash's quick-sub `^old^new` and `!!:s/old/new/`, or an `fc -s`
+  style `old=new`. Decide the spelling (a `^old^new` quick form vs. a `:s`
+  modifier on a history reference) and how it reads against mesh's `:`-modifier
+  grammar.
 - **Core surface** (arrays / maps / functions / `if` / `match` / loops / scope /
   tests / isolation) — sketched above. Remaining sub-questions: an infix **`in`**
   operator as a second membership spelling alongside `:has`; **regex captures**
