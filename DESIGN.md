@@ -88,15 +88,24 @@ Everything below is **decided** unless marked *(open)*.
 
 ### Command substitution
 
-Bare substitution splits on **newlines** into a list; quoting gives the whole
-string. Newline-splitting is the dominant Unix convention (`ls`, `find`, `grep`,
-`ps`) and — crucially — never breaks on spaces in filenames, which is the
-classic word-splitting footgun.
+A command substitution **captures the command's raw output bytes.** What you get
+back depends on the split that is applied to that capture:
 
 ```
-$(cmd)        # list, split on newlines, trailing blank line trimmed
-"$(cmd)"      # one string (trailing newline trimmed)
+$(cmd)          # default: split raw bytes on newlines, trim trailing blank -> list
+"$(cmd)"        # one string (trailing newline trimmed)
+$(cmd):nulls    # split the raw bytes on NUL -> list  (newline-safe)
+$(cmd):raw      # the raw bytes, unsplit, trailing newline intact
 ```
+
+Newline-splitting is the **default** because it is the dominant Unix convention
+(`ls`, `find`, `grep`, `ps`) and never breaks on spaces in filenames — the
+classic word-splitting footgun. But it is only the default: a split modifier
+**replaces** it and runs against the raw capture (see [Modifiers](#modifiers)),
+so the default split never destroys bytes that an explicit splitter needs. In
+particular, splitting is applied *once*, not layered on top of the newline
+split — `:nulls` sees the raw output (so `find -print0` filenames containing
+newlines survive), and `:raw` keeps the trailing newline the default would trim.
 
 ### Modifiers
 
@@ -104,22 +113,32 @@ A **postfix modifier** transforms a value. The operator is `:`, followed by a
 readable keyword. This is the zsh history-modifier idea (`:h :t :r :e`) but with
 *words instead of cryptic letters*.
 
-- Modifiers **chain**: `$f:stem:stem`.
-- Modifiers **map over lists** automatically: applying a modifier to a list
-  applies it to each element.
+There are two kinds of modifier, and the difference matters:
+
+- **Split modifiers** (`:lines :words :nulls :tabs :raw :split`) turn a command
+  substitution's **raw byte capture** into a list. They *replace* the default
+  newline split and run against the raw bytes — they never run *after* it. Each
+  applies to a `$(…)` capture, producing the list.
+- **Value modifiers** (path and string — `:stem`, `:dir`, `:strip`, …) transform
+  a value, and **map over a list** automatically (applied to each element).
+
+Both kinds:
+
+- **chain**: `$f:stem:stem`, `$(cmd):nulls` then value modifiers over each item.
 - **Disambiguation:** `:` is a modifier only when immediately followed by a
   known modifier keyword. `$dir:$PATH` keeps `:` literal (the token after `:`
   is an expansion, not a keyword), so the classic `PATH` construction is
   unaffected.
 
-**Splitting** (choose the separator):
+**Split modifiers** (choose the separator). These bind to a substitution's raw
+byte capture and replace the default newline split:
 
 ```
-$(cmd):lines        # split on newlines (explicit form of the default)
+$(cmd):lines        # split raw bytes on newlines (explicit form of the default)
 $(cmd):words        # split on whitespace runs (opt-in; the old IFS behavior)
-$(cmd):nulls        # split on NUL   (pairs with find -print0 / xargs -0)
+$(cmd):nulls        # split on NUL   (find -print0 / xargs -0; newline-safe)
 $(cmd):tabs         # split on tab   (TSV)
-$(cmd):raw          # no split; whole string including trailing newline
+$(cmd):raw          # no split; raw bytes including the trailing newline
 $(cmd):split ":"    # split on an arbitrary separator
 ```
 
