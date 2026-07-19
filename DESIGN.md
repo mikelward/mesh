@@ -496,6 +496,13 @@ position uses its **string value** (`[$name: 1]`, `$m[$k]`). A non-string value
 used as a key — a list or map — is an **error**, not silently stringified. This
 keeps maps to the one job an rc file needs: string-keyed lookup tables.
 
+**Duplicate keys** in one literal (`[a: 1, a: 2]`, or interpolated keys that
+collide) resolve **last-value-wins, first-position** — the later value is kept
+(`2`), and the key stays at the position of its first appearance. That is the
+same "right side wins" as `+=` merge, and it keeps insertion order stable so map
+iteration is unaffected by a later overwrite. It is never an error, so building
+a map by overriding earlier defaults just works.
+
 Access mirrors list indexing exactly — `$m[key]` for a string key is the same
 shape as `$arr[0]` for an integer index:
 
@@ -643,7 +650,13 @@ Rules:
   do **not** usefully coexist (the rest would swallow anything meant for the
   optional), so a signature with `...rest` keeps its positionals required.
 - **Flags** are declared with a leading `--`. `--force` (no `=`) is a boolean
-  **switch**, false unless passed. `--tag = default` is a **valued flag**.
+  **switch**, false unless passed. `--tag = default` is a **valued flag**, and at
+  the call site it accepts **both spellings** — attached `--tag=v2` and separate
+  `--tag v2` (the flag consumes the next argument) — the two getopt forms every
+  shell user knows. A valued flag with **no value to consume** (nothing follows,
+  or the next token is `--`/another flag) is an **error** — a missing value fails
+  loud rather than silently swallowing an unrelated token. A **switch** never
+  consumes a following argument (`--force web1` leaves `web1` a positional).
   Flags may appear in any order at the call site and are *not* consumed as
   positionals — this is why a shell wants real flag parsing in the signature
   rather than hand-rolled `case $1` juggling. An argument that begins with `--`
@@ -782,7 +795,9 @@ Decisions:
   context-dependent "empty string or empty list." mesh infers types and does not
   carry a contextual target type back into the branch, so there is nothing to
   pick an empty *list* from; the empty string is the universal shell "nothing"
-  and is what an interpolation like `prompt = "$(if $root { "[root]" })…"` wants.
+  that a prompt fragment wants — `tag = if $root { "[root]" }` then `"$tag…"`
+  reads a plain empty string when not root (interpolate the *bound value*, not a
+  `$(…)` stdout capture, which a statement-position `if` would not feed).
   Both branches (when both exist) are expected to yield the same *shape*; mesh
   does not coerce one to match the other. **Decided: lenient** — a lone `if` is
   a valid expression and the no-`else` case is `""`. (The stricter Rust-style
