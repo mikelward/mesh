@@ -471,7 +471,7 @@ the shell's built-in state out of your variable namespace. The whole lowercase
 top-level is **yours**; the built-ins hang off two reserved roots:
 
 - **`$env`** — the process environment, accessed by name: `$env.EDITOR`,
-  `$env.HOME`. **`$env.PATH` is a list** — `$env.PATH += [/opt/bin]`,
+  `$env.HOME`. **`$env.PATH` is a list** — `$env.PATH += /opt/bin`,
   `$env.PATH:dedup`, `$env.PATH:has /usr/bin` all just work, which is the
   "guarded, deduped PATH" requirement. Because the OS environment is bytes, a
   path-type entry is `:`-joined on the way out and split on the way in (see the
