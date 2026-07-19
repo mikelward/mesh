@@ -357,7 +357,11 @@ hyphen between — the third payoff of that one spacing rule.
 
   Reading resolves **outward** (local → global); an **unbound** name is an
   **error**, not empty — the always-on `set -u` that the *no null* rule below
-  already implies. The **total read** for a maybe-unset name is the same `:get`
+  already implies, so a **typo'd read fails loud** (`$staus` → error). The one
+  place a typo is *not* caught is **assignment**, which always creates
+  (`staus = 5` binds a new var) — the cost of having no `let`/`var` keyword;
+  reads carry the fail-loud guarantee, writes create. The **total read** for a
+  maybe-unset name is the same `:get`
   that maps use, because the **environment is a first-class map named `env`**:
 
   ```
@@ -384,7 +388,7 @@ hyphen between — the third payoff of that one spacing rule.
   two states that stand in for a missing null. **`unset` also deletes a
   collection element** — `unset $m[key]` / `unset $m.key` removes that map entry
   (and `unset $xs[i]` removes the element and closes the gap); deleting a missing
-  key is a **no-op**, not an error, so `unset $prompt.auth` is idempotent whether
+  key is a **no-op**, not an error, so `unset $hooks.prompt.auth` is idempotent whether
   or not the segment was registered.
 - **Command/function names resolve at call time** — a separate namespace from
   variables. A bare word in command position (`g` inside `func f { g }`) is a
@@ -426,11 +430,14 @@ hyphen between — the third payoff of that one spacing rule.
   a name-baked sigil would lie the moment a var is reassigned a different shape —
   and Perl's context-varying sigil (where `$foo[0]` indexes the array `@foo`) is
   a notorious footgun. `$name` means one thing everywhere: "read this variable."
-- **String interpolation** is `$name` inside `"…"`, extended to
-  `$name[key]` / `$name.key` and, when the expression's end needs delimiting,
-  the braced **`${…}`** form: `"${dir}s"`, `"${m.key}"`. A bare `"$file.txt"`
-  interpolates `$file` then keeps `.txt` literal (the shell reflex) — reach for
-  `"${file}.txt"` (or `${m.key}`) when the dot is meant as access, not text.
+- **String interpolation.** Inside `"…"`, a bare `$name` interpolates just the
+  **variable** — the following `.`/`[` is *literal text*, so `"$file.txt"` is
+  `$file` then `.txt` and `"$m.key"` is `$m` then `.key` (the shell reflex). Any
+  **member access, indexing, or expression** in a string uses the braced
+  **`${…}`** form, which also delimits where it ends: `"${m.key}"`, `"${xs[0]}"`,
+  `"${dir}s"`. One rule — unbraced `$name` is the variable, `${…}` is everything
+  more — so the two never parse ambiguously. (Outside strings there is no
+  ambiguity: `$m.key` / `$xs[0]` are ordinary access.)
 - **No null.** mesh has **no `nil`/`null`/`none`** value — the billion-dollar
   mistake is left out. The consequence is a consistent rule wherever a value
   might be absent: **exact** access fails loud (`$xs[99]`, `$m[absent]` are
@@ -441,49 +448,44 @@ hyphen between — the third payoff of that one spacing rule.
   back for, e.g., "key present but unset"? Current answer: no; `:has` +
   `:get default` cover it.)*
 
-**Special variables.** A few names are maintained by the shell:
+**Special variables live in namespaces** — the *(decided)* answer to keeping the
+shell's built-in state from colliding with your own names. The whole lowercase
+top-level namespace is **yours**; the built-ins hang off exactly three reserved
+roots, each a map:
 
-- **`$status`** — the last command's exit status (an int, `0`–`255`), the
-  readable replacement for `$?` (fish uses the same name).
-- **`$pipestatus`** — a **list** of the per-stage statuses of the last pipeline
-  (`a | b | c` → three ints), where mesh's real lists beat bash's `PIPESTATUS`
-  array.
-- **PATH** — a **list**, not a colon-string, so `+= [/opt/bin]`, `:dedup`,
-  `:has /usr/bin` all just work — exactly the "idempotent, guarded, deduped PATH"
-  requirement. The environment is bytes, so the shell **`:`-joins it on the way
-  out** to children and splits on the way in; one value, list in-shell,
-  `:`-string in `env` (and the other standard `:`-delimited path vars —
-  `MANPATH`, `CDPATH`, … — are lists too). Its exact spelling depends on the
-  collision scheme below (`$PATH` list vs `$Path` list-over-`$PATH`-string vs
-  `$env.PATH`).
+- **`$env`** — the process environment. `$env.EDITOR`, `$env.HOME`, and
+  **`$env.PATH` is a list** (mesh splits the `:`-string in / joins it out, so
+  `$env.PATH += [/opt/bin]`, `:dedup`, `:has /usr/bin` all just work — the
+  "guarded, deduped PATH" requirement; the other `:`-delimited path vars are
+  lists too).
+- **`$sh`** — runtime state: **`$sh.status`** (last exit status, int `0`–`255`,
+  the readable replacement for `$?`), **`$sh.pipestatus`** (a **list** of the
+  last pipeline's per-stage statuses — real lists beat bash's `PIPESTATUS`),
+  `$sh.interactive`, `$sh.pid`, …
+- **`$hooks`** — the hook points ([Hooks and the prompt](#hooks-and-the-prompt)):
+  `$hooks.precmd`, `$hooks.prompt`, …
 
-**Avoiding collisions with your variables** *(open — strong options, to be
-decided; they combine):*
+The win is **not** "fail-loud on typo" — a mistyped *plain* variable read errors
+too. It is that a built-in and a user variable **can never share a namespace**,
+so there is no collision to slip into: your `status` var and `$sh.status` are
+unrelated. (A bare-reserved-name scheme is fail-loud *except* precisely when you
+also have a same-base-name var — and its `$PATH`/`$Path` pair is worse, since
+both are *bound*, so a case-slip hands you the wrong **type** with no error.)
+Namespacing also lists what exists (`$sh:keys`) and reuses the map/dot features
+rather than adding rules.
 
-1. **Two-tier case** *(the author's existing habit)* — **UPPERCASE = the
-   environment (exported), lowercase = shell-local**. `$PATH` is the env
-   path-list, `$path` stays yours; no zsh-style `$path`/`$PATH` dual-binding.
-   Leaves open where the *reserved* specials (`status`, hooks) sit.
-2. **Three-tier case** — extend that with a middle tier: **UPPERCASE = env,
-   Initial-Cap = shell-reserved, lowercase = user** (`$Status`, `$Prompt`,
-   `$myvar`). Elegant and prefix-free — case alone tells you the tier, and it
-   handles PATH's dual nature neatly: `$PATH` is the exported colon-string,
-   `$Path` the reserved shell **list** view (linked like zsh's `$path`/`$PATH`,
-   but disambiguated by case). The catch: it leans on *case-sensitivity* to
-   separate namespaces, so a typo'd `$status` for `$Status` silently reads your
-   own var instead of erroring, and it capitalizes hook names (`$Preexec`) that
-   shells conventionally lowercase.
-3. **Namespaced built-ins** — put shell state behind namespace maps so the whole
-   lowercase top-level namespace is yours by construction: `$env` (`$env.PATH`),
-   `$sh` (`$sh.status`, `$sh.pipestatus`), `$hooks` (`$hooks.precmd`,
-   `$hooks.prompt`). Verbose but a *hard, explicit* guarantee (greppable, no
-   case-typo footgun).
+**Bare UPPERCASE names alias into `$env`** — so the muscle memory survives:
+`$PATH` *is* `$env.PATH`, `$EDITOR` *is* `$env.EDITOR`. Uppercase reads as
+"environment" (the author's long-standing convention), and it is just sugar for
+the map, so `$PATH` is the same list as `$env.PATH`. lowercase names are never
+touched, so a var called `path`, `status`, or `prompt` is entirely yours.
 
-They compose. A likely blend: keep **UPPERCASE-for-env** (a convention users
-already know) and put the built-in maps behind **`$env` / `$sh` / `$hooks`** for
-the hard guarantee — with the open question being whether to also surface bare
-conveniences (`$status`, `$PATH`) on top, and whether Initial-Cap earns its place
-as a third tier or the case-typo risk rules it out.
+*(Considered and dropped: a **three-tier case** scheme — `$Status` / `$Path`
+Initial-Cap for reserved — was elegant and prefix-free, but it separates three
+namespaces by *case alone*: a typo'd `$status` for `$Status` (when you also have
+a `status` var) reads the wrong one silently, it capitalizes hook names shells
+lowercase (`$Preexec`), and it isn't introspectable. A silent case-collision is
+the same class of footgun mesh exists to remove, so the fail-loud namespace won.)*
 
 ### Arrays (lists)
 
@@ -1273,13 +1275,13 @@ mesh models a hook point as an **insertion-ordered [map](#maps-associative-array
 of named callables** — the key is the handler's *identity*. That one choice
 solves the composition requirement and the worst hook footgun at once:
 
-- **Re-source-safe by construction.** `$precmd.git = …` is *keyed*, so running
+- **Re-source-safe by construction.** `$hooks.precmd.git = …` is *keyed*, so running
   your rc file again **replaces** the `git` handler instead of stacking a
   duplicate — the bane of bash `PROMPT_COMMAND` (which appends) and zsh's
   `add-zsh-hook` (which needs manual dedup). The identity is what lets you
   re-source freely.
-- **Update or drop one by name** — reassign `$precmd.git`, or `unset $precmd.git`
-  — without touching the others; `$precmd:keys` introspects.
+- **Update or drop one by name** — reassign `$hooks.precmd.git`, or `unset $hooks.precmd.git`
+  — without touching the others; `$hooks.precmd:keys` introspects.
 - **Deterministic order** — maps preserve insertion order, so handlers run
   (and segments render) in the order registered.
 - **Compose, never replace** — adding a key leaves every other handler intact.
@@ -1298,12 +1300,12 @@ given the target) / **`postcd`** (after, now in the new dir, given the previous
 dir), and `exit`:
 
 ```
-$precmd.jobs   = publish-jobs                    # by name
-$postcd.fetch  = func() { vcs auto-fetch & }     # arrived in a new dir — the PWD-gate is now the event itself
-$precd.save    = func(to) { save-dir-state }     # about to leave: act while still in the old dir
-$preexec.timer = func(cmd) { timer-start }       # start the clock…
-$postexec.timer = func(cmd, status, ms) { global last-cmd-time = $ms }   # …stop it; `global` so it survives to feed the prompt
-unset $precmd.jobs                               # remove one
+$hooks.precmd.jobs   = publish-jobs                    # by name
+$hooks.postcd.fetch  = func() { vcs auto-fetch & }     # arrived in a new dir — the PWD-gate is now the event itself
+$hooks.precd.save    = func(to) { save-dir-state }     # about to leave: act while still in the old dir
+$hooks.preexec.timer = func(cmd) { timer-start }       # start the clock…
+$hooks.postexec.timer = func(cmd, status, ms) { global last-cmd-time = $ms }   # …stop it; `global` so it survives to feed the prompt
+unset $hooks.precmd.jobs                               # remove one
 ```
 
 The `pre`/`post` split (rather than a single after-the-fact hook) is what lets a
@@ -1316,7 +1318,7 @@ casing.
 **Command hooks fire for the outer interactive command only.** `preexec` /
 `postexec` fire once for the command line you submit at the prompt — *not* for
 commands run inside a function, a script, a `$(…)`, or a hook handler itself, and
-a handler's own commands don't re-fire them. Without this, `$preexec.timer`'s
+a handler's own commands don't re-fire them. Without this, `$hooks.preexec.timer`'s
 `timer-start` would dispatch `preexec` again forever.
 
 **Directory hooks fire around each actual `cd`** — `precd` *before* the
@@ -1329,21 +1331,22 @@ config hand-rolls). Per-`cd` is the right default because `precd`'s "old dir"
 contract can't hold if the hooks are deferred to function return.
 
 **Status is snapshotted across hook dispatch.** The submitted command's exit
-status is captured before `postexec` / `precmd` run, and **`$status` is restored
-to it** for the prompt segments — so a segment always sees the *interactive
-command's* status, never the status of some command a handler happened to run.
-(`postexec` also gets it as an explicit `status` argument.)
+status (and pipeline stage statuses) are captured before `postexec` / `precmd`
+run, and **`$sh.status` and `$sh.pipestatus` are restored** to them for the
+prompt segments — so a segment always sees the *interactive command's* status,
+never the status of some command a handler happened to run. (`postexec` also
+gets the status as an explicit `status` argument.)
 
 **The prompt** is the same shape, but each segment is a callable that **returns a
 string** (or `""` to contribute nothing); the shell joins the non-empty ones in
 key order:
 
 ```
-$prompt.host = host-seg                           # named, ordered segments
-$prompt.dir  = func() { if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() } }
-$prompt.auth = func() { if ssh-id-missing() { yellow("no-ssh-id") } }   # no else → "" → segment omitted
-$prompt.dir  = my-dir-seg                          # swap ONE segment by name
-unset $prompt.auth                                 # drop the auth warning
+$hooks.prompt.host = host-seg                     # named, ordered segments
+$hooks.prompt.dir  = func() { if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() } }
+$hooks.prompt.auth = func() { if ssh-id-missing() { yellow("no-ssh-id") } }   # no else → "" → segment omitted
+$hooks.prompt.dir  = my-dir-seg                   # swap ONE segment by name
+unset $hooks.prompt.auth                          # drop the auth warning
 ```
 
 (The segments use `if` *expressions* to pick a string — not `and`/`or`, which
