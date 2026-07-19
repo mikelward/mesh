@@ -13,6 +13,12 @@ language, and not a POSIX-compatible `sh`. Where nontrivial logic is needed
 
 ### Goals
 
+Every syntax decision is weighed against three tests, in this order:
+**familiar, consistent, concise** — reuse what people already know, make it
+compose the same way everywhere, then trim. (The *e* in mesh is for
+*ergonomic*.) When these pull apart, familiarity and consistency win over pure
+brevity.
+
 - Excellent interactive ergonomics: completion, history, line editing, prompt.
 - **Byte-stream pipes** — external commands and coreutils work exactly as they
   do everywhere else. No structured-data pipeline (that is the one thing that
@@ -310,9 +316,9 @@ Half-open is the default because `[..n]` then reads as "the first `n`", and
 `[i..j]` has length `j - i` — the two properties that make off-by-one bugs
 rare. Reach for `..=` when you literally mean "up to and including."
 
-**Build and append** go through the spread operator `...` (see
-[Spread](#spread--flattening) below) rather than a mutation verb, so there is
-one primitive to learn:
+**Build** goes through the spread operator `...` (see
+[Spread](#spread--flattening) below), so there is one primitive for assembling
+lists:
 
 ```
 xs = [...$xs e]           # append e
@@ -320,8 +326,24 @@ xs = [pre ...$xs]         # prepend
 both = [...$a ...$b]      # concatenate
 ```
 
-*(open: whether a terse in-place `xs += [e]` / a `push` builtin is worth having
-on top of the spread form for interactive brevity.)*
+**Append in place** is `+=` — the familiar compound-assignment spelling, chosen
+over a `push` verb because it is what people already reach for and it needs no
+new keyword. Its right side is a **list**, whose elements are appended (Python's
+`list += …`, and consistent with `...` spread — `xs += ys` is exactly
+`xs = [...$xs ...$ys]`):
+
+```
+xs += [e]                 # append one element
+xs += [d e f]             # append several
+xs += $more               # extend by another list
+```
+
+Maps take `+=` too, as merge/update (right side wins on key collisions),
+keeping one operator across both collections:
+
+```
+m += [key: value]         # insert or update
+```
 
 ### Maps (associative arrays)
 
@@ -400,11 +422,16 @@ error**:
 
 | Value | Crosses to argv as | Why |
 | --- | --- | --- |
-| string | itself | already bytes |
+| string (NUL-free) | itself | already bytes |
 | int (`$xs:len`, `n = 42`) | decimal digits — `echo $xs:len` → `4` | decimal is canonical, not a choice |
 | bool (a switch, a comparison) | `true` / `false` | two fixed spellings, unambiguous |
+| **string with embedded NUL** | **error** | argv entries are NUL-terminated; the OS cannot carry it (same limit as `export`) |
 | **list** | **error** — spread or `:join` | no canonical separator (space? tab? `,`?) |
 | **map** | **error** — render it explicitly | no canonical flattening at all |
+
+An embedded NUL (which a `$(cmd):raw` capture can hold) is the one place a
+*string* fails to cross — argv, like the environment, is NUL-terminated, so it
+is a hard error at both boundaries, never a silent truncation.
 
 So `echo $xs:len` prints `4` and `echo $found` prints `true`, but `echo $xs`
 (a list) and `echo $m` (a map) are errors that name the fix. The dividing line
@@ -598,9 +625,9 @@ re-litigated here.
 - **String modifier set** — beyond `:strip` / `:replace`.
 - **Predicate qualifier syntax** — confirm `size>` / `age<` / `mtime<` forms.
 - **Arrays / maps / functions / `if`** — core surface now sketched above.
-  Remaining sub-questions: in-place append (`+=` / `push`) vs spread-only;
-  `:has` vs a `?` membership postfix; and a `local` binding narrower than
-  function scope. (Expression-`if` with no `else` is now decided: yields `""`.)
+  Remaining sub-questions: `:has` vs a `?` membership postfix; and a `local`
+  binding narrower than function scope. (Decided: expression-`if` with no
+  `else` yields `""`; in-place append/merge is `+=`.)
 - **Structured return** *(TODO, leaning decided)* — a plain `func` outputs
   stdout bytes; a **function-declaration modifier** (keyword TBD — not `raw`,
   which is taken) marks a function that returns a rich list/map to an in-shell
