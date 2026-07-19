@@ -11,6 +11,21 @@ language, and not a POSIX-compatible `sh`. Where nontrivial logic is needed
 (prompt rendering, VCS info), the shell leans on small external binaries (the
 `vcs`-style split) rather than growing a heavy scripting layer.
 
+The emphasis is interactive use, but fixing the two things that make today's
+interactive shells worse than they need to be:
+
+- **Safer word expansion.** A bare `$x` never word-splits on whitespace or
+  silently glob-expands. The default capture splits on newlines and lists stay
+  whole (see [Command substitution](#command-substitution) /
+  [Spread](#spread--flattening)) — the footgun is opt-*in*, spelled `...`, not
+  opt-out via quoting.
+- **No backwards-compatibility contortions.** bash arrays are the cautionary
+  tale: a genuinely useful feature bolted onto a word-splitting, POSIX-compatible
+  base until it takes `"${arr[@]}"` incantations to use without getting burned.
+  mesh starts from a clean base instead, so arrays, maps, expansion, and quoting
+  are *boring and safe by default* — the point of the [clean
+  break](#core-decisions).
+
 ### Goals
 
 Every syntax decision is weighed against three tests, in this order:
