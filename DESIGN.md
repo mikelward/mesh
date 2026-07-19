@@ -830,6 +830,47 @@ So `echo $xs:len` prints `4` and `echo $found` prints `true`, but `echo $xs`
 is "is there one obviously-right rendering?" — ints and bools have one, a list's
 separator and a map's shape do not.
 
+### Destructuring
+
+Binding several names from a list in one step reuses the **list-literal syntax on
+the left**. So splitting a string into variables — bash's `read a b c` — is just
+*split then destructure*, and there is no monolithic `read` built-in:
+
+```
+[user pass uid gid home shell] = $line:split ":"   # a passwd line into fields
+[k v]           = gets():split "="                 # read a line, split on =, bind two
+[first ...rest] = $args                            # ...rest absorbs the remainder as a list
+[a b ...mid z]  = $xs                              # ends pinned; mid is everything between
+[_ _ uid]       = $line:split ":"                  # _ discards a field
+```
+
+- **`...rest`** absorbs the remaining elements as a list (possibly empty) — the
+  variable-length case; it may sit anywhere, with fixed names on either side.
+- **`_`** discards that position — the same wildcard [`match`](#matching-match) uses.
+- **A length mismatch is an error** unless a `...rest` is present, consistent with
+  [no null](#variables-and-assignment): a missing field is a bug, not a silent
+  empty. This is cleaner than bash's `read`, where the last variable silently soaks
+  up the leftover — here you write `...rest` when you mean it.
+
+**The pattern grammar is shared with [`match`](#matching-match).** A bare
+destructuring assignment is the *unconditional* use ("I know the shape — bind it");
+a **`match` arm** is the *conditional* use — branch on shape or length and bind in
+the same step:
+
+```
+match $args {
+  []            { usage() }                # empty
+  [cmd]         { run($cmd) }              # exactly one, bound as cmd
+  [cmd ...rest] { run($cmd ...$rest) }     # one-or-more; rest bound
+}
+```
+
+So destructuring isn't *owned* by `match` — it is one list-pattern grammar, used
+bare for the simple case and in a `match` arm when you need to branch.
+
+*(deferred: **map destructuring** — `[name: n, age: a] = $m` binding by key — a
+natural extension of the same idea; and nested patterns (`[a [b c]] = …`).)*
+
 ### Functions
 
 ```
@@ -1553,14 +1594,18 @@ programs or user functions:
     *no-such-directory* error, not command-not-found. On by default —
     `$sh.options.autocd = off` disables it.
 - **I/O**
-  - **`puts [args…]`** — write the arguments joined by a single space, then a
-    newline (a list spreads: `puts ...$xs`). It takes **no flags** — none of
-    `echo`'s `-e` / `-n` reinterpretation, because escapes are already resolved by
-    the [string literal](#quoting-and-escaping), so `puts` never re-parses its
-    input.
-  - **`print [args…]`** — the same, but with **no trailing newline** — for partial
-    lines and hand-built prompts. The `puts` / `print` pair replaces `echo -n`,
-    keeping both flag-free.
+  - **`puts [args…]`** — write to stdout. **Scalar** arguments are joined by a
+    single space (`puts a b` → `a b`), then a newline; a **list** argument prints
+    **one element per line** (a list *is* a sequence of lines — `puts $(ls)`
+    reprints the listing) and a **map** prints `key: value` per line. `puts` can
+    render these rich values because it is a **built-in** operating on real values —
+    an *external* command still needs bytes (spread or
+    [`:join`](#spread--flattening)). It takes **no flags** — none of `echo`'s
+    `-e` / `-n` reinterpretation, since escapes are already resolved by the
+    [string literal](#quoting-and-escaping).
+  - **`print [args…]`** — the same rendering, but with **no trailing newline** —
+    for partial lines and hand-built prompts. The `puts` / `print` pair replaces
+    `echo -n`, keeping both flag-free.
   - **`gets [var]`** — read one line from stdin into `var` (trailing newline
     stripped) and return that line as its value. **At EOF it returns `false`**
     (whose [status](#variables-and-assignment) is `1`) and leaves `var` unchanged,
