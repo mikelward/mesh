@@ -1390,18 +1390,30 @@ combine bools, not values — and the `auth` segment leans on the decided
 no-`else`-yields-`""` rule so "not applicable" is just an empty contribution.)
 
 **Color comes from a `style` helper, not raw escapes.** The value call
-`style("no-ssh-id" --fg yellow --bold)` returns a **styled value** — text
-carrying style attributes — rather than baked-in ANSI. It is an ordinary value
+`style("no-ssh-id" --fg yellow --bold)` returns a **styled value** — text and
+style attributes kept apart — rather than baked-in ANSI. It is an ordinary value
 call, so it takes attached parens and `--flag` arguments like any other; a *bare*
 `style …` would run it in command position and yield a status, not the value
-(hence the parens in the example above). Because the shell owns rendering, from a
-styled value it measures true **display width** off the text alone (raw escapes
-buried in a string are the classic prompt width-math footgun) and can later strip
-or re-theme the styling. So a **renderable** is either a plain string or a styled
-value, and one whose **text** is empty contributes nothing — a plain `""` or a
-styled value with empty text alike, since emptiness is judged by the payload
-text, so `style("" --fg yellow)` is omitted rather than emitted as bare control
-codes. `style` is the one styling primitive in the MVP (color + bold).
+(hence the parens in the example above).
+
+This falls out of the general [`$(…)`-vs-`()` split](#calling-for-a-value-and-lambdas):
+**`()` yields a structured value, `$(…)` yields raw output.** A **renderable** is
+therefore one of two things:
+
+- a **styled value** (from a `()` call to `style`) — text and attributes kept
+  separate, so the shell measures display width from the text *and* can strip or
+  re-theme the styling (needed for the later transient/collapsed form); or
+- a **plain string** — which may carry its own ANSI escapes, as an external
+  renderer captured with `$(vcs prompt-info)` does (externals have no return
+  value, so the renderer necessarily comes in through the output lane). The shell
+  still measures visible width correctly by **skipping** the escape sequences; it
+  just treats them as opaque and cannot restyle them.
+
+So width is accurate either way — the reason to prefer `style` is that structured
+attributes stay *restylable*, which raw escapes are not. A renderable whose
+**text** is empty contributes nothing — a plain `""` or `style("" --fg yellow)`
+alike, since emptiness is judged by the payload text (not emitted as bare control
+codes). `style` is the one styling primitive in the MVP (color + bold).
 
 **A segment may render more than one line.** The shell assembles the segments
 into a single prompt buffer and treats a **newline as a line break wherever it
