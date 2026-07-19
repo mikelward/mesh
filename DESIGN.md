@@ -1443,13 +1443,16 @@ programs or user functions:
   searches `CDPATH`); the block form `in DIR { }` covers scoped `pushd`/`popd`.
 - **I/O** — `puts` (write a line — mesh's `echo`) and `gets` (read a line into a
   variable).
+- **Formatting** — `style` (produce a [styled value](#hooks-and-the-prompt) for
+  the prompt); it must be a built-in because a structured return value can't come
+  from an external command.
 - **Vars / env** — `export`, `unset`, `global`, and `source FILE` to (re-)load a
   file — re-sourcing your rc is safe because [hooks are keyed](#hooks-and-the-prompt).
 - **Jobs** — `fg`, `bg`, `jobs`, `kill`, `wait` ([Job control](#job-control)).
 - **Session** — `exit [status]`.
 
 **No aliases.** mesh drops the alias mechanism entirely: a **function** is just
-as terse (`func ll() { ls -l --color ...$sh.args }`), and it composes, scopes,
+as terse (`func ll(...args) { ls -l --color ...$args }`), and it composes, scopes,
 and takes arguments properly, so there's no second half-language of "short
 names." A bare word that is neither a function nor a built-in is a
 command-not-found error, never a silently-expanded alias.
@@ -1474,9 +1477,13 @@ readline is avoided as GPL.
 `Ctrl-B`/`Ctrl-F` and arrows to move, `Ctrl-W` / `Alt-Backspace` word-kill,
 `Ctrl-U`/`Ctrl-K` line-kill, `Ctrl-Y` yank, `Ctrl-R` reverse history search,
 up/down for history, `Tab` to complete, `Ctrl-L` to clear. **Multi-line
-continuation** is a validator: an unclosed brace/quote/paren, or a trailing `|` /
-`&&` / `\`, keeps reading on a continuation line. The editor owns rendering the
-[prompt](#hooks-and-the-prompt) segment map and its multi-line redraw.
+continuation** is driven by **parser incompleteness** — the editor asks the
+parser whether the buffer is a complete command and, if not, reads a continuation
+line — so *every* unfinished form is covered uniformly rather than by an
+enumerated token list: an unclosed `{` / `[` / `(` / quote, or a trailing binary
+connector (`|`, `|&`, `&&`, `||`) or line-continuation `\`. The editor owns
+rendering the [prompt](#hooks-and-the-prompt) segment map and its multi-line
+redraw.
 
 *(deferred: exposing the **keybinding config** from `rc.mesh` — the whole reason
 for the library choice — plus a vi mode, custom widgets, fish-style
