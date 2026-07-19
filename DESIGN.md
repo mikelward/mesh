@@ -1236,9 +1236,14 @@ Rules:
 - **Regex captures** *(open)*: a `/re/` arm likely exposes its groups (e.g. as a
   list) to that arm's body; spelling TBD.
 - **List-shape patterns** *(settled — see [Destructuring](#destructuring))*: a
-  `match` arm may be a list pattern (`[a b]`, `[cmd ...rest]`, `_` to discard),
-  sharing the one list-pattern grammar with destructuring assignment. **Map-shape**
-  patterns (`[k: v]`) and nested patterns stay **deferred** until the need is real.
+  `match` arm may be a list pattern that **binds by position** — a bare element is
+  always a **binder** (never a literal to match), with `_` to discard and `...rest`
+  for the tail (`[a b]`, `[cmd ...rest]`). Note this differs from a *top-level* arm,
+  where a bare word is a literal: inside `[ ]` you are destructuring, so `[start arg]`
+  binds both. To *match* a specific element, use an arm **guard**
+  (`[verb ...rest] if $verb == "quit"`). Richer element sub-patterns (a literal /
+  glob / `/re/` element, or nesting) and **map-shape** patterns (`[k: v]`) stay
+  **deferred** until the need is real.
 
 ### Tests and comparisons
 
@@ -1523,7 +1528,10 @@ step** — so any output a handler writes (`puts "interrupted"`) appears *before
 fresh prompt is drawn, never stranded after it, and the line editor's displayed
 buffer / cursor stay consistent (a WINCH handler's output likewise precedes the
 reflow). Handlers fire for signals delivered while a script, function, or command
-is running, matching where bash traps fire.
+is running, matching where bash traps fire. And — as with `postexec` / `preprompt`
+dispatch — **`$sh.status` and `$sh.pipestatus` are snapshotted and restored** across
+a handler, so a command the handler runs (that `puts`) can't overwrite the
+interrupted foreground status the next prompt reports.
 
 *(deferred: whether a handler may **suppress** a default (e.g. swallow `Ctrl-C`);
 exact SIGINT delivery mid-pipeline; and per-signal masking during handler
