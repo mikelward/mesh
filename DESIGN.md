@@ -1733,16 +1733,20 @@ for the count, `$sh.args[0]` for the first — none of `$1` / `$@` / `$#`), and
 runtime entries.
 
 *(TODO: **am-I-sourced, and the current source file.** A file needs to know both
-that it is being **`source`d** (vs run as a script vs typed interactively) and the
-**path of the file currently being sourced** — bash's `${BASH_SOURCE[0]}` and the
-`[[ "${BASH_SOURCE[0]}" != "$0" ]]` idiom, which real rc files use to locate
-sibling files and to guard "only when executed directly" blocks. Candidates: a
-read-only **`$sh.source`** (the path of the file being evaluated, empty for
-interactive input) and **`$sh.sourced`** (bool), or a small `$sh` context record
-(source path + execution mode: interactive / script / sourced). `$sh.name`
-(bash's `$0`) is not enough — it doesn't change on `source` and can't locate the
-sourced file. Decide whether `$sh.source` nests (a stack, for a file that sources
-another) or reports only the innermost.)*
+that it is being **`source`d** (vs run as a script, a `-c` command string, `-s`
+stdin, or typed interactively) and the **path of the file currently being
+sourced** — bash's `${BASH_SOURCE[0]}` and the `[[ "${BASH_SOURCE[0]}" != "$0" ]]`
+idiom, which real rc files use to locate sibling files and to guard "only when
+executed directly" blocks. Model the two axes **orthogonally**: an input **origin**
+— `script` / `sourced` / `command` (`-c`) / `stdin` (`-s`) / `interactive` — kept
+separate from **interactivity**, since `mesh -i script.mesh` is interactive *and* a
+script; interactivity is already [`$sh.interactive`](#variables-and-assignment).
+Then a read-only **`$sh.source`** carries the path of the file being evaluated,
+defined only for the **file** origins (`script` / `sourced`) and empty for
+`command` / `stdin` / `interactive`. `$sh.name` (bash's `$0`) is not enough — it
+doesn't change on `source` and can't locate the sourced file. Decide whether
+`$sh.source` nests (a stack, for a file that sources another) or reports only the
+innermost.)*
 
 *(deferred: system-wide `/etc/mesh/*` files; mutating positional args
 (`shift` / `set --`); and whether a non-login, non-interactive script should skip
