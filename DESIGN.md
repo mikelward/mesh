@@ -141,7 +141,10 @@ There are four kinds of modifier, and the difference matters:
 - **Split modifiers** (`:lines :words :nulls :tabs :split`) turn a command
   substitution's **raw byte capture** into a list. They *replace* the default
   newline split and run against the raw bytes — they never run *after* it. Each
-  applies to a `$(…)` capture, producing the list. The odd one out is **`:raw`**,
+  applies to a `$(…)` capture, producing the list. They apply equally to a
+  **plain string value** (`$line:split ":"`, `gets():words`) — there the string's
+  own bytes are the input and there is no default split to override; the `$(…)`
+  capture is just the most common source. The odd one out is **`:raw`**,
   which lives in the same capture-modifier family but is the *no-split* member:
   it yields the raw bytes as **one string**, not a list (it is what turns the
   default newline-splitting off). So every split modifier produces a list
@@ -886,21 +889,53 @@ capture groups, so destructuring names them in one step:
   sub-matches only, *not* the whole match — so `[one two] = …:matches /(.*) (.*)/`
   binds exactly the two groups. A pattern with **no** group yields the whole match
   as a one-element list, so `[ip] = …:matches /re/` still binds.
+- **An unmatched group keeps its slot as `""`** — a group that didn't participate
+  (an optional `(a)?(b)` against `"b"`) contributes an **empty string**, never a
+  dropped position, so the list length equals the group count and the following
+  bindings don't shift. mesh has no null, so `""` is the placeholder (a group that
+  matched empty and one that didn't both read as `""` — distinguish with an
+  explicit optional-group guard if you must).
 - **Named groups** `(?<name>…)` come back as a **map** keyed by name
-  (`m = $str:matches /(?<user>\w+)@(?<host>\S+)/` then `$m.user`), which pairs
-  with map destructuring once that lands (deferred below).
-- **No match yields an empty list** (`[]`, or `{}` for named groups). Because an
-  empty list is [falsy](#tests-and-comparisons) and length-mismatches a fixed
-  pattern, `[a b] = $str:matches /…/` **errors loudly** when the string doesn't
-  match — the [no-null](#variables-and-assignment) rule again — while
-  `if $str:matches /…/ { … }` or a `match` over the result lets you **test first**:
+  (`m = $str:matches /(?<user>\w+)@(?<host>\S+)/` then `$m.user`); an unmatched
+  named group is present with value `""`. This pairs with map destructuring once
+  that lands (deferred below).
+- **No match yields `false`**, not an empty collection. Matching is a pass/fail
+  operation, so on a miss `:matches` returns the bool **`false`** (status `1`) —
+  keeping the model's rule that failure is signalled by a `false`, never by the
+  *shape* of a value. On a match it returns the capture list (or map).
+  That makes the result a **valid condition** on its own:
+
+  ```
+  if $str:matches /(.*) (.*)/ { … }      # matched? — false on a miss
+  ```
+
+- **Bind and test in one step** by using the assignment *as* the condition — the
+  `if let` shape, so the pattern is written **once** and the names are in scope for
+  the block:
+
+  ```
+  if [one two] = $str:matches /(.*) (.*)/  { puts "$one / $two" }
+  if m = $str:matches /(?<user>\w+)@(?<host>\S+)/  { puts $m.user }
+  ```
+
+  As a *condition*, `lhs = rhs` tests the RHS's status: a match binds `lhs` and
+  enters the block; a miss (`false`) skips it and binds nothing. This isn't
+  regex-specific — `if line = gets() { … }` falls out of the same rule, since
+  `gets()` returns `false` at EOF. The longer `match`-with-destructuring form is
+  there when you want to branch on more than one shape:
 
   ```
   match $line:matches /(\w+): (.*)/ {
     [key val] { … }      # matched — key/val bound
-    []        { … }      # no match
+    false     { … }      # no match
   }
   ```
+
+- **A bare, unconditional bind is an assertion.** `[a b] = $str:matches /…/` with
+  no `if` says "I know this matches" — so a miss (`false`, not a two-element list)
+  is a **loud error**, the [no-null](#variables-and-assignment) rule again: an
+  unconditional bind that silently yielded `a = ""` would bury the bug. Reach for
+  the `if` form when a miss is expected; the bare form when it isn't.
 
 This makes `/re/` mesh's one regex story on the *value* side too: `~`
 ([Tests](#tests-and-comparisons)) answers yes/no, `:matches` extracts the
@@ -1195,6 +1230,14 @@ Decisions:
   vocabulary](#requirements-carried-over-from-existing-configs)
   (`have_command`, `inside_project`, …) is just commands/functions — they slot
   straight into `if` with no `[ … ]` / `test`.
+- **An assignment may *be* the condition** — `if lhs = rhs { … }`, the `if let`
+  shape. It tests the RHS's status (a `false` / nonzero fails), and on success
+  binds `lhs` for the block; `lhs` may be a name or a `[…]`
+  [destructuring](#destructuring) pattern, so `if [one two] = $s:matches /…/ { … }`
+  and `if line = gets() { … }` both test-and-bind in one step, with the RHS written
+  once. A miss binds nothing. This is the conditional counterpart to a bare
+  `lhs = rhs` statement, which stays a loud assertion (a shape/length mismatch
+  errors rather than yielding false).
 - **No `then` / `fi`.** Brace-delimited blocks, same as `func` bodies; chain
   with `else if`. The POSIX `then`/`elif`/`fi` scaffolding is dropped (clean
   break).
