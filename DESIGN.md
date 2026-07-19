@@ -1446,13 +1446,15 @@ signals never end your session; only a lost terminal (SIGHUP) does:
   does nothing, so a stray `Ctrl-D` can't drop you mid-command. An
   **`$sh.options.ignore-eof`** setting can require a second press.
 - **`Ctrl-Z` / SIGTSTP** — suspend the foreground job to a **stopped**
-  [job](#job-control).
+  [job](#job-control); at an idle prompt (no foreground job) it is **ignored** —
+  the interactive shell never suspends itself.
 - **`Ctrl-\` / SIGQUIT** — ignored at the prompt; delivered to the foreground job.
 - **SIGWINCH** (resize) — the [line editor](#line-editing) reflows and redraws the
   (possibly multi-line) prompt.
-- **SIGHUP** (terminal closed) — the shell exits and HUPs its jobs; **SIGTERM** is
-  ignored interactively (as bash does). (A `disown` exemption from the HUP arrives
-  with `disown` itself, which is [deferred](#job-control).)
+- **SIGHUP** (terminal closed) — the shell exits and sends its jobs **SIGHUP then
+  SIGCONT** (a *stopped* job can't act on the HUP until it's continued); **SIGTERM**
+  is ignored interactively (as bash does). (A `disown` exemption from the HUP
+  arrives with `disown` itself, which is [deferred](#job-control).)
 
 **User handlers are keyed hook maps, not bash's `trap`.** `$sh.signal.<NAME>` is an
 insertion-ordered map of named callables — the *same shape* as `$sh.preprompt` and
