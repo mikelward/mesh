@@ -901,31 +901,35 @@ capture groups, so destructuring names them in one step. Like `~`, it is
 - **Named groups** `(?<name>…)` come back as a **map** keyed by name
   (`m = $str:match /(?<user>\w+)@(?<host>\S+)/` then `$m.user`); an unmatched
   named group is present with value `""`. This pairs with map destructuring once
-  that lands (deferred below).
+  that lands (deferred below). **Name all the groups or none** — a pattern that
+  *mixes* named and unnamed groups is a **loud error** for the MVP (list or map is
+  ambiguous); a later map-keyed-by-both-name-and-position rule is deferred until the
+  need is real.
 - **No match yields `false`**, not an empty collection. Matching is a pass/fail
   operation, so on a miss `:match` returns the bool **`false`** (status `1`) —
-  keeping the model's rule that failure is signalled by a `false`, never by the
+  keeping the model's rule that failure is signaled by a `false`, never by the
   *shape* of a value. On a match it returns the capture list (or map).
-  That makes the result a **valid condition** on its own:
+- **Test with `~`, capture with an `if`-binding.** A match returns a list/map, and
+  a bare collection is *not* a condition (the [condition
+  contract](#conditionals-if-is-an-expression) is a bool or a command, and a
+  list has status `0` whether or not it matched). So use `~` for a pure yes/no, and
+  put the assignment *in* the condition — the `if let` shape — to test **and**
+  capture in one step, pattern written **once**, names in scope for the block:
 
   ```
-  if $str:match /(.*) (.*)/ { … }      # matched? — false on a miss
-  ```
-
-- **Bind and test in one step** by using the assignment *as* the condition — the
-  `if let` shape, so the pattern is written **once** and the names are in scope for
-  the block:
-
-  ```
+  if $str ~ /(.*) (.*)/  { … }                          # yes/no only
   if [one two] = $str:match /(.*) (.*)/  { puts "$one / $two" }
   if m = $str:match /(?<user>\w+)@(?<host>\S+)/  { puts $m.user }
   ```
 
-  As a *condition*, `lhs = rhs` tests the RHS's status: a match binds `lhs` and
-  enters the block; a miss (`false`) skips it and binds nothing. This isn't
-  regex-specific — `if line = gets() { … }` falls out of the same rule, since
-  `gets()` returns `false` at EOF. The longer `match`-with-destructuring form is
-  there when you want to branch on more than one shape:
+  As a *condition*, `lhs = rhs` is true iff the RHS is **truthy** (a `false` — the
+  no-match, or `gets()` at EOF — fails it) **and** its shape fits `lhs`; on true the
+  names bind for the block, on false it skips and binds nothing. A shape mismatch in
+  the condition (`[a b]` against a three-element list) is a **soft false → skip** —
+  deliberately unlike the bare statement below. This isn't regex-specific:
+  `if line = gets() { … }` falls out of the same rule. The longer
+  `match`-with-destructuring form is there when you want to branch on more than one
+  shape:
 
   ```
   match $line:match /(\w+): (.*)/ {
@@ -937,8 +941,10 @@ capture groups, so destructuring names them in one step. Like `~`, it is
 - **A bare, unconditional bind is an assertion.** `[a b] = $str:match /…/` with
   no `if` says "I know this matches" — so a miss (`false`, not a two-element list)
   is a **loud error**, the [no-null](#variables-and-assignment) rule again: an
-  unconditional bind that silently yielded `a = ""` would bury the bug. Reach for
-  the `if` form when a miss is expected; the bare form when it isn't.
+  unconditional bind that silently yielded `a = ""` would bury the bug. (The same
+  mismatch *inside* an `if` condition is the quiet skip above — that contrast is the
+  point of the `if let` form.) Reach for the `if` form when a miss is expected; the
+  bare form when it isn't.
 
 This makes `/re/` mesh's one regex story on the *value* side too: `~`
 ([Tests](#tests-and-comparisons)) answers yes/no, `:match` extracts the
@@ -1083,7 +1089,7 @@ Rules:
   So `have_command` ends in a test whose bool becomes the status and
   `if have_command fzf { … }` reads correctly; `return $cond` exits `0`/`1`;
   `return 2` exits `2`; and a function that returns a string or a list is a
-  success (`0`) when its status is observed. Failure is only ever signalled by a
+  success (`0`) when its status is observed. Failure is only ever signaled by a
   command's own status, a `false`, or an explicit nonzero `int` — never by the
   mere *shape* of a returned value.
 
@@ -1243,13 +1249,17 @@ Decisions:
   (`have_command`, `inside_project`, …) is just commands/functions — they slot
   straight into `if` with no `[ … ]` / `test`.
 - **An assignment may *be* the condition** — `if lhs = rhs { … }`, the `if let`
-  shape. It tests the RHS's status (a `false` / nonzero fails), and on success
-  binds `lhs` for the block; `lhs` may be a name or a `[…]`
-  [destructuring](#destructuring) pattern, so `if [one two] = $s:match /…/ { … }`
-  and `if line = gets() { … }` both test-and-bind in one step, with the RHS written
-  once. A miss binds nothing. This is the conditional counterpart to a bare
-  `lhs = rhs` statement, which stays a loud assertion (a shape/length mismatch
-  errors rather than yielding false).
+  shape. The condition is true iff the RHS is **truthy** (a `false` / failed
+  command / nonzero int fails it) **and** its shape **fits** `lhs`; on true the
+  names bind for the block, on false it skips and binds nothing. `lhs` may be a
+  name (always fits) or a `[…]` [destructuring](#destructuring) pattern, so
+  `if [one two] = $s:match /…/ { … }` and `if line = gets() { … }` both test-and-bind
+  in one step, RHS written once. Crucially, **pattern-fit is part of the test**: a
+  shape or length mismatch (`[a b]` against a three-element list) makes the
+  condition *false and skips* — it does **not** error. That is the deliberate
+  contrast with a bare `lhs = rhs` statement, where the same mismatch is a loud
+  assertion failure — the conditional form is "bind if it fits," the statement form
+  is "it must fit."
 - **No `then` / `fi`.** Brace-delimited blocks, same as `func` bodies; chain
   with `else if`. The POSIX `then`/`elif`/`fi` scaffolding is dropped (clean
   break).
