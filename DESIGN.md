@@ -903,7 +903,7 @@ Rules:
   | command | its own exit status |
   | int | the integer itself — `0` success (the shell `return N`) |
   | bool | `true` → `0`, `false` → `1` (the Unix inversion) |
-  | string / list / map (incl. empty) | `0` — producing a value *is* success |
+  | string / list / map / styled value (incl. empty) | `0` — producing a value *is* success |
 
   So `have_command` ends in a test whose bool becomes the status and
   `if have_command fzf { … }` reads correctly; `return $cond` exits `0`/`1`;
@@ -1398,8 +1398,10 @@ call, so it takes attached parens and `--flag` arguments like any other; a *bare
 styled value it measures true **display width** off the text alone (raw escapes
 buried in a string are the classic prompt width-math footgun) and can later strip
 or re-theme the styling. So a **renderable** is either a plain string or a styled
-value, and an empty string contributes nothing; `style` is the one styling
-primitive in the MVP (color + bold).
+value, and one whose **text** is empty contributes nothing — a plain `""` or a
+styled value with empty text alike, since emptiness is judged by the payload
+text, so `style("" --fg yellow)` is omitted rather than emitted as bare control
+codes. `style` is the one styling primitive in the MVP (color + bold).
 
 **A segment may render more than one line.** The shell assembles the segments
 into a single prompt buffer and treats a **newline as a line break wherever it
