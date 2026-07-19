@@ -1499,41 +1499,66 @@ and the distinctive choice is that command-argument completion is
 **auto-generated, never hand-written**: no bash/zsh-style completion scripts to
 maintain, in the spirit of fish's `--help`/man-page scraping.
 
-**One spec per command, and `--help` generates it.** There is a single notion of a
+**One spec per command, generated for you.** There is a single notion of a
 per-command **spec** — its subcommands, flags, and which arguments expect a
 file / dir / enum value. A spec is found by a layered resolver:
 
-1. a **curated spec file**, if one exists (same format, a drop-in override) —
-   `$XDG_DATA_HOME/mesh/completions/`;
-2. else a spec **auto-generated from `cmd --help`** and cached —
-   `$XDG_CACHE_HOME/mesh/completions/`;
-3. else plain **file / dir** completion — the universal fallback.
+1. a **curated spec file** if one exists (a drop-in override) —
+   `$XDG_DATA_HOME/mesh/completions/` (`$XDG_DATA_HOME` defaulting to
+   `~/.local/share`);
+2. else a spec **parsed from the command's man page** — this needs *no execution*,
+   so it is preferred over the probe below;
+3. else a spec **auto-generated from `cmd --help`** — the executing probe, for
+   external commands only;
+4. else plain **file / dir** completion — the universal fallback.
+
+Both generated specs (man page, `--help`) are **cached** under
+`$XDG_CACHE_HOME/mesh/completions/` (`$XDG_CACHE_HOME` defaulting to `~/.cache`),
+keyed by the command's path + mtime so they regenerate on upgrade.
 
 Files and dirs are not a separate mechanism; they are the built-in *value types* a
 spec's arguments point at (`cd` completes dirs; a `--output FILE` flag completes
-files). Unifying the two sources this way means there is one format and one
-resolver — the `--help` parser simply *writes* a spec of the same shape a curated
-file would.
+files). Every source — curated file, man page, `--help` — writes a spec of the
+**same shape**, so there is one format and one resolver.
 
 **In command position (word 0)** completion offers PATH executables, functions,
 and built-ins. After that the spec drives it: subcommands, flags (`-x` / `--long`),
 a flag's value (file / dir / enum), or a positional file / dir.
 
-**Generation is lazy and cached.** The first time you complete arguments for a
-command with no spec yet, mesh runs `cmd --help` *once*, parses it, and writes a
-cached spec keyed by the binary's path + mtime — generated once, self-healing on
-upgrade, never re-probed on later Tabs. Running an arbitrary `--help` at
-completion time is the real hazard, so the probe is defended:
+**Only external executables are ever run.** The `--help` probe applies solely to a
+resolved external binary; the shell never executes a **function** or **built-in**
+to learn its arguments — it introspects them. In fact mesh gives **every function
+a canned `--help`**, auto-generated from its declared **parameter signature** (its
+positionals, `--switch` / `--flag`s, and `...rest`, see [Functions](#functions))
+and emitted in the *same format the `--help` parser reads* — so `ll --help` prints
+a real usage message **and** completion reads that same spec, both without running
+the function. A function extends the generated help with a **docstring** (a
+leading string in its body) for per-argument descriptions; the signature alone is
+the zero-effort default. Built-ins ship their specs the same way. This is why the
+[command-position](#completion) sources — functions and built-ins — need no probe.
+
+**Generation is lazy.** A spec is generated the first time you complete
+*arguments* for a command with no spec yet, then cached, so later Tabs never
+regenerate. The man-page parse is tried first because it runs nothing; the
+`--help` probe is the executing fallback.
+
+**On executing `--help`:** it fires only at *argument* completion — after you have
+already typed the command name and a space — so you have signaled intent to run
+that command, and reading its `--help` is within that intent (you would have run
+`cmd --help` yourself otherwise), not a surprise execution. It is still bounded:
 
 - **stdin from `/dev/null`**, so a command that reads input can't hang the prompt;
 - a **short timeout** with kill, and an **output-size cap**;
-- an **opt-out denylist** for commands whose `--help` isn't safe or idempotent;
+- an **opt-out denylist** for commands whose `--help` isn't safe, plus a global
+  off switch **`$sh.options.complete.probe = off`** for anyone who wants *zero*
+  implicit execution (curated specs, man pages, and file / dir still work);
 - **conservative parsing** — recognize the `-x` / `--long` / `--long=VAL` /
   subcommand-table shapes; if parsing yields nothing, silently fall back to
   file / dir.
 
-(Modern `--help` from clap / cobra / argparse is regular enough that this works in
-practice — the bet fish already makes.)
+(`--help` is side-effect-free by near-universal convention, and clap / cobra /
+argparse output is regular enough to parse — the bet fish makes; the
+man-page-first order and the off switch cover the rest.)
 
 **Override hook.** The **`$sh.complete`** map — keyed by command, each value a spec
 *or* a callable returning candidates — overrides or augments the auto-generated
@@ -1541,10 +1566,9 @@ spec, matching the keyed-map pattern used for [hooks](#hooks-and-the-prompt).
 Auto-generation stays the zero-config default; this is where a *dynamic* completer
 (git branches, a live PID list) goes.
 
-*(deferred: the exact spec-file format; man-page parsing as a second generation
-source; dynamic value providers; recursive per-subcommand `--help` probing; and
-shared/remote spec repos. The match/menu UI itself is the
-[line editor](#line-editing)'s.)*
+*(deferred: the exact spec-file format; the function-docstring format; dynamic
+value providers; recursive per-subcommand `--help` probing; and shared/remote spec
+repos. The match/menu UI itself is the [line editor](#line-editing)'s.)*
 
 ### Hooks and the prompt
 
