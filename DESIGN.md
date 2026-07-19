@@ -486,7 +486,8 @@ top-level is **yours**; the built-ins hang off two reserved roots:
   **`$sh.status`** (last exit, int `0`–`255`, the readable replacement for `$?`),
   **`$sh.pipestatus`** (a **list** of the last pipeline's stage statuses, where
   real lists beat bash's `PIPESTATUS`), `$sh.pid`, `$sh.version`, `$sh.options`,
-  `$sh.interactive`; **and the hooks** — `$sh.prompt`, `$sh.preprompt`,
+  `$sh.interactive`, and **`$sh.jobs`** (the live [job-control](#job-control)
+  map); **and the hooks** — `$sh.prompt`, `$sh.preprompt`,
   `$sh.preexec` / `$sh.postexec`, `$sh.precd` / `$sh.postcd`, `$sh.exit`
   ([Hooks and the prompt](#hooks-and-the-prompt)).
 
@@ -496,9 +497,11 @@ clashes. Access is strict [map access](#maps-associative-arrays), so `$sh:keys`
 lists the whole surface and a mistyped key fails loud.
 
 **Read-only vs. writable within `$sh`.** The **runtime** entries (`$sh.status`,
-`$sh.pipestatus`, `$sh.pid`, `$sh.version`, `$sh.interactive`) are the shell's
-authoritative state — **read-only**: assigning or `unset`ting one is an error, so
-config can't corrupt an invariant. The **configuration** entries are yours to
+`$sh.pipestatus`, `$sh.pid`, `$sh.version`, `$sh.interactive`, and `$sh.jobs`
+with its records) are the shell's authoritative state — **read-only**: assigning
+or `unset`ting one is an error, so config can't corrupt an invariant. (`$sh.jobs`
+changes only through `&` / `fg` / `bg` / `kill` and job completion, never by
+mutating the map directly — you still *read* it freely, e.g. `$sh.jobs:len`.) The **configuration** entries are yours to
 write: the hook maps (`$sh.prompt`, `$sh.preprompt`, …) and the `$sh.options`
 settings map. (This is the one place the general map rules are constrained —
 individual keys carry a mutability flag.)
@@ -1312,6 +1315,8 @@ cmd 2>&1            # stderr to wherever stdout currently goes
 cmd &> file         # both stdout and stderr (>& also accepted)
 cmd 2>> file        # stderr, append
 cmd > /dev/null     # discard
+a | b               # pipe: a's stdout to b's stdin (the byte-stream pipe)
+a |& b              # pipe stdout AND stderr (shorthand for a 2>&1 | b)
 cmd << END … END    # here-document
 cmd <<< "text"      # here-string
 cmd 3< file         # explicit fd; n>&m dup, n>&- close
@@ -1347,7 +1352,7 @@ $sh.jobs
 #   2: [pid: 49001, cmd: "vim notes", state: stopped, status: ""] ]
 
 $sh.jobs:len              # 2   — this is `publish-jobs`, now one word in a prompt segment
-$sh.jobs.2.state          # stopped
+$sh.jobs[2].state          # stopped
 $sh.jobs:values:filter func(j) { $j.state == running }
 ```
 
@@ -1366,11 +1371,11 @@ so `$j.pid` is mesh's replacement for bash's `$!` and `$j` is the thing you
 | foreground | `fg` (most recent) · `fg 2` · `fg %2` · `fg $j` |
 | resume in background | `bg` · `bg 2` · `bg %2` |
 | list | `jobs` (pretty-prints `$sh.jobs`) |
-| signal | `kill $j` · `kill $sh.jobs.2` · `kill %2` — but `kill 49001` is still a **PID** |
+| signal | `kill $j` · `kill $sh.jobs[2]` · `kill %2` — but `kill 49001` is still a **PID** |
 | wait for it | `wait $j` |
 
 **Job references — three ways, no ambiguity.** `fg` / `bg` only ever take a job,
-so a **bare id** there (`fg 2`) is unambiguous. The **handle** (`$sh.jobs.2`, or
+so a **bare id** there (`fg 2`) is unambiguous. The **handle** (`$sh.jobs[2]`, or
 `$j` from `j = cmd &`) is the value-model reference and is what disambiguates
 `kill` from a PID. And the **`%n` sigil is kept as sugar** for muscle memory —
 `%2` (by id), **`%+`** / **`%%`** (current job), **`%-`** (previous job), and
