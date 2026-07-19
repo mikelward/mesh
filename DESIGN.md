@@ -138,10 +138,14 @@ readable keyword. This is the zsh history-modifier idea (`:h :t :r :e`) but with
 
 There are three kinds of modifier, and the difference matters:
 
-- **Split modifiers** (`:lines :words :nulls :tabs :raw :split`) turn a command
+- **Split modifiers** (`:lines :words :nulls :tabs :split`) turn a command
   substitution's **raw byte capture** into a list. They *replace* the default
   newline split and run against the raw bytes — they never run *after* it. Each
-  applies to a `$(…)` capture, producing the list.
+  applies to a `$(…)` capture, producing the list. The odd one out is **`:raw`**,
+  which lives in the same capture-modifier family but is the *no-split* member:
+  it yields the raw bytes as **one string**, not a list (it is what turns the
+  default newline-splitting off). So every split modifier produces a list
+  *except* `:raw`, whose whole job is to hand back a single byte-string.
 - **Value modifiers** (path and string — `:stem`, `:dir`, `:strip`, …) transform
   a value, and **map over a list** automatically (applied to each element).
 - **Collection modifiers** (`:len :first :last :rest :init :keys :values
@@ -369,24 +373,34 @@ xs = [pre ...$xs]         # prepend
 both = [...$a ...$b]      # concatenate
 ```
 
-**Append in place** is `+=`, and it **dispatches on the right-hand side's
-type** — the two common cases both stay terse, with no `push` verb and no
-unfamiliar operator (a `<<`-style shovel was considered and rejected — not
-widely known, and it collides with heredocs):
+**Append in place** is `+=`, terse in the common cases, with no `push` verb and
+no unfamiliar operator (a `<<`-style shovel was considered and rejected — not
+widely known, and it collides with heredocs). It is defined by **both operands —
+the left-hand type first, then the right** — so every combination has one
+answer:
 
-- **scalar RHS → append** it as one element (the `.append` you reach for
-  interactively);
-- **list RHS → extend** by its elements (Python/Ruby `+=`);
-- **map RHS → merge** into a map (right side wins on key collisions).
+| LHS | RHS | `+=` does | Note |
+| --- | --- | --- | --- |
+| list | list | **extend** by its elements | Python/Ruby `+=` |
+| list | scalar or map | **append** as one element | a list may hold any value |
+| map | map | **merge** (right side wins on key clash) | |
+| map | non-map | **error** | no key to merge a bare value under |
+| string | string | **concatenate** | |
+| int | int | **add** | |
+| scalar | mismatched scalar type | **error** | no coercion (`n += "x"` fails) |
 
 ```
-hosts += web3             # scalar: append one       -> [...$hosts web3]
-xs    += [d e f]          # list:   extend by three
-xs    += $more            # list:   extend by a list
-m     += [key: value]     # map:    insert / update
+hosts += web3             # list  += scalar : append one   -> [...$hosts web3]
+xs    += [d e f]          # list  += list   : extend by three
+xs    += $more            # list  += list   : extend by a list
+m     += [key: value]     # map   += map    : insert / update
+greeting += "!"           # string += string: concatenate
+n += 1                    # int   += int    : add
 ```
 
-Why this is safe here and not a bash-style "word or list?" trap: mesh values
+For the common **list** LHS this is the ergonomic rule you'd expect — a list on
+the right extends, anything else appends as one element. Why it is safe and not
+a bash-style "word or list?" trap: mesh values
 are **typed with no coercion** — a scalar `x` and the one-element list `[x]`
 are distinct and stay that way — so the dispatch is *determinate and knowable*,
 never inferred from whitespace. Two properties follow:
@@ -594,38 +608,33 @@ Rules:
   (`...$xs`, one argv entry per element) or join it (`$xs:join ","`, one
   string). The shell never guesses a serialization (see
   [Spread](#spread--flattening)).
-- **Exit status.** A function has an exit status just like an external command,
-  and it is the **status of the last command the function ran** (kept from shell
-  tradition — familiar, and exactly what makes a predicate work: `have_command`
-  is a `func` whose last command is the existence test, so `if have_command fzf
-  { … }` reads its status straight out). `return` exits the function early with
-  the current status; `return N` (or `return $cond`) exits with an explicit
-  status, `0` = success. This status channel is **separate** from the
-  value/output channels below — a function can stream bytes *and* carry a
-  success/fail status, which is why predicates need no special declaration.
-- **Return / output.** A plain `func`'s *stdout is its output*, exactly like an
-  external command, so functions compose in byte-stream pipes with everything
-  else.
+- **Result and `return`.** A function's **result is its last expression** —
+  evaluated like any block, the same rule as [`if`](#conditionals-if-is-an-expression).
+  No explicit `return` is needed to produce it. `return` on its own exits the
+  function **early**, carrying the result so far; `return val` exits early
+  **with a value**. That is the whole return mechanism — implicit last
+  expression, `return`/`return val` for early exit.
+- **Exit status is a view of the result** — not a separate channel. It derives
+  from the result value: a **command** result carries its own exit status, and a
+  **bool maps `true` → `0`** (success) **and `false` → `1`** (the Unix
+  inversion). That is exactly what makes a predicate work without any special
+  declaration: `have_command` ends in a test whose bool result becomes the
+  status, so `if have_command fzf { … }` reads correctly. `return $cond` in a
+  predicate therefore exits with `0`/`1` per the same mapping.
+- **Output is stdout.** Independently of its result, whatever a `func` writes to
+  stdout *is* its output stream, exactly like an external command, so functions
+  compose in byte-stream pipes with everything else.
 
-  **TODO — structured return.** Some functions want to hand a real list/map
-  back to an in-shell caller without a bytes round-trip (`config = load-env()`).
-  The current lean is to make this a **function-declaration modifier** rather
-  than an in-body `return <value>` statement — i.e. the *signature* declares
-  "this returns a mesh value," so the two kinds of function are distinguishable
-  at the call site and by the reader:
-
-  ```
-  func fetch(url) { curl -sS $url }          # streams bytes (a command)
-  <mod> func load-env(path) { … a map … }    # returns a mesh value
-  ```
-
-  Open sub-points: (a) the modifier keyword — `raw func` was floated, but `raw`
-  already means *unsplit bytes* as a modifier (`$(cmd):raw`), i.e. the opposite
-  of "rich value," so it would need a different word (`val`/`pure`/`fn`/`ret`
-  are candidates); (b) whether a value-function may still stream to stdout or is
-  value-only; (c) how its value-returning body reads — which is where
-  [`if` as an expression](#conditionals-if-is-an-expression) below does a lot
-  of the work.
+  **TODO — value vs stream reconciliation.** With `return val` and
+  last-expression results, the *syntax* for handing back a real list/map is
+  settled (`config = load-env()` where `load-env` ends in / returns a map). The
+  genuinely open part is how a value coexists with stdout streaming: in
+  `x = f()`, does `x` get `f`'s **returned value** or its **captured stdout**?
+  Candidate answers: decide by **call context** (value context takes the return
+  value, command/pipe context takes the stream — no declaration needed), or mark
+  value-returning functions with a **declaration modifier** (keyword TBD — not
+  `raw`, which already means *unsplit bytes*). Leaning toward call-context now
+  that `return val` exists, since it avoids a second function flavor.
 
 **Prior art surveyed** (all shell-adjacent, all validate the same four
 signature roles): Elvish `{|a b &opt=default @rest|}`, Nushell
@@ -694,20 +703,126 @@ external command rather than a mesh value — is the same bytes-vs-values
 question as the structured-return TODO, and is tracked there rather than
 re-litigated here.
 
+### Loops (`for`, `while`)
+
+Same brace-delimited shape as `func` and `if` — **no `do` / `done`**:
+
+```
+for f in * {
+  …
+}
+```
+
+Take the loop that motivated this section — "walk a directory, skip the
+subdirectories":
+
+```bash
+# bash
+for f in *; do
+  test -d "$f" && continue
+  process "$f"
+done
+```
+
+Two things make that fussier than it should be, and both are things mesh already
+fixed elsewhere:
+
+1. `*` **word-splits**, so `$f` *must* be quoted or a filename with a space
+   breaks the loop.
+2. There is no way to say "only files," so you filter by hand with
+   `test -d … && continue`.
+
+`*` is a real list and `$f` is one element that never splits, so the quotes just
+go away:
+
+```
+# mesh — direct translation, no quoting needed
+for f in * {
+  if $f:type == dir { continue }
+  process $f
+}
+```
+
+…and the **idiomatic** version deletes the guard, because the glob already
+*types* its matches — `(f)` is "plain files," straight from `find -type`
+([Globbing](#globbing)):
+
+```
+# mesh — filter at the source; the loop body has nothing to skip
+for f in *(f) {
+  process $f
+}
+```
+
+That is the ergonomic payoff: the most common reason for a `continue` at the top
+of a shell loop (wrong file type) is gone, because filtering lives in the glob.
+`continue` and `break` are still there for the cases that need them — kept
+as-is, familiar.
+
+**Iterating other things** — anything that is a list, plus maps and ranges,
+reusing syntax already defined:
+
+```
+for line in $(git status --porcelain) {   # a capture: splits on newlines — safe
+  …
+}
+for k, v in $aliases {                     # a map yields key, value pairs
+  alias $k $v
+}
+for i in 1..=5 {                           # a range: same .. / ..= as slices
+  echo $i
+}
+```
+
+The map form (`k, v`) and the range form need nothing new — they are the `[k:
+v]` maps and `..`/`..=` ranges from earlier, showing up where a loop expects a
+list.
+
+**Reach for a modifier before a loop when you are *transforming*.** A `for` loop
+is for side effects; to *derive* a list you usually do not need one, because
+value modifiers already map over a list:
+
+```
+stems = $files:stem       # not: stems = []; for f in $files { stems += [$f:stem] }
+```
+
+**`while`** is the same shape, with an `if`-style condition (a bool or a
+command's exit status):
+
+```
+while $queue:len > 0 {
+  handle ($queue:first)
+  queue = $queue:rest
+}
+```
+
+Two notes flagged as *(open)*:
+
+- **`$f:type`** — a path modifier yielding the `find -type` word
+  (`file`/`dir`/`link`/…), the single-value cousin of the glob `(f d l)`
+  qualifiers. The full file-test modifier set (`:type`, maybe `:exists`,
+  `:isdir`) is sketched here but not yet pinned, like the string-modifier set.
+- **A postfix guard** — `continue if $f:type == dir` (Ruby/Perl statement
+  modifier) reads well for one-line skips; whether to add it on top of the block
+  `if` is an ergonomics call, not yet made.
+
 ## Open questions
 
 - **Name** — smash vs mesh (below).
 - **`~` as a terse alias for exclusion `-`?** Or keep `-` only.
 - **String modifier set** — beyond `:strip` / `:replace`.
 - **Predicate qualifier syntax** — confirm `size>` / `age<` / `mtime<` forms.
-- **Arrays / maps / functions / `if`** — core surface now sketched above.
-  Remaining sub-questions: `:has` vs a `?` membership postfix; and a `local`
-  binding narrower than function scope. (Decided: expression-`if` with no
-  `else` yields `""`; in-place append/merge is `+=`.)
-- **Structured return** *(TODO, leaning decided)* — a plain `func` outputs
-  stdout bytes; a **function-declaration modifier** (keyword TBD — not `raw`,
-  which is taken) marks a function that returns a rich list/map to an in-shell
-  caller without a bytes round-trip. Sub-points tracked in
+- **Arrays / maps / functions / `if` / loops** — core surface now sketched
+  above. Remaining sub-questions: `:has` vs a `?` membership postfix; a `local`
+  binding narrower than function scope; the **file-test modifier set**
+  (`$f:type` and friends); and a **postfix guard** (`continue if …`). (Decided:
+  expression-`if` with no `else` yields `""`; in-place append/merge is `+=`,
+  defined over both operand types; `for`/`while` are brace-delimited, no
+  `do`/`done`.)
+- **Value vs stream reconciliation** *(narrowed)* — the return *syntax* is
+  settled (last expression, or `return val`); the open part is whether `x = f()`
+  captures a function's returned value or its stdout, resolved by **call
+  context** (leaning) or a **declaration modifier**. Tracked in
   [Functions](#functions).
 - **`match` expression** — the companion to expression-`if`; deferred until the
   rc-file need is real.
