@@ -113,7 +113,7 @@ A **postfix modifier** transforms a value. The operator is `:`, followed by a
 readable keyword. This is the zsh history-modifier idea (`:h :t :r :e`) but with
 *words instead of cryptic letters*.
 
-There are two kinds of modifier, and the difference matters:
+There are three kinds of modifier, and the difference matters:
 
 - **Split modifiers** (`:lines :words :nulls :tabs :raw :split`) turn a command
   substitution's **raw byte capture** into a list. They *replace* the default
@@ -121,10 +121,20 @@ There are two kinds of modifier, and the difference matters:
   applies to a `$(…)` capture, producing the list.
 - **Value modifiers** (path and string — `:stem`, `:dir`, `:strip`, …) transform
   a value, and **map over a list** automatically (applied to each element).
+- **Collection modifiers** (`:len :first :last :rest :init :keys :values
+  :join`) consume a list or map **as a whole** — they do *not* map element-wise
+  — and return either a scalar (`:len` → int, `:join` → one byte-string) or a
+  derived collection (`:rest`, `:keys`). This is the category that answers "how
+  long," "the last one," and "flatten to a string." `:join SEP` is the fold
+  that turns a list back into bytes (`$dirs:join ":"`); it stringifies each
+  element and errors on a nested list or map (there is no implicit deep
+  flattening — spell it out). The full list/map surface is in
+  [Arrays](#arrays-lists) and [Maps](#maps-associative-arrays).
 
-Both kinds:
+All three kinds:
 
-- **chain**: `$f:stem:stem`, `$(cmd):nulls` then value modifiers over each item.
+- **chain**: `$f:stem:stem`, `$(cmd):nulls` then value modifiers over each item,
+  `$xs:rest:last` (collection modifiers compose too).
 - **Disambiguation:** `:` is a modifier only when immediately followed by a
   known modifier keyword. `$dir:$PATH` keeps `:` literal (the token after `:`
   is an expansion, not a keyword), so the classic `PATH` construction is
@@ -354,10 +364,23 @@ cp ...$srcs $dest         # spread in the middle is fine
 ```
 
 This is the crux of mesh's **no-word-splitting** promise: a bare `$xs` passed
-to a command is **one argument that happens to be a list**, and it stays whole;
-flattening into argv only happens where you *write* `...`. That inverts the
-bash default (everything splits unless you fight it with quotes) into
-opt-in — the footgun becomes a deliberate keystroke.
+to a command stays **one value, a list** — flattening into argv only happens
+where you *write* `...`. That inverts the bash default (everything splits unless
+you fight it with quotes) into opt-in — the footgun becomes a deliberate
+keystroke.
+
+What "stays a list" means depends on where the value lands, because argv for an
+external program is bytes, not mesh values:
+
+- **To an in-shell `func`**, the list arrives intact as one parameter — the
+  callee sees a real list and can index it, `:len` it, spread it onward.
+- **To an external program**, there is no list-shaped argv slot, so passing an
+  un-spread list is a **hard error** (`git log $flags` → *"$flags is a list;
+  spread it with ...$flags or join it with $flags:join"*). mesh refuses to
+  silently pick a separator — that guess is exactly the bash footgun. The two
+  explicit outs are `...$flags` (one argv entry per element) and `$flags:join
+  SEP` (one byte-string). A scalar string variable, of course, passes straight
+  through as one argv entry.
 
 ### Functions
 
@@ -379,36 +402,60 @@ The signature borrows Nushell's/Elvish's proven vocabulary — *positional*,
 *optional-with-default*, *flag*, and *rest*:
 
 ```
-func deploy(env, region = us-west, --force, --tag = latest, ...hosts) {
+func deploy(env, --region = us-west, --force, --tag = latest, ...hosts) {
   # $env     required positional
-  # $region  optional positional, defaults to us-west
+  # $region  valued flag,   defaults to us-west
   # $force   boolean switch: true iff --force was passed
   # $tag     valued flag,   defaults to latest
   # $hosts   list of any remaining positionals   (rest / "flattening")
 }
 
 deploy prod --force web1 web2
-#   $env=prod  $region=us-west  $force=true  $tag=latest  $hosts=[web1 web2]
+#   env=prod  region=us-west  force=true  tag=latest  hosts=[web1 web2]
 
-deploy prod eu-west --tag=v9 ...$fleet
-#   $region=eu-west  $tag=v9  $hosts = the spread-in elements of $fleet
+deploy prod --region=eu-west --tag=v9 ...$fleet
+#   env=prod  region=eu-west  tag=v9  hosts = the spread-in elements of $fleet
+```
+
+`region` is a **flag**, not an optional positional, on purpose — with a
+`...hosts` rest parameter present, an optional *positional* `region` could not
+be skipped (the first host would silently bind to it). That is the general
+rule below. An optional positional is fine when it is the last non-rest
+parameter and can just be omitted from the right:
+
+```
+func tag(image, version = latest) {          # optional positional, no rest
+  docker tag $image $image:$version
+}
+tag app          # version defaults to latest
+tag app v9       # version = v9
 ```
 
 Rules:
 
-- **Positionals** bind left to right. A parameter with `= default` is optional;
-  once one parameter has a default, later positionals should too (no gap).
+- **Positionals** bind left to right. A parameter with `= default` is optional
+  and may be **omitted only from the right** — you cannot skip an optional
+  positional while still supplying a later positional or a rest element. When
+  you need to set a later value but default an earlier one, make the earlier
+  one a `--flag`; that skip-ability is the main reason to prefer a flag over an
+  optional positional. It follows that an optional positional and a `...rest`
+  do **not** usefully coexist (the rest would swallow anything meant for the
+  optional), so a signature with `...rest` keeps its positionals required.
 - **Flags** are declared with a leading `--`. `--force` (no `=`) is a boolean
   **switch**, false unless passed. `--tag = default` is a **valued flag**.
   Flags may appear in any order at the call site and are *not* consumed as
   positionals — this is why a shell wants real flag parsing in the signature
   rather than hand-rolled `case $1` juggling.
-- **Rest** (`...name`, at most one, last) collects everything left over into a
-  list. This is the "flattening" you asked about — the same slurpy/`@rest`
+- **Rest** (`...name`, at most one, last) collects the leftover positionals
+  into a list. This is the "flattening" you asked about — the same slurpy/`@rest`
   concept as Raku's `*@rest`, Elvish's `@rest`, Nushell's `...rest`, Tcl's
   `args`.
-- **Arguments do not word-split.** A list argument arrives as one list value
-  (see [Spread](#spread--flattening)); use `...` to flatten deliberately.
+- **Arguments do not word-split.** A bare list argument passes to an **in-shell
+  function** as one list value. External programs take **bytes only**, so an
+  un-spread list handed to an external command is an **error** — spread it
+  (`...$xs`, one argv entry per element) or join it (`$xs:join ","`, one
+  string). The shell never guesses a serialization (see
+  [Spread](#spread--flattening)).
 - **Return / output.** A function's *stdout is its output*, exactly like an
   external command, so functions compose in byte-stream pipes with everything
   else. *(open: an explicit `return <value>` that yields a rich list/map to a
