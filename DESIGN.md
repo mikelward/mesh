@@ -486,7 +486,7 @@ top-level is **yours**; the built-ins hang off two reserved roots:
   **`$sh.status`** (last exit, int `0`–`255`, the readable replacement for `$?`),
   **`$sh.pipestatus`** (a **list** of the last pipeline's stage statuses, where
   real lists beat bash's `PIPESTATUS`), `$sh.pid`, `$sh.version`, `$sh.options`,
-  `$sh.interactive`; **and the hooks** — `$sh.prompt`, `$sh.precmd`,
+  `$sh.interactive`; **and the hooks** — `$sh.prompt`, `$sh.preprompt`,
   `$sh.preexec` / `$sh.postexec`, `$sh.precd` / `$sh.postcd`, `$sh.exit`
   ([Hooks and the prompt](#hooks-and-the-prompt)).
 
@@ -499,7 +499,7 @@ lists the whole surface and a mistyped key fails loud.
 `$sh.pipestatus`, `$sh.pid`, `$sh.version`, `$sh.interactive`) are the shell's
 authoritative state — **read-only**: assigning or `unset`ting one is an error, so
 config can't corrupt an invariant. The **configuration** entries are yours to
-write: the hook maps (`$sh.prompt`, `$sh.precmd`, …) and the `$sh.options`
+write: the hook maps (`$sh.prompt`, `$sh.preprompt`, …) and the `$sh.options`
 settings map. (This is the one place the general map rules are constrained —
 individual keys carry a mutability flag.)
 
@@ -1307,13 +1307,13 @@ mesh models a hook point as an **insertion-ordered [map](#maps-associative-array
 of named callables** — the key is the handler's *identity*. That one choice
 solves the composition requirement and the worst hook footgun at once:
 
-- **Re-source-safe by construction.** `$sh.precmd.git = …` is *keyed*, so running
+- **Re-source-safe by construction.** `$sh.preprompt.git = …` is *keyed*, so running
   your rc file again **replaces** the `git` handler instead of stacking a
   duplicate — the bane of bash `PROMPT_COMMAND` (which appends) and zsh's
   `add-zsh-hook` (which needs manual dedup). The identity is what lets you
   re-source freely.
-- **Update or drop one by name** — reassign `$sh.precmd.git`, or `unset $sh.precmd.git`
-  — without touching the others; `$sh.precmd:keys` introspects.
+- **Update or drop one by name** — reassign `$sh.preprompt.git`, or `unset $sh.preprompt.git`
+  — without touching the others; `$sh.preprompt:keys` introspects.
 - **Deterministic order** — maps preserve insertion order, so handlers run
   (and segments render) in the order registered.
 - **Compose, never replace** — adding a key leaves every other handler intact.
@@ -1324,7 +1324,7 @@ namespace](#variables-and-assignment)), or a `func(){ … }` lambda for inline
 logic.
 
 **Event hooks** run for effect at named events, in symmetric `pre`/`post` pairs
-plus the singletons — `precmd` (before each prompt), the command pair
+plus the singletons — `preprompt` (before each prompt), the command pair
 **`preexec`** (before a command runs, given the command line) / **`postexec`**
 (after it finishes, given the command, its **exit status**, and **duration**),
 the directory pair **`precd`** (before the cwd changes, still in the old dir,
@@ -1332,12 +1332,12 @@ given the target) / **`postcd`** (after, now in the new dir, given the previous
 dir), and `exit`:
 
 ```
-$sh.precmd.jobs   = publish-jobs                    # by name
+$sh.preprompt.jobs   = publish-jobs                    # by name
 $sh.postcd.fetch  = func() { vcs auto-fetch & }     # arrived in a new dir — the PWD-gate is now the event itself
 $sh.precd.save    = func(to) { save-dir-state }     # about to leave: act while still in the old dir
 $sh.preexec.timer = func(cmd) { timer-start }       # start the clock…
 $sh.postexec.timer = func(cmd, status, ms) { global last-cmd-time = $ms }   # …stop it; `global` so it survives to feed the prompt
-unset $sh.precmd.jobs                               # remove one
+unset $sh.preprompt.jobs                               # remove one
 ```
 
 The `pre`/`post` split (rather than a single after-the-fact hook) is what lets a
@@ -1366,20 +1366,20 @@ handler that itself `cd`s elsewhere (allowed — its change just doesn't
 re-dispatch) can't make a *relative* outer `cd` land somewhere unintended.
 
 **Status is snapshotted across hook dispatch.** The submitted command's exit
-status (and pipeline stage statuses) are captured before `postexec` / `precmd`
+status (and pipeline stage statuses) are captured before `postexec` / `preprompt`
 run, and **`$sh.status` and `$sh.pipestatus` are restored** to them for the
 prompt segments — so a segment always sees the *interactive command's* status,
 never the status of some command a handler happened to run. (`postexec` also
 gets the status as an explicit `status` argument.)
 
-**The prompt** is the same shape, but each segment is a callable that **returns a
-string** (or `""` to contribute nothing); the shell joins the non-empty ones in
-key order:
+**The prompt** is the same shape — a named, insertion-ordered segment map — but
+each segment is a callable that **returns a string** (or `""` to contribute
+nothing); the shell renders the non-empty ones in key order:
 
 ```
 $sh.prompt.host = host-seg                     # named, ordered segments
 $sh.prompt.dir  = func() { if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() } }
-$sh.prompt.auth = func() { if ssh-id-missing() { yellow("no-ssh-id") } }   # no else → "" → segment omitted
+$sh.prompt.auth = func() { if ssh-id-missing() { style "no-ssh-id" fg: yellow } }   # no else → "" → omitted
 $sh.prompt.dir  = my-dir-seg                   # swap ONE segment by name
 unset $sh.prompt.auth                          # drop the auth warning
 ```
@@ -1388,24 +1388,42 @@ unset $sh.prompt.auth                          # drop the auth warning
 combine bools, not values — and the `auth` segment leans on the decided
 no-`else`-yields-`""` rule so "not applicable" is just an empty contribution.)
 
+**Color comes from a `style` helper, not raw escapes.** `style TEXT fg: yellow
+bold: true` returns a **styled value** — text carrying style attributes — rather
+than baked-in ANSI. The shell owns the actual rendering, so it can measure true
+**display width** (raw escapes buried in a string are the classic prompt
+width-math footgun) and later strip or re-theme the styling. A plain string is an
+unstyled segment; `style` is the one styling primitive in the MVP (color + bold).
+
+**A segment may render more than one line.** The shell assembles the segments
+into a single prompt buffer and treats a **newline as a line break wherever it
+appears** — so one callable can emit an entire multi-line prompt (a
+`preprompt`-style blob is just a segment that returns a string with newlines in
+it), and there is **no line-count setting**: the line structure emerges from the
+newlines in the output. The renderer therefore measures width **per line** and
+tracks how many lines the prompt occupies, placing the input after the last one
+so redraw, completion, and resize stay correct.
+
 The payoff is the requirement, met directly: **the external base renderer is
 just one named segment** (`$(vcs prompt-info)`), sitting among peers, so
 `[root]`, the auth warning, and the session nag compose *around* it rather than
 being swallowed by it — the failure mode of "set `$PROMPT` to one big external
-command." The shell owns the **frame** — the two-line full-width layout, the
-horizontal rule, the transient collapse in scrollback, per-segment color — so a
-segment only produces its own text. This is exactly the hand-rolled
-`preprompt` / `prompt_line` / `host_info` / `auth_info` structure of today's
-config, promoted to first-class, keyed, re-source-safe hooks.
+command." This is exactly the hand-rolled `preprompt` / `prompt_line` /
+`host_info` / `auth_info` structure of today's config, promoted to first-class,
+keyed, re-source-safe segments — with its *side effects* (a background fetch)
+moving to the `$sh.preprompt` event hook and its *rendering* to this segment map.
 
-*(open: the exact frame-styling surface — how a segment declares its color and
-padding, and how the two-line / full-width / transient-collapse layout is
-configured. The event set — `precmd`, `preexec`/`postexec`, `precd`/`postcd`,
-`exit` — is settled.)*
+*(MVP is the above: keyed segments, `style` color, and multi-line output.
+Deferred to a later iteration — all layered on the same per-line width the styled
+values already give the shell: a full-width **rule**, a **`fill`** spacer for
+right-aligned segments, **transient collapse** of past prompts in scrollback, and
+whether `newline` / `fill` / `rule` get a **structural-segment** spelling. Line
+structure itself stays emergent from newlines, not a line-count knob. The event
+set — `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settled.)*
 
 ## Open questions
 
-- **Name** — smash vs mesh (below).
+- **Name — decided: mesh** ([Name](#name)); smash was the runner-up.
 - **Exclusion `~` alias** — resolved by elimination: `~` / `!~` is now the
   **pattern-match** operator ([Tests and comparisons](#tests-and-comparisons)),
   so glob exclusion keeps the spaced infix `-` only.
@@ -1435,10 +1453,22 @@ configured. The event set — `precmd`, `preexec`/`postexec`, `precd`/`postcd`,
   dynamic) scope against the lexical default.
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
-  identity → re-source-safe, individually removable). Events `precmd`,
-  `preexec`/`postexec`, `precd`/`postcd`, `exit`; the prompt is a named,
-  ordered segment map with the external renderer as one peer segment. Remaining:
-  the frame-styling surface (segment color/padding, two-line/transient layout).
+  identity → re-source-safe, individually removable). Events `preprompt`,
+  `preexec`/`postexec`, `precd`/`postcd`, `exit`; the prompt is a named, ordered
+  segment map with the external renderer as one peer segment. Prompt MVP: `style`
+  color plus multi-line output (a newline is a line break wherever it appears, so
+  one callable may emit the whole prompt). Remaining: the frame surface layered on
+  per-line width — a full-width rule, a `fill` right-align spacer, transient
+  collapse, and an optional structural-segment spelling for `newline`/`fill`/`rule`.
+- **Structured prompt — explore next** ([Hooks and the prompt](#hooks-and-the-prompt)):
+  the MVP renders a flat segment map with newlines-as-line-breaks. The next
+  iteration is the *structured* model — **structural segments** (`newline` /
+  `fill` / `rule`) as keyed peers of the content segments, giving the shell
+  first-class line boundaries for per-line **right-alignment** (`fill` spacer), a
+  **full-width rule**, and **transient collapse** — all without a line-count knob
+  (structure stays emergent from the segments). Weigh this keyed-structural-segment
+  shape against a list-of-lines (which buys explicit lines at the cost of
+  positional, non-keyed rows).
 
 ## Name
 
