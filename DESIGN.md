@@ -1118,6 +1118,29 @@ PowerShell `param()` with `[Parameter(ValueFromRemainingArguments)]`. mesh
 takes the *semantics* these agree on and dresses them in the `func name(...)`
 syntax above.
 
+*(TODO: **aliases, wrappers, and dynamic definition.** mesh has no `alias` or
+`eval` yet, but real configs lean on both — the `conf`/`scripts` repos wrap a
+tool's every subcommand at load time (`for c in $(vcs --list-commands) { <define c
+as a forwarder to `vcs $c ...$args`> }`) and alias short names to commands. Open
+questions:*
+  - *A lightweight **alias/wrapper** form for the common "rename or prefix a
+    command" case — `alias ll = ls -l` for the literal case, and a **forwarding
+    wrapper** that passes args through (something like `wrap co = vcs checkout` so
+    `co -b x` runs `vcs checkout -b x`) — without reaching for string `eval`.*
+  - ***`sudo`-style alias expansion.** In bash/zsh an alias whose value ends in a
+    space makes the shell expand the **next** word as an alias too — the classic
+    `alias sudo='sudo '` so `sudo ll` still resolves `ll`. mesh should decide this
+    deliberately: pick a clean way to say "expand this command's first argument as
+    a command/alias in its own right" (the sudo/`command`/`xargs`/`watch` case)
+    rather than inheriting bash's trailing-space-is-significant trick, which is
+    invisible and error-prone.*
+  - *Whether to expose **dynamic `func` definition** (a function whose name is
+    computed) at all — it fights static [completion](#completion) and readability,
+    so the forwarding-wrapper form above may cover the real need; if a general
+    escape hatch is wanted, prefer a **scoped** primitive over bash's
+    string-concatenating `eval`. Leaning: ship aliases + forwarding wrappers with
+    a defined arg-expansion rule, defer general dynamic definition.)*
+
 ### Isolation and subshells
 
 **A plain `func` does not isolate process state.** cwd, umask, and the `env`
@@ -2148,6 +2171,115 @@ right-aligned segments, **transient collapse** of past prompts in scrollback, an
 whether `newline` / `fill` / `rule` get a **structural-segment** spelling. Line
 structure itself stays emergent from newlines, not a line-count knob. The event
 set — `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settled.)*
+
+## Footguns we avoid
+
+mesh's surface is partly *reactive*: many decisions exist to remove a specific,
+well-known way an existing shell surprises people. This section collects the ones
+that most shaped the design, grouped by the shell they're most associated with,
+each paired with the mesh decision that defuses it. Several are drawn from real
+workarounds in the author's own `bash` / `fish` / `nushell` configs — where a
+comment in those files documents a hack, that hack marks the footgun.
+
+### bash / POSIX
+
+- **A pipeline's `while read` silently loses its variables.** `cmd | while read x
+  { n = $((n+1)) }; echo $n` prints `0` — the loop ran in a forked subshell, so
+  `n` never escaped. mesh removes the trap two ways: a [command
+  substitution](#command-substitution) is a real list you iterate *in the current
+  scope* (`for line in $(cmd) { n += 1 }` leaves `n` set), and the **last stage of
+  a pipeline runs in the current shell**, not a subshell — bash's opt-in
+  `lastpipe`, made the default.
+- **Unquoted `$var` word-splits and globs.** `rm $file` breaks on a space; `[ $x =
+  y ]` becomes a parse error when `$x` is empty. The single most common bash bug.
+  mesh has **no word splitting and no implicit globbing of a value** — `$x` is
+  exactly one value; splitting is opt-in (`:words` / `:split`) and exploding a list
+  into arguments is the explicit `...`. See [Spread](#spread--flattening).
+- **`!` in double quotes fires history expansion.** Interactive bash mangles
+  `echo "it works!"`. mesh's [history expansion](#history-expansion) is
+  **quote-safe and lexically narrow**: `!` is a designator only directly before a
+  ref character, never inside quotes, and `!=` / `!~` are excluded — so
+  `"it works!"` is plain text.
+- **`[ ]` / `[[ ]]` operator quirks** — `-a`/`-o` precedence, empty-operand parse
+  errors, `-lt` vs `<`, `=` vs `==`. mesh has no `[ ]`: value
+  [tests](#tests-and-comparisons) are type-directed (`==` / `<`), `~` matches
+  patterns, and `:exists` / `:exec` are the file tests.
+
+### zsh
+
+- **Over-complexity.** zsh's power is a very large, mutable surface: dozens of
+  `setopt`s that silently change core semantics (whether `$x` splits, how globs
+  behave, prompt parsing), plus a completion system that is its own programming
+  language. mesh keeps a **small, non-optional core** — no option flips whether a
+  value splits — and derives [completion](#completion) mechanically from `--help` /
+  man pages rather than a bespoke DSL. Behavior you can read off the page.
+- **Job-control edge cases.** zsh has a long tail of job-control surprises. mesh
+  makes [jobs first-class values](#job-control) with a specified lifecycle and
+  defined [signal](#signals) semantics (SIGHUP-then-SIGCONT-to-stopped on terminal
+  close, Ctrl-Z ignored at an idle prompt, status snapshotted across handlers) —
+  behavior that is *specified*, not emergent. The author's configs hand-roll
+  `%1`…`%9` job aliases (`for i in (seq 0 9) { alias %$i = fg %$i }`); mesh's `%n`
+  job refs are built in.
+- **1-based indexing.** zsh (and fish) index from 1. mesh is
+  [zero-based](#arrays-lists), always — matching bash/Python/Rust — so a ported
+  `$xs[1]` doesn't silently shift by one.
+
+### fish
+
+- **Splitting and the empty-vs-scalar trap.** fish splits every command
+  substitution into a list and has changed those rules over time; the standard
+  defense is `| string collect`, which appears dozens of times in the author's
+  `config.fish` purely to keep a result (e.g. an empty `projectroot`) a *string*
+  rather than an empty list that breaks the next comparison. mesh makes splitting
+  **explicit and stable** — default newline split, opt-in `:words` / `:nulls` /
+  `:tabs` / `:split`, `:raw` for exact bytes, a defined [trailing-empty-field
+  rule](#modifiers) — and, by [no null](#variables-and-assignment), an empty result
+  is the scalar `""`, not a shape that needs a `string collect` guard.
+- **Non-POSIX breaks muscle memory.** fish dropped `$(...)`, `&&` / `||` (for
+  years), `export`, and more; nushell can't even source a `brew shellenv` snippet
+  (the author's `config.nu` reimplements it by hand). mesh keeps the POSIX spine —
+  `$()`, `&&` / `||`, `~`, redirection, `source` — so reflexes and existing
+  snippets transfer; the ergonomics are additive, not a dialect you relearn.
+- **`switch` / `case` is glob-only.** fish's `case` has no regex — the author's
+  config notes "fish wildcards have no `[0-9]` character class" and falls back to
+  `string match -rq '^-[0-9]+$'`. mesh's [`match`](#matching-match) takes `/re/`
+  arms directly.
+- **`eval` for dynamic definition and indirect variables.** fish resorts to
+  `eval "function $alias; ssh_to $alias \$argv; end"` to synthesize per-host
+  functions, and `eval "printf ... \$$arg"` for indirect variable access. mesh
+  treats both as first-class design questions rather than string-`eval`: see the
+  alias/wrapper/dynamic-definition TODO in [Functions](#functions), and note that
+  indirect access is just [map indexing](#maps-associative-arrays)
+  (`$colors[$name]`), no `eval`.
+
+### elvish / nushell (rich-value shells)
+
+- **Everything is an exception.** Elvish raises on every nonzero command (you reach
+  for `?(...)` to tolerate failure), which is heavy for interactive use. mesh keeps
+  the Unix **status model** — a nonzero status is a [value, not a thrown
+  exception](#functions) — so `grep x f; echo done` just runs, while you can still
+  branch on the status.
+- **Static (parse-time) command resolution.** nushell resolves `def`→`def` calls
+  at parse time, so you *cannot* redefine a command and have existing callers pick
+  it up (the author's `config.nu` documents this and routes overridable hooks
+  through `$env.*` closures invoked with `do`). mesh resolves function calls at
+  **call time** (see [Isolation](#isolation-and-subshells)), so a later
+  redefinition or a hook override is visible to callers — no closure-in-a-variable
+  workaround.
+- **No exit hook.** nushell has none, so the author's job-publish file can't be
+  cleaned up on shell exit. mesh's `exit` hook — with the full `preprompt` /
+  `preexec` / `postexec` / `precd` / `postcd` set — is part of the core
+  ([Hooks](#hooks-and-the-prompt)).
+- **Rich-value ↔ byte-stream friction.** Elvish/nushell's structured values don't
+  flow cleanly into byte-oriented Unix tools; you convert at every boundary. mesh
+  draws the [bytes-vs-values line explicitly](#command-substitution) at the
+  external-command edge (argv rendering rules; `puts` renders, externals take
+  `...` / `:join`), so you always know which side you're on — rich values inside,
+  bytes at the process boundary.
+- **Unfamiliar syntax tax.** Elvish's `{|a b| … }` lambdas and data literals are a
+  real relearn. mesh puts signatures where readers already look
+  (`func name(params)`), keeps `$var`, and borrows the *semantics* (rest / flag /
+  default params) not the syntax — see [Functions](#functions).
 
 ## Open questions
 
