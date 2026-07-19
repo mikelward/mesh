@@ -373,7 +373,11 @@ misread.
   **`global unset name`** (symmetric with `global name = value`). A read errors
   only when the name is unbound in *every* visible scope. `unset x` differs from
   `x = ""`: the latter is *bound to the empty string*, the former *unbound* — the
-  two states that stand in for a missing null.
+  two states that stand in for a missing null. **`unset` also deletes a
+  collection element** — `unset $m[key]` / `unset $m.key` removes that map entry
+  (and `unset $xs[i]` removes the element and closes the gap); deleting a missing
+  key is a **no-op**, not an error, so `unset $prompt.auth` is idempotent whether
+  or not the segment was registered.
 - **Command/function names resolve at call time** — a separate namespace from
   variables. A bare word in command position (`g` inside `func f { g }`) is a
   *command or function* looked up **when `f` runs**, not when `f` is defined. So
@@ -409,6 +413,16 @@ misread.
 - **Types are inferred, not declared.** `x = foo` is a string, `x = [a b c]` a
   list, `x = [a: 1]` a map. There is no type sigil (`@`, `%`) on the *name* —
   a variable just holds whatever value it was given, and `$x` reads it back.
+  Perl-style sigils (`@PATH` a list, `$PATH` a scalar) were considered and
+  rejected: a variable's type here is the *value's* business, not the name's, so
+  a name-baked sigil would lie the moment a var is reassigned a different shape —
+  and Perl's context-varying sigil (where `$foo[0]` indexes the array `@foo`) is
+  a notorious footgun. `$name` means one thing everywhere: "read this variable."
+- **String interpolation** is `$name` inside `"…"`, extended to
+  `$name[key]` / `$name.key` and, when the expression's end needs delimiting,
+  the braced **`${…}`** form: `"${dir}s"`, `"${m.key}"`. A bare `"$file.txt"`
+  interpolates `$file` then keeps `.txt` literal (the shell reflex) — reach for
+  `"${file}.txt"` (or `${m.key}`) when the dot is meant as access, not text.
 - **No null.** mesh has **no `nil`/`null`/`none`** value — the billion-dollar
   mistake is left out. The consequence is a consistent rule wherever a value
   might be absent: **exact** access fails loud (`$xs[99]`, `$m[absent]` are
@@ -418,6 +432,50 @@ misread.
   one genuine fork this leaves: is a first-class absent value ever worth adding
   back for, e.g., "key present but unset"? Current answer: no; `:has` +
   `:get default` cover it.)*
+
+**Special variables.** A few names are maintained by the shell:
+
+- **`$status`** — the last command's exit status (an int, `0`–`255`), the
+  readable replacement for `$?` (fish uses the same name).
+- **`$pipestatus`** — a **list** of the per-stage statuses of the last pipeline
+  (`a | b | c` → three ints), where mesh's real lists beat bash's `PIPESTATUS`
+  array.
+- **PATH** — a **list**, not a colon-string, so `+= [/opt/bin]`, `:dedup`,
+  `:has /usr/bin` all just work — exactly the "idempotent, guarded, deduped PATH"
+  requirement. The environment is bytes, so the shell **`:`-joins it on the way
+  out** to children and splits on the way in; one value, list in-shell,
+  `:`-string in `env` (and the other standard `:`-delimited path vars —
+  `MANPATH`, `CDPATH`, … — are lists too). Its exact spelling depends on the
+  collision scheme below (`$PATH` list vs `$Path` list-over-`$PATH`-string vs
+  `$env.PATH`).
+
+**Avoiding collisions with your variables** *(open — strong options, to be
+decided; they combine):*
+
+1. **Two-tier case** *(the author's existing habit)* — **UPPERCASE = the
+   environment (exported), lowercase = shell-local**. `$PATH` is the env
+   path-list, `$path` stays yours; no zsh-style `$path`/`$PATH` dual-binding.
+   Leaves open where the *reserved* specials (`status`, hooks) sit.
+2. **Three-tier case** — extend that with a middle tier: **UPPERCASE = env,
+   Initial-Cap = shell-reserved, lowercase = user** (`$Status`, `$Prompt`,
+   `$myvar`). Elegant and prefix-free — case alone tells you the tier, and it
+   handles PATH's dual nature neatly: `$PATH` is the exported colon-string,
+   `$Path` the reserved shell **list** view (linked like zsh's `$path`/`$PATH`,
+   but disambiguated by case). The catch: it leans on *case-sensitivity* to
+   separate namespaces, so a typo'd `$status` for `$Status` silently reads your
+   own var instead of erroring, and it capitalizes hook names (`$Preexec`) that
+   shells conventionally lowercase.
+3. **Namespaced built-ins** — put shell state behind namespace maps so the whole
+   lowercase top-level namespace is yours by construction: `$env` (`$env.PATH`),
+   `$sh` (`$sh.status`, `$sh.pipestatus`), `$hooks` (`$hooks.precmd`,
+   `$hooks.prompt`). Verbose but a *hard, explicit* guarantee (greppable, no
+   case-typo footgun).
+
+They compose. A likely blend: keep **UPPERCASE-for-env** (a convention users
+already know) and put the built-in maps behind **`$env` / `$sh` / `$hooks`** for
+the hard guarantee — with the open question being whether to also surface bare
+conveniences (`$status`, `$PATH`) on top, and whether Initial-Cap earns its place
+as a third tier or the case-typo risk rules it out.
 
 ### Arrays (lists)
 
@@ -1246,6 +1304,14 @@ timer before a command — separately from the after-work. The `preexec` /
 `postexec` pair in particular is how the prompt's **last-exit status** and
 **command timing** (both required dashboard fields) get fed without special
 casing.
+
+**Hooks fire for the outer interactive event only.** A command hook fires once
+for the command line you submit at the prompt — *not* for commands run inside a
+function, a script, a `$(…)`, or a hook handler itself; and while a handler runs,
+its own commands do not re-fire the hook. Without this, `$preexec.timer`'s
+`timer-start` would dispatch `preexec` again forever. The same applies to the
+directory hooks: they fire on the net interactive cwd change, so a `func` that
+`cd`s around internally triggers them once (on return), not per internal `cd`.
 
 **The prompt** is the same shape, but each segment is a callable that **returns a
 string** (or `""` to contribute nothing); the shell joins the non-empty ones in
