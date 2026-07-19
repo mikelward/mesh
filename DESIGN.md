@@ -491,8 +491,9 @@ top-level is **yours**; the built-ins hang off two reserved roots:
   shell-or-script name — see [Startup](#startup-and-invocation)); **and the
   hooks** — `$sh.prompt`, `$sh.preprompt`,
   `$sh.preexec` / `$sh.postexec`, `$sh.precd` / `$sh.postcd`, `$sh.exit`
-  ([Hooks and the prompt](#hooks-and-the-prompt)) — and the **`$sh.complete`**
-  [completion-override](#completion) map.
+  ([Hooks and the prompt](#hooks-and-the-prompt)), the **`$sh.complete`**
+  [completion-override](#completion) map, and the **`$sh.signal`**
+  [signal-handler](#signals) map.
 
 So there are exactly **two reserved names** (`env`, `sh`); every other lowercase
 name is entirely yours — a var called `status`, `prompt`, or `path` never
@@ -507,7 +508,8 @@ an invariant. (`$sh.jobs` changes only through `&` / `fg` / `bg` / `kill` and jo
 completion, never by mutating the map directly — you still *read* it freely, e.g.
 `$sh.jobs:len`.) The **configuration** entries are yours to
 write: the hook maps (`$sh.prompt`, `$sh.preprompt`, …), the `$sh.options`
-settings map, and the `$sh.complete` [completion-override](#completion) map.
+settings map, the `$sh.complete` [completion-override](#completion) map, and the
+`$sh.signal` [signal-handler](#signals) map.
 (This is the one place the general map rules are constrained — individual keys
 carry a mutability flag.)
 
@@ -1431,6 +1433,51 @@ pipeline; and a `jobdone` hook to fire on completion. Terminal plumbing —
 process groups, `tcsetpgrp`, `SIGTSTP`/`SIGCONT` — is implementation, not
 surface.)*
 
+### Signals
+
+**Interactive defaults** — the shell owns these at the prompt, and none of them
+kill your session:
+
+- **`Ctrl-C` / SIGINT** — at the prompt, **abandon the current input** and draw a
+  fresh prompt (never exits the shell). While a foreground command runs, SIGINT
+  goes to *that* [job](#job-control)'s process group; the shell stays up and the
+  next prompt shows its interrupted [status](#variables-and-assignment).
+- **`Ctrl-D` / EOF** — on an **empty** line, exit the shell; on a non-empty line it
+  does nothing, so a stray `Ctrl-D` can't drop you mid-command. An
+  **`$sh.options.ignore-eof`** setting can require a second press.
+- **`Ctrl-Z` / SIGTSTP** — suspend the foreground job to a **stopped**
+  [job](#job-control).
+- **`Ctrl-\` / SIGQUIT** — ignored at the prompt; delivered to the foreground job.
+- **SIGWINCH** (resize) — the [line editor](#line-editing) reflows and redraws the
+  (possibly multi-line) prompt.
+- **SIGHUP** (terminal closed) — the shell exits and HUPs its jobs unless they were
+  `disown`ed; **SIGTERM** is ignored interactively (as bash does).
+
+**User handlers are keyed hook maps, not bash's `trap`.** `$sh.signal.<NAME>` is an
+insertion-ordered map of named callables — the *same shape* as `$sh.preprompt` and
+the other [hooks](#hooks-and-the-prompt), so it is re-source-safe and composable,
+with no new `trap` builtin:
+
+```
+$sh.signal.INT.note  = func() { puts "interrupted" }
+$sh.signal.TERM.save = save-state                 # by name
+$sh.signal.USR1.reload = func() { source $sh.rc }
+unset $sh.signal.INT.note                          # remove one
+```
+
+Names drop the `SIG` prefix (`INT`, `TERM`, `HUP`, `USR1`, …). **`$sh.exit`** is
+the EXIT-pseudo-signal trap (bash's `trap … EXIT`), already defined with the
+[hooks](#hooks-and-the-prompt). **`SIGKILL` and `SIGSTOP` can't be trapped** (an OS
+rule); assigning a handler for them is an error. A user handler runs *in addition
+to* the shell's interactive default where both apply — the shell keeps terminal
+control (the line-cancel / redraw still happens) and the handler runs for its
+effect; handlers fire for signals delivered while a script, function, or command is
+running, matching where bash traps fire.
+
+*(deferred: whether a handler may **suppress** a default (e.g. swallow `Ctrl-C`);
+exact SIGINT delivery mid-pipeline; and per-signal masking during handler
+execution.)*
+
 ### Startup and invocation
 
 **Config files** live under `$XDG_CONFIG_HOME/mesh` (default `~/.config/mesh/`),
@@ -1909,11 +1956,12 @@ set — `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settl
   `preexec` / `postexec`; recall via up/down and `Ctrl-R`; a `history` built-in
   plus `history | grep` as the MVP search. Remaining: fuzzy search, a
   `$sh.history` accessor, cross-session sync, dedup policy, and secret redaction.
-- **Interactive signals — TODO.** `Ctrl-C` (SIGINT cancels the current line /
-  interrupts the foreground job but never kills the interactive shell), `Ctrl-D`
-  (EOF → `exit` on an empty line), and `SIGWINCH` (resize → prompt redraw), plus
-  how a user `trap`s signals and how that relates to the `$sh.exit`
-  [hook](#hooks-and-the-prompt).
+- **Interactive signals — decided** ([Signals](#signals)): interactive defaults
+  (`Ctrl-C` abandons the line / interrupts the foreground job but never kills the
+  shell; `Ctrl-D` EOFs on an empty line; `Ctrl-Z` suspends; `SIGWINCH` redraws;
+  `SIGHUP` exits, `SIGTERM` ignored). User handlers are the keyed **`$sh.signal.<NAME>`**
+  hook maps (no bash `trap`), with `$sh.exit` as the EXIT trap. Remaining: whether
+  a handler may suppress a default, and mid-pipeline SIGINT delivery.
 - **Core surface** (arrays / maps / functions / `if` / `match` / loops / scope /
   tests / isolation) — sketched above. Remaining sub-questions: an infix **`in`**
   operator as a second membership spelling alongside `:has`; **regex captures**
