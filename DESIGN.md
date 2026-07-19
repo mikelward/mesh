@@ -1154,9 +1154,12 @@ plain `func` doesn't yet give cleanly; these are open:*
     mesh should offer a deliberate way to say "expand this command's first argument
     as a mesh command" instead.*
   - *Whether to expose **dynamic definition** (a function whose name is computed —
-    the `set_up_ssh_aliases` `eval` loop) at all; it fights static
-    [completion](#completion), so the wrapper shorthand may cover the real need. If
-    a general escape hatch is wanted, prefer a **scoped** primitive over bash's
+    the `set_up_ssh_aliases` `eval` loop) at all; a dynamically-defined function
+    still [completes](#completion) like any other once it exists, so the cost is
+    **readability and static analysis** (you can't tell from reading the config
+    which commands are defined), not completion. The wrapper shorthand may cover
+    the real need; if a general escape hatch is wanted, prefer a **scoped**
+    primitive over bash's
     string-concatenating `eval`. Leaning: a forwarding-wrapper shorthand with
     transparent flag passthrough, defer general dynamic definition.)*
 
@@ -2221,11 +2224,13 @@ to avoid" rather than promising the latter as done.
   mesh has **no word splitting and no implicit globbing of a value** — `$x` is
   exactly one value; splitting is opt-in (`:words` / `:split`) and exploding a list
   into arguments is the explicit `...`. See [Spread](#spread--flattening).
-- **`!` in double quotes fires history expansion.** Interactive bash mangles
-  `echo "it works!"`. mesh's [history expansion](#history-expansion) is
+- **`!` in double quotes fires history expansion.** Interactive bash expands `!`
+  inside double quotes — `echo "hello!world"` fails with `!world: event not found`
+  (a trailing `!` before a space or end-of-line is safe, but `!` before a word is
+  not, which is the trap). mesh's [history expansion](#history-expansion) is
   **quote-safe and lexically narrow**: `!` is a designator only directly before a
-  ref character, never inside quotes, and `!=` / `!~` are excluded — so
-  `"it works!"` is plain text.
+  ref character *and never inside quotes*, and `!=` / `!~` are excluded — so
+  `"hello!world"` is plain text.
 - **`[ ]` / `[[ ]]` operator quirks** — `-a`/`-o` precedence, empty-operand parse
   errors, `-lt` vs `<`, `=` vs `==`. mesh has no `[ ]`: value
   [tests](#tests-and-comparisons) are type-directed (`==` / `<`), `~` matches
@@ -2267,10 +2272,15 @@ to avoid" rather than promising the latter as done.
   `:raw` (scalar) capture is `""` — [no null](#variables-and-assignment) either
   way, so neither needs a guard.
 - **Non-POSIX breaks muscle memory.** fish dropped `$(...)`, `&&` / `||` (for
-  years), `export`, and more; nushell can't even source a `brew shellenv` snippet
-  (the author's `config.nu` reimplements it by hand). mesh keeps the POSIX spine —
-  `$()`, `&&` / `||`, `~`, redirection, `source` — so reflexes and existing
-  snippets transfer; the ergonomics are additive, not a dialect you relearn.
+  years), `export`, and more, so familiar reflexes stop working. mesh keeps the
+  POSIX **spine** — `$()`, `&&` / `||`, `~`, redirection — so those reflexes
+  transfer; the ergonomics are additive, not a dialect you relearn. This is about
+  *syntax familiarity only*: running existing sh/bash **code** stays a
+  [non-goal](#non-goals), so `source` reads mesh grammar, not POSIX. A `brew
+  shellenv`-style integration (whose output is POSIX shell) therefore needs a
+  mesh-native path or an adapter here just as it does in nushell (whose `config.nu`
+  reimplements it by hand) — mesh's win is that the *language* stays familiar, not
+  that foreign snippets run.
 - **`switch` / `case` is glob-only.** fish's `case` has no regex — the author's
   config notes "fish wildcards have no `[0-9]` character class" and falls back to
   `string match -rq '^-[0-9]+$'`. mesh's [`match`](#matching-match) takes `/re/`
