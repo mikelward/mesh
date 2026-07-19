@@ -1373,13 +1373,14 @@ never the status of some command a handler happened to run. (`postexec` also
 gets the status as an explicit `status` argument.)
 
 **The prompt** is the same shape — a named, insertion-ordered segment map — but
-each segment is a callable that **returns a string** (or `""` to contribute
-nothing); the shell renders the non-empty ones in key order:
+each segment is a callable that **returns a renderable** — a plain string *or* a
+styled value (below) — or `""` to contribute nothing; the shell renders the
+non-empty ones in key order:
 
 ```
 $sh.prompt.host = host-seg                     # named, ordered segments
 $sh.prompt.dir  = func() { if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() } }
-$sh.prompt.auth = func() { if ssh-id-missing() { style "no-ssh-id" fg: yellow } }   # no else → "" → omitted
+$sh.prompt.auth = func() { if ssh-id-missing() { style("no-ssh-id" --fg yellow) } }   # no else → "" → omitted
 $sh.prompt.dir  = my-dir-seg                   # swap ONE segment by name
 unset $sh.prompt.auth                          # drop the auth warning
 ```
@@ -1388,12 +1389,17 @@ unset $sh.prompt.auth                          # drop the auth warning
 combine bools, not values — and the `auth` segment leans on the decided
 no-`else`-yields-`""` rule so "not applicable" is just an empty contribution.)
 
-**Color comes from a `style` helper, not raw escapes.** `style TEXT fg: yellow
-bold: true` returns a **styled value** — text carrying style attributes — rather
-than baked-in ANSI. The shell owns the actual rendering, so it can measure true
-**display width** (raw escapes buried in a string are the classic prompt
-width-math footgun) and later strip or re-theme the styling. A plain string is an
-unstyled segment; `style` is the one styling primitive in the MVP (color + bold).
+**Color comes from a `style` helper, not raw escapes.** The value call
+`style("no-ssh-id" --fg yellow --bold)` returns a **styled value** — text
+carrying style attributes — rather than baked-in ANSI. It is an ordinary value
+call, so it takes attached parens and `--flag` arguments like any other; a *bare*
+`style …` would run it in command position and yield a status, not the value
+(hence the parens in the example above). Because the shell owns rendering, from a
+styled value it measures true **display width** off the text alone (raw escapes
+buried in a string are the classic prompt width-math footgun) and can later strip
+or re-theme the styling. So a **renderable** is either a plain string or a styled
+value, and an empty string contributes nothing; `style` is the one styling
+primitive in the MVP (color + bold).
 
 **A segment may render more than one line.** The shell assembles the segments
 into a single prompt buffer and treats a **newline as a line break wherever it
