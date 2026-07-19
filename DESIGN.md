@@ -772,6 +772,7 @@ error**:
 | string (NUL-free) | itself | already bytes |
 | int (`$xs:len`, `n = 42`) | decimal digits — `echo $xs:len` → `4` | decimal is canonical, not a choice |
 | bool (a switch, a comparison) | `true` / `false` | two fixed spellings, unambiguous |
+| styled value (from `style`) | its **text**, style attributes dropped | the text is the content; the attributes are display metadata, not argv data |
 | **string with embedded NUL** | **error** | argv entries are NUL-terminated; the OS cannot carry it (same limit as `export`) |
 | **list** | **error** — spread or `:join` | no canonical separator (space? tab? `,`?) |
 | **map** | **error** — render it explicitly | no canonical flattening at all |
@@ -1406,11 +1407,16 @@ therefore one of two things:
 - a **plain string** — which may carry its own ANSI escapes, as an external
   renderer captured with `$(vcs prompt-info)` does (externals have no return
   value, so the renderer necessarily comes in through the output lane). The shell
-  still measures visible width correctly by **skipping** the escape sequences; it
-  just treats them as opaque and cannot restyle them.
+  measures visible width by **skipping SGR (color/style) sequences** — the
+  `ESC [ … m` family, which are genuinely zero-width — treating them as opaque and
+  un-restylable. A plain string that emits **cursor-positioning or other non-SGR
+  control** sequences is *outside* the width contract: those move the cursor, so
+  the shell can't treat them as zero-width, and a prompt segment is expected to
+  produce styled text, not drive the cursor.
 
-So width is accurate either way — the reason to prefer `style` is that structured
-attributes stay *restylable*, which raw escapes are not. A renderable whose
+So width is accurate either way for the styling (SGR) case — the reason to prefer
+`style` is that structured attributes stay *restylable*, which raw escapes are
+not. A renderable whose
 **text** is empty contributes nothing — a plain `""` or `style("" --fg yellow)`
 alike, since emptiness is judged by the payload text (not emitted as bare control
 codes). `style` is the one styling primitive in the MVP (color + bold).
