@@ -592,6 +592,20 @@ $ports[https]             # 443
 $ports[https] = 8443      # set / update
 ```
 
+**Dot sugar.** When the key is a bareword identifier, `$m.key` is sugar for
+`$m[key]` — the record-style access every language has, and much nicer for
+config-shaped maps and the [hook maps](#hooks-and-the-prompt) below:
+
+```
+$ports.https              # == $ports[https]
+$config.editor = vim
+```
+
+Brackets stay for dynamic or non-identifier keys (`$m[$k]`, `$m["a b"]`). The
+dot is an **expression-position** operator only: inside a double-quoted string a
+bare `"$file.txt"` is still interpolate-then-literal (the shell reflex), so reach
+for `$m[key]` or `${m.key}` when you need a map access *inside* a string.
+
 | Form | Result | Meaning |
 | --- | --- | --- |
 | `$m:keys` | list | keys (insertion order preserved) |
@@ -1182,6 +1196,84 @@ now decided — see [Conditionals](#conditionals-if-is-an-expression). The
 file-test modifiers it leans on (`$f:type` / `:exists` / `:exec`) are settled in
 [Tests and comparisons](#tests-and-comparisons).
 
+### Hooks and the prompt
+
+The requirement (from [Requirements](#requirements-carried-over-from-existing-configs)):
+the prompt may be rendered by an external binary, *provided* override hooks — the
+`ssh-add` "no identity" warning, a `[root]` tag, the session nag — can **layer
+on top**, and **hooks compose, they do not replace each other**.
+
+mesh models a hook point as an **insertion-ordered [map](#maps-associative-arrays)
+of named callables** — the key is the handler's *identity*. That one choice
+solves the composition requirement and the worst hook footgun at once:
+
+- **Re-source-safe by construction.** `$precmd.git = …` is *keyed*, so running
+  your rc file again **replaces** the `git` handler instead of stacking a
+  duplicate — the bane of bash `PROMPT_COMMAND` (which appends) and zsh's
+  `add-zsh-hook` (which needs manual dedup). The identity is what lets you
+  re-source freely.
+- **Update or drop one by name** — reassign `$precmd.git`, or `unset $precmd.git`
+  — without touching the others; `$precmd:keys` introspects.
+- **Deterministic order** — maps preserve insertion order, so handlers run
+  (and segments render) in the order registered.
+- **Compose, never replace** — adding a key leaves every other handler intact.
+
+A handler value is a **command name or a callable**: a bareword is a string that
+names a command/function run late-bound (matching the [command
+namespace](#variables-and-assignment)), or a `func(){ … }` lambda for inline
+logic.
+
+**Event hooks** run for effect at named events, in symmetric `pre`/`post` pairs
+plus the singletons — `precmd` (before each prompt), the command pair
+**`preexec`** (before a command runs, given the command line) / **`postexec`**
+(after it finishes, given the command, its **exit status**, and **duration**),
+the directory pair **`precd`** (before the cwd changes, still in the old dir,
+given the target) / **`postcd`** (after, now in the new dir, given the previous
+dir), and `exit`:
+
+```
+$precmd.jobs   = publish-jobs                    # by name
+$postcd.fetch  = func() { vcs auto-fetch & }     # arrived in a new dir — the PWD-gate is now the event itself
+$precd.save    = func(to) { save-dir-state }     # about to leave: act while still in the old dir
+$preexec.timer = func(cmd) { timer-start }       # start the clock…
+$postexec.timer = func(cmd status ms) { last-cmd-time = $ms }   # …stop it; feeds the prompt's timing
+unset $precmd.jobs                               # remove one
+```
+
+The `pre`/`post` split (rather than a single after-the-fact hook) is what lets a
+handler run *before* the transition — save state before leaving a dir, start a
+timer before a command — separately from the after-work. The `preexec` /
+`postexec` pair in particular is how the prompt's **last-exit status** and
+**command timing** (both required dashboard fields) get fed without special
+casing.
+
+**The prompt** is the same shape, but each segment is a callable that **returns a
+string** (or `""` to contribute nothing); the shell joins the non-empty ones in
+key order:
+
+```
+prompt.host = host-seg                            # named, ordered segments
+prompt.dir  = func() { inside-project() and $(vcs prompt-info):raw or tilde-pwd() }
+prompt.auth = func() { ssh-id-missing() and yellow("no-ssh-id") or "" }
+prompt.dir  = my-dir-seg                          # swap ONE segment by name
+unset prompt.auth                                 # drop the auth warning
+```
+
+The payoff is the requirement, met directly: **the external base renderer is
+just one named segment** (`$(vcs prompt-info)`), sitting among peers, so
+`[root]`, the auth warning, and the session nag compose *around* it rather than
+being swallowed by it — the failure mode of "set `$PROMPT` to one big external
+command." The shell owns the **frame** — the two-line full-width layout, the
+horizontal rule, the transient collapse in scrollback, per-segment color — so a
+segment only produces its own text. This is exactly the hand-rolled
+`preprompt` / `prompt_line` / `host_info` / `auth_info` structure of today's
+config, promoted to first-class, keyed, re-source-safe hooks.
+
+*(open: the exact frame-styling surface — how a segment declares its color and
+padding, and how the two-line / full-width / transient-collapse layout is
+configured. The event set — `precmd`, `preexec`/`postexec`, `precd`/`postcd`,
+`exit` — is settled.)*
+
 ## Open questions
 
 - **Name** — smash vs mesh (below).
@@ -1212,8 +1304,12 @@ file-test modifiers it leans on (`$f:type` / `:exists` / `:exec`) are settled in
   into a subfunction" goal that fixed cwd as *persist* would be served further by
   letting an extracted helper see the caller's locals — weigh dynamic (or opt-in
   dynamic) scope against the lexical default.
-- **Hook API** — how override hooks compose over a base (possibly external)
-  prompt renderer.
+- **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
+  points are insertion-ordered maps of named callables (the key is the handler's
+  identity → re-source-safe, individually removable). Events `precmd`,
+  `preexec`/`postexec`, `precd`/`postcd`, `exit`; the prompt is a named,
+  ordered segment map with the external renderer as one peer segment. Remaining:
+  the frame-styling surface (segment color/padding, two-line/transient layout).
 
 ## Name
 
