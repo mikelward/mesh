@@ -851,6 +851,10 @@ the left**. So splitting a string into variables — bash's `read a b c` — is 
   [no null](#variables-and-assignment): a missing field is a bug, not a silent
   empty. This is cleaner than bash's `read`, where the last variable silently soaks
   up the leftover — here you write `...rest` when you mean it.
+- **A failed destructure binds nothing** — shape and length are validated against
+  the RHS *before* any name is committed, so `[a b c] = $two_items` errors with
+  `a`/`b`/`c` left at their prior values (or unbound), never half-updated. The
+  assignment is atomic: all names take their new values or none do.
 
 **The pattern grammar is shared with [`match`](#matching-match).** A bare
 destructuring assignment is the *unconditional* use ("I know the shape — bind it");
@@ -867,6 +871,44 @@ match $args {
 
 So destructuring isn't *owned* by `match` — it is one list-pattern grammar, used
 bare for the simple case and in a `match` arm when you need to branch.
+
+**Regex captures.** The right-hand side is any list, and `:split` is not the only
+way to build one — **`:matches`** runs a regex against a string and hands back its
+capture groups, so destructuring names them in one step:
+
+```
+[one two]      = $str:matches /(.*) (.*)/          # two groups → two names
+[year mon day] = $date:matches /(\d+)-(\d+)-(\d+)/  # an ISO date into fields
+[ip]           = $line:matches /\d+\.\d+\.\d+\.\d+/ # no group → the whole match, one element
+```
+
+- **Positional groups** come back as a **list**, in order — the parenthesized
+  sub-matches only, *not* the whole match — so `[one two] = …:matches /(.*) (.*)/`
+  binds exactly the two groups. A pattern with **no** group yields the whole match
+  as a one-element list, so `[ip] = …:matches /re/` still binds.
+- **Named groups** `(?<name>…)` come back as a **map** keyed by name
+  (`m = $str:matches /(?<user>\w+)@(?<host>\S+)/` then `$m.user`), which pairs
+  with map destructuring once that lands (deferred below).
+- **No match yields an empty list** (`[]`, or `{}` for named groups). Because an
+  empty list is [falsy](#tests-and-comparisons) and length-mismatches a fixed
+  pattern, `[a b] = $str:matches /…/` **errors loudly** when the string doesn't
+  match — the [no-null](#variables-and-assignment) rule again — while
+  `if $str:matches /…/ { … }` or a `match` over the result lets you **test first**:
+
+  ```
+  match $line:matches /(\w+): (.*)/ {
+    [key val] { … }      # matched — key/val bound
+    []        { … }      # no match
+  }
+  ```
+
+This makes `/re/` mesh's one regex story on the *value* side too: `~`
+([Tests](#tests-and-comparisons)) answers yes/no, `:matches` extracts the
+captures — no `=~`-then-`$BASH_REMATCH` dance.
+
+*(TODO: **name this modifier** before first release. `:matches` reads well in
+`[a b] = $s:matches /…/`, but `:match`, `:groups`, and `:captures` are all in the
+running.)*
 
 *(deferred: **map destructuring** — `[name: n, age: a] = $m` binding by key — a
 natural extension of the same idea; and nested patterns (`[a [b c]] = …`).)*
@@ -1233,8 +1275,11 @@ Rules:
   lenient (a `match` with no arm hit yields `""`, like a no-`else` `if`).
 - **It is an expression**: `x = match … { … }` binds the winning arm's value;
   in statement position the value is discarded and arms run for effect.
-- **Regex captures** *(open)*: a `/re/` arm likely exposes its groups (e.g. as a
-  list) to that arm's body; spelling TBD.
+- **Regex captures**: on the *value* side this is **settled** — `str:matches /re/`
+  returns the groups (positional → list, named → map); see
+  [Destructuring](#destructuring). What stays *(open)* is only whether a `/re/`
+  **arm** *auto*-binds its groups into the arm body, or whether you reach for
+  `:matches` explicitly there too.
 - **List-shape patterns** *(settled — see [Destructuring](#destructuring))*: a
   `match` arm may be a list pattern that **binds by position** — a bare element is
   always a **binder** (never a literal to match), with `_` to discard and `...rest`
@@ -1583,7 +1628,10 @@ programs or user functions:
 
 - **Navigation**
   - **`cd [DIR]`** — change directory. No arg → `$env.HOME`; **`cd -`** → the
-    previous dir (`$env.OLDPWD`); a *relative* `DIR` is searched in `CDPATH`. It
+    previous dir (`$env.OLDPWD`); a *relative* `DIR` that does **not** begin with
+    `./` or `../` is searched in `CDPATH`. A **dot-relative** operand (`./child`,
+    `../sib`) always resolves from the current directory, never through `CDPATH` —
+    the conventional POSIX exemption, so `cd ../` can't jump to a `CDPATH` entry. It
     updates `$env.PWD` / `$env.OLDPWD` and fires the
     [`precd` / `postcd`](#hooks-and-the-prompt) hooks. Logical by default;
     **`--physical` / `-P`** resolves symlinks first. The block form `in DIR { }` is
@@ -1600,7 +1648,9 @@ programs or user functions:
     command that shares a directory's name is never shadowed), and only the explicit
     `src/` means "go there." Because it *is* a `cd`, a relative target honors
     [`CDPATH`](#variables-and-assignment) — `proj/` resolves through `CDPATH`
-    exactly as `cd proj` would. It fires for a **lone** word only (`src/ x` runs
+    exactly as `cd proj` would, and the same **dot-path exemption** applies, so
+    `../` and `./sub/` resolve from the current directory rather than a `CDPATH`
+    entry. It fires for a **lone** word only (`src/ x` runs
     `src/` as a command); a trailing-slash word whose target isn't a directory is a
     *no-such-directory* error, not command-not-found. On by default —
     `$sh.options.autocd = off` disables it.
@@ -2062,8 +2112,10 @@ set — `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settl
   a handler may suppress a default, and mid-pipeline SIGINT delivery.
 - **Core surface** (arrays / maps / functions / `if` / `match` / loops / scope /
   tests / isolation) — sketched above. Remaining sub-questions: an infix **`in`**
-  operator as a second membership spelling alongside `:has`; **regex captures**
-  from a `/re/` `match` arm; and whether non-`_` `match` must be **exhaustive**
+  operator as a second membership spelling alongside `:has`; whether a `/re/`
+  `match` **arm** auto-binds its **captures** (the value-side `:matches` extractor
+  is settled — see [Destructuring](#destructuring)); and whether non-`_` `match`
+  must be **exhaustive**
   (leaning lenient → `""`). Decided this pass: **`match`** replaces `case`
   (literal/glob/`/regex/`/range/`_` arms; no single-arm sugar — `~` covers the
   one-test case); **tests** replace `[[ ]]` (`~`/`!~` pattern-match, type-directed
