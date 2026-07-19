@@ -595,7 +595,7 @@ answer:
 | list | scalar or map | **append** as one element | a list may hold any value |
 | map | map | **merge** (right side wins on key clash) | |
 | map | non-map | **error** | no key to merge a bare value under |
-| string | string | **concatenate** | |
+| string | string | **concatenate** | a [styled value](#hooks-and-the-prompt) counts as its text here → plain-string concatenate |
 | int | int | **add** | |
 | bool | bool | **error** | `+=` has no meaning on bools — use `or` / `and` |
 | scalar | mismatched scalar type | **error** | no coercion (`n += "x"` fails) |
@@ -772,7 +772,7 @@ error**:
 | string (NUL-free) | itself | already bytes |
 | int (`$xs:len`, `n = 42`) | decimal digits — `echo $xs:len` → `4` | decimal is canonical, not a choice |
 | bool (a switch, a comparison) | `true` / `false` | two fixed spellings, unambiguous |
-| styled value (from `style`) | its **text**, style attributes dropped | the text is the content; the attributes are display metadata, not argv data |
+| styled value (from `style`) | its **text** (attributes dropped), then the string rows apply | a styled value *is* a string with display metadata, so an embedded NUL in its text is the same hard error as below |
 | **string with embedded NUL** | **error** | argv entries are NUL-terminated; the OS cannot carry it (same limit as `export`) |
 | **list** | **error** — spread or `:join` | no canonical separator (space? tab? `,`?) |
 | **map** | **error** — render it explicitly | no canonical flattening at all |
@@ -1420,6 +1420,18 @@ not. A renderable whose
 **text** is empty contributes nothing — a plain `""` or `style("" --fg yellow)`
 alike, since emptiness is judged by the payload text (not emitted as bare control
 codes). `style` is the one styling primitive in the MVP (color + bold).
+
+A styled value is **not a new scalar type** — it is a **string carrying display
+attributes**. Everywhere *except* prompt rendering it behaves exactly as its
+text: the same [argv](#spread--flattening) rule (its text crosses, an
+embedded NUL is the same hard error), the same [`+=`](#arrays-lists) (it
+concatenates as its text, yielding a plain string — attributes are
+rendering-only and don't survive), the same comparisons and string
+interpolation. **Only the prompt renderer reads the attributes**; every other
+context sees a string. So `style` adds presentation metadata to a string without
+minting a type that must be defined at each boundary. *(A richer per-fragment
+"styled spans" value — where concatenation preserves each fragment's own style —
+is a possible later iteration; the MVP keeps one attribute set per string.)*
 
 **A segment may render more than one line.** The shell assembles the segments
 into a single prompt buffer and treats a **newline as a line break wherever it
