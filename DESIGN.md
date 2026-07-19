@@ -1543,6 +1543,13 @@ leading string in its body) for per-argument descriptions; the signature alone i
 the zero-effort default. Built-ins ship their specs the same way. This is why the
 [command-position](#completion) sources — functions and built-ins — need no probe.
 
+The canned help never overrides the function's own contract: it is synthesized
+**only when the signature does not itself claim `--help`** (a function that
+declares a `--help` switch keeps it), and the `--` terminator still wins — a
+literal `--help` after `--` reaches the body as data (`ll -- --help`), never the
+auto-help. So the synthesized help fills the gap only where the function hasn't
+spoken for the name.
+
 **Generation is lazy.** A spec is generated the first time you complete
 *arguments* for a command with no spec yet, then cached, so later Tabs never
 regenerate. The man-page parse is tried first because it runs nothing; the
