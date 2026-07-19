@@ -637,6 +637,14 @@ a scalar removing one), and what a map LHS means (`-= key` dropping that entry,
 overlapping with `unset $m.key`). Note this is a value-level remove-by-content,
 distinct from `unset $xs[i]`, which deletes by index.)*
 
+*(TODO: consider modifier-form **`:add`** / **`:remove`** (or similar names) as
+the **pure** counterparts to the mutating `+=` / `-=` — `$xs:add e` returning a
+new list with `e` appended and `$xs:remove e` returning one with the matching
+element gone, so they compose in a modifier chain (`$env.PATH:remove /usr/games:dedup`)
+and read as expressions rather than statements. Open: the exact names, whether
+they mirror `+=`'s type-directed dispatch, and how they line up with the existing
+`:map` / `:filter` transforms.)*
+
 ### Maps (associative arrays)
 
 A map literal is a bracket literal whose entries are **`key: value` pairs**,
