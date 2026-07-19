@@ -876,19 +876,22 @@ So destructuring isn't *owned* by `match` — it is one list-pattern grammar, us
 bare for the simple case and in a `match` arm when you need to branch.
 
 **Regex captures.** The right-hand side is any list, and `:split` is not the only
-way to build one — **`:matches`** runs a regex against a string and hands back its
-capture groups, so destructuring names them in one step:
+way to build one — **`:match`** runs a regex against a string and hands back its
+capture groups, so destructuring names them in one step. Like `~`, it is
+**unanchored** — the first match anywhere in the string, so `[ip] = $line:match
+/\d+\.\d+\.\d+\.\d+/` pulls an address out of the middle of a line; anchor with
+`^…$` when you mean the whole string:
 
 ```
-[one two]      = $str:matches /(.*) (.*)/          # two groups → two names
-[year mon day] = $date:matches /(\d+)-(\d+)-(\d+)/  # an ISO date into fields
-[ip]           = $line:matches /\d+\.\d+\.\d+\.\d+/ # no group → the whole match, one element
+[one two]      = $str:match /(.*) (.*)/          # two groups → two names
+[year mon day] = $date:match /(\d+)-(\d+)-(\d+)/  # an ISO date into fields
+[ip]           = $line:match /\d+\.\d+\.\d+\.\d+/ # no group → the whole match, one element
 ```
 
 - **Positional groups** come back as a **list**, in order — the parenthesized
-  sub-matches only, *not* the whole match — so `[one two] = …:matches /(.*) (.*)/`
+  sub-matches only, *not* the whole match — so `[one two] = …:match /(.*) (.*)/`
   binds exactly the two groups. A pattern with **no** group yields the whole match
-  as a one-element list, so `[ip] = …:matches /re/` still binds.
+  as a one-element list, so `[ip] = …:match /re/` still binds.
 - **An unmatched group keeps its slot as `""`** — a group that didn't participate
   (an optional `(a)?(b)` against `"b"`) contributes an **empty string**, never a
   dropped position, so the list length equals the group count and the following
@@ -896,17 +899,17 @@ capture groups, so destructuring names them in one step:
   matched empty and one that didn't both read as `""` — distinguish with an
   explicit optional-group guard if you must).
 - **Named groups** `(?<name>…)` come back as a **map** keyed by name
-  (`m = $str:matches /(?<user>\w+)@(?<host>\S+)/` then `$m.user`); an unmatched
+  (`m = $str:match /(?<user>\w+)@(?<host>\S+)/` then `$m.user`); an unmatched
   named group is present with value `""`. This pairs with map destructuring once
   that lands (deferred below).
 - **No match yields `false`**, not an empty collection. Matching is a pass/fail
-  operation, so on a miss `:matches` returns the bool **`false`** (status `1`) —
+  operation, so on a miss `:match` returns the bool **`false`** (status `1`) —
   keeping the model's rule that failure is signalled by a `false`, never by the
   *shape* of a value. On a match it returns the capture list (or map).
   That makes the result a **valid condition** on its own:
 
   ```
-  if $str:matches /(.*) (.*)/ { … }      # matched? — false on a miss
+  if $str:match /(.*) (.*)/ { … }      # matched? — false on a miss
   ```
 
 - **Bind and test in one step** by using the assignment *as* the condition — the
@@ -914,8 +917,8 @@ capture groups, so destructuring names them in one step:
   the block:
 
   ```
-  if [one two] = $str:matches /(.*) (.*)/  { puts "$one / $two" }
-  if m = $str:matches /(?<user>\w+)@(?<host>\S+)/  { puts $m.user }
+  if [one two] = $str:match /(.*) (.*)/  { puts "$one / $two" }
+  if m = $str:match /(?<user>\w+)@(?<host>\S+)/  { puts $m.user }
   ```
 
   As a *condition*, `lhs = rhs` tests the RHS's status: a match binds `lhs` and
@@ -925,25 +928,27 @@ capture groups, so destructuring names them in one step:
   there when you want to branch on more than one shape:
 
   ```
-  match $line:matches /(\w+): (.*)/ {
+  match $line:match /(\w+): (.*)/ {
     [key val] { … }      # matched — key/val bound
     false     { … }      # no match
   }
   ```
 
-- **A bare, unconditional bind is an assertion.** `[a b] = $str:matches /…/` with
+- **A bare, unconditional bind is an assertion.** `[a b] = $str:match /…/` with
   no `if` says "I know this matches" — so a miss (`false`, not a two-element list)
   is a **loud error**, the [no-null](#variables-and-assignment) rule again: an
   unconditional bind that silently yielded `a = ""` would bury the bug. Reach for
   the `if` form when a miss is expected; the bare form when it isn't.
 
 This makes `/re/` mesh's one regex story on the *value* side too: `~`
-([Tests](#tests-and-comparisons)) answers yes/no, `:matches` extracts the
+([Tests](#tests-and-comparisons)) answers yes/no, `:match` extracts the
 captures — no `=~`-then-`$BASH_REMATCH` dance.
 
-*(TODO: **name this modifier** before first release. `:matches` reads well in
-`[a b] = $s:matches /…/`, but `:match`, `:groups`, and `:captures` are all in the
-running.)*
+Named **`:match`** (not `:matches`), the unanchored scripting-world sense — Ruby
+`String#match`, JS, Perl `=~`, bash `[[ =~ ]]`, grep — *not* Python's anchored
+`re.match`. `:groups` / `:captures` were considered and dropped: `:match` pairs
+with the [`match`](#matching-match) statement and the `~` test, one regex story
+under one word.
 
 *(deferred: **map destructuring** — `[name: n, age: a] = $m` binding by key — a
 natural extension of the same idea; and nested patterns (`[a [b c]] = …`).)*
@@ -1233,7 +1238,7 @@ Decisions:
 - **An assignment may *be* the condition** — `if lhs = rhs { … }`, the `if let`
   shape. It tests the RHS's status (a `false` / nonzero fails), and on success
   binds `lhs` for the block; `lhs` may be a name or a `[…]`
-  [destructuring](#destructuring) pattern, so `if [one two] = $s:matches /…/ { … }`
+  [destructuring](#destructuring) pattern, so `if [one two] = $s:match /…/ { … }`
   and `if line = gets() { … }` both test-and-bind in one step, with the RHS written
   once. A miss binds nothing. This is the conditional counterpart to a bare
   `lhs = rhs` statement, which stays a loud assertion (a shape/length mismatch
@@ -1318,11 +1323,11 @@ Rules:
   lenient (a `match` with no arm hit yields `""`, like a no-`else` `if`).
 - **It is an expression**: `x = match … { … }` binds the winning arm's value;
   in statement position the value is discarded and arms run for effect.
-- **Regex captures**: on the *value* side this is **settled** — `str:matches /re/`
+- **Regex captures**: on the *value* side this is **settled** — `str:match /re/`
   returns the groups (positional → list, named → map); see
   [Destructuring](#destructuring). What stays *(open)* is only whether a `/re/`
   **arm** *auto*-binds its groups into the arm body, or whether you reach for
-  `:matches` explicitly there too.
+  `:match` explicitly there too.
 - **List-shape patterns** *(settled — see [Destructuring](#destructuring))*: a
   `match` arm may be a list pattern that **binds by position** — a bare element is
   always a **binder** (never a literal to match), with `_` to discard and `...rest`
@@ -1345,7 +1350,10 @@ to a bool):
 - **Pattern-match** with `~` / `!~`: `$f ~ *.txt` is a bool "does the string
   match this glob," and `$f ~ /re/` the regex form — the one-line boolean twin
   of a `match` arm (`!~` negates). This is bash's `[[ $f == *.glob ]]` and
-  `[[ $s =~ re ]]`, unified.
+  `[[ $s =~ re ]]`, unified. The regex form is **unanchored** (first match
+  anywhere, as bash `=~` and grep are); anchor with `^…$`. A glob, by contrast,
+  matches the **whole string** (fnmatch), the same as a `/re/` wrapped in `^…$` —
+  and `:match` shares the regex rule.
 - **File tests** are the scalar cousins of the `:files`/`:f` filter modifiers.
   The type/permission axis is words: `$p:type` yields the `find -type` word
   (`file`/`dir`/`link`/…) so `$p:type == dir` is `-d`; `$p:exists` is `-e`;
@@ -2156,7 +2164,7 @@ set — `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settl
 - **Core surface** (arrays / maps / functions / `if` / `match` / loops / scope /
   tests / isolation) — sketched above. Remaining sub-questions: an infix **`in`**
   operator as a second membership spelling alongside `:has`; whether a `/re/`
-  `match` **arm** auto-binds its **captures** (the value-side `:matches` extractor
+  `match` **arm** auto-binds its **captures** (the value-side `:match` extractor
   is settled — see [Destructuring](#destructuring)); and whether non-`_` `match`
   must be **exhaustive**
   (leaning lenient → `""`). Decided this pass: **`match`** replaces `case`
