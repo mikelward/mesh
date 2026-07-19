@@ -1141,13 +1141,15 @@ syntax above.
 *(TODO: **wrappers, forwarding, and dynamic definition.** [No aliases](#built-ins)
 is *decided* — a `func` replaces `alias ll`. But real configs still need things a
 plain `func` doesn't yet give cleanly; these are open:*
-  - *A **terse forwarding wrapper.** `func co(...args) { vcs checkout ...$args }`
-    works but is tedious to repeat for a tool's every subcommand (the `conf`/
-    `scripts` configs generate these in a loop over `$(vcs --list-commands)`). A
-    shorthand — `wrap co = vcs checkout`, or a loop-friendly definer — would cover
-    "prefix/rename a command, pass the rest through." It must forward flags
-    **transparently**: nushell's plain `def` wrapper rejects `co -m msg` as an
-    "unknown flag" unless declared (`def --wrapped`) — the exact trap to avoid.*
+  - *A **terse forwarding wrapper.** Even `func co(...args) { vcs checkout ...$args }`
+    is not a fully transparent baseline: under the settled function rules an
+    **undeclared long flag** (`co --amend`) is rejected before `...args` can collect
+    it, so the caller would need an explicit `--` — the same trap nushell hits, where
+    a plain `def` wrapper rejects `co -m msg` as an "unknown flag" unless it uses
+    `def --wrapped`. So the open work is a shorthand — `wrap co = vcs checkout`, or a
+    loop-friendly definer over `$(vcs --list-commands)` — that **disables the
+    wrapper's own flag parsing and forwards every argument verbatim**, which a plain
+    `...args` `func` does not do today.*
   - ***Running a wrapper under `sudo` / `xargs` / `watch`.** Because mesh commands
     are functions, not aliases or `PATH` binaries, `sudo ll` can't see `ll` — bash
     papers over this with the invisible `alias sudo='sudo '` trailing-space trick.
@@ -2210,9 +2212,9 @@ to avoid" rather than promising the latter as done.
 
 ### bash / POSIX
 
-- **A pipeline's `while read` silently loses its variables.** `cmd | while read x
-  { n = $((n+1)) }; echo $n` prints `0` — the loop ran in a forked subshell, so
-  `n` never escaped. mesh's **settled** answer is to not pipe into a loop at all: a
+- **A pipeline's `while read` silently loses its variables.**
+  `n=0; seq 3 | while read x; do n=$((n+1)); done; echo "$n"` prints `0` in bash —
+  the loop ran in a forked subshell, so `n` never escaped. mesh's **settled** answer is to not pipe into a loop at all: a
   [command substitution](#command-substitution) is a real list you iterate *in the
   current scope* — `for line in $(cmd) { n += 1 }` leaves `n` set, no subshell
   involved. ***(planned)*** for the literal `cmd | while gets line { … }` form to
@@ -2396,6 +2398,60 @@ to avoid" rather than promising the latter as done.
   (structure stays emergent from the segments). Weigh this keyed-structural-segment
   shape against a list-of-lines (which buys explicit lines at the cost of
   positional, non-keyed rows).
+
+**Foundational specification work.** The entries above settle *surface* features;
+these five are the deeper contracts an implementation needs before code, and each
+is currently under-specified. They are called out together because tooling, error
+recovery, and the Rust data representation all depend on them.
+
+- **Grammar and precedence — needs an EBNF.** Publish a real parser grammar (EBNF
+  or equivalent), not just examples, covering adjacency/concatenation, modifier
+  arguments, value calls `f(...)`, ranges `..` / `..=`, redirects, `&`
+  backgrounding, pipelines, `&&` / `||` chains, postfix guards, and newline / `;`
+  termination. Pin the ambiguous cases explicitly: does `a | b && c &` background
+  the whole `&&` list or only `c` (leaning: the whole list, as in bash), and where
+  does a trailing redirect attach (leaning: to the nearest simple command).
+  Examples alone can't make tooling and error recovery agree.
+- **Status lifetime.** Define exactly when `$sh.status` changes. Provisional: a
+  pipeline's status is its **last stage**, every stage retained in
+  [`$sh.pipestatus`](#variables-and-assignment); decide whether a **`pipefail`**
+  option is in the MVP (leaning: available, default off). Specify the status after
+  a plain assignment, a value expression, a parse error vs a runtime error, a
+  background launch (`&`), and hook dispatch (already snapshotted/restored around
+  hooks). mesh adds **no implicit `errexit`**; interactive and `source`d
+  configuration errors therefore need an explicit recovery rule (see failure
+  classes below) rather than unpredictable termination.
+- **Condition truthiness — needs a table or a narrowing.** Ordinary `if` / `while`
+  accept a bool or a command status; the [assignment-condition](#conditionals-if-is-an-expression)
+  additionally calls the RHS "truthy," which needs a per-type table or should be
+  narrowed. Leaning: **narrow it to the status view** — bool `false`, a failed
+  command, and a nonzero `int` are false; everything else (including `""`, `[]`,
+  `[:]`, and any non-empty value) is true — so truthiness is never
+  content-emptiness, and pattern-fit stays the separate gate. That keeps it
+  consistent with the result/status model and `gets`'s truthy `""`, and avoids
+  inventing collection-truthiness. Write the table out explicitly for every value
+  type.
+- **Text vs bytes — the encoding model.** Decide whether a mesh string is an
+  arbitrary **byte string** or guaranteed **UTF-8**; how undecodable filenames and
+  command output are represented (leaning: bytes that round-trip losslessly, so a
+  non-UTF-8 path survives capture → argv unharmed); what a **"character" index**
+  means (byte / scalar value / grapheme); and which operations require text
+  (case-fold, display width, parsing) versus bytes (pipes, captures, argv, paths).
+  Leaning: a string is a **byte string that is usually UTF-8** — byte operations
+  never decode, text operations decode on demand and **fail loud** on an invalid
+  sequence. This must precede the Rust representation and is essential on Unix,
+  where paths are not guaranteed UTF-8.
+- **Failure classes — the execution model behind "fail loud."** Classify every
+  failure as a **parse error**, a **recoverable runtime error** (bad index, type
+  error, undefined variable under strict access, undecodable text where text is
+  required), or an **ordinary nonzero command status**, and define how each behaves
+  in an interactive line, in `source FILE`, in a function body, mid-pipeline, and
+  within `&&` / `||`. Leaning: a parse error rejects the whole compilation unit (the
+  line, or the entire file — a bad `source` runs *none* of it) but never ends an
+  interactive session; a runtime error aborts the current statement and surfaces
+  (nonzero status) but does not unwind past the interactive prompt; a command's
+  nonzero status is just a value. "[Fail loud](#variables-and-assignment)" is the
+  right UX principle but is not yet an execution model — this makes it one.
 
 ## Name
 
