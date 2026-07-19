@@ -629,6 +629,14 @@ This is the **one place the shell flattens by type rather than by an explicit
 `...`** — confined to the `+=` right-hand side, type-directed not
 whitespace-directed, so it does not reintroduce word-splitting.
 
+*(TODO: consider a symmetric **`-=`** that removes an element — `$hosts -= web3`
+deleting the matching element, mirroring how `+=` appends one. Open: remove the
+first match or every match; equality by value; whether the right-hand type
+dispatches like `+=` (a list RHS removing each of its elements → set-difference,
+a scalar removing one), and what a map LHS means (`-= key` dropping that entry,
+overlapping with `unset $m.key`). Note this is a value-level remove-by-content,
+distinct from `unset $xs[i]`, which deletes by index.)*
+
 ### Maps (associative arrays)
 
 A map literal is a bracket literal whose entries are **`key: value` pairs**,
