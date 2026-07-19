@@ -1513,9 +1513,11 @@ readline is avoided as GPL.
 
 **MVP: bindings are hardcoded emacs/friendly** — `Ctrl-A`/`Ctrl-E` for line ends,
 `Ctrl-B`/`Ctrl-F` and arrows to move, `Ctrl-W` / `Alt-Backspace` word-kill,
-`Ctrl-U`/`Ctrl-K` line-kill, `Ctrl-Y` yank, `Ctrl-R` reverse history search,
-up/down for **prefix** history search (a typed prefix filters the walk; see
-[Interactive history](#interactive-history)), `Tab` to complete, `Ctrl-L` to
+`Ctrl-U`/`Ctrl-K` line-kill, `Ctrl-Y` yank, `Alt-.` (Esc + `.`) to insert the
+**last argument** of the previous command (repeat to walk earlier commands' last
+args), `Ctrl-R` reverse history search, up/down for **prefix** history search (a
+typed prefix filters the walk; see [Interactive history](#interactive-history)),
+`Tab` to complete, `Ctrl-L` to
 clear. **Multi-line
 continuation** is driven by **parser incompleteness** — the editor asks the
 parser whether the buffer is a complete command and, if not, reads a continuation
