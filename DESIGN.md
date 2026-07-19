@@ -1515,7 +1515,8 @@ readline is avoided as GPL.
 `Ctrl-B`/`Ctrl-F` and arrows to move, `Ctrl-W` / `Alt-Backspace` word-kill,
 `Ctrl-U`/`Ctrl-K` line-kill, `Ctrl-Y` yank, `Alt-.` (Esc + `.`) to insert the
 **last argument** of the previous command (repeat to walk earlier commands' last
-args), `Ctrl-R` reverse history search, up/down for **prefix** history search (a
+args; it obeys the same [session selection rule](#interactive-history) as the other
+recall motions), `Ctrl-R` reverse history search, up/down for **prefix** history search (a
 typed prefix filters the walk; see [Interactive history](#interactive-history)),
 `Tab` to complete, `Ctrl-L` to
 clear. **Multi-line
@@ -1653,12 +1654,16 @@ search** — with a prefix already typed, `Up` walks the most recent commands th
 *start with* it (an empty buffer just steps chronologically). So typing `git ` then
 `Up` cycles your recent `git …` lines — the friendly default.
 
-**Recall and expansion are scoped to the current session.** `Up`, `Ctrl-R`, and the
-`!!` / `!$` / `!string` expansions resolve against *this* session's rows, so a
-command typed in another terminal never becomes your "previous" command. The store
-stays **shared** — `history` lists and searches across every session — but "most
-recent" *for recall* means *your* most recent. (A global/shared-recall mode is a
-deferred opt-in.)
+**Recall and expansion draw from your session plus finished history.** `Up`,
+`Ctrl-R`, `Alt-.`, and the `!!` / `!$` / `!string` expansions all select from one
+view: **this session's own rows together with every completed row from sessions
+that are no longer live** — the full persisted history, *minus* the in-flight
+commands of other **currently-live** sessions. So a fresh session still recalls
+everything earlier sessions saved, while a command running *right now* in another
+terminal never becomes your "previous" command. (Once that terminal exits its rows
+become finished history and join the view; a mode that also pulls in *live* peers'
+commands is a deferred opt-in.) The store stays **shared** — `history` lists and
+searches across every session regardless.
 
 **The MVP surface is a `history` built-in** that lists entries (newest last), and
 **`history | grep foo`** is the MVP search — the whole point of a real store is
@@ -1708,9 +1713,10 @@ above), so another terminal's commands are never your `!!`.
   (`!git:old\ thing=new\ thing`). `^old^new` is just shorthand for `!!:old=new`.
 
 **The `!` clash is resolved lexically:** `!` introduces an expansion only when
-immediately followed by a **designator** — `!`, `$`, `-`, a digit, or a word char —
-so the operators **`!=`** and **`!~`** (a `!` before `=` / `~`) and a lone `!` are
-never touched. Two safety wins over bash: expansion happens **only unquoted** —
+immediately followed by a **supported designator** — `!` (→ `!!`), `$` (→ `!$`), or
+a word character (→ `!string`). A digit, `-`, or `*` does **not** activate
+expansion in the MVP (they are reserved for the deferred `!n` / `!-n` / `!*`), and
+neither do `=` / `~` (the operators `!=` / `!~`) or a lone `!` — all left literal. Two safety wins over bash: expansion happens **only unquoted** —
 *both* single and double quotes make `!` literal (bash expanding `!` inside double
 quotes is a classic footgun) — with `\!` to escape and a
 **`$sh.options.histexpand = off`** switch to turn it off entirely.
