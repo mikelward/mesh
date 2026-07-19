@@ -511,6 +511,40 @@ settings map, and the `$sh.complete` [completion-override](#completion) map.
 (This is the one place the general map rules are constrained — individual keys
 carry a mutability flag.)
 
+### Quoting and escaping
+
+mesh has three ways to write a literal plus one escape character, chosen so the
+common cases need no ceremony and the rules stay few.
+
+**Bare words are literal** (`x = foo` binds `"foo"`), and a single **backslash
+escapes the next character** so one metacharacter can go literal without reaching
+for quotes: `cp a\ b dst` (a literal space keeps it one argument), `\*` (a literal
+star, not a glob), `\$`, `\#`, `\!`, `\-`. A `\` at end of line is **line
+continuation**.
+
+**Single quotes `'…'` are raw** — no interpolation and almost no escapes — so they
+are the natural home for regex source and paths (`'\d+\.txt'` is exactly those
+bytes). The **only** two escapes are **`\'`** (a literal quote — `'can\'t'` →
+`can't`) and **`\\`** (a literal backslash — `'C:\\'` → `C:\`); the `\\` escape is
+what lets you put a backslash *before* a quote (`'\\\''` → `\'`) or at the very end
+of a string. *Every other* backslash — `\n`, `\d`, `\.` — stays literal, so regex
+and path rawness holds.
+
+**Double quotes `"…"` interpolate and escape.** `$name` / `${…}`
+[interpolate](#variables-and-assignment), and a **modern C-style escape set**
+applies — `\n \t \r \e \\ \" \$` and `\u{1F600}` for Unicode — so `"a\nb"` is two
+lines and `"\$5"` is a literal dollar. This is a deliberate break from bash (where
+`"\n"` is a backslash-n and you reach for `$'\n'`): mesh needs no `$'…'` form
+because double quotes already interpret escapes.
+
+**Adjacent pieces concatenate** into one word — `"$dir"/'sub'/$file` fuses into a
+single path and `--flag='some value'` is one argument — so literals and expansions
+compose without a `+`.
+
+*(open: a raw form that can itself hold *both* quote kinds — a heredoc or an
+`r#"…"#`-style delimiter — for the rare string needing embedded `'` and `"` with
+no escaping.)*
+
 ### Arrays (lists)
 
 The list is mesh's core value — command substitutions already produce lists
