@@ -1451,6 +1451,8 @@ programs or user functions:
 - **Vars / env** — `export`, `unset`, `global`, and `source FILE` to (re-)load a
   file — re-sourcing your rc is safe because [hooks are keyed](#hooks-and-the-prompt).
 - **Jobs** — `fg`, `bg`, `jobs`, `kill`, `wait` ([Job control](#job-control)).
+- **History** — `history` (list past commands; `history | grep` is the MVP search —
+  see [Interactive history](#interactive-history)).
 - **Session** — `exit [status]`.
 
 **No aliases.** mesh drops the alias mechanism entirely: a **function** is just
@@ -1618,11 +1620,47 @@ search** — with a prefix already typed, `Up` walks the most recent commands th
 **The MVP surface is a `history` built-in** that lists entries (newest last), and
 **`history | grep foo`** is the MVP search — the whole point of a real store is
 that richer queries (by cwd, by exit status, by time) can come later without
-changing how entries are written. So `list | grep` is enough to ship.
+changing how entries are written. So `list | grep` is enough to ship. The
+**currently-executing command is excluded** from what `history` lists: its row is
+*recorded* at `preexec` (to capture `start` / `cwd` / `tty`) but not *visible* to
+`history` until it completes, so `history | grep foo` never matches its own
+pipeline — a command never sees itself.
 
 *(deferred: an atuin-style fuzzy / interactive search over the columns; a
 `$sh.history` value accessor for scripting; cross-session and cross-host sync;
 the dedup policy; secret redaction; and import from bash/zsh history files.)*
+
+### History expansion
+
+For quick keyboard recall mesh keeps bash's `!` history expansion — but
+**interactive-only and quote-safe**. It is a pre-parse pass that rewrites the input
+line *before* parsing and runs **only in an interactive shell** (a script never
+expands `!`), so it can never surprise non-interactive code. It reads from the same
+[history store](#interactive-history).
+
+- **`!!`** — the previous command line.
+- **`!string`** — the most recent command that *starts with* `string`
+  (`!git` → your last `git …`).
+- **`!$`** — the last argument of the previous command (`mkdir foo; cd !$`).
+  (`!*` for all args, and `!n` / `!-n` by index, are natural extensions — deferred.)
+- **Substitution** — two spellings: the terse **`^old^new`** for the everyday
+  "fix my last command" (line-start; previous command; first match), and a general
+  **`:old=new`** modifier on *any* history reference (`!!:foo=bar`,
+  `!git:foo=bar`). The `old=new` form reads as a *mapping* rather than importing
+  sed's `s///` (which mesh uses nowhere else), and it **chains** like every other
+  mesh `:` modifier — `!git:foo=bar:x=y` applies both substitutions in order. Split
+  is on the **first `=`** (so `new` may contain `=`; a literal `=` in `old` escapes
+  as `\=`), first match by default. `^old^new` is just shorthand for `!!:old=new`.
+  *(open: the global-replace spelling, and a delimited/quoted form for patterns
+  containing spaces or `:`.)*
+
+**The `!` clash is resolved lexically:** `!` introduces an expansion only when
+immediately followed by a **designator** — `!`, `$`, `-`, a digit, or a word char —
+so the operators **`!=`** and **`!~`** (a `!` before `=` / `~`) and a lone `!` are
+never touched. Two safety wins over bash: expansion happens **only unquoted** —
+*both* single and double quotes make `!` literal (bash expanding `!` inside double
+quotes is a classic footgun) — with `\!` to escape and a
+**`$sh.options.histexpand = off`** switch to turn it off entirely.
 
 ### Hooks and the prompt
 
@@ -1794,16 +1832,14 @@ set — `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settl
   so glob exclusion keeps the spaced infix `-` only.
 - **String modifier set** — beyond `:strip` / `:replace`.
 - **Predicate qualifier syntax** — confirm `size>` / `age<` / `mtime<` forms.
-- **History expansion — TODO.** Whether to support bash-style `!!` (last command),
-  `!$` (last arg), `!n` / `!-n`, `!string` (last starting with `string`), and the
-  `:` word/`:s` modifiers — and which subset, given modern Ctrl-R/arrow recall
-  makes some of it vestigial. Watch the clash with the existing `!~` / `!=`
-  operators (history `!` is a word-leading prefix; `!=`/`!~` are spaced infix).
-- **History run with substitution — TODO.** Re-run a past command with a
-  substitution — bash's quick-sub `^old^new` and `!!:s/old/new/`, or an `fc -s`
-  style `old=new`. Decide the spelling (a `^old^new` quick form vs. a `:s`
-  modifier on a history reference) and how it reads against mesh's `:`-modifier
-  grammar.
+- **History expansion — decided** ([History expansion](#history-expansion)):
+  interactive-only, quote-safe `!!` / `!string` / `!$` (with `!*` / `!n` deferred);
+  the `!` clash resolved lexically (a designator must follow, so `!=` / `!~` and a
+  lone `!` are untouched); both quotes make `!` literal, `\!` escapes, and
+  `$sh.options.histexpand = off` disables it. Substitution is a chainable
+  **`:old=new`** modifier on any history reference (`!git:foo=bar:x=y`), with
+  **`^old^new`** as shorthand for `!!:old=new`. Remaining: the global-replace
+  spelling and a delimited form for patterns with spaces / `:`.
 - **Interactive history (store & recall) — decided**
   ([Interactive history](#interactive-history)): a **SQLite** store at
   `$XDG_STATE_HOME/mesh/history.db` with rich per-entry columns
