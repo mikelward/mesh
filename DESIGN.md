@@ -486,8 +486,10 @@ top-level is **yours**; the built-ins hang off two reserved roots:
   **`$sh.status`** (last exit, int `0`–`255`, the readable replacement for `$?`),
   **`$sh.pipestatus`** (a **list** of the last pipeline's stage statuses, where
   real lists beat bash's `PIPESTATUS`), `$sh.pid`, `$sh.version`, `$sh.options`,
-  `$sh.interactive`, and **`$sh.jobs`** (the live [job-control](#job-control)
-  map); **and the hooks** — `$sh.prompt`, `$sh.preprompt`,
+  `$sh.interactive`, **`$sh.jobs`** (the live [job-control](#job-control) map),
+  and **`$sh.args`** / **`$sh.name`** (script/positional args as a list, and the
+  shell-or-script name — see [Startup](#startup-and-invocation)); **and the
+  hooks** — `$sh.prompt`, `$sh.preprompt`,
   `$sh.preexec` / `$sh.postexec`, `$sh.precd` / `$sh.postcd`, `$sh.exit`
   ([Hooks and the prompt](#hooks-and-the-prompt)).
 
@@ -497,11 +499,12 @@ clashes. Access is strict [map access](#maps-associative-arrays), so `$sh:keys`
 lists the whole surface and a mistyped key fails loud.
 
 **Read-only vs. writable within `$sh`.** The **runtime** entries (`$sh.status`,
-`$sh.pipestatus`, `$sh.pid`, `$sh.version`, `$sh.interactive`, and `$sh.jobs`
-with its records) are the shell's authoritative state — **read-only**: assigning
-or `unset`ting one is an error, so config can't corrupt an invariant. (`$sh.jobs`
-changes only through `&` / `fg` / `bg` / `kill` and job completion, never by
-mutating the map directly — you still *read* it freely, e.g. `$sh.jobs:len`.) The **configuration** entries are yours to
+`$sh.pipestatus`, `$sh.pid`, `$sh.version`, `$sh.interactive`, `$sh.jobs` with
+its records, and `$sh.args` / `$sh.name`) are the shell's authoritative state —
+**read-only**: assigning or `unset`ting one is an error, so config can't corrupt
+an invariant. (`$sh.jobs` changes only through `&` / `fg` / `bg` / `kill` and job
+completion, never by mutating the map directly — you still *read* it freely, e.g.
+`$sh.jobs:len`.) The **configuration** entries are yours to
 write: the hook maps (`$sh.prompt`, `$sh.preprompt`, …) and the `$sh.options`
 settings map. (This is the one place the general map rules are constrained —
 individual keys carry a mutability flag.)
@@ -1392,6 +1395,95 @@ pipeline; and a `jobdone` hook to fire on completion. Terminal plumbing —
 process groups, `tcsetpgrp`, `SIGTSTP`/`SIGCONT` — is implementation, not
 surface.)*
 
+### Startup and invocation
+
+**Config files** live under `$XDG_CONFIG_HOME/mesh` (default `~/.config/mesh/`),
+sourced in order by shell kind — the zsh split, XDG-located and mesh-named:
+
+- **`env.mesh`** — *every* mesh, including non-interactive scripts: environment
+  and `$env.PATH` setup. Kept small and fast, because scripts pay for it on
+  every run.
+- **`login.mesh`** — login shells only, after `env.mesh`: once-per-login setup.
+- **`rc.mesh`** — interactive shells, after the above: the *interactive* rc where
+  prompt segments, hooks, keybindings, and functions live. This is the file the
+  whole design has been targeting.
+- **`logout.mesh`** — on login-shell exit.
+
+Order: `env` → (login) `login` → (interactive) `rc`, and `logout` on the way out.
+
+**Invocation & flags** are the familiar surface:
+
+```
+mesh                       # interactive shell when stdin is a tty
+mesh script.mesh a b c     # run a script; a b c become $sh.args
+mesh -c "puts hi" a b      # run a command string; a b become $sh.args
+mesh -s                    # read commands from stdin
+mesh -i                    # force interactive
+mesh -l / --login          # login shell (also sources login.mesh)
+mesh --rcfile FILE         # use FILE instead of rc.mesh
+mesh --norc                # skip rc.mesh
+mesh --version / --help
+```
+
+Script and positional args are a **real list**, **`$sh.args`** (`$sh.args:len`
+for the count, `$sh.args[0]` for the first — none of `$1` / `$@` / `$#`), and
+**`$sh.name`** is the shell-or-script name (bash's `$0`). Both are read-only
+runtime entries.
+
+*(deferred: system-wide `/etc/mesh/*` files; mutating positional args
+(`shift` / `set --`); and whether a non-login, non-interactive script should skip
+`env.mesh` for speed.)*
+
+### Built-ins
+
+The MVP built-in set is deliberately small — most "commands" are external
+programs or user functions:
+
+- **Navigation** — `cd` (`cd -` toggles to the previous dir, no arg → `$env.HOME`,
+  searches `CDPATH`); the block form `in DIR { }` covers scoped `pushd`/`popd`.
+- **I/O** — `puts` (write a line — mesh's `echo`) and `gets` (read a line into a
+  variable).
+- **Vars / env** — `export`, `unset`, `global`, and `source FILE` to (re-)load a
+  file — re-sourcing your rc is safe because [hooks are keyed](#hooks-and-the-prompt).
+- **Jobs** — `fg`, `bg`, `jobs`, `kill`, `wait` ([Job control](#job-control)).
+- **Session** — `exit [status]`.
+
+**No aliases.** mesh drops the alias mechanism entirely: a **function** is just
+as terse (`func ll() { ls -l --color ...$sh.args }`), and it composes, scopes,
+and takes arguments properly, so there's no second half-language of "short
+names." A bare word that is neither a function nor a built-in is a
+command-not-found error, never a silently-expanded alias.
+
+### Line editing
+
+The interactive read loop — cursor motion, kill/yank, multi-line editing, history
+recall, completion — is built on a **line-editor library**, not hand-rolled,
+chosen so the keybinding and completion model stays configurable later. The pick
+is **reedline** (nushell's editor, **MIT-licensed**): it already models swappable
+keybinding maps (emacs *and* vi), completion menus, hints/autosuggestions, a
+syntax-highlight hook, multi-line validation, and pluggable history — so mesh's
+future "configure your keys from `rc.mesh`" surface is mostly a matter of exposing
+what reedline already has. A deciding factor is **word-boundary editing** — good
+word motions and word-kills (`Ctrl-W`, `Alt-B`/`Alt-F`, `Alt-D`) are exactly the
+everyday ergonomics that matter, and reedline handles them well where **libedit
+is poor** and **readline is workable but not ergonomic**. Both viable candidates
+are permissively licensed (reedline and the fallback **rustyline** are MIT); GNU
+readline is avoided as GPL.
+
+**MVP: bindings are hardcoded emacs/friendly** — `Ctrl-A`/`Ctrl-E` for line ends,
+`Ctrl-B`/`Ctrl-F` and arrows to move, `Ctrl-W` / `Alt-Backspace` word-kill,
+`Ctrl-U`/`Ctrl-K` line-kill, `Ctrl-Y` yank, `Ctrl-R` reverse history search,
+up/down for history, `Tab` to complete, `Ctrl-L` to clear. **Multi-line
+continuation** is a validator: an unclosed brace/quote/paren, or a trailing `|` /
+`&&` / `\`, keeps reading on a continuation line. The editor owns rendering the
+[prompt](#hooks-and-the-prompt) segment map and its multi-line redraw.
+
+*(deferred: exposing the **keybinding config** from `rc.mesh` — the whole reason
+for the library choice — plus a vi mode, custom widgets, fish-style
+autosuggestions, and syntax highlighting. Completion is wired *through* the editor
+but its **spec** — programmable per-command completers — is its own spike; MVP
+does file and command-name completion.)*
+
 ### Hooks and the prompt
 
 The requirement (from [Requirements](#requirements-carried-over-from-existing-configs)):
@@ -1572,6 +1664,15 @@ set — `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settl
   style `old=new`. Decide the spelling (a `^old^new` quick form vs. a `:s`
   modifier on a history reference) and how it reads against mesh's `:`-modifier
   grammar.
+- **Interactive history (store & recall) — TODO.** Separate from the expansion
+  syntax above: the history *store* and *recall* — up/down and `Ctrl-R` search
+  (wired through the [line editor](#line-editing)), on-disk persistence (path,
+  format — plain file vs. SQLite), and the dedup / cross-session-sharing policy.
+- **Interactive signals — TODO.** `Ctrl-C` (SIGINT cancels the current line /
+  interrupts the foreground job but never kills the interactive shell), `Ctrl-D`
+  (EOF → `exit` on an empty line), and `SIGWINCH` (resize → prompt redraw), plus
+  how a user `trap`s signals and how that relates to the `$sh.exit`
+  [hook](#hooks-and-the-prompt).
 - **Core surface** (arrays / maps / functions / `if` / `match` / loops / scope /
   tests / isolation) — sketched above. Remaining sub-questions: an infix **`in`**
   operator as a second membership spelling alongside `:has`; **regex captures**
