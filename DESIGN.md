@@ -145,7 +145,7 @@ There are three kinds of modifier, and the difference matters:
 - **Value modifiers** (path and string — `:stem`, `:dir`, `:strip`, …) transform
   a value, and **map over a list** automatically (applied to each element).
 - **Collection modifiers** (`:len :first :last :rest :init :keys :values
-  :has :join`) consume a list or map **as a whole** — they do *not* map element-wise
+  :has :get :join`) consume a list or map **as a whole** — they do *not* map element-wise
   — and return either a scalar (`:len` → int, `:join` → one byte-string) or a
   derived collection (`:rest`, `:keys`). This is the category that answers "how
   long," "the last one," and "flatten to a string." `:join SEP` is the fold
@@ -279,6 +279,15 @@ n = 42
 - **Types are inferred, not declared.** `x = foo` is a string, `x = [a b c]` a
   list, `x = [a: 1]` a map. There is no type sigil (`@`, `%`) on the *name* —
   a variable just holds whatever value it was given, and `$x` reads it back.
+- **No null.** mesh has **no `nil`/`null`/`none`** value — the billion-dollar
+  mistake is left out. The consequence is a consistent rule wherever a value
+  might be absent: **exact** access fails loud (`$xs[99]`, `$m[absent]` are
+  errors), **total** access takes a default (`$xs:get i d`, `$m:get k d`), and
+  a **control-flow gap** yields the empty string (a no-`else` `if`). Nothing
+  silently returns a null that has to be checked for downstream. *(open — the
+  one genuine fork this leaves: is a first-class absent value ever worth adding
+  back for, e.g., "key present but unset"? Current answer: no; `:has` +
+  `:get default` cover it.)*
 
 ### Arrays (lists)
 
@@ -333,6 +342,23 @@ Half-open is the default because `[..n]` then reads as "the first `n`", and
 `[i..j]` has length `j - i` — the two properties that make off-by-one bugs
 rare. Reach for `..=` when you literally mean "up to and including."
 
+**Empty and out-of-range** — mesh has **no null value**, so every accessor has a
+defined result rather than a silent `nil`. The rule follows Python/Rust: exact
+access is **strict** (fail loud), range access is **lenient** (clamp), and a
+**total** accessor with a default is the ergonomic safe path.
+
+| Access | On empty / out of range | Rationale |
+| --- | --- | --- |
+| `$xs[i]` (exact index) | **error** | asking for element `i` that isn't there is a bug, not a `""` |
+| `$xs:first` / `$xs:last` | **error** on empty | no first/last element exists |
+| `$xs:rest` / `$xs:init` | **`[]`** | "all but one" of a 0- or 1-element list is genuinely empty — total, no error |
+| `$xs[a..b]` (slice) | **clamped** | `$xs[2..99]` → to the end; `$xs[5..]` on a short list → `[]` (a range is a request, a partial answer is fine) |
+| `$xs:get i default` | returns `default` | total, never errors — the safe accessor when absence is expected |
+
+So `$xs[99]` on a 4-element list is an error that names the index, but
+`$xs:get 99 "-"` yields `"-"`, and `$xs[1..99]` just runs to the end. Fail loud
+where a missing element means a mistake; stay total where absence is normal.
+
 **Build** goes through the spread operator `...` (see
 [Spread](#spread--flattening) below), so there is one primitive for assembling
 lists:
@@ -343,24 +369,40 @@ xs = [pre ...$xs]         # prepend
 both = [...$a ...$b]      # concatenate
 ```
 
-**Append in place** is `+=` — the familiar compound-assignment spelling, chosen
-over a `push` verb because it is what people already reach for and it needs no
-new keyword. Its right side is a **list**, whose elements are appended (Python's
-`list += …`, and consistent with `...` spread — `xs += ys` is exactly
-`xs = [...$xs ...$ys]`):
+**Append in place** is `+=`, and it **dispatches on the right-hand side's
+type** — the two common cases both stay terse, with no `push` verb and no
+unfamiliar operator (a `<<`-style shovel was considered and rejected — not
+widely known, and it collides with heredocs):
+
+- **scalar RHS → append** it as one element (the `.append` you reach for
+  interactively);
+- **list RHS → extend** by its elements (Python/Ruby `+=`);
+- **map RHS → merge** into a map (right side wins on key collisions).
 
 ```
-xs += [e]                 # append one element
-xs += [d e f]             # append several
-xs += $more               # extend by another list
+hosts += web3             # scalar: append one       -> [...$hosts web3]
+xs    += [d e f]          # list:   extend by three
+xs    += $more            # list:   extend by a list
+m     += [key: value]     # map:    insert / update
 ```
 
-Maps take `+=` too, as merge/update (right side wins on key collisions),
-keeping one operator across both collections:
+Why this is safe here and not a bash-style "word or list?" trap: mesh values
+are **typed with no coercion** — a scalar `x` and the one-element list `[x]`
+are distinct and stay that way — so the dispatch is *determinate and knowable*,
+never inferred from whitespace. Two properties follow:
 
-```
-m += [key: value]         # insert or update
-```
+- **The single-append case has no wrong answer.** For a scalar `e`, `xs += e`
+  (append) and `xs += [e]` (extend-by-one) both yield `[...$xs e]`. They only
+  diverge when the RHS is genuinely a list — which is exactly when you mean
+  extend.
+- **Nesting stays expressible** by bracketing: `xs += [$ys]` is a one-element
+  list whose element is `$ys`, so it appends `$ys` *whole* (one nested
+  element), while `xs += $ys` extends and `xs += [...$ys]` forces extend. The
+  bracket is the explicit control when a variable's arity is unknown.
+
+This is the **one place the shell flattens by type rather than by an explicit
+`...`** — confined to the `+=` right-hand side, type-directed not
+whitespace-directed, so it does not reintroduce word-splitting.
 
 ### Maps (associative arrays)
 
@@ -397,6 +439,14 @@ $ports[https] = 8443      # set / update
 | `$m:values` | list | values |
 | `$m:len` | int | entry count (same word as lists) |
 | `$m:has KEY` | bool | membership *(open: `:has` vs a `?` postfix)* |
+| `$m:get KEY default` | value | total lookup — `default` when absent |
+
+**Missing keys** follow the same strict/total split as list access, since mesh
+has no null: `$m[absent]` is an **error** (a bad key is usually a typo in
+config, and should fail loud, not silently yield `""`), while `$m:get key
+default` is the total form that returns `default` when the key is absent, and
+`if $m:has key { … }` is the guard. So a dynamic lookup that may legitimately
+miss is written `$m:get $name unknown`, never a bare `$m[$name]`.
 
 Insertion order is **preserved** (like Python dict / a `Vec<(K,V)>` behind the
 scenes) so `for k in $m:keys` is deterministic — important for an rc file that
@@ -544,6 +594,15 @@ Rules:
   (`...$xs`, one argv entry per element) or join it (`$xs:join ","`, one
   string). The shell never guesses a serialization (see
   [Spread](#spread--flattening)).
+- **Exit status.** A function has an exit status just like an external command,
+  and it is the **status of the last command the function ran** (kept from shell
+  tradition — familiar, and exactly what makes a predicate work: `have_command`
+  is a `func` whose last command is the existence test, so `if have_command fzf
+  { … }` reads its status straight out). `return` exits the function early with
+  the current status; `return N` (or `return $cond`) exits with an explicit
+  status, `0` = success. This status channel is **separate** from the
+  value/output channels below — a function can stream bytes *and* carry a
+  success/fail status, which is why predicates need no special declaration.
 - **Return / output.** A plain `func`'s *stdout is its output*, exactly like an
   external command, so functions compose in byte-stream pipes with everything
   else.
