@@ -329,6 +329,14 @@ hazard — forgetting the `$` and running a command by accident — is softened
 because an unknown bareword is a **command-not-found error**, not a silent
 misread.
 
+**Names are kebab-case.** Identifiers — variables *and* command/function names
+alike — may contain hyphens (`last-cmd-time`, `auto-fetch`, `host-seg`), matching
+Unix command names (`ssh-add`, `docker-compose`) and the Lisp tradition. There is
+no clash with the minus operator because of the [operators-need-spaces](#globbing)
+rule: `-` is subtraction / exclusion *only* with surrounding spaces. So `a-b` is
+one name, `a - b` subtracts, and `$a-$b` interpolates the two with a literal
+hyphen between — the third payoff of that one spacing rule.
+
 - **Scope — two levels, lexical.** There are exactly two variable scopes: the
   **session-global** scope (top-level rc and interactive bindings) and a fresh
   **function-local** scope per `func` call. The environment (exported names) is
@@ -1305,13 +1313,26 @@ timer before a command — separately from the after-work. The `preexec` /
 **command timing** (both required dashboard fields) get fed without special
 casing.
 
-**Hooks fire for the outer interactive event only.** A command hook fires once
-for the command line you submit at the prompt — *not* for commands run inside a
-function, a script, a `$(…)`, or a hook handler itself; and while a handler runs,
-its own commands do not re-fire the hook. Without this, `$preexec.timer`'s
-`timer-start` would dispatch `preexec` again forever. The same applies to the
-directory hooks: they fire on the net interactive cwd change, so a `func` that
-`cd`s around internally triggers them once (on return), not per internal `cd`.
+**Command hooks fire for the outer interactive command only.** `preexec` /
+`postexec` fire once for the command line you submit at the prompt — *not* for
+commands run inside a function, a script, a `$(…)`, or a hook handler itself, and
+a handler's own commands don't re-fire them. Without this, `$preexec.timer`'s
+`timer-start` would dispatch `preexec` again forever.
+
+**Directory hooks fire around each actual `cd`** — `precd` *before* the
+`chdir` (so it genuinely runs in the old dir, even for a `cd` inside a navigation
+`func`), `postcd` *after* (in the new dir) — with the same guard that a `cd`
+performed *by a hook handler* doesn't re-dispatch. A `func` that `cd`s internally
+therefore fires them per change; if a handler only cares about net movement it
+gates on `$PWD` itself (the one-line `precd`/`postcd` PWD-check that today's
+config hand-rolls). Per-`cd` is the right default because `precd`'s "old dir"
+contract can't hold if the hooks are deferred to function return.
+
+**Status is snapshotted across hook dispatch.** The submitted command's exit
+status is captured before `postexec` / `precmd` run, and **`$status` is restored
+to it** for the prompt segments — so a segment always sees the *interactive
+command's* status, never the status of some command a handler happened to run.
+(`postexec` also gets it as an explicit `status` argument.)
 
 **The prompt** is the same shape, but each segment is a callable that **returns a
 string** (or `""` to contribute nothing); the shell joins the non-empty ones in
@@ -1319,7 +1340,7 @@ key order:
 
 ```
 $prompt.host = host-seg                           # named, ordered segments
-$prompt.dir  = func() { if inside-project() { $(vcs prompt-info):raw } else { tilde-pwd() } }
+$prompt.dir  = func() { if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() } }
 $prompt.auth = func() { if ssh-id-missing() { yellow("no-ssh-id") } }   # no else → "" → segment omitted
 $prompt.dir  = my-dir-seg                          # swap ONE segment by name
 unset $prompt.auth                                 # drop the auth warning
