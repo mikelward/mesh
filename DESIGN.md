@@ -1673,12 +1673,13 @@ changing how entries are written. So `list | grep` is enough to ship. Only the *
 `tty`) but hidden until it completes, so `history | grep foo` never matches its own
 pipeline. A row left incomplete — its owning session no longer live — is
 **finalized at startup** (a null `status` / `duration`) rather than hidden forever,
-so no real command is lost. **Liveness** is tracked by a `sessions` record: each
-session registers its `pid` + boot time (an identity a recycled PID can't
-counterfeit) and holds an OS **advisory lock** on that record for its lifetime. A
-session is *live* iff its lock is held, so startup recovery finalizes an incomplete
-row only when its session's lock is unheld — a still-running session's in-flight row
-is never mistaken for a crash.
+so no real command is lost. **Liveness** is tracked by a per-session **lock
+file** — `$XDG_STATE_HOME/mesh/sessions/<id>.lock` — on which the session holds an
+**exclusive OS advisory lock** for its lifetime; the `sessions` record stores that
+path plus the session's `pid` + boot time (an identity a recycled PID can't
+counterfeit). A session is *live* iff its lock file's lock is still held, so startup
+recovery finalizes an incomplete row only when the owning session's lock is unheld —
+a still-running session's in-flight row is never mistaken for a crash.
 
 *(deferred: an atuin-style fuzzy / interactive search over the columns; a
 `$sh.history` value accessor for scripting; cross-session and cross-host sync;
@@ -1689,9 +1690,11 @@ the dedup policy; secret redaction; and import from bash/zsh history files.)*
 For quick keyboard recall mesh keeps bash's `!` history expansion — but
 **interactive-only and quote-safe**. It is a pre-parse pass that rewrites the input
 line *before* parsing and runs **only in an interactive shell** (a script never
-expands `!`), so it can never surprise non-interactive code. It reads from **this
-session's** rows in the [history store](#interactive-history) (the session scoping
-above), so another terminal's commands are never your `!!`.
+expands `!`), so it can never surprise non-interactive code. It reads from the
+**same selection view** as the other [recall motions](#interactive-history) — this
+session's rows plus finished (non-live) sessions' — so a fresh session's `!!` still
+finds your last command, while another *live* terminal's commands never become your
+`!!`.
 
 - **`!!`** — the previous command line.
 - **`!string`** — the most recent command that *starts with* `string`
