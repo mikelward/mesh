@@ -1506,15 +1506,21 @@ file / dir / enum value. A spec is found by a layered resolver:
 1. a **curated spec file** if one exists (a drop-in override) —
    `$XDG_DATA_HOME/mesh/completions/` (`$XDG_DATA_HOME` defaulting to
    `~/.local/share`);
-2. else a spec **parsed from the command's man page** — this needs *no execution*,
-   so it is preferred over the probe below;
+2. else a spec **parsed from the command's man page** — *when that page can be
+   associated with the resolved executable* (same package / install). It needs
+   *no execution*, so it is preferred; but a system page is **not** trusted for a
+   `PATH`-shadowing local binary (a project-local `./tool` must not inherit
+   `/usr/bin/tool`'s page), which instead falls through to the probe;
 3. else a spec **auto-generated from `cmd --help`** — the executing probe, for
    external commands only;
 4. else plain **file / dir** completion — the universal fallback.
 
-Both generated specs (man page, `--help`) are **cached** under
-`$XDG_CACHE_HOME/mesh/completions/` (`$XDG_CACHE_HOME` defaulting to `~/.cache`),
-keyed by the command's path + mtime so they regenerate on upgrade.
+Both generated specs are **cached** under `$XDG_CACHE_HOME/mesh/completions/`
+(`$XDG_CACHE_HOME` defaulting to `~/.cache`), keyed by **the source that produced
+them** so each regenerates when *its own* input changes: a `--help` spec by the
+binary's path + mtime, a man-page spec by the **selected page's path + mtime**
+(plus the `MANPATH` / locale that selected it) — so a docs-only package update or
+a `MANPATH`/locale change re-parses rather than serving a stale spec.
 
 Files and dirs are not a separate mechanism; they are the built-in *value types* a
 spec's arguments point at (`cd` completes dirs; a `--output FILE` flag completes
