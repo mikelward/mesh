@@ -1,4 +1,4 @@
-# smash *(working title — see below)*
+# mesh
 
 A personal, **interactive-first** Unix shell: byte-stream pipes with real
 arrays, a clean-break syntax (no POSIX-script baggage), and a prompt/session/
@@ -9,12 +9,9 @@ rationale and the language sketch so far.
 
 ## Name
 
-Not final. The two working candidates are **smash** and **mesh**:
-
-- **smash** — distinctive and unconfusable; only soft collisions (abandoned
-  toy shells, HPE's unrelated SMASH standard).
-- **mesh** — no other *shell* owns the name, but the word is heavily overloaded
-  (service mesh, mesh networking) and sits one letter from `mosh`.
+**mesh.** No other shell claims the name. Two tradeoffs accepted: the word is
+overloaded in infra (service mesh, mesh networking) and sits one letter from
+`mosh` (mobile shell). The runner-up was **smash**.
 
 ## Status
 

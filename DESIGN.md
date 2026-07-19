@@ -1,7 +1,7 @@
 # Design
 
-> **Name is not final.** Working title is **smash** or **mesh**. This document
-> uses "the shell" to stay name-neutral. See [Name](#name) for the tradeoff.
+> **Name: mesh.** (Runner-up: smash.) See [Name](#name). This document often
+> just says "the shell".
 
 ## What this is
 
@@ -227,14 +227,12 @@ and likely `:upper` / `:lower`. To be fleshed out.
 
 ## Name
 
-Not final. Candidates:
+**mesh.** No other shell claims the name — the cleanest option on that axis. Two
+tradeoffs accepted: the word is heavily overloaded in infra (service mesh, mesh
+networking, WiFi mesh), and it sits one letter from `mosh` (mobile shell), an
+adjacent tool, so there is a real read-alike / typo risk.
 
-- **smash** — distinctive, memorable, unconfusable. Soft collisions only
-  (abandoned toy shells; HPE's unrelated SMASH server-management standard).
-- **mesh** — no other *shell* claims it (cleaner than smash on that axis), but
-  the word is heavily overloaded in infra (service mesh, mesh networking, WiFi
-  mesh) and sits one letter away from `mosh` (mobile shell), an adjacent tool —
-  a real read-alike / typo risk.
-
+Runner-up: **smash** — distinctive and unconfusable, but with soft collisions
+(abandoned toy shells; HPE's unrelated SMASH server-management standard).
 Rejected along the way: `lish`, `lsh`, `sish`, `ish`, `bish`, `sash` (all taken
 by real or well-known tools).
