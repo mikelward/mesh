@@ -1235,8 +1235,10 @@ Rules:
   in statement position the value is discarded and arms run for effect.
 - **Regex captures** *(open)*: a `/re/` arm likely exposes its groups (e.g. as a
   list) to that arm's body; spelling TBD.
-- Later: **destructuring** list/map shapes in patterns (`[a, b]`, `[k: v]`),
-  deferred until the need is real.
+- **List-shape patterns** *(settled — see [Destructuring](#destructuring))*: a
+  `match` arm may be a list pattern (`[a b]`, `[cmd ...rest]`, `_` to discard),
+  sharing the one list-pattern grammar with destructuring assignment. **Map-shape**
+  patterns (`[k: v]`) and nested patterns stay **deferred** until the need is real.
 
 ### Tests and comparisons
 
@@ -1492,10 +1494,11 @@ signals never end your session; only a lost terminal (SIGHUP) does:
 - **`Ctrl-\` / SIGQUIT** — ignored at the prompt; delivered to the foreground job.
 - **SIGWINCH** (resize) — the [line editor](#line-editing) reflows and redraws the
   (possibly multi-line) prompt.
-- **SIGHUP** (terminal closed) — the shell exits and sends its jobs **SIGHUP then
-  SIGCONT** (a *stopped* job can't act on the HUP until it's continued); **SIGTERM**
-  is ignored interactively (as bash does). (A `disown` exemption from the HUP
-  arrives with `disown` itself, which is [deferred](#job-control).)
+- **SIGHUP** (terminal closed) — the shell exits, **SIGHUPs its jobs, then sends
+  SIGCONT to any that are *stopped*** (a stopped job can't act on the HUP until it's
+  continued; a running job just gets the HUP); **SIGTERM** is ignored interactively
+  (as bash does). (A `disown` exemption from the HUP arrives with `disown` itself,
+  which is [deferred](#job-control).)
 
 **User handlers are keyed hook maps, not bash's `trap`.** `$sh.signal.<NAME>` is an
 insertion-ordered map of named callables — the *same shape* as `$sh.preprompt` and
@@ -1594,18 +1597,19 @@ programs or user functions:
     *no-such-directory* error, not command-not-found. On by default —
     `$sh.options.autocd = off` disables it.
 - **I/O**
-  - **`puts [args…]`** — write to stdout. **Scalar** arguments are joined by a
-    single space (`puts a b` → `a b`), then a newline; a **list** argument prints
-    **one element per line** (a list *is* a sequence of lines — `puts $(ls)`
-    reprints the listing) and a **map** prints `key: value` per line. `puts` can
-    render these rich values because it is a **built-in** operating on real values —
-    an *external* command still needs bytes (spread or
-    [`:join`](#spread--flattening)). It takes **no flags** — none of `echo`'s
-    `-e` / `-n` reinterpretation, since escapes are already resolved by the
+  - **`puts [args…]`** — one order-preserving rule: **render each argument to
+    text** — a scalar as itself, a **list** as its elements joined by newlines (a
+    list *is* a sequence of lines), a **map** as `key: value` entries joined by
+    newlines — then **join the arguments with a single space** and append a trailing
+    newline. So `puts a b` → `a b`, `puts $(ls)` → one file per line, and a mixed
+    `puts head $xs tail` is fully defined by that rule. `puts` can render rich values
+    because it is a **built-in** on real values — an *external* command still needs
+    bytes (spread or [`:join`](#spread--flattening)). It takes **no flags** — none of
+    `echo`'s `-e` / `-n` reinterpretation, since escapes are resolved by the
     [string literal](#quoting-and-escaping).
-  - **`print [args…]`** — the same rendering, but with **no trailing newline** —
-    for partial lines and hand-built prompts. The `puts` / `print` pair replaces
-    `echo -n`, keeping both flag-free.
+  - **`print [args…]`** — identical, but with **no trailing newline** — for partial
+    lines and hand-built prompts. The `puts` / `print` pair replaces `echo -n`,
+    keeping both flag-free.
   - **`gets [var]`** — read one line from stdin into `var` (trailing newline
     stripped) and return that line as its value. **At EOF it returns `false`**
     (whose [status](#variables-and-assignment) is `1`) and leaves `var` unchanged,
