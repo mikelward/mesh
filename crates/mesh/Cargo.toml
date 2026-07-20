@@ -1,0 +1,17 @@
+[package]
+name = "mesh"
+version = "0.0.0"
+description = "An interactive-first Unix shell (pre-alpha; M0 build track)."
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# M0 is intentionally dependency-free: the standard library covers a
+# read/tokenize/exec loop, and staying zero-dep keeps the build offline and
+# fast. Interactive dependencies (reedline, nix, crossterm) arrive in M1 — see
+# ../../ROADMAP.md.
+[dependencies]
