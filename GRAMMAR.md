@@ -154,13 +154,44 @@ segment = words?                      # may be empty (a no-op)
   `;;`) are no-ops that leave the status unchanged. The line's status is the last
   command actually run — so `exit` in a later segment sees it (`false; exit` → 1).
 
-Deferred: `&` (background) and `|` (pipe) are **not** operators yet — a lone
-`&`/`|` stays a literal character (they arrive with job control and pipes). A
-dangling trailing operator (`a &&`) is currently a lenient no-op, not an error.
+Deferred: `&` (background) is **not** an operator yet — a lone `&` stays a
+literal character (it arrives with job control). A dangling trailing operator
+(`a &&`) is currently a lenient no-op, not an error.
+
+## Task 8 — pipes and redirection
+
+Each command is now a **pipeline** of `|`-joined stages, and every stage may carry
+`<` / `>` / `>>` redirections:
+
+```
+segment = pipeline?                   # may be empty (a no-op)
+pipeline = stage ("|" stage)*
+stage    = (word | redir)+            # words and redirections interleave
+redir    = ("<" | ">" | ">>") word    # the following word is the target file
+```
+
+- **`|`** connects one command's stdout to the next command's stdin (a single
+  `|`; `||` is still the sequence separator, matched first). **`>`** truncates (or
+  creates) a file with stdout, **`>>`** appends, **`<`** reads stdin from a file.
+  A redirection's target is the **next word**; the last redirection of a direction
+  wins.
+- Operators are recognized only **bare** — a quoted (`'a|b'`) or escaped (`a\|b`)
+  operator is literal.
+- **Pipeline status is pipefail, ignoring upstream SIGPIPE**: the pipeline fails
+  if any stage genuinely fails (`false | true` → 1), but a stage killed by SIGPIPE
+  because a later stage closed the pipe early is not a failure (`yes | head` → 0).
+- An **empty pipeline stage** (`| cat`, `ls |`, `ls | | wc`) and a **redirection
+  with no target** (`cat >`) are syntax errors (status 2); the shell recovers.
+
+Deferred: a **builtin** in a multi-stage pipeline or with a redirection is not
+supported yet (needs a forked child / an output sink) and is rejected with a
+clear message — use an external command (`echo … > f`) meanwhile. Also deferred:
+`2>`/stderr redirection, `&>`, here-strings, and a redirection with no command
+(`> f`).
 
 ### Not yet parsed
-Pipes `|`, redirection `>` `<`, `{ }` blocks, `func`, `:` modifiers, heredocs.
-Each arrives with the task that needs it, and this file grows to match.
+`{ }` blocks, `func`, `:` modifiers, heredocs. Each arrives with the task that
+needs it, and this file grows to match.
 
 **Design target (still ahead of the lexer above).** The **Model B strings**
 direction from `DESIGN.md` is now implemented (see task 5 above). What the lexer

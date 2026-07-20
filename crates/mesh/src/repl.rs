@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 
 use crate::builtins::{self, Builtin};
-use crate::lexer::{Piece, Sep, Word};
+use crate::lexer::{Piece, Redir, RedirKind, Sep, Stage, Word};
 use crate::vars::Vars;
 use crate::{exec, expand, lexer};
 
@@ -65,12 +65,12 @@ fn run_line(text: &str, last: u8, vars: &mut Vars) -> Step {
             Sep::And => status == 0, // run after success
             Sep::Or => status != 0,  // run after failure
         };
-        if !run_it || segment.words.is_empty() {
+        if !run_it || segment.stages.is_empty() {
             // Short-circuited, or an empty segment (blank line, `;;`, a trailing
             // `;`): a no-op that leaves the status unchanged.
             continue;
         }
-        match run_segment(segment.words, status, vars) {
+        match run_pipeline(segment.stages, status, vars) {
             Step::Exit(code) => return Step::Exit(code),
             Step::Continue(code) => status = code,
         }
@@ -78,9 +78,113 @@ fn run_line(text: &str, last: u8, vars: &mut Vars) -> Step {
     Step::Continue(status)
 }
 
-/// Run one command segment: classify it as an assignment or a command and act.
-/// `last` is the status of the previous command (the default for a bare `exit`).
-fn run_segment(tokens: Vec<Word>, last: u8, vars: &mut Vars) -> Step {
+/// Run one pipeline. A single stage keeps the full command surface (assignments,
+/// builtins). A multi-stage pipeline (`|`) is external commands only for now.
+fn run_pipeline(mut stages: Vec<Stage>, last: u8, vars: &mut Vars) -> Step {
+    if stages.len() == 1 {
+        run_single(stages.pop().unwrap(), last, vars)
+    } else {
+        run_multi(stages, vars)
+    }
+}
+
+/// Run a one-stage pipeline. Without redirections this is the full command
+/// surface: an assignment or a builtin/external command. With redirections it is
+/// a command only (external for now — a redirected builtin is not supported yet).
+fn run_single(stage: Stage, last: u8, vars: &mut Vars) -> Step {
+    let Stage { words, redirs } = stage;
+    if redirs.is_empty() {
+        return run_command_or_assign(words, last, vars);
+    }
+    let argv = match expand::expand(words, vars) {
+        Ok(argv) => argv,
+        Err(err) => {
+            eprintln!("mesh: {err}");
+            return Step::Continue(1);
+        }
+    };
+    if argv.is_empty() {
+        eprintln!("mesh: redirection with no command is not supported yet");
+        return Step::Continue(1);
+    }
+    if builtins::is_builtin(&argv[0]) {
+        eprintln!(
+            "mesh: {}: redirection of a builtin is not supported yet",
+            argv[0]
+        );
+        return Step::Continue(1);
+    }
+    match expand_redirs(redirs, vars) {
+        Ok(redirs) => Step::Continue(exec::run_pipeline(vec![exec::Cmd {
+            words: argv,
+            redirs,
+        }])),
+        Err(err) => {
+            eprintln!("mesh: {err}");
+            Step::Continue(1)
+        }
+    }
+}
+
+/// Run a multi-stage pipeline (`a | b | c`). Every stage must be an external
+/// command; a builtin in a pipeline is not supported yet.
+fn run_multi(stages: Vec<Stage>, vars: &mut Vars) -> Step {
+    let mut cmds = Vec::with_capacity(stages.len());
+    for stage in stages {
+        let Stage { words, redirs } = stage;
+        let argv = match expand::expand(words, vars) {
+            Ok(argv) => argv,
+            Err(err) => {
+                eprintln!("mesh: {err}");
+                return Step::Continue(1);
+            }
+        };
+        if argv.is_empty() {
+            eprintln!("mesh: empty command in a pipeline");
+            return Step::Continue(1);
+        }
+        if builtins::is_builtin(&argv[0]) {
+            eprintln!(
+                "mesh: {}: builtins are not supported in a pipeline yet",
+                argv[0]
+            );
+            return Step::Continue(1);
+        }
+        let redirs = match expand_redirs(redirs, vars) {
+            Ok(redirs) => redirs,
+            Err(err) => {
+                eprintln!("mesh: {err}");
+                return Step::Continue(1);
+            }
+        };
+        cmds.push(exec::Cmd {
+            words: argv,
+            redirs,
+        });
+    }
+    Step::Continue(exec::run_pipeline(cmds))
+}
+
+/// Expand each redirection target to exactly one path. Zero or several words is
+/// an ambiguous redirect (a glob/list target is not a single file).
+fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<(RedirKind, String)>, String> {
+    let mut out = Vec::with_capacity(redirs.len());
+    for redir in redirs {
+        let mut paths = expand::expand(vec![redir.target], vars).map_err(|e| e.to_string())?;
+        if paths.len() != 1 {
+            return Err(format!(
+                "ambiguous redirect: target expanded to {} words",
+                paths.len()
+            ));
+        }
+        out.push((redir.kind, paths.pop().unwrap()));
+    }
+    Ok(out)
+}
+
+/// Run one command with no redirections: classify it as an assignment or a
+/// command and act. `last` is the previous status (the default for a bare `exit`).
+fn run_command_or_assign(tokens: Vec<Word>, last: u8, vars: &mut Vars) -> Step {
     match classify(tokens) {
         Line::Assign { name, rhs } => match assign(&name, rhs, vars) {
             Ok(()) => Step::Continue(0),

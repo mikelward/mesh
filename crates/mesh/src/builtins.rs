@@ -17,6 +17,13 @@ pub enum Builtin {
     Exit(u8),
 }
 
+/// Does `name` name a builtin? Used to reject a builtin in a pipeline or with a
+/// redirection, which are not supported yet (both need the builtin to write to a
+/// non-stdout target / a forked child).
+pub fn is_builtin(name: &str) -> bool {
+    matches!(name, "cd" | "pwd" | "puts" | "exit")
+}
+
 /// If `words[0]` names a builtin, run it and return its outcome; otherwise
 /// return `None` so the caller falls through to external execution.
 ///

@@ -131,7 +131,7 @@ mesh/
 │       │   ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
 │       │   ├── vars.rs     # session-global variable store
 │       │   ├── builtins.rs # cd, pwd, puts, exit
-│       │   └── exec.rs     # launch external commands, map exit status
+│       │   └── exec.rs     # launch external commands + pipelines/redirection
 │       └── tests/
 │           └── cli.rs      # end-to-end tests driving the built binary
 ├── DESIGN.md               # vision + language design (the "why/what")
