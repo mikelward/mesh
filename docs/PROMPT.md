@@ -31,8 +31,8 @@ $sh.postexec.timer = func(cmd, status, ms) { global _cmd_ms = $ms }
 
 # how the last command went: an error in red, or a slow time in yellow (else nothing)
 $sh.prompt.status = func() {
-  if $sh.status != 0      { style("✗ ${sh.status}" --fg red) }
-  else if $_cmd_ms > 1000 { style("took ${_cmd_ms / 1000}s" --fg yellow) }
+  if $sh.status != 0      { style("✗ ${sh.status}" --fg=red) }
+  else if $_cmd_ms > 1000 { style("took ${_cmd_ms / 1000}s" --fg=yellow) }
 }
 
 $sh.prompt.rule = rule                                   # a full-width rule
@@ -40,9 +40,9 @@ $sh.prompt.rule = rule                                   # a full-width rule
 # where you are — one line: user@host, the path in blue, the git branch in green
 $sh.prompt.head = [
   who:  func() { h = $env.HOSTNAME:split "." :first; "${env.USER}@$h" },
-  path: func() { style(pwd() --fg blue) },
-  git:  func() { style("$(git branch --show-current)" --fg green) },   # empty off a repo → hidden
-  root: func() { if $env.USER == "root" { style("#" --fg red) } },     # a red # only when root
+  path: func() { style(pwd() --fg=blue) },
+  git:  func() { style("$(git branch --show-current)" --fg=green) },   # empty off a repo → hidden
+  root: func() { if $env.USER == "root" { style("#" --fg=red) } },     # a red # only when root
 ]
 
 # the current commit: short SHA + subject line (nothing outside a repo)
@@ -59,7 +59,7 @@ $sh.prompt.char = func() { "❯ " }
 - **Your prompt is named pieces, not one big string.** Restyle one, reorder them,
   or drop one — `unset $sh.prompt.commit` — without touching the rest. Re-sourcing
   your config replaces pieces by name instead of duplicating them.
-- **Color is data, not escape codes.** `style("main" --fg green)` — no
+- **Color is data, not escape codes.** `style("main" --fg=green)` — no
   `\e[32m…\e[0m` to hand-balance. The shell knows the real text width, and can even
   recolor a piece later.
 - **Empty pieces vanish.** A piece with nothing to show returns `""` and its whole
