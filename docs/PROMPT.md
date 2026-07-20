@@ -14,12 +14,12 @@ here follows what those sections settle.
 took 3s
 ─────────────────────────────────────────────────────────────
 host ~/src/mesh [main] SSH
-2 unmerged
+9f3c2a1 Pull fill into the MVP
 %1 vim  %2 tail -f log
 >
 ```
 
-The `took …` line, the `unmerged` line, the jobs line, and the `SSH` warning are
+The `took …` line, the commit line, the jobs line, and the `SSH` warning are
 all **optional** — each is present only when it has something to say, and its line
 is skipped otherwise (an entry that renders `""` contributes no line).
 
@@ -75,7 +75,9 @@ $sh.prompt.head = [                            # a MAP literal — [ ], not { } 
   auth: func() { if not ssh-id-loaded() { style("SSH" --fg yellow) } },      # no else → "" → dropped
 ]
 
-$sh.prompt.vcs  = func() { "$(vcs unmerged)" }       # own line; empty → line skipped
+$sh.prompt.commit = func() {                         # own line: short SHA + commit subject; empty outside a repo → skipped
+  if inside-project() { "$(git log -1 --format='%h %s')" }
+}
 $sh.prompt.jobs = func() {                           # was the `jobs | sed` tab-parser
   $sh.jobs:values:map(func(j) { "%${j.id} ${j.cmd}" }):join "  "
 }
@@ -136,7 +138,7 @@ the whole-line case — `rule ≡ a line that is [fill("─")]`.
 
 ## The mechanic that makes the optional lines clean
 
-`status`, `vcs`, and the `jobs` line are optional: each returns `""` most of the
+`status`, `commit`, and the `jobs` line are optional: each returns `""` most of the
 time, and an entry that renders `""` **contributes no line** — so there are no
 blank gaps and nothing to suppress, without the conditional-`printf` dance the fish
 version needed. Note `${sh.status}` / `${j.id}` / `${j.cmd}` use **braced**
