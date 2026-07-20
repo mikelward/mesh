@@ -30,7 +30,9 @@ file as tasks land.
       Deferred: list/map values (single-value assignment only), `:` modifiers,
       `export`, `global`/`unset`, function-local scope, `$sh.*`, `$env:get`.
 - [ ] Promote internals into `crates/mesh-core` (lib); binary becomes thin `main`
-- [ ] `;`, `&&`, `||` sequencing
+- [x] `;`, `&&`, `||` sequencing (bare only; short-circuit on the previous
+      status; quoted/escaped operators literal). `&`/`|` deferred to job
+      control/pipes.
 - [x] `cd` builtin (basic): `$HOME` default, `cd -`, updates `$PWD`/`$OLDPWD`,
       rejects surplus operands. Still deferred: `CDPATH`, `--physical`, autocd,
       logical cwd.

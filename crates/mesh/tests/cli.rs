@@ -89,6 +89,38 @@ fn exit_status_propagates() {
 }
 
 #[test]
+fn semicolon_runs_commands_in_sequence() {
+    let out = run_with_input("puts a; puts b\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\n");
+}
+
+#[test]
+fn and_or_short_circuit_on_status() {
+    // `&&` runs the next command only after success; `||` only after failure.
+    let out = run_with_input(
+        "true && puts ran-and\nfalse && puts skipped\nfalse || puts ran-or\ntrue || puts skipped\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ran-and\nran-or\n");
+}
+
+#[test]
+fn a_sequence_reports_the_last_commands_status() {
+    // `true && false` short-circuits to false's status (1); a following `;`
+    // still runs. The whole line's status is the last command actually run.
+    assert_eq!(run_with_input("true && false\n").status.code(), Some(1));
+    assert_eq!(run_with_input("false || true\n").status.code(), Some(0));
+    // `exit` inside a sequence sees the previous command's status.
+    assert_eq!(run_with_input("false; exit\n").status.code(), Some(1));
+}
+
+#[test]
+fn a_quoted_separator_is_not_an_operator() {
+    // A `;` inside quotes (or escaped) is a literal, not a command separator.
+    let out = run_with_input("puts 'a;b'\nputs one\\;two\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a;b\none;two\n");
+}
+
+#[test]
 fn bare_exit_uses_the_last_status() {
     // `exit` with no argument leaves the last command's status (POSIX), not 0.
     assert_eq!(run_with_input("false\nexit\n").status.code(), Some(1));
