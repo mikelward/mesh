@@ -283,7 +283,7 @@ and likely `:upper` / `:lower`. To be fleshed out.
 - **Predicate qualifiers** *(open — direction)*: the arg-carrying predicates
   (`size>1M`, `age<1d`, `empty`) stay in `(...)` since they do not fit a bare
   `:word` — `*(f size>1M)`, `*(f age<1d)`. Comparisons (`>` / `<`) read better
-  than zsh's `+/-` age codes; whether these also grow `:word arg` modifier
+  than zsh's `+/-` age codes; whether these also grow `:word(arg)` modifier
   spellings is folded into this open question.
 
 - **Exclusion** — a spaced infix `-`:
@@ -714,9 +714,9 @@ overlapping with `unset $m.key`). Note this is a value-level remove-by-content,
 distinct from `unset $xs[i]`, which deletes by index.)*
 
 *(TODO: consider modifier-form **`:add`** / **`:remove`** (or similar names) as
-the **pure** counterparts to the mutating `+=` / `-=` — `$xs:add e` returning a
-new list with `e` appended and `$xs:remove e` returning one with the matching
-element gone, so they compose in a modifier chain (`$env.PATH:remove /usr/games:dedup`)
+the **pure** counterparts to the mutating `+=` / `-=` — `$xs:add(e)` returning a
+new list with `e` appended and `$xs:remove(e)` returning one with the matching
+element gone, so they compose in a modifier chain (`$env.PATH:remove(/usr/games):dedup`)
 and read as expressions rather than statements. Open: the exact names, whether
 they mirror `+=`'s type-directed dispatch, and how they line up with the existing
 `:map` / `:filter` transforms.)*
@@ -1434,7 +1434,7 @@ to a bool):
   `$s == ""` / `$s:len > 0`.) The **binary** file relations `-nt` / `-ot` / `-ef`
   (newer / older / same-inode) are the same comparison family as the
   [predicate qualifiers](#globbing) (`age<`) and are *(open)* alongside them —
-  likely `$a:mtime > $b:mtime` and a `$a:same $b` rather than cryptic digraphs.
+  likely `$a:mtime > $b:mtime` and a `$a:same($b)` rather than cryptic digraphs.
 - **Combine** bools with the words `and` / `or` / `not` (`if $a:exists and not
   $b:exists { … }`). These join *values*; the byte-stream **command** chains
   `&&` / `||` (run-next-on-success/failure, by exit status) are kept separately
