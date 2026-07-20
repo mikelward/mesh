@@ -46,7 +46,7 @@ $sh.prompt.head = [
   git:  func() { style("$(git branch --show-current)" --fg=green) },   # empty off a repo → hidden
 ]
 
-# the current commit: short SHA + subject line (nothing outside a repo)
+# the current commit: short hash + subject line (nothing outside a repo)
 $sh.prompt.commit = func() { "$(git log -1 --format='%h %s' 2>/dev/null)" }
 
 # background jobs, read straight from the live job table
