@@ -925,3 +925,21 @@ fn a_single_amp_before_a_raw_prefix_does_not_close_the_body() {
     let out = run_with_input("func f() { puts &r'\\'}' tail }\nf\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "&r'} tail\n");
 }
+
+#[test]
+fn a_parameter_named_env_is_rejected() {
+    // `env` is the environment namespace, so a parameter named `env` could never
+    // be read back — reject it at definition, and keep running afterward.
+    let out = run_with_input("func f(env) { puts $env }\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`env` is a reserved name"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_duplicate_parameter_name_is_rejected() {
+    // A repeated name would silently overwrite the first positional; it must be a
+    // loud error at definition time.
+    let out = run_with_input("func f(x, x) { puts $x }\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("duplicate parameter"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}

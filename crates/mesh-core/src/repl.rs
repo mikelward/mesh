@@ -403,6 +403,16 @@ fn parse_params(list: &str) -> Result<Vec<String>, String> {
         if !lexer::is_ident(tok) {
             return Err(format!("func: `{tok}` is not a valid parameter name"));
         }
+        // `env` is the environment namespace (`$env.KEY`), so a parameter named
+        // `env` would bind but never read back — reject it, as assignment does.
+        if tok == "env" {
+            return Err("func: `env` is a reserved name and cannot be a parameter".to_string());
+        }
+        // A repeated name would silently overwrite the earlier positional in the
+        // local scope, making one argument unreachable; diagnose it here.
+        if params.iter().any(|p| p == tok) {
+            return Err(format!("func: duplicate parameter `{tok}`"));
+        }
         params.push(tok.to_string());
     }
     Ok(params)
