@@ -22,11 +22,11 @@ something to say.
 ## `rc.mesh`
 
 ```
-# Record each command's run time — the shell measures it and hands `ms` to
-# postexec; we just stash it so the prompt can say "took 3s". Side effects like
+# Record each command's run time — the shell measures it and hands a `Duration`
+# to postexec; we just stash it so the prompt can say "took 3s". Side effects like
 # this live in hooks; the prompt segments below stay pure renderers.
-global _cmd_ms = 0
-$sh.postexec.record-time = func(cmd, status, ms) { global _cmd_ms = $ms }
+global _cmd_time = 0s
+$sh.postexec.record-time = func(cmd, status, elapsed) { global _cmd_time = $elapsed }
 
 # The prompt is a map — one entry per line, rendered top to bottom in the order
 # you add them (maps preserve insertion order).
@@ -34,7 +34,7 @@ $sh.postexec.record-time = func(cmd, status, ms) { global _cmd_ms = $ms }
 # how the last command went: an error in red, or a slow time in yellow (else nothing)
 $sh.prompt.status = func() {
   if $sh.status != 0      { style("✗ ${sh.status}" --fg=red) }
-  else if $_cmd_ms > 1000 { style("took ${_cmd_ms / 1000}s" --fg=yellow) }
+  else if $_cmd_time > 1s { style("took $_cmd_time" --fg=yellow) }
 }
 
 $sh.prompt.rule = rule                                   # a full-width rule

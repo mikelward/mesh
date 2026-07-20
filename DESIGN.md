@@ -1483,7 +1483,12 @@ to a bool):
   (`$a:ms / $b:ms`), so no float or rational type has to be introduced. A `Duration`
   is **signed** — `Instant - Instant` goes negative for a future instant (so a
   future-dated file's `age` is just negative, not an error or a saturated zero),
-  rendering with a leading `-` (`-3s`). A bare
+  rendering with a leading `-` (`-3s`). `Instant` and `Duration` are
+  **nanosecond**-resolution internally, so sub-millisecond file-time differences
+  still compare correctly (`$a:mtime > $b:mtime`, the `-nt` replacement); literals
+  only reach down to `ms`, and canonical rendering stops at `ms` — any finer
+  remainder is dropped from the *printed* form but kept for comparison and
+  arithmetic. A bare
   integer is **not** a
   Duration (the ms-vs-s footgun mesh kills), but the process boundary stays bytes, so
   an external `sleep 2` still passes `"2"` — the type governs only *in-shell* values.
@@ -2258,7 +2263,7 @@ $sh.preprompt.jobs   = publish-jobs                    # by name
 $sh.postcd.fetch  = func() { vcs auto-fetch & }     # arrived in a new dir — the PWD-gate is now the event itself
 $sh.precd.save    = func(to) { save-dir-state }     # about to leave: act while still in the old dir
 $sh.preexec.timer = func(cmd) { timer-start }       # start the clock…
-$sh.postexec.timer = func(cmd, status, ms) { global last-cmd-time = $ms }   # …stop it; `global` so it survives to feed the prompt
+$sh.postexec.timer = func(cmd, status, elapsed) { global last-cmd-time = $elapsed }   # …stop it; a Duration — `global` so it survives to feed the prompt
 unset $sh.preprompt.jobs                               # remove one
 ```
 
