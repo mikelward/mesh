@@ -35,10 +35,13 @@ fn expand_tilde(word: &str) -> (String, usize) {
             let len = home.len();
             return (home, len);
         }
-    } else if let Some(rest) = word.strip_prefix("~/") {
+    } else if word.starts_with("~/") {
         if let Some(home) = home() {
-            let home = home.trim_end_matches('/');
-            return (format!("{home}/{rest}"), home.len() + 1);
+            let len = home.len();
+            // Replace only the leading `~`; keep the rest of the word (its
+            // `/…`) verbatim, so a trailing slash in `$HOME` is preserved as
+            // typed rather than normalized away.
+            return (format!("{home}{}", &word[1..]), len);
         }
     }
     (word.to_string(), 0)

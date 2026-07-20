@@ -213,6 +213,34 @@ fn glob_star_excludes_dotfiles() {
 }
 
 #[test]
+fn tilde_preserves_home_bytes_including_trailing_slash() {
+    // With a trailing slash in $HOME, `~/child` keeps the bytes verbatim
+    // (`.../child` with the double slash), not a normalized single slash.
+    let home = fresh_dir("tilde_slash");
+    let mut home_with_slash = home.clone().into_os_string();
+    home_with_slash.push("/");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .env("HOME", &home_with_slash)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"puts ~/child\n")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait for mesh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}//child\n", home.display())
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn a_command_that_globs_away_reports_success() {
     let dir = fresh_dir("glob_away");
     // `false` sets status 1; a line that globs to nothing is an empty-list
