@@ -1802,11 +1802,13 @@ spelling.)*
 - ***`exec` — replace the process image.*** A dispatcher/wrapper (`autosession`
   ending in `exec autotmux …`, `logexec` in `exec "$0".distrib`) hands off without
   leaving a parent shell behind. There is no `exec` builtin yet — add one that
-  *becomes* the command (where `run` runs a **child**, `exec` replaces the current
-  process).
+  *becomes* the command: ordinary invocation runs it as a **child**, `exec` replaces
+  the current process with it.
 - ***isatty on a stream.*** `confirm` guards on `test -t 0 && test -t 2`, but
-  `$sh.interactive` is shell-level only. Expose a per-stream test — `$stdin:tty` /
-  `$stderr:tty` — so a function can tell whether *its own* stderr is a terminal.
+  `$sh.interactive` is shell-level only. Expose a per-stream test **under the `sh`
+  namespace** — `$sh.stdin:tty` / `$sh.stderr:tty` (a bare `$stdin` is an ordinary
+  user variable under the two-reserved-names rule, so the handles can't live there) —
+  so a function can tell whether *its own* stderr is a terminal.
 - ***Output process substitution `>(cmd)`.*** The input form `<(cmd)` and explicit
   fds / dup / close are settled above; the output form (`filter`'s `3> >(cmd)`) is
   not. Decide whether to add it.)*
