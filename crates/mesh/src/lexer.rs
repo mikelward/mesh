@@ -80,6 +80,9 @@ pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
             i += 2;
             continue;
         }
+        // Track lexical word start (no word yet) — not segment emptiness, since
+        // an empty quote like `""` starts a word but emits no segment.
+        let at_word_start = current.is_none();
         let word = current.get_or_insert_with(Vec::new);
         match c {
             '\\' => {
@@ -103,7 +106,7 @@ pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
             }
             // Raw-string prefix `r'…'` / `r"…"`, recognized only at the start of
             // a word so ordinary words like `grep` or `ptr'x'` are unaffected.
-            'r' if word.is_empty() && matches!(chars.get(i + 1), Some('\'') | Some('"')) => {
+            'r' if at_word_start && matches!(chars.get(i + 1), Some('\'') | Some('"')) => {
                 let delim = chars[i + 1];
                 i = lex_raw(&chars, i + 2, delim, word)?;
             }
@@ -339,6 +342,13 @@ mod tests {
     fn raw_prefix_only_at_word_start() {
         // A bare `r` mid-word is not a raw prefix; `ptr'x'` fuses to `ptrx`.
         assert_eq!(words(r"ptr'x'"), [Word(vec![exp("ptr"), lit("x")])]);
+    }
+
+    #[test]
+    fn empty_quote_does_not_reset_word_start() {
+        // `""r'x'` has already started a word (via `""`), so `r` is a bare char,
+        // not a raw prefix: the pieces fuse to `rx`, not `x`.
+        assert_eq!(words(r#"""r'x'"#), [Word(vec![exp("r"), lit("x")])]);
     }
 
     #[test]
