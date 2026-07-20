@@ -1179,7 +1179,14 @@ plain `func` doesn't yet give cleanly; these are open:*
     `def --wrapped`. So the open work is a shorthand — `wrap co = vcs checkout`, or a
     loop-friendly definer over `$(vcs --list-commands)` — that **disables the
     wrapper's own flag parsing and forwards every argument verbatim**, which a plain
-    `...args` `func` does not do today.*
+    `...args` `func` does not do today. *Decided (porting the ssh/vcs wrappers): a
+    wrapper **cannot** validate the flags it forwards — it does not know the callee's
+    grammar — so a passthrough wrapper forwards unknown flags **verbatim** and
+    validity is enforced at the **wrapped call**: the wrapped in-shell `func`'s own
+    signature rejects a bad flag (a loud error* there*), or the external program
+    rejects it itself. Disabling the wrapper's flag parsing therefore does not drop
+    the check, it **relocates** it to where the grammar is known. Still open: only the
+    surface — `wrap`, a `--wrapped` marker, or a passthrough-tagged `...rest`.*
   - ***Running a wrapper under `sudo` / `xargs` / `watch`.** Because mesh commands
     are functions, not aliases or `PATH` binaries, `sudo ll` can't see `ll` — bash
     papers over this with the invisible `alias sudo='sudo '` trailing-space trick.
@@ -1454,8 +1461,25 @@ to a bool):
   `$p:exec` / `$p:read` / `$p:write` are `-x` / `-r` / `-w`. (`-z`/`-n` are just
   `$s == ""` / `$s:len > 0`.) The **binary** file relations `-nt` / `-ot` / `-ef`
   (newer / older / same-inode) are the same comparison family as the
-  [predicate qualifiers](#globbing) (`age<`) and are *(open)* alongside them —
-  likely `$a:mtime > $b:mtime` and a `$a:same($b)` rather than cryptic digraphs.
+  [predicate qualifiers](#globbing) (`age<`), spelled `$a:mtime > $b:mtime` and
+  `$a:same($b)` rather than cryptic digraphs. These ride on the **time model**
+  *(decided, porting `age()`)*: `now()` and the file-time modifiers
+  (`:mtime`/`:atime`/`:ctime`) return an **`Instant`**, and `Instant - Instant` is
+  a **`Duration`** (`age = now() - $f:mtime`). A `Duration` is written with **suffix
+  literals** — `500ms`, `3s`, `5m`, `2h`, `7d`, units up through **days** (no week or
+  year — not fixed-length), compounding as `2h30m` — and **prints canonically**, so
+  the prompt timer is `took $elapsed` with no `/1000`. Arithmetic is the closed set
+  `Duration ± Duration`, `Duration × n`, `Duration ÷ Duration` (a bare ratio),
+  `Instant ± Duration → Instant`, `Instant - Instant → Duration` (`Instant + Instant`
+  is an error); `:ms` / `:secs` drop back to a number. A bare integer is **not** a
+  Duration (the ms-vs-s footgun mesh kills), but the process boundary stays bytes, so
+  an external `sleep 2` still passes `"2"` — the type governs only *in-shell* values.
+  One literal grammar then unifies the glob `age<1d` predicate, file-time
+  comparisons, `retry --sleep 2s`, and the prompt's `took 3s`. *(TODO — **timezone /
+  calendar handling** deferred: `Instant` parse and format (`$t:format("%F %T")`,
+  `"…":datetime`, and the tz conversion behind `tz2tz`/`udate`/`utc2`) delegate to
+  `date` for now; consider a native tz-aware datetime later, weighed against simply
+  shelling out.)*
   *(TODO — surfaced porting `age()`: settle the **time model** these imply. Is
   `:mtime` a bare epoch **int** or an **instant**, is there a `now()`, and is a
   difference a plain count of seconds or a **duration** that prints as `3s`?
@@ -1978,6 +2002,14 @@ connector (`|`, `|&`, `&&`, `||`) or line-continuation `\`. The editor owns
 rendering the [prompt](#hooks-and-the-prompt) segment map and its multi-line
 redraw.
 
+*(TODO — gap surfaced porting a vi NORMAL/INSERT prompt indicator
+(`keymap_character`): the [prompt segment map](#hooks-and-the-prompt) is evaluated
+**once before** the editor runs, but the vi keymap changes **during** editing, and
+mesh exposes neither the live keymap as a value nor a redraw hook when it changes.
+zsh solves this with a `zle-keymap-select` widget that redraws a mode indicator
+reactively. Decide how to surface the active keymap (e.g. a `$sh.keymap` a segment
+can read) plus the on-mode-change **redraw** a reactive indicator needs.)*
+
 *(deferred: exposing the **keybinding config** from `rc.mesh` — the whole reason
 for the library choice — plus a vi mode, custom widgets, fish-style
 autosuggestions, and syntax highlighting.)* Completion runs *through* the editor's
@@ -2224,6 +2256,39 @@ timer before a command — separately from the after-work. The `preexec` /
 `postexec` pair in particular is how the prompt's **last-exit status** and
 **command timing** (both required dashboard fields) get fed without special
 casing.
+
+*(TODO — **terminal control: escapes & OSC features**. Surfaced porting
+`title`/`set_title`/`init_title_sequences`, broadened to the whole surface. mesh
+owns the line editor and prompt, so it should decide first-class handling — a hook,
+a builtin, or automatic — for the escape/OSC features a modern interactive shell is
+expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
+- ***Window/tab title*** *(OSC 0/1/2)* — set alongside the prompt, from `preexec`;
+  needs the per-`$env.TERM` sequence choice (xterm `\e]0;…\a` vs screen/tmux
+  `\ek…`). A `$sh.title` hook or a `set-title` builtin.
+- ***Bracketed paste*** *(`\e[?2004h/l`)* — the editor must wrap pasted input so a
+  multi-line paste is **inserted, not executed** line by line, and a lone newline in
+  a paste doesn't submit. Almost certainly on by default, but it needs stating.
+- ***Shell integration / semantic prompt marks*** *(OSC 133 `A`/`B`/`C`/`D`)* — mark
+  prompt-start, command-start, output-start, and exit code so terminals (iTerm2, VS
+  Code, WezTerm) can jump between prompts, fold command output, and badge exit
+  status. mesh already has the exact `preexec`/`postexec`/prompt boundaries to emit
+  these; decide whether it does so automatically.
+- ***cwd reporting*** *(OSC 7)* — emit the cwd on `postcd` so a new terminal
+  tab/split opens in the same directory. A natural `$sh.postcd` default.
+- ***Hyperlinks*** *(OSC 8)* — clickable paths/URLs in output; likely a `style()`
+  sibling (`link(text url)`) rather than a raw escape, keeping color-as-data.
+- ***Clipboard*** *(OSC 52)* — copy to the terminal's clipboard (works over ssh); a
+  builtin.
+- ***Notifications*** *(OSC 9 / 777)* — desktop notification, e.g. auto-notify when a
+  long command finishes (pairs with the `postexec` duration).
+- ***Cursor shape per mode*** *(DECSCUSR `\e[…q`)* — block in vi NORMAL, bar in
+  INSERT; driven by the same mode-change event as the keymap-indicator TODO in the
+  line-editor section.
+- ***Synchronized output*** *(DCS 2026)* — wrap the prompt / multi-line redraw so it
+  updates atomically without flicker.
+
+  Decide per feature: automatic, a hook/builtin, or out of scope (left to a
+  hand-emitted `print "\e…"`).)*
 
 **Command hooks fire for the outer interactive command only.** `preexec` /
 `postexec` fire once for the command line you submit at the prompt — *not* for
