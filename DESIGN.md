@@ -532,7 +532,9 @@ top-level is **yours**; the built-ins hang off two reserved roots:
   **`$sh.pipestatus`** (a **list** of the last pipeline's stage statuses, where
   real lists beat bash's `PIPESTATUS`), `$sh.pid` / `$sh.ppid` (own and parent PID,
   bash's `$$` / `$PPID`), `$sh.version`, `$sh.options`,
-  `$sh.interactive`, **`$sh.jobs`** (the live [job-control](#job-control) map),
+  `$sh.interactive`, the **stream handles** `$sh.stdin` / `$sh.stdout` / `$sh.stderr`
+  (each with a `:tty` test — the `test -t N` replacement), **`$sh.jobs`** (the live
+  [job-control](#job-control) map),
   and **`$sh.args`** / **`$sh.name`** (script/positional args as a list, and the
   shell-or-script name — see [Startup](#startup-and-invocation)); **and the
   hooks** — `$sh.prompt`, `$sh.preprompt`,
@@ -547,7 +549,8 @@ clashes. Access is strict [map access](#maps-associative-arrays), so `$sh:keys`
 lists the whole surface and a mistyped key fails loud.
 
 **Read-only vs. writable within `$sh`.** The **runtime** entries (`$sh.status`,
-`$sh.pipestatus`, `$sh.pid`, `$sh.ppid`, `$sh.version`, `$sh.interactive`, `$sh.jobs` with
+`$sh.pipestatus`, `$sh.pid`, `$sh.ppid`, `$sh.version`, `$sh.interactive`, the
+`$sh.stdin` / `$sh.stdout` / `$sh.stderr` handles, `$sh.jobs` with
 its records, and `$sh.args` / `$sh.name`) are the shell's authoritative state —
 **read-only**: assigning or `unset`ting one is an error, so config can't corrupt
 an invariant. (`$sh.jobs` changes only through `&` / `fg` / `bg` / `kill` and job
@@ -1018,21 +1021,24 @@ revisit whether one should be defined in terms of the other, or dropped, before
 first release.)*
 
 **Regex is a first-class value** *(decided — porting `fromto`, `filter`, `he`,
-`untar`)*. `/re/` is a **regex literal** — like `[a b]` is a list literal —
-evaluating to a regex **value** usable in any value position (`p = /\d+/`, stored,
-passed, returned), not a token that exists only inside `~`/`:match`. `~` and
-`:match` **consume a regex value**, so `$str ~ /re/` and `$str:match(/re/)` are just
-the literal case. A pattern that arrives as a **string** — `fromto $from $to`, any
-`grep`-like — becomes a regex through the explicit constructor **`re($str)`**:
-`$line ~ re($to)`, `$line:match(re($to))`. `re` is **fail-loud** (a malformed
-pattern errors at the call, not silently), carries flags on the value
-(`re($x --ignore-case)`), and `re($s --literal)` quotes the string to match
-**verbatim** (Perl's `\Q…\E`) — the common "match exactly what the user typed" case.
-A **bare string is never auto-converted**: `$s ~ "a.b"` is an **error** pointing at
-`re("a.b")` or `/a.b/`, so a string full of metacharacters never silently becomes a
-pattern — the same no-silent-coercion rule as `:int`. Lexing is the standard
-regex-or-division rule: in expression/argument position `/…/` opens a regex, after
-an operand `/` is division.
+`untar`)*. `/re/` is a **regex literal** evaluating to a regex **value**, and `~`
+and `:match` **consume a regex value** — so `$str ~ /re/` and `$str:match(/re/)` are
+the literal case. It is recognized **where a regex is expected** — the RHS of
+`~`/`!~`, the argument of `:match`, a `match` arm — and in **expression position**
+generally (between two operands `/` is division, as usual). In **command-argument
+position a `/…/` word stays a path**, so `cd /tmp/` and `grep /usr/bin` are
+unaffected — the same place [autocd](#built-ins) already reads `/tmp/` as a
+directory. When you want a regex **value** where a bare `/…/` would read as a path
+(binding it to a variable, passing it as a plain argument), or a pattern that
+arrives as a **string** — `fromto $from $to`, any `grep`-like — you use the
+constructor **`re($str)`**: `$line ~ re($to)`, `$line:match(re($to))`. `re` is a
+**[built-in](#built-ins)** (a rich value can't come from an external) and
+**fail-loud** (a malformed pattern errors at the call, not silently), carries flags
+on the value (`re($x --ignore-case)`), and `re($s --literal)` quotes the string to
+match **verbatim** (Perl's `\Q…\E`) — the common "match exactly what the user typed"
+case. A **bare string is never auto-converted**: `$s ~ "a.b"` is an **error**
+pointing at `re("a.b")` or `/a.b/`, so a string full of metacharacters never
+silently becomes a pattern — the same no-silent-coercion rule as `:int`.
 
 *(deferred: **`/$var/` interpolation** for a literal skeleton with a variable hole
 (`/^$user@/`). Held because `$` is the regex end-anchor, so interpolation would need
@@ -2062,6 +2068,13 @@ programs or user functions:
 - **Jobs** — `fg`, `bg`, `jobs`, `kill`, `wait` ([Job control](#job-control)).
 - **History** — `history` (list past commands; `history | grep` is the MVP search —
   see [Interactive history](#interactive-history)).
+- **Process** — **`exec CMD …`** replaces the shell process with the command (the
+  `exec(2)` hand-off; ordinary invocation runs a child instead). With only
+  redirections and no command it applies them to the current shell (bash's `exec >log`).
+- **Values** — **`re(STR)`** builds a [regex value](#tests-and-comparisons) from a
+  string — a built-in constructor, since a rich value can't come from an external —
+  with `re(STR --literal)` for verbatim matching; `style` (above) is the styled-value
+  constructor.
 - **Session** — `exit [status]`.
 
 **No aliases.** mesh drops the alias mechanism entirely: a **function** is just
