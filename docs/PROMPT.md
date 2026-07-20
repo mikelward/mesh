@@ -22,10 +22,11 @@ something to say.
 ## `rc.mesh`
 
 ```
-# Time each command, so the prompt can say "took 3s". Side effects like this
-# live in hooks; the prompt segments below stay pure renderers.
+# Record each command's run time — the shell measures it and hands `ms` to
+# postexec; we just stash it so the prompt can say "took 3s". Side effects like
+# this live in hooks; the prompt segments below stay pure renderers.
 global _cmd_ms = 0
-$sh.postexec.timer = func(cmd, status, ms) { global _cmd_ms = $ms }
+$sh.postexec.record-time = func(cmd, status, ms) { global _cmd_ms = $ms }
 
 # The prompt is a map — one entry per line, rendered top to bottom.
 
