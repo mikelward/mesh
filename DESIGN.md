@@ -1484,10 +1484,14 @@ attaches to, so a forked function stays run/capture-only however its body is
 spelled. **Every block is `{ … }`**, so isolation is now a *keyword*, never a
 swapped delimiter — the
 older POSIX spelling (a bare `( … )` subshell, and a `func f() ( … )` whose
-parenthesized body was the isolation flag) is **dropped**. That leaves `( )` a
-single theme — the [value-and-argument world](#calling-for-a-value-and-lambdas)
-(calls, signatures, modifier arguments) — with no attached-vs-spaced whitespace
-rule needed to tell a value call `f(x)` apart from a subshell `( x )`.
+parenthesized body was the isolation flag) is **dropped**. That leaves a
+**standalone** `( )` a single theme — the
+[value-and-argument world](#calling-for-a-value-and-lambdas) (calls, signatures,
+modifier arguments) — with no attached-vs-spaced whitespace rule needed to tell a
+value call `f(x)` apart from a subshell `( x )`. (Process substitution
+[`<(cmd)` / `>(cmd)`](#redirection) is untouched: there the paren is bound to the
+`<`/`>` as a single lexical token — `<(` — not a bare group, so it is not what
+"the subshell is dropped" refers to and stays a retained form.)
 
 A **`fork` block forks**, so — like `export` — only **bytes** cross back out (its
 stdout); rich list/map values do not survive the process boundary. A direct
