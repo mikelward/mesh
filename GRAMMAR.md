@@ -233,6 +233,14 @@ return  = "return" value?                 # ends the function
   status. `return` at top level (outside a function) is an error.
 - **Deferred:** a function in a multi-stage pipeline or with a redirection is not
   supported yet (rejected, like builtins — needs the fork-based executor).
+- **Standalone statement (for now).** A `func` definition must be its own
+  statement; it does **not** yet compose with `;` / `&&` / `||`. `func f() {…}; f`
+  and `true && func f() {…}` are not parsed as sequences (the whole line is read
+  as one definition, so trailing text after `}` is an error, and a `func` after a
+  separator is treated as an external command). Making a definition a sequence
+  *segment* requires the line splitter and the multi-line buffer to treat
+  `func … { … }` as one atomic unit — the body's own `;` must not split it — which
+  lands with the statement-parser / command-classification rework.
 
 ### Not yet parsed
 `{ }` blocks (`if` / `for` / `while`), `:` modifiers, heredocs. Each arrives with
