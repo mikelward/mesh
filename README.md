@@ -19,8 +19,8 @@ cargo run -p mesh      # start the shell
 cargo test --workspace # run the tests
 ```
 
-The shell is at milestone **M0**: it reads a line and launches the external
-command it names (plus an `exit` builtin) — `echo 'ls' | mesh` works. None of the
+The shell reads a line and launches the external command it names — `echo 'ls'
+| mesh` works — with the builtins `cd`, `pwd`, `puts`, and `exit`. None of the
 mesh *language* is implemented yet; see [`ROADMAP.md`](ROADMAP.md).
 
 ## Name
