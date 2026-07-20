@@ -856,6 +856,21 @@ fn return_outside_a_function_is_reported() {
 }
 
 #[test]
+fn a_nested_multi_line_function_is_buffered() {
+    // A multi-line `func` defined inside a body must be buffered until its braces
+    // balance, then defined — not run line by line. The output order is the tell:
+    // if `inner`'s body leaked, "in-inner" would print between "start" and "end"
+    // (during `outer`); buffered correctly, `inner` runs only when called after.
+    let out = run_with_input(
+        "func outer() {\n  puts start\n  func inner() {\n    puts in-inner\n  }\n  puts end\n}\nouter\ninner\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "start\nend\nin-inner\n"
+    );
+}
+
+#[test]
 fn a_top_level_return_does_not_abort_the_rest_of_the_line() {
     // A stray `return` at top level is a recoverable error, so `;` still runs the
     // next command unconditionally — the sequence is not aborted.

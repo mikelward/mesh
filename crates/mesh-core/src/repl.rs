@@ -321,30 +321,49 @@ fn call_func(name: &str, args: Vec<String>, shell: &mut Shell) -> Step {
         shell.vars.set(param, arg);
     }
 
-    // A function starts fresh, not inheriting the caller's `$?`: an empty body or
-    // a bare `return` before any command yields status 0 (`DESIGN.md` — "no
-    // expression to yield … status 0"), and the first body line likewise sees
-    // `$?` = 0 rather than an unrelated prior failure.
+    let result = run_func_body(&body, shell);
+
+    shell.vars.pop_scope();
+    result
+}
+
+/// Run a function body line by line, buffering a nested multi-line `func`
+/// definition until its braces balance — exactly as the top-level reader does —
+/// so a nested definition is stored rather than having only its first line reach
+/// `run_line` and the rest run as loose commands.
+///
+/// A function starts fresh, not inheriting the caller's `$?`: an empty body (or a
+/// bare `return` before any command) yields status 0 (`DESIGN.md` — "no
+/// expression to yield … status 0"), and the first line likewise sees `$?` = 0.
+/// `return` ends the body early with its status; `exit` propagates out.
+fn run_func_body(body: &str, shell: &mut Shell) -> Step {
     let mut status = 0;
     let mut result = Step::Continue(status);
+    let mut pending = String::new();
     for line in body.lines() {
-        match run_line(line, status, true, shell) {
+        pending.push_str(line);
+        pending.push('\n');
+        if is_func_start(&pending) && lexer::needs_more_input(&pending) {
+            continue;
+        }
+        let full = std::mem::take(&mut pending);
+        match run_line(&full, status, true, shell) {
             Step::Continue(code) => {
                 status = code;
                 result = Step::Continue(code);
             }
-            Step::Return(code) => {
-                result = Step::Continue(code);
-                break;
-            }
-            Step::Exit(code) => {
-                result = Step::Exit(code);
-                break;
-            }
+            Step::Return(code) => return Step::Continue(code),
+            Step::Exit(code) => return Step::Exit(code),
         }
     }
-
-    shell.vars.pop_scope();
+    // A truncated nested definition still buffered at the end of the body: run it
+    // so its "missing }" error is reported rather than silently swallowed.
+    if !pending.trim().is_empty() {
+        return match run_line(&pending, status, true, shell) {
+            Step::Return(code) => Step::Continue(code),
+            other => other,
+        };
+    }
     result
 }
 
