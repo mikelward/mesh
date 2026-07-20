@@ -127,8 +127,8 @@ mesh/
 │       ├── src/
 │       │   ├── main.rs     # entry point
 │       │   ├── repl.rs     # read / tokenize / dispatch loop
-│       │   ├── lexer.rs    # M0 whitespace tokenizer (PLACEHOLDER)
-│       │   ├── expand.rs   # tilde + glob expansion of words
+│       │   ├── lexer.rs    # quotes + escapes → words of tagged segments
+│       │   ├── expand.rs   # tilde + glob expansion (respects quoting)
 │       │   ├── builtins.rs # cd, pwd, puts, exit
 │       │   └── exec.rs     # launch external commands, map exit status
 │       └── tests/

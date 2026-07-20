@@ -1,101 +1,114 @@
 //! Word expansion: tilde and filesystem globs.
 //!
-//! Runs after the M0 tokenizer and before dispatch, so `cd ~` and `ls *.rs` are
-//! expanded before a builtin or external command sees them.
+//! Runs after the lexer and before dispatch. Each word is a list of segments
+//! tagged expandable (unquoted) or literal (quoted/escaped). Only **expandable**
+//! text supplies tilde/glob syntax; literal text is kept verbatim (its
+//! metacharacters are glob-escaped), so quoting suppresses expansion.
 //!
-//! There is **no way to suppress expansion yet** — quoting and escaping arrive
-//! with task 5, so for now every leading `~` and every glob metacharacter is
-//! active. Expansion works on `String` words, so a non-UTF-8 `$HOME` or match is
-//! rendered lossily; the real fix is `OsString` words with the real lexer.
+//! Expansion produces `String` args, so a non-UTF-8 `$HOME` or glob match is
+//! rendered lossily; the real fix is `OsString` words with a later lexer.
 
 use std::env;
 
-/// Expand each word: a leading `~`/`~/…` via `$HOME`, then filesystem globs for
-/// any word containing glob metacharacters. A word without metacharacters passes
-/// through literally (even if no such file exists — `touch new`, `puts foo.txt`).
-/// A glob that matches nothing contributes zero words (the settled "empty" rule).
-pub fn expand(words: Vec<String>) -> Vec<String> {
+use crate::lexer::Word;
+
+/// Expand each word into zero or more argument strings.
+pub fn expand(words: Vec<Word>) -> Vec<String> {
     let mut out = Vec::new();
     for word in words {
-        let (expanded, literal_prefix) = expand_tilde(&word);
-        expand_glob(expanded, literal_prefix, &mut out);
+        expand_word(word, &mut out);
     }
     out
 }
 
-/// Replace a leading `~` (alone or before `/`) with `$HOME`. `~user` is not yet
-/// supported — it needs a passwd lookup — and is left unchanged.
-///
-/// Returns the expanded word plus the byte length of the tilde-introduced
-/// prefix (the `$HOME` portion). That prefix is *path text*, not something the
-/// user typed, so its glob metacharacters must stay literal — see `expand_glob`.
-fn expand_tilde(word: &str) -> (String, usize) {
-    if word == "~" {
-        if let Some(home) = home() {
-            let len = home.len();
-            return (home, len);
+/// A word reduced to `(text, expandable)` pieces, after tilde expansion.
+type Pieces = Vec<(String, bool)>;
+
+fn expand_word(word: Word, out: &mut Vec<String>) {
+    let mut pieces: Pieces = word
+        .0
+        .into_iter()
+        .map(|seg| (seg.text, seg.expandable))
+        .collect();
+    apply_tilde(&mut pieces);
+
+    // Only expandable text contributes glob syntax.
+    let has_meta = pieces.iter().any(|(t, e)| *e && has_glob_meta(t));
+    if !has_meta {
+        out.push(literal(&pieces));
+        return;
+    }
+
+    // Build the pattern: expandable text as-is, literal text escaped so its
+    // metacharacters match literally.
+    let pattern: String = pieces
+        .iter()
+        .map(|(t, e)| {
+            if *e {
+                t.clone()
+            } else {
+                glob::Pattern::escape(t)
+            }
+        })
+        .collect();
+    // Shell defaults: `*`/`?`/`[…]` don't match a leading dot unless the pattern
+    // starts with `.`.
+    let options = glob::MatchOptions {
+        require_literal_leading_dot: true,
+        ..glob::MatchOptions::new()
+    };
+    match glob::glob_with(&pattern, options) {
+        // No matches → contribute nothing (the settled empty-list rule).
+        // `flatten()` drops unreadable entries; the crate yields matches sorted.
+        Ok(paths) => out.extend(paths.flatten().map(|p| p.to_string_lossy().into_owned())),
+        // Invalid pattern → the literal word.
+        Err(_) => out.push(literal(&pieces)),
+    }
+}
+
+/// The literal value of a word: its segment texts concatenated (an empty word,
+/// e.g. from `""`, yields an empty argument).
+fn literal(pieces: &Pieces) -> String {
+    pieces.iter().map(|(t, _)| t.as_str()).collect()
+}
+
+/// Replace a leading expandable `~` (alone or before `/`) with `$HOME`. The
+/// substituted `$HOME` is literal (its metacharacters must not glob). A quoted
+/// or escaped `~` is not expandable and so is skipped. `~user` needs a passwd
+/// lookup and is left unchanged.
+fn apply_tilde(pieces: &mut Pieces) {
+    let Some((text, true)) = pieces.first().map(|(t, e)| (t.clone(), *e)) else {
+        return;
+    };
+    if text == "~" {
+        // A bare `~`: expand when it is the whole word or is followed by `/`.
+        let followed_by_slash = pieces.get(1).is_some_and(|(t, _)| t.starts_with('/'));
+        if pieces.len() == 1 || followed_by_slash {
+            if let Some(home) = home() {
+                pieces[0] = (home, false);
+            }
         }
-    } else if word.starts_with("~/") {
+    } else if let Some(rest) = text.strip_prefix("~/") {
         if let Some(home) = home() {
-            let len = home.len();
-            // Replace only the leading `~`; keep the rest of the word (its
-            // `/…`) verbatim, so a trailing slash in `$HOME` is preserved as
-            // typed rather than normalized away.
-            return (format!("{home}{}", &word[1..]), len);
+            // Keep the `/rest` verbatim and still expandable (so `~/*.rs` globs).
+            pieces[0] = (home, false);
+            pieces.insert(1, (format!("/{rest}"), true));
         }
     }
-    (word.to_string(), 0)
 }
 
 fn home() -> Option<String> {
     env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
 }
 
-/// Does the word contain a glob metacharacter? (Escaping to make one literal is
-/// a task-5 concern; for now any `*`, `?`, or `[` triggers globbing.)
-fn has_glob_meta(word: &str) -> bool {
-    word.chars().any(|c| matches!(c, '*' | '?' | '['))
-}
-
-/// Glob-expand `word` into `out`: a non-glob word (or an invalid pattern) passes
-/// through literally; a matching glob contributes its sorted matches; a
-/// non-matching glob contributes nothing.
-///
-/// `literal_prefix` marks a leading byte range (from tilde expansion) whose
-/// metacharacters must stay literal — only the user-typed remainder supplies
-/// glob syntax, and that prefix is escaped before matching.
-fn expand_glob(word: String, literal_prefix: usize, out: &mut Vec<String>) {
-    if !has_glob_meta(&word[literal_prefix..]) {
-        out.push(word);
-        return;
-    }
-    let pattern = if literal_prefix == 0 {
-        word.clone()
-    } else {
-        format!(
-            "{}{}",
-            glob::Pattern::escape(&word[..literal_prefix]),
-            &word[literal_prefix..]
-        )
-    };
-    // Match shell defaults: `*`/`?`/`[…]` do not match a leading dot (so `rm *`
-    // skips dotfiles) unless the pattern itself starts with `.`.
-    let options = glob::MatchOptions {
-        require_literal_leading_dot: true,
-        ..glob::MatchOptions::new()
-    };
-    match glob::glob_with(&pattern, options) {
-        // `flatten()` drops unreadable entries (e.g. a permission error mid-walk)
-        // and keeps the matches; the `glob` crate yields them already sorted.
-        Ok(paths) => out.extend(paths.flatten().map(|p| p.to_string_lossy().into_owned())),
-        // An invalid pattern (e.g. an unclosed `[`) is treated as a literal word.
-        Err(_) => out.push(word),
-    }
+/// Does the text contain a glob metacharacter?
+fn has_glob_meta(text: &str) -> bool {
+    text.chars().any(|c| matches!(c, '*' | '?' | '['))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_tilde, has_glob_meta};
+    use super::{apply_tilde, has_glob_meta};
 
     #[test]
     fn detects_glob_metacharacters() {
@@ -106,8 +119,17 @@ mod tests {
     }
 
     #[test]
+    fn quoted_tilde_is_not_expanded() {
+        // A literal (quoted/escaped) leading `~` must be left alone.
+        let mut pieces = vec![("~".to_string(), false)];
+        apply_tilde(&mut pieces);
+        assert_eq!(pieces, vec![("~".to_string(), false)]);
+    }
+
+    #[test]
     fn tilde_user_is_left_alone() {
-        // `~user` needs a passwd lookup we don't do yet: unchanged, no prefix.
-        assert_eq!(expand_tilde("~root/x"), ("~root/x".to_string(), 0));
+        let mut pieces = vec![("~root/x".to_string(), true)];
+        apply_tilde(&mut pieces);
+        assert_eq!(pieces, vec![("~root/x".to_string(), true)]);
     }
 }

@@ -261,6 +261,59 @@ fn a_blank_line_preserves_the_previous_status() {
 }
 
 #[test]
+fn double_quotes_keep_spaces_in_one_argument() {
+    let out = run_with_input("puts \"a b\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a b\n");
+}
+
+#[test]
+fn backslash_escapes_a_space() {
+    let out = run_with_input("puts a\\ b\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a b\n");
+}
+
+#[test]
+fn double_quote_escapes_are_interpreted() {
+    let out = run_with_input("puts \"x\\ty\\$5\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x\ty$5\n");
+}
+
+#[test]
+fn empty_double_quotes_are_one_empty_argument() {
+    let out = run_with_input("puts \"\" x\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), " x\n");
+}
+
+#[test]
+fn quoting_suppresses_glob_expansion() {
+    let dir = fresh_dir("quote_glob");
+    std::fs::write(dir.join("afile"), "").unwrap();
+    // Unquoted `*` matches `afile`; quoted and escaped `*` stay literal.
+    let out = run_with_input(&format!(
+        "cd {}\nputs *\nputs '*'\nputs \\*\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "afile\n*\n*\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn quoting_suppresses_tilde_expansion() {
+    let home = fresh_dir("quote_tilde");
+    let out = run_with_home("puts '~' \\~\n", &home);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "~ ~\n");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn unterminated_quote_is_a_syntax_error_that_recovers() {
+    // The bad line reports a syntax error; the shell keeps going.
+    let out = run_with_input("puts 'oops\nputs ok\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("syntax error"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+#[test]
 fn tilde_keeps_home_metacharacters_literal() {
     // A $HOME containing glob metacharacters must not be treated as a pattern.
     let base = fresh_dir("tilde_meta");

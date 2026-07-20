@@ -47,7 +47,13 @@ enum Step {
 /// Tokenize and dispatch one line of input. Empty lines are a no-op that keeps
 /// the previous status.
 fn run_line(text: &str, last: u8) -> Step {
-    let tokens = lexer::split(text);
+    let tokens = match lexer::split(text) {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            eprintln!("mesh: {err}");
+            return Step::Continue(2); // syntax error
+        }
+    };
     if tokens.is_empty() {
         // A blank line is not a command; the last status is unchanged.
         return Step::Continue(last);

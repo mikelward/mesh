@@ -20,7 +20,9 @@ file as tasks land.
       for piped input. Ctrl-D exits on an empty line; Ctrl-C cancels the line.
 - [x] History (in-memory, reedline default). Persisted history: later.
 - [x] Two-glyph prompt (`mesh$` / `mesh!`) via reedline.
-- [ ] Lexer v1: single/double quotes and escapes (raw form = heredoc, see below)
+- [x] Lexer v1: single/double quotes, backslash escapes, concatenation;
+      quoting suppresses tilde/glob expansion. Deferred: `$`-interpolation
+      (task 6), heredoc raw form, `\`-newline continuation across lines.
 - [ ] Promote internals into `crates/mesh-core` (lib); binary becomes thin `main`
 - [ ] `;`, `&&`, `||` sequencing
 - [x] `cd` builtin (basic): `$HOME` default, `cd -`, updates `$PWD`/`$OLDPWD`,
