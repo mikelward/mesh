@@ -127,8 +127,9 @@ mesh/
 │       ├── src/
 │       │   ├── main.rs     # entry point
 │       │   ├── repl.rs     # read / tokenize / dispatch loop
-│       │   ├── lexer.rs    # quotes + escapes → words of tagged segments
-│       │   ├── expand.rs   # tilde + glob expansion (respects quoting)
+│       │   ├── lexer.rs    # quotes + escapes + $interpolation → words of pieces
+│       │   ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
+│       │   ├── vars.rs     # session-global variable store
 │       │   ├── builtins.rs # cd, pwd, puts, exit
 │       │   └── exec.rs     # launch external commands, map exit status
 │       └── tests/
@@ -143,10 +144,12 @@ mesh/
 
 ### How the code fits together
 
-`main` calls `repl::run`, which loops: read a line → `lexer::split` into words →
-`expand::expand` (tilde + globs) → `builtins::dispatch` (handles
-`cd`/`pwd`/`puts`/`exit`, returns `None` otherwise) → else `exec::run` launches
-the external command. The loop tracks the last exit status and returns it as the
+`main` calls `repl::run`, which loops: read a line → `lexer::split` into words of
+pieces → classify as an assignment or a command → for a command,
+`expand::expand` (resolve `$` interpolation against `vars`, then tilde/globs) →
+`builtins::dispatch` (handles `cd`/`pwd`/`puts`/`exit`, returns `None` otherwise)
+→ else `exec::run` launches the external command. A session-global `vars` store
+persists across lines; the loop tracks the last exit status and returns it as the
 process exit code at EOF.
 
 **Planned evolution.** When the real lexer/parser replace the M0 placeholder,

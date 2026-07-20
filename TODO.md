@@ -23,7 +23,12 @@ file as tasks land.
 - [x] Lexer v1 (**Model B**): `"…"` (escape+interpolate), `'…'` (escape, no
       interpolation), `r'…'`/`r"…"` (raw); unknown escape is an error; backslash
       escapes; concatenation; quoting suppresses tilde/glob expansion. Deferred:
-      `$`-interpolation (task 6), heredocs, `\`-newline continuation across lines.
+      heredocs, `\`-newline continuation across lines.
+- [x] Variables (simple): `name = value` / `name=value` assignment (session-
+      global), `$name`/`${name}` + `$env.KEY` interpolation (in bare + `"…"`),
+      unbound read is a loud error, no word-splitting of interpolated values.
+      Deferred: list/map values (single-value assignment only), `:` modifiers,
+      `export`, `global`/`unset`, function-local scope, `$sh.*`, `$env:get`.
 - [ ] Promote internals into `crates/mesh-core` (lib); binary becomes thin `main`
 - [ ] `;`, `&&`, `||` sequencing
 - [x] `cd` builtin (basic): `$HOME` default, `cd -`, updates `$PWD`/`$OLDPWD`,
