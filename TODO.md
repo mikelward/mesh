@@ -109,6 +109,9 @@ file as tasks land.
 
 ## Icebox / decide later
 
+- [ ] **`return` with no argument — use the last status.** `exit` already does
+      this (a bare `exit` leaves the last command's status). Apply the same rule
+      to `return` when it lands with function bodies.
 - [ ] **Reserve only bare `_` as discard, allow `_name`.** Today a name must
       start with a letter, so a leading underscore is rejected wholesale (`_` and
       `_x` alike) — `_` is the discard pattern (`DESIGN.md`). Reconsider narrowing

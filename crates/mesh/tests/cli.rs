@@ -89,6 +89,15 @@ fn exit_status_propagates() {
 }
 
 #[test]
+fn bare_exit_uses_the_last_status() {
+    // `exit` with no argument leaves the last command's status (POSIX), not 0.
+    assert_eq!(run_with_input("false\nexit\n").status.code(), Some(1));
+    assert_eq!(run_with_input("true\nexit\n").status.code(), Some(0));
+    // An explicit argument still wins over the last status.
+    assert_eq!(run_with_input("false\nexit 0\n").status.code(), Some(0));
+}
+
+#[test]
 fn exit_status_is_masked_to_eight_bits() {
     assert_eq!(run_with_input("exit 256\n").status.code(), Some(0));
     assert_eq!(run_with_input("exit -1\n").status.code(), Some(255));

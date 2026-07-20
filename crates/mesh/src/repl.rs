@@ -82,7 +82,7 @@ fn run_line(text: &str, last: u8, vars: &mut Vars) -> Step {
                 // matches) is an empty-list result — status 0 per `DESIGN.md`.
                 return Step::Continue(0);
             }
-            match builtins::dispatch(&words) {
+            match builtins::dispatch(&words, last) {
                 Some(Builtin::Exit(code)) => Step::Exit(code),
                 Some(Builtin::Status(code)) => Step::Continue(code),
                 None => Step::Continue(exec::run(&words)),

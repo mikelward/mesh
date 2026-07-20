@@ -20,13 +20,14 @@ pub enum Builtin {
 /// If `words[0]` names a builtin, run it and return its outcome; otherwise
 /// return `None` so the caller falls through to external execution.
 ///
-/// `words` is guaranteed non-empty by the caller.
-pub fn dispatch(words: &[String]) -> Option<Builtin> {
+/// `words` is guaranteed non-empty by the caller. `last` is the status of the
+/// previous command, used as the default for a bare `exit`.
+pub fn dispatch(words: &[String], last: u8) -> Option<Builtin> {
     match words[0].as_str() {
         "cd" => Some(Builtin::Status(cd(&words[1..]))),
         "pwd" => Some(Builtin::Status(pwd(&words[1..]))),
         "puts" => Some(Builtin::Status(puts(&words[1..]))),
-        "exit" => Some(exit(&words[1..])),
+        "exit" => Some(exit(&words[1..], last)),
         _ => None,
     }
 }
@@ -140,19 +141,20 @@ fn puts(args: &[String]) -> u8 {
     write_stdout("puts", &line)
 }
 
-/// `exit [N]` — leave the shell with status `N` (default 0). The status is an
-/// 8-bit process status, so an out-of-range `N` is masked to `0`–`255`
-/// (`exit 256` → `0`, `exit -1` → `255`), matching `DESIGN.md` and conventional
-/// shells. A non-numeric argument is an error but still exits; a surplus operand
-/// is a likely typo, so the shell reports it and keeps running rather than
-/// exiting on it.
-fn exit(args: &[String]) -> Builtin {
+/// `exit [N]` — leave the shell with status `N`. With no argument it exits with
+/// the **last command's status** (`last`), the POSIX convention (`false; exit`
+/// leaves 1), not a bare 0. The status is an 8-bit process status, so an
+/// out-of-range `N` is masked to `0`–`255` (`exit 256` → `0`, `exit -1` → `255`),
+/// matching `DESIGN.md` and conventional shells. A non-numeric argument is an
+/// error but still exits; a surplus operand is a likely typo, so the shell
+/// reports it and keeps running rather than exiting on it.
+fn exit(args: &[String], last: u8) -> Builtin {
     if args.len() > 1 {
         eprintln!("mesh: exit: too many arguments");
         return Builtin::Status(1);
     }
     match args.first() {
-        None => Builtin::Exit(0),
+        None => Builtin::Exit(last),
         Some(arg) => match arg.parse::<i64>() {
             Ok(code) => Builtin::Exit(code.rem_euclid(256) as u8),
             Err(_) => {
