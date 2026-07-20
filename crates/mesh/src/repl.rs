@@ -18,10 +18,17 @@ use crate::builtins::{self, Builtin};
 use crate::{exec, lexer};
 
 /// Run the shell until end-of-input or `exit`, returning the last status as the
-/// process exit code. Picks the interactive or piped reader by whether stdin is
-/// a terminal.
+/// process exit code.
+///
+/// Interactive line editing needs **both** stdin and stdout to be terminals:
+/// reedline reads keys from the tty and renders its prompt and cursor-position
+/// queries through stdout. If stdout is redirected (`mesh >session.log`), those
+/// control bytes would corrupt the file and the cursor query could hang, so we
+/// fall back to the plain line reader. (A prompt on the controlling terminal
+/// even when stdout is redirected would need reedline to write to `/dev/tty`;
+/// that refinement is deferred.)
 pub fn run() -> ExitCode {
-    if io::stdin().is_terminal() {
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
         run_interactive()
     } else {
         run_piped()
