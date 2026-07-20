@@ -2052,7 +2052,9 @@ programs or user functions:
   - **`puts [args…]`** — one order-preserving rule: **render each argument to
     text** — a scalar as itself, a **list** as its elements joined by newlines (a
     list *is* a sequence of lines), a **map** as `key: value` entries joined by
-    newlines — then **join the arguments with a single space** and append a trailing
+    newlines; a value with **no canonical byte form** — an `Instant`, a `regex`, a
+    stream handle — is a **loud error** here, exactly as at the argv boundary above,
+    never a guessed rendering — then **join the arguments with a single space** and append a trailing
     newline. So `puts a b` → `a b`, `puts $(ls)` → one file per line, and a mixed
     `puts head $xs tail` is fully defined by that rule. `puts` can render rich values
     because it is a **built-in** on real values — an *external* command still needs
