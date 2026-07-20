@@ -59,7 +59,7 @@ $sh.prompt.rule = rule             # full-width ─── (replaces `bar $COLUMN
 
 # The header — one line, built from keyed inline segments so each keeps its own
 # color (concatenating styled values into a single string would flatten them).
-$sh.prompt.head = {
+$sh.prompt.head = [                            # a MAP literal — [ ], not { } (braces are blocks)
   root: func() { if is-root() { style("[root] " --fg red) } },              # "" when not root
   host: func() {
     h = short-hostname()
@@ -71,7 +71,7 @@ $sh.prompt.head = {
     else                { style(tilde-pwd() --fg blue) }   # mesh fallback — we color it
   },
   auth: func() { if not ssh-id-loaded() { style(" SSH" --fg yellow) } },     # no else → "" → dropped
-}
+]
 
 $sh.prompt.vcs  = func() { "$(vcs unmerged)" }       # own line; empty → line skipped
 $sh.prompt.jobs = func() {                           # was the `jobs | sed` tab-parser
