@@ -1025,13 +1025,14 @@ first release.)*
 **Regex is a first-class value** *(decided — porting `fromto`, `filter`, `he`,
 `untar`)*. `/re/` is a **regex literal** evaluating to a regex **value**, and `~`
 and `:match` **consume a regex value** — so `$str ~ /re/` and `$str:match(/re/)` are
-the literal case. A regex literal is recognized **only in the match slots** (the
-`~`/`!~` RHS, the `:match` argument, a `match` arm), and there only as a **complete
-`/…/`-delimited** atom — interior literal slashes escaped `\/`. The `~` RHS *also*
-accepts a **glob** (`$f ~ *.txt`), and a leading-`/` word that is not a clean `/…/` —
-an absolute glob like `/usr/*/bin` (its interior slashes mean it can't be a single
-`/…/`), or a bare path — reads as the **glob**, never a regex. **Everywhere else a
-`/…/` word is a path or string** — `cd /tmp/`, `grep /usr/bin`,
+the literal case. A regex literal is recognized **only in the match slots** — the
+`~`/`!~` RHS, the `:match` argument, and a `match` arm — and there a `/…/` is
+**always a regex**. The `~` RHS *also* takes a **glob**, but a bare glob is
+**relative** (`*.txt`, `src/**`) — it never starts with `/`, so it never collides;
+an **absolute** glob uses the **`glob(STR)`** constructor (`$p ~ glob("/usr/*/bin")`),
+because a bare leading-slash `/…/` reads as a regex there. So `$p ~ /tmp/` is the
+regex `tmp` (not the path); for the path, `$p ~ glob("/tmp/")` or `$p == "/tmp/"`.
+**Everywhere else a `/…/` word is a path or string** — `cd /tmp/`, `grep /usr/bin`,
 `$env.PATH:has(/usr/bin)`, `p = /etc/hosts` are all unaffected (a `/…/` is only a
 regex next to the match operators, never in a plain argument or modifier slot). To
 hold a regex as a **value** anywhere else — a variable, a list, another argument — or
@@ -1195,7 +1196,7 @@ Rules:
   | command | its own exit status |
   | int | the integer itself — `0` success (the shell `return N`) |
   | bool | `true` → `0`, `false` → `1` (the Unix inversion) |
-  | string / list / map / styled value / Instant / Duration / regex / stream handle (incl. empty or zero) | `0` — producing a value *is* success |
+  | string / list / map / styled value / Instant / Duration / regex / glob / stream handle (incl. empty or zero) | `0` — producing a value *is* success |
 
   So `have_command` ends in a test whose bool becomes the status and
   `if have_command fzf { … }` reads correctly; `return $cond` exits `0`/`1`;
@@ -1522,9 +1523,9 @@ to a bool):
   `[[ $s =~ re ]]`, unified. The regex form is **unanchored** (first match
   anywhere, as bash `=~` and grep are); anchor with `^…$`. A glob, by contrast,
   matches the **whole string** (fnmatch), the same as a `/re/` wrapped in `^…$` —
-  and `:match` shares the regex rule. On the RHS a **complete `/…/`** atom is the
-  regex and any other pattern is the glob, so an absolute glob (`/usr/*/bin`) is
-  unambiguously a glob.
+  and `:match` shares the regex rule. On the RHS a `/…/` is the regex; a **relative**
+  glob (`*.txt`) is bare, and an **absolute** glob uses the `glob("/usr/*/bin")`
+  constructor (a bare leading-slash `/…/` would read as a regex).
 - **File tests** are the scalar cousins of the `:files`/`:f` filter modifiers.
   The type/permission axis is words: `$p:type` yields the `find -type` word
   (`file`/`dir`/`link`/…) so `$p:type == dir` is `-d`; `$p:exists` is `-e`;
@@ -2086,8 +2087,9 @@ programs or user functions:
   redirections and no command it applies them to the current shell (bash's `exec >log`).
 - **Values** — **`re(STR)`** builds a [regex value](#tests-and-comparisons) from a
   string — a built-in constructor, since a rich value can't come from an external —
-  with `re(STR --literal)` for verbatim matching; `style` (above) is the styled-value
-  constructor.
+  with `re(STR --literal)` for verbatim matching; **`glob(STR)`** likewise builds a
+  glob value (for an absolute or runtime-built glob); `style` (above) is the
+  styled-value constructor.
 - **Session** — `exit [status]`.
 
 **No aliases.** mesh drops the alias mechanism entirely: a **function** is just
