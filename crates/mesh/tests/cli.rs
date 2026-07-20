@@ -421,6 +421,17 @@ fn unterminated_braced_interpolation_is_a_syntax_error() {
 }
 
 #[test]
+fn leading_underscore_is_not_a_variable_name() {
+    // A name starts with a letter; `_` is reserved as the discard pattern, so
+    // `_`/`_x` are not bindable (the line is a command, which isn't found) and
+    // `$_` is a literal. An interior underscore (`a_b`) is still a valid name.
+    let out = run_with_input("_ = secret\na_b = ok\nputs $a_b\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("command not found: _"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\nafter\n");
+}
+
+#[test]
 fn unbound_variable_is_a_loud_error_that_recovers() {
     let out = run_with_input("puts $nope\nputs ok\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("unbound variable"));
