@@ -19,9 +19,12 @@ cargo run -p mesh      # start the shell
 cargo test --workspace # run the tests
 ```
 
-The shell reads a line and launches the external command it names — `echo 'ls'
-| mesh` works — with the builtins `cd`, `pwd`, `puts`, and `exit`. None of the
-mesh *language* is implemented yet; see [`ROADMAP.md`](ROADMAP.md).
+The shell launches external commands and the builtins `cd`, `pwd`, `puts`, and
+`exit`, with a first slice of the language in place: quoting and escapes, `~` and
+filename globs, and variables with `$`-interpolation. For a hands-on walk through
+what runs today, see [`docs/TOUR.md`](docs/TOUR.md); for a terse lookup,
+[`docs/REFERENCE.md`](docs/REFERENCE.md). The full language is still landing task
+by task — see [`ROADMAP.md`](ROADMAP.md).
 
 ## Name
 
@@ -31,5 +34,6 @@ overloaded in infra (service mesh, mesh networking) and sits one letter from
 
 ## Status
 
-Language design in draft. Implementation at milestone **M0** (runs external
-commands); see [`ROADMAP.md`](ROADMAP.md).
+Language design in draft. Implementation in milestone **M1**: external commands
+and builtins, `reedline` editing, Model B quoting, tilde/glob expansion, and
+variables with interpolation. See [`ROADMAP.md`](ROADMAP.md).
