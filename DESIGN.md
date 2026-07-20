@@ -1023,15 +1023,15 @@ first release.)*
 **Regex is a first-class value** *(decided — porting `fromto`, `filter`, `he`,
 `untar`)*. `/re/` is a **regex literal** evaluating to a regex **value**, and `~`
 and `:match` **consume a regex value** — so `$str ~ /re/` and `$str:match(/re/)` are
-the literal case. It is recognized **where a regex is expected** — the RHS of
-`~`/`!~`, the argument of `:match`, a `match` arm — and in **expression position**
-generally (between two operands `/` is division, as usual). In **command-argument
-position a `/…/` word stays a path**, so `cd /tmp/` and `grep /usr/bin` are
-unaffected — the same place [autocd](#built-ins) already reads `/tmp/` as a
-directory. When you want a regex **value** where a bare `/…/` would read as a path
-(binding it to a variable, passing it as a plain argument), or a pattern that
-arrives as a **string** — `fromto $from $to`, any `grep`-like — you use the
-constructor **`re($str)`**: `$line ~ re($to)`, `$line:match(re($to))`. `re` is a
+the literal case. A regex literal is recognized **only where a regex is expected** —
+the RHS of `~`/`!~`, the argument of `:match`, and a `match` arm. **Everywhere else a
+`/…/` word is a path or string** — `cd /tmp/`, `grep /usr/bin`,
+`$env.PATH:has(/usr/bin)`, `p = /etc/hosts` are all unaffected (a `/…/` is only a
+regex next to the match operators, never in a plain argument or modifier slot). To
+hold a regex as a **value** anywhere else — a variable, a list, another argument — or
+to turn a pattern that arrives as a **string** (`fromto $from $to`, any `grep`-like)
+into one, you use the constructor **`re($str)`**: `$line ~ re($to)`,
+`$line:match(re($to))`. `re` is a
 **[built-in](#built-ins)** (a rich value can't come from an external) and
 **fail-loud** (a malformed pattern errors at the call, not silently), carries flags
 on the value (`re($x --ignore-case)`), and `re($s --literal)` quotes the string to
@@ -2069,7 +2069,10 @@ programs or user functions:
 - **History** — `history` (list past commands; `history | grep` is the MVP search —
   see [Interactive history](#interactive-history)).
 - **Process** — **`exec CMD …`** replaces the shell process with the command (the
-  `exec(2)` hand-off; ordinary invocation runs a child instead). With only
+  `exec(2)` hand-off; ordinary invocation runs a child instead). `CMD` resolves as
+  an **external executable** — function and built-in lookup is bypassed, since there
+  is no process image to replace the shell with otherwise, so a name that is only a
+  function or built-in (`exec cd`, `exec my-wrapper`) is an **error**. With only
   redirections and no command it applies them to the current shell (bash's `exec >log`).
 - **Values** — **`re(STR)`** builds a [regex value](#tests-and-comparisons) from a
   string — a built-in constructor, since a rich value can't come from an external —
