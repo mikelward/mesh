@@ -726,6 +726,11 @@ fn a_descriptor_redirect_is_rejected_for_now() {
     // `&>` attached to a preceding argument (`hello&>f`) is still rejected.
     let attached = run_with_input("echo hello&>f\nputs after\n");
     assert!(String::from_utf8_lossy(&attached.stderr).contains("descriptor redirection"));
+    // The fd-duplication form with `&` after the operator (`>&2`, `<&0`) too.
+    let dup = run_with_input("echo hi >&2\nputs after\n");
+    assert!(String::from_utf8_lossy(&dup.stderr).contains("descriptor redirection"));
+    let dupin = run_with_input("cat <&0\nputs after\n");
+    assert!(String::from_utf8_lossy(&dupin.stderr).contains("descriptor redirection"));
     // But an escaped `\&` is a literal, so `hi\&>f` is a normal redirect.
     let dir = fresh_dir("redir_escaped_amp");
     let esc = run_with_input(&format!("cd {}\necho hi\\&>f\ncat f\n", dir.display()));

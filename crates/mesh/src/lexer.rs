@@ -188,10 +188,11 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
             continue;
         }
         if let Some((kind, len)) = redirect_at(&chars, i) {
-            // A file-descriptor redirect attached to the operator (`2>`, `&>`)
-            // is deferred — reject it rather than silently redirecting stdout and
-            // leaving the `2`/`&` as an argument.
-            if is_descriptor_prefix(&current, &chars, i) {
+            // Deferred descriptor forms are rejected rather than silently
+            // reinterpreted: an fd number or `&` attached *before* the operator
+            // (`2>`, `&>`), or a `&` attached *after* it (`>&2`, `<&0`, the
+            // fd-duplication form) which would otherwise become the target file.
+            if is_descriptor_prefix(&current, &chars, i) || chars.get(i + len) == Some(&'&') {
                 return Err(LexError::UnsupportedRedirect);
             }
             finish_word(&mut current, &mut words, &mut redirs, &mut pending_redir);
