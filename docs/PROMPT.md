@@ -42,7 +42,6 @@ $sh.prompt.head = [
   who:  func() { h = $env.HOSTNAME:split "." :first; "${env.USER}@$h" },
   path: func() { style(pwd() --fg=blue) },
   git:  func() { style("$(git branch --show-current)" --fg=green) },   # empty off a repo → hidden
-  root: func() { if $env.USER == "root" { style("#" --fg=red) } },     # a red # only when root
 ]
 
 # the current commit: short SHA + subject line (nothing outside a repo)
