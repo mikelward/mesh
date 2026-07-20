@@ -25,6 +25,13 @@ file as tasks land.
 
 ## Decisions needed
 
+- [ ] **Namespace for the working-directory vars in the mesh language:**
+      `$env.PWD` / `$env.OLDPWD` vs `$sh.PWD` / `$sh.OLDPWD`. `DESIGN.md` (~line
+      2027) currently writes `$env.PWD` / `$env.OLDPWD` — reconcile with the
+      intended `$sh.*` choice and make the design consistent (`$env.PATH` etc.
+      use `$env.`). Language-surface only: M0 sets the real OS `PWD`/`OLDPWD`
+      environment variables (that's what child processes read), which is
+      unaffected by how the shell language exposes them.
 - [ ] **Choose a repo license** (none declared yet). M0 has no dependencies, so
       nothing constrains the choice today. Planned deps and their licenses:
       `reedline` MIT, `nix` MIT, `crossterm` MIT — all permissive; `nucleo`
