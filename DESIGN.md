@@ -1106,7 +1106,9 @@ first release.)*
 **Regex is a first-class value** *(decided — porting `fromto`, `filter`, `he`,
 `untar`)*. `/re/` is a **regex literal** evaluating to a regex **value**, and `~`
 and `:match` **consume a regex value** — so `$str ~ /re/` and `$str:match(/re/)` are
-the literal case. A regex literal is recognized **only in the match slots** — the
+the literal case. A `/…/` literal is **raw and does not interpolate** (like `r'…'`),
+so `$` inside it is always the anchor; build a regex with a variable hole via
+`re("…$var…")` (see the interpolation note below). A regex literal is recognized **only in the match slots** — the
 `~`/`!~` RHS, the `:match` argument, and a `match` arm — and there a leading-slash
 word is a regex **only when its base is a clean `/BODY/`** (the base is the word minus
 any trailing `:` flag modifiers, so `/\d+/:i` qualifies; the closing `/` is the base's
@@ -1151,11 +1153,21 @@ therefore be known at construction: folded in pre-compile on a `/…/` literal
 (`/foo # (/:x`, compiled once) or passed as a constructor argument
 (`re($x --extended)`), never as a post-hoc modifier on a finished value.)*
 
-*(deferred: **`/$var/` interpolation** for a literal skeleton with a variable hole
-(`/^$user@/`). Held because `$` is the regex end-anchor, so interpolation would need
-a disambiguation rule (`$name` splices, a bare `$` anchors, `\$` is literal); `re()`
-already covers the whole-pattern-from-a-string case the scripts need, so this stays
-optional future sugar.)*
+*(decided: **`/…/` does not interpolate** — it is a **raw** regex literal (like
+`r'…'`), so a `$` inside `/…/` is always the anchor/metacharacter, with no
+splice-vs-anchor ambiguity. To build a regex with a variable hole, use
+**`re("…$var…")`**: the `"…"` string does the interpolation (its settled `$`-splice /
+`\$`-literal rules apply), then `re()` compiles. So there is **one** interpolation
+path — the `"…"` string — and no `/$var/` special case; the earlier deferred sugar is
+dropped.*
+
+*An interpolated hole is **regex source** by default (metacharacters live — building a
+pattern from parts is what `re()`-from-a-string means). To splice a value as a
+**literal** (match it verbatim, the regex-injection-safe case), quote it with the
+**`:quotemeta`** modifier — `re("^${user:quotemeta}@")` — Perl's `\Q…\E` / Python's
+`re.escape` as an ordinary modifier. It is the per-value cousin of `re($s --literal)`
+(which quotes a whole string); use `:quotemeta` when only the hole is literal and the
+skeleton is a real pattern.)*
 
 *(deferred: **map destructuring** — `[name: n, age: a] = $m` binding by key — a
 natural extension of the same idea; and nested patterns (`[a [b c]] = …`).)*
