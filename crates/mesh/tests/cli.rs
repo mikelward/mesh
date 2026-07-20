@@ -213,6 +213,26 @@ fn glob_star_excludes_dotfiles() {
 }
 
 #[test]
+fn a_command_that_globs_away_reports_success() {
+    let dir = fresh_dir("glob_away");
+    // `false` sets status 1; a line that globs to nothing is an empty-list
+    // result and must reset to 0 (not preserve the previous status).
+    let out = run_with_input(&format!(
+        "cd {}\nfalse\n*.definitely_missing\n",
+        dir.display()
+    ));
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_blank_line_preserves_the_previous_status() {
+    // A truly blank line is not a command, so it leaves the status untouched.
+    let out = run_with_input("false\n\n");
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn tilde_keeps_home_metacharacters_literal() {
     // A $HOME containing glob metacharacters must not be treated as a pattern.
     let base = fresh_dir("tilde_meta");
