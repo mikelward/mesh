@@ -933,9 +933,19 @@ mechanical, not stylistic — each marks a different kind of thing:
   `func f(env, --tag = latest, ...hosts)`.
 
 So the rule is: **a comma appears exactly where an entry may itself contain a
-space, and nowhere else.** A list element or a call argument is atomic — quote it
-(`["a b" "c d"]`) if it must contain a space — so it never needs, or takes, a
-comma.
+space, and nowhere else.** In the space-separated contexts the separator is the
+*top-level* space *between* elements, and each element is one of two shapes:
+
+- an **atomic token** — a bareword or a scalar; quote it (`["a b" "c d"]`) when
+  it must contain a space, since a bare space there would read as two tokens;
+- a **self-delimited grouped expression** — a nested list `[a b]`, a map
+  `[k: v]`, a command substitution `$(cmd sub args)`, or a lambda
+  `func(f) { $f:stem }` — whose own `[ ]`/`( )`/`{ }` balance it, so it carries
+  internal spaces verbatim, needs no quoting (quoting would turn it into a
+  string), and takes no comma.
+
+A space never splits a *token* and a comma never separates *atomic elements*;
+only balanced brackets carry an internal space in an unquoted element.
 
 **Should mesh broaden commas — allow `[a, b]`, or comma-separated call args?**
 The settled answer is **no**:
@@ -1456,15 +1466,20 @@ as in any language.) Isolation is therefore **explicit**, in three grades:
 ```
 fork { cd build; make }                 # forks: cwd/env/umask/vars isolated, a
                                         #   nonzero exit can't kill the outer shell
-fork func build() { cd build; make }    # a func that forks on every call — sugar
-                                        #   for `func build() { fork { … } }`
+fork func build() { cd build; make }    # a func that forks on every call —
+                                        #   run/capture only, never value-called
 in dist { rm -rf * }                    # scoped cwd: run the block there, restore
                                         #   after — NO fork (cheaper than a fork)
 ```
 
 `fork` is the isolation keyword, and `fork { … }` is the one primitive; the
-`fork func` prefix is pure sugar for wrapping the whole body in it. **Every block
-is `{ … }`**, so isolation is now a *keyword*, never a swapped delimiter — the
+`fork func` prefix runs the whole body in a `fork` block **and** marks the
+function itself *forking*. It is not merely rewritten to `func f() { fork { … } }`
+— that would be an ordinary function the value-call contract still lets you call
+as `f()`; the explicit `fork` marker is what the value-call rejection below
+attaches to, so a forked function stays run/capture-only however its body is
+spelled. **Every block is `{ … }`**, so isolation is now a *keyword*, never a
+swapped delimiter — the
 older POSIX spelling (a bare `( … )` subshell, and a `func f() ( … )` whose
 parenthesized body was the isolation flag) is **dropped**. That leaves `( )` a
 single theme — the [value-and-argument world](#calling-for-a-value-and-lambdas)
