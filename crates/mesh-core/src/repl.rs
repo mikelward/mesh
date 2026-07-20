@@ -246,7 +246,7 @@ fn run_command_or_assign(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step
             if shell.funcs.get(&words[0]).is_some() {
                 let name = words[0].clone();
                 let args = words[1..].to_vec();
-                return call_func(&name, args, last, shell);
+                return call_func(&name, args, shell);
             }
             Step::Continue(exec::run(&words))
         }
@@ -277,7 +277,7 @@ fn make_return(args: &[String], last: u8) -> Step {
 /// parameters in a fresh local scope, runs the body line by line, and returns the
 /// function's status — an explicit `return`, else the last command's status. An
 /// arity mismatch is an error.
-fn call_func(name: &str, args: Vec<String>, last: u8, shell: &mut Shell) -> Step {
+fn call_func(name: &str, args: Vec<String>, shell: &mut Shell) -> Step {
     let (params, body) = match shell.funcs.get(name) {
         Some(def) => (def.params.clone(), def.body.clone()),
         None => return Step::Continue(exec::run(&[name.to_string()])),
@@ -296,7 +296,11 @@ fn call_func(name: &str, args: Vec<String>, last: u8, shell: &mut Shell) -> Step
         shell.vars.set(param, arg);
     }
 
-    let mut status = last;
+    // A function starts fresh, not inheriting the caller's `$?`: an empty body or
+    // a bare `return` before any command yields status 0 (`DESIGN.md` — "no
+    // expression to yield … status 0"), and the first body line likewise sees
+    // `$?` = 0 rather than an unrelated prior failure.
+    let mut status = 0;
     let mut result = Step::Continue(status);
     for line in body.lines() {
         match run_line(line, status, shell) {
@@ -404,72 +408,15 @@ fn parse_params(list: &str) -> Result<Vec<String>, String> {
     Ok(params)
 }
 
-/// Given the text right after a body's opening `{`, split off the body (up to the
-/// matching `}`) and whatever follows it. Quote- and escape-aware so a brace
-/// inside a string is not counted.
+/// Given the text right after a body's opening `{`, split off the body (up to
+/// the matching `}`) and whatever follows it. Delegates to the lexer's shared
+/// [`lexer::scan_braces`] so the boundary honors the same quote/raw/escape rules
+/// as execution — the definition scanner and the runtime lexer cannot disagree.
 fn split_braced_body(src: &str) -> Result<(&str, &str), String> {
-    let chars: Vec<(usize, char)> = src.char_indices().collect();
-    let mut depth: i32 = 1;
-    // A raw prefix `r'`/`r"` is a raw string only at a word start (as in the
-    // lexer), so a bare word ending in `r` before a quote (`bar"…"`) is not raw.
-    let mut word_start = true;
-    let mut k = 0;
-    while k < chars.len() {
-        let (byte, c) = chars[k];
-        if c.is_whitespace() {
-            word_start = true;
-            k += 1;
-            continue;
-        }
-        match c {
-            '\\' => {
-                k += 2;
-                word_start = false;
-                continue;
-            }
-            'r' if word_start
-                && matches!(chars.get(k + 1).map(|(_, c)| *c), Some('\'') | Some('"')) =>
-            {
-                k = skip_quoted_chars(&chars, k + 2, chars[k + 1].1, false);
-                word_start = false;
-                continue;
-            }
-            '\'' | '"' => {
-                k = skip_quoted_chars(&chars, k + 1, c, true);
-                word_start = false;
-                continue;
-            }
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok((&src[..byte], &src[byte + 1..]));
-                }
-            }
-            _ => {}
-        }
-        // A raw prefix is eligible again right after a bare word-boundary char.
-        word_start = matches!(c, '=' | ';' | '|' | '&' | '<' | '>' | '(' | '{' | '}');
-        k += 1;
+    match lexer::scan_braces(src, 1).close {
+        Some(byte) => Ok((&src[..byte], &src[byte + 1..])),
+        None => Err("func: missing closing `}`".to_string()),
     }
-    Err("func: missing closing `}`".to_string())
-}
-
-/// Advance past a quoted region in a `(byte, char)` slice (see [`split_braced_body`]).
-fn skip_quoted_chars(chars: &[(usize, char)], start: usize, quote: char, escapes: bool) -> usize {
-    let mut k = start;
-    while k < chars.len() {
-        let c = chars[k].1;
-        if escapes && c == '\\' {
-            k += 2;
-            continue;
-        }
-        if c == quote {
-            return k + 1;
-        }
-        k += 1;
-    }
-    k
 }
 
 /// A classified line: a variable binding or a command.

@@ -524,51 +524,124 @@ pub fn is_ident(s: &str) -> bool {
 
 /// Does `text` leave an unclosed `{` at the bare (unquoted) level? The read loop
 /// uses this to keep buffering the lines of a multi-line `func … { … }` body.
-/// Quoted regions (`'…'`, `"…"`, `r'…'`, `r"…"`) and `\`-escapes are skipped, so
-/// a brace inside a string does not count.
 pub fn needs_more_input(text: &str) -> bool {
-    // Delegate all quoting/escaping to the real lexer and count `{` / `}` only in
-    // *unquoted* (expandable) text, so a brace inside a string — or a quote's
-    // raw-string eligibility — can never diverge from `split_line`. A line that
-    // does not lex (e.g. an unterminated quote) is treated as complete, so the
-    // normal path reports the error rather than buffering forever.
-    let Ok(segments) = split_line(text) else {
-        return false;
-    };
-    let mut depth: i32 = 0;
-    for segment in &segments {
-        for stage in &segment.stages {
-            for word in &stage.words {
-                depth += brace_delta(word);
-            }
-            for redir in &stage.redirs {
-                depth += brace_delta(&redir.target);
-            }
-        }
-    }
-    depth > 0
+    scan_braces(text, 0).depth > 0
 }
 
-/// Net `{` minus `}` in a word's **unquoted** text (a quoted brace is a
-/// non-expandable piece and is not counted).
-fn brace_delta(word: &Word) -> i32 {
-    let mut delta = 0;
-    for piece in &word.0 {
-        if let Piece::Text {
-            text,
-            expandable: true,
-        } = piece
-        {
-            for c in text.chars() {
-                match c {
-                    '{' => delta += 1,
-                    '}' => delta -= 1,
-                    _ => {}
+/// The result of a bare-level brace scan (see [`scan_braces`]).
+pub struct BraceScan {
+    /// Byte offset of the `}` that first returned the depth to 0, if one was
+    /// reached — used to split a `func` body from whatever follows its `}`.
+    pub close: Option<usize>,
+    /// Net `{` minus `}` at the bare (unquoted) level over the whole input.
+    pub depth: i32,
+}
+
+/// Scan `text` for `{`/`}` nesting at the bare (unquoted) level, applying the
+/// same quote/raw-string/escape rules as [`split_line`], so a brace inside
+/// `'…'`, `"…"`, `r'…'`, `r"…"`, or after a `\` is never counted. Both the
+/// multi-line `func` reader ([`needs_more_input`]) and the body extractor
+/// (`repl::split_braced_body`) go through this one scanner, so the two cannot
+/// disagree about where a body ends.
+///
+/// Unlike `split_line`, it never fails: a line that lexes cleanly at the quote
+/// level but is unsupported higher up (a bare `2>`, a target-less `>`) does not
+/// change brace nesting, so a still-open `func` body keeps buffering instead of
+/// being released into the top-level loop. Only an unterminated quote stops the
+/// scan (the rest of the input is inside that string); the depth returned still
+/// reflects the open brace, so buffering continues and the syntax error surfaces
+/// when the completed definition is finally parsed.
+///
+/// Counting starts from `start_depth` (0 for a whole-line check, 1 for a body
+/// whose opening `{` has already been consumed).
+pub fn scan_braces(text: &str, start_depth: i32) -> BraceScan {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut depth = start_depth;
+    let mut close = None;
+    // Raw-string eligibility, tracked exactly as `split_line`: a raw prefix
+    // `r'`/`r"` is recognized only at a word start or right after a bare `=`.
+    let mut word_start = true;
+    let mut after_equals = false;
+    let mut k = 0;
+    while k < chars.len() {
+        let (byte, c) = chars[k];
+        let raw_eligible = word_start || after_equals;
+        // Default: an ordinary bare-word char. Boundary arms below re-enable
+        // raw eligibility exactly where the lexer would start a fresh word.
+        word_start = false;
+        after_equals = false;
+        match c {
+            _ if c.is_whitespace() => {
+                word_start = true;
+                k += 1;
+            }
+            // A backslash escapes the next char, so `\{` / `\}` are literal.
+            '\\' => k += 2,
+            '\'' | '"' => match skip_quote(&chars, k + 1, c, true) {
+                Some(next) => k = next,
+                None => return BraceScan { close, depth },
+            },
+            'r' if raw_eligible
+                && matches!(chars.get(k + 1).map(|&(_, c)| c), Some('\'') | Some('"')) =>
+            {
+                match skip_quote(&chars, k + 2, chars[k + 1].1, false) {
+                    Some(next) => k = next,
+                    None => return BraceScan { close, depth },
                 }
             }
+            '{' => {
+                depth += 1;
+                k += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 && close.is_none() {
+                    close = Some(byte);
+                }
+                k += 1;
+            }
+            // Operators the lexer starts a fresh word after (so a following
+            // `r'…'` is raw): `;`, `|`/`||`, `<`, `>`/`>>`.
+            ';' | '|' | '<' | '>' => {
+                word_start = true;
+                k += 1;
+            }
+            // `&&` is a separator (fresh word after it); a lone `&` is a literal
+            // character and is *not* a word boundary.
+            '&' if chars.get(k + 1).map(|&(_, c)| c) == Some('&') => {
+                word_start = true;
+                k += 2;
+            }
+            // A bare `=` lets a raw prefix begin the value (`k=r'v'`).
+            '=' => {
+                after_equals = true;
+                k += 1;
+            }
+            _ => k += 1,
         }
     }
-    delta
+    BraceScan { close, depth }
+}
+
+/// Advance past a quoted region in a `(byte, char)` slice. `start` is the index
+/// just past the opening quote. With `escapes`, a `\` escapes the next char
+/// (`'…'` / `"…"`); without, `\` is literal (raw `r'…'` / `r"…"`). Returns the
+/// index just past the closing `quote`, or `None` if the input ends first
+/// (an unterminated quote).
+fn skip_quote(chars: &[(usize, char)], start: usize, quote: char, escapes: bool) -> Option<usize> {
+    let mut k = start;
+    while k < chars.len() {
+        let c = chars[k].1;
+        if escapes && c == '\\' {
+            k += 2;
+            continue;
+        }
+        if c == quote {
+            return Some(k + 1);
+        }
+        k += 1;
+    }
+    None
 }
 
 /// Parse the inner content of a `${…}` — a `name` with an optional `.member`.

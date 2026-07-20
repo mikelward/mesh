@@ -885,3 +885,43 @@ fn a_quoted_brace_in_a_function_body_does_not_close_it() {
     let out = run_with_input("func f() { puts bar\"a\\\"}b\" }\nf\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "bara\"}b\n");
 }
+
+#[test]
+fn an_empty_function_reports_success_not_the_callers_status() {
+    // A function with no expression to yield is status 0 (`DESIGN.md`), so the
+    // `&&` branch runs even though the preceding `false` set `$?` to 1.
+    let out = run_with_input("func f() {}\nfalse\nf && puts ok\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+#[test]
+fn a_bare_return_before_any_command_reports_success() {
+    // A bare `return` before the body runs anything also yields 0, not the
+    // caller's prior failure.
+    let out = run_with_input("func f() {\n  return\n}\nfalse\nf && puts ok\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+#[test]
+fn a_lexer_error_inside_a_body_does_not_release_it_to_the_top_level() {
+    // A body line the runtime lexer rejects (here the unsupported `2>` form)
+    // must not stop brace buffering: the still-open `{` keeps the rest of the
+    // body captured, so a later command cannot execute during definition. The
+    // error surfaces only when the defined function is actually called.
+    let out = run_with_input("func f() {\n  bad 2> x\n  puts LEAKED\n}\nputs defined\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("LEAKED"),
+        "body leaked to top level: {stdout}"
+    );
+    assert_eq!(stdout, "defined\n");
+}
+
+#[test]
+fn a_single_amp_before_a_raw_prefix_does_not_close_the_body() {
+    // `&` is a literal char, not a word boundary, so `&r'…'` is *not* a raw
+    // string — the `}` inside the single-quoted `'\'}'` stays quoted and does
+    // not close the body. The definition scanner must agree with the lexer.
+    let out = run_with_input("func f() { puts &r'\\'}' tail }\nf\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "&r'} tail\n");
+}
