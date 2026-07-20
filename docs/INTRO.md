@@ -198,10 +198,12 @@ mesh$ puts $ports.https          # 443   (dot sugar for $ports[https])
 mesh$ empty-map = [:]            # vs [] the empty list
 ```
 
-That is the whole comma rule: **a comma sits between compound entries (map pairs,
-signature params); a space sits between atomic elements (list items, call args).**
-Writing a list with commas — `[a, b]` — is a loud error, not a second spelling,
-so the JSON reflex gets corrected instead of silently accepted.
+The comma rule in one line: **a comma sits between compound entries (map pairs,
+signature params); a space sits between list items and call args.** An element
+that itself has spaces just carries them — quote it (`"a b"`), escape them
+(`a\ b`), or let a grouped value hold its own (`[[a b] c]` is two elements). What
+you can't do is separate plain items with a comma: `[a, b]` is a loud error, not
+a second spelling, so the JSON reflex gets corrected instead of silently accepted.
 
 ## Isolate a block with `fork`
 
