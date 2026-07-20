@@ -47,9 +47,17 @@ enum Step {
 /// Tokenize and dispatch one line of input. Empty lines are a no-op that keeps
 /// the previous status.
 fn run_line(text: &str, last: u8) -> Step {
-    let words = expand::expand(lexer::split(text));
-    if words.is_empty() {
+    let tokens = lexer::split(text);
+    if tokens.is_empty() {
+        // A blank line is not a command; the last status is unchanged.
         return Step::Continue(last);
+    }
+    let words = expand::expand(tokens);
+    if words.is_empty() {
+        // A real command whose words all expanded away (e.g. a glob with no
+        // matches) is an empty-list result — status 0 per `DESIGN.md`, not the
+        // previous status.
+        return Step::Continue(0);
     }
     match builtins::dispatch(&words) {
         Some(Builtin::Exit(code)) => Step::Exit(code),
