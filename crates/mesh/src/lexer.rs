@@ -297,12 +297,14 @@ fn parse_var_ref(inner: &str) -> Option<VarRef> {
     Some(VarRef { name, member })
 }
 
-/// Read a kebab identifier at `start`: an alphabetic/`_` head, then
-/// alphanumeric/`_`, plus interior `-` (a hyphen only when the next char is
-/// alphanumeric, so `$a-$b` is `$a` + `-` + `$b` while `$auto-fetch` is one name).
+/// Read a kebab identifier at `start`: an alphabetic head, then alphanumeric/`_`,
+/// plus interior `-` (a hyphen only when the next char is alphanumeric, so
+/// `$a-$b` is `$a` + `-` + `$b` while `$auto-fetch` is one name). The first
+/// character must be a letter — a leading `_` is not a name (`_` is reserved as
+/// the discard pattern), so `_` / `_x` are not bindable and `$_` is a literal.
 fn read_name(chars: &[char], start: usize) -> Option<(String, usize)> {
     let first = *chars.get(start)?;
-    if !(first.is_ascii_alphabetic() || first == '_') {
+    if !first.is_ascii_alphabetic() {
         return None;
     }
     let mut name = String::from(first);
