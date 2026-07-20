@@ -528,7 +528,8 @@ top-level is **yours**; the built-ins hang off two reserved roots:
 - **`$sh`** — everything else the shell owns, **flat**: runtime values —
   **`$sh.status`** (last exit, int `0`–`255`, the readable replacement for `$?`),
   **`$sh.pipestatus`** (a **list** of the last pipeline's stage statuses, where
-  real lists beat bash's `PIPESTATUS`), `$sh.pid`, `$sh.version`, `$sh.options`,
+  real lists beat bash's `PIPESTATUS`), `$sh.pid` / `$sh.ppid` (own and parent PID,
+  bash's `$$` / `$PPID`), `$sh.version`, `$sh.options`,
   `$sh.interactive`, **`$sh.jobs`** (the live [job-control](#job-control) map),
   and **`$sh.args`** / **`$sh.name`** (script/positional args as a list, and the
   shell-or-script name — see [Startup](#startup-and-invocation)); **and the
@@ -544,7 +545,7 @@ clashes. Access is strict [map access](#maps-associative-arrays), so `$sh:keys`
 lists the whole surface and a mistyped key fails loud.
 
 **Read-only vs. writable within `$sh`.** The **runtime** entries (`$sh.status`,
-`$sh.pipestatus`, `$sh.pid`, `$sh.version`, `$sh.interactive`, `$sh.jobs` with
+`$sh.pipestatus`, `$sh.pid`, `$sh.ppid`, `$sh.version`, `$sh.interactive`, `$sh.jobs` with
 its records, and `$sh.args` / `$sh.name`) are the shell's authoritative state —
 **read-only**: assigning or `unset`ting one is an error, so config can't corrupt
 an invariant. (`$sh.jobs` changes only through `&` / `fg` / `bg` / `kill` and job
@@ -1795,6 +1796,20 @@ Two mesh notes, neither a behavior change:
 
 *(open: `noclobber` and the `>|` override; whether `&>>` append-both is worth a
 spelling.)*
+
+*(TODO — low-level process & stream plumbing surfaced porting `autosession`,
+`logexec`, `confirm`, `filter`:*
+- ***`exec` — replace the process image.*** A dispatcher/wrapper (`autosession`
+  ending in `exec autotmux …`, `logexec` in `exec "$0".distrib`) hands off without
+  leaving a parent shell behind. There is no `exec` builtin yet — add one that
+  *becomes* the command (where `run` runs a **child**, `exec` replaces the current
+  process).
+- ***isatty on a stream.*** `confirm` guards on `test -t 0 && test -t 2`, but
+  `$sh.interactive` is shell-level only. Expose a per-stream test — `$stdin:tty` /
+  `$stderr:tty` — so a function can tell whether *its own* stderr is a terminal.
+- ***Output process substitution `>(cmd)`.*** The input form `<(cmd)` and explicit
+  fds / dup / close are settled above; the output form (`filter`'s `3> >(cmd)`) is
+  not. Decide whether to add it.)*
 
 ### Job control
 
