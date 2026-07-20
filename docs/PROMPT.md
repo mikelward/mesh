@@ -1,146 +1,76 @@
-# Worked example: a real prompt in mesh
+# A prompt in mesh
 
-This ports a real, hand-rolled interactive prompt (from a `config.fish`) to
-mesh's prompt model — the `$sh.prompt` map (each top-level entry is a **line**),
-`style(…)` styled values, the `rule` / `newline` structural entries, keyed inline
-**groups**, and `$sh.jobs`. It's a companion to the
-[Hooks and the prompt](../DESIGN.md#hooks-and-the-prompt) and
-[Error handling](../DESIGN.md#error-handling) sections of `DESIGN.md`; the syntax
-here follows what those sections settle.
+In mesh your prompt is a **map of named pieces**, one per line — not a single
+cryptic `$PS1` string. Each piece is a small function returning text (optionally
+with color). Pieces that have nothing to show simply disappear. Here's a complete,
+real prompt.
 
 ## What it renders
 
 ```
 took 3s
-─────────────────────────────────────────────────────────────
-host ~/src/mesh [main] SSH
-9f3c2a1 Pull fill into the MVP
+──────────────────────────────────────────────────────────────
+mikel@host ~/src/mesh main
+9f3c2a1 Initial commit
 %1 vim  %2 tail -f log
->
+❯
 ```
 
-The `took …` line, the commit line, the jobs line, and the `SSH` warning are
-all **optional** — each is present only when it has something to say, and its line
-is skipped otherwise (an entry that renders `""` contributes no line).
+The `took …`, commit, jobs, and status lines are each shown only when they have
+something to say.
 
 ## `rc.mesh`
 
 ```
-# ── hooks ────────────────────────────────────────────────────────────
-# The fish version's maybe_background_fetch hand-gated on "did PWD change?".
-# postcd only fires on an actual cd, so the event *is* the gate.
-$sh.postcd.fetch   = func() { vcs auto-fetch & }
-
-# Time each command. Initialize _cmd_ms so the first prompt — rendered before any
-# command has run, so before postexec fires — reads a bound value, not an error.
+# Time each command, so the prompt can say "took 3s". Side effects like this
+# live in hooks; the prompt segments below stay pure renderers.
 global _cmd_ms = 0
 $sh.postexec.timer = func(cmd, status, ms) { global _cmd_ms = $ms }
 
-# No log_history: the built-in SQLite history records
-# command / cwd / tty / session / start / duration / status for you.
+# The prompt is a map — one entry per line, rendered top to bottom.
 
-# ── prompt: each top-level entry is one line ─────────────────────────
-
-# fish's postexec `last_job_info`: the previous command's error + how long it took
+# how the last command went: an error in red, or a slow time in yellow (else nothing)
 $sh.prompt.status = func() {
-  parts = []
-  if $sh.status != 0 { parts += style("status ${sh.status}" --fg red) }   # nonzero → show it
-  if $_cmd_ms > 1000 {
-    d = fmt-duration($_cmd_ms)                        # value call — its return value, not its stdout
-    parts += style("took $d" --fg yellow)
-  }
-  $parts:join " "                                    # "" when empty → line skipped
+  if $sh.status != 0      { style("✗ ${sh.status}" --fg red) }
+  else if $_cmd_ms > 1000 { style("took ${_cmd_ms / 1000}s" --fg yellow) }
 }
-# (Want per-signal wording? `match $sh.status { 130 { "interrupted" } 148 { } _ { … } }`
-#  — reach for match only when you branch on specific statuses, not just zero/nonzero.)
 
-$sh.prompt.gap  = newline          # a deliberate blank line
-$sh.prompt.rule = rule             # full-width ─── (replaces `bar $COLUMNS`)
+$sh.prompt.rule = rule                                   # a full-width rule
 
-# The header — one line, built from keyed inline segments so each keeps its own
-# color (concatenating styled values into a single string would flatten them). The
-# renderer space-joins the pieces (empties dropped, puts-style), so no piece carries
-# its own spacing.
-$sh.prompt.head = [                            # a MAP literal — [ ], not { } (braces are blocks)
-  root: func() { if is-root() { style("[root]" --fg red) } },               # "" when not root
-  host: func() {
-    h = short-hostname()
-    if on-production-host() { style($h --fg red) } else { $h }
-  },
-  sess: func() { session-tag() },                                            # value call — the styled session tag
-  dir:  func() {
-    if inside-project() { "$(vcs prompt-info)" }     # external renderer — returned RAW (own color, own newlines)
-    else                { style(tilde-pwd() --fg blue) }   # mesh fallback — we color it
-  },
-  auth: func() { if not ssh-id-loaded() { style("SSH" --fg yellow) } },      # no else → "" → dropped
+# where you are — one line: user@host, the path in blue, the git branch in green
+$sh.prompt.head = [
+  who:  func() { h = $env.HOSTNAME:split "." :first; "${env.USER}@$h" },
+  path: func() { style(pwd() --fg blue) },
+  git:  func() { style("$(git branch --show-current)" --fg green) },   # empty off a repo → hidden
+  root: func() { if $env.USER == "root" { style("#" --fg red) } },     # a red # only when root
 ]
 
-$sh.prompt.commit = func() {                         # own line: short SHA + commit subject; empty outside a repo → skipped
-  if inside-project() { "$(git log -1 --format='%h %s')" }
-}
-$sh.prompt.jobs = func() {                           # was the `jobs | sed` tab-parser
-  $sh.jobs:values:map(func(j) { "%${j.id} ${j.cmd}" }):join "  "
-}
+# the current commit: short SHA + subject line (nothing outside a repo)
+$sh.prompt.commit = func() { "$(git log -1 --format='%h %s' 2>/dev/null)" }
 
-# the prompt character — red when root, doubling as a which-shell-am-I cue
-$sh.prompt.char = func() { if is-root() { style("> " --fg red) } else { "> " } }
+# background jobs, read straight from the live job table
+$sh.prompt.jobs = func() { $sh.jobs:values:map(func(j) { "%${j.id} ${j.cmd}" }):join "  " }
 
-# ── helpers (the fish helpers that don't become built-ins) ───────────
-# Illustrative — string-modifier spellings track DESIGN.md's modifier set.
-func is-root()            { $(id -u):raw == "0" }
-func ssh-id-loaded()      { ssh-add -L >/dev/null }              # status → bool
-func short-hostname()     { $env.HOSTNAME:split "." :first }
-func on-production-host() { not on-my-machine() and not on-test-host() }
+$sh.prompt.char = func() { "❯ " }
 ```
 
-## Variations with `fill`
+## Why this is nice
 
-`fill` is the inline right-align / trailing-bar piece. A couple of common tweaks:
-
-```
-# a bar on the SAME line as the header, instead of a separate rule line:
-$sh.prompt.head = [host-info dir-info auth-info fill("─")]   # host dir auth───────────  to the right edge
-
-# a clock pinned to the right edge of the header:
-$sh.prompt.head = [host-info dir-info fill clock-info]        # host dir …………………… 14:23
-```
-
-`fill` eats the slack (spaces by default, or the repeat-char you give it); multiple
-`fill`s on a line split the slack evenly. The full-width `rule` entry above is just
-the whole-line case — `rule ≡ a line that is [fill("─")]`.
-
-## What falls away vs the fish version
-
-- **`| string collect` — gone everywhere.** No auto-split, so `ssh-add -L`'s status
-  is just a bool, `$(id -u):raw` is one string, and an empty `vcs prompt-info`
-  doesn't collapse a variable to an empty list. That was dozens of `string collect`s
-  in the original.
-- **`bar $COLUMNS` → `rule`.** No width loop and no `$COLUMNS` — the structural
-  entry is full-width by construction.
-- **The `nl1`/`nl2` separator keys are gone.** Each top-level entry is a line; the
-  only structural entries (`gap`, `rule`) carry meaningful names.
-- **`job_info`'s tab-split / skip-optional-CPU-column / `sed` parser →
-  `$sh.jobs:values:map(…)`.** The "don't index past field 1" comment is gone; jobs
-  are structured records.
-- **History logging, `_session_name` warming, and `my_set_color 'normal'` resets —
-  gone.** History is built-in; styled values are scoped per segment, so there's no
-  color to reset; session info is a lookup, not a memoized `tmux display-message`
-  fork.
-- **`maybe_background_fetch`'s PWD-gate → `postcd`.** The hook fires only on a real
-  `cd`, so the hand-rolled `_LAST_BG_FETCH_PWD` check vanishes.
-- **`auth_info`'s "nothing when fine"** is the decided **no-`else` → `""` → segment
-  omitted** rule, directly.
-- **The external renderer (`vcs prompt-info`) is one inline segment (`dir`)** among
-  peers — returned **raw** so its own coloring (and any newlines) survive; the
-  mesh `tilde-pwd` fallback is the branch we `style`. Passing external output
-  through `style(…)` would re-import it as an ordinary mesh string (single line), so
-  a multi-line external renderer is returned unwrapped.
-
-## The mechanic that makes the optional lines clean
-
-`status`, `commit`, and the `jobs` line are optional: each returns `""` most of the
-time, and an entry that renders `""` **contributes no line** — so there are no
-blank gaps and nothing to suppress, without the conditional-`printf` dance the fish
-version needed. Note `${sh.status}` / `${j.id}` / `${j.cmd}` use **braced**
-interpolation: an unbraced `$sh.status` in a string would stop at `$sh` and append
-literal `.status`, so member access inside a string is always braced.
+- **Your prompt is named pieces, not one big string.** Restyle one, reorder them,
+  or drop one — `unset $sh.prompt.commit` — without touching the rest. Re-sourcing
+  your config replaces pieces by name instead of duplicating them.
+- **Color is data, not escape codes.** `style("main" --fg green)` — no
+  `\e[32m…\e[0m` to hand-balance. The shell knows the real text width, and can even
+  recolor a piece later.
+- **Empty pieces vanish.** A piece with nothing to show returns `""` and its whole
+  line disappears — the branch off a repo, the timer after a fast command, the error
+  after a success — with no `if`-guards wrapped around your layout.
+- **You read real values, not scraped text.** `$sh.status` is the last exit code,
+  `$sh.jobs` is the live job table, and `postexec` hands you a command's runtime —
+  so the jobs line is `$sh.jobs:values:map(…)`, never a parse of `jobs` output.
+- **Side effects stay in hooks.** Timing here — or a background `git fetch` on `cd`
+  — lives in `postexec` / `postcd`, keeping every segment a pure, predictable
+  renderer.
+- **Drop-in external prompts are just one piece.** A tool like starship sits among
+  your own segments, framed by your `[root]` and git bits — not a black box that
+  owns the whole line.
