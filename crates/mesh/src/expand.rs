@@ -39,6 +39,20 @@ fn expand_word(word: Word, out: &mut Vec<String>) {
         return;
     }
 
+    // Guard against an escaped literal fragment completing a broken glob class
+    // in an adjacent expandable segment (e.g. `['*'` must stay literal `[*`, not
+    // become the pattern `[[*]`). A word globs only if its *expandable* segments
+    // form a valid pattern on their own, with literal segments stood in by a
+    // neutral placeholder; otherwise it is a literal word.
+    let structure: String = pieces
+        .iter()
+        .map(|(t, e)| if *e { t.clone() } else { "a".to_string() })
+        .collect();
+    if glob::Pattern::new(&structure).is_err() {
+        out.push(literal(&pieces));
+        return;
+    }
+
     // Build the pattern: expandable text as-is, literal text escaped so its
     // metacharacters match literally.
     let pattern: String = pieces

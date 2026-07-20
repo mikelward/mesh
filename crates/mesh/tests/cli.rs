@@ -314,6 +314,30 @@ fn unterminated_quote_is_a_syntax_error_that_recovers() {
 }
 
 #[test]
+fn malformed_unicode_escape_is_preserved() {
+    // A bad \u escape keeps both chars, not just the backslash.
+    let out = run_with_input("puts \"\\uZ\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\\uZ\n");
+}
+
+#[test]
+fn trailing_line_continuation_adds_no_empty_argument() {
+    // `puts a \<newline>` must yield just `a`, not `a` plus an empty argument.
+    let out = run_with_input("puts a \\\n\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\n");
+}
+
+#[test]
+fn quoted_fragment_cannot_complete_a_glob_class() {
+    // `['*'` is a literal `[*`, not the pattern `[[*]` — escaping the quoted `*`
+    // must not close the unquoted `[`.
+    let dir = fresh_dir("glob_class");
+    let out = run_with_input(&format!("cd {}\nputs ['*'\n", dir.display()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[*\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn tilde_keeps_home_metacharacters_literal() {
     // A $HOME containing glob metacharacters must not be treated as a pattern.
     let base = fresh_dir("tilde_meta");
