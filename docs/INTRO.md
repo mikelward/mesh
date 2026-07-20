@@ -27,17 +27,20 @@ rm $file
 if $x == y { ... }
 ```
 
-`$PATH` is a **list**, not a colon-string, so the classic "prepend a dir" ceremony
-disappears:
+`$PATH` is a **list**, not a colon-string, so the `IFS=:` juggling disappears.
+To **prepend** (bash's `PATH="/opt/bin:$PATH"` — new dir wins), build the list with
+it first; `:dedup` drops any later duplicate, keeping the first:
 
 ```
-# bash
+# bash — prepend /opt/bin
 export PATH="/opt/bin:$PATH"
 
-# mesh — a real list; += appends, :dedup guards against duplicates
-$env.PATH += /opt/bin
-$env.PATH = $env.PATH:dedup
+# mesh — spread the old list after the new dir, then dedup (keep-first)
+$env.PATH = [/opt/bin ...$env.PATH]:dedup
 ```
+
+To **append** instead (existing entries win), that's exactly what `+=` is:
+`$env.PATH += /opt/bin`.
 
 ## Modifiers instead of subshell-and-sed gymnastics
 

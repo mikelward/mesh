@@ -1503,14 +1503,22 @@ error has to land somewhere; the rule is where:
   prompt. The session never dies.
 - **`source FILE`** — a *parse* error rejects the whole file (none of it runs, so a
   bad rc can't leave a half-defined config); a *runtime* error aborts the file at
-  that point and surfaces, but does not kill the shell that sourced it.
+  that point. Whether that error is then **contained or propagated depends on
+  interactivity**, not on `source` itself: in an **interactive** shell it is
+  contained — surfaced, and the shell keeps running so a broken `rc.mesh` never
+  bricks your session — whereas in a **non-interactive** shell it **propagates** as
+  an uncaught channel-2 error and follows the batch rule below (the sourcing
+  script fails hard; subsequent deploy/mutation commands do *not* run). Containment
+  is an interactive affordance, never a blanket swallow.
 - **Prompt / hook / completion callback** — the shell **catches** the error at the
   dispatch boundary, reports it (above the fresh prompt), and continues with a
   degraded result — that one prompt segment is dropped, not the whole prompt. A
   buggy config *shows* its bug without bricking interactivity: fail-loud and
-  keep-running at once.
+  keep-running at once. (This boundary-catch is interactive-only for the same
+  reason; a hook firing in a non-interactive run propagates like any other error.)
 - **Script / `-c` / non-interactive** — an uncaught error exits nonzero (the batch
-  contract), so automation still fails hard.
+  contract), so automation still fails hard. This is the rule a propagated
+  sourced-file or hook error lands in.
 
 *(Open — the catch question: whether mesh also exposes a **user-facing** recovery
 form — a `try` / `catch`, or an Elvish-style `?(…)` capture that converts a
@@ -2208,22 +2216,38 @@ prompt segments — so a segment always sees the *interactive command's* status,
 never the status of some command a handler happened to run. (`postexec` also
 gets the status as an explicit `status` argument.)
 
-**The prompt** is the same shape — a named, insertion-ordered segment map — but
-each segment is a callable that **returns a renderable** — a plain string *or* a
-styled value (below) — or `""` to contribute nothing; the shell renders the
-non-empty ones in key order:
+**The prompt** is a named, insertion-ordered map where **each top-level entry is
+one line**, rendered top to bottom. An entry is a **callable** returning a
+renderable (a string, or a **list of strings** for several lines) — or `""` to
+contribute nothing — a **structural value** (`rule` for a full-width line,
+`newline` for a deliberate blank line), or a **keyed sub-map** grouping several
+segments onto *one* line — the group's segments **concatenate in key order, empties
+dropped**, each carrying its own spacing, so each keeps its **own** style (a styled
+value flattens to plain text only when you concatenate it into a *string*, so
+distinctly-colored pieces of one line are distinct segments, not one interpolated
+string). Line breaks between entries are **implicit**, so there are no separator
+entries to name:
 
 ```
-$sh.prompt.host = host-seg                     # named, ordered segments
-$sh.prompt.dir  = func() { if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() } }
-$sh.prompt.auth = func() { if ssh-id-missing() { style("no-ssh-id" --fg yellow) } }   # no else → "" → omitted
-$sh.prompt.dir  = my-dir-seg                   # swap ONE segment by name
-unset $sh.prompt.auth                          # drop the auth warning
+$sh.prompt.rule = rule                         # a full-width line
+$sh.prompt.head = {                            # ONE line — three keyed inline segments
+  host: host-seg,
+  dir:  func() { if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() } },
+  auth: func() { if ssh-id-missing() { style("no-ssh-id" --fg yellow) } },   # no else → "" → omitted
+}
+$sh.prompt.jobs = func() { … }                 # its own line — omitted when empty
+$sh.prompt.char = func() { "> " }              # its own line
+
+$sh.prompt.head.dir = my-dir-seg               # swap ONE inline segment by name
+unset $sh.prompt.head.auth                      # drop the auth warning
 ```
 
-(The segments use `if` *expressions* to pick a string — not `and`/`or`, which
-combine bools, not values — and the `auth` segment leans on the decided
-no-`else`-yields-`""` rule so "not applicable" is just an empty contribution.)
+(Segments use `if` *expressions* to pick a string — not `and`/`or`, which combine
+bools, not values — and the `auth` segment leans on the decided
+no-`else`-yields-`""` rule so "not applicable" is just an empty contribution. The
+`nl1` / `nl2` separator keys an earlier draft needed are gone: lines come from the
+map's shape, and the only structural entries — `rule`, a deliberate blank
+`newline` — carry *meaningful* names, never a positional filler like `nl3`.)
 
 **Color comes from a `style` helper, not raw escapes.** The value call
 `style("no-ssh-id" --fg yellow --bold)` returns a **styled value** — text and
@@ -2268,38 +2292,33 @@ minting a type that must be defined at each boundary. *(A richer per-fragment
 "styled spans" value — where concatenation preserves each fragment's own style —
 is a possible later iteration; the MVP keeps one attribute set per string.)*
 
-**A segment yields a line — or a list of lines. Line structure is the segment
-map, not embedded newlines.** A **mesh** (function) segment returns either a
-single-line string or a **list of strings** (one element per line); it does *not*
-carry structure in an in-band `\n`. Multi-line prompts come from returning a list,
-from registering several segments, or from an explicit **`newline`** structural
-segment — so the segment map (with its structural segments) is the **sole** source
-of line structure, never re-derived by scanning a segment's bytes. That is exactly
-what makes the per-line features well-defined: a "line" is the run of content
-between line boundaries the *map* declares, so it is stable and addressable rather
-than a function of whatever a callable happened to print. A segment renders its
-**return value** (its string or list), consistent with the
-[value-vs-stream split](#calling-for-a-value-and-lambdas) — you *return* your
-prompt, you don't `puts` it — and a list element that is itself a list is an error
-(no guessed flatten), matching the no-implicit-deep-flatten rule elsewhere.
+**Line structure is the map — newlines are not in-band.** Because each top-level
+entry is a line, line breaks come from the **map's shape**, never from an in-band
+`\n` a callable printed. A callable may return a **list of strings** to occupy
+several lines from one entry (a list element that is itself a list is an error — no
+guessed flatten). That is what makes the per-line features well-defined: a "line"
+is a map entry (or a list element), stable and addressable, not a function of what
+a callable happened to print. A segment renders its **return value**, consistent
+with the [value-vs-stream split](#calling-for-a-value-and-lambdas) — you *return*
+your prompt, you don't `puts` it.
 
-**Empty lines are skipped.** A `newline` structural segment is a **no-op when the
-current line has no content**, so an optional content segment that returns `""`
-(the common "nothing to show" case — an empty `vcs`/`jobs`/auth line) collapses its
-line instead of leaving a blank gap. So you can bracket an optional whole-line
-segment with `newline`s freely; it costs a line only when it has something to say.
-(A `newline` between two *non-empty* lines still breaks as written, and a
-deliberately blank spacer line is an empty *string* segment on its own line, not a
-bare `newline`.)
+**Empty entries take no line.** An entry — or a grouped inline segment — that
+renders `""` contributes **no line**, so the common "nothing to show" case (an
+empty `vcs` / `jobs` / auth) simply collapses: no blank gap, and no separator to
+suppress. A *deliberate* blank line is an explicit **`newline`** entry (named, e.g.
+`gap`), so blank lines are opt-in, never an accident of an empty segment.
 
-The **one exception is an external-command segment**: you can't dictate an external
-tool's output, so it *may* emit `\n`, and the shell honors those as line breaks —
-but as **dumb** breaks that the structural segments (`fill` / `rule`) do not try to
-align across. So mesh-controlled structure stays explicit and alignable, while a
-drop-in external renderer (starship, `vcs prompt-info`) still works, degrading to
-plain line breaks. The renderer measures width **per line**, tracks how many lines
-the prompt occupies, and places the input after the last one so redraw, completion,
-and resize stay correct; there is **no line-count knob**.
+**External output is the one place `\n` is honored.** A value that *is* the raw
+output of an external capture — `"$(vcs prompt-info)"` returned **directly** — may
+carry `\n`, since you can't dictate an external tool's output; the shell honors
+those as **dumb** breaks that the structural entries (`fill` / `rule`) don't align
+across. Provenance rides the **value**, not the map slot: passing that output
+through `style(…)` or string concatenation re-imports it as an ordinary mesh string
+(back under the one-line-or-list-of-lines rule), so a genuinely multi-line external
+renderer must be returned raw, not wrapped. So a drop-in external renderer
+(starship, `vcs prompt-info`) still works. The renderer measures width **per line**,
+tracks how many lines the prompt occupies, and places input after the last one so
+redraw, completion, and resize stay correct; there is **no line-count knob**.
 
 The payoff is the requirement, met directly: **the external base renderer is
 just one named segment** (`$(vcs prompt-info)`), sitting among peers, so
@@ -2310,14 +2329,15 @@ command." This is exactly the hand-rolled `preprompt` / `prompt_line` /
 keyed, re-source-safe segments — with its *side effects* (a background fetch)
 moving to the `$sh.preprompt` event hook and its *rendering* to this segment map.
 
-*(MVP: keyed segments, `style` color, a segment yielding a **string or a list of
-lines**, and the explicit **`newline`** structural segment — line structure is the
-segment map, never in-band `\n` (external segments excepted, above). Layered next
-on the same per-line width the styled values already give the shell, and now
-**well-defined because lines are explicit**: **`fill`** (right-align by consuming a
-line's slack; multiple `fill`s on a line split it evenly), a full-width **`rule`**,
-and **transient collapse** of past prompts in scrollback. The event set —
-`preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settled.)*
+*(MVP: keyed **line entries** with inline line-**groups**, `style` color, an entry
+yielding a **string or a list of lines**, a deliberate-blank **`newline`** entry,
+and the full-width **`rule`** entry. Line structure is the **map**, never in-band
+`\n` (raw external output excepted, above). Layered next on the same per-line width
+the styled values already give the shell, and now well-defined because lines are
+explicit map entries: **`fill`** (right-align by consuming a line's slack; multiple
+`fill`s on a line split it evenly) and **transient collapse** of past prompts in
+scrollback — their concrete semantics are the remaining prompt work. The event set
+— `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settled.)*
 
 ## Footguns we avoid
 
@@ -2507,22 +2527,23 @@ to avoid" rather than promising the latter as done.
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
   `preexec`/`postexec`, `precd`/`postcd`, `exit`; the prompt is a named, ordered
-  segment map with the external renderer as one peer segment. Prompt MVP: `style`
-  color plus multi-line output where a mesh segment yields a **string or a list of
-  lines** and line structure is the **segment map** (plus an explicit `newline`
-  segment), not in-band `\n` — only an *external* segment's newlines are honored, as
-  dumb breaks. Remaining: the frame surface layered on per-line width — a full-width
-  `rule`, a `fill` right-align spacer, and transient collapse.
+  segment map with the external renderer as one peer segment. Prompt MVP: **each
+  top-level entry is a line** (implicit breaks between entries — no separator keys),
+  an entry yields a **string or a list of lines**, several inline segments share a
+  line via a keyed **sub-map group**, `style` color, a deliberate-blank **`newline`**
+  entry, and the full-width **`rule`** entry; line structure is the map, not in-band
+  `\n` (raw external output excepted, as dumb breaks). Remaining: `fill` and
+  transient collapse.
 - **Structured prompt — direction decided** ([Hooks and the prompt](#hooks-and-the-prompt)):
-  line structure is the **segment map**, not in-band newlines. A mesh segment yields
-  a **string or a list of lines** (its return value), structure comes from the map +
-  an explicit **`newline`** structural segment, and only an *external* segment's `\n`
-  is honored (as a dumb break). The keyed-map shape won over a whole-prompt
-  list-of-lines (which would have made rows positional, not keyed) — but
-  list-of-lines reappears *at the segment level* as a segment's return. **Remaining:**
-  the concrete semantics of the `fill` (even split across multiple fills on a line),
-  `rule`, and **transient collapse** structural segments, now that lines are explicit
-  and addressable.
+  line structure is the **map**, not in-band newlines — **each top-level entry is a
+  line** (implicit breaks; no `nl1`/`nl2` separator keys), multi-segment lines are a
+  keyed **sub-map group**, a `list of strings` return spans several lines, and a
+  deliberate blank line is a named **`newline`** entry. The keyed-map shape won over
+  a whole-prompt list-of-lines (which would have made rows positional, not keyed) —
+  list-of-lines reappears only *inside* an entry (its return). `rule` is in the MVP.
+  **Remaining:** the concrete semantics of **`fill`** (even split across multiple
+  fills on a line) and **transient collapse**, now that lines are explicit and
+  addressable.
 
 **Foundational specification work.** The entries above settle *surface* features;
 these five are the deeper contracts an implementation needs before code, and each
