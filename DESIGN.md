@@ -1189,7 +1189,7 @@ Rules:
   | command | its own exit status |
   | int | the integer itself — `0` success (the shell `return N`) |
   | bool | `true` → `0`, `false` → `1` (the Unix inversion) |
-  | string / list / map / styled value / Instant / Duration (incl. empty or zero) | `0` — producing a value *is* success |
+  | string / list / map / styled value / Instant / Duration / regex (incl. empty or zero) | `0` — producing a value *is* success |
 
   So `have_command` ends in a test whose bool becomes the status and
   `if have_command fzf { … }` reads correctly; `return $cond` exits `0`/`1`;
