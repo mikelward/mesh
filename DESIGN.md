@@ -266,6 +266,14 @@ custom function.
 **String** *(open — initial set)*: `:strip(PREFIX/SUFFIX)`, `:replace(OLD NEW)`,
 and likely `:upper` / `:lower`. To be fleshed out.
 
+*(TODO — **string→number parse**, surfaced porting `total`, `bisect`. Values from
+argv / `gets` / `$(…)` captures are **strings**, but arithmetic and `+=` are
+int-only (no coercion — `n += "x"` fails) and `<` / `>` on numeric-looking strings
+compare *lexically*, so `bisect`'s `$good`/`$bad` math and a native `total` are
+impossible today. Add a fail-loud `:int` / `:num` parse modifier — the inverse of
+the canonical int→decimal rendering — erroring on non-numeric input rather than
+silently yielding `0`.)*
+
 ### Globbing
 
 - `**` — recursive, **on by default** (no `globstar`-style opt-in).
@@ -1006,6 +1014,14 @@ exists for, so `~` is arguably sugar for `:match`'s truthiness. Keep both for no
 revisit whether one should be defined in terms of the other, or dropped, before
 first release.)*
 
+*(TODO — **dynamic regex from a runtime string**, surfaced porting `fromto`,
+`filter`, `he`, `untar`. mesh's regex is only the *literal* `/re/`, so a pattern
+that arrives as an **argument** (`fromto $from $to`, any `grep`-like) has no way to
+become a regex. Decide the string→regex path — interpolation `/$var/` and/or a
+`re($str)` constructor — plus a **regex-quote** to embed a literal string as a
+pattern (Perl's `\Q…\E`). Without it the whole class of "the pattern comes from the
+caller" scripts can't be expressed.)*
+
 *(deferred: **map destructuring** — `[name: n, age: a] = $m` binding by key — a
 natural extension of the same idea; and nested patterns (`[a [b c]] = …`).)*
 
@@ -1085,14 +1101,24 @@ Rules:
   **last occurrence wins** for a valued flag (`--tag=v1 --tag=v2` binds `v2`, the
   universal CLI convention that makes a forwarded default overridable), and a
   repeated switch is simply still true (idempotent) — neither repeat is an error.
-  *(TODO — surfaced porting `recent`, `body`, `shift_options`: **short and numeric
-  flags**. The grammar here declares only `--long` flags, but interactive use leans
-  on `-N` counts (`recent -20`, the `head -20` idiom), single-letter switches (`-v`),
-  bundles (`-abc`), and attached values (`-ffile`). Decide whether a user function
-  can declare short aliases (`--verbose | -v`) and a numeric-count form, or whether
-  short/numeric flags stay an external-tool-only convention and in-shell functions
-  are `--long`-only. The `--`-mid-stream that `shift_options` relies on is already
-  covered by the terminator rule below.)*
+  *(TODO — flag-grammar extensions the settled `--long` grammar doesn't yet cover,
+  surfaced porting `recent`/`shift_options`/`homepkg`/`setup`:*
+  - ***Short & numeric flags.*** Interactive use leans on `-N` counts (`recent -20`,
+    the `head -20` idiom), single-letter switches (`-v`), bundles (`-abc`), and
+    attached values (`-ffile`). Decide whether a function can declare short aliases
+    (`--verbose | -v`) and a numeric-count form, or whether short/numeric flags stay
+    an external-tool-only convention and in-shell functions are `--long`-only.
+  - ***Enum / choice-constrained values.*** `homepkg --backend mamba|conda|github`
+    and `setup`'s mutually-exclusive `--kde|--hypr|--sway` have no parse-time
+    validation — "enum" exists only as a *completion* value type. Let a flag or
+    positional declare an allowed-value set that validates at the call and feeds
+    completion.
+  - ***Negatable / tri-state flags.*** `setup`'s `--gui`/`--no-gui` auto/yes/no
+    pairs have no expression: a switch is binary, false-unless-passed, with no
+    `--no-` negation. Allow a switch to auto-derive a `--no-` form (a
+    true/false/unset tri-state), or a first-class three-valued flag.
+  The `--`-mid-stream that `shift_options` relies on is already covered by the
+  terminator rule below.)*
 - **`--` ends flag parsing** (the universal Unix terminator, kept). Everything
   after a bare `--` is positional/rest, even if it begins with `--`. This is
   how a value that literally looks like a flag reaches a rest parameter:
