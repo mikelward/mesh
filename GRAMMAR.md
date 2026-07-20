@@ -56,7 +56,7 @@ After tokenizing, each word is expanded (before dispatch, so `cd ~` and
   literal and passes through even if no such file exists. An invalid pattern is
   a literal.
 
-## Task 5 — quoting and escapes (the real lexer)
+## Task 5 — quoting and escapes (the real lexer, **Model B**)
 
 The placeholder whitespace tokenizer is replaced by a real lexer. A **word** is
 now a sequence of adjacent pieces that concatenate; each piece is *expandable*
@@ -65,32 +65,38 @@ so **quoting suppresses expansion**.
 
 ```
 word   = piece+
-piece  = bare | escape | single | double        # adjacent pieces fuse
-bare   = <unquoted chars, expandable>            # e.g. * ? [ ~ are active here
-escape = "\" <any char>                          # literal next char; \<nl> = line continuation
-single = "'" ( <raw> | "\'" | "\\" )* "'"        # raw: only \' and \\ ; all else literal
-double = '"' ( <text> | c-escape )* '"'          # c-escape: \n \t \r \e \\ \" \$ \u{HEX}
+piece  = bare | escape | double | single | raw   # adjacent pieces fuse
+bare   = <unquoted chars, expandable>             # e.g. * ? [ ~ are active here
+escape = "\" <any char>                           # literal next char; \<nl> = continuation
+double = '"' ( <text> | c-escape | "$name" )* '"' # interpolates (deferred) + escapes
+single = "'" ( <text> | s-escape )* "'"           # escapes, no interpolation; $ literal
+raw    = ("r'" <bytes> "'") | ('r"' <bytes> '"')  # no escapes at all
 ```
 
+The escape sets (an **unknown escape inside a quote is a syntax error**):
+
+- `"…"` : `\n \t \r \e \\ \" \$` and `\u{HEX}`.
+- `'…'` : `\n \t \r \e \\ \'` and `\u{HEX}`; `$` is always literal (no `\$`).
+
 - **Bare words** are expandable; a backslash makes the next char literal
-  (`a\ b` is one word; `\*`, `\~` are literal).
-- **Single quotes** are raw — only `\'` and `\\` are escapes; every other
-  backslash is literal (the home of regex source / paths).
-- **Double quotes** interpret a C-style escape set and are literal text.
-  `$`-interpolation is **deferred to task 6** — a bare `$name` inside `"…"`
-  stays literal for now.
+  (`a\ b` is one word; `\*`, `\~` literal).
+- **Double quotes** `"…"` interpolate (deferred to task 6 — a bare `$name` is
+  literal for now) and interpret the C-style escape set.
+- **Single quotes** `'…'` do *not* interpolate but *do* escape (Python `str`):
+  `'a\nb'` is two lines, `'$x'` is a literal `$x`, and `'\d'` is an **error**.
+- **Raw strings** `r'…'` / `r"…"` take no escapes — the home for regex source
+  and paths (`r'\d+\.txt'`). Recognized only at the start of a word. A string
+  needing both quote kinds uses a (future) quoted-delimiter heredoc.
 - **Adjacent pieces concatenate**: `"a"b'c'` is one argument `abc`;
   `--flag='a b'` is one argument. `""` is one empty argument.
 - **Expansion suppression**: a quoted or escaped `*`/`?`/`[`/`~` is literal, so
-  `puts '*'` prints `*` and `puts '~'` prints `~`, while unquoted `*`/`~` still
-  expand.
-- An **unterminated quote** is a syntax error (status 2); the shell recovers and
-  continues with the next line.
+  `puts '*'` prints `*`, while unquoted `*`/`~` still expand.
+- An **unterminated quote** or **unknown/bad escape** is a syntax error
+  (status 2); the shell recovers and continues with the next line.
 
-Deferred within this area: `$`-interpolation (task 6), a **heredoc** `<< END`
-for the raw both-quotes form (the chosen raw form — see `TODO.md`), and
-`\`-newline continuation across multiple input lines (needs a multi-line
-reader). Words are still `String`-based, so a non-UTF-8 `$HOME`/match is lossy.
+Deferred within this area: `$`-interpolation (task 6), heredocs (incl. the raw
+both-quotes `<< 'END'` form), and `\`-newline continuation across multiple input
+lines. Words are still `String`-based, so a non-UTF-8 `$HOME`/match is lossy.
 
 ### Not yet parsed
 `$` variables and interpolation, pipes `|`, redirection `>` `<`, sequencing `;`
