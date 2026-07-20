@@ -411,6 +411,16 @@ fn assignment_to_reserved_env_name_is_rejected() {
 }
 
 #[test]
+fn unterminated_braced_interpolation_is_a_syntax_error() {
+    // `${` signals interpolation intent, so a missing `}` (or a malformed name
+    // inside) is a loud syntax error, not silent literal text — a literal `$`
+    // in a string is `\$`. An unbraced `$5` stays a literal `$5`.
+    let out = run_with_input("x = abc\nputs \"${x\"\nputs \"$5\"\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("syntax error"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "$5\n");
+}
+
+#[test]
 fn unbound_variable_is_a_loud_error_that_recovers() {
     let out = run_with_input("puts $nope\nputs ok\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("unbound variable"));

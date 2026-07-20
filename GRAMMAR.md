@@ -122,6 +122,9 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
   `r'…'`.
 - **Reads fail loud**: an **unbound** variable is an error (no null / always-on
   `set -u`), and the shell recovers to the next line. Assignment always creates.
+  A **malformed `${…}`** (missing `}`, or an invalid name inside) is a syntax
+  error too — the braces signal intent, so a typo isn't silently literal text
+  (a literal `$` is `\$`). A bare `$` not followed by a name (`$5`) stays literal.
 - **No word splitting**: an interpolated value is one literal value — `$x`
   holding `*` is not re-globbed and never splits on spaces.
 - **Hyphens** are interior only: `$a-$b` is `$a` + `-` + `$b`, while
