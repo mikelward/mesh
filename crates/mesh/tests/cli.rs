@@ -985,3 +985,18 @@ fn return_in_a_pipeline_is_rejected() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be used in a pipeline"));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 }
+
+#[test]
+fn a_function_named_after_a_control_word_is_rejected() {
+    // `func` and `return` are intercepted before function dispatch, so a function
+    // by either name could never be called — reject the definition.
+    for name in ["func", "return"] {
+        let out = run_with_input(&format!("func {name}() {{ puts hi }}\nputs after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("reserved word"),
+            "name `{name}` stderr: {stderr}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    }
+}
