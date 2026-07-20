@@ -96,3 +96,15 @@ reader). Words are still `String`-based, so a non-UTF-8 `$HOME`/match is lossy.
 `$` variables and interpolation, pipes `|`, redirection `>` `<`, sequencing `;`
 `&&` `||`, `{ }` blocks, `func`, heredocs. Each arrives with the task that needs
 it, and this file grows to match.
+
+**Design target (differs from the current lexer above).** `DESIGN.md` has since
+settled a quoting/regex direction the implemented Model A lexer does not yet reflect:
+keep `/…/` with the **word-shape rule** (a leading-slash word is a regex only when its
+base — minus trailing `:` flag modifiers — is a clean `/BODY/`, otherwise a
+path/glob, so absolute globs go bare); **Model B strings** — `"…"` interpolates +
+escapes, `'…'` is non-interpolating but *escaped* (single quotes are no longer raw),
+`r'…'` / `r"…"` are raw; heredocs interpolate unless the delimiter is quoted; the
+`~`/`match` RHS does **not** coerce a plain string to a regex; regex flags are `:`
+modifiers coexisting with `--ignore-case`. The lexer migrates to this when the
+quoting/interpolation tasks land — see the "Quoting and escaping" section in
+[`DESIGN.md`](DESIGN.md) and [`TODO.md`](TODO.md).
