@@ -58,8 +58,8 @@ mesh and the child share the foreground process group. The fix is job control
 the placeholder tokenizer with the first real slice of the mesh lexer.
 
 **Scope**
-- `reedline` line editing: history, cursor movement, hinting; a real (still
-  simple) prompt.
+- `reedline` line editing ✅ landed — interactive TTY input with in-memory
+  history and Ctrl-C/Ctrl-D handling; the std byte reader stays for piped input.
 - Lexer v1: quoting (`'…'`, `"…"`) and escaping, so arguments with spaces work.
 - Promote the shell internals into a `crates/mesh-core` library; the binary
   becomes a thin `main` (enables direct unit tests of the lexer).

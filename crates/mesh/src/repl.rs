@@ -1,36 +1,101 @@
 //! The read / tokenize / dispatch loop.
 //!
-//! M0 reads whole lines from stdin (so `echo ls | mesh` and an interactive
-//! terminal both work) and has no line editor yet — reedline arrives in M1. The
-//! prompt is written to stderr so it never contaminates captured stdout.
+//! Interactive (TTY) input goes through [`reedline`] for line editing, history,
+//! and Ctrl-C/Ctrl-D handling. Piped / non-interactive input keeps the std-only
+//! unbuffered fd-0 byte reader, so a spawned child still inherits any bytes that
+//! follow its command line and the integration tests need no terminal.
 
+use std::borrow::Cow;
 use std::fs::File;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
 use std::process::ExitCode;
+
+use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 
 use crate::builtins::{self, Builtin};
 use crate::{exec, lexer};
 
 /// Run the shell until end-of-input or `exit`, returning the last status as the
-/// process exit code.
+/// process exit code. Picks the interactive or piped reader by whether stdin is
+/// a terminal.
 pub fn run() -> ExitCode {
-    let interactive = io::stdin().is_terminal();
-    // Read commands straight from file descriptor 0, unbuffered. A buffered
-    // reader would pull bytes past the command's newline into its own buffer;
-    // those bytes belong to any child that inherits stdin (e.g. `cat` reading a
-    // here-doc piped after its command line), so buffering them would starve the
-    // child and then mis-run the leftovers as commands. `ManuallyDrop` keeps us
-    // from closing fd 0 when the shell exits.
+    if io::stdin().is_terminal() {
+        run_interactive()
+    } else {
+        run_piped()
+    }
+}
+
+/// What to do after handling one input line.
+#[derive(Debug, PartialEq)]
+enum Step {
+    /// A line ran; carry this status as the new "last status".
+    Continue(u8),
+    /// `exit` was invoked; leave the shell with this status.
+    Exit(u8),
+}
+
+/// Tokenize and dispatch one line of input. Empty lines are a no-op that keeps
+/// the previous status.
+fn run_line(text: &str, last: u8) -> Step {
+    let words = lexer::split(text);
+    if words.is_empty() {
+        return Step::Continue(last);
+    }
+    match builtins::dispatch(&words) {
+        Some(Builtin::Exit(code)) => Step::Exit(code),
+        Some(Builtin::Status(code)) => Step::Continue(code),
+        None => Step::Continue(exec::run(&words)),
+    }
+}
+
+/// Interactive loop: reedline line editing with an in-memory history. Ctrl-D on
+/// an empty line exits (reedline's default — a non-empty line is unaffected);
+/// Ctrl-C cancels the current line and returns to the prompt without exiting.
+fn run_interactive() -> ExitCode {
+    let mut editor = Reedline::create();
+    let mut last: u8 = 0;
+    loop {
+        let prompt = MeshPrompt { failed: last != 0 };
+        match editor.read_line(&prompt) {
+            Ok(signal) => match handle_signal(signal, last) {
+                Step::Exit(code) => return ExitCode::from(code),
+                Step::Continue(code) => last = code,
+            },
+            Err(err) => {
+                eprintln!("mesh: line editor error: {err}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+}
+
+/// Map a reedline signal to the next [`Step`]. Extracted from the read loop so
+/// the interactive control flow is unit-testable without a terminal.
+///
+/// `Ctrl-D` exits (reedline only emits it on an empty line, so this is the
+/// exit-on-empty behavior); `Ctrl-C` — and any future signal — cancels the
+/// current line and re-prompts, keeping the last status.
+fn handle_signal(signal: Signal, last: u8) -> Step {
+    match signal {
+        Signal::Success(line) => run_line(&line, last),
+        Signal::CtrlD => Step::Exit(last),
+        _ => Step::Continue(last),
+    }
+}
+
+/// Piped / non-interactive loop: read commands unbuffered from fd 0 so bytes
+/// past a command's newline stay in the pipe/file for a child that inherits
+/// stdin. A malformed (non-UTF-8) line is rejected loudly and skipped.
+fn run_piped() -> ExitCode {
+    // `ManuallyDrop` keeps us from closing fd 0 when the shell exits.
     let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
     let mut last: u8 = 0;
     let mut line = Vec::new();
 
     loop {
-        if interactive {
-            prompt(last);
-        }
         line.clear();
         match read_line(&mut *stdin, &mut line) {
             Ok(0) => break, // EOF
@@ -41,10 +106,6 @@ pub fn run() -> ExitCode {
             }
         }
 
-        // Reject a malformed line loudly rather than lossily converting it: a
-        // U+FFFD substitution could otherwise launch a *different* executable
-        // than the bytes named. Handling non-UTF-8 command bytes losslessly is a
-        // job for the real lexer (M0's works on `&str`).
         let text = match std::str::from_utf8(&line) {
             Ok(text) => text,
             Err(_) => {
@@ -53,29 +114,17 @@ pub fn run() -> ExitCode {
                 continue;
             }
         };
-        let words = lexer::split(text);
-        if words.is_empty() {
-            continue;
+        match run_line(text, last) {
+            Step::Exit(code) => return ExitCode::from(code),
+            Step::Continue(code) => last = code,
         }
-
-        match builtins::dispatch(&words) {
-            Some(Builtin::Exit(code)) => return ExitCode::from(code),
-            Some(Builtin::Status(code)) => last = code,
-            None => last = exec::run(&words),
-        }
-    }
-
-    if interactive {
-        // Terminate the line the final prompt started when the user hits Ctrl-D.
-        eprintln!();
     }
     ExitCode::from(last)
 }
 
 /// Read one line (up to and including the newline) into `out`, one byte at a
-/// time so nothing beyond the newline is consumed — bytes a spawned child should
-/// read on stdin stay in the pipe or file. Returns the number of bytes read; 0
-/// signals EOF. `out` is cleared by the caller before each call.
+/// time so nothing beyond the newline is consumed. Returns the number of bytes
+/// read; 0 signals EOF.
 fn read_line(reader: &mut impl Read, out: &mut Vec<u8>) -> io::Result<usize> {
     let mut byte = [0u8; 1];
     loop {
@@ -94,10 +143,60 @@ fn read_line(reader: &mut impl Read, out: &mut Vec<u8>) -> io::Result<usize> {
     Ok(out.len())
 }
 
-/// A minimal two-glyph prompt: `mesh$` after success, `mesh!` after failure.
+/// The minimal two-glyph prompt: `mesh$` after success, `mesh!` after failure.
 /// The full status-dashboard prompt from `DESIGN.md` is a later milestone.
-fn prompt(last: u8) {
-    let glyph = if last == 0 { "mesh$ " } else { "mesh! " };
-    eprint!("{glyph}");
-    let _ = io::stderr().flush();
+struct MeshPrompt {
+    failed: bool,
+}
+
+impl Prompt for MeshPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_indicator(&self, _edit_mode: PromptEditMode) -> Cow<'_, str> {
+        if self.failed {
+            Cow::Borrowed("mesh! ")
+        } else {
+            Cow::Borrowed("mesh$ ")
+        }
+    }
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("... ")
+    }
+    fn render_prompt_history_search_indicator(
+        &self,
+        _history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        Cow::Borrowed("search: ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Step, handle_signal, run_line};
+    use reedline::Signal;
+
+    #[test]
+    fn ctrl_d_exits_with_the_last_status() {
+        assert_eq!(handle_signal(Signal::CtrlD, 7), Step::Exit(7));
+    }
+
+    #[test]
+    fn ctrl_c_re_prompts_keeping_status() {
+        assert_eq!(handle_signal(Signal::CtrlC, 7), Step::Continue(7));
+    }
+
+    #[test]
+    fn a_submitted_exit_line_exits() {
+        let signal = Signal::Success("exit 5".to_string());
+        assert_eq!(handle_signal(signal, 0), Step::Exit(5));
+    }
+
+    #[test]
+    fn a_submitted_blank_line_keeps_the_status() {
+        assert_eq!(run_line("   ", 3), Step::Continue(3));
+    }
 }
