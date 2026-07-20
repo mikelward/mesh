@@ -736,6 +736,12 @@ fn a_descriptor_redirect_is_rejected_for_now() {
     let esc = run_with_input(&format!("cd {}\necho hi\\&>f\ncat f\n", dir.display()));
     assert_eq!(String::from_utf8_lossy(&esc.stdout), "hi&\n");
     let _ = std::fs::remove_dir_all(&dir);
+    // And a bare fd needs *only* digits abutting the operator: an empty quote
+    // (`""2>f`) or an escaped digit (`\2>f`) is a normal argument + redirect.
+    let dir2 = fresh_dir("redir_empty_quote_fd");
+    let eq = run_with_input(&format!("cd {}\necho \"\"2>f\ncat f\n", dir2.display()));
+    assert_eq!(String::from_utf8_lossy(&eq.stdout), "2\n");
+    let _ = std::fs::remove_dir_all(&dir2);
 }
 
 #[test]
