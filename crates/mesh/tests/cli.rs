@@ -723,4 +723,12 @@ fn a_descriptor_redirect_is_rejected_for_now() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
     let amp = run_with_input("echo hello &>f\nputs after\n");
     assert!(String::from_utf8_lossy(&amp.stderr).contains("descriptor redirection"));
+    // `&>` attached to a preceding argument (`hello&>f`) is still rejected.
+    let attached = run_with_input("echo hello&>f\nputs after\n");
+    assert!(String::from_utf8_lossy(&attached.stderr).contains("descriptor redirection"));
+    // But an escaped `\&` is a literal, so `hi\&>f` is a normal redirect.
+    let dir = fresh_dir("redir_escaped_amp");
+    let esc = run_with_input(&format!("cd {}\necho hi\\&>f\ncat f\n", dir.display()));
+    assert_eq!(String::from_utf8_lossy(&esc.stdout), "hi&\n");
+    let _ = std::fs::remove_dir_all(&dir);
 }
