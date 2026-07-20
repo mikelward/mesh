@@ -737,3 +737,50 @@ fn a_descriptor_redirect_is_rejected_for_now() {
     assert_eq!(String::from_utf8_lossy(&esc.stdout), "hi&\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_fifo_redirect_in_a_pipeline_does_not_deadlock() {
+    // Two stages of one pipeline open the same FIFO (one for read, one for
+    // write). The redirections must open concurrently, or the parent deadlocks
+    // opening the reader before the writer is spawned. Guarded by a timeout so a
+    // regression fails the test instead of hanging CI.
+    let dir = fresh_dir("fifo_pipe");
+    let fifo = dir.join("f");
+    let made = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !made {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // mkfifo unavailable — skip
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"cat < f | echo hi > f\nputs done\n")
+        .expect("write stdin");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = std::fs::remove_dir_all(&dir);
+            panic!("mesh deadlocked on a FIFO redirect in a pipeline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().expect("wait");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("done"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
