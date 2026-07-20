@@ -109,6 +109,13 @@ file as tasks land.
 
 ## Icebox / decide later
 
+- [ ] **Reserve only bare `_` as discard, allow `_name`.** Today a name must
+      start with a letter, so a leading underscore is rejected wholesale (`_` and
+      `_x` alike) — `_` is the discard pattern (`DESIGN.md`). Reconsider narrowing
+      the reservation to **bare `_` only**, letting `_name` (underscore + letters)
+      be a valid identifier, the common "intentional / private / unused-but-named"
+      convention. Would touch `read_name` (allow a `_` head as long as the whole
+      token isn't just `_`) and the `GRAMMAR.md` name rule.
 - [ ] **Empty-glob warning (optional).** Keep behavior "empty always", but
       consider *warning* on an empty glob expansion while still proceeding — mesh
       is the only party that can detect it (the argv boundary carries bytes, not
