@@ -328,37 +328,36 @@ fn separator_at(chars: &[char], at: usize) -> Option<(Sep, usize)> {
 /// unspaced fd number (`2>`) or `&` (`&>`) directly before it? True only when
 /// the pending word abuts the operator (no space) and is either a bare run of
 /// digits (`2>`) or ends in a bare `&` (`&>`, `hello&>`). So a plain argument
-/// `2 > f`, a non-fd word `file2>f`, and an escaped `\&>` (a literal `&`) are all
-/// excluded.
+/// `2 > f`, a non-fd word `file2>f`, an escaped `\&>`/`\2>` (a literal), and an
+/// empty-quote form (`""2>`) are all excluded.
 fn is_descriptor_prefix(current: &Option<Vec<Piece>>, chars: &[char], at: usize) -> bool {
     if at == 0 || chars[at - 1].is_whitespace() {
         return false;
     }
-    let Some(pieces) = current.as_deref() else {
-        return false;
-    };
     // `&>` / `&>>`: a bare (unescaped) `&` immediately before the operator,
     // whatever precedes it — `echo hello&>f` is still the deferred both-streams
     // form. An escaped `\&` is a literal piece, so it is excluded.
     if let Some(Piece::Text {
         text,
         expandable: true,
-    }) = pieces.last()
+    }) = current.as_deref().and_then(<[Piece]>::last)
     {
         if text.ends_with('&') {
             return true;
         }
     }
-    // `N>` / `N>>` / `N<`: the whole word is a bare run of digits (an fd number).
-    matches!(
-        pieces,
-        [
-            Piece::Text {
-                text,
-                expandable: true,
-            },
-        ] if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
-    )
+    // `N>` / `N>>` / `N<`: the word abutting the operator is a bare run of ASCII
+    // digits (an fd number). Scan the raw chars back to the previous space, so an
+    // empty quote (`""2>`), an escape (`\2>`), or a non-fd word (`file2>`) — each
+    // of which puts a non-digit char in the run — is excluded.
+    let mut j = at;
+    while j > 0 && !chars[j - 1].is_whitespace() {
+        if !chars[j - 1].is_ascii_digit() {
+            return false;
+        }
+        j -= 1;
+    }
+    j < at // at least one digit abutted the operator
 }
 
 /// If a bare redirection operator starts at `at`, return it and its length:

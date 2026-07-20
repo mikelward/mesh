@@ -178,10 +178,22 @@ redir    = ("<" | ">" | ">>") word    # the following word is the target file
 - Operators are recognized only **bare** — a quoted (`'a|b'`) or escaped (`a\|b`)
   operator is literal.
 - **Pipeline status is pipefail, ignoring upstream SIGPIPE**: the pipeline fails
-  if any stage genuinely fails (`false | true` → 1), but a stage killed by SIGPIPE
-  because a later stage closed the pipe early is not a failure (`yes | head` → 0).
+  if any stage genuinely fails (`false | true` → 1), but a stage whose stdout fed
+  a pipe and was killed by SIGPIPE is not counted (`yes | head` → 0). This is a
+  *heuristic* — the exit status alone can't say *why* a stage got SIGPIPE, so a
+  self-inflicted SIGPIPE in a piped stage is also excused (an accepted cost of
+  avoiding the `yes | head` → 141 footgun).
 - An **empty pipeline stage** (`| cat`, `ls |`, `ls | | wc`) and a **redirection
   with no target** (`cat >`) are syntax errors (status 2); the shell recovers.
+
+**Known limitation** (deferred to the fork-based executor, M2 job control): a
+**FIFO** used as a redirection target in a pipeline can deadlock when its peer is
+opened by a *pipeline command* rather than another stage's redirection
+(`sh -c 'printf x >f' | cat <f`). Redirections between *stages* open concurrently
+(`cat <f | echo >f` is fine), but opening a redirection still happens before any
+command spawns; fully interleaving open and spawn needs per-child fd setup after
+`fork`, which arrives with job control. Ordinary file redirection and pipes are
+unaffected.
 
 Deferred: a **builtin** in a multi-stage pipeline or with a redirection is not
 supported yet (needs a forked child / an output sink) and is rejected with a
