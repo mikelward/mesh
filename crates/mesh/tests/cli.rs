@@ -577,3 +577,88 @@ fn child_reads_remaining_stdin() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn a_pipe_connects_two_commands() {
+    let out = run_with_input("printf 'a\\nb\\nc\\n' | grep b\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "b\n");
+}
+
+#[test]
+fn a_three_stage_pipeline_works() {
+    let out = run_with_input("printf '3\\n1\\n2\\n' | sort | head -1\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+}
+
+#[test]
+fn output_redirection_writes_a_file_and_input_reads_it() {
+    let dir = fresh_dir("redir_io");
+    let out = run_with_input(&format!("cd {}\necho hello > f\ncat < f\n", dir.display()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n");
+    assert_eq!(std::fs::read_to_string(dir.join("f")).unwrap(), "hello\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn append_redirection_adds_to_a_file() {
+    let dir = fresh_dir("redir_append");
+    let out = run_with_input(&format!(
+        "cd {}\necho one > f\necho two >> f\ncat f\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one\ntwo\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pipeline_status_is_pipefail() {
+    // A failing upstream stage fails the pipeline even if the last stage is fine.
+    assert_eq!(run_with_input("false | true\n").status.code(), Some(1));
+    assert_eq!(run_with_input("true | false\n").status.code(), Some(1));
+    assert_eq!(run_with_input("true | true\n").status.code(), Some(0));
+}
+
+#[test]
+fn upstream_sigpipe_does_not_fail_the_pipeline() {
+    // `yes` is SIGPIPE-killed once `head` closes the pipe, but that is not a
+    // failure — the pipeline succeeds.
+    let out = run_with_input("yes | head -1\n");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "y\n");
+}
+
+#[test]
+fn a_quoted_pipe_is_a_literal_not_an_operator() {
+    let out = run_with_input("echo 'a|b'\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a|b\n");
+}
+
+#[test]
+fn a_builtin_in_a_pipeline_is_rejected_for_now() {
+    let out = run_with_input("puts hi | cat\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not supported in a pipeline"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_redirected_builtin_is_rejected_for_now() {
+    let dir = fresh_dir("redir_builtin");
+    let out = run_with_input(&format!("cd {}\npwd > f\nputs after\n", dir.display()));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("redirection of a builtin"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_redirect_with_no_target_is_a_syntax_error_that_recovers() {
+    let out = run_with_input("echo hi >\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("redirection needs a target"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn an_empty_pipeline_stage_is_a_syntax_error_that_recovers() {
+    let out = run_with_input("echo hi |\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("empty command in a pipeline"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}

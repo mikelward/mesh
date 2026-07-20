@@ -49,6 +49,8 @@ pub enum LexError {
     BadUnicodeEscape,
     UnterminatedInterpolation,
     BadInterpolation(String),
+    MissingRedirectTarget,
+    EmptyPipelineStage,
 }
 
 impl std::fmt::Display for LexError {
@@ -62,6 +64,12 @@ impl std::fmt::Display for LexError {
             }
             LexError::BadInterpolation(inner) => {
                 write!(f, "syntax error: invalid interpolation ${{{inner}}}")
+            }
+            LexError::MissingRedirectTarget => {
+                write!(f, "syntax error: redirection needs a target file")
+            }
+            LexError::EmptyPipelineStage => {
+                write!(f, "syntax error: empty command in a pipeline")
             }
         }
     }
@@ -77,23 +85,51 @@ pub enum Sep {
     Or,
 }
 
-/// One command in a sequence: its words plus the separator that connects it to
-/// the previous command (`Seq` for the first). The connector decides whether the
-/// command runs, based on the previous command's status.
+/// A redirection operator: `>` truncate stdout, `>>` append stdout, `<` stdin.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum RedirKind {
+    Out,
+    Append,
+    In,
+}
+
+/// A redirection: an operator and the file word it targets.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Redir {
+    pub kind: RedirKind,
+    pub target: Word,
+}
+
+/// One stage of a pipeline: the command words plus any redirections applied to
+/// it. Stages are joined by `|`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Stage {
+    pub words: Vec<Word>,
+    pub redirs: Vec<Redir>,
+}
+
+/// One command in a sequence: the separator connecting it to the previous
+/// command (`Seq` for the first), and its pipeline — one or more `|`-joined
+/// stages. The connector decides whether the pipeline runs, based on the
+/// previous command's status.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Segment {
     pub sep_before: Sep,
-    pub words: Vec<Word>,
+    pub stages: Vec<Stage>,
 }
 
-/// Split `line` into command segments joined by `;` / `&&` / `||`. A line with no
-/// separator is a single segment. Operators are recognized only at the bare
-/// (unquoted, unescaped) level; a lone `&` (background) or `|` (pipe) is not an
-/// operator yet and stays a literal character.
+/// Split `line` into command segments joined by `;` / `&&` / `||`, each a
+/// pipeline of `|`-joined stages with optional `>` / `>>` / `<` redirections. A
+/// line with no separator is a single segment. Operators are recognized only at
+/// the bare (unquoted, unescaped) level; a lone `&` (background) is not one yet
+/// and stays a literal character.
 pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
     let chars: Vec<char> = line.chars().collect();
     let mut segments = Vec::new();
+    let mut stages: Vec<Stage> = Vec::new();
     let mut words: Vec<Word> = Vec::new();
+    let mut redirs: Vec<Redir> = Vec::new();
+    let mut pending_redir: Option<RedirKind> = None;
     let mut sep_before = Sep::Seq;
     let mut current: Option<Vec<Piece>> = None;
     let mut i = 0;
@@ -101,9 +137,7 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
     while i < chars.len() {
         let c = chars[i];
         if c.is_whitespace() {
-            if let Some(word) = current.take() {
-                words.push(Word(word));
-            }
+            finish_word(&mut current, &mut words, &mut redirs, &mut pending_redir);
             i += 1;
             continue;
         }
@@ -113,18 +147,47 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
             i += 2;
             continue;
         }
-        // A bare `;` / `&&` / `||` ends the current command and opens a new
-        // segment. Checked before the escape/quote handling below, so a quoted
-        // or `\`-escaped operator is left literal.
+        // Bare operators, checked before the escape/quote handling below so a
+        // quoted or `\`-escaped operator is left literal. Order matters: the
+        // sequence separators (which include `||`) come before the single-`|`
+        // pipe so `||` is not read as two pipes.
         if let Some((sep, len)) = separator_at(&chars, i) {
-            if let Some(word) = current.take() {
-                words.push(Word(word));
+            finish_word(&mut current, &mut words, &mut redirs, &mut pending_redir);
+            if pending_redir.is_some() {
+                return Err(LexError::MissingRedirectTarget);
             }
-            segments.push(Segment {
+            finish_segment(
+                &mut segments,
                 sep_before,
-                words: std::mem::take(&mut words),
-            });
+                &mut stages,
+                &mut words,
+                &mut redirs,
+            )?;
             sep_before = sep;
+            i += len;
+            continue;
+        }
+        if chars[i] == '|' {
+            finish_word(&mut current, &mut words, &mut redirs, &mut pending_redir);
+            if pending_redir.is_some() {
+                return Err(LexError::MissingRedirectTarget);
+            }
+            if words.is_empty() && redirs.is_empty() {
+                return Err(LexError::EmptyPipelineStage);
+            }
+            stages.push(Stage {
+                words: std::mem::take(&mut words),
+                redirs: std::mem::take(&mut redirs),
+            });
+            i += 1;
+            continue;
+        }
+        if let Some((kind, len)) = redirect_at(&chars, i) {
+            finish_word(&mut current, &mut words, &mut redirs, &mut pending_redir);
+            if pending_redir.is_some() {
+                return Err(LexError::MissingRedirectTarget);
+            }
+            pending_redir = Some(kind);
             i += len;
             continue;
         }
@@ -174,15 +237,72 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
         }
     }
 
-    if let Some(word) = current.take() {
-        words.push(Word(word));
+    finish_word(&mut current, &mut words, &mut redirs, &mut pending_redir);
+    if pending_redir.is_some() {
+        return Err(LexError::MissingRedirectTarget);
     }
-    segments.push(Segment { sep_before, words });
+    finish_segment(
+        &mut segments,
+        sep_before,
+        &mut stages,
+        &mut words,
+        &mut redirs,
+    )?;
     Ok(segments)
 }
 
+/// Complete the word being built (if any): it becomes the target of a pending
+/// redirection, or otherwise a command word of the current stage.
+fn finish_word(
+    current: &mut Option<Vec<Piece>>,
+    words: &mut Vec<Word>,
+    redirs: &mut Vec<Redir>,
+    pending_redir: &mut Option<RedirKind>,
+) {
+    if let Some(pieces) = current.take() {
+        let word = Word(pieces);
+        match pending_redir.take() {
+            Some(kind) => redirs.push(Redir { kind, target: word }),
+            None => words.push(word),
+        }
+    }
+}
+
+/// Close off the pipeline accumulated so far and push it as a segment. The final
+/// stage is completed from `words`/`redirs`; an empty final stage is a no-op for
+/// a single-stage segment (a blank line, `;;`) but an error inside a pipeline
+/// (a trailing `|`).
+fn finish_segment(
+    segments: &mut Vec<Segment>,
+    sep_before: Sep,
+    stages: &mut Vec<Stage>,
+    words: &mut Vec<Word>,
+    redirs: &mut Vec<Redir>,
+) -> Result<(), LexError> {
+    let last_empty = words.is_empty() && redirs.is_empty();
+    if !stages.is_empty() {
+        if last_empty {
+            return Err(LexError::EmptyPipelineStage);
+        }
+        stages.push(Stage {
+            words: std::mem::take(words),
+            redirs: std::mem::take(redirs),
+        });
+    } else if !last_empty {
+        stages.push(Stage {
+            words: std::mem::take(words),
+            redirs: std::mem::take(redirs),
+        });
+    }
+    segments.push(Segment {
+        sep_before,
+        stages: std::mem::take(stages),
+    });
+    Ok(())
+}
+
 /// If a bare separator token starts at `at`, return it and its length in chars:
-/// `;` (1), `&&` (2), `||` (2). A lone `&` or `|` is not a separator yet.
+/// `;` (1), `&&` (2), `||` (2). A lone `&` is not a separator yet.
 fn separator_at(chars: &[char], at: usize) -> Option<(Sep, usize)> {
     match chars[at] {
         ';' => Some((Sep::Seq, 1)),
@@ -192,13 +312,25 @@ fn separator_at(chars: &[char], at: usize) -> Option<(Sep, usize)> {
     }
 }
 
-/// Lex a single command (no separators) into its words. Test-only convenience
-/// over [`split_line`]; the shell uses `split_line` so `;` / `&&` / `||` split.
+/// If a bare redirection operator starts at `at`, return it and its length:
+/// `>>` (2), `>` (1), `<` (1).
+fn redirect_at(chars: &[char], at: usize) -> Option<(RedirKind, usize)> {
+    match chars[at] {
+        '>' if chars.get(at + 1) == Some(&'>') => Some((RedirKind::Append, 2)),
+        '>' => Some((RedirKind::Out, 1)),
+        '<' => Some((RedirKind::In, 1)),
+        _ => None,
+    }
+}
+
+/// Lex a single command (no separators/pipes/redirects) into its words.
+/// Test-only convenience over [`split_line`].
 #[cfg(test)]
 fn split(line: &str) -> Result<Vec<Word>, LexError> {
     Ok(split_line(line)?
         .into_iter()
-        .flat_map(|segment| segment.words)
+        .flat_map(|segment| segment.stages)
+        .flat_map(|stage| stage.words)
         .collect())
 }
 
@@ -455,7 +587,9 @@ fn push_char(word: &mut Vec<Piece>, c: char, expandable: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{LexError, Piece, Segment, Sep, VarRef, Word, split, split_line};
+    use super::{
+        LexError, Piece, Redir, RedirKind, Segment, Sep, Stage, VarRef, Word, split, split_line,
+    };
 
     fn exp(text: &str) -> Piece {
         Piece::Text {
@@ -480,10 +614,17 @@ mod tests {
         split(line).expect("lex")
     }
 
+    fn stage(ws: &[&str]) -> Stage {
+        Stage {
+            words: ws.iter().map(|w| Word(vec![exp(w)])).collect(),
+            redirs: Vec::new(),
+        }
+    }
+
     fn seg(sep_before: Sep, ws: &[&str]) -> Segment {
         Segment {
             sep_before,
-            words: ws.iter().map(|w| Word(vec![exp(w)])).collect(),
+            stages: vec![stage(ws)],
         }
     }
 
@@ -523,30 +664,78 @@ mod tests {
         // segment of one word each (the pieces are literal, not expandable).
         let quoted = split_line("'a;b'").unwrap();
         assert_eq!(quoted.len(), 1);
-        assert_eq!(quoted[0].words, [Word(vec![lit("a;b")])]);
+        assert_eq!(quoted[0].stages[0].words, [Word(vec![lit("a;b")])]);
         let escaped = split_line(r"a\&\&b").unwrap();
         assert_eq!(escaped.len(), 1);
         assert_eq!(
-            escaped[0].words,
+            escaped[0].stages[0].words,
             [Word(vec![exp("a"), lit("&&"), exp("b")])]
         );
     }
 
     #[test]
-    fn a_lone_amp_or_pipe_is_not_a_separator() {
-        // `&` (background) and `|` (pipe) are not operators yet — they stay
-        // literal characters in a single word.
-        assert_eq!(split_line("a|b").unwrap(), [seg(Sep::Seq, &["a|b"])]);
+    fn a_lone_amp_is_not_a_separator() {
+        // `&` (background) is not an operator yet — it stays a literal character.
         assert_eq!(split_line("a&b").unwrap(), [seg(Sep::Seq, &["a&b"])]);
     }
 
     #[test]
+    fn a_single_pipe_splits_a_segment_into_stages() {
+        let segs = split_line("a | b|c").unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(
+            segs[0].stages,
+            [stage(&["a"]), stage(&["b"]), stage(&["c"])]
+        );
+    }
+
+    #[test]
+    fn redirections_attach_to_their_stage() {
+        // `sort < in > out` — one stage, two redirections, targets peeled off the
+        // command words.
+        let segs = split_line("sort < in >> out").unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].stages.len(), 1);
+        let s = &segs[0].stages[0];
+        assert_eq!(s.words, [Word(vec![exp("sort")])]);
+        assert_eq!(
+            s.redirs,
+            [
+                Redir {
+                    kind: RedirKind::In,
+                    target: Word(vec![exp("in")]),
+                },
+                Redir {
+                    kind: RedirKind::Append,
+                    target: Word(vec![exp("out")]),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_redirect_without_a_target_is_an_error() {
+        assert_eq!(split_line("cat >"), Err(LexError::MissingRedirectTarget));
+        assert_eq!(
+            split_line("cat > | wc"),
+            Err(LexError::MissingRedirectTarget)
+        );
+    }
+
+    #[test]
+    fn an_empty_pipeline_stage_is_an_error() {
+        assert_eq!(split_line("| cat"), Err(LexError::EmptyPipelineStage));
+        assert_eq!(split_line("ls |"), Err(LexError::EmptyPipelineStage));
+        assert_eq!(split_line("ls | | wc"), Err(LexError::EmptyPipelineStage));
+    }
+
+    #[test]
     fn an_empty_segment_is_kept() {
-        // A trailing `;` leaves an empty final segment; the runner treats it as a
-        // no-op. Structurally it is still present.
+        // A trailing `;` leaves an empty final segment (no stages); the runner
+        // treats it as a no-op. Structurally it is still present.
         let segs = split_line("a ;").unwrap();
         assert_eq!(segs.len(), 2);
-        assert_eq!(segs[1].words, Vec::<Word>::new());
+        assert!(segs[1].stages.is_empty());
     }
 
     #[test]
