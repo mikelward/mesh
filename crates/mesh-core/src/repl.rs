@@ -662,9 +662,13 @@ fn handle_signal(
             let text = std::mem::take(pending);
             Some(run_line(&text, last, false, shell))
         }
-        Signal::CtrlD if pending.is_empty() => Some(Step::Exit(last)),
+        // Ctrl-D (EOF) exits with the last status, abandoning any in-progress
+        // `func` — the buffered lines are dropped as the shell leaves. reedline
+        // only emits this on an empty editor line, so a half-typed line is safe.
+        Signal::CtrlD => Some(Step::Exit(last)),
         _ => {
-            // Ctrl-C, or Ctrl-D mid-definition: drop any buffered input.
+            // Ctrl-C: cancel the current line (and any buffered `func` body) and
+            // re-prompt, keeping the status.
             pending.clear();
             Some(Step::Continue(last))
         }
@@ -794,6 +798,18 @@ mod tests {
         assert_eq!(
             handle_signal(Signal::CtrlD, 7, &mut shell, &mut pending),
             Some(Step::Exit(7))
+        );
+    }
+
+    #[test]
+    fn ctrl_d_exits_even_mid_function_definition() {
+        // With a `func` body still buffered, Ctrl-D still exits (abandoning it),
+        // matching the documented Ctrl-D-on-empty-line behavior.
+        let mut shell = Shell::new();
+        let mut pending = String::from("func f() {\n");
+        assert_eq!(
+            handle_signal(Signal::CtrlD, 4, &mut shell, &mut pending),
+            Some(Step::Exit(4))
         );
     }
 
