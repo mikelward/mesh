@@ -2283,6 +2283,15 @@ than a function of whatever a callable happened to print. A segment renders its
 prompt, you don't `puts` it — and a list element that is itself a list is an error
 (no guessed flatten), matching the no-implicit-deep-flatten rule elsewhere.
 
+**Empty lines are skipped.** A `newline` structural segment is a **no-op when the
+current line has no content**, so an optional content segment that returns `""`
+(the common "nothing to show" case — an empty `vcs`/`jobs`/auth line) collapses its
+line instead of leaving a blank gap. So you can bracket an optional whole-line
+segment with `newline`s freely; it costs a line only when it has something to say.
+(A `newline` between two *non-empty* lines still breaks as written, and a
+deliberately blank spacer line is an empty *string* segment on its own line, not a
+bare `newline`.)
+
 The **one exception is an external-command segment**: you can't dictate an external
 tool's output, so it *may* emit `\n`, and the shell honors those as line breaks —
 but as **dumb** breaks that the structural segments (`fill` / `rule`) do not try to
