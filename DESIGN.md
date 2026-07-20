@@ -1625,8 +1625,8 @@ reusing syntax already defined:
 for line in $(git status --porcelain) {   # a capture: splits on newlines — safe
   …
 }
-for k, v in $aliases {                     # a map yields key, value pairs
-  alias $k $v
+for host, addr in $known_hosts {           # a map yields key, value pairs
+  puts "$host is $addr"
 }
 for i in 1..=5 {                           # a range: same .. / ..= as slices
   echo $i
