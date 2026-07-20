@@ -1135,7 +1135,7 @@ Rules:
   | command | its own exit status |
   | int | the integer itself — `0` success (the shell `return N`) |
   | bool | `true` → `0`, `false` → `1` (the Unix inversion) |
-  | string / list / map / styled value (incl. empty) | `0` — producing a value *is* success |
+  | string / list / map / styled value / Instant / Duration (incl. empty or zero) | `0` — producing a value *is* success |
 
   So `have_command` ends in a test whose bool becomes the status and
   `if have_command fzf { … }` reads correctly; `return $cond` exits `0`/`1`;
@@ -1473,7 +1473,10 @@ to a bool):
   `$a:same($b)` rather than cryptic digraphs. Like `test`, these **dereference
   symlinks** — `:mtime`/`:atime`/`:ctime` and `:same` act on the link *target*, so a
   symlink and its target share an mtime and are `:same`; `:type == link` is how you
-  ask about the link itself. These ride on the **time model**
+  ask about the link itself. A raw `$a:mtime > $b:mtime` requires **both** files to
+  exist (strict absence errors on a missing operand); `-nt`'s quirk of treating a
+  *missing* target as older is the rebuild idiom, written explicitly as
+  `not $b:exists or $a:mtime > $b:mtime`. These ride on the **time model**
   *(decided, porting `age()`)*: `now()` and the file-time modifiers
   (`:mtime`/`:atime`/`:ctime`) return an **`Instant`**, and `Instant - Instant` is
   a **`Duration`** (`age = now() - $f:mtime`). A `Duration` is written with **suffix
@@ -1482,8 +1485,10 @@ to a bool):
   the prompt timer is `took $elapsed` with no `/1000`. Arithmetic is the closed set
   `Duration ± Duration`, `Duration × n`, `Instant ± Duration → Instant`, and
   `Instant - Instant → Duration` (`Instant + Instant` is an error). Division is
-  **not** in the set — for a ratio, drop to an integer first with `:ms` / `:secs`
-  (`$a:ms / $b:ms`), so no float or rational type has to be introduced. A `Duration`
+  **not** in the set — for a ratio, drop to an integer first with `:ms` / `:secs`,
+  which **truncate toward zero** (`1900µs:ms` → `1`, `-1900µs:ms` → `-1`); then
+  `$a:ms / $b:ms` is ordinary integer division, so no float or rational type has to
+  be introduced. A `Duration`
   is **signed** — `Instant - Instant` goes negative for a future instant (so a
   future-dated file's `age` is just negative, not an error or a saturated zero),
   rendering with a leading `-` (`-3s`). `Instant` and `Duration` are
