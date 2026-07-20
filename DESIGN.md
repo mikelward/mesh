@@ -151,7 +151,7 @@ There are four kinds of modifier, and the difference matters:
   substitution's **raw byte capture** into a list. They *replace* the default
   newline split and run against the raw bytes — they never run *after* it. Each
   applies to a `$(…)` capture, producing the list. They apply equally to a
-  **plain string value** (`$line:split ":"`, `gets():words`) — there the string's
+  **plain string value** (`$line:split(":")`, `gets():words`) — there the string's
   own bytes are the input and there is no default split to override; the `$(…)`
   capture is just the most common source. The odd one out is **`:raw`**,
   which lives in the same capture-modifier family but is the *no-split* member:
@@ -164,8 +164,8 @@ There are four kinds of modifier, and the difference matters:
   :has :get :join :dedup`) consume a list or map **as a whole** — they do *not* map element-wise
   — and return either a scalar (`:len` → int, `:join` → one byte-string) or a
   derived collection (`:rest`, `:keys`, `:dedup`). This is the category that answers "how
-  long," "the last one," and "flatten to a string." `:join SEP` is the fold
-  that turns a list back into bytes (`$dirs:join ":"`); it stringifies each
+  long," "the last one," and "flatten to a string." `:join(SEP)` is the fold
+  that turns a list back into bytes (`$dirs:join(":")`); it stringifies each
   element and errors on a nested list or map (there is no implicit deep
   flattening — spell it out). **`:dedup`** returns the list with duplicate
   elements removed — **keep-first, order-preserving**, equality by value — so
@@ -184,22 +184,15 @@ All four kinds:
 
 - **chain**: `$f:stem:stem`, `$(cmd):nulls` then value modifiers over each item,
   `$xs:rest:last` (collection modifiers compose too).
-- **Arguments — bare, space-separated, or parenthesized.** A **no-argument**
-  modifier is always **bare** — `:stem`, `:first`, `:dedup`, `:values` — and chains
-  by adjacency (`$f:stem:dir`, `$xs:rest:last`); it never takes parens (`:first`,
-  never `:first()`). A modifier that **takes arguments** accepts them either
-  **space-separated** (`:split ":"`, `:get key default`) or **parenthesized**
-  (`:split(":")`, `:get(key default)`). The paren form **delimits the argument
-  list**, so a following modifier chains with no whitespace:
-  `$host:split(".")​:first`. In the bare space form the argument list runs until the
-  next `:`-keyword, so a chained modifier there needs a **space** —
-  `$host:split "." :first`, *not* `$host:split ".":first`, because a modifier binds
-  to the value immediately before it, so `".":first` would take `:first` of the
-  `"."` literal (yielding `"."`) and hand *that* to `split`, dropping the chain.
-  So: prefer `:split(".")` when you chain after an argument; the space form is fine
-  when the arg-taking modifier is last. This whitespace-significance is the reason
-  the paren form exists — it makes the space non-load-bearing. (A slash-delimited
-  regex argument, `:match /re/`, is already self-delimiting — no parens needed.)
+- **No-argument modifiers are bare; arguments are parenthesized.** A modifier that
+  takes **no** argument is written bare and chains by adjacency — `$f:stem:dir`,
+  `$xs:rest:last`, `:dedup`, `:values` — never `:first()`. A modifier that **takes
+  arguments** uses **parentheses**, space-separated inside like a
+  [value call](#calling-for-a-value-and-lambdas): `:split(":")`, `:get(EDITOR vim)`,
+  `:get(99 "-")`. One form, so there is no load-bearing whitespace to trip over and
+  chaining is always unambiguous — `$host:split("."):first` reads exactly one way.
+  The lone exception is a **regex** argument, which is already slash-delimited and
+  needs no parens: `:match /re/` (the `/…/` *is* the delimiter).
 - **Disambiguation:** `:` is a modifier only when immediately followed by a
   known modifier keyword. `$host:$port` keeps `:` literal (the token after `:`
   is an expansion, not a keyword), so building `host:port`-style strings — or
@@ -214,7 +207,7 @@ $(cmd):words        # split on whitespace runs (opt-in; the old IFS behavior)
 $(cmd):nulls        # split on NUL   (find -print0 / xargs -0; newline-safe)
 $(cmd):tabs         # split on tab   (TSV)
 $(cmd):raw          # no split; raw bytes including the trailing newline
-$(cmd):split ":"    # split on an arbitrary separator
+$(cmd):split(":")    # split on an arbitrary separator
 ```
 
 The delimiter is a **terminator, not a separator**: **trailing empty fields are
@@ -397,12 +390,12 @@ hyphen between — the third payoff of that one spacing rule.
   that maps use, because the **environment is a first-class map named `env`**:
 
   ```
-  editor = $env:get EDITOR vim  # total: value, or "vim" if unset — never errors
+  editor = $env:get(EDITOR vim)  # total: value, or "vim" if unset — never errors
   $env.EDITOR                   # strict: errors if unset (like any $m.key)
   if $env:has SSH_AUTH_SOCK { … }
   ```
 
-  So `$env.EDITOR` (a strict read) errors when unset, and `$env:get EDITOR vim`
+  So `$env.EDITOR` (a strict read) errors when unset, and `$env:get(EDITOR vim)`
   is the safe defaulting form — no new syntax, just the map surface applied to
   the environment.
 - **No block scope; `unset` removes a scope's binding.** Control-flow blocks
@@ -435,7 +428,7 @@ hyphen between — the third payoff of that one spacing rule.
   children. **Only byte-strings can be exported** — the environment is a flat
   `KEY=bytes` table, so a list or map cannot cross an `exec` boundary. Exporting
   a list is an error with a clear message (join it first: `export P =
-  $dirs:join ":"`). **The one exception is path-type variables** —
+  $dirs:join(":")`). **The one exception is path-type variables** —
   `$env.PATH` and friends are lists *by design* and the shell **auto-`:`-joins**
   them on export (splitting on read); that is a defined serialization for the
   known `:`-delimited path vars, not a general "lists become strings" rule, so an
@@ -487,12 +480,12 @@ hyphen between — the third payoff of that one spacing rule.
 - **No null.** mesh has **no `nil`/`null`/`none`** value — the billion-dollar
   mistake is left out. The consequence is a consistent rule wherever a value
   might be absent: **exact** access fails loud (`$xs[99]`, `$m[absent]` are
-  errors), **total** access takes a default (`$xs:get i d`, `$m:get k d`), and
+  errors), **total** access takes a default (`$xs:get(i d)`, `$m:get(k d)`), and
   a **control-flow gap** yields the empty string (a no-`else` `if`). Nothing
   silently returns a null that has to be checked for downstream. *(open — the
   one genuine fork this leaves: is a first-class absent value ever worth adding
   back for, e.g., "key present but unset"? Current answer: no; `:has` +
-  `:get default` cover it.)*
+  `:get(key default)` cover it.)*
 
 **Special variables live in two namespace maps** — the *(decided)* way to keep
 the shell's built-in state out of your variable namespace. The whole lowercase
@@ -650,10 +643,10 @@ access is **strict** (fail loud), range access is **lenient** (clamp), and a
 | `$xs:first` / `$xs:last` | **error** on empty | no first/last element exists |
 | `$xs:rest` / `$xs:init` | **`[]`** | "all but one" of a 0- or 1-element list is genuinely empty — total, no error |
 | `$xs[a..b]` (slice) | **clamped** | `$xs[2..99]` → to the end; `$xs[5..]` on a short list → `[]` (a range is a request, a partial answer is fine) |
-| `$xs:get i default` | returns `default` | total, never errors — the safe accessor when absence is expected |
+| `$xs:get(i default)` | returns `default` | total, never errors — the safe accessor when absence is expected |
 
 So `$xs[99]` on a 4-element list is an error that names the index, but
-`$xs:get 99 "-"` yields `"-"`, and `$xs[1..99]` just runs to the end. Fail loud
+`$xs:get(99 "-")` yields `"-"`, and `$xs[1..99]` just runs to the end. Fail loud
 where a missing element means a mistake; stay total where absence is normal.
 
 **Build** goes through the spread operator `...` (see
@@ -795,7 +788,7 @@ for `$m[key]` or `${m.key}` when you need a map access *inside* a string.
 | `$m:values` | list | values |
 | `$m:len` | int | entry count (same word as lists) |
 | `$m:has KEY` | bool | membership — the decided spelling |
-| `$m:get KEY default` | value | total lookup — `default` when absent |
+| `$m:get(KEY default)` | value | total lookup — `default` when absent |
 
 **Membership is `:has`.** The terser `?` postfix (`$m[key]?`) was considered and
 dropped — it fights the "words, not punctuation" grain the modifiers are built
@@ -806,10 +799,10 @@ it adds a second way to phrase the same test, so weigh it before adding.)*
 
 **Missing keys** follow the same strict/total split as list access, since mesh
 has no null: `$m[absent]` is an **error** (a bad key is usually a typo in
-config, and should fail loud, not silently yield `""`), while `$m:get key
-default` is the total form that returns `default` when the key is absent, and
+config, and should fail loud, not silently yield `""`), while `$m:get(key
+default)` is the total form that returns `default` when the key is absent, and
 `if $m:has key { … }` is the guard. So a dynamic lookup that may legitimately
-miss is written `$m:get $name unknown`, never a bare `$m[$name]`.
+miss is written `$m:get($name unknown)`, never a bare `$m[$name]`.
 
 Insertion order is **preserved** (like Python dict / a `Vec<(K,V)>` behind the
 scenes) so `for k in $m:keys` is deterministic — important for an rc file that
@@ -876,11 +869,11 @@ the left**. So splitting a string into variables — bash's `read a b c` — is 
 *split then destructure*, and there is no monolithic `read` built-in:
 
 ```
-[user pass uid gid home shell] = $line:split ":"   # a passwd line into fields
-[k v]           = gets():split "="                 # read a line, split on =, bind two
+[user pass uid gid home shell] = $line:split(":")   # a passwd line into fields
+[k v]           = gets():split("=")                 # read a line, split on =, bind two
 [first ...rest] = $args                            # ...rest absorbs the remainder as a list
 [a b ...mid z]  = $xs                              # ends pinned; mid is everything between
-[_ _ uid]       = $line:split ":"                  # _ discards a field
+[_ _ uid]       = $line:split(":")                  # _ discards a field
 ```
 
 - **`...rest`** absorbs the remaining elements as a list (possibly empty) — the
@@ -1098,7 +1091,7 @@ Rules:
 - **Arguments do not word-split.** A bare list argument passes to an **in-shell
   function** as one list value. External programs take **bytes only**, so an
   un-spread list handed to an external command is an **error** — spread it
-  (`...$xs`, one argv entry per element) or join it (`$xs:join ","`, one
+  (`...$xs`, one argv entry per element) or join it (`$xs:join(",")`, one
   string). The shell never guesses a serialization (see
   [Spread](#spread--flattening)).
 - **Result and `return`.** A function's **result is its last expression** —
@@ -1484,16 +1477,16 @@ construct you write* is how you declare whether absence is a bug or expected:
 | --- | --- | --- |
 | bind N names from a list | `[a b] = xs` | `if [a b] = xs { … }` — a miss skips |
 | a captured group | `[x] = s:match /re/` | `if [x] = s:match /re/ { … }` |
-| index an element | `$xs[i]` | `$xs:get i default` — total, never errors |
-| a map value | `$m.key` | `$m:get key default` |
+| index an element | `$xs[i]` | `$xs:get(i default)` — total, never errors |
+| a map value | `$m.key` | `$m:get(key default)` |
 | read a line | — | `gets()` → `false` at EOF |
 | a branch's value | — | `if cond { v }` → `""` when false |
 
 So absence is loud when you **asserted** the value is there (a bare bind, a direct
 `[i]`) and quiet when you **asked whether** it is (`if`-binding, `:get`, `gets`, a
 no-`else` `if`). You never get bash's silent-empty-*by-default*; softness is
-explicit. The soft index accessor is the existing two-arg [`$xs:get i
-default`](#arrays-lists) rather than a `:get(i)` that returns a bare `false` or a
+explicit. The soft index accessor is the existing two-arg [`$xs:get(i
+default)`](#arrays-lists) rather than a `:get(i)` that returns a bare `false` or a
 `:get():default()` chain — deliberately, because the two-arg form does the bounds
 check *internally* and so can still distinguish "element `i` is genuinely `false` /
 `""`" from "there is no element `i`," which a returned-sentinel chain cannot. That

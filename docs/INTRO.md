@@ -63,7 +63,7 @@ mesh:  $files:filter(:exec)
 
 # join a list back into a colon-string (a whole shell function, in the config this
 # is ported from, collapses to one modifier)
-$env.PATH:join ":"
+$env.PATH:join(":")
 ```
 
 ## Split + destructure replaces `read` / `cut` / `IFS`
@@ -76,8 +76,8 @@ no `IFS` juggling:
 IFS=: read -r user pass uid gid home shell <<<"$line"
 
 # mesh
-[user pass uid gid home shell] = $line:split ":"
-[_ _ uid] = $line:split ":"        # _ discards fields you don't want
+[user pass uid gid home shell] = $line:split(":")
+[_ _ uid] = $line:split(":")        # _ discards fields you don't want
 ```
 
 Regex captures come back as a list, so there's no `[[ =~ ]]`-then-`$BASH_REMATCH`
@@ -147,7 +147,7 @@ isn't there. Asking for a missing element is a bug and says so; when absence is
 
 ```
 $xs[99]              # error — names the index; a missing element is a mistake
-$xs:get 99 "-"       # "-" — the total accessor, when absence is normal
+$xs:get(99 "-")       # "-" — the total accessor, when absence is normal
 [a b] = $xs          # error if $xs isn't exactly two long
 if [a b] = $xs { }   # soft: a wrong shape just skips the block
 ```
