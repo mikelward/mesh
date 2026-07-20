@@ -695,3 +695,32 @@ fn a_sigpipe_in_the_final_stage_still_counts() {
     let out = run_with_input("true | sh -c 'kill -PIPE $$'\n");
     assert_eq!(out.status.code(), Some(141));
 }
+
+#[test]
+fn redirections_apply_in_source_order() {
+    // `cat > out < missing` opens (creates/truncates) `out` first, then fails on
+    // the missing input — so `out` exists even though the command failed.
+    let dir = fresh_dir("redir_order");
+    let out = run_with_input(&format!(
+        "cd {}\ncat > out < missing\nputs after\n",
+        dir.display()
+    ));
+    assert!(
+        dir.join("out").exists(),
+        "out should have been created first"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("missing"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_descriptor_redirect_is_rejected_for_now() {
+    // `2>err` and `&>f` are deferred descriptor redirects — rejected loudly, not
+    // silently reinterpreted as a stdout redirect with a stray `2`/`&` argument.
+    let out = run_with_input("echo hello 2>err\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("descriptor redirection"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    let amp = run_with_input("echo hello &>f\nputs after\n");
+    assert!(String::from_utf8_lossy(&amp.stderr).contains("descriptor redirection"));
+}

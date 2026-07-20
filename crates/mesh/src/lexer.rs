@@ -51,6 +51,7 @@ pub enum LexError {
     BadInterpolation(String),
     MissingRedirectTarget,
     EmptyPipelineStage,
+    UnsupportedRedirect,
 }
 
 impl std::fmt::Display for LexError {
@@ -71,6 +72,10 @@ impl std::fmt::Display for LexError {
             LexError::EmptyPipelineStage => {
                 write!(f, "syntax error: empty command in a pipeline")
             }
+            LexError::UnsupportedRedirect => write!(
+                f,
+                "syntax error: descriptor redirection (e.g. `2>`, `&>`) is not supported yet"
+            ),
         }
     }
 }
@@ -183,6 +188,12 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
             continue;
         }
         if let Some((kind, len)) = redirect_at(&chars, i) {
+            // A file-descriptor redirect attached to the operator (`2>`, `&>`)
+            // is deferred — reject it rather than silently redirecting stdout and
+            // leaving the `2`/`&` as an argument.
+            if is_descriptor_prefix(&current, &chars, i) {
+                return Err(LexError::UnsupportedRedirect);
+            }
             finish_word(&mut current, &mut words, &mut redirs, &mut pending_redir);
             if pending_redir.is_some() {
                 return Err(LexError::MissingRedirectTarget);
@@ -309,6 +320,27 @@ fn separator_at(chars: &[char], at: usize) -> Option<(Sep, usize)> {
         '&' if chars.get(at + 1) == Some(&'&') => Some((Sep::And, 2)),
         '|' if chars.get(at + 1) == Some(&'|') => Some((Sep::Or, 2)),
         _ => None,
+    }
+}
+
+/// Is the redirection operator at `at` a deferred file-descriptor form — an
+/// unspaced fd number (`2>`) or `&` (`&>`) directly before it? True only when
+/// the pending word is exactly a run of digits, or a lone `&`, and it abuts the
+/// operator (no space), so `2 > f` (a plain argument) and `file2>f` are excluded.
+fn is_descriptor_prefix(current: &Option<Vec<Piece>>, chars: &[char], at: usize) -> bool {
+    if at == 0 || chars[at - 1].is_whitespace() {
+        return false;
+    }
+    match current.as_deref() {
+        Some(
+            [
+                Piece::Text {
+                    text,
+                    expandable: true,
+                },
+            ],
+        ) => text == "&" || (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())),
+        _ => false,
     }
 }
 
