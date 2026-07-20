@@ -1105,8 +1105,11 @@ first release.)*
 **Regex is a first-class value** *(decided — porting `fromto`, `filter`, `he`,
 `untar`)*. `/re/` is a **regex literal** evaluating to a regex **value**, and `~`
 and `:match` **consume a regex value** — so `$str ~ /re/` and `$str:match(/re/)` are
-the literal case. A `/…/` literal is **raw and does not interpolate** (like `r'…'`),
-so `$` inside it is always the anchor; build a regex with a variable hole via
+the literal case. A `/…/` literal is **raw and does not interpolate** — like `r'…'`
+but for a single lexical exception: **`\/` is the delimiter escape** (a literal slash
+in the pattern, since `/` bounds the literal), and the lexer strips only that
+backslash. Every *other* backslash reaches the regex engine verbatim (`\d`, `\.`,
+`\\`), and `$` inside it is always the anchor; build a regex with a variable hole via
 `re("…$var…")` (see the interpolation note below). A regex literal is recognized **only in the match slots** — the
 `~`/`!~` RHS, the `:match` argument, and a `match` arm — and there a leading-slash
 word is a regex **only when its base is a clean `/BODY/`** (the base is the word minus
@@ -1152,9 +1155,9 @@ therefore be known at construction: folded in pre-compile on a `/…/` literal
 (`/foo # (/:x`, compiled once) or passed as a constructor argument
 (`re($x --extended)`), never as a post-hoc modifier on a finished value.)*
 
-*(decided: **`/…/` does not interpolate** — it is a **raw** regex literal (like
-`r'…'`), so a `$` inside `/…/` is always the anchor/metacharacter, with no
-splice-vs-anchor ambiguity. To build a regex with a variable hole, use
+*(decided: **`/…/` does not interpolate** — it is a **raw** regex literal (raw except
+the `\/` delimiter escape; see the regex-value section above), so a `$` inside `/…/`
+is always the anchor/metacharacter, with no splice-vs-anchor ambiguity. To build a regex with a variable hole, use
 **`re("…$var…")`**: the `"…"` string does the interpolation (its settled `$`-splice /
 `\$`-literal rules apply), then `re()` compiles. So there is **one** interpolation
 path — the `"…"` string — and no `/$var/` special case; the earlier deferred sugar is
