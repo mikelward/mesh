@@ -4,10 +4,11 @@ How to build, test, and lay out the mesh implementation. For *what* mesh is and
 the language design, see [`DESIGN.md`](DESIGN.md); for the milestone plan, see
 [`ROADMAP.md`](ROADMAP.md).
 
-> **Status:** the implementation is at **M0** — a read/tokenize/exec loop that
-> launches external commands plus an `exit` builtin. None of the mesh *language* is
-> implemented yet. Treat the current code as a seed, not a foundation to build
-> features on before the real lexer/parser land.
+> **Status:** the implementation is a read/tokenize/exec loop that launches
+> external commands plus the `cd`, `pwd`, `puts`, and `exit` builtins, behind a
+> hardcoded prompt. None of the mesh *language* is implemented yet. Treat the
+> current code as a seed, not a foundation to build features on before the real
+> lexer/parser land.
 
 ## Prerequisites
 
@@ -124,7 +125,7 @@ mesh/
 │       │   ├── main.rs     # entry point
 │       │   ├── repl.rs     # read / tokenize / dispatch loop
 │       │   ├── lexer.rs    # M0 whitespace tokenizer (PLACEHOLDER)
-│       │   ├── builtins.rs # exit (cd deferred to M1)
+│       │   ├── builtins.rs # cd, pwd, puts, exit
 │       │   └── exec.rs     # launch external commands, map exit status
 │       └── tests/
 │           └── cli.rs      # end-to-end tests driving the built binary
@@ -136,12 +137,12 @@ mesh/
 └── docs/                   # INTRO.md, PROMPT.md — design narratives
 ```
 
-### How the M0 code fits together
+### How the code fits together
 
 `main` calls `repl::run`, which loops: read a line → `lexer::split` into words →
-`builtins::dispatch` (handles `exit`, returns `None` otherwise) → else
-`exec::run` launches the external command. The loop tracks the last exit status
-and returns it as the process exit code at EOF.
+`builtins::dispatch` (handles `cd`/`pwd`/`puts`/`exit`, returns `None` otherwise)
+→ else `exec::run` launches the external command. The loop tracks the last exit
+status and returns it as the process exit code at EOF.
 
 **Planned evolution.** When the real lexer/parser replace the M0 placeholder,
 the shell internals graduate into a `crates/mesh-core` **library** and the binary

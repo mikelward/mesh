@@ -30,9 +30,10 @@ it names. No mesh language yet.
   when signaled; the last command's status becomes the shell's exit code.
 - Zero dependencies; workspace + CI (fmt, clippy, test on Linux and macOS).
 
-`cd` is **punted to M1** (tentative — see `TODO.md`): a correct `cd` pulls in
-logical-cwd tracking, `CDPATH`, `cd -`, and the `$env.PWD`/`OLDPWD` contract from
-`DESIGN.md`, which is more than M0 needs to run `ls`.
+`cd` was **punted from M0** to keep it minimal: a correct `cd` pulls in
+logical-cwd tracking, `CDPATH`, and the `$env.PWD`/`OLDPWD` contract from
+`DESIGN.md`, which is more than M0 needs to run `ls`. A basic `cd` (plus `pwd`
+and `puts`) subsequently landed in M1.
 
 **Acceptance**
 - `echo 'ls' | mesh` lists the directory; an interactive session runs `ls`,
@@ -63,7 +64,9 @@ the placeholder tokenizer with the first real slice of the mesh lexer.
 - Promote the shell internals into a `crates/mesh-core` library; the binary
   becomes a thin `main` (enables direct unit tests of the lexer).
 - `&&` / `||` sequencing and `;` — the smallest useful control flow.
-- `cd` builtin (deferred from M0): `$env.PWD`/`OLDPWD`, `cd -`, `CDPATH`.
+- `cd`/`pwd`/`puts` builtins ✅ landed — basic `cd` (`$HOME`, `cd -`, updates
+  `$env.PWD`/`OLDPWD`). Remaining for `cd`: `CDPATH`, `--physical`, autocd,
+  logical cwd.
 
 **Acceptance:** edit and recall lines interactively; `echo "a b"` passes one
 argument; `false || echo ok` prints `ok`.

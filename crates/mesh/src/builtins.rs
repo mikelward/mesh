@@ -74,6 +74,7 @@ fn cd(args: &[String]) -> u8 {
         return 1;
     }
 
+    let mut status = 0;
     // SAFETY: the shell runs this loop single-threaded, so mutating the
     // environment here races with nothing.
     unsafe {
@@ -83,11 +84,11 @@ fn cd(args: &[String]) -> u8 {
         if let Ok(current) = env::current_dir() {
             env::set_var("PWD", &current);
             if echo_destination {
-                write_path(current.as_os_str());
+                status = write_stdout("cd", &path_line(current.as_os_str()));
             }
         }
     }
-    0
+    status
 }
 
 /// The bytes to print for a path: its raw `OsStr` bytes plus a newline, so a
@@ -98,9 +99,19 @@ fn path_line(path: &OsStr) -> Vec<u8> {
     line
 }
 
-/// Write a path to stdout as raw bytes followed by a newline.
-fn write_path(path: &OsStr) {
-    let _ = std::io::stdout().write_all(&path_line(path));
+/// Write `bytes` to stdout, returning a builtin status: `0` on success, `1` on
+/// error. An ordinary I/O failure (a full disk, a closed pipe) must report a
+/// failure, never crash the REPL — so this never panics the way `println!` does.
+/// A broken pipe is silent (the reader went away), the way a shell takes SIGPIPE.
+fn write_stdout(label: &str, bytes: &[u8]) -> u8 {
+    match std::io::stdout().write_all(bytes) {
+        Ok(()) => 0,
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => 1,
+        Err(err) => {
+            eprintln!("mesh: {label}: {err}");
+            1
+        }
+    }
 }
 
 /// `pwd` — print the current working directory (physical `getcwd`).
@@ -112,10 +123,7 @@ fn pwd(args: &[String]) -> u8 {
         return 1;
     }
     match env::current_dir() {
-        Ok(dir) => {
-            write_path(dir.as_os_str());
-            0
-        }
+        Ok(dir) => write_stdout("pwd", &path_line(dir.as_os_str())),
         Err(err) => {
             eprintln!("mesh: pwd: {err}");
             1
@@ -127,8 +135,9 @@ fn pwd(args: &[String]) -> u8 {
 /// by a newline (no args → a blank line). The basic string form; list/value
 /// formatting arrives with the value system.
 fn puts(args: &[String]) -> u8 {
-    println!("{}", args.join(" "));
-    0
+    let mut line = args.join(" ").into_bytes();
+    line.push(b'\n');
+    write_stdout("puts", &line)
 }
 
 /// `exit [N]` — leave the shell with status `N` (default 0). The status is an

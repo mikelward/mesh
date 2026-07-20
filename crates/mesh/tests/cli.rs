@@ -120,6 +120,34 @@ fn cd_rejects_surplus_operands() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("too many arguments"));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn stdout_write_error_does_not_crash_the_shell() {
+    // Writing to /dev/full always fails with ENOSPC. `puts` must report the
+    // error and the REPL must keep going (not panic with exit 101), so the
+    // following `exit 7` still runs.
+    use std::fs::OpenOptions;
+    let dev_full = OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .stdin(Stdio::piped())
+        .stdout(dev_full)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"puts hi\nexit 7\n")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait for mesh");
+    assert_eq!(out.status.code(), Some(7));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("puts"));
+}
+
 #[test]
 fn last_status_becomes_the_exit_code() {
     // `false` exits 1, then EOF; the shell should exit 1.
