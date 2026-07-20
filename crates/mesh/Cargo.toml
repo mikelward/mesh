@@ -10,11 +10,7 @@ publish = false
 [lints]
 workspace = true
 
-# reedline provides interactive line editing, history, and Ctrl-C/Ctrl-D
-# handling. It is used only for interactive (TTY) input; piped input keeps the
-# std-only byte reader, so the integration tests stay dependency-light. Further
-# interactive deps (nix for job control) arrive with the tasks that need them —
-# see ../../ROADMAP.md.
+# The executable stays intentionally thin; all shell behavior lives in the
+# library crate so it can be reused and tested independently.
 [dependencies]
-glob = "0.3.3"
-reedline = "0.49.0"
+mesh-core = { path = "../mesh-core" }
