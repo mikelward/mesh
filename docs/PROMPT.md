@@ -41,7 +41,7 @@ $sh.prompt.rule = rule                                   # a full-width rule
 
 # where you are — one line: user@host, the path in blue, the git branch in green
 $sh.prompt.head = [
-  who:  func() { h = $env.HOSTNAME:split "." :first; "${env.USER}@$h" },
+  who:  func() { h = $env.HOSTNAME:split("."):first; "${env.USER}@$h" },
   path: func() { style(pwd() --fg=blue) },
   git:  func() { style("$(git branch --show-current)" --fg=green) },   # empty off a repo → hidden
 ]
