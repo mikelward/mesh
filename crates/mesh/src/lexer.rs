@@ -94,7 +94,7 @@ pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
                     i += 1;
                 }
             },
-            '$' => match parse_var(&chars, i + 1) {
+            '$' => match parse_var(&chars, i + 1, true) {
                 Some((vref, next)) => {
                     word.push(Piece::Var(vref));
                     i = next;
@@ -148,7 +148,9 @@ fn lex_escaped(
             break;
         }
         if double && c == '$' {
-            if let Some((vref, next)) = parse_var(chars, i + 1) {
+            // Inside a string an unbraced `$name.member` is `$name` + literal
+            // `.member`; only `${…}` parses member access here.
+            if let Some((vref, next)) = parse_var(chars, i + 1, false) {
                 push_text(word, &buf, false);
                 buf.clear();
                 word.push(Piece::Var(vref));
@@ -217,7 +219,13 @@ fn lex_raw(
 /// Parse a `$…` interpolation starting at `at` (the index just past `$`).
 /// Returns the reference and the index just past it, or `None` if `$` is not
 /// followed by a valid variable (so the `$` is a literal character).
-fn parse_var(chars: &[char], at: usize) -> Option<(VarRef, usize)> {
+///
+/// `member_after_name` controls whether a `.member` after an unbraced `$name` is
+/// consumed as member access. It is **true** outside strings (`$m.key` is access)
+/// and **false** inside `"…"`, where an unbraced `$name.member` is `$name` plus
+/// the literal `.member` (per `DESIGN.md` — use `${…}` for access in a string).
+/// The braced `${…}` form always parses member access.
+fn parse_var(chars: &[char], at: usize, member_after_name: bool) -> Option<(VarRef, usize)> {
     if chars.get(at) == Some(&'{') {
         let start = at + 1;
         let mut j = start;
@@ -232,13 +240,20 @@ fn parse_var(chars: &[char], at: usize) -> Option<(VarRef, usize)> {
     }
     let (name, mut j) = read_name(chars, at)?;
     let mut member = None;
-    if chars.get(j) == Some(&'.') {
+    if member_after_name && chars.get(j) == Some(&'.') {
         if let Some((m, k)) = read_name(chars, j + 1) {
             member = Some(m);
             j = k;
         }
     }
     Some((VarRef { name, member }, j))
+}
+
+/// Is `s` a valid kebab identifier? Uses the same rule as [`read_name`] (so an
+/// assignment target and a `$name` read agree — e.g. `a--b` is not a name).
+pub fn is_ident(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    matches!(read_name(&chars, 0), Some((_, n)) if n == chars.len())
 }
 
 /// Parse the inner content of a `${…}` — a `name` with an optional `.member`.
