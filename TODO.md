@@ -23,10 +23,19 @@ file as tasks land.
 - [ ] `;`, `&&`, `||` sequencing
 - [ ] A simple prompt (host/dir), stderr-rendered as today
 
+## Decisions needed
+
+- [ ] **Choose a repo license** (none declared yet). M0 has no dependencies, so
+      nothing constrains the choice today. Planned deps and their licenses:
+      `reedline` MIT, `nix` MIT, `crossterm` MIT — all permissive; `nucleo`
+      **MPL-2.0** (weak, file-level copyleft). MPL-2.0 is compatible with a
+      permissive project license (it only obliges sharing changes to nucleo's
+      *own* files), but confirm the intended repo license (e.g. MIT, or
+      MIT OR Apache-2.0 — the Rust-ecosystem norm) is acceptable alongside it.
+
 ## Icebox / decide later
 
 - [ ] Reading a script file as an argument (`mesh script.msh`) vs. stdin only
 - [ ] `-c "…"` one-shot command flag
 - [ ] Whether satellite helpers (`vcs`, prompt) are Rust workspace members or
       standalone (per-helper call; see `DEVELOPMENT.md`)
-- [ ] License choice for the repo (none declared yet)

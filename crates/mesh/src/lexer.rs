@@ -1,12 +1,12 @@
 //! M0 tokenizer.
 //!
-//! **This is a placeholder, not the real lexer.** It splits on ASCII whitespace
-//! and nothing else — no quotes, no `$`-expansion, no lists, no operators. It
-//! exists only so M0 can name and launch an external command. The real lexer
-//! (quoting, expansion, the clean-break grammar) is designed in `DESIGN.md` and
-//! lands in a later milestone; do not build features on top of this.
+//! **This is a placeholder, not the real lexer.** It splits on whitespace and
+//! nothing else — no quotes, no `$`-expansion, no lists, no operators. It exists
+//! only so M0 can name and launch an external command. The real lexer (quoting,
+//! expansion, the clean-break grammar) is designed in `DESIGN.md` and lands in a
+//! later milestone; do not build features on top of this.
 
-/// Split a line into words on runs of ASCII whitespace, dropping empties.
+/// Split a line into words on runs of Unicode whitespace, dropping empties.
 pub fn split(line: &str) -> Vec<String> {
     line.split_whitespace().map(str::to_owned).collect()
 }
@@ -28,5 +28,11 @@ mod tests {
     #[test]
     fn empty_line_is_no_words() {
         assert!(split("   \t\n").is_empty());
+    }
+
+    #[test]
+    fn splits_on_unicode_whitespace() {
+        // A no-break space (U+00A0) is whitespace here — see the module doc.
+        assert_eq!(split("a\u{00A0}b"), ["a", "b"]);
     }
 }
