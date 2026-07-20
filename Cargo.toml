@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["crates/mesh"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/mikelward/mesh"
+
+# Lints applied across every workspace crate. Warnings are denied in CI
+# (`cargo clippy -- -D warnings`); keep the source clean rather than sprinkling
+# `#[allow]`.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

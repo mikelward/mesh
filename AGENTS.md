@@ -5,9 +5,11 @@ Conventions for AI agents working in this repository.
 `CLAUDE.md` and `GEMINI.md` are symlinks to this file, so every agent reads the
 same conventions. Edit `AGENTS.md`.
 
-The repo is at the **design stage** — `DESIGN.md` is the deliverable and there is
-no implementation yet. The code-style and testing rules below apply once
-implementation begins; the process rules apply now.
+The repo runs two tracks in parallel. **Language design** is still in progress in
+`DESIGN.md`. A **build track** has started (milestone M0): see `DEVELOPMENT.md`
+for build/test/layout and `ROADMAP.md` for the plan. The code-style and testing
+rules below are now in force for anything under `crates/`; the process rules
+apply throughout.
 
 ## Responding to review comments
 
