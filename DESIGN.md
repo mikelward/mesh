@@ -575,8 +575,9 @@ Leaning: maps only — revisit only if a real need survives the reframe.)*
 
 ### Quoting and escaping
 
-mesh has three ways to write a literal plus one escape character, chosen so the
-common cases need no ceremony and the rules stay few.
+mesh has a few string forms — a bare word, three quote kinds (`"…"`, `'…'`, `r'…'`),
+and a heredoc — plus the backslash escape, chosen so the common cases need no
+ceremony and the rules stay few.
 
 **Bare words are literal** (`x = foo` binds `"foo"`), and a single **backslash
 escapes the next character** so one metacharacter can go literal without reaching
@@ -584,13 +585,18 @@ for quotes: `cp a\ b dst` (a literal space keeps it one argument), `\*` (a liter
 star, not a glob), `\$`, `\#`, `\!`, `\-`. A `\` at end of line is **line
 continuation**.
 
-**Single quotes `'…'` are raw** — no interpolation and almost no escapes — so they
-are the natural home for regex source and paths (`'\d+\.txt'` is exactly those
-bytes). The **only** two escapes are **`\'`** (a literal quote — `'can\'t'` →
-`can't`) and **`\\`** (a literal backslash — `'C:\\'` → `C:\`); the `\\` escape is
-what lets you put a backslash *before* a quote (`'\\\''` → `\'`) or at the very end
-of a string. *Every other* backslash — `\n`, `\d`, `\.` — stays literal, so regex
-and path rawness holds.
+**Single quotes `'…'` don't interpolate but do escape** — they are `"…"` minus `$`
+interpolation (Python's `str`). The escape set is the double-quote set with the quote
+swapped: `\n \t \r \e \\ \'` and `\u{…}`; `$` is always literal (no `\$` needed), and
+an **unknown escape is an error** (`'\d'` is a mistake, not a literal backslash-d).
+So `'can\'t'` → `can't`, `'a\nb'` is two lines, and no variable expands.
+
+**Raw strings `r'…'` / `r"…"` take no escapes at all** — every byte is literal and
+the delimiter is the only special character — so they are the home for regex source
+and paths: `r'\d+\.txt'` is exactly those bytes and `r'C:\x'` is a Windows path. Pick
+the delimiter that avoids your content's quote — `r"can't \d+"` holds an apostrophe
+freely — and a string needing **both** quote kinds uses the quoted-delimiter
+[heredoc](#redirection).
 
 **Double quotes `"…"` interpolate and escape.** `$name` / `${…}`
 [interpolate](#variables-and-assignment), and a **modern C-style escape set**
@@ -603,9 +609,84 @@ because double quotes already interpret escapes.
 single path and `--flag='some value'` is one argument — so literals and expansions
 compose without a `+`.
 
-*(open: a raw form that can itself hold *both* quote kinds — a heredoc or an
-`r#"…"#`-style delimiter — for the rare string needing embedded `'` and `"` with
-no escaping.)*
+*(decided: the raw form that can itself hold *both* quote kinds — for the rare
+string embedding `'` and `"` with no escaping — is a **quoted-delimiter heredoc**
+(`<< 'END' … END`; the bare `<< END` interpolates, see [Redirection](#redirection)),
+chosen over an `r#"…"#` delimiter; see [`TODO.md`](TODO.md). Its *value-producing*
+spelling is still unspecified — today's heredoc is command-redirection only —
+tracked in TODO.md.)*
+
+**Regex literals stay `/…/`; absolute paths are disambiguated by word shape**
+*(decided direction — the raw-string alternative is recorded under "Alternatives
+considered" below)*. mesh keeps the familiar `/…/` regex literal and resolves the one
+real problem it creates — an absolute path or glob also begins with `/` — with a
+**word-shape rule**, replacing the blunt "any leading slash in a match slot is a
+regex."
+
+In a **match slot** (the `~` / `!~` RHS, a `:match` argument, a `match` arm), a word
+beginning with `/` is a **regex** *only* when its **base** — the word stripped of any
+trailing recognized `:` flag modifiers — is a clean `/BODY/`: the closing `/` is the
+final character of the base and `BODY` has no unescaped interior `/`. So `/\d+/:i` is
+a regex (base `/\d+/`, then `:i`). Every other leading-`/` word is a **path or
+glob**:
+
+| RHS word | reads as | why |
+| --- | --- | --- |
+| `/error/`, `/^\d+$/`, `/a\|b/` | **regex** | clean `/BODY/`, no interior `/` |
+| `/a\/b/` | **regex** `a/b` | interior slash escaped |
+| `/usr/bin` | **path** | interior `/` before the end |
+| `/usr/*/bin` | **glob** (absolute) | interior `/` ⇒ path shape |
+| `/tmp/*` | **glob** | the closing-looking `/` isn't final |
+| `/tmp` | **path** | no closing `/` |
+| `/*.txt` | **glob** at root | leading `/`, no closing `/` |
+
+The win over the old rule: **absolute globs and paths need no `glob("…")` wrapper** —
+`$p ~ /tmp/*` and `$p ~ /usr/bin` just work, where before *every* absolute pattern
+had to be wrapped.
+
+**The one residual.** A single segment with a trailing slash still reads as a regex:
+`$p ~ /tmp/` is the regex `tmp`, not the path. Three teachable outs — drop the slash
+(`$p ~ /tmp`, the path, and the more usual spelling anyway), add structure
+(`$p ~ /tmp/*`), or force it (`glob("/tmp/")` / `== "/tmp/"`). That is the entire
+residual, versus the old rule's blanket wrapper requirement.
+
+**Recognized only in match slots.** Everywhere else a `/…/` word stays a path or
+string — `cd /tmp/`, `grep /usr/bin`, `p = /etc/hosts`. In particular an
+**assignment** `x = /…/` binds the **path string**, not a regex: extending
+regex-literal recognition into general value position was considered and **not
+chased** — it reopens the `$`-anchor-vs-interpolation ambiguity (worst exactly where
+interpolation is expected), splits `x = /tmp/` from `cd /tmp/` inconsistently, and
+buys only sugar over `re("…")`. To bind a **regex value** to a name, use the
+constructor with a raw string, `pat = re(r'\d+')` (a plain `'\d+'` is a Model B
+error — `\d` is an unknown escape).
+
+**Settled independent of the literal syntax:** regex flags are `:` modifiers on the
+regex value — `/\d+/:i`, `:m`, `:s`, `:x` (see the note by `re()`; parse-affecting
+flags like `:x` are construction-time).
+
+**Alternatives considered (explored, not taken).** Sketched while hunting for a rule
+with *zero* edge cases; the word-shape rule above accepts one narrow residual
+instead. Kept as the record and as possible future sugar:
+
+- **`rx'…'` as a regex literal replacing `/…/`.** The Python-shaped string trio —
+  `"…"`, `'…'` (non-interpolating but escaped), `r'…'` / `r"…"` (raw) — **was
+  adopted** (see [Quoting](#quoting-and-escaping) above); what was *not* taken is
+  spelling the **regex literal** as `rx'…'` (raw body → regex value,
+  `rx'\d+' ≡ re(r'\d+')`) with `/` then always a path/glob. `/…/` is kept instead.
+  Still, `rx'…'` remains the clean way to write a regex *value* in a non-match
+  position (`pat = rx'\d+'`: no `$`-anchor issue, no path ambiguity), so it may
+  return as sugar for `re(r'…')`.
+- **`~` / `match` RHS coercion** *(decided: no coercion, for now)*. A plain string on
+  the RHS stays an **error**; a regex must be explicit (`/…/` or `re($pat)`) — the
+  no-silent-coercion rule (below) holds. The two coercion flavors were weighed and
+  neither adopted: *string → regex* ("like `match`": terse, but inverts the universal
+  "quotes mean literal" and risks `$x ~ 'a.b'` matching `axb`), and
+  *quotes-mean-literal* (`'…'` inert, regex only via `re` / `/…/`). Revisitable.
+- **Removing the two single-quote escapes.** The thread's original question — the old
+  design made `'…'` raw with only `\'` / `\\`, and asked whether to drop those to make
+  it *fully* raw. Overtaken by adopting Model B: `'…'` is now the *escaped*
+  non-interpolating string (so `\'` is simply part of a full escape set), and rawness
+  lives in `r'…'`. No longer open.
 
 ### Arrays (lists)
 
@@ -1026,12 +1107,16 @@ first release.)*
 `untar`)*. `/re/` is a **regex literal** evaluating to a regex **value**, and `~`
 and `:match` **consume a regex value** — so `$str ~ /re/` and `$str:match(/re/)` are
 the literal case. A regex literal is recognized **only in the match slots** — the
-`~`/`!~` RHS, the `:match` argument, and a `match` arm — and there a `/…/` is
-**always a regex**. The `~` RHS *also* takes a **glob**, but a bare glob is
-**relative** (`*.txt`, `src/**`) — it never starts with `/`, so it never collides;
-an **absolute** glob uses the **`glob(STR)`** constructor (`$p ~ glob("/usr/*/bin")`),
-because a bare leading-slash `/…/` reads as a regex there. So `$p ~ /tmp/` is the
-regex `tmp` (not the path); for the path, `$p ~ glob("/tmp/")` or `$p == "/tmp/"`.
+`~`/`!~` RHS, the `:match` argument, and a `match` arm — and there a leading-slash
+word is a regex **only when its base is a clean `/BODY/`** (the base is the word minus
+any trailing `:` flag modifiers, so `/\d+/:i` qualifies; the closing `/` is the base's
+final character and `BODY` has no unescaped interior `/`); every other leading-`/`
+word is a **path or glob** (full rule and cases in [Quoting](#quoting-and-escaping)).
+The `~` RHS *also* takes a **glob**: a **relative** one is bare (`*.txt`, `src/**`),
+and an **absolute** one now also goes bare — `$p ~ /usr/*/bin`, `$p ~ /tmp/*` — with
+`$p ~ /usr/bin` reading as the path. The one residual is a single segment with a
+trailing slash: `$p ~ /tmp/` is the regex `tmp`; write `$p ~ /tmp` for the path (or
+`glob("/tmp/")` / `== "/tmp/"`).
 **Everywhere else a `/…/` word is a path or string** — `cd /tmp/`, `grep /usr/bin`,
 `$env.PATH:has(/usr/bin)`, `p = /etc/hosts` are all unaffected (a `/…/` is only a
 regex next to the match operators, never in a plain argument or modifier slot). To
@@ -1043,9 +1128,28 @@ into one, you use the constructor **`re($str)`**: `$line ~ re($to)`,
 **fail-loud** (a malformed pattern errors at the call, not silently), carries flags
 on the value (`re($x --ignore-case)`), and `re($s --literal)` quotes the string to
 match **verbatim** (Perl's `\Q…\E`) — the common "match exactly what the user typed"
-case. A **bare string is never auto-converted**: `$s ~ "a.b"` is an **error**
-pointing at `re("a.b")` or `/a.b/`, so a string full of metacharacters never
-silently becomes a pattern — the same no-silent-coercion rule as `:int`.
+case. A **bare string is never auto-converted** *(decided — no RHS coercion, for
+now)*: `$s ~ "a.b"` is an **error** pointing at `re("a.b")` or `/a.b/`, so a string
+full of metacharacters never silently becomes a pattern — the same no-silent-coercion
+rule as `:int`.
+
+*(Settled — regex flags are `:` modifiers* (independent of the quoting exploration
+above). Flags are set with the ordinary
+[`:` modifier](#modifiers) machinery rather than a constructor flag: `re($x):i` /
+`:ignorecase`, `:m` / `:multiline`, `:s` / `:dotall`, `:x` / `:extended` —
+chainable, and carrying the readable-or-terse dual spelling used elsewhere. This
+applies to `re(…)` and to the `/…/` literal (`/\d+/:i`). *(Decided: the `:` modifiers
+**coexist** with the `--ignore-case` constructor flag — both spellings are
+supported.)* `--literal` stays a
+**constructor** argument regardless, since it
+changes how the string becomes a pattern rather than being a post-hoc flag on a
+finished regex. Match-behavior flags (`:i` `:m` `:s`) work as post-hoc modifiers on
+any regex value; a **parse-affecting** flag like `:x` cannot, because `re()` is
+fail-loud and compiles the *unflagged* pattern first — `re('foo # (')` errors before
+a trailing `:x` could make it valid in extended mode. Parse-affecting flags must
+therefore be known at construction: folded in pre-compile on a `/…/` literal
+(`/foo # (/:x`, compiled once) or passed as a constructor argument
+(`re($x --extended)`), never as a post-hoc modifier on a finished value.)*
 
 *(deferred: **`/$var/` interpolation** for a literal skeleton with a variable hole
 (`/^$user@/`). Held because `$` is the regex end-anchor, so interpolation would need
@@ -1523,9 +1627,11 @@ to a bool):
   `[[ $s =~ re ]]`, unified. The regex form is **unanchored** (first match
   anywhere, as bash `=~` and grep are); anchor with `^…$`. A glob, by contrast,
   matches the **whole string** (fnmatch), the same as a `/re/` wrapped in `^…$` —
-  and `:match` shares the regex rule. On the RHS a `/…/` is the regex; a **relative**
-  glob (`*.txt`) is bare, and an **absolute** glob uses the `glob("/usr/*/bin")`
-  constructor (a bare leading-slash `/…/` would read as a regex).
+  and `:match` shares the regex rule. On the RHS a leading-slash word is the regex
+  only when its base (minus trailing `:` modifiers, so `/\d+/:i` counts) is a clean
+  `/BODY/` (closing `/` final, no unescaped interior `/`); otherwise it is a path or
+  glob, so both **relative** (`*.txt`) and **absolute** (`/usr/*/bin`, `/tmp/*`) globs
+  are bare (full rule in [Quoting](#quoting-and-escaping)).
 - **File tests** are the scalar cousins of the `:files`/`:f` filter modifiers.
   The type/permission axis is words: `$p:type` yields the `find -type` word
   (`file`/`dir`/`link`/…) so `$p:type == dir` is `-d`; `$p:exists` is `-e`;
@@ -1825,6 +1931,14 @@ Two mesh notes, neither a behavior change:
   (`puts $xs > file`) and the command's stdout is what lands. This is the same
   bytes-vs-values split as [command substitution](#command-substitution) and
   [export](#variables-and-assignment).
+- A **here-document** `<< END … END` **interpolates** by default — `$var` and the
+  `"…"` escape set apply, as inside double quotes — and a **quoted delimiter**
+  `<< 'END' … END` makes it **raw** (no interpolation, no escapes), the bash
+  convention. The quoted-delimiter form is mesh's raw **both-quote-kinds** string: it
+  holds `'` and `"` freely with no escaping. Using a heredoc as a **value**
+  (`re(<< 'END' … END)`, `x = << END … END`) rather than a command's stdin is still
+  to be specified (see [`TODO.md`](TODO.md)); the interpolate-unless-quoted rule
+  applies to both uses.
 
 *(open: `noclobber` and the `>|` override; whether `&>>` append-both is worth a
 spelling.)*
