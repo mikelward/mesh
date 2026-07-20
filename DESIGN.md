@@ -247,9 +247,10 @@ Rules:
 *(TODO — decisions surfaced porting real `PATH` / `find_up` code:*
 - ***Transform-vs-predicate overlap.*** Keeping directories is the settled
   `:dirs` / `:d` filter modifier; the open question is only the footgun sitting
-  next to it — `:dir` is *dirname* (a transform), so a slip to `$paths:filter(:dir)`
-  silently keeps **everything** (dirname is always a truthy string). Decide whether
-  a bare **transform** modifier used in **predicate** position should be a **loud
+  next to it — `:dir` is *dirname* (a transform), so a predicate that reaches for it,
+  `$paths:filter(func(p) { $p:dir })`, silently keeps **everything** (dirname is
+  always a truthy string) when the writer meant "keep directories." Decide whether a
+  transform modifier surfacing as a predicate's truthy value should be a **loud
   error** rather than a quiet keep-all.
 - ***Upward path walk — `:ancestors` / `:parents`.*** `find_up`, project-root
   detection, and `rootdir` all want `$env.PWD:ancestors` → `[/a/b/c /a/b /a /]`, turning
