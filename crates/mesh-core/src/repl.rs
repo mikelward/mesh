@@ -70,7 +70,7 @@ enum Step {
 /// sequence of commands joined by `;` / `&&` / `||`; each connector decides
 /// whether its command runs from the previous command's status. Empty lines (and
 /// empty segments, e.g. a trailing `;`) are a no-op that keeps the last status.
-fn run_line(text: &str, last: u8, shell: &mut Shell) -> Step {
+fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
     // A `func name(params) { … }` definition is parsed from raw text, since its
     // body spans lines that the per-line lexer would otherwise flatten.
     if is_func_start(text) {
@@ -97,8 +97,19 @@ fn run_line(text: &str, last: u8, shell: &mut Shell) -> Step {
         }
         match run_pipeline(segment.stages, status, shell) {
             Step::Continue(code) => status = code,
-            // `exit` / `return` abort the rest of the line immediately.
-            other => return other,
+            // `exit` aborts the rest of the line immediately.
+            Step::Exit(code) => return Step::Exit(code),
+            Step::Return(code) => {
+                if in_function {
+                    // Inside a function, `return` unwinds — abort the line so the
+                    // caller (`call_func`) can stop the body.
+                    return Step::Return(code);
+                }
+                // At top level `return` is a recoverable error; the `;` sequence
+                // still runs the following command unconditionally.
+                eprintln!("mesh: return: not inside a function");
+                status = 1;
+            }
         }
     }
     Step::Continue(status)
@@ -317,7 +328,7 @@ fn call_func(name: &str, args: Vec<String>, shell: &mut Shell) -> Step {
     let mut status = 0;
     let mut result = Step::Continue(status);
     for line in body.lines() {
-        match run_line(line, status, shell) {
+        match run_line(line, status, true, shell) {
             Step::Continue(code) => {
                 status = code;
                 result = Step::Continue(code);
@@ -615,10 +626,9 @@ fn run_interactive() -> ExitCode {
                 Some(step) => match step {
                     Step::Exit(code) => return ExitCode::from(code),
                     Step::Continue(code) => last = code,
-                    Step::Return(_) => {
-                        eprintln!("mesh: return: not inside a function");
-                        last = 1;
-                    }
+                    // Top-level `run_line` reports a stray `return` itself, so one
+                    // never reaches here.
+                    Step::Return(_) => unreachable!("top-level return is handled in run_line"),
                 },
             },
             Err(err) => {
@@ -650,7 +660,7 @@ fn handle_signal(
                 return None;
             }
             let text = std::mem::take(pending);
-            Some(run_line(&text, last, shell))
+            Some(run_line(&text, last, false, shell))
         }
         Signal::CtrlD if pending.is_empty() => Some(Step::Exit(last)),
         _ => {
@@ -698,24 +708,20 @@ fn run_piped() -> ExitCode {
             continue;
         }
         let full = std::mem::take(&mut pending);
-        match run_line(&full, last, &mut shell) {
+        match run_line(&full, last, false, &mut shell) {
             Step::Exit(code) => return ExitCode::from(code),
             Step::Continue(code) => last = code,
-            Step::Return(_) => {
-                eprintln!("mesh: return: not inside a function");
-                last = 1;
-            }
+            // A top-level `run_line` reports a stray `return` itself and returns
+            // `Continue`, so it never hands one back here.
+            Step::Return(_) => unreachable!("top-level return is handled in run_line"),
         }
     }
     // A truncated `func` definition at EOF: run it so the parse error is reported.
     if !pending.trim().is_empty() {
-        match run_line(&pending, last, &mut shell) {
+        match run_line(&pending, last, false, &mut shell) {
             Step::Exit(code) => return ExitCode::from(code),
             Step::Continue(code) => last = code,
-            Step::Return(_) => {
-                eprintln!("mesh: return: not inside a function");
-                last = 1;
-            }
+            Step::Return(_) => unreachable!("top-level return is handled in run_line"),
         }
     }
     ExitCode::from(last)
@@ -815,20 +821,23 @@ mod tests {
     #[test]
     fn a_submitted_blank_line_keeps_the_status() {
         let mut shell = Shell::new();
-        assert_eq!(run_line("   ", 3, &mut shell), Step::Continue(3));
+        assert_eq!(run_line("   ", 3, false, &mut shell), Step::Continue(3));
     }
 
     #[test]
     fn assignment_then_read() {
         let mut shell = Shell::new();
-        assert_eq!(run_line("x = hello", 0, &mut shell), Step::Continue(0));
+        assert_eq!(
+            run_line("x = hello", 0, false, &mut shell),
+            Step::Continue(0)
+        );
         assert_eq!(shell.vars.get("x"), Some("hello"));
     }
 
     #[test]
     fn unspaced_assignment() {
         let mut shell = Shell::new();
-        assert_eq!(run_line("n=42", 0, &mut shell), Step::Continue(0));
+        assert_eq!(run_line("n=42", 0, false, &mut shell), Step::Continue(0));
         assert_eq!(shell.vars.get("n"), Some("42"));
     }
 
@@ -862,12 +871,17 @@ mod tests {
         );
         assert!(pending.is_empty());
         // Calling it now runs the body.
-        assert_eq!(run_line("greet world", 0, &mut shell), Step::Continue(0));
+        assert_eq!(
+            run_line("greet world", 0, false, &mut shell),
+            Step::Continue(0)
+        );
     }
 
     #[test]
     fn a_bare_return_at_top_level_is_reported() {
+        // Outside a function, `return` is a recoverable error (status 1), not an
+        // unwind — `run_line` reports it and continues rather than propagating it.
         let mut shell = Shell::new();
-        assert_eq!(run_line("return", 0, &mut shell), Step::Return(0));
+        assert_eq!(run_line("return", 0, false, &mut shell), Step::Continue(1));
     }
 }

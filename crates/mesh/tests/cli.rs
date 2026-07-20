@@ -856,6 +856,15 @@ fn return_outside_a_function_is_reported() {
 }
 
 #[test]
+fn a_top_level_return_does_not_abort_the_rest_of_the_line() {
+    // A stray `return` at top level is a recoverable error, so `;` still runs the
+    // next command unconditionally — the sequence is not aborted.
+    let out = run_with_input("return; puts after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not inside a function"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
 fn a_function_in_a_pipeline_is_rejected_for_now() {
     let out = run_with_input("func f() { puts hi }\nf | cat\nputs after\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("not supported in a pipeline"));
