@@ -654,11 +654,10 @@ residual, versus the old rule's blanket wrapper requirement.
 string — `cd /tmp/`, `grep /usr/bin`, `p = /etc/hosts`. In particular an
 **assignment** `x = /…/` binds the **path string**, not a regex: extending
 regex-literal recognition into general value position was considered and **not
-chased** — it reopens the `$`-anchor-vs-interpolation ambiguity (worst exactly where
-interpolation is expected), splits `x = /tmp/` from `cd /tmp/` inconsistently, and
-buys only sugar over `re("…")`. To bind a **regex value** to a name, use the
-constructor with a raw string, `pat = re(r'\d+')` (a plain `'\d+'` is a Model B
-error — `\d` is an unknown escape).
+chased** — it would split `x = /tmp/` from `cd /tmp/` inconsistently, and buys only
+sugar over `re("…")`. To bind a **regex value** to a name, use the constructor with a
+raw string, `pat = re(r'\d+')` (a plain `'\d+'` is a Model B error — `\d` is an
+unknown escape).
 
 **Settled independent of the literal syntax:** regex flags are `:` modifiers on the
 regex value — `/\d+/:i`, `:m`, `:s`, `:x` (see the note by `re()`; parse-affecting
