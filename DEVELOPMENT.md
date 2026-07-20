@@ -124,7 +124,7 @@ mesh/
 │       │   ├── main.rs     # entry point
 │       │   ├── repl.rs     # read / tokenize / dispatch loop
 │       │   ├── lexer.rs    # M0 whitespace tokenizer (PLACEHOLDER)
-│       │   ├── builtins.rs # cd, exit
+│       │   ├── builtins.rs # exit (cd deferred to M1)
 │       │   └── exec.rs     # launch external commands, map exit status
 │       └── tests/
 │           └── cli.rs      # end-to-end tests driving the built binary
@@ -138,7 +138,7 @@ mesh/
 ### How the M0 code fits together
 
 `main` calls `repl::run`, which loops: read a line → `lexer::split` into words →
-`builtins::dispatch` (handles `cd`/`exit`, returns `None` otherwise) → else
+`builtins::dispatch` (handles `exit`, returns `None` otherwise) → else
 `exec::run` launches the external command. The loop tracks the last exit status
 and returns it as the process exit code at EOF.
 
