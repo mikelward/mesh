@@ -359,6 +359,28 @@ fn env_interpolation_reads_the_environment() {
 }
 
 #[test]
+fn dotted_suffix_in_a_string_is_literal_not_member_access() {
+    // Inside `"…"`, an unbraced `$x.txt` is `$x` + the literal `.txt` — member
+    // access needs braces (`${x}` is fine too). `$env.HOME` access uses `${…}`
+    // form when a literal dot must follow.
+    let out = run_with_input("x = report\nputs \"$x.txt\"\nputs \"${x}.txt\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "report.txt\nreport.txt\n"
+    );
+}
+
+#[test]
+fn double_hyphen_name_is_not_a_valid_binding() {
+    // `a--b` is not a kebab identifier (hyphens are interior, single), so it is
+    // not an assignment target — the line is a command, and there is no such
+    // command. The assignment target and the `$name` read agree on the rule.
+    let out = run_with_input("a--b = v\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("a--b"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
 fn unbound_variable_is_a_loud_error_that_recovers() {
     let out = run_with_input("puts $nope\nputs ok\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("unbound variable"));

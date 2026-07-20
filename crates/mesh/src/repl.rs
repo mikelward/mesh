@@ -132,7 +132,7 @@ fn bare_ident(word: &Word) -> Option<&str> {
                 text,
                 expandable: true,
             },
-        ] if is_ident(text) => Some(text),
+        ] if lexer::is_ident(text) => Some(text),
         _ => None,
     }
 }
@@ -157,7 +157,7 @@ fn split_unspaced_assignment(word: &Word) -> Option<(String, Word)> {
         return None;
     };
     let (name, after) = text.split_once('=')?;
-    if !is_ident(name) {
+    if !lexer::is_ident(name) {
         return None;
     }
     let mut value: Vec<Piece> = Vec::new();
@@ -182,28 +182,6 @@ fn clone_piece(piece: &Piece) -> Piece {
             member: v.member.clone(),
         }),
     }
-}
-
-/// A kebab identifier: an alphabetic/`_` head, then alphanumeric/`_`/interior-`-`.
-fn is_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-    let mut prev_hyphen = false;
-    for c in chars {
-        if c.is_ascii_alphanumeric() || c == '_' {
-            prev_hyphen = false;
-        } else if c == '-' {
-            prev_hyphen = true;
-        } else {
-            return false;
-        }
-    }
-    !prev_hyphen // no trailing hyphen
 }
 
 /// Bind `name` to the expansion of `rhs`. Only single-value assignments are
