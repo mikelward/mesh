@@ -16,9 +16,11 @@ file as tasks land.
 
 ## M1 — Next up
 
-- [ ] Add `reedline`; replace the stdin reader with a real line editor
-- [ ] History (in-memory first, then persisted)
-- [ ] Lexer v1: single/double quotes and escapes
+- [x] `reedline` line editor for interactive (TTY) input; std byte reader kept
+      for piped input. Ctrl-D exits on an empty line; Ctrl-C cancels the line.
+- [x] History (in-memory, reedline default). Persisted history: later.
+- [x] Two-glyph prompt (`mesh$` / `mesh!`) via reedline.
+- [ ] Lexer v1: single/double quotes and escapes (raw form = heredoc, see below)
 - [ ] Promote internals into `crates/mesh-core` (lib); binary becomes thin `main`
 - [ ] `;`, `&&`, `||` sequencing
 - [x] `cd` builtin (basic): `$HOME` default, `cd -`, updates `$PWD`/`$OLDPWD`,
@@ -26,7 +28,6 @@ file as tasks land.
       logical cwd.
 - [x] `pwd` and `puts` builtins
 - [ ] Globs + `~` expansion (glob no-match → **empty**, see Decisions made)
-- [ ] A simple prompt (host/dir), stderr-rendered as today
 
 ## Known limitations
 
@@ -39,6 +40,14 @@ file as tasks land.
 - **Merge method:** rebase. **Toolchain:** floating `stable`. **Loop autonomy:**
   proceed with best call, documented + overridable; pause only for grammar-level
   design decisions.
+- **Working-directory var namespace = `$env.PWD` / `$env.OLDPWD`** (confirms
+  `DESIGN.md`; the `$sh.*` alternative was considered and dropped — if a value is
+  exported to and inherited by children, it lives under `$env.`).
+- **Raw mixed-quote string form = heredoc** (`<< END … END`) — for a literal
+  that embeds both `'` and `"` with no escaping. Chosen over a Rust-style
+  `r#"…"#` delimiter. Implementation lands with the quoting task (task 5).
+- **Repo license = decide later** (leave unlicensed for now; revisit before any
+  real release). Recorded in "Decisions needed" below for visibility.
 - **Glob no-match → empty** (nullglob-style: the pattern expands to zero words).
   This is *principled*, not a compromise, and fully consistent with "absence is
   loud": specific-element access (`xs[99]`, `$map.key`) errors because you asked
@@ -49,20 +58,11 @@ file as tasks land.
 
 ## Decisions needed
 
-- [ ] **Namespace for the working-directory vars in the mesh language:**
-      `$env.PWD` / `$env.OLDPWD` vs `$sh.PWD` / `$sh.OLDPWD`. `DESIGN.md` (~line
-      2027) currently writes `$env.PWD` / `$env.OLDPWD` — reconcile with the
-      intended `$sh.*` choice and make the design consistent (`$env.PATH` etc.
-      use `$env.`). Language-surface only: M0 sets the real OS `PWD`/`OLDPWD`
-      environment variables (that's what child processes read), which is
-      unaffected by how the shell language exposes them.
-- [ ] **Choose a repo license** (none declared yet). M0 has no dependencies, so
-      nothing constrains the choice today. Planned deps and their licenses:
-      `reedline` MIT, `nix` MIT, `crossterm` MIT — all permissive; `nucleo`
-      **MPL-2.0** (weak, file-level copyleft). MPL-2.0 is compatible with a
-      permissive project license (it only obliges sharing changes to nucleo's
-      *own* files), but confirm the intended repo license (e.g. MIT, or
-      MIT OR Apache-2.0 — the Rust-ecosystem norm) is acceptable alongside it.
+- [ ] **Choose a repo license** — *decided: later* (revisit before any real
+      release). Nothing constrains the choice today: all current/planned deps are
+      permissive (`reedline`/`nix`/`crossterm` MIT) except `nucleo` **MPL-2.0**
+      (weak, file-level copyleft — compatible with a permissive project). Likely
+      landing spot: `MIT OR Apache-2.0` (the Rust-ecosystem norm).
 
 ## Icebox / decide later
 

@@ -5,10 +5,11 @@ the language design, see [`DESIGN.md`](DESIGN.md); for the milestone plan, see
 [`ROADMAP.md`](ROADMAP.md).
 
 > **Status:** the implementation is a read/tokenize/exec loop that launches
-> external commands plus the `cd`, `pwd`, `puts`, and `exit` builtins, behind a
-> hardcoded prompt. None of the mesh *language* is implemented yet. Treat the
-> current code as a seed, not a foundation to build features on before the real
-> lexer/parser land.
+> external commands plus the `cd`, `pwd`, `puts`, and `exit` builtins. Interactive
+> input uses `reedline` line editing (history, Ctrl-C/Ctrl-D) behind a two-glyph
+> prompt; piped input uses a std-only reader. None of the mesh *language* is
+> implemented yet. Treat the current code as a seed, not a foundation to build
+> features on before the real lexer/parser land.
 
 ## Prerequisites
 
@@ -43,16 +44,17 @@ cargo build --release  # optimized build
 
 ### Dependencies
 
-M0 is intentionally **dependency-free** — the standard library covers a
-line/tokenize/exec loop, and zero deps keep the build offline and fast. The
-interactive stack named in `DESIGN.md` arrives with the milestones that need it:
+The dependency set is kept minimal. `reedline` powers interactive line editing;
+it is used **only** for TTY input, so piped input stays std-only and the
+integration tests need no terminal. The rest of the interactive stack named in
+`DESIGN.md` arrives with the milestones that need it:
 
-| Crate | Purpose | License | Milestone |
+| Crate | Purpose | License | Status |
 | --- | --- | --- | --- |
-| `reedline` | line editing, history, hinting | MIT | M1 |
-| `nix` | `fork`/`exec`, `setpgid`, `tcsetpgrp`, signals | MIT | M2 (job control) |
-| `crossterm` | terminal control | MIT | later |
-| `nucleo` | fuzzy completion | MPL-2.0 | later |
+| `reedline` | interactive line editing, history, Ctrl-C/D | MIT | **in use** |
+| `nix` | `fork`/`exec`, `setpgid`, `tcsetpgrp`, signals | MIT | planned (job control) |
+| `crossterm` | terminal control (pulled in by `reedline`) | MIT | transitive |
+| `nucleo` | fuzzy completion | MPL-2.0 | planned |
 
 Add a dependency only when a milestone calls for it; prefer a small, focused
 crate over a framework. Note the license column when the repo license is chosen

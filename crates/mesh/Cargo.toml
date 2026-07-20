@@ -10,8 +10,10 @@ publish = false
 [lints]
 workspace = true
 
-# M0 is intentionally dependency-free: the standard library covers a
-# read/tokenize/exec loop, and staying zero-dep keeps the build offline and
-# fast. Interactive dependencies (reedline, nix, crossterm) arrive in M1 — see
-# ../../ROADMAP.md.
+# reedline provides interactive line editing, history, and Ctrl-C/Ctrl-D
+# handling. It is used only for interactive (TTY) input; piped input keeps the
+# std-only byte reader, so the integration tests stay dependency-light. Further
+# interactive deps (nix for job control) arrive with the tasks that need them —
+# see ../../ROADMAP.md.
 [dependencies]
+reedline = "0.49.0"
