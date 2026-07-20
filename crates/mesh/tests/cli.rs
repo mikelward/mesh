@@ -662,3 +662,36 @@ fn an_empty_pipeline_stage_is_a_syntax_error_that_recovers() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("empty command in a pipeline"));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 }
+
+#[test]
+fn a_redirected_producer_gives_the_next_stage_eof() {
+    // `printf … > f | cat` sends printf's output to the file, so `cat` must read
+    // EOF (an empty pipe), not inherit the shell's stdin and swallow the next
+    // script line. The following `echo` must still run.
+    let dir = fresh_dir("redir_producer");
+    let out = run_with_input(&format!(
+        "cd {}\nprintf x > f | cat\necho sentinel\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "sentinel\n");
+    assert_eq!(std::fs::read_to_string(dir.join("f")).unwrap(), "x");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn downstream_stages_run_after_an_upstream_spawn_failure() {
+    // A not-found producer must not stop the rest of the pipeline: `echo` still
+    // runs (reading EOF), and pipefail keeps the 127.
+    let out = run_with_input("nosuchcmd | echo after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("command not found"));
+    assert_eq!(out.status.code(), Some(127));
+}
+
+#[test]
+fn a_sigpipe_in_the_final_stage_still_counts() {
+    // The SIGPIPE exemption is only for a stage feeding a pipe. The last stage
+    // has no downstream reader, so a SIGPIPE there is a real failure (141).
+    let out = run_with_input("true | sh -c 'kill -PIPE $$'\n");
+    assert_eq!(out.status.code(), Some(141));
+}

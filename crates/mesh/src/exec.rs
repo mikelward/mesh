@@ -34,40 +34,71 @@ pub fn run(words: &[String]) -> u8 {
     }
 }
 
+/// How the next stage receives its stdin.
+enum NextIn {
+    /// The first stage with no `<` inherits the shell's stdin.
+    Inherit,
+    /// EOF (`/dev/null`): the previous stage sent its stdout elsewhere (a
+    /// redirect) or failed to spawn, so there is no producer for this stage.
+    Null,
+    /// The previous stage's stdout, piped in.
+    Pipe(ChildStdout),
+}
+
+/// A spawned stage awaiting its status, or a stage that failed before running.
+enum Outcome {
+    /// `piped_out` is true when this stage's stdout fed a downstream pipe (the
+    /// only case where a SIGPIPE can legitimately come from a later stage
+    /// closing the pipe).
+    Running {
+        child: Child,
+        piped_out: bool,
+    },
+    Failed(u8),
+}
+
 /// Run a pipeline of external commands connected by pipes, applying each stage's
 /// redirections. The status is **pipefail, ignoring upstream SIGPIPE**: the last
-/// stage to fail wins, except a stage killed by SIGPIPE (a later stage closed the
-/// pipe early) is not counted — so `false | true` is `1` but `big | head` is `0`.
+/// stage to fail wins, except a stage whose stdout fed a pipe and was killed by
+/// SIGPIPE (a later stage closed the pipe early) is not counted — so `false |
+/// true` is `1`, `big | head` is `0`, but a SIGPIPE in the final stage still
+/// counts.
 ///
 /// `cmds` is non-empty and every stage is an external command (builtins in a
 /// pipeline / with redirection are not supported yet, and are rejected earlier).
 pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
     let n = cmds.len();
-    let mut children: Vec<Child> = Vec::new();
-    let mut prev_stdout: Option<ChildStdout> = None;
-    let mut spawn_failure: Option<u8> = None;
+    let mut outcomes: Vec<Outcome> = Vec::new();
+    let mut next_stdin = NextIn::Inherit;
 
     for (idx, cmd) in cmds.into_iter().enumerate() {
         let is_last = idx + 1 == n;
-        let piped_in = prev_stdout.take();
+        // Default the following stage to EOF; a successful piped spawn upgrades
+        // it to the real pipe. So a redirected or failed stage leaves the next
+        // one reading `/dev/null` rather than the shell's stdin.
+        let incoming = std::mem::replace(&mut next_stdin, NextIn::Null);
         let mut command = Command::new(&cmd.words[0]);
         command.args(&cmd.words[1..]);
 
-        // stdin: an input redirection wins over the incoming pipe; otherwise the
-        // previous stage's stdout; otherwise inherit (only the first stage).
-        match last_redir(&cmd.redirs, RedirKind::In) {
-            Some(path) => match File::open(path) {
+        // stdin: an input redirection wins over the incoming pipe/EOF/terminal.
+        if let Some(path) = last_redir(&cmd.redirs, RedirKind::In) {
+            match File::open(path) {
                 Ok(file) => {
                     command.stdin(file);
                 }
                 Err(err) => {
                     eprintln!("mesh: {path}: {err}");
-                    spawn_failure = Some(1);
-                    break;
+                    outcomes.push(Outcome::Failed(1));
+                    continue;
                 }
-            },
-            None => {
-                if let Some(prev) = piped_in {
+            }
+        } else {
+            match incoming {
+                NextIn::Inherit => {}
+                NextIn::Null => {
+                    command.stdin(Stdio::null());
+                }
+                NextIn::Pipe(prev) => {
                     command.stdin(prev);
                 }
             }
@@ -75,47 +106,54 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
 
         // stdout: an output redirection wins over the pipe to the next stage;
         // otherwise pipe to the next stage; otherwise inherit (only the last).
-        match last_out_redir(&cmd.redirs) {
-            Some((kind, path)) => match open_out(kind, path) {
+        let mut piped_out = false;
+        if let Some((kind, path)) = last_out_redir(&cmd.redirs) {
+            match open_out(kind, path) {
                 Ok(file) => {
                     command.stdout(file);
                 }
                 Err(err) => {
                     eprintln!("mesh: {path}: {err}");
-                    spawn_failure = Some(1);
-                    break;
-                }
-            },
-            None => {
-                if !is_last {
-                    command.stdout(Stdio::piped());
+                    outcomes.push(Outcome::Failed(1));
+                    continue;
                 }
             }
+        } else if !is_last {
+            command.stdout(Stdio::piped());
+            piped_out = true;
         }
 
         match command.spawn() {
             Ok(mut child) => {
-                prev_stdout = child.stdout.take();
-                children.push(child);
+                if piped_out {
+                    if let Some(out) = child.stdout.take() {
+                        next_stdin = NextIn::Pipe(out);
+                    }
+                }
+                outcomes.push(Outcome::Running { child, piped_out });
             }
             Err(err) => {
-                spawn_failure = Some(spawn_error_code(&cmd.words[0], &err));
-                break;
+                outcomes.push(Outcome::Failed(spawn_error_code(&cmd.words[0], &err)));
             }
         }
     }
-    // Drop any dangling pipe end so a waiting downstream stage sees EOF.
-    drop(prev_stdout);
 
-    // pipefail, ignoring SIGPIPE: the last stage that failed for a real reason.
+    // pipefail: the last stage to fail wins. A SIGPIPE is ignored only for a
+    // stage whose stdout fed a pipe (a downstream stage could have closed it).
     let mut status = 0;
-    for mut child in children {
-        let code = child.wait().map(status_to_code).unwrap_or(1);
-        if code != 0 && code != SIGPIPE_CODE {
+    for outcome in outcomes {
+        let (code, piped_out) = match outcome {
+            Outcome::Running {
+                mut child,
+                piped_out,
+            } => (child.wait().map(status_to_code).unwrap_or(1), piped_out),
+            Outcome::Failed(code) => (code, false),
+        };
+        if code != 0 && !(piped_out && code == SIGPIPE_CODE) {
             status = code;
         }
     }
-    spawn_failure.unwrap_or(status)
+    status
 }
 
 /// The path of the last redirection of `kind`, if any (last wins).
