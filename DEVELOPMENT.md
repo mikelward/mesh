@@ -71,7 +71,7 @@ Two layers, both run by `cargo test --workspace`:
 
 ```sh
 cargo test --workspace          # everything
-cargo test -p mesh cli          # just the integration tests
+cargo test -p mesh --test cli   # just the end-to-end (integration) tests
 ```
 
 Convention (from `AGENTS.md`): **a change isn't done until it's covered.** When
