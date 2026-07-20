@@ -410,20 +410,33 @@ fn parse_params(list: &str) -> Result<Vec<String>, String> {
 fn split_braced_body(src: &str) -> Result<(&str, &str), String> {
     let chars: Vec<(usize, char)> = src.char_indices().collect();
     let mut depth: i32 = 1;
+    // A raw prefix `r'`/`r"` is a raw string only at a word start (as in the
+    // lexer), so a bare word ending in `r` before a quote (`bar"…"`) is not raw.
+    let mut word_start = true;
     let mut k = 0;
     while k < chars.len() {
         let (byte, c) = chars[k];
+        if c.is_whitespace() {
+            word_start = true;
+            k += 1;
+            continue;
+        }
         match c {
             '\\' => {
                 k += 2;
+                word_start = false;
                 continue;
             }
-            'r' if matches!(chars.get(k + 1).map(|(_, c)| *c), Some('\'') | Some('"')) => {
+            'r' if word_start
+                && matches!(chars.get(k + 1).map(|(_, c)| *c), Some('\'') | Some('"')) =>
+            {
                 k = skip_quoted_chars(&chars, k + 2, chars[k + 1].1, false);
+                word_start = false;
                 continue;
             }
             '\'' | '"' => {
                 k = skip_quoted_chars(&chars, k + 1, c, true);
+                word_start = false;
                 continue;
             }
             '{' => depth += 1,
@@ -435,6 +448,8 @@ fn split_braced_body(src: &str) -> Result<(&str, &str), String> {
             }
             _ => {}
         }
+        // A raw prefix is eligible again right after a bare word-boundary char.
+        word_start = matches!(c, '=' | ';' | '|' | '&' | '<' | '>' | '(' | '{' | '}');
         k += 1;
     }
     Err("func: missing closing `}`".to_string())

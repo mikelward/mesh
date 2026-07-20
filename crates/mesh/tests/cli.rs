@@ -867,3 +867,21 @@ fn an_unterminated_function_at_eof_is_a_syntax_error() {
     let out = run_with_input("func f() {\n  puts hi\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("missing closing"));
 }
+
+#[test]
+fn scope_is_lexical_not_dynamic() {
+    // `inner` must see the *global* x, not `outer`'s local x — lexical scope, so
+    // a caller's locals are invisible to a callee.
+    let out = run_with_input(
+        "x = global\nfunc inner() { puts \"inner sees $x\" }\nfunc outer() {\n  x = caller\n  inner\n}\nouter\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "inner sees global\n");
+}
+
+#[test]
+fn a_quoted_brace_in_a_function_body_does_not_close_it() {
+    // The `}` inside the double-quoted string must not be read as the body's
+    // closing brace (the `bar` word ending in `r` is not a raw-string prefix).
+    let out = run_with_input("func f() { puts bar\"a\\\"}b\" }\nf\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bara\"}b\n");
+}

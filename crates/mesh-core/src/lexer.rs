@@ -527,48 +527,48 @@ pub fn is_ident(s: &str) -> bool {
 /// Quoted regions (`'…'`, `"…"`, `r'…'`, `r"…"`) and `\`-escapes are skipped, so
 /// a brace inside a string does not count.
 pub fn needs_more_input(text: &str) -> bool {
-    let chars: Vec<char> = text.chars().collect();
+    // Delegate all quoting/escaping to the real lexer and count `{` / `}` only in
+    // *unquoted* (expandable) text, so a brace inside a string — or a quote's
+    // raw-string eligibility — can never diverge from `split_line`. A line that
+    // does not lex (e.g. an unterminated quote) is treated as complete, so the
+    // normal path reports the error rather than buffering forever.
+    let Ok(segments) = split_line(text) else {
+        return false;
+    };
     let mut depth: i32 = 0;
-    let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
-            '\\' => {
-                i += 2;
-                continue;
+    for segment in &segments {
+        for stage in &segment.stages {
+            for word in &stage.words {
+                depth += brace_delta(word);
             }
-            'r' if matches!(chars.get(i + 1), Some('\'') | Some('"')) => {
-                i = skip_quoted(&chars, i + 2, chars[i + 1], false);
-                continue;
+            for redir in &stage.redirs {
+                depth += brace_delta(&redir.target);
             }
-            q @ ('\'' | '"') => {
-                i = skip_quoted(&chars, i + 1, q, true);
-                continue;
-            }
-            '{' => depth += 1,
-            '}' => depth -= 1,
-            _ => {}
         }
-        i += 1;
     }
     depth > 0
 }
 
-/// Skip from `start` to just past the closing `quote`. When `escapes`, a `\`
-/// escapes the next character (as in `"…"` / `'…'`); a raw string skips none.
-/// Returns the text length if the quote is unterminated in `text` so far.
-fn skip_quoted(chars: &[char], start: usize, quote: char, escapes: bool) -> usize {
-    let mut i = start;
-    while i < chars.len() {
-        if escapes && chars[i] == '\\' {
-            i += 2;
-            continue;
+/// Net `{` minus `}` in a word's **unquoted** text (a quoted brace is a
+/// non-expandable piece and is not counted).
+fn brace_delta(word: &Word) -> i32 {
+    let mut delta = 0;
+    for piece in &word.0 {
+        if let Piece::Text {
+            text,
+            expandable: true,
+        } = piece
+        {
+            for c in text.chars() {
+                match c {
+                    '{' => delta += 1,
+                    '}' => delta -= 1,
+                    _ => {}
+                }
+            }
         }
-        if chars[i] == quote {
-            return i + 1;
-        }
-        i += 1;
     }
-    i
+    delta
 }
 
 /// Parse the inner content of a `${…}` — a `name` with an optional `.member`.

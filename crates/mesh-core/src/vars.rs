@@ -37,14 +37,16 @@ impl Vars {
             .insert(name.to_string(), value);
     }
 
-    /// Read `name`, resolving outward from the innermost scope to the global one.
-    /// Returns `None` if unbound in every visible scope — the caller turns that
-    /// into a loud error, per the no-null / fail-loud rule.
+    /// Read `name` with **lexical** two-level scope: the current (innermost)
+    /// scope, then the global scope. A function's *caller's* locals are **not**
+    /// visible — scoping is lexical, not dynamic (the classic shell footgun).
+    /// Returns `None` if unbound in both, which the caller turns into a loud
+    /// error per the no-null / fail-loud rule.
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name))
+        let current = self.scopes.last().expect("at least the global scope");
+        current
+            .get(name)
+            .or_else(|| self.scopes[0].get(name))
             .map(String::as_str)
     }
 
