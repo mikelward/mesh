@@ -56,13 +56,18 @@ pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
             i += 1;
             continue;
         }
+        // `\`-newline is line continuation: drop the pair *without* starting a
+        // word, so a lone `\<newline>` or a trailing one adds no spurious empty
+        // argument. Cross-line continuation (joining the next input line) is
+        // still deferred. Inside a word, this just fuses across the newline.
+        if c == '\\' && chars.get(i + 1) == Some(&'\n') {
+            i += 2;
+            continue;
+        }
         let word = current.get_or_insert_with(Vec::new);
         match c {
             '\\' => {
                 match chars.get(i + 1) {
-                    // `\`-newline is line continuation; for a single line it just
-                    // drops the pair. Cross-line continuation is deferred.
-                    Some('\n') => i += 2,
                     Some(&next) => {
                         push_char(word, next, false);
                         i += 2;
@@ -160,8 +165,10 @@ fn lex_double_quote(
                             i += 2 + consumed;
                             continue;
                         }
-                        // Malformed \u: keep the backslash literal.
+                        // Malformed \u: keep both chars literal (`\uX` stays
+                        // `\uX`), so invalid input is not silently altered.
                         buf.push('\\');
+                        buf.push('u');
                     }
                     // Unknown escape: the backslash stays literal.
                     other => {
