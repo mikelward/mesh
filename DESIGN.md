@@ -248,10 +248,10 @@ Rules:
 - ***Transform-vs-predicate overlap.*** Keeping directories is the settled
   `:dirs` / `:d` filter modifier; the open question is only the footgun sitting
   next to it — `:dir` is *dirname* (a transform), so `$paths:filter(:dir)` silently
-  keeps **everything** (a dirname is always a truthy string) when `$paths:dirs` /
-  `$paths:filter(:d)` was meant — a one-letter slip. Decide whether a transform
-  modifier surfacing as a predicate's truthy value should be a **loud error** rather
-  than a quiet keep-all.
+  keeps **everything** (a dirname is always a truthy string) when `$paths:dirs` (the
+  directory **filter** modifier) was meant. Decide whether a transform modifier
+  surfacing as a predicate's truthy value should be a **loud error** rather than a
+  quiet keep-all.
 - ***Upward path walk — `:ancestors` / `:parents`.*** `find_up`, project-root
   detection, and `rootdir` all want `pwd():ancestors` → `[/a/b/c /a/b /a /]`, turning
   a `cd ..`-in-a-subshell loop into a plain list iteration — `pwd()`, the *validated*
@@ -1480,7 +1480,10 @@ to a bool):
   `Duration ± Duration`, `Duration × n`, `Instant ± Duration → Instant`, and
   `Instant - Instant → Duration` (`Instant + Instant` is an error). Division is
   **not** in the set — for a ratio, drop to an integer first with `:ms` / `:secs`
-  (`$a:ms / $b:ms`), so no float or rational type has to be introduced. A bare
+  (`$a:ms / $b:ms`), so no float or rational type has to be introduced. A `Duration`
+  is **signed** — `Instant - Instant` goes negative for a future instant (so a
+  future-dated file's `age` is just negative, not an error or a saturated zero),
+  rendering with a leading `-` (`-3s`). A bare
   integer is **not** a
   Duration (the ms-vs-s footgun mesh kills), but the process boundary stays bytes, so
   an external `sleep 2` still passes `"2"` — the type governs only *in-shell* values.
@@ -2282,8 +2285,9 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
   Code, WezTerm) can jump between prompts, fold command output, and badge exit
   status. mesh already has the exact `preexec`/`postexec`/prompt boundaries to emit
   these; decide whether it does so automatically.
-- ***cwd reporting*** *(OSC 7)* — emit the cwd on `postcd` so a new terminal
-  tab/split opens in the same directory. A natural `$sh.postcd` default.
+- ***cwd reporting*** *(OSC 7)* — emit the cwd at startup / prompt render **and** on
+  `postcd`, so a new terminal tab/split opens in the same directory even before the
+  first `cd` (a fresh remote shell must report immediately, not only after a change).
 - ***Hyperlinks*** *(OSC 8)* — clickable paths/URLs in output; likely a `style()`
   sibling (`link(text url)`) rather than a raw escape, keeping color-as-data.
 - ***Clipboard*** *(OSC 52)* — copy to the terminal's clipboard (works over ssh); a
