@@ -83,6 +83,10 @@ pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
         }
         let at_word_start = current.is_none();
         let word = current.get_or_insert_with(Vec::new);
+        // A raw string starts a word, and also begins the value of an unspaced
+        // `name=r'…'` binding — so `r'…'` is recognized right after a bare `=`,
+        // matching the spaced `name = r'…'` form.
+        let raw_eligible = at_word_start || ends_with_bare_equals(word);
         match c {
             '\\' => match chars.get(i + 1) {
                 Some(&next) => {
@@ -111,7 +115,7 @@ pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
             '"' => {
                 i = lex_escaped(&chars, i + 1, '"', word)?;
             }
-            'r' if at_word_start && matches!(chars.get(i + 1), Some('\'') | Some('"')) => {
+            'r' if raw_eligible && matches!(chars.get(i + 1), Some('\'') | Some('"')) => {
                 let delim = chars[i + 1];
                 i = lex_raw(&chars, i + 2, delim, word)?;
             }
@@ -335,6 +339,16 @@ fn push_text(word: &mut Vec<Piece>, text: &str, expandable: bool) {
         text: text.to_string(),
         expandable,
     });
+}
+
+/// Does `word` end in an unquoted `=`? Used to let a raw-string prefix begin the
+/// value of an unspaced `name=r'…'` assignment (the `=` is a bare, expandable
+/// char, so it lands in a trailing expandable `Text` piece).
+fn ends_with_bare_equals(word: &[Piece]) -> bool {
+    matches!(
+        word.last(),
+        Some(Piece::Text { text, expandable: true }) if text.ends_with('=')
+    )
 }
 
 fn push_char(word: &mut Vec<Piece>, c: char, expandable: bool) {

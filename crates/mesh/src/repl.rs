@@ -187,6 +187,12 @@ fn clone_piece(piece: &Piece) -> Piece {
 /// Bind `name` to the expansion of `rhs`. Only single-value assignments are
 /// supported for now; a list (glob/multiple words) or empty result is an error.
 fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
+    // `env` is the environment namespace (`$env.KEY`); a plain `env` binding
+    // would be shadowed by that read and so could never be read back. Reject it
+    // rather than store an unreachable value.
+    if name == "env" {
+        return Err(format!("{name}: cannot assign to the reserved name"));
+    }
     let mut args = expand::expand(rhs, vars).map_err(|e| e.to_string())?;
     match args.len() {
         1 => {

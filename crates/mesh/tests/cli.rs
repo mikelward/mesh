@@ -381,6 +381,24 @@ fn double_hyphen_name_is_not_a_valid_binding() {
 }
 
 #[test]
+fn unspaced_assignment_value_can_be_a_raw_string() {
+    // `x=r'…'` must recognize the raw prefix at the value boundary, just like the
+    // spaced `x = r'…'` form — storing the literal bytes, not `r` + a single-
+    // quoted string (which would also choke on `\d` as an unknown escape).
+    let out = run_with_input("x=r'\\d+'\nputs $x\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\\d+\n");
+}
+
+#[test]
+fn assignment_to_reserved_env_name_is_rejected() {
+    // `env` is the environment namespace; a plain `env` binding would be shadowed
+    // by `$env.KEY` reads and could never be read back, so it is rejected loudly.
+    let out = run_with_input("env=hello\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reserved name"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
 fn unbound_variable_is_a_loud_error_that_recovers() {
     let out = run_with_input("puts $nope\nputs ok\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("unbound variable"));
