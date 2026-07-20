@@ -67,10 +67,34 @@ impl std::fmt::Display for LexError {
     }
 }
 
-/// Split `line` into words.
-pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
+/// A statement separator between commands: `;` (sequence), `&&` (run the next on
+/// success), `||` (run the next on failure). Recognized only bare — a quoted or
+/// escaped operator is a literal character.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Sep {
+    Seq,
+    And,
+    Or,
+}
+
+/// One command in a sequence: its words plus the separator that connects it to
+/// the previous command (`Seq` for the first). The connector decides whether the
+/// command runs, based on the previous command's status.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub sep_before: Sep,
+    pub words: Vec<Word>,
+}
+
+/// Split `line` into command segments joined by `;` / `&&` / `||`. A line with no
+/// separator is a single segment. Operators are recognized only at the bare
+/// (unquoted, unescaped) level; a lone `&` (background) or `|` (pipe) is not an
+/// operator yet and stays a literal character.
+pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
     let chars: Vec<char> = line.chars().collect();
-    let mut words = Vec::new();
+    let mut segments = Vec::new();
+    let mut words: Vec<Word> = Vec::new();
+    let mut sep_before = Sep::Seq;
     let mut current: Option<Vec<Piece>> = None;
     let mut i = 0;
 
@@ -87,6 +111,21 @@ pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
         // word. Cross-line continuation is still deferred.
         if c == '\\' && chars.get(i + 1) == Some(&'\n') {
             i += 2;
+            continue;
+        }
+        // A bare `;` / `&&` / `||` ends the current command and opens a new
+        // segment. Checked before the escape/quote handling below, so a quoted
+        // or `\`-escaped operator is left literal.
+        if let Some((sep, len)) = separator_at(&chars, i) {
+            if let Some(word) = current.take() {
+                words.push(Word(word));
+            }
+            segments.push(Segment {
+                sep_before,
+                words: std::mem::take(&mut words),
+            });
+            sep_before = sep;
+            i += len;
             continue;
         }
         let at_word_start = current.is_none();
@@ -138,7 +177,29 @@ pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
     if let Some(word) = current.take() {
         words.push(Word(word));
     }
-    Ok(words)
+    segments.push(Segment { sep_before, words });
+    Ok(segments)
+}
+
+/// If a bare separator token starts at `at`, return it and its length in chars:
+/// `;` (1), `&&` (2), `||` (2). A lone `&` or `|` is not a separator yet.
+fn separator_at(chars: &[char], at: usize) -> Option<(Sep, usize)> {
+    match chars[at] {
+        ';' => Some((Sep::Seq, 1)),
+        '&' if chars.get(at + 1) == Some(&'&') => Some((Sep::And, 2)),
+        '|' if chars.get(at + 1) == Some(&'|') => Some((Sep::Or, 2)),
+        _ => None,
+    }
+}
+
+/// Lex a single command (no separators) into its words. Test-only convenience
+/// over [`split_line`]; the shell uses `split_line` so `;` / `&&` / `||` split.
+#[cfg(test)]
+fn split(line: &str) -> Result<Vec<Word>, LexError> {
+    Ok(split_line(line)?
+        .into_iter()
+        .flat_map(|segment| segment.words)
+        .collect())
 }
 
 /// Lex a `"…"` or `'…'` string (Model B). `"…"` also interpolates `$…`. `start`
@@ -394,7 +455,7 @@ fn push_char(word: &mut Vec<Piece>, c: char, expandable: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{LexError, Piece, VarRef, Word, split};
+    use super::{LexError, Piece, Segment, Sep, VarRef, Word, split, split_line};
 
     fn exp(text: &str) -> Piece {
         Piece::Text {
@@ -417,6 +478,75 @@ mod tests {
 
     fn words(line: &str) -> Vec<Word> {
         split(line).expect("lex")
+    }
+
+    fn seg(sep_before: Sep, ws: &[&str]) -> Segment {
+        Segment {
+            sep_before,
+            words: ws.iter().map(|w| Word(vec![exp(w)])).collect(),
+        }
+    }
+
+    #[test]
+    fn a_plain_line_is_one_segment() {
+        assert_eq!(split_line("ls -l").unwrap(), [seg(Sep::Seq, &["ls", "-l"])]);
+    }
+
+    #[test]
+    fn separators_split_into_segments() {
+        assert_eq!(
+            split_line("a; b && c || d").unwrap(),
+            [
+                seg(Sep::Seq, &["a"]),
+                seg(Sep::Seq, &["b"]),
+                seg(Sep::And, &["c"]),
+                seg(Sep::Or, &["d"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn separators_need_no_surrounding_space() {
+        assert_eq!(
+            split_line("a&&b||c").unwrap(),
+            [
+                seg(Sep::Seq, &["a"]),
+                seg(Sep::And, &["b"]),
+                seg(Sep::Or, &["c"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quoted_or_escaped_separator_is_literal() {
+        // Neither the quoted `;` nor the escaped `&&` splits the line — one
+        // segment of one word each (the pieces are literal, not expandable).
+        let quoted = split_line("'a;b'").unwrap();
+        assert_eq!(quoted.len(), 1);
+        assert_eq!(quoted[0].words, [Word(vec![lit("a;b")])]);
+        let escaped = split_line(r"a\&\&b").unwrap();
+        assert_eq!(escaped.len(), 1);
+        assert_eq!(
+            escaped[0].words,
+            [Word(vec![exp("a"), lit("&&"), exp("b")])]
+        );
+    }
+
+    #[test]
+    fn a_lone_amp_or_pipe_is_not_a_separator() {
+        // `&` (background) and `|` (pipe) are not operators yet — they stay
+        // literal characters in a single word.
+        assert_eq!(split_line("a|b").unwrap(), [seg(Sep::Seq, &["a|b"])]);
+        assert_eq!(split_line("a&b").unwrap(), [seg(Sep::Seq, &["a&b"])]);
+    }
+
+    #[test]
+    fn an_empty_segment_is_kept() {
+        // A trailing `;` leaves an empty final segment; the runner treats it as a
+        // no-op. Structurally it is still present.
+        let segs = split_line("a ;").unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[1].words, Vec::<Word>::new());
     }
 
     #[test]

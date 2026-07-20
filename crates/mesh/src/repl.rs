@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 
 use crate::builtins::{self, Builtin};
-use crate::lexer::{Piece, Word};
+use crate::lexer::{Piece, Sep, Word};
 use crate::vars::Vars;
 use crate::{exec, expand, lexer};
 
@@ -46,21 +46,41 @@ enum Step {
     Exit(u8),
 }
 
-/// Tokenize and run one line of input against the variable store. Empty lines
-/// are a no-op that keeps the previous status.
+/// Tokenize and run one line of input against the variable store. A line is a
+/// sequence of commands joined by `;` / `&&` / `||`; each connector decides
+/// whether its command runs from the previous command's status. Empty lines (and
+/// empty segments, e.g. a trailing `;`) are a no-op that keeps the last status.
 fn run_line(text: &str, last: u8, vars: &mut Vars) -> Step {
-    let tokens = match lexer::split(text) {
-        Ok(tokens) => tokens,
+    let segments = match lexer::split_line(text) {
+        Ok(segments) => segments,
         Err(err) => {
             eprintln!("mesh: {err}");
             return Step::Continue(2); // syntax error
         }
     };
-    if tokens.is_empty() {
-        // A blank line is not a command; the last status is unchanged.
-        return Step::Continue(last);
+    let mut status = last;
+    for segment in segments {
+        let run_it = match segment.sep_before {
+            Sep::Seq => true,
+            Sep::And => status == 0, // run after success
+            Sep::Or => status != 0,  // run after failure
+        };
+        if !run_it || segment.words.is_empty() {
+            // Short-circuited, or an empty segment (blank line, `;;`, a trailing
+            // `;`): a no-op that leaves the status unchanged.
+            continue;
+        }
+        match run_segment(segment.words, status, vars) {
+            Step::Exit(code) => return Step::Exit(code),
+            Step::Continue(code) => status = code,
+        }
     }
+    Step::Continue(status)
+}
 
+/// Run one command segment: classify it as an assignment or a command and act.
+/// `last` is the status of the previous command (the default for a bare `exit`).
+fn run_segment(tokens: Vec<Word>, last: u8, vars: &mut Vars) -> Step {
     match classify(tokens) {
         Line::Assign { name, rhs } => match assign(&name, rhs, vars) {
             Ok(()) => Step::Continue(0),

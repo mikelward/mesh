@@ -135,10 +135,32 @@ Deferred: list/map values (only single-value assignment for now — a glob/list
 RHS is an error), the `:` value modifiers (`$f:stem`), `export`, `global`/`unset`,
 function-local scope, the `$sh.*` surface, and `$env:get(K default)`.
 
+## Task 7 — sequencing (`;`, `&&`, `||`)
+
+A line is now a sequence of commands joined by separators, run left to right:
+
+```
+line    = segment (sep segment)*
+sep     = ";" | "&&" | "||"
+segment = words?                      # may be empty (a no-op)
+```
+
+- **`;`** runs the next command unconditionally; **`&&`** runs it only if the
+  previous command **succeeded** (status 0); **`||`** only if it **failed**
+  (nonzero). Equal precedence, left-associative — `a && b || c` is `(a && b) || c`.
+- A separator is recognized only **bare**: a quoted (`'a;b'`) or backslash-escaped
+  (`a\;b`) operator is a literal character.
+- Short-circuited and **empty** segments (a blank line, a leading/trailing `;`,
+  `;;`) are no-ops that leave the status unchanged. The line's status is the last
+  command actually run — so `exit` in a later segment sees it (`false; exit` → 1).
+
+Deferred: `&` (background) and `|` (pipe) are **not** operators yet — a lone
+`&`/`|` stays a literal character (they arrive with job control and pipes). A
+dangling trailing operator (`a &&`) is currently a lenient no-op, not an error.
+
 ### Not yet parsed
-Pipes `|`, redirection `>` `<`, sequencing `;` `&&` `||`, `{ }` blocks, `func`,
-`:` modifiers, heredocs. Each arrives with the task that needs it, and this file
-grows to match.
+Pipes `|`, redirection `>` `<`, `{ }` blocks, `func`, `:` modifiers, heredocs.
+Each arrives with the task that needs it, and this file grows to match.
 
 **Design target (still ahead of the lexer above).** The **Model B strings**
 direction from `DESIGN.md` is now implemented (see task 5 above). What the lexer
