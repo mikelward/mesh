@@ -133,6 +133,14 @@ fn run_single(stage: Stage, last: u8, shell: &mut Shell) -> Step {
         eprintln!("mesh: redirection with no command is not supported yet");
         return Step::Continue(1);
     }
+    // `return` is a control word handled in `run_command_or_assign` (the
+    // no-redirection path). With a redirection it never reaches that handler, so
+    // reject it here rather than truncating the target and launching an external
+    // `return` that fails while the body keeps running.
+    if argv[0] == "return" {
+        eprintln!("mesh: return: cannot be redirected");
+        return Step::Continue(2);
+    }
     if builtins::is_builtin(&argv[0]) || shell.funcs.get(&argv[0]).is_some() {
         eprintln!(
             "mesh: {}: redirection of a builtin or function is not supported yet",
@@ -168,6 +176,12 @@ fn run_multi(stages: Vec<Stage>, shell: &Shell) -> Step {
         if argv.is_empty() {
             eprintln!("mesh: empty command in a pipeline");
             return Step::Continue(1);
+        }
+        // `return` unwinds the enclosing function; it has no meaning as a pipeline
+        // stage, so reject it rather than launching an external `return`.
+        if argv[0] == "return" {
+            eprintln!("mesh: return: cannot be used in a pipeline");
+            return Step::Continue(2);
         }
         if builtins::is_builtin(&argv[0]) || shell.funcs.get(&argv[0]).is_some() {
             eprintln!(
@@ -383,14 +397,39 @@ fn parse_func_def(text: &str) -> Result<(String, FuncDef), String> {
     ))
 }
 
-/// Parse a parameter list (comma- or space-separated names). v1 rejects the
-/// deferred flag / optional / rest forms with a clear message.
+/// Parse a parameter list: names separated by commas and/or whitespace. A comma
+/// is a real separator, not ignorable filler — it must sit between two names, so
+/// a leading, trailing, or doubled comma (`,x`, `x,`, `x,,y`) is a loud error
+/// rather than a silently dropped empty. v1 also rejects the deferred flag /
+/// optional / rest forms with a clear message.
 fn parse_params(list: &str) -> Result<Vec<String>, String> {
-    let mut params = Vec::new();
-    for tok in list.split(|c: char| c == ',' || c.is_whitespace()) {
-        if tok.is_empty() {
+    let chars: Vec<char> = list.chars().collect();
+    let mut params: Vec<String> = Vec::new();
+    // A comma needs a name on each side: it is only valid once at least one name
+    // has been read, and never immediately after another comma.
+    let mut have_name = false;
+    let mut pending_comma = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
             continue;
         }
+        if c == ',' {
+            if !have_name || pending_comma {
+                return Err("func: missing parameter name before `,`".to_string());
+            }
+            pending_comma = true;
+            i += 1;
+            continue;
+        }
+        // Read a name token: a run up to the next comma or whitespace.
+        let start = i;
+        while i < chars.len() && chars[i] != ',' && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        let tok: String = chars[start..i].iter().collect();
         if tok.starts_with("...") {
             return Err("func: rest parameters (`...name`) are not supported yet".to_string());
         }
@@ -400,7 +439,7 @@ fn parse_params(list: &str) -> Result<Vec<String>, String> {
         if tok.contains('=') {
             return Err("func: optional/default parameters are not supported yet".to_string());
         }
-        if !lexer::is_ident(tok) {
+        if !lexer::is_ident(&tok) {
             return Err(format!("func: `{tok}` is not a valid parameter name"));
         }
         // `env` is the environment namespace (`$env.KEY`), so a parameter named
@@ -410,10 +449,15 @@ fn parse_params(list: &str) -> Result<Vec<String>, String> {
         }
         // A repeated name would silently overwrite the earlier positional in the
         // local scope, making one argument unreachable; diagnose it here.
-        if params.iter().any(|p| p == tok) {
+        if params.iter().any(|p| p == &tok) {
             return Err(format!("func: duplicate parameter `{tok}`"));
         }
-        params.push(tok.to_string());
+        params.push(tok);
+        have_name = true;
+        pending_comma = false;
+    }
+    if pending_comma {
+        return Err("func: missing parameter name after `,`".to_string());
     }
     Ok(params)
 }

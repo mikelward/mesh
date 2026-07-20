@@ -943,3 +943,45 @@ fn a_duplicate_parameter_name_is_rejected() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("duplicate parameter"));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 }
+
+#[test]
+fn misplaced_commas_in_a_parameter_list_are_rejected() {
+    // A comma is a real separator, so a leading, doubled, or trailing comma is a
+    // recoverable syntax error, not a silently dropped empty.
+    for sig in ["func f(,x) {}", "func f(x,,y) {}", "func f(x,) {}"] {
+        let out = run_with_input(&format!("{sig}\nputs after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("missing parameter"),
+            "sig `{sig}` stderr: {stderr}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    }
+    // Well-formed comma and space separators both still work.
+    let out = run_with_input("func g(a, b) { puts \"$a $b\" }\ng 1 2\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1 2\n");
+}
+
+#[test]
+fn a_redirected_return_is_rejected_and_does_not_truncate() {
+    // `return > file` must not create/truncate the target or launch an external
+    // `return`; it is rejected and the body keeps running (does not unwind).
+    let dir = fresh_dir("return_redirect");
+    let out = run_with_input(&format!(
+        "cd {}\nfunc f() {{\n  puts before\n  return > out.txt\n  puts after\n}}\nf\n",
+        dir.display()
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot be redirected"), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "before\nafter\n");
+    assert!(!dir.join("out.txt").exists(), "return truncated its target");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn return_in_a_pipeline_is_rejected() {
+    // `return` first so the control-word check fires before the pipeline runs.
+    let out = run_with_input("func f() {\n  return | cat\n}\nf\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be used in a pipeline"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
