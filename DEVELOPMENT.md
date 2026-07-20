@@ -5,7 +5,7 @@ the language design, see [`DESIGN.md`](DESIGN.md); for the milestone plan, see
 [`ROADMAP.md`](ROADMAP.md).
 
 > **Status:** the implementation is at **M0** — a read/tokenize/exec loop that
-> launches external commands plus `cd`/`exit`. None of the mesh *language* is
+> launches external commands plus an `exit` builtin. None of the mesh *language* is
 > implemented yet. Treat the current code as a seed, not a foundation to build
 > features on before the real lexer/parser land.
 
