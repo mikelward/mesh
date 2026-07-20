@@ -58,19 +58,21 @@ $sh.prompt.gap  = newline          # a deliberate blank line
 $sh.prompt.rule = rule             # full-width ─── (replaces `bar $COLUMNS`)
 
 # The header — one line, built from keyed inline segments so each keeps its own
-# color (concatenating styled values into a single string would flatten them).
+# color (concatenating styled values into a single string would flatten them). The
+# renderer space-joins the pieces (empties dropped, puts-style), so no piece carries
+# its own spacing.
 $sh.prompt.head = [                            # a MAP literal — [ ], not { } (braces are blocks)
-  root: func() { if is-root() { style("[root] " --fg red) } },              # "" when not root
+  root: func() { if is-root() { style("[root]" --fg red) } },               # "" when not root
   host: func() {
     h = short-hostname()
     if on-production-host() { style($h --fg red) } else { $h }
   },
-  sess: func() { session-tag() },                                            # value call; returns a styled value that bakes in its own surrounding spaces
+  sess: func() { session-tag() },                                            # value call — the styled session tag
   dir:  func() {
     if inside-project() { "$(vcs prompt-info)" }     # external renderer — returned RAW (own color, own newlines)
     else                { style(tilde-pwd() --fg blue) }   # mesh fallback — we color it
   },
-  auth: func() { if not ssh-id-loaded() { style(" SSH" --fg yellow) } },     # no else → "" → dropped
+  auth: func() { if not ssh-id-loaded() { style("SSH" --fg yellow) } },      # no else → "" → dropped
 ]
 
 $sh.prompt.vcs  = func() { "$(vcs unmerged)" }       # own line; empty → line skipped
@@ -88,6 +90,22 @@ func ssh-id-loaded()      { ssh-add -L >/dev/null }              # status → bo
 func short-hostname()     { $env.HOSTNAME:split "." :first }
 func on-production-host() { not on-my-machine() and not on-test-host() }
 ```
+
+## Variations with `fill`
+
+`fill` is the inline right-align / trailing-bar piece. A couple of common tweaks:
+
+```
+# a bar on the SAME line as the header, instead of a separate rule line:
+$sh.prompt.head = [host-info dir-info auth-info fill("─")]   # host dir auth───────────  to the right edge
+
+# a clock pinned to the right edge of the header:
+$sh.prompt.head = [host-info dir-info fill clock-info]        # host dir …………………… 14:23
+```
+
+`fill` eats the slack (spaces by default, or the repeat-char you give it); multiple
+`fill`s on a line split the slack evenly. The full-width `rule` entry above is just
+the whole-line case — `rule ≡ a line that is [fill("─")]`.
 
 ## What falls away vs the fish version
 

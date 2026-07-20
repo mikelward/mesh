@@ -2236,7 +2236,8 @@ produce it — is one of:
   *same* inline line, but each piece **named** so you can replace or `unset` it
   individually;
 - a **structural value**: `rule` (a full-width line) or `newline` (a blank line) —
-  each a **whole** line, never an inline piece.
+  each a **whole** line; or **`fill`**, the *inline* structural piece, used *within*
+  a line's list (below).
 
 A **bare word in a segment slot is the callable of that name** (late-bound, so
 re-sourcing rebinds it — the by-name rule the hooks use); **quote it for a literal
@@ -2246,10 +2247,13 @@ line, never several lines. So there are no separator entries to name:
 
 ```
 $sh.prompt.status = status-info                # a line — bare name = the status-info segment, by name
-$sh.prompt.rule   = rule                       # a full-width line (its own entry — `rule` is never inline)
-$sh.prompt.line1  = [host-info dir-info auth-info]   # ONE line: host (red) dir (blue) auth (yellow), each its own color
+$sh.prompt.line1  = [host-info dir-info auth-info fill("─")]   # host (red) dir (blue) auth (yellow), then a bar to the right edge
 $sh.prompt.jobs   = job-info                   # its own line — skipped when empty
 $sh.prompt.char   = func() { "> " }            # a func literal is fine too
+
+# `fill` is the inline right-align / trailing-bar piece; `rule` is its whole-line form:
+$sh.prompt.rule   = rule                       # ≡ a line that is just [fill("─")]
+$sh.prompt.line1  = [host-info fill clock-info] # host on the left, clock flush-right (fill of spaces eats the middle)
 
 # named variant — same line, pieces individually addressable:
 $sh.prompt.line1     = [host: host-info, dir: dir-info, auth: auth-info]
@@ -2335,11 +2339,24 @@ carry `\n`, since you can't dictate an external tool's output; the shell honors
 those as **dumb** breaks that the structural entries (`fill` / `rule`) don't align
 across. Provenance rides the **value**, not the map slot: passing that output
 through `style(…)` or string concatenation re-imports it as an ordinary mesh string
-(back under the one-line-or-list-of-lines rule), so a genuinely multi-line external
-renderer must be returned raw, not wrapped. So a drop-in external renderer
-(starship, `vcs prompt-info`) still works. The renderer measures width **per line**,
-tracks how many lines the prompt occupies, and places input after the last one so
-redraw, completion, and resize stay correct; there is **no line-count knob**.
+(back under the single-line rule), so a genuinely multi-line external renderer must
+be returned raw, not wrapped. So a drop-in external renderer (starship, `vcs
+prompt-info`) still works. The renderer measures width **per line**, tracks how many
+lines the prompt occupies, and places input after the last one so redraw,
+completion, and resize stay correct; there is **no line-count knob**.
+
+**`fill` — right-align and trailing bars.** Within a line's list, **`fill`** is an
+inline piece that **expands to consume the remaining width of its line**, pushing
+whatever follows it to the right edge — the right-alignment primitive.
+`[left fill right]` puts `left` flush-left and `right` flush-right; **multiple
+`fill`s on a line split the slack evenly** (even columns). It fills with **spaces**
+by default; give it a character to repeat that instead — `fill("─")` draws a bar to
+the edge, so `[host-info dir-info fill("─")]` renders `host dir───────────────` out
+to the right margin. **`rule` is the whole-line case of `fill`** — a line whose only
+piece is `fill("─")` — so the two are one mechanism: `fill` fills the *rest of a
+line*, `rule` fills a *whole line*. `fill` measures against the same per-line width
+the renderer already tracks, and its own width is the slack (zero when the line is
+already full).
 
 The payoff is the requirement, met directly: **the external base renderer is
 just one named segment** (`$(vcs prompt-info)`), sitting among peers, so
@@ -2353,14 +2370,14 @@ moving to the `$sh.preprompt` event hook and its *rendering* to this segment map
 *(MVP: keyed **line entries**, `style` color, an entry yielding a renderable **or a
 space-joined flat list of pieces** (empties dropped, `puts`-style; each keeps its
 own style), an optional keyed **sub-map** so the pieces are individually named, a
-deliberate-blank **`newline`** entry, and the full-width **`rule`** entry. Line
-structure is the **map** — a list is one line's pieces, multiple lines are multiple
-entries — never in-band `\n` (raw external output excepted, above). Layered next on the same per-line width
-the styled values already give the shell, and now well-defined because lines are
-explicit map entries: **`fill`** (right-align by consuming a line's slack; multiple
-`fill`s on a line split it evenly) and **transient collapse** of past prompts in
-scrollback — their concrete semantics are the remaining prompt work. The event set
-— `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settled.)*
+deliberate-blank **`newline`** entry, the full-width **`rule`** entry, and the
+inline **`fill`** piece (right-align / trailing bar — consumes a line's slack,
+multiple `fill`s split it evenly, an optional repeat-char draws a bar; `rule` ≡ a
+whole-line `[fill("─")]`). Line structure is the **map** — a list is one line's
+pieces, multiple lines are multiple entries — never in-band `\n` (raw external
+output excepted, above). The one thing layered *past* the MVP is **transient
+collapse** of past prompts in scrollback. The event set — `preprompt`,
+`preexec`/`postexec`, `precd`/`postcd`, `exit` — is settled.)*
 
 ## Footguns we avoid
 
@@ -2555,21 +2572,23 @@ to avoid" rather than promising the latter as done.
   an entry yields a renderable **or a space-joined flat list of pieces**
   (`puts`-style, empties dropped, each keeping its own style), with a keyed
   **sub-map** variant to name the pieces; `style` color; a deliberate-blank
-  **`newline`** entry; and the full-width **`rule`** entry. A list is one line's
-  pieces — **multiple lines are multiple entries** — and line structure is the map,
-  not in-band `\n` (raw external output excepted, as dumb breaks). A bare word in a
+  **`newline`** entry; the full-width **`rule`** entry; and the inline **`fill`**
+  piece (right-align / trailing bar, multiple `fill`s split slack evenly, optional
+  repeat-char; `rule` ≡ a whole-line `[fill("─")]`). A list is one line's pieces —
+  **multiple lines are multiple entries** — and line structure is the map, not
+  in-band `\n` (raw external output excepted, as dumb breaks). A bare word in a
   segment slot is the callable of that name (late-bound); quote for a literal.
-  Remaining: `fill` and transient collapse.
+  Remaining: transient collapse.
 - **Structured prompt — direction decided** ([Hooks and the prompt](#hooks-and-the-prompt)):
   line structure is the **map**, not in-band newlines — **each top-level entry is a
   line** (implicit breaks; no `nl1`/`nl2` separator keys), a line's pieces are a
-  **space-joined flat list** (or a keyed **sub-map** to name them), and a deliberate
-  blank line is a named **`newline`** entry. A list is one line's pieces, so
-  **multiple lines are multiple entries** — the keyed-map shape won over a
-  whole-prompt list-of-lines (which would have made rows positional, not keyed).
-  `rule` is in the MVP. **Remaining:** the concrete semantics of **`fill`** (even
-  split across multiple
-  fills on a line) and **transient collapse**, now that lines are explicit and
+  **space-joined flat list** (or a keyed **sub-map** to name them), a deliberate
+  blank line is a named **`newline`** entry, and **`fill`** is the inline
+  right-align / trailing-bar piece (`rule` ≡ a whole-line `[fill("─")]`). A list is
+  one line's pieces, so **multiple lines are multiple entries** — the keyed-map
+  shape won over a whole-prompt list-of-lines (which would have made rows positional,
+  not keyed). `rule`, `fill`, and `newline` are all in the MVP. **Remaining:**
+  **transient collapse** of past prompts, now that lines are explicit and
   addressable.
 
 **Foundational specification work.** The entries above settle *surface* features;
