@@ -266,13 +266,15 @@ custom function.
 **String** *(open — initial set)*: `:strip(PREFIX/SUFFIX)`, `:replace(OLD NEW)`,
 and likely `:upper` / `:lower`. To be fleshed out.
 
-*(TODO — **string→number parse**, surfaced porting `total`, `bisect`. Values from
-argv / `gets` / `$(…)` captures are **strings**, but arithmetic and `+=` are
-int-only (no coercion — `n += "x"` fails) and `<` / `>` on numeric-looking strings
-compare *lexically*, so `bisect`'s `$good`/`$bad` math and a native `total` are
-impossible today. Add a fail-loud `:int` / `:num` parse modifier — the inverse of
-the canonical int→decimal rendering — erroring on non-numeric input rather than
-silently yielding `0`.)*
+**String→number parse** *(decided — porting `total`, `bisect`)*. Values from argv /
+`gets` / `$(…)` captures are **strings**, and arithmetic / `+=` are int-only (no
+coercion — `n += "x"` fails) with `<` / `>` comparing strings *lexically*. The
+**`:int`** modifier parses a string to an integer, **fail-loud** — the inverse of
+the canonical int→decimal rendering, erroring on non-numeric input rather than
+silently yielding `0`. So `$line:words:get(0 "0"):int` sums a column and
+`$good:int < $bad:int` compares numerically. *(A float type and a `:num` parse are
+deferred — mesh has no non-integer number type today; add both together if the need
+appears.)*
 
 ### Globbing
 
@@ -1015,13 +1017,28 @@ exists for, so `~` is arguably sugar for `:match`'s truthiness. Keep both for no
 revisit whether one should be defined in terms of the other, or dropped, before
 first release.)*
 
-*(TODO — **dynamic regex from a runtime string**, surfaced porting `fromto`,
-`filter`, `he`, `untar`. mesh's regex is only the *literal* `/re/`, so a pattern
-that arrives as an **argument** (`fromto $from $to`, any `grep`-like) has no way to
-become a regex. Decide the string→regex path — interpolation `/$var/` and/or a
-`re($str)` constructor — plus a **regex-quote** to embed a literal string as a
-pattern (Perl's `\Q…\E`). Without it the whole class of "the pattern comes from the
-caller" scripts can't be expressed.)*
+**Regex is a first-class value** *(decided — porting `fromto`, `filter`, `he`,
+`untar`)*. `/re/` is a **regex literal** — like `[a b]` is a list literal —
+evaluating to a regex **value** usable in any value position (`p = /\d+/`, stored,
+passed, returned), not a token that exists only inside `~`/`:match`. `~` and
+`:match` **consume a regex value**, so `$str ~ /re/` and `$str:match(/re/)` are just
+the literal case. A pattern that arrives as a **string** — `fromto $from $to`, any
+`grep`-like — becomes a regex through the explicit constructor **`re($str)`**:
+`$line ~ re($to)`, `$line:match(re($to))`. `re` is **fail-loud** (a malformed
+pattern errors at the call, not silently), carries flags on the value
+(`re($x --ignore-case)`), and `re($s --literal)` quotes the string to match
+**verbatim** (Perl's `\Q…\E`) — the common "match exactly what the user typed" case.
+A **bare string is never auto-converted**: `$s ~ "a.b"` is an **error** pointing at
+`re("a.b")` or `/a.b/`, so a string full of metacharacters never silently becomes a
+pattern — the same no-silent-coercion rule as `:int`. Lexing is the standard
+regex-or-division rule: in expression/argument position `/…/` opens a regex, after
+an operand `/` is division.
+
+*(deferred: **`/$var/` interpolation** for a literal skeleton with a variable hole
+(`/^$user@/`). Held because `$` is the regex end-anchor, so interpolation would need
+a disambiguation rule (`$name` splices, a bare `$` anchors, `\$` is literal); `re()`
+already covers the whole-pattern-from-a-string case the scripts need, so this stays
+optional future sugar.)*
 
 *(deferred: **map destructuring** — `[name: n, age: a] = $m` binding by key — a
 natural extension of the same idea; and nested patterns (`[a [b c]] = …`).)*
@@ -1797,21 +1814,23 @@ Two mesh notes, neither a behavior change:
 *(open: `noclobber` and the `>|` override; whether `&>>` append-both is worth a
 spelling.)*
 
-*(TODO — low-level process & stream plumbing surfaced porting `autosession`,
-`logexec`, `confirm`, `filter`:*
-- ***`exec` — replace the process image.*** A dispatcher/wrapper (`autosession`
-  ending in `exec autotmux …`, `logexec` in `exec "$0".distrib`) hands off without
-  leaving a parent shell behind. There is no `exec` builtin yet — add one that
-  *becomes* the command: ordinary invocation runs it as a **child**, `exec` replaces
-  the current process with it.
-- ***isatty on a stream.*** `confirm` guards on `test -t 0 && test -t 2`, but
-  `$sh.interactive` is shell-level only. Expose a per-stream test **under the `sh`
-  namespace** — `$sh.stdin:tty` / `$sh.stderr:tty` (a bare `$stdin` is an ordinary
-  user variable under the two-reserved-names rule, so the handles can't live there) —
-  so a function can tell whether *its own* stderr is a terminal.
-- ***Output process substitution `>(cmd)`.*** The input form `<(cmd)` and explicit
-  fds / dup / close are settled above; the output form (`filter`'s `3> >(cmd)`) is
-  not. Decide whether to add it.)*
+**`exec` replaces the process image** *(decided — porting `autosession`, `logexec`)*.
+`exec CMD …` replaces the current shell process with the command — the standard
+`exec(2)` hand-off — so a dispatcher/wrapper (`autosession` → `exec autotmux …`,
+`logexec` → `exec "$0".distrib`) leaves no parent shell behind: ordinary invocation
+runs a **child**, `exec` *becomes* the command. (`exec` with only redirections and no
+command applies them to the current shell, bash's `exec >log`.)
+
+**Per-stream tty tests** *(decided — porting `confirm`)*. `$sh.interactive` answers
+"is this an interactive shell," but a function sometimes needs "is *this stream* a
+terminal" — `confirm` guards on `test -t 0 && test -t 2`. That is **`$sh.stdin:tty` /
+`$sh.stdout:tty` / `$sh.stderr:tty`** — each a bool, the `test -t N` replacement,
+under the `sh` namespace (a bare `$stdin` is an ordinary user variable under the
+two-reserved-names rule).
+
+*(TODO — **output process substitution `>(cmd)`**. The input form `<(cmd)` and
+explicit fds / dup / close are settled above; the output form (`filter`'s
+`3> >(cmd)`) is not — decide whether to add it.)*
 
 ### Job control
 
