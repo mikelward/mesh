@@ -390,6 +390,18 @@ fn unspaced_assignment_value_can_be_a_raw_string() {
 }
 
 #[test]
+fn raw_prefix_after_equals_matches_the_other_quotes() {
+    // A raw string may begin a piece right after `=`, just like `'…'`/`"…"`
+    // already do — so `k=r'v'`, `k='v'`, and `k="v"` all yield `k=v` as a plain
+    // command argument (not an assignment).
+    let out = run_with_input("puts option=r'abc'\nputs option='abc'\nputs option=\"abc\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "option=abc\noption=abc\noption=abc\n"
+    );
+}
+
+#[test]
 fn assignment_to_reserved_env_name_is_rejected() {
     // `env` is the environment namespace; a plain `env` binding would be shadowed
     // by `$env.KEY` reads and could never be read back, so it is rejected loudly.

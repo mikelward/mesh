@@ -85,8 +85,12 @@ The escape sets (an **unknown escape inside a quote is a syntax error**):
 - **Single quotes** `'…'` do *not* interpolate but *do* escape (Python `str`):
   `'a\nb'` is two lines, `'$x'` is a literal `$x`, and `'\d'` is an **error**.
 - **Raw strings** `r'…'` / `r"…"` take no escapes — the home for regex source
-  and paths (`r'\d+\.txt'`). Recognized only at the start of a word. A string
-  needing both quote kinds uses a (future) quoted-delimiter heredoc.
+  and paths (`r'\d+\.txt'`). The `r` prefix is recognized where a string piece
+  can begin: at the start of a word, and immediately after an unescaped `=`
+  (`--flag=r'a b'`, and the value of a `name=r'…'` binding) — the same positions
+  where a bare `'…'` / `"…"` already starts a piece, so `k=r'v'`, `k='v'`, and
+  `k="v"` all yield `k=v`. A string needing both quote kinds uses a (future)
+  quoted-delimiter heredoc.
 - **Adjacent pieces concatenate**: `"a"b'c'` is one argument `abc`;
   `--flag='a b'` is one argument. `""` is one empty argument.
 - **Expansion suppression**: a quoted or escaped `*`/`?`/`[`/`~` is literal, so
