@@ -880,6 +880,8 @@ error**:
 | **string with embedded NUL** | **error** | argv entries are NUL-terminated; the OS cannot carry it (same limit as `export`) |
 | **list** | **error** — spread or `:join` | no canonical separator (space? tab? `,`?) |
 | **map** | **error** — render it explicitly | no canonical flattening at all |
+| Duration | its canonical spelling (`3s`, `1m30s`) | it has a canonical form |
+| **Instant / regex / stream handle** | **error** — no canonical byte form | an Instant needs `:iso`/`:epoch`/`:format`; a regex (it carries flags) and a stream handle have no byte form at all |
 
 An embedded NUL (which a `$(cmd):raw` capture can hold) is the one place a
 *string* fails to cross — argv, like the environment, is NUL-terminated, so it
@@ -1023,8 +1025,12 @@ first release.)*
 **Regex is a first-class value** *(decided — porting `fromto`, `filter`, `he`,
 `untar`)*. `/re/` is a **regex literal** evaluating to a regex **value**, and `~`
 and `:match` **consume a regex value** — so `$str ~ /re/` and `$str:match(/re/)` are
-the literal case. A regex literal is recognized **only where a regex is expected** —
-the RHS of `~`/`!~`, the argument of `:match`, and a `match` arm. **Everywhere else a
+the literal case. A regex literal is recognized **only in the match slots** (the
+`~`/`!~` RHS, the `:match` argument, a `match` arm), and there only as a **complete
+`/…/`-delimited** atom — interior literal slashes escaped `\/`. The `~` RHS *also*
+accepts a **glob** (`$f ~ *.txt`), and a leading-`/` word that is not a clean `/…/` —
+an absolute glob like `/usr/*/bin` (its interior slashes mean it can't be a single
+`/…/`), or a bare path — reads as the **glob**, never a regex. **Everywhere else a
 `/…/` word is a path or string** — `cd /tmp/`, `grep /usr/bin`,
 `$env.PATH:has(/usr/bin)`, `p = /etc/hosts` are all unaffected (a `/…/` is only a
 regex next to the match operators, never in a plain argument or modifier slot). To
@@ -1189,7 +1195,7 @@ Rules:
   | command | its own exit status |
   | int | the integer itself — `0` success (the shell `return N`) |
   | bool | `true` → `0`, `false` → `1` (the Unix inversion) |
-  | string / list / map / styled value / Instant / Duration / regex (incl. empty or zero) | `0` — producing a value *is* success |
+  | string / list / map / styled value / Instant / Duration / regex / stream handle (incl. empty or zero) | `0` — producing a value *is* success |
 
   So `have_command` ends in a test whose bool becomes the status and
   `if have_command fzf { … }` reads correctly; `return $cond` exits `0`/`1`;
@@ -1516,7 +1522,9 @@ to a bool):
   `[[ $s =~ re ]]`, unified. The regex form is **unanchored** (first match
   anywhere, as bash `=~` and grep are); anchor with `^…$`. A glob, by contrast,
   matches the **whole string** (fnmatch), the same as a `/re/` wrapped in `^…$` —
-  and `:match` shares the regex rule.
+  and `:match` shares the regex rule. On the RHS a **complete `/…/`** atom is the
+  regex and any other pattern is the glob, so an absolute glob (`/usr/*/bin`) is
+  unambiguously a glob.
 - **File tests** are the scalar cousins of the `:files`/`:f` filter modifiers.
   The type/permission axis is words: `$p:type` yields the `find -type` word
   (`file`/`dir`/`link`/…) so `$p:type == dir` is `-d`; `$p:exists` is `-e`;
