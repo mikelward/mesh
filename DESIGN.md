@@ -1470,7 +1470,10 @@ to a bool):
   `$s == ""` / `$s:len > 0`.) The **binary** file relations `-nt` / `-ot` / `-ef`
   (newer / older / same-inode) are the same comparison family as the
   [predicate qualifiers](#globbing) (`age<`), spelled `$a:mtime > $b:mtime` and
-  `$a:same($b)` rather than cryptic digraphs. These ride on the **time model**
+  `$a:same($b)` rather than cryptic digraphs. Like `test`, these **dereference
+  symlinks** — `:mtime`/`:atime`/`:ctime` and `:same` act on the link *target*, so a
+  symlink and its target share an mtime and are `:same`; `:type == link` is how you
+  ask about the link itself. These ride on the **time model**
   *(decided, porting `age()`)*: `now()` and the file-time modifiers
   (`:mtime`/`:atime`/`:ctime`) return an **`Instant`**, and `Instant - Instant` is
   a **`Duration`** (`age = now() - $f:mtime`). A `Duration` is written with **suffix
@@ -1491,7 +1494,10 @@ to a bool):
   arithmetic. A `Duration`'s **canonical spelling** uses the largest units that fit
   with no zero components (`90s` → `1m30s`, `3000ms` → `3s`), bottoms out at `ms`,
   writes zero as `0s`, and prefixes a negative value's whole form with `-`
-  (`-1m30s`). An **`Instant` has no canonical text form**: interpolating, `puts`-ing,
+  (`-1m30s`). Any magnitude that rounds below the `ms` floor — including a wholly
+  sub-millisecond duration like `500µs` — renders as `0s` too, and there is **no
+  negative zero**: a value that renders as zero is always `0s`, never `-0s` or `0ms`.
+  An **`Instant` has no canonical text form**: interpolating, `puts`-ing,
   or passing one to argv is a **loud error** — epoch-vs-ISO and the timezone are a
   guess, the same no-guess-at-the-boundary rule as an un-spread list — so render it
   explicitly with `$t:epoch` (integer seconds), `$t:iso` (ISO-8601), or
