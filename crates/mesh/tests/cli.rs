@@ -191,11 +191,39 @@ fn tilde_expands_to_home() {
 fn cd_tilde_goes_home() {
     let home = fresh_dir("tilde_cd");
     let out = run_with_home("cd ~\npwd\n", &home);
+    // pwd reports the canonical getcwd, so canonicalize the expected path too —
+    // otherwise this fails where the temp dir sits under a symlink (macOS
+    // /var -> /private/var).
+    let expected = home.canonicalize().expect("canonicalize home");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", expected.display())
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn glob_star_excludes_dotfiles() {
+    let dir = fresh_dir("glob_dot");
+    std::fs::write(dir.join("visible.txt"), "").unwrap();
+    std::fs::write(dir.join(".hidden"), "").unwrap();
+    let out = run_with_input(&format!("cd {}\nputs *\n", dir.display()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "visible.txt\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tilde_keeps_home_metacharacters_literal() {
+    // A $HOME containing glob metacharacters must not be treated as a pattern.
+    let base = fresh_dir("tilde_meta");
+    let home = base.join("home[1]");
+    std::fs::create_dir_all(&home).unwrap();
+    let out = run_with_home("puts ~\n", &home);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         format!("{}\n", home.display())
     );
-    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[cfg(target_os = "linux")]
