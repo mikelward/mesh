@@ -27,9 +27,9 @@ Cargo, as a **workspace** rooted at [`Cargo.toml`](Cargo.toml).
 
 - **Edition:** 2024. **MSRV:** 1.85 (recorded as `rust-version`; bumps are
   deliberate, not incidental).
-- **One member today** — `crates/mesh`, the shell binary. The workspace exists
-  so satellite crates (a VCS/prompt helper, a future `mesh-core` library) drop in
-  as new `members` without restructuring.
+- **Two members today** — `crates/mesh`, the thin shell executable, and
+  `crates/mesh-core`, the reusable lexer, expansion, and runtime library. The
+  workspace leaves room for satellite crates without restructuring.
 - **Lints are centralized** in `[workspace.lints]` and inherited by each crate
   (`[lints] workspace = true`). CI denies warnings, so keep the tree clean rather
   than scattering `#[allow]`.
@@ -122,18 +122,20 @@ mesh/
 ├── rust-toolchain.toml     # pins stable + rustfmt + clippy
 ├── .github/workflows/ci.yml
 ├── crates/
-│   └── mesh/               # the shell binary
+│   ├── mesh/               # thin shell executable
+│   │   ├── Cargo.toml
+│   │   ├── src/main.rs     # calls mesh_core::run
+│   │   └── tests/cli.rs    # end-to-end tests driving the built binary
+│   └── mesh-core/          # reusable shell implementation
 │       ├── Cargo.toml
-│       ├── src/
-│       │   ├── main.rs     # entry point
-│       │   ├── repl.rs     # read / tokenize / dispatch loop
-│       │   ├── lexer.rs    # quotes + escapes + $interpolation → words of pieces
-│       │   ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
-│       │   ├── vars.rs     # session-global variable store
-│       │   ├── builtins.rs # cd, pwd, puts, exit
-│       │   └── exec.rs     # launch external commands + pipelines/redirection
-│       └── tests/
-│           └── cli.rs      # end-to-end tests driving the built binary
+│       └── src/
+│           ├── lib.rs      # public run entry point and lexer module
+│           ├── repl.rs     # read / tokenize / dispatch loop
+│           ├── lexer.rs    # quotes + escapes + $interpolation → words of pieces
+│           ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
+│           ├── vars.rs     # session-global variable store
+│           ├── builtins.rs # cd, pwd, puts, exit
+│           └── exec.rs     # launch external commands + pipelines/redirection
 ├── DESIGN.md               # vision + language design (the "why/what")
 ├── DEVELOPMENT.md          # this file (the "how to build")
 ├── GRAMMAR.md              # the grammar actually implemented so far (grows per task)
@@ -144,7 +146,8 @@ mesh/
 
 ### How the code fits together
 
-`main` calls `repl::run`, which loops: read a line → `lexer::split_line` into
+`main` calls `mesh_core::run`, which enters the REPL and loops: read a line →
+`lexer::split_line` into
 command segments joined by `;` / `&&` / `||`, each a list of words of pieces →
 run the segments left to right, each connector deciding from the previous status
 whether its command runs → per command, classify as an assignment or a command →
@@ -154,8 +157,7 @@ tilde/globs) → `builtins::dispatch` (handles `cd`/`pwd`/`puts`/`exit`, returns
 session-global `vars` store persists across lines; the loop tracks the last exit
 status and returns it as the process exit code at EOF.
 
-**Planned evolution.** When the real lexer/parser replace the M0 placeholder,
-the shell internals graduate into a `crates/mesh-core` **library** and the binary
-becomes a thin `main` over it — that is the natural moment to make the split
-(direct unit-testing of the parser, shared code for satellite binaries), not
-before. See [`ROADMAP.md`](ROADMAP.md).
+The shell internals live in the `crates/mesh-core` library; `crates/mesh` is a
+thin executable that calls its public `run` entry point. This keeps lexer and
+future parser logic directly testable and makes the runtime reusable by future
+frontends or satellite binaries. See [`ROADMAP.md`](ROADMAP.md).
