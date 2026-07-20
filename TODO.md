@@ -22,7 +22,26 @@ file as tasks land.
 - [ ] Promote internals into `crates/mesh-core` (lib); binary becomes thin `main`
 - [ ] `;`, `&&`, `||` sequencing
 - [ ] `cd` builtin (deferred from M0): `$env.PWD`/`OLDPWD`, `cd -`, `CDPATH`
+- [ ] `pwd` and `puts` builtins
+- [ ] Globs + `~` expansion (glob no-match → **empty**, see Decisions made)
 - [ ] A simple prompt (host/dir), stderr-rendered as today
+
+## Known limitations
+
+- Ctrl-C during a foreground command kills the shell instead of returning to the
+  prompt with status `130`. Deferred to the job-control task (M2); see
+  `ROADMAP.md`.
+
+## Decisions made
+
+- **Merge method:** rebase. **Toolchain:** floating `stable`. **Loop autonomy:**
+  proceed with best call, documented + overridable; pause only for grammar-level
+  design decisions.
+- **Glob no-match → empty** (nullglob-style: the pattern expands to zero words,
+  "as if it weren't there"). Rejects bash's literal pass-through as a footgun.
+  Caveat to revisit: a silently-vanishing no-match is a mild version of the
+  "absence is loud" concern elsewhere in `DESIGN.md` (e.g. `rm *.bak` with no
+  matches becomes a bare `rm`); the alternative was erroring like zsh `nomatch`.
 
 ## Decisions needed
 
