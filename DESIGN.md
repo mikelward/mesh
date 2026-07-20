@@ -245,12 +245,12 @@ Rules:
   available via chaining (`$f:stem:stem`).
 
 *(TODO — decisions surfaced porting real `PATH` / `find_up` code:*
-- ***Transform-vs-predicate overlap.*** `:dir` is *dirname* (a transform), so
-  `$paths:filter(:dir)` would silently keep **everything** — dirname is always a
-  truthy string — when the writer meant "keep directories." The directory *test*
-  is already `$p:type == dir` (glob type `:d` / `(d)`); decide whether a bare
-  **transform** modifier used in **predicate** position should be a **loud error**
-  to kill that footgun, and confirm the shorthand directory-*filter* spelling.
+- ***Transform-vs-predicate overlap.*** Keeping directories is the settled
+  `:dirs` / `:d` filter modifier; the open question is only the footgun sitting
+  next to it — `:dir` is *dirname* (a transform), so a slip to `$paths:filter(:dir)`
+  silently keeps **everything** (dirname is always a truthy string). Decide whether
+  a bare **transform** modifier used in **predicate** position should be a **loud
+  error** rather than a quiet keep-all.
 - ***Upward path walk — `:ancestors` / `:parents`.*** `find_up`, project-root
   detection, and `rootdir` all want `pwd():ancestors` → `[/a/b/c /a/b /a /]`, turning
   a `cd ..`-in-a-subshell loop into a plain list iteration. Decide the name and
