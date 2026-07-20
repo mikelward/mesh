@@ -1109,10 +1109,14 @@ Rules:
     (`--verbose | -v`) and a numeric-count form, or whether short/numeric flags stay
     an external-tool-only convention and in-shell functions are `--long`-only.
   - ***Enum / choice-constrained values.*** `homepkg --backend mamba|conda|github`
-    and `setup`'s mutually-exclusive `--kde|--hypr|--sway` have no parse-time
-    validation — "enum" exists only as a *completion* value type. Let a flag or
-    positional declare an allowed-value set that validates at the call and feeds
-    completion.
+    has no parse-time validation — "enum" exists only as a *completion* value type.
+    Let a flag or positional declare an allowed-value set that validates at the call
+    and feeds completion.
+  - ***Mutually-exclusive switch groups.*** `setup`'s `--kde`/`--hypr`/`--sway` are
+    three separate switches where at most one is allowed — a *different* requirement
+    from a single enum value (a plain allowed-set check would still pass
+    `setup --kde --sway`). Either steer such interfaces toward one enum-valued option
+    (`--desktop kde|hypr|sway`) or grow a mutex-group constraint in the signature.
   - ***Negatable / tri-state flags.*** `setup`'s `--gui`/`--no-gui` auto/yes/no
     pairs have no expression: a switch is binary, false-unless-passed, with no
     `--no-` negation. Allow a switch to auto-derive a `--no-` form (a
