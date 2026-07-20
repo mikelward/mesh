@@ -987,16 +987,20 @@ fn return_in_a_pipeline_is_rejected() {
 }
 
 #[test]
-fn a_function_named_after_a_control_word_is_rejected() {
-    // `func` and `return` are intercepted before function dispatch, so a function
-    // by either name could never be called — reject the definition.
-    for name in ["func", "return"] {
+fn a_function_named_after_a_reserved_name_is_rejected() {
+    // Control words (`func`, `return`) and builtins (`cd`, `pwd`, `puts`) are all
+    // resolved before defined functions, so a function by any of these names
+    // could never be called — reject the definition.
+    for name in ["func", "return", "cd", "pwd", "puts"] {
         let out = run_with_input(&format!("func {name}() {{ puts hi }}\nputs after\n"));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("reserved word"),
+            stderr.contains("reserved name"),
             "name `{name}` stderr: {stderr}"
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
     }
+    // `exit` too, checked on its own so a stray call can't end the shell first.
+    let out = run_with_input("func exit() { puts hi }\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reserved name"));
 }

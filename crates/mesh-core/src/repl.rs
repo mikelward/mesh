@@ -374,12 +374,14 @@ fn parse_func_def(text: &str) -> Result<(String, FuncDef), String> {
     if !lexer::is_ident(name) {
         return Err(format!("func: `{name}` is not a valid function name"));
     }
-    // `func` and `return` are control words the reader/dispatcher intercept
-    // before consulting defined functions, so a function by either name could be
-    // stored but never called. Reject them rather than accept a dead definition.
-    if name == "func" || name == "return" {
+    // A name resolves as builtin → function → external, and `func`/`return` are
+    // intercepted even earlier (the reader reads `func …` as a definition, and
+    // `return` is control flow). A function named after any of these would be
+    // stored but never reachable, so reject it rather than accept a dead
+    // definition.
+    if name == "func" || name == "return" || builtins::is_builtin(name) {
         return Err(format!(
-            "func: `{name}` is a reserved word and cannot be a function name"
+            "func: `{name}` is a reserved name and cannot be a function name"
         ));
     }
     let after_open = rest[name_end..]
