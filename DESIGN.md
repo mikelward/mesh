@@ -184,6 +184,22 @@ All four kinds:
 
 - **chain**: `$f:stem:stem`, `$(cmd):nulls` then value modifiers over each item,
   `$xs:rest:last` (collection modifiers compose too).
+- **Arguments — bare, space-separated, or parenthesized.** A **no-argument**
+  modifier is always **bare** — `:stem`, `:first`, `:dedup`, `:values` — and chains
+  by adjacency (`$f:stem:dir`, `$xs:rest:last`); it never takes parens (`:first`,
+  never `:first()`). A modifier that **takes arguments** accepts them either
+  **space-separated** (`:split ":"`, `:get key default`) or **parenthesized**
+  (`:split(":")`, `:get(key default)`). The paren form **delimits the argument
+  list**, so a following modifier chains with no whitespace:
+  `$host:split(".")​:first`. In the bare space form the argument list runs until the
+  next `:`-keyword, so a chained modifier there needs a **space** —
+  `$host:split "." :first`, *not* `$host:split ".":first`, because a modifier binds
+  to the value immediately before it, so `".":first` would take `:first` of the
+  `"."` literal (yielding `"."`) and hand *that* to `split`, dropping the chain.
+  So: prefer `:split(".")` when you chain after an argument; the space form is fine
+  when the arg-taking modifier is last. This whitespace-significance is the reason
+  the paren form exists — it makes the space non-load-bearing. (A slash-delimited
+  regex argument, `:match /re/`, is already self-delimiting — no parens needed.)
 - **Disambiguation:** `:` is a modifier only when immediately followed by a
   known modifier keyword. `$host:$port` keeps `:` literal (the token after `:`
   is an expansion, not a keyword), so building `host:port`-style strings — or
