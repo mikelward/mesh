@@ -247,15 +247,16 @@ Rules:
 *(TODO — decisions surfaced porting real `PATH` / `find_up` code:*
 - ***Transform-vs-predicate overlap.*** Keeping directories is the settled
   `:dirs` / `:d` filter modifier; the open question is only the footgun sitting
-  next to it — `:dir` is *dirname* (a transform), so a predicate that reaches for it,
-  `$paths:filter(func(p) { $p:dir })`, silently keeps **everything** (dirname is
-  always a truthy string) when the writer meant "keep directories." Decide whether a
-  transform modifier surfacing as a predicate's truthy value should be a **loud
-  error** rather than a quiet keep-all.
+  next to it — `:dir` is *dirname* (a transform), so `$paths:filter(:dir)` silently
+  keeps **everything** (a dirname is always a truthy string) when `$paths:dirs` /
+  `$paths:filter(:d)` was meant — a one-letter slip. Decide whether a transform
+  modifier surfacing as a predicate's truthy value should be a **loud error** rather
+  than a quiet keep-all.
 - ***Upward path walk — `:ancestors` / `:parents`.*** `find_up`, project-root
-  detection, and `rootdir` all want `$env.PWD:ancestors` → `[/a/b/c /a/b /a /]`, turning
-  a `cd ..`-in-a-subshell loop into a plain list iteration. Decide the name and
-  whether it includes the path itself and the `/` root.)*
+  detection, and `rootdir` all want `pwd():ancestors` → `[/a/b/c /a/b /a /]`, turning
+  a `cd ..`-in-a-subshell loop into a plain list iteration — `pwd()`, the *validated*
+  shell-owned cwd, not the possibly-stale `$env.PWD`. Decide the name and whether it
+  includes the path itself and the `/` root.)*
 
 This modifier system is the direct answer to
 [fish #4002](https://github.com/fish-shell/fish-shell/issues/4002) ("a
@@ -1302,6 +1303,13 @@ syntax** for named and anonymous functions, and the transform modifiers
 complementing the auto-mapping value modifiers for the cases a bare modifier
 can't express.
 
+A **bare modifier reference is itself a callable value**, so where a predicate or
+mapper is wanted you can hand a modifier directly instead of wrapping it in a
+lambda: `$files:filter(:exec)` *is* `$files:filter(func(f) { $f:exec })`, and
+`$paths:map(:stem)` *is* `$paths:map(func(p) { $p:stem })`. A `:mod` in argument
+position denotes "the function that applies `:mod`"; the lambda form remains for
+anything a single modifier can't say.
+
 ### Conditionals: `if` is an expression
 
 `if` **yields a value** — it is an expression, not just a statement (Rust,
@@ -1469,9 +1477,11 @@ to a bool):
   literals** — `500ms`, `3s`, `5m`, `2h`, `7d`, units up through **days** (no week or
   year — not fixed-length), compounding as `2h30m` — and **prints canonically**, so
   the prompt timer is `took $elapsed` with no `/1000`. Arithmetic is the closed set
-  `Duration ± Duration`, `Duration × n`, `Duration ÷ Duration` (a bare ratio),
-  `Instant ± Duration → Instant`, `Instant - Instant → Duration` (`Instant + Instant`
-  is an error); `:ms` / `:secs` drop back to a number. A bare integer is **not** a
+  `Duration ± Duration`, `Duration × n`, `Instant ± Duration → Instant`, and
+  `Instant - Instant → Duration` (`Instant + Instant` is an error). Division is
+  **not** in the set — for a ratio, drop to an integer first with `:ms` / `:secs`
+  (`$a:ms / $b:ms`), so no float or rational type has to be introduced. A bare
+  integer is **not** a
   Duration (the ms-vs-s footgun mesh kills), but the process boundary stays bytes, so
   an external `sleep 2` still passes `"2"` — the type governs only *in-shell* values.
   One literal grammar then unifies the glob `age<1d` predicate, file-time
@@ -1480,10 +1490,6 @@ to a bool):
   `"…":datetime`, and the tz conversion behind `tz2tz`/`udate`/`utc2`) delegate to
   `date` for now; consider a native tz-aware datetime later, weighed against simply
   shelling out.)*
-  *(TODO — surfaced porting `age()`: settle the **time model** these imply. Is
-  `:mtime` a bare epoch **int** or an **instant**, is there a `now()`, and is a
-  difference a plain count of seconds or a **duration** that prints as `3s`?
-  `age = now() - $f:mtime` and the prompt's `took 3s` both ride on this answer.)*
 - **Combine** bools with the words `and` / `or` / `not` (`if $a:exists and not
   $b:exists { … }`). These join *values*; the byte-stream **command** chains
   `&&` / `||` (run-next-on-success/failure, by exit status) are kept separately
@@ -1915,11 +1921,14 @@ programs or user functions:
     [`precd` / `postcd`](#hooks-and-the-prompt) hooks. Logical by default;
     **`--physical` / `-P`** resolves symlinks first. The block form `in DIR { }` is
     the scoped `pushd` / `popd`.
-  - **`pwd`** — print the working directory. The shell **maintains the logical cwd
+  - **`pwd`** — the working directory. The shell **maintains the logical cwd
     itself** (updated by `cd` / autocd), so `pwd` reports *that* shell-owned value —
     validated against the real directory and recomputed if a stale or forged
-    `$env.PWD` has diverged, so `pwd` can't lie. **`--physical` / `-P`** calls
-    `getcwd` for the symlink-resolved path.
+    `$env.PWD` has diverged, so `pwd` can't lie. Run bare it **prints** the path; the
+    **value call `pwd()` returns** the same validated cwd as a string value — so
+    `pwd():ancestors` and `style(pwd() --fg=blue)` read the authoritative path, never
+    the raw `$env.PWD`. **`--physical` / `-P`** calls `getcwd` for the symlink-resolved
+    path.
   - **Autocd** — a bare word in command position that is a **directory path ending
     in `/`** (`src/`, `../`, `/tmp/`) is a `cd` into it, no `cd` keyword needed. The
     **trailing slash is the signal** — and it's what makes this safe where zsh's
@@ -2284,7 +2293,7 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
 - ***Cursor shape per mode*** *(DECSCUSR `\e[…q`)* — block in vi NORMAL, bar in
   INSERT; driven by the same mode-change event as the keymap-indicator TODO in the
   line-editor section.
-- ***Synchronized output*** *(DCS 2026)* — wrap the prompt / multi-line redraw so it
+- ***Synchronized output*** *(DEC private mode 2026, `CSI ?2026 h/l`)* — wrap the prompt / multi-line redraw so it
   updates atomically without flicker.
 
   Decide per feature: automatic, a hook/builtin, or out of scope (left to a
@@ -2385,7 +2394,10 @@ therefore one of two things:
 
 - a **styled value** (from a `()` call to `style`) — text and attributes kept
   separate, so the shell measures display width from the text *and* can strip or
-  re-theme the styling (needed for the later transient/collapsed form); or
+  re-theme the styling (needed for the later transient/collapsed form). Because the
+  attributes are data, `style` is also where **color downgrade** lives: it drops the
+  styling automatically when output is not a color-capable tty or when **`NO_COLOR`**
+  is set, so there is no config-visible `$color` flag or capability probe to manage; or
 - a **plain string** — which may carry its own ANSI escapes, as an external
   renderer captured with `$(vcs prompt-info)` does (externals have no return
   value, so the renderer necessarily comes in through the output lane). The shell
