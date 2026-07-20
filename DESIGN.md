@@ -1438,6 +1438,88 @@ tracked, not hand-waved: the binary file relations (`-nt`/`-ot`/`-ef`) sit with
 the predicate-qualifier open question, and regex **captures** (bash's
 `BASH_REMATCH`) with the `match`-arm capture question above.
 
+### Error handling
+
+mesh keeps **two distinct failure channels** and deliberately does not merge them
+the way bash does (into "empty string, exit 1"):
+
+- **Value-level failure** — a `false`, a nonzero `int`, or a command's exit
+  status. This is *not* an interruption: it is a **value** you branch on (`if`,
+  `while`, `&&` / `||`, `and` / `or` / `not`). It is the whole of the
+  [result/status model](#functions) — failure here is signalled by a `false` /
+  nonzero-int / command-status, **never** by the *shape* of a value.
+- **Errors ("fail loud")** — a value the code *required* is absent or ill-typed:
+  a destructure length mismatch (`[a b c] = two_items`), an out-of-range index
+  (`$xs[99]`), a bare [`:match`](#destructuring) miss, undecodable text where text
+  is required, a type error. These produce **no value** — they **abort the current
+  statement** and surface loudly. They live *outside* the value/status model: not a
+  `false` you might accidentally test as truthy, but an interruption you can't miss.
+
+The split exists because "the command found nothing" (channel 1 — normal, testable)
+and "the code asked for something that isn't there" (channel 2 — a bug) are
+genuinely different, and collapsing them is the source of a whole class of silent
+shell bugs.
+
+**Strict by default, soft by opt-in.** Fail-loud is the *default*; every strict
+operation that can be legitimately "maybe absent" has a **soft twin**, and *which
+construct you write* is how you declare whether absence is a bug or expected:
+
+| Intent | Strict — errors (channel 2) | Soft — yields a value (channel 1) |
+| --- | --- | --- |
+| bind N names from a list | `[a b] = xs` | `if [a b] = xs { … }` — a miss skips |
+| a captured group | `[x] = s:match /re/` | `if [x] = s:match /re/ { … }` |
+| index an element | `$xs[i]` | `$xs:get i default` — total, never errors |
+| a map value | `$m.key` | `$m:get key default` |
+| read a line | — | `gets()` → `false` at EOF |
+| a branch's value | — | `if cond { v }` → `""` when false |
+
+So absence is loud when you **asserted** the value is there (a bare bind, a direct
+`[i]`) and quiet when you **asked whether** it is (`if`-binding, `:get`, `gets`, a
+no-`else` `if`). You never get bash's silent-empty-*by-default*; softness is
+explicit. The soft index accessor is the existing two-arg [`$xs:get i
+default`](#arrays-lists) rather than a `:get(i)` that returns a bare `false` or a
+`:get():default()` chain — deliberately, because the two-arg form does the bounds
+check *internally* and so can still distinguish "element `i` is genuinely `false` /
+`""`" from "there is no element `i`," which a returned-sentinel chain cannot. That
+is the same no-null reasoning as everywhere else: don't let one value stand in for
+both "empty" and "absent."
+
+**`if` with no `else` is a soft form, not a suppressed error.** A false condition
+is a normal outcome, not a failure, so `tag = if $root { "[root]" }` yielding `""`
+when not root is the *soft channel producing the "nothing" value* — exactly
+parallel to `gets()` producing `false` — and is consistent with fail-loud, which
+governs only *required* positions. The residual edge is stated honestly: `""`-as-
+nothing is indistinguishable from a real empty string and flows downstream under
+[no-null](#variables-and-assignment), so a no-`else` `if` is the one place mesh
+hands you a silent empty that a destructure would refuse. That is the accepted cost
+of the terse one-liner ([Conditionals](#conditionals-if-is-an-expression),
+"Decided: lenient"); the only lever to close it — requiring `else` in *binding*
+position — was weighed and declined for ergonomics.
+
+**Recovery — the shell contains errors at interactive boundaries.** A channel-2
+error has to land somewhere; the rule is where:
+
+- **Interactive line** — the error aborts that line, prints, and returns to a fresh
+  prompt. The session never dies.
+- **`source FILE`** — a *parse* error rejects the whole file (none of it runs, so a
+  bad rc can't leave a half-defined config); a *runtime* error aborts the file at
+  that point and surfaces, but does not kill the shell that sourced it.
+- **Prompt / hook / completion callback** — the shell **catches** the error at the
+  dispatch boundary, reports it (above the fresh prompt), and continues with a
+  degraded result — that one prompt segment is dropped, not the whole prompt. A
+  buggy config *shows* its bug without bricking interactivity: fail-loud and
+  keep-running at once.
+- **Script / `-c` / non-interactive** — an uncaught error exits nonzero (the batch
+  contract), so automation still fails hard.
+
+*(Open — the catch question: whether mesh also exposes a **user-facing** recovery
+form — a `try` / `catch`, or an Elvish-style `?(…)` capture that converts a
+channel-2 error into a channel-1 value — for the cases with no soft twin (a type
+error, div-by-zero, undecodable text), or whether the strict/soft pairs plus the
+boundary-catch above suffice for the MVP. Leaning: ship the boundary-catch and the
+soft twins, **no** user `try` / `catch` in the MVP, since interactive use rarely
+needs to programmatically recover from a genuine bug; revisit for scripting.)*
+
 ### Loops (`for`, `while`, `loop`)
 
 Same brace-delimited shape as `func` and `if` — **no `do` / `done`**. The header
@@ -2457,17 +2539,15 @@ recovery, and the Rust data representation all depend on them.
   never decode, text operations decode on demand and **fail loud** on an invalid
   sequence. This must precede the Rust representation and is essential on Unix,
   where paths are not guaranteed UTF-8.
-- **Failure classes — the execution model behind "fail loud."** Classify every
-  failure as a **parse error**, a **recoverable runtime error** (bad index, type
-  error, undefined variable under strict access, undecodable text where text is
-  required), or an **ordinary nonzero command status**, and define how each behaves
-  in an interactive line, in `source FILE`, in a function body, mid-pipeline, and
-  within `&&` / `||`. Leaning: a parse error rejects the whole compilation unit (the
-  line, or the entire file — a bad `source` runs *none* of it) but never ends an
-  interactive session; a runtime error aborts the current statement and surfaces
-  (nonzero status) but does not unwind past the interactive prompt; a command's
-  nonzero status is just a value. "[Fail loud](#variables-and-assignment)" is the
-  right UX principle but is not yet an execution model — this makes it one.
+- **Failure classes — mostly settled** ([Error handling](#error-handling)). The
+  execution model is now written up: **two channels** (value-level failure vs
+  fail-loud errors), **strict-by-default / soft-by-opt-in** with a strict/soft table,
+  the reconciliation that a no-`else` `if` is a *soft* form (so it is consistent
+  with fail-loud), and the **boundary-catch** recovery rule (interactive line,
+  `source`, prompt/hook/completion, script). **Remaining open:** whether to expose a
+  **user-facing** `try` / `catch` or `?(…)` capture for channel-2 errors with no
+  soft twin, or ship only the boundary-catch + soft twins for the MVP (leaning: no
+  user catch in the MVP).
 
 ## Name
 
