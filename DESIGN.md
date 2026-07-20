@@ -1488,7 +1488,14 @@ to a bool):
   still compare correctly (`$a:mtime > $b:mtime`, the `-nt` replacement); literals
   only reach down to `ms`, and canonical rendering stops at `ms` — any finer
   remainder is dropped from the *printed* form but kept for comparison and
-  arithmetic. A bare
+  arithmetic. A `Duration`'s **canonical spelling** uses the largest units that fit
+  with no zero components (`90s` → `1m30s`, `3000ms` → `3s`), bottoms out at `ms`,
+  writes zero as `0s`, and prefixes a negative value's whole form with `-`
+  (`-1m30s`). An **`Instant` has no canonical text form**: interpolating, `puts`-ing,
+  or passing one to argv is a **loud error** — epoch-vs-ISO and the timezone are a
+  guess, the same no-guess-at-the-boundary rule as an un-spread list — so render it
+  explicitly with `$t:epoch` (integer seconds), `$t:iso` (ISO-8601), or
+  `$t:format(…)`. A bare
   integer is **not** a
   Duration (the ms-vs-s footgun mesh kills), but the process boundary stays bytes, so
   an external `sleep 2` still passes `"2"` — the type governs only *in-shell* values.
@@ -1505,10 +1512,10 @@ to a bool):
 
 So `case` → `match`, and the everyday `[[ … ]]` jobs map to a comparison, a `~`
 pattern-match, a file-test modifier, or an `and`/`or`/`not` of those — no
-special `[[` context, and none of its word-splitting quirks. The stragglers are
-tracked, not hand-waved: the binary file relations (`-nt`/`-ot`/`-ef`) sit with
-the predicate-qualifier open question, and regex **captures** (bash's
-`BASH_REMATCH`) with the `match`-arm capture question above.
+special `[[` context, and none of its word-splitting quirks. The binary file
+relations (`-nt`/`-ot`/`-ef`) are settled above as `$a:mtime > $b:mtime` and
+`$a:same($b)`; the one straggler still tracked, not hand-waved, is regex
+**captures** (bash's `BASH_REMATCH`), with the `match`-arm capture question above.
 
 ### Error handling
 
