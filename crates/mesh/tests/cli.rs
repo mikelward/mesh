@@ -790,3 +790,80 @@ fn a_fifo_redirect_in_a_pipeline_does_not_deadlock() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("done"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_multi_line_function_defines_and_calls() {
+    let out =
+        run_with_input("func greet(who) {\n  puts \"hi, $who\"\n}\ngreet world\ngreet mesh\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi, world\nhi, mesh\n"
+    );
+}
+
+#[test]
+fn a_single_line_function_works() {
+    let out = run_with_input("func hi(n) { puts \"yo $n\" }\nhi bob\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "yo bob\n");
+}
+
+#[test]
+fn return_sets_the_function_status_and_stops_the_body() {
+    // `return N` ends the body (later commands do not run) and sets the status.
+    let out = run_with_input(
+        "func f() {\n  puts before\n  return 3\n  puts after\n}\nf || puts failed\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "before\nfailed\n");
+}
+
+#[test]
+fn a_function_status_is_its_last_command() {
+    // With no explicit return, the function's status is the last command's.
+    assert_eq!(
+        run_with_input("func f() { false }\nf\n").status.code(),
+        Some(1)
+    );
+    assert_eq!(
+        run_with_input("func f() { true }\nf\n").status.code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn a_function_local_does_not_leak_and_reads_reach_the_global() {
+    let out = run_with_input(
+        "x = outer\ng = GLOBAL\nfunc mut() {\n  x = inner\n  puts \"in $x see $g\"\n}\nmut\nputs \"out $x\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "in inner see GLOBAL\nout outer\n"
+    );
+}
+
+#[test]
+fn an_arity_mismatch_is_a_loud_error_that_recovers() {
+    let out = run_with_input("func one(a) { puts $a }\none\none too many\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("expected 1 argument"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn return_outside_a_function_is_reported() {
+    let out = run_with_input("return\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("return: not inside a function"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_function_in_a_pipeline_is_rejected_for_now() {
+    let out = run_with_input("func f() { puts hi }\nf | cat\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not supported in a pipeline"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn an_unterminated_function_at_eof_is_a_syntax_error() {
+    let out = run_with_input("func f() {\n  puts hi\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("missing closing"));
+}

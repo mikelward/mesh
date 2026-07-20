@@ -202,9 +202,41 @@ redirect** (`2>`, `&>`, and their `>>` forms) is also deferred and **rejected as
 a syntax error** rather than silently reinterpreted. Also deferred: here-strings
 and a redirection with no command (`> f`).
 
+## Task 9 — functions
+
+A `func` definition binds a named callable. v1 supports **required named
+positionals** only.
+
+```
+funcdef = "func" name "(" params? ")" "{" body "}"
+params  = name (("," | ws) name)*        # required positionals only
+body    = <lines of commands>
+call    = name arg*                       # a defined name in command position
+return  = "return" value?                 # ends the function
+```
+
+- **Definition.** `func greet(name) { … }` — parameters are named; inside the body
+  you write `$name`, never `$1`. A definition may span **multiple lines**: the
+  read loop buffers input until the body's `{ … }` braces balance (quote-aware),
+  then defines the function. A single-line `func f(x) { … }` works too. Deferred:
+  optional/default parameters, `--flags`, and `...rest` (each rejected with a
+  clear message for now).
+- **Call.** A defined name in command position runs the function. Resolution order
+  is **builtins → functions → external**. Arguments bind to the positionals; the
+  count must match exactly (an arity mismatch is a loud error).
+- **Scope.** Each call runs in a fresh **function-local** scope. `x = 5` in a body
+  binds a local (gone on return); reads resolve **outward** local → global; a
+  function never sees its caller's locals. `global` / `export` / `unset` deferred.
+- **`return`.** `return` ends the function immediately (later body commands do not
+  run). `return N` sets the status (masked 0–255); a bare `return` uses the last
+  command's status. A function with no explicit `return` yields its last command's
+  status. `return` at top level (outside a function) is an error.
+- **Deferred:** a function in a multi-stage pipeline or with a redirection is not
+  supported yet (rejected, like builtins — needs the fork-based executor).
+
 ### Not yet parsed
-`{ }` blocks, `func`, `:` modifiers, heredocs. Each arrives with the task that
-needs it, and this file grows to match.
+`{ }` blocks (`if` / `for` / `while`), `:` modifiers, heredocs. Each arrives with
+the task that needs it, and this file grows to match.
 
 **Design target (still ahead of the lexer above).** The **Model B strings**
 direction from `DESIGN.md` is now implemented (see task 5 above). What the lexer

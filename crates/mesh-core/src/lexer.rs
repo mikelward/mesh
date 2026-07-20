@@ -522,6 +522,55 @@ pub fn is_ident(s: &str) -> bool {
     matches!(read_name(&chars, 0), Some((_, n)) if n == chars.len())
 }
 
+/// Does `text` leave an unclosed `{` at the bare (unquoted) level? The read loop
+/// uses this to keep buffering the lines of a multi-line `func … { … }` body.
+/// Quoted regions (`'…'`, `"…"`, `r'…'`, `r"…"`) and `\`-escapes are skipped, so
+/// a brace inside a string does not count.
+pub fn needs_more_input(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                i += 2;
+                continue;
+            }
+            'r' if matches!(chars.get(i + 1), Some('\'') | Some('"')) => {
+                i = skip_quoted(&chars, i + 2, chars[i + 1], false);
+                continue;
+            }
+            q @ ('\'' | '"') => {
+                i = skip_quoted(&chars, i + 1, q, true);
+                continue;
+            }
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth > 0
+}
+
+/// Skip from `start` to just past the closing `quote`. When `escapes`, a `\`
+/// escapes the next character (as in `"…"` / `'…'`); a raw string skips none.
+/// Returns the text length if the quote is unterminated in `text` so far.
+fn skip_quoted(chars: &[char], start: usize, quote: char, escapes: bool) -> usize {
+    let mut i = start;
+    while i < chars.len() {
+        if escapes && chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == quote {
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
 /// Parse the inner content of a `${…}` — a `name` with an optional `.member`.
 fn parse_var_ref(inner: &str) -> Option<VarRef> {
     let chars: Vec<char> = inner.chars().collect();
