@@ -74,7 +74,7 @@ impl std::fmt::Display for LexError {
             }
             LexError::UnsupportedRedirect => write!(
                 f,
-                "syntax error: descriptor redirection (e.g. `2>`, `&>`) is not supported yet"
+                "syntax error: this descriptor redirection is not supported yet"
             ),
         }
     }
@@ -90,12 +90,14 @@ pub enum Sep {
     Or,
 }
 
-/// A redirection operator: `>` truncate stdout, `>>` append stdout, `<` stdin.
+/// A file redirection operator.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum RedirKind {
     Out,
     Append,
     In,
+    ErrOut,
+    ErrAppend,
 }
 
 /// A redirection: an operator and the file word it targets.
@@ -187,12 +189,20 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
             i += 1;
             continue;
         }
-        if let Some((kind, len)) = redirect_at(&chars, i) {
-            // Deferred descriptor forms are rejected rather than silently
-            // reinterpreted: an fd number or `&` attached *before* the operator
-            // (`2>`, `&>`), or a `&` attached *after* it (`>&2`, `<&0`, the
-            // fd-duplication form) which would otherwise become the target file.
-            if is_descriptor_prefix(&current, &chars, i) || chars.get(i + len) == Some(&'&') {
+        if let Some((mut kind, len)) = redirect_at(&chars, i) {
+            // `2>` and `2>>` are the supported descriptor forms. Consume the
+            // abutting `2` instead of leaving it as an argv word.
+            let stderr_prefix = is_stderr_prefix(&current, &chars, i);
+            if stderr_prefix {
+                kind = match kind {
+                    RedirKind::Out => RedirKind::ErrOut,
+                    RedirKind::Append => RedirKind::ErrAppend,
+                    _ => return Err(LexError::UnsupportedRedirect),
+                };
+                current = None;
+            } else if is_descriptor_prefix(&current, &chars, i) || chars.get(i + len) == Some(&'&')
+            {
+                // Other fd numbers, `&>`, and fd duplication remain deferred.
                 return Err(LexError::UnsupportedRedirect);
             }
             finish_word(&mut current, &mut words, &mut redirs, &mut pending_redir);
@@ -322,6 +332,21 @@ fn separator_at(chars: &[char], at: usize) -> Option<(Sep, usize)> {
         '|' if chars.get(at + 1) == Some(&'|') => Some((Sep::Or, 2)),
         _ => None,
     }
+}
+
+/// Does a bare, unescaped `2` abut this operator?
+fn is_stderr_prefix(current: &Option<Vec<Piece>>, chars: &[char], at: usize) -> bool {
+    at > 0
+        && !chars[at - 1].is_whitespace()
+        && chars[at - 1] == '2'
+        && (at == 1 || chars[at - 2].is_whitespace())
+        && matches!(
+            current.as_deref(),
+            Some([Piece::Text {
+                text,
+                expandable: true,
+            }]) if text == "2"
+        )
 }
 
 /// Is the redirection operator at `at` a deferred file-descriptor form — an
@@ -759,6 +784,15 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn stderr_redirections_attach_without_an_argv_prefix() {
+        let segs = split_line("cmd 2> err 2>>log").unwrap();
+        let stage = &segs[0].stages[0];
+        assert_eq!(stage.words, [Word(vec![exp("cmd")])]);
+        assert_eq!(stage.redirs[0].kind, RedirKind::ErrOut);
+        assert_eq!(stage.redirs[1].kind, RedirKind::ErrAppend);
     }
 
     #[test]

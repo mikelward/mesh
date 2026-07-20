@@ -715,18 +715,30 @@ fn redirections_apply_in_source_order() {
 }
 
 #[test]
-fn a_descriptor_redirect_is_rejected_for_now() {
-    // `2>err` and `&>f` are deferred descriptor redirects — rejected loudly, not
-    // silently reinterpreted as a stdout redirect with a stray `2`/`&` argument.
-    let out = run_with_input("echo hello 2>err\nputs after\n");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("descriptor redirection"));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+fn stderr_redirection_writes_and_appends() {
+    let dir = fresh_dir("stderr_redirection");
+    let out = run_with_input(&format!(
+        "cd {}\nsh -c 'echo first >&2' 2>err\nsh -c 'echo second >&2' 2>>err\ncat err\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "first\nsecond\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unsupported_descriptor_redirects_are_rejected() {
+    // Other fd numbers, both-stream redirects, and descriptor duplication are
+    // rejected loudly rather than reinterpreted as argv plus stdout redirect.
+    let fd = run_with_input("echo hello 1>out\nputs after\n");
+    assert!(String::from_utf8_lossy(&fd.stderr).contains("descriptor redirection"));
+    assert_eq!(String::from_utf8_lossy(&fd.stdout), "after\n");
     let amp = run_with_input("echo hello &>f\nputs after\n");
     assert!(String::from_utf8_lossy(&amp.stderr).contains("descriptor redirection"));
     // `&>` attached to a preceding argument (`hello&>f`) is still rejected.
     let attached = run_with_input("echo hello&>f\nputs after\n");
     assert!(String::from_utf8_lossy(&attached.stderr).contains("descriptor redirection"));
-    // The fd-duplication form with `&` after the operator (`>&2`, `<&0`) too.
+    // The fd-duplication forms with `&` after the operator remain unsupported.
     let dup = run_with_input("echo hi >&2\nputs after\n");
     assert!(String::from_utf8_lossy(&dup.stderr).contains("descriptor redirection"));
     let dupin = run_with_input("cat <&0\nputs after\n");
@@ -736,8 +748,8 @@ fn a_descriptor_redirect_is_rejected_for_now() {
     let esc = run_with_input(&format!("cd {}\necho hi\\&>f\ncat f\n", dir.display()));
     assert_eq!(String::from_utf8_lossy(&esc.stdout), "hi&\n");
     let _ = std::fs::remove_dir_all(&dir);
-    // And a bare fd needs *only* digits abutting the operator: an empty quote
-    // (`""2>f`) or an escaped digit (`\2>f`) is a normal argument + redirect.
+    // A descriptor prefix must be wholly bare: an empty quote or escaped digit
+    // makes `2` an ordinary argument followed by a stdout redirect.
     let dir2 = fresh_dir("redir_empty_quote_fd");
     let eq = run_with_input(&format!("cd {}\necho \"\"2>f\ncat f\n", dir2.display()));
     assert_eq!(String::from_utf8_lossy(&eq.stdout), "2\n");

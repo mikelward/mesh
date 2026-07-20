@@ -29,7 +29,7 @@ file as tasks land.
       unbound read is a loud error, no word-splitting of interpolated values.
       Deferred: list/map values (single-value assignment only), `:` modifiers,
       `export`, `global`/`unset`, function-local scope, `$sh.*`, `$env:get`.
-- [ ] Promote internals into `crates/mesh-core` (lib); binary becomes thin `main`
+- [x] Promote internals into `crates/mesh-core` (lib); binary becomes thin `main`
 - [x] `;`, `&&`, `||` sequencing (bare only; short-circuit on the previous
       status; quoted/escaped operators literal). `&`/`|` deferred to job
       control/pipes.
@@ -39,6 +39,14 @@ file as tasks land.
 - [x] `pwd` and `puts` builtins
 - [x] Globs + `~` expansion (glob no-match → **empty**). `~user` and expansion
       suppression (quoting) still to come; non-UTF-8 lossy under String words.
+
+## M2 — Pipes, redirection, and job control
+
+- [x] Pipelines (`a | b | c`) with pipefail status and upstream-SIGPIPE handling
+- [x] File redirection (`>`, `>>`, `<`, `2>`, `2>>`)
+- [ ] POSIX process groups, terminal handoff, and signal handling
+- [ ] Foreground Ctrl-C returns to the prompt with status 130
+- [ ] Suspended/background jobs plus `fg` / `bg`
 
 ## Known limitations
 

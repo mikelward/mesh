@@ -82,7 +82,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Ok((None, None))))
+            .map(|h| h.join().unwrap_or_else(|_| Ok((None, None, None))))
             .collect::<Vec<_>>()
     });
 
@@ -93,7 +93,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
         // one reading `/dev/null` rather than the shell's stdin.
         let incoming = std::mem::replace(&mut next_stdin, NextIn::Null);
 
-        let (in_file, out_file) = match redir_result {
+        let (in_file, out_file, err_file) = match redir_result {
             Ok(files) => files,
             Err((path, err)) => {
                 eprintln!("mesh: {path}: {err}");
@@ -118,6 +118,10 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
                     command.stdin(prev);
                 }
             }
+        }
+
+        if let Some(file) = err_file {
+            command.stderr(file);
         }
 
         // stdout: an output redirection wins over the pipe to the next stage;
@@ -165,14 +169,15 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
 
 /// Open every redirection in source order so each file's create/truncate side
 /// effect and any error happens in order, as POSIX shells do (`> a > b` opens
-/// both). Returns the final stdin/stdout target — the last redirection of each
-/// direction wins. On the first failure, returns the offending path and error.
+/// both). Returns the final stdin/stdout/stderr targets — the last redirection
+/// of each stream wins. On the first failure, returns the offending path and error.
 #[allow(clippy::type_complexity)]
 fn open_redirs(
     redirs: &[(RedirKind, String)],
-) -> Result<(Option<File>, Option<File>), (String, std::io::Error)> {
+) -> Result<(Option<File>, Option<File>, Option<File>), (String, std::io::Error)> {
     let mut stdin_file = None;
     let mut stdout_file = None;
+    let mut stderr_file = None;
     for (kind, path) in redirs {
         match kind {
             RedirKind::In => stdin_file = Some(File::open(path).map_err(|e| (path.clone(), e))?),
@@ -180,16 +185,25 @@ fn open_redirs(
                 stdout_file = Some(File::create(path).map_err(|e| (path.clone(), e))?)
             }
             RedirKind::Append => {
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .map_err(|e| (path.clone(), e))?;
-                stdout_file = Some(file);
+                stdout_file = Some(open_append(path)?);
+            }
+            RedirKind::ErrOut => {
+                stderr_file = Some(File::create(path).map_err(|e| (path.clone(), e))?)
+            }
+            RedirKind::ErrAppend => {
+                stderr_file = Some(open_append(path)?);
             }
         }
     }
-    Ok((stdin_file, stdout_file))
+    Ok((stdin_file, stdout_file, stderr_file))
+}
+
+fn open_append(path: &str) -> Result<File, (String, std::io::Error)> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| (path.to_string(), e))
 }
 
 /// Map a spawn error to a status and report it (`127` not-found, else `126`).

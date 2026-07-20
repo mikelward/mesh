@@ -98,8 +98,13 @@ of `x` followed by `.txt`); use `${…}` for anything more. A malformed `${…}`
 closing `}`, or an invalid name inside) is a syntax error. A `$` not followed by
 a name (`$5`) is a literal `$`; a literal `$` in a string is `\$`.
 
+## Sequencing, pipelines, and redirection
+
+`;` always runs the next command. `&&` runs it after success; `||` runs it after
+failure. A single `|` connects external commands into a pipeline. File redirects
+are `<`, `>`, `>>`, `2>`, and `2>>`; redirecting builtins is not supported yet.
+
 ## Not yet implemented
 
-Sequencing (`;`, `&&`, `||`), pipes, redirection, list and map values, `:`
-modifiers, regex literals, functions, and heredocs. See
-[`ROADMAP.md`](../ROADMAP.md).
+Job control, list and map values, `:` modifiers, regex literals, functions, and
+heredocs. See [`ROADMAP.md`](../ROADMAP.md).

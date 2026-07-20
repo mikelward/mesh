@@ -161,20 +161,22 @@ literal character (it arrives with job control). A dangling trailing operator
 ## Task 8 — pipes and redirection
 
 Each command is now a **pipeline** of `|`-joined stages, and every stage may carry
-`<` / `>` / `>>` redirections:
+`<` / `>` / `>>` / `2>` / `2>>` redirections:
 
 ```
 segment = pipeline?                   # may be empty (a no-op)
 pipeline = stage ("|" stage)*
 stage    = (word | redir)+            # words and redirections interleave
-redir    = ("<" | ">" | ">>") word    # the following word is the target file
+redir    = ("<" | ">" | ">>" | "2>" | "2>>") word
+                                        # the following word is the target file
 ```
 
 - **`|`** connects one command's stdout to the next command's stdin (a single
   `|`; `||` is still the sequence separator, matched first). **`>`** truncates (or
-  creates) a file with stdout, **`>>`** appends, **`<`** reads stdin from a file.
-  A redirection's target is the **next word**; the last redirection of a direction
-  wins.
+  creates) a file with stdout, **`>>`** appends, and **`<`** reads stdin from a
+  file. **`2>`** truncates (or creates) a file with stderr and **`2>>`** appends
+  stderr. A redirection's target is the **next word**; the last redirection of a
+  stream wins.
 - Operators are recognized only **bare** — a quoted (`'a|b'`) or escaped (`a\|b`)
   operator is literal.
 - **Pipeline status is pipefail, ignoring upstream SIGPIPE**: the pipeline fails
@@ -197,10 +199,11 @@ unaffected.
 
 Deferred: a **builtin** in a multi-stage pipeline or with a redirection is not
 supported yet (needs a forked child / an output sink) and is rejected with a
-clear message — use an external command (`echo … > f`) meanwhile. A **descriptor
-redirect** (`2>`, `&>`, and their `>>` forms) is also deferred and **rejected as
-a syntax error** rather than silently reinterpreted. Also deferred: here-strings
-and a redirection with no command (`> f`).
+clear message — use an external command (`echo … > f`) meanwhile. Descriptor
+redirects other than `2>` / `2>>` (including `&>`, arbitrary fd numbers, and fd
+duplication) are deferred and **rejected as a syntax error** rather than silently
+reinterpreted. Also deferred: here-strings and a redirection with no command
+(`> f`).
 
 ### Not yet parsed
 `{ }` blocks, `func`, `:` modifiers, heredocs. Each arrives with the task that
