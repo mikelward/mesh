@@ -50,7 +50,7 @@ $sh.prompt.head = [
 $sh.prompt.commit = func() { "$(git log -1 --format='%h %s' 2>/dev/null)" }
 
 # background jobs, read straight from the live job table
-$sh.prompt.jobs = func() { $sh.jobs:values:map(func(job) { "%${job.id} ${job.cmd}" }):join "  " }
+$sh.prompt.jobs = func() { $sh.jobs:values:map(func(job) { "%${job.id} ${job.cmd}" }):join("  ") }
 
 $sh.prompt.char = func() { "❯ " }
 ```
