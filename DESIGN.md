@@ -249,7 +249,7 @@ This modifier system is the direct answer to
 dead-simple way to strip a suffix"): it is a first-class language feature, not a
 custom function.
 
-**String** *(open — initial set)*: `:strip PREFIX/SUFFIX`, `:replace OLD NEW`,
+**String** *(open — initial set)*: `:strip(PREFIX/SUFFIX)`, `:replace(OLD NEW)`,
 and likely `:upper` / `:lower`. To be fleshed out.
 
 ### Globbing
@@ -392,7 +392,7 @@ hyphen between — the third payoff of that one spacing rule.
   ```
   editor = $env:get(EDITOR vim)  # total: value, or "vim" if unset — never errors
   $env.EDITOR                   # strict: errors if unset (like any $m.key)
-  if $env:has SSH_AUTH_SOCK { … }
+  if $env:has(SSH_AUTH_SOCK) { … }
   ```
 
   So `$env.EDITOR` (a strict read) errors when unset, and `$env:get(EDITOR vim)`
@@ -493,7 +493,7 @@ top-level is **yours**; the built-ins hang off two reserved roots:
 
 - **`$env`** — the process environment, accessed by name: `$env.EDITOR`,
   `$env.HOME`. **`$env.PATH` is a list** — `$env.PATH += /opt/bin`,
-  `$env.PATH:dedup`, `$env.PATH:has /usr/bin` all just work, which is the
+  `$env.PATH:dedup`, `$env.PATH:has(/usr/bin)` all just work, which is the
   "guarded, deduped PATH" requirement. Because the OS environment is bytes, a
   path-type entry is `:`-joined on the way out and split on the way in (see the
   [export exception](#variables-and-assignment) below); the other built-in path
@@ -787,7 +787,7 @@ for `$m[key]` or `${m.key}` when you need a map access *inside* a string.
 | `$m:keys` | list | keys (insertion order preserved) |
 | `$m:values` | list | values |
 | `$m:len` | int | entry count (same word as lists) |
-| `$m:has KEY` | bool | membership — the decided spelling |
+| `$m:has(KEY)` | bool | membership — the decided spelling |
 | `$m:get(KEY default)` | value | total lookup — `default` when absent |
 
 **Membership is `:has`.** The terser `?` postfix (`$m[key]?`) was considered and
@@ -801,7 +801,7 @@ it adds a second way to phrase the same test, so weigh it before adding.)*
 has no null: `$m[absent]` is an **error** (a bad key is usually a typo in
 config, and should fail loud, not silently yield `""`), while `$m:get(key
 default)` is the total form that returns `default` when the key is absent, and
-`if $m:has key { … }` is the guard. So a dynamic lookup that may legitimately
+`if $m:has(key) { … }` is the guard. So a dynamic lookup that may legitimately
 miss is written `$m:get($name unknown)`, never a bare `$m[$name]`.
 
 Insertion order is **preserved** (like Python dict / a `Vec<(K,V)>` behind the
@@ -836,8 +836,8 @@ external program is bytes, not mesh values:
   un-spread list is a **hard error** (`git log $flags` → *"$flags is a list;
   spread it with ...$flags or join it with $flags:join"*). mesh refuses to
   silently pick a separator — that guess is exactly the bash footgun. The two
-  explicit outs are `...$flags` (one argv entry per element) and `$flags:join
-  SEP` (one byte-string).
+  explicit outs are `...$flags` (one argv entry per element) and
+  `$flags:join(SEP)` (one byte-string).
 
 The general rule at the bytes boundary — **a value renders to argv iff it has a
 *canonical* byte form; if rendering it would require a *guess*, that is an
@@ -1264,8 +1264,8 @@ they are value-called the same way:
 double = func(x) { $x * 2 }       # a function value bound to a variable
 y = $double(5)                    # value-call it through the variable
 
-evens = $xs:filter func(x) { $x % 2 == 0 }
-stems = $files:map func(f) { $f:stem }     # :map / :filter / :each take a lambda
+evens = $xs:filter(func(x) { $x % 2 == 0 })
+stems = $files:map(func(f) { $f:stem })    # :map / :filter / :each take a lambda
 ```
 
 `func(params) { … }` (over an Elvish-style `{|params| …}`) keeps **one parameter
@@ -1701,7 +1701,7 @@ $sh.jobs
 
 $sh.jobs:len              # 2   — this is `publish-jobs`, now one word in a prompt segment
 $sh.jobs[2].state          # stopped
-$sh.jobs:values:filter func(j) { $j.state == running }
+$sh.jobs:values:filter(func(j) { $j.state == running })
 ```
 
 `state` is `running` / `stopped` / `done`; `status` fills in when a job finishes
