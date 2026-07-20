@@ -79,7 +79,8 @@ argument; `false || echo ok` prints `ok`.
 makes a shell a shell.
 
 **Scope**
-- Pipelines (`a | b | c`) and redirection (`>`, `>>`, `<`, `2>`).
+- Pipelines (`a | b | c`) and basic redirection (`>`, `>>`, `<`) ✅ landed.
+  Descriptor/stderr redirection (`2>`) remains planned.
 - `fork`/`exec` via `nix` with process groups, `tcsetpgrp`, and signal handling
   for `Ctrl-Z` / `fg` / `bg`.
 - **Ctrl-C returns to the prompt** with status `130` (child gets SIGINT, shell

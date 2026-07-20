@@ -14,7 +14,7 @@ file as tasks land.
 - [x] Unit tests (lexer) + end-to-end tests (built binary, std-only)
 - [x] CI: fmt + clippy (`-D warnings`) + test on Linux and macOS
 
-## M1 — Next up
+## M1 — A shell you'd actually sit in ✅ (done)
 
 - [x] `reedline` line editor for interactive (TTY) input; std byte reader kept
       for piped input. Ctrl-D exits on an empty line; Ctrl-C cancels the line.
@@ -39,6 +39,20 @@ file as tasks land.
 - [x] `pwd` and `puts` builtins
 - [x] Globs + `~` expansion (glob no-match → **empty**). `~user` and expansion
       suppression (quoting) still to come; non-UTF-8 lossy under String words.
+
+## M2 — Next up
+
+- [x] Pipelines (`a | b | c`) with pipefail status, ignoring an upstream
+      `SIGPIPE` caused by a downstream stage closing the pipe.
+- [x] Basic redirection (`>`, `>>`, `<`) on external commands, including
+      redirections on individual pipeline stages. Deferred: descriptor/stderr
+      redirection, redirected builtins, and redirection without a command.
+- [ ] Fork-based executor and process groups (`fork`/`exec`, `setpgid`,
+      `tcsetpgrp`) so mesh can own the terminal and manage foreground jobs.
+- [ ] Signal handling: Ctrl-C interrupts the foreground job and returns to the
+      prompt with status 130; Ctrl-Z suspends it without suspending mesh.
+- [ ] Job table plus `fg` / `bg` builtins.
+- [ ] Hand the terminal to full-screen programs and restore it cleanly.
 
 ## Known limitations
 
