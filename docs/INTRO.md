@@ -139,6 +139,91 @@ func ips() {
 }
 ```
 
+## Functions take a real signature
+
+A `func` declares **named** parameters — positional, optional-with-default,
+`--flag`, and `...rest` — so you never index `$1` or hand-roll `case $1` flag
+parsing:
+
+```
+func deploy(env, --region = us-west, --force, ...hosts) {
+  # $env     required positional
+  # $region  valued flag, defaults to us-west
+  # $force   switch: true only if --force was passed
+  # $hosts   list of the remaining positionals
+}
+
+mesh$ deploy prod --force web1 web2        # env=prod force=true hosts=[web1 web2]
+mesh$ deploy prod --region=eu-west ...$fleet   # ...spreads a list into positionals
+```
+
+Notice the two separators. The **signature** is comma-separated, because a
+parameter like `--region = us-west` has spaces inside it. The **call** is
+space-separated, exactly like invoking a command — `deploy prod --force web1` —
+and reads the same whether `deploy` is your function or `/usr/bin/deploy`.
+
+You pick what a call gives back by *how you write it*:
+
+```
+mesh$ deploy prod            # run it — streams stdout, status is the result
+mesh$ $(deploy prod)         # capture its stdout as bytes (a list of lines)
+mesh$ config = deploy(prod)  # take its return value — a rich list/map, in-shell only
+```
+
+The attached-parens form `f(arg)` is the one that reaches the return value; zero
+args still needs them (`load-config()`), since a bare name is just a string.
+
+## Lists spread with `...`; maps pair with `,`
+
+A list is space-separated, and nothing splits unless you say so. The one operator
+that moves between "a list" and "several arguments" is `...`:
+
+```
+mesh$ files = [a.txt b.txt "c d.txt"]   # three elements — quote the one with a space
+mesh$ cp ...$files ~/backup             # ... explodes the list into separate argv
+mesh$ git log $flags                    # error: a bare list can't cross to an external
+mesh$ git log ...$flags                 # spread it — one argv entry per element
+```
+
+`...` collects, too: `...rest` in a signature slurps the leftover positionals
+back into a list. Build lists with it (`[/opt/bin ...$env.PATH]`) and grow them
+with `+=`.
+
+A **map** is the same `[ … ]` literal, but its entries are `key: value` pairs,
+and *pairs* are comma-separated:
+
+```
+mesh$ ports = [http: 80, https: 443, ssh: 22]
+mesh$ puts $ports.https          # 443   (dot sugar for $ports[https])
+mesh$ empty-map = [:]            # vs [] the empty list
+```
+
+That is the whole comma rule: **a comma sits between compound entries (map pairs,
+signature params); a space sits between atomic elements (list items, call args).**
+Writing a list with commas — `[a, b]` — is a loud error, not a second spelling,
+so the JSON reflex gets corrected instead of silently accepted.
+
+## Isolate a block with `fork`
+
+A plain `func` runs *in* your shell, so a `cd` inside it **moves you** — which is
+the whole point of a navigation helper. When you instead want a block's
+`cd`/`export`/umask to **not** leak out, `fork` it:
+
+```
+mesh$ func proj(name) { cd ~/work/$name }     # moves your shell — intended
+mesh$ fork { cd build; make }                 # cwd/env isolated; you stay put
+mesh$ fork func build() { cd build; make }    # a func that forks on every call
+```
+
+A `fork` forks a process, so only **bytes** cross back out (its stdout) — the
+same boundary as an external command. When you only need a different directory,
+not a whole fork, `in DIR { … }` is the cheap version: it runs the block there
+and restores your cwd after, with no process spawned.
+
+```
+mesh$ in dist { rm -rf * }      # scoped cwd, no fork — the pushd/popd pattern
+```
+
 ## Absence is loud — unless you say it's expected
 
 mesh never hands you a silent empty string where you asked for something that
