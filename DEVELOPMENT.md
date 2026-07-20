@@ -46,14 +46,17 @@ M0 is intentionally **dependency-free** — the standard library covers a
 line/tokenize/exec loop, and zero deps keep the build offline and fast. The
 interactive stack named in `DESIGN.md` arrives with the milestones that need it:
 
-| Crate | Purpose | Milestone |
-| --- | --- | --- |
-| `reedline` | line editing, history, hinting | M1 |
-| `nix` | `fork`/`exec`, `setpgid`, `tcsetpgrp`, signals | M2 (job control) |
-| `crossterm` / `nucleo` | terminal control, fuzzy completion | later |
+| Crate | Purpose | License | Milestone |
+| --- | --- | --- | --- |
+| `reedline` | line editing, history, hinting | MIT | M1 |
+| `nix` | `fork`/`exec`, `setpgid`, `tcsetpgrp`, signals | MIT | M2 (job control) |
+| `crossterm` | terminal control | MIT | later |
+| `nucleo` | fuzzy completion | MPL-2.0 | later |
 
 Add a dependency only when a milestone calls for it; prefer a small, focused
-crate over a framework.
+crate over a framework. Note the license column when the repo license is chosen
+(see `TODO.md`): all planned deps are permissive except `nucleo`, which is
+MPL-2.0 (weak, file-level copyleft — compatible with a permissive project).
 
 ## Testing
 

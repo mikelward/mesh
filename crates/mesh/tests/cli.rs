@@ -68,3 +68,17 @@ fn cd_changes_the_working_directory() {
     let out = run_with_input("cd /\npwd\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "/\n");
 }
+
+#[test]
+fn child_reads_remaining_stdin() {
+    // The shell must not buffer past a command's newline: `cat` inherits stdin
+    // and should read the bytes that follow its command line, not have the shell
+    // swallow them and then try to run them as commands.
+    let out = run_with_input("cat\nPAYLOAD\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "PAYLOAD\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("command not found"),
+        "stderr should be clean, was: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

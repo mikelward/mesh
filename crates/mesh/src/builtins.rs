@@ -5,6 +5,7 @@
 //! `exit` (ends the loop). Everything else in M0 is an external command.
 
 use std::env;
+use std::ffi::OsString;
 use std::path::Path;
 
 /// Outcome of a builtin. `Status` reports an exit status and continues the loop;
@@ -31,18 +32,22 @@ pub fn dispatch(words: &[String]) -> Option<Builtin> {
 /// M0 does not yet implement `cd -`, `CDPATH`, or the autocd behavior from
 /// `DESIGN.md`; those come with the language layer.
 fn cd(args: &[String]) -> u8 {
-    let target = match args.first() {
-        Some(dir) => dir.clone(),
+    // Keep the target as an `OsString` so a non-UTF-8 `$HOME` (or, later, a
+    // non-UTF-8 argument) reaches the OS unchanged rather than being mangled by
+    // lossy UTF-8 conversion.
+    let target: OsString = match args.first() {
+        Some(dir) => dir.into(),
         None => match env::var_os("HOME") {
-            Some(home) => home.to_string_lossy().into_owned(),
+            Some(home) => home,
             None => {
                 eprintln!("mesh: cd: HOME not set");
                 return 1;
             }
         },
     };
-    if let Err(err) = env::set_current_dir(Path::new(&target)) {
-        eprintln!("mesh: cd: {target}: {err}");
+    let path = Path::new(&target);
+    if let Err(err) = env::set_current_dir(path) {
+        eprintln!("mesh: cd: {}: {err}", path.display());
         return 1;
     }
     0
