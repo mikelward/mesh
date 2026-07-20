@@ -80,18 +80,21 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
         let mut command = Command::new(&cmd.words[0]);
         command.args(&cmd.words[1..]);
 
-        // stdin: an input redirection wins over the incoming pipe/EOF/terminal.
-        if let Some(path) = last_redir(&cmd.redirs, RedirKind::In) {
-            match File::open(path) {
-                Ok(file) => {
-                    command.stdin(file);
-                }
-                Err(err) => {
-                    eprintln!("mesh: {path}: {err}");
-                    outcomes.push(Outcome::Failed(1));
-                    continue;
-                }
+        // Open every redirection in source order (creating/truncating each file
+        // and surfacing its error in order); the last of each direction is the
+        // one the command actually reads from / writes to.
+        let (in_file, out_file) = match open_redirs(&cmd.redirs) {
+            Ok(files) => files,
+            Err((path, err)) => {
+                eprintln!("mesh: {path}: {err}");
+                outcomes.push(Outcome::Failed(1));
+                continue;
             }
+        };
+
+        // stdin: an input redirection wins over the incoming pipe/EOF/terminal.
+        if let Some(file) = in_file {
+            command.stdin(file);
         } else {
             match incoming {
                 NextIn::Inherit => {}
@@ -107,17 +110,8 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
         // stdout: an output redirection wins over the pipe to the next stage;
         // otherwise pipe to the next stage; otherwise inherit (only the last).
         let mut piped_out = false;
-        if let Some((kind, path)) = last_out_redir(&cmd.redirs) {
-            match open_out(kind, path) {
-                Ok(file) => {
-                    command.stdout(file);
-                }
-                Err(err) => {
-                    eprintln!("mesh: {path}: {err}");
-                    outcomes.push(Outcome::Failed(1));
-                    continue;
-                }
-            }
+        if let Some(file) = out_file {
+            command.stdout(file);
         } else if !is_last {
             command.stdout(Stdio::piped());
             piped_out = true;
@@ -156,30 +150,33 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
     status
 }
 
-/// The path of the last redirection of `kind`, if any (last wins).
-fn last_redir(redirs: &[(RedirKind, String)], kind: RedirKind) -> Option<&str> {
-    redirs
-        .iter()
-        .rev()
-        .find(|(k, _)| *k == kind)
-        .map(|(_, path)| path.as_str())
-}
-
-/// The last output redirection (`>` or `>>`), if any (last wins).
-fn last_out_redir(redirs: &[(RedirKind, String)]) -> Option<(RedirKind, &str)> {
-    redirs
-        .iter()
-        .rev()
-        .find(|(k, _)| matches!(k, RedirKind::Out | RedirKind::Append))
-        .map(|(k, path)| (*k, path.as_str()))
-}
-
-/// Open an output-redirection target: `>` truncates (or creates), `>>` appends.
-fn open_out(kind: RedirKind, path: &str) -> std::io::Result<File> {
-    match kind {
-        RedirKind::Append => OpenOptions::new().create(true).append(true).open(path),
-        _ => File::create(path),
+/// Open every redirection in source order so each file's create/truncate side
+/// effect and any error happens in order, as POSIX shells do (`> a > b` opens
+/// both). Returns the final stdin/stdout target — the last redirection of each
+/// direction wins. On the first failure, returns the offending path and error.
+#[allow(clippy::type_complexity)]
+fn open_redirs(
+    redirs: &[(RedirKind, String)],
+) -> Result<(Option<File>, Option<File>), (String, std::io::Error)> {
+    let mut stdin_file = None;
+    let mut stdout_file = None;
+    for (kind, path) in redirs {
+        match kind {
+            RedirKind::In => stdin_file = Some(File::open(path).map_err(|e| (path.clone(), e))?),
+            RedirKind::Out => {
+                stdout_file = Some(File::create(path).map_err(|e| (path.clone(), e))?)
+            }
+            RedirKind::Append => {
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|e| (path.clone(), e))?;
+                stdout_file = Some(file);
+            }
+        }
     }
+    Ok((stdin_file, stdout_file))
 }
 
 /// Map a spawn error to a status and report it (`127` not-found, else `126`).

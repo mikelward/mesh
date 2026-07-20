@@ -185,9 +185,10 @@ redir    = ("<" | ">" | ">>") word    # the following word is the target file
 
 Deferred: a **builtin** in a multi-stage pipeline or with a redirection is not
 supported yet (needs a forked child / an output sink) and is rejected with a
-clear message — use an external command (`echo … > f`) meanwhile. Also deferred:
-`2>`/stderr redirection, `&>`, here-strings, and a redirection with no command
-(`> f`).
+clear message — use an external command (`echo … > f`) meanwhile. A **descriptor
+redirect** (`2>`, `&>`, and their `>>` forms) is also deferred and **rejected as
+a syntax error** rather than silently reinterpreted. Also deferred: here-strings
+and a redirection with no command (`> f`).
 
 ### Not yet parsed
 `{ }` blocks, `func`, `:` modifiers, heredocs. Each arrives with the task that
