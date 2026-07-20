@@ -2247,13 +2247,14 @@ line, never several lines. So there are no separator entries to name:
 
 ```
 $sh.prompt.status = status-info                # a line — bare name = the status-info segment, by name
-$sh.prompt.line1  = [host-info dir-info auth-info fill("─")]   # host (red) dir (blue) auth (yellow), then a bar to the right edge
+$sh.prompt.rule   = rule                       # a full-width line on its own
+$sh.prompt.line1  = [host-info dir-info auth-info]   # ONE line: host (red) dir (blue) auth (yellow), each its own color
 $sh.prompt.jobs   = job-info                   # its own line — skipped when empty
 $sh.prompt.char   = func() { "> " }            # a func literal is fine too
 
-# `fill` is the inline right-align / trailing-bar piece; `rule` is its whole-line form:
-$sh.prompt.rule   = rule                       # ≡ a line that is just [fill("─")]
-$sh.prompt.line1  = [host-info fill clock-info] # host on the left, clock flush-right (fill of spaces eats the middle)
+# `fill` is the inline right-align / trailing-bar piece, when you want it:
+$sh.prompt.line1  = [host-info dir-info fill clock-info]   # host dir on the left, clock flush-right
+$sh.prompt.line1  = [host-info dir-info fill("─")]         # …or a bar to the right edge (`rule` ≡ a whole-line [fill("─")])
 
 # named variant — same line, pieces individually addressable:
 $sh.prompt.line1     = [host: host-info, dir: dir-info, auth: auth-info]
