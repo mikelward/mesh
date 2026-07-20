@@ -1,15 +1,24 @@
 //! Lexer: split a line into words, honoring quotes and backslash escapes.
 //!
-//! Implements the quoting model from `DESIGN.md` (§ "Quoting and escaping"):
-//! bare words with backslash escapes, raw single quotes, double quotes with a
-//! C-style escape set, and adjacent-piece concatenation. Each character is
-//! tagged **expandable** (unquoted/unescaped — eligible for later tilde/glob
-//! expansion) or **literal** (quoted or backslash-escaped — exempt), so quoting
-//! *suppresses* expansion in [`crate::expand`].
+//! Implements the **Model B** quoting model from `DESIGN.md` (§ "Quoting and
+//! escaping"):
+//!
+//! - Bare words: a backslash escapes the next character.
+//! - `"…"` — interpolates (deferred) and escapes; C-style set `\n \t \r \e \\
+//!   \" \$` and `\u{…}`.
+//! - `'…'` — does *not* interpolate but *does* escape: the same set with the
+//!   quote swapped (`\'` in place of `\"`), `$` always literal.
+//! - `r'…'` / `r"…"` — raw: no escapes at all, the delimiter is the only special
+//!   character (the home for regex source and paths).
+//! - An **unknown escape inside a quote is an error** (`'\d'`, `"\z"`).
+//!
+//! Each character is tagged **expandable** (unquoted/unescaped — eligible for
+//! later tilde/glob expansion) or **literal** (quoted or backslash-escaped —
+//! exempt), so quoting *suppresses* expansion in [`crate::expand`].
 //!
 //! Not yet handled here (noted for later): `$`-interpolation inside `"…"`
-//! (task 6 — a bare `$name` stays literal for now) and `\`-newline line
-//! continuation across multiple input lines (needs a multi-line reader).
+//! (task 6 — a bare `$name` stays literal for now); `\`-newline continuation
+//! across multiple input lines; and heredocs.
 
 /// A run of characters within a word, tagged with whether it is subject to
 /// later expansion. Unquoted, unescaped text is `expandable`; quoted or
@@ -25,16 +34,23 @@ pub struct Segment {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Word(pub Vec<Segment>);
 
-/// A lexing error — currently only unterminated quotes.
+/// A lexing (syntax) error.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LexError {
+    /// A quote (or raw-string delimiter) was never closed.
     UnterminatedQuote(char),
+    /// A backslash escape inside a quote is not one of the recognized forms.
+    UnknownEscape(char),
+    /// A `\u{…}` escape is malformed or names no Unicode scalar.
+    BadUnicodeEscape,
 }
 
 impl std::fmt::Display for LexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LexError::UnterminatedQuote(q) => write!(f, "syntax error: unterminated {q} quote"),
+            LexError::UnknownEscape(c) => write!(f, "syntax error: invalid escape \\{c}"),
+            LexError::BadUnicodeEscape => write!(f, "syntax error: invalid \\u{{…}} escape"),
         }
     }
 }
@@ -80,10 +96,16 @@ pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
                 }
             }
             '\'' => {
-                i = lex_single_quote(&chars, i + 1, word)?;
+                i = lex_escaped(&chars, i + 1, '\'', word)?;
             }
             '"' => {
-                i = lex_double_quote(&chars, i + 1, word)?;
+                i = lex_escaped(&chars, i + 1, '"', word)?;
+            }
+            // Raw-string prefix `r'…'` / `r"…"`, recognized only at the start of
+            // a word so ordinary words like `grep` or `ptr'x'` are unaffected.
+            'r' if word.is_empty() && matches!(chars.get(i + 1), Some('\'') | Some('"')) => {
+                let delim = chars[i + 1];
+                i = lex_raw(&chars, i + 2, delim, word)?;
             }
             _ => {
                 push_char(word, c, true);
@@ -98,93 +120,81 @@ pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
     Ok(words)
 }
 
-/// Raw single quotes: the only escapes are `\'` and `\\`; every other backslash
-/// is literal. `start` is the index just past the opening quote; returns the
-/// index just past the closing quote.
-fn lex_single_quote(
+/// Lex a `"…"` or `'…'` string (Model B: escaped, `"` also interpolates). `start`
+/// is the index just past the opening `quote`; returns the index just past the
+/// close. The content is literal (not expandable).
+///
+/// Escapes: `\n \t \r \e \\`, `\u{HEX}`, and `\<quote>` (so `\"` in `"…"`, `\'`
+/// in `'…'`). In `"…"`, `\$` is a literal dollar; in `'…'`, `$` is already
+/// literal so `\$` is not a valid escape. Any unrecognized escape is an error.
+/// (`$`-interpolation in `"…"` is deferred to task 6 — a bare `$name` is
+/// literal for now.)
+fn lex_escaped(
     chars: &[char],
     start: usize,
+    quote: char,
     word: &mut Vec<Segment>,
 ) -> Result<usize, LexError> {
+    let double = quote == '"';
     let mut buf = String::new();
     let mut i = start;
     loop {
         let Some(&c) = chars.get(i) else {
-            return Err(LexError::UnterminatedQuote('\''));
+            return Err(LexError::UnterminatedQuote(quote));
         };
-        match c {
-            '\'' => {
-                i += 1;
-                break;
-            }
-            '\\' if matches!(chars.get(i + 1), Some('\'') | Some('\\')) => {
-                buf.push(chars[i + 1]);
-                i += 2;
-            }
-            _ => {
-                buf.push(c);
-                i += 1;
-            }
+        if c == quote {
+            i += 1;
+            break;
         }
+        if c == '\\' {
+            let Some(&next) = chars.get(i + 1) else {
+                return Err(LexError::UnterminatedQuote(quote));
+            };
+            match next {
+                'n' => buf.push('\n'),
+                't' => buf.push('\t'),
+                'r' => buf.push('\r'),
+                'e' => buf.push('\x1b'),
+                '\\' => buf.push('\\'),
+                'u' => {
+                    let (ch, consumed) =
+                        parse_unicode_escape(&chars[i + 2..]).ok_or(LexError::BadUnicodeEscape)?;
+                    buf.push(ch);
+                    i += 2 + consumed;
+                    continue;
+                }
+                q if q == quote => buf.push(q),
+                '$' if double => buf.push('$'),
+                other => return Err(LexError::UnknownEscape(other)),
+            }
+            i += 2;
+            continue;
+        }
+        buf.push(c);
+        i += 1;
     }
     push_str(word, &buf, false);
     Ok(i)
 }
 
-/// Double quotes: a C-style escape set applies (`\n \t \r \e \\ \" \$` and
-/// `\u{…}`); an unknown escape keeps the backslash literal. `$`-interpolation is
-/// deferred, so a bare `$name` stays literal for now. Content is not expandable.
-fn lex_double_quote(
+/// Lex a raw string `r'…'` / `r"…"`: no escapes at all — every byte is literal
+/// and only the `delim` closes it. `start` is the index just past the opening
+/// delimiter; returns the index just past the close.
+fn lex_raw(
     chars: &[char],
     start: usize,
+    delim: char,
     word: &mut Vec<Segment>,
 ) -> Result<usize, LexError> {
     let mut buf = String::new();
     let mut i = start;
     loop {
         let Some(&c) = chars.get(i) else {
-            return Err(LexError::UnterminatedQuote('"'));
+            return Err(LexError::UnterminatedQuote(delim));
         };
-        if c == '"' {
+        if c == delim {
             i += 1;
             break;
-        }
-        if c == '\\' {
-            if let Some(&next) = chars.get(i + 1) {
-                match next {
-                    'n' => buf.push('\n'),
-                    't' => buf.push('\t'),
-                    'r' => buf.push('\r'),
-                    'e' => buf.push('\x1b'),
-                    '\\' => buf.push('\\'),
-                    '"' => buf.push('"'),
-                    '$' => buf.push('$'),
-                    'u' => {
-                        if let Some((ch, consumed)) = parse_unicode_escape(&chars[i + 2..]) {
-                            buf.push(ch);
-                            i += 2 + consumed;
-                            continue;
-                        }
-                        // Malformed \u: keep both chars literal (`\uX` stays
-                        // `\uX`), so invalid input is not silently altered.
-                        buf.push('\\');
-                        buf.push('u');
-                    }
-                    // Unknown escape: the backslash stays literal.
-                    other => {
-                        buf.push('\\');
-                        buf.push(other);
-                        i += 2;
-                        continue;
-                    }
-                }
-                i += 2;
-                continue;
-            }
-            // Trailing backslash inside quotes: literal.
-            buf.push('\\');
-            i += 1;
-            continue;
         }
         buf.push(c);
         i += 1;
@@ -290,14 +300,18 @@ mod tests {
     }
 
     #[test]
-    fn single_quotes_are_raw() {
-        assert_eq!(words(r"'\d+\.txt'"), [Word(vec![lit(r"\d+\.txt")])]);
+    fn single_quotes_escape_but_do_not_interpolate() {
+        // Model B: `'…'` interprets escapes (Python str), `$` is literal.
+        assert_eq!(words(r"'can\'t'"), [Word(vec![lit("can't")])]);
+        assert_eq!(words(r"'a\nb'"), [Word(vec![lit("a\nb")])]);
+        assert_eq!(words(r"'$x'"), [Word(vec![lit("$x")])]);
     }
 
     #[test]
-    fn single_quote_escapes_quote_and_backslash() {
-        assert_eq!(words(r"'can\'t'"), [Word(vec![lit("can't")])]);
-        assert_eq!(words(r"'C:\\'"), [Word(vec![lit(r"C:\")])]);
+    fn single_quote_unknown_escape_is_an_error() {
+        // `\d` and `\$` are not valid single-quote escapes.
+        assert_eq!(split(r"'\d'"), Err(LexError::UnknownEscape('d')));
+        assert_eq!(split(r"'\$'"), Err(LexError::UnknownEscape('$')));
     }
 
     #[test]
@@ -305,6 +319,26 @@ mod tests {
         assert_eq!(words(r#""a\nb""#), [Word(vec![lit("a\nb")])]);
         assert_eq!(words(r#""\$5""#), [Word(vec![lit("$5")])]);
         assert_eq!(words(r#""\u{41}""#), [Word(vec![lit("A")])]);
+    }
+
+    #[test]
+    fn double_quote_unknown_or_bad_escape_is_an_error() {
+        assert_eq!(split(r#""\z""#), Err(LexError::UnknownEscape('z')));
+        assert_eq!(split(r#""\uZ""#), Err(LexError::BadUnicodeEscape));
+        assert_eq!(split(r#""\u{ZZ}""#), Err(LexError::BadUnicodeEscape));
+    }
+
+    #[test]
+    fn raw_strings_take_no_escapes() {
+        // `r'…'` / `r"…"` are the home for regex source and paths.
+        assert_eq!(words(r"r'\d+\.txt'"), [Word(vec![lit(r"\d+\.txt")])]);
+        assert_eq!(words(r#"r"can't \d+""#), [Word(vec![lit(r"can't \d+")])]);
+    }
+
+    #[test]
+    fn raw_prefix_only_at_word_start() {
+        // A bare `r` mid-word is not a raw prefix; `ptr'x'` fuses to `ptrx`.
+        assert_eq!(words(r"ptr'x'"), [Word(vec![exp("ptr"), lit("x")])]);
     }
 
     #[test]
@@ -331,5 +365,6 @@ mod tests {
     fn unterminated_quote_is_an_error() {
         assert_eq!(split("'oops"), Err(LexError::UnterminatedQuote('\'')));
         assert_eq!(split(r#""oops"#), Err(LexError::UnterminatedQuote('"')));
+        assert_eq!(split(r"r'oops"), Err(LexError::UnterminatedQuote('\'')));
     }
 }

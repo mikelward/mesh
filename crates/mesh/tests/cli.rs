@@ -314,10 +314,25 @@ fn unterminated_quote_is_a_syntax_error_that_recovers() {
 }
 
 #[test]
-fn malformed_unicode_escape_is_preserved() {
-    // A bad \u escape keeps both chars, not just the backslash.
-    let out = run_with_input("puts \"\\uZ\"\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "\\uZ\n");
+fn malformed_unicode_escape_is_a_syntax_error() {
+    // Model B: an unknown/malformed escape is an error, not silently altered.
+    let out = run_with_input("puts \"\\uZ\"\nputs ok\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("syntax error"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+#[test]
+fn raw_strings_are_literal() {
+    // r'…' takes no escapes — the home for regex source / paths.
+    let out = run_with_input("puts r'\\d+\\.txt'\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\\d+\\.txt\n");
+}
+
+#[test]
+fn single_quotes_escape_in_model_b() {
+    // `'a\tb'` is a real tab now (single quotes escape); `$x` stays literal.
+    let out = run_with_input("puts 'a\\tb' '$x'\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\tb $x\n");
 }
 
 #[test]
