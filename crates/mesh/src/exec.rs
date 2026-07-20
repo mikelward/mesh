@@ -71,19 +71,29 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
     let mut outcomes: Vec<Outcome> = Vec::new();
     let mut next_stdin = NextIn::Inherit;
 
-    for (idx, cmd) in cmds.into_iter().enumerate() {
+    // Open each stage's redirections concurrently — each stage still opens its
+    // own in source order, but different stages open at the same time, so a FIFO
+    // opened by one stage does not block a peer opened by another stage of the
+    // same pipeline (`cat < fifo | cmd > fifo`) before the writer is spawned.
+    let opened = std::thread::scope(|scope| {
+        let handles: Vec<_> = cmds
+            .iter()
+            .map(|cmd| scope.spawn(move || open_redirs(&cmd.redirs)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Ok((None, None))))
+            .collect::<Vec<_>>()
+    });
+
+    for ((idx, cmd), redir_result) in cmds.into_iter().enumerate().zip(opened) {
         let is_last = idx + 1 == n;
         // Default the following stage to EOF; a successful piped spawn upgrades
         // it to the real pipe. So a redirected or failed stage leaves the next
         // one reading `/dev/null` rather than the shell's stdin.
         let incoming = std::mem::replace(&mut next_stdin, NextIn::Null);
-        let mut command = Command::new(&cmd.words[0]);
-        command.args(&cmd.words[1..]);
 
-        // Open every redirection in source order (creating/truncating each file
-        // and surfacing its error in order); the last of each direction is the
-        // one the command actually reads from / writes to.
-        let (in_file, out_file) = match open_redirs(&cmd.redirs) {
+        let (in_file, out_file) = match redir_result {
             Ok(files) => files,
             Err((path, err)) => {
                 eprintln!("mesh: {path}: {err}");
@@ -91,6 +101,9 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
                 continue;
             }
         };
+
+        let mut command = Command::new(&cmd.words[0]);
+        command.args(&cmd.words[1..]);
 
         // stdin: an input redirection wins over the incoming pipe/EOF/terminal.
         if let Some(file) = in_file {
