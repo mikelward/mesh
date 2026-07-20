@@ -2268,14 +2268,29 @@ minting a type that must be defined at each boundary. *(A richer per-fragment
 "styled spans" value — where concatenation preserves each fragment's own style —
 is a possible later iteration; the MVP keeps one attribute set per string.)*
 
-**A segment may render more than one line.** The shell assembles the segments
-into a single prompt buffer and treats a **newline as a line break wherever it
-appears** — so one callable can emit an entire multi-line prompt (a
-`preprompt`-style blob is just a segment that returns a string with newlines in
-it), and there is **no line-count setting**: the line structure emerges from the
-newlines in the output. The renderer therefore measures width **per line** and
-tracks how many lines the prompt occupies, placing the input after the last one
-so redraw, completion, and resize stay correct.
+**A segment yields a line — or a list of lines. Line structure is the segment
+map, not embedded newlines.** A **mesh** (function) segment returns either a
+single-line string or a **list of strings** (one element per line); it does *not*
+carry structure in an in-band `\n`. Multi-line prompts come from returning a list,
+from registering several segments, or from an explicit **`newline`** structural
+segment — so the segment map (with its structural segments) is the **sole** source
+of line structure, never re-derived by scanning a segment's bytes. That is exactly
+what makes the per-line features well-defined: a "line" is the run of content
+between line boundaries the *map* declares, so it is stable and addressable rather
+than a function of whatever a callable happened to print. A segment renders its
+**return value** (its string or list), consistent with the
+[value-vs-stream split](#calling-for-a-value-and-lambdas) — you *return* your
+prompt, you don't `puts` it — and a list element that is itself a list is an error
+(no guessed flatten), matching the no-implicit-deep-flatten rule elsewhere.
+
+The **one exception is an external-command segment**: you can't dictate an external
+tool's output, so it *may* emit `\n`, and the shell honors those as line breaks —
+but as **dumb** breaks that the structural segments (`fill` / `rule`) do not try to
+align across. So mesh-controlled structure stays explicit and alignable, while a
+drop-in external renderer (starship, `vcs prompt-info`) still works, degrading to
+plain line breaks. The renderer measures width **per line**, tracks how many lines
+the prompt occupies, and places the input after the last one so redraw, completion,
+and resize stay correct; there is **no line-count knob**.
 
 The payoff is the requirement, met directly: **the external base renderer is
 just one named segment** (`$(vcs prompt-info)`), sitting among peers, so
@@ -2286,13 +2301,14 @@ command." This is exactly the hand-rolled `preprompt` / `prompt_line` /
 keyed, re-source-safe segments — with its *side effects* (a background fetch)
 moving to the `$sh.preprompt` event hook and its *rendering* to this segment map.
 
-*(MVP is the above: keyed segments, `style` color, and multi-line output.
-Deferred to a later iteration — all layered on the same per-line width the styled
-values already give the shell: a full-width **rule**, a **`fill`** spacer for
-right-aligned segments, **transient collapse** of past prompts in scrollback, and
-whether `newline` / `fill` / `rule` get a **structural-segment** spelling. Line
-structure itself stays emergent from newlines, not a line-count knob. The event
-set — `preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settled.)*
+*(MVP: keyed segments, `style` color, a segment yielding a **string or a list of
+lines**, and the explicit **`newline`** structural segment — line structure is the
+segment map, never in-band `\n` (external segments excepted, above). Layered next
+on the same per-line width the styled values already give the shell, and now
+**well-defined because lines are explicit**: **`fill`** (right-align by consuming a
+line's slack; multiple `fill`s on a line split it evenly), a full-width **`rule`**,
+and **transient collapse** of past prompts in scrollback. The event set —
+`preprompt`, `preexec`/`postexec`, `precd`/`postcd`, `exit` — is settled.)*
 
 ## Footguns we avoid
 
@@ -2483,19 +2499,21 @@ to avoid" rather than promising the latter as done.
   identity → re-source-safe, individually removable). Events `preprompt`,
   `preexec`/`postexec`, `precd`/`postcd`, `exit`; the prompt is a named, ordered
   segment map with the external renderer as one peer segment. Prompt MVP: `style`
-  color plus multi-line output (a newline is a line break wherever it appears, so
-  one callable may emit the whole prompt). Remaining: the frame surface layered on
-  per-line width — a full-width rule, a `fill` right-align spacer, transient
-  collapse, and an optional structural-segment spelling for `newline`/`fill`/`rule`.
-- **Structured prompt — explore next** ([Hooks and the prompt](#hooks-and-the-prompt)):
-  the MVP renders a flat segment map with newlines-as-line-breaks. The next
-  iteration is the *structured* model — **structural segments** (`newline` /
-  `fill` / `rule`) as keyed peers of the content segments, giving the shell
-  first-class line boundaries for per-line **right-alignment** (`fill` spacer), a
-  **full-width rule**, and **transient collapse** — all without a line-count knob
-  (structure stays emergent from the segments). Weigh this keyed-structural-segment
-  shape against a list-of-lines (which buys explicit lines at the cost of
-  positional, non-keyed rows).
+  color plus multi-line output where a mesh segment yields a **string or a list of
+  lines** and line structure is the **segment map** (plus an explicit `newline`
+  segment), not in-band `\n` — only an *external* segment's newlines are honored, as
+  dumb breaks. Remaining: the frame surface layered on per-line width — a full-width
+  `rule`, a `fill` right-align spacer, and transient collapse.
+- **Structured prompt — direction decided** ([Hooks and the prompt](#hooks-and-the-prompt)):
+  line structure is the **segment map**, not in-band newlines. A mesh segment yields
+  a **string or a list of lines** (its return value), structure comes from the map +
+  an explicit **`newline`** structural segment, and only an *external* segment's `\n`
+  is honored (as a dumb break). The keyed-map shape won over a whole-prompt
+  list-of-lines (which would have made rows positional, not keyed) — but
+  list-of-lines reappears *at the segment level* as a segment's return. **Remaining:**
+  the concrete semantics of the `fill` (even split across multiple fills on a line),
+  `rule`, and **transient collapse** structural segments, now that lines are explicit
+  and addressable.
 
 **Foundational specification work.** The entries above settle *surface* features;
 these five are the deeper contracts an implementation needs before code, and each
