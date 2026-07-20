@@ -9,6 +9,10 @@ use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 fn run_with_input(input: &str) -> Output {
+    run_with_bytes(input.as_bytes())
+}
+
+fn run_with_bytes(input: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -19,7 +23,7 @@ fn run_with_input(input: &str) -> Output {
         .stdin
         .take()
         .expect("stdin")
-        .write_all(input.as_bytes())
+        .write_all(input)
         .expect("write stdin");
     child.wait_with_output().expect("wait for mesh")
 }
@@ -78,6 +82,15 @@ fn last_status_becomes_the_exit_code() {
     // `false` exits 1, then EOF; the shell should exit 1.
     let out = run_with_input("false\n");
     assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn invalid_utf8_line_is_rejected_loudly() {
+    // A malformed line is reported and skipped, not lossily executed; the shell
+    // recovers and runs the next line.
+    let out = run_with_bytes(b"\xff\xfe\necho ok\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid UTF-8"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
 #[test]
