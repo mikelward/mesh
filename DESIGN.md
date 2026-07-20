@@ -564,8 +564,9 @@ carry a mutability flag.)
 
 *(TODO: **indirect / by-name variable access.** Real configs reach a value through
 a *computed* name — fish's `my_set_color` does `eval "printf \$$arg"` to read the
-variable named by `$arg` (`bold`, `blue`, …); bash/zsh have the `${!var}` /
-`declare -n` / `${(P)var}` family. mesh has **no** by-name access to the variable
+variable named by `$arg` (`bold`, `blue`, …); bash has `${!var}` and `declare -n`,
+zsh the `${(P)var}` flag, ksh namerefs (`typeset -n`). mesh has **no** by-name access
+to the variable
 namespace, deliberately so far — the intended answer is to put such values in a
 **map** and index it (`$colors[$name]`), which is first-class and needs no `eval`.
 Because `$env` / `$sh` are already maps, indirect *environment* access falls out
