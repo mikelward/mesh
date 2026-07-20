@@ -23,8 +23,9 @@ runs in-process; any other name is launched as an external program with the
 remaining words as arguments.
 
 ```
-exit [ N ]      # leave the shell. N is masked to 0-255 (default 0);
-                # a surplus operand is reported and the shell keeps running.
+exit [ N ]      # leave the shell. N is masked to 0-255 (default: the last
+                # command's status); a surplus operand is reported and the
+                # shell keeps running.
 ```
 
 Input must be valid UTF-8; a malformed line is rejected loudly. (Lossless

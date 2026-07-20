@@ -9,7 +9,7 @@ grows as features land.
 ## Commands
 
 A line is a command: the first word names it, the rest are arguments. Words are
-separated by spaces. A `\` at the end of a line continues it onto the next.
+separated by spaces.
 
 ```
 command arg1 arg2 …
@@ -24,7 +24,7 @@ An unknown command prints `command not found` and sets a failing status.
 | `puts [arg …]` | Print the arguments separated by single spaces, then a newline. No arguments prints a blank line. |
 | `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`. |
 | `pwd` | Print the working directory. |
-| `exit [n]` | Leave the shell with status `n` (default: the last status; masked to 0–255). |
+| `exit [n]` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). |
 
 ## Exit status
 
