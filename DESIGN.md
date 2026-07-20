@@ -933,21 +933,27 @@ mechanical, not stylistic — each marks a different kind of thing:
   `func f(env, --tag = latest, ...hosts)`.
 
 So the rule is: **a comma appears exactly where an entry may itself contain a
-space, and nowhere else.** In the space-separated contexts the separator is the
-*top-level* space *between* elements, and each element is one of two shapes:
+space, and nowhere else.** In the space-separated contexts the separator is only
+the *top-level* space — the one outside every bracket and block — and each
+element is a self-contained expression, in one of these shapes:
 
 - an **atomic token** — a bareword or a scalar; to hold a space, quote it
   (`["a b" "c d"]`) or backslash-escape the space (`[a\ b c]` is two elements,
   `a\ b` and `c`, per the [bare-word escape](#quoting-and-escaping)), since an
   *unescaped* bare space would read as two tokens;
-- a **self-delimited grouped expression** — a nested list `[a b]`, a map
-  `[k: v]`, a command substitution `$(cmd sub args)`, or a lambda
-  `func(f) { $f:stem }` — whose own `[ ]`/`( )`/`{ }` balance it, so it carries
-  internal spaces verbatim, needs no quoting (quoting would turn it into a
-  string), and takes no comma.
+- a **self-delimited expression** — one whose own grammar closes it, so its
+  internal spaces are structural, it needs no quoting (quoting would turn it into
+  a string), and it takes no comma. This spans both **bracket-delimited** values
+  — a nested list `[a b]`, a map `[k: v]`, a command substitution `$(cmd sub
+  args)`, a call or lambda `func(f) { $f:stem }` — and **keyword-led block
+  expressions** used in argument position, e.g.
+  `style(if inside-project() { … } else { … } --fg blue)`, `match … { … }`, or
+  `fork { … }`, which a keyword plus its `{ }` blocks close just as brackets do.
 
-An *unescaped, unquoted* space always separates elements and a comma never
-separates atomic elements; an internal space survives inside one element only
+The precise point where one element ends and the next begins is the parser's to
+fix (the EBNF is still a TODO); the principle here is only that an *unescaped,
+unquoted top-level* space separates elements and a comma never separates them —
+an internal space survives inside one element only
 when it is quoted, backslash-escaped, or enclosed in balanced brackets.
 
 **Should mesh broaden commas — allow `[a, b]`, or comma-separated call args?**
@@ -1489,9 +1495,11 @@ parenthesized body was the isolation flag) is **dropped**. That leaves a
 [value-and-argument world](#calling-for-a-value-and-lambdas) (calls, signatures,
 modifier arguments) — with no attached-vs-spaced whitespace rule needed to tell a
 value call `f(x)` apart from a subshell `( x )`. (Process substitution
-[`<(cmd)` / `>(cmd)`](#redirection) is untouched: there the paren is bound to the
-`<`/`>` as a single lexical token — `<(` — not a bare group, so it is not what
-"the subshell is dropped" refers to and stays a retained form.)
+[`<(cmd)`](#redirection) is untouched: there the paren is bound to the `<` as a
+single lexical token — `<(` — not a bare group, so it is not what "the subshell
+is dropped" refers to and stays a retained form. The output form `>(cmd)` is a
+separate open question — still a TODO under [Redirection](#redirection) — and is
+neither settled nor unsettled by this change.)
 
 A **`fork` block forks**, so — like `export` — only **bytes** cross back out (its
 stdout); rich list/map values do not survive the process boundary. A direct
