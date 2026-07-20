@@ -28,7 +28,8 @@ something to say.
 global _cmd_ms = 0
 $sh.postexec.record-time = func(cmd, status, ms) { global _cmd_ms = $ms }
 
-# The prompt is a map — one entry per line, rendered top to bottom.
+# The prompt is a map — one entry per line, rendered top to bottom in the order
+# you add them (maps preserve insertion order).
 
 # how the last command went: an error in red, or a slow time in yellow (else nothing)
 $sh.prompt.status = func() {
