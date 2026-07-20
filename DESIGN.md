@@ -244,6 +244,18 @@ Rules:
   reach for `:root` when you mean "strip it all." Controlled peeling is also
   available via chaining (`$f:stem:stem`).
 
+*(TODO — decisions surfaced porting real `PATH` / `find_up` code:*
+- ***Transform-vs-predicate overlap.*** `:dir` is *dirname* (a transform), so
+  `$paths:filter(:dir)` would silently keep **everything** — dirname is always a
+  truthy string — when the writer meant "keep directories." The directory *test*
+  is already `$p:type == dir` (glob type `:d` / `(d)`); decide whether a bare
+  **transform** modifier used in **predicate** position should be a **loud error**
+  to kill that footgun, and confirm the shorthand directory-*filter* spelling.
+- ***Upward path walk — `:ancestors` / `:parents`.*** `find_up`, project-root
+  detection, and `rootdir` all want `pwd():ancestors` → `[/a/b/c /a/b /a /]`, turning
+  a `cd ..`-in-a-subshell loop into a plain list iteration. Decide the name and
+  whether it includes the path itself and the `/` root.)*
+
 This modifier system is the direct answer to
 [fish #4002](https://github.com/fish-shell/fish-shell/issues/4002) ("a
 dead-simple way to strip a suffix"): it is a first-class language feature, not a
@@ -1071,6 +1083,14 @@ Rules:
   **last occurrence wins** for a valued flag (`--tag=v1 --tag=v2` binds `v2`, the
   universal CLI convention that makes a forwarded default overridable), and a
   repeated switch is simply still true (idempotent) — neither repeat is an error.
+  *(TODO — surfaced porting `recent`, `body`, `shift_options`: **short and numeric
+  flags**. The grammar here declares only `--long` flags, but interactive use leans
+  on `-N` counts (`recent -20`, the `head -20` idiom), single-letter switches (`-v`),
+  bundles (`-abc`), and attached values (`-ffile`). Decide whether a user function
+  can declare short aliases (`--verbose | -v`) and a numeric-count form, or whether
+  short/numeric flags stay an external-tool-only convention and in-shell functions
+  are `--long`-only. The `--`-mid-stream that `shift_options` relies on is already
+  covered by the terminator rule below.)*
 - **`--` ends flag parsing** (the universal Unix terminator, kept). Everything
   after a bare `--` is positional/rest, even if it begins with `--`. This is
   how a value that literally looks like a flag reaches a rest parameter:
@@ -1435,6 +1455,10 @@ to a bool):
   (newer / older / same-inode) are the same comparison family as the
   [predicate qualifiers](#globbing) (`age<`) and are *(open)* alongside them —
   likely `$a:mtime > $b:mtime` and a `$a:same($b)` rather than cryptic digraphs.
+  *(TODO — surfaced porting `age()`: settle the **time model** these imply. Is
+  `:mtime` a bare epoch **int** or an **instant**, is there a `now()`, and is a
+  difference a plain count of seconds or a **duration** that prints as `3s`?
+  `age = now() - $f:mtime` and the prompt's `took 3s` both ride on this answer.)*
 - **Combine** bools with the words `and` / `or` / `not` (`if $a:exists and not
   $b:exists { … }`). These join *values*; the byte-stream **command** chains
   `&&` / `||` (run-next-on-success/failure, by exit status) are kept separately
