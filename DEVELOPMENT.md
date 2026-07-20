@@ -52,6 +52,7 @@ integration tests need no terminal. The rest of the interactive stack named in
 | Crate | Purpose | License | Status |
 | --- | --- | --- | --- |
 | `reedline` | interactive line editing, history, Ctrl-C/D | MIT | **in use** |
+| `glob` | filesystem glob expansion | MIT/Apache-2.0 | **in use** |
 | `nix` | `fork`/`exec`, `setpgid`, `tcsetpgrp`, signals | MIT | planned (job control) |
 | `crossterm` | terminal control (pulled in by `reedline`) | MIT | transitive |
 | `nucleo` | fuzzy completion | MPL-2.0 | planned |
@@ -127,6 +128,7 @@ mesh/
 │       │   ├── main.rs     # entry point
 │       │   ├── repl.rs     # read / tokenize / dispatch loop
 │       │   ├── lexer.rs    # M0 whitespace tokenizer (PLACEHOLDER)
+│       │   ├── expand.rs   # tilde + glob expansion of words
 │       │   ├── builtins.rs # cd, pwd, puts, exit
 │       │   └── exec.rs     # launch external commands, map exit status
 │       └── tests/
@@ -142,9 +144,10 @@ mesh/
 ### How the code fits together
 
 `main` calls `repl::run`, which loops: read a line → `lexer::split` into words →
-`builtins::dispatch` (handles `cd`/`pwd`/`puts`/`exit`, returns `None` otherwise)
-→ else `exec::run` launches the external command. The loop tracks the last exit
-status and returns it as the process exit code at EOF.
+`expand::expand` (tilde + globs) → `builtins::dispatch` (handles
+`cd`/`pwd`/`puts`/`exit`, returns `None` otherwise) → else `exec::run` launches
+the external command. The loop tracks the last exit status and returns it as the
+process exit code at EOF.
 
 **Planned evolution.** When the real lexer/parser replace the M0 placeholder,
 the shell internals graduate into a `crates/mesh-core` **library** and the binary

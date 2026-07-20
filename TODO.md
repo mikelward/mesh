@@ -27,7 +27,8 @@ file as tasks land.
       rejects surplus operands. Still deferred: `CDPATH`, `--physical`, autocd,
       logical cwd.
 - [x] `pwd` and `puts` builtins
-- [ ] Globs + `~` expansion (glob no-match → **empty**, see Decisions made)
+- [x] Globs + `~` expansion (glob no-match → **empty**). `~user` and expansion
+      suppression (quoting) still to come; non-UTF-8 lossy under String words.
 
 ## Known limitations
 

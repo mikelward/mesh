@@ -6,10 +6,38 @@
 //! stderr, and the exit code.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 fn run_with_input(input: &str) -> Output {
     run_with_bytes(input.as_bytes())
+}
+
+/// A fresh, empty temp directory unique to this test process and `tag`.
+fn fresh_dir(tag: &str) -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("mesh_test_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+/// Run mesh with `HOME` set to `home` (for tilde tests).
+fn run_with_home(input: &str, home: &std::path::Path) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for mesh")
 }
 
 fn run_with_bytes(input: &[u8]) -> Output {
@@ -118,6 +146,56 @@ fn cd_dash_returns_to_previous_and_prints_it() {
 fn cd_rejects_surplus_operands() {
     let out = run_with_input("cd / extra\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("too many arguments"));
+}
+
+#[test]
+fn glob_expands_and_sorts_matches() {
+    let dir = fresh_dir("glob_match");
+    std::fs::write(dir.join("b.ext"), "").unwrap();
+    std::fs::write(dir.join("a.ext"), "").unwrap();
+    std::fs::write(dir.join("c.other"), "").unwrap();
+    let out = run_with_input(&format!("cd {}\nputs *.ext\n", dir.display()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.ext b.ext\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn glob_with_no_matches_contributes_nothing() {
+    let dir = fresh_dir("glob_empty");
+    // The middle word globs to nothing, so `puts` sees only `x` and `y`.
+    let out = run_with_input(&format!("cd {}\nputs x *.nomatch y\n", dir.display()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x y\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_glob_word_passes_through_even_if_absent() {
+    let dir = fresh_dir("glob_literal");
+    let out = run_with_input(&format!("cd {}\nputs missing.txt\n", dir.display()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "missing.txt\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tilde_expands_to_home() {
+    let home = fresh_dir("tilde_home");
+    let out = run_with_home("puts ~\n", &home);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", home.display())
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn cd_tilde_goes_home() {
+    let home = fresh_dir("tilde_cd");
+    let out = run_with_home("cd ~\npwd\n", &home);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", home.display())
+    );
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[cfg(target_os = "linux")]
