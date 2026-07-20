@@ -116,6 +116,24 @@ file as tasks land.
       be a valid identifier, the common "intentional / private / unused-but-named"
       convention. Would touch `read_name` (allow a `_` head as long as the whole
       token isn't just `_`) and the `GRAMMAR.md` name rule.
+- [ ] **Optional commas + word×list distribution in list literals.** Two related
+      list ergonomics, motivated by the bash `mv foo{,bak}` idiom (rename
+      `foo` → `foobak` in one word):
+  - **Optional commas** — accept `[a, b, c]` as well as `[a b c]`. Decide whether
+    *empty* elements are allowed (`[, bak]` → an empty-string first element),
+    which is what would make `foo[, bak]` a terse cross-product.
+  - **Word × list distribution** — `pre[a b]` → `prea preb` (distribute a prefix
+    over a list), the list-native analog of brace expansion, so `mv foo['' bak]`
+    or `mv foo[, bak]` → `mv foo foobak`. Blocked on a disambiguation rule versus
+    the **glob character class** `[abc]` (already implemented): `foo[a b]` differs
+    from the class `foo[ab]` only by a space.
+      Note: bash-style **braces are already kept** (`DESIGN.md` "Braces — kept";
+      `mv foo{,bak}` is the specced idiom), so this is about whether the list
+      syntax should *also* cover it, not a missing capability. Leaning (from
+      discussion): keep `{,}` for textual expansion, keep `[]` for real list
+      values, maybe add optional commas — but don't overload `foo[…]` for
+      brace-style expansion (small payoff, muddies the glob-class / list / index
+      story).
 - [ ] **Empty-glob warning (optional).** Keep behavior "empty always", but
       consider *warning* on an empty glob expansion while still proceeding — mesh
       is the only party that can detect it (the argv boundary carries bytes, not
