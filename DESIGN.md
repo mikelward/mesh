@@ -936,16 +936,19 @@ So the rule is: **a comma appears exactly where an entry may itself contain a
 space, and nowhere else.** In the space-separated contexts the separator is the
 *top-level* space *between* elements, and each element is one of two shapes:
 
-- an **atomic token** — a bareword or a scalar; quote it (`["a b" "c d"]`) when
-  it must contain a space, since a bare space there would read as two tokens;
+- an **atomic token** — a bareword or a scalar; to hold a space, quote it
+  (`["a b" "c d"]`) or backslash-escape the space (`[a\ b c]` is two elements,
+  `a\ b` and `c`, per the [bare-word escape](#quoting-and-escaping)), since an
+  *unescaped* bare space would read as two tokens;
 - a **self-delimited grouped expression** — a nested list `[a b]`, a map
   `[k: v]`, a command substitution `$(cmd sub args)`, or a lambda
   `func(f) { $f:stem }` — whose own `[ ]`/`( )`/`{ }` balance it, so it carries
   internal spaces verbatim, needs no quoting (quoting would turn it into a
   string), and takes no comma.
 
-A space never splits a *token* and a comma never separates *atomic elements*;
-only balanced brackets carry an internal space in an unquoted element.
+An *unescaped, unquoted* space always separates elements and a comma never
+separates atomic elements; an internal space survives inside one element only
+when it is quoted, backslash-escaped, or enclosed in balanced brackets.
 
 **Should mesh broaden commas — allow `[a, b]`, or comma-separated call args?**
 The settled answer is **no**:
