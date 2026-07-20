@@ -41,13 +41,12 @@ $sh.postexec.timer = func(cmd, status, ms) { global _cmd_ms = $ms }
 # fish's postexec `last_job_info`: the previous command's error + how long it took
 $sh.prompt.status = func() {
   parts = []
-  match $sh.status {
-    0 { }                                              # success → silent
-    _ { parts += style("status $sh.status" --fg red) }
-  }
+  if $sh.status != 0 { parts += style("status $sh.status" --fg red) }   # nonzero → show it
   if $_cmd_ms > 1000 { parts += style("took $(fmt-duration $_cmd_ms)" --fg yellow) }
   $parts:join " "                                      # "" when empty → line skipped
 }
+# (Want per-signal wording? `match $sh.status { 130 { "interrupted" } 148 { } _ { … } }`
+#  — reach for match only when you branch on specific statuses, not just zero/nonzero.)
 
 $sh.prompt.gap  = newline          # blank line above the rule
 $sh.prompt.rule = rule             # full-width ─── (replaces `bar $COLUMNS`)
