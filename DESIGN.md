@@ -2217,29 +2217,48 @@ never the status of some command a handler happened to run. (`postexec` also
 gets the status as an explicit `status` argument.)
 
 **The prompt** is a named, insertion-ordered map where **each top-level entry is
-one line**, rendered top to bottom. An entry is a **callable** returning a
-renderable (a string, or a **list of strings** for several lines) — or `""` to
-contribute nothing — a **structural value** (`rule` for a full-width line,
-`newline` for a deliberate blank line), or a **keyed sub-map** grouping several
-segments onto *one* line — the group's segments **concatenate in key order, empties
-dropped**, each carrying its own spacing, so each keeps its **own** style (a styled
-value flattens to plain text only when you concatenate it into a *string*, so
-distinctly-colored pieces of one line are distinct segments, not one interpolated
-string). Line breaks between entries are **implicit**, so there are no separator
-entries to name:
+one line**, rendered top to bottom. A line's value — a callable is evaluated to
+produce it — is one of:
+
+- a **renderable**: a plain string or a `style(…)` value (or `""` to contribute
+  nothing → its line is skipped);
+- a **flat list of renderables**: the inline pieces of the line, **space-joined,
+  empties dropped** — the *same rule `puts` uses* for its arguments, so `[host-info
+  dir-info auth-info]` reads like `puts host dir auth` and an empty middle piece
+  never leaves a double space. Each piece **keeps its own style** (the pieces stay
+  separate *values*; fold them into a string — `"$a$b"` — and the attributes flatten,
+  since a string has nowhere to store per-piece color). *Tight* joining (`user@host`,
+  no space) is not a list job: build it **inside a segment** as a string where you
+  control every character — or, when the tight unit is also multi-color, as a
+  `style([…])` [span](#hooks-and-the-prompt) (post-MVP). Line list = space-joined
+  fields; segment string = character-level control;
+- a **keyed sub-map** (`[host: …, dir: …]` — a map literal, `[ ]` not `{ }`): the
+  *same* inline line, but each piece **named** so you can replace or `unset` it
+  individually;
+- a **structural value**: `rule` (a full-width line) or `newline` (a blank line) —
+  each a **whole** line, never an inline piece.
+
+A **bare word in a segment slot is the callable of that name** (late-bound, so
+re-sourcing rebinds it — the by-name rule the hooks use); **quote it for a literal
+string** (`host` calls the `host` segment, `"host"` renders the text). And
+**multiple lines are multiple entries** — a list is always the pieces of *one*
+line, never several lines. So there are no separator entries to name:
 
 ```
-$sh.prompt.rule = rule                         # a full-width line
-$sh.prompt.head = [                            # a MAP literal ([ ], not { }) — one line, keyed inline segments
-  host: host-seg,
-  dir:  func() { if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() } },
-  auth: func() { if ssh-id-missing() { style("no-ssh-id" --fg yellow) } },   # no else → "" → omitted
-]
-$sh.prompt.jobs = func() { … }                 # its own line — omitted when empty
-$sh.prompt.char = func() { "> " }              # its own line
+$sh.prompt.status = status-info                # a line — bare name = the status-info segment, by name
+$sh.prompt.rule   = rule                       # a full-width line (its own entry — `rule` is never inline)
+$sh.prompt.line1  = [host-info dir-info auth-info]   # ONE line: host (red) dir (blue) auth (yellow), each its own color
+$sh.prompt.jobs   = job-info                   # its own line — skipped when empty
+$sh.prompt.char   = func() { "> " }            # a func literal is fine too
 
-$sh.prompt.head.dir = my-dir-seg               # swap ONE inline segment by name
-unset $sh.prompt.head.auth                      # drop the auth warning
+# named variant — same line, pieces individually addressable:
+$sh.prompt.line1     = [host: host-info, dir: dir-info, auth: auth-info]
+$sh.prompt.line1.dir = my-dir-info             # swap ONE piece by name
+unset $sh.prompt.line1.auth                    # drop the auth warning
+
+func host-info() { style("$(hostname)" --fg red) }     # `style` (not styled); space-separated args; parens on the func
+func dir-info()  { if inside-project() { "$(vcs prompt-info)" } else { style(tilde-pwd() --fg blue) } }
+func auth-info() { if ssh-id-missing() { style("SSH" --fg yellow) } }   # no else → "" → omitted
 ```
 
 (Segments use `if` *expressions* to pick a string — not `and`/`or`, which combine
@@ -2294,13 +2313,15 @@ is a possible later iteration; the MVP keeps one attribute set per string.)*
 
 **Line structure is the map — newlines are not in-band.** Because each top-level
 entry is a line, line breaks come from the **map's shape**, never from an in-band
-`\n` a callable printed. A callable may return a **list of strings** to occupy
-several lines from one entry (a list element that is itself a list is an error — no
-guessed flatten). That is what makes the per-line features well-defined: a "line"
-is a map entry (or a list element), stable and addressable, not a function of what
-a callable happened to print. A segment renders its **return value**, consistent
-with the [value-vs-stream split](#calling-for-a-value-and-lambdas) — you *return*
-your prompt, you don't `puts` it.
+`\n` a callable printed, and **never from a list** — a list is the space-joined
+*pieces of one line*, so **multiple lines are multiple entries** (a list element
+that is itself a list is an error — no guessed flatten, no lines-from-nesting).
+That is what makes the per-line features well-defined: a "line" is a map entry,
+stable and addressable, not a function of what a callable happened to print. A
+segment renders its **return value**, consistent with the
+[value-vs-stream split](#calling-for-a-value-and-lambdas) — you *return* your
+prompt, you don't `puts` it. (The one exception is raw external output, below,
+whose `\n`s are honored — you can't dictate an external tool's line count.)
 
 **Empty entries take no line.** An entry — or a grouped inline segment — that
 renders `""` contributes **no line**, so the common "nothing to show" case (an
@@ -2329,10 +2350,12 @@ command." This is exactly the hand-rolled `preprompt` / `prompt_line` /
 keyed, re-source-safe segments — with its *side effects* (a background fetch)
 moving to the `$sh.preprompt` event hook and its *rendering* to this segment map.
 
-*(MVP: keyed **line entries** with inline line-**groups**, `style` color, an entry
-yielding a **string or a list of lines**, a deliberate-blank **`newline`** entry,
-and the full-width **`rule`** entry. Line structure is the **map**, never in-band
-`\n` (raw external output excepted, above). Layered next on the same per-line width
+*(MVP: keyed **line entries**, `style` color, an entry yielding a renderable **or a
+space-joined flat list of pieces** (empties dropped, `puts`-style; each keeps its
+own style), an optional keyed **sub-map** so the pieces are individually named, a
+deliberate-blank **`newline`** entry, and the full-width **`rule`** entry. Line
+structure is the **map** — a list is one line's pieces, multiple lines are multiple
+entries — never in-band `\n` (raw external output excepted, above). Layered next on the same per-line width
 the styled values already give the shell, and now well-defined because lines are
 explicit map entries: **`fill`** (right-align by consuming a line's slack; multiple
 `fill`s on a line split it evenly) and **transient collapse** of past prompts in
@@ -2529,19 +2552,23 @@ to avoid" rather than promising the latter as done.
   `preexec`/`postexec`, `precd`/`postcd`, `exit`; the prompt is a named, ordered
   segment map with the external renderer as one peer segment. Prompt MVP: **each
   top-level entry is a line** (implicit breaks between entries — no separator keys),
-  an entry yields a **string or a list of lines**, several inline segments share a
-  line via a keyed **sub-map group**, `style` color, a deliberate-blank **`newline`**
-  entry, and the full-width **`rule`** entry; line structure is the map, not in-band
-  `\n` (raw external output excepted, as dumb breaks). Remaining: `fill` and
-  transient collapse.
+  an entry yields a renderable **or a space-joined flat list of pieces**
+  (`puts`-style, empties dropped, each keeping its own style), with a keyed
+  **sub-map** variant to name the pieces; `style` color; a deliberate-blank
+  **`newline`** entry; and the full-width **`rule`** entry. A list is one line's
+  pieces — **multiple lines are multiple entries** — and line structure is the map,
+  not in-band `\n` (raw external output excepted, as dumb breaks). A bare word in a
+  segment slot is the callable of that name (late-bound); quote for a literal.
+  Remaining: `fill` and transient collapse.
 - **Structured prompt — direction decided** ([Hooks and the prompt](#hooks-and-the-prompt)):
   line structure is the **map**, not in-band newlines — **each top-level entry is a
-  line** (implicit breaks; no `nl1`/`nl2` separator keys), multi-segment lines are a
-  keyed **sub-map group**, a `list of strings` return spans several lines, and a
-  deliberate blank line is a named **`newline`** entry. The keyed-map shape won over
-  a whole-prompt list-of-lines (which would have made rows positional, not keyed) —
-  list-of-lines reappears only *inside* an entry (its return). `rule` is in the MVP.
-  **Remaining:** the concrete semantics of **`fill`** (even split across multiple
+  line** (implicit breaks; no `nl1`/`nl2` separator keys), a line's pieces are a
+  **space-joined flat list** (or a keyed **sub-map** to name them), and a deliberate
+  blank line is a named **`newline`** entry. A list is one line's pieces, so
+  **multiple lines are multiple entries** — the keyed-map shape won over a
+  whole-prompt list-of-lines (which would have made rows positional, not keyed).
+  `rule` is in the MVP. **Remaining:** the concrete semantics of **`fill`** (even
+  split across multiple
   fills on a line) and **transient collapse**, now that lines are explicit and
   addressable.
 
