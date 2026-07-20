@@ -252,7 +252,7 @@ Rules:
   a bare **transform** modifier used in **predicate** position should be a **loud
   error** rather than a quiet keep-all.
 - ***Upward path walk — `:ancestors` / `:parents`.*** `find_up`, project-root
-  detection, and `rootdir` all want `pwd():ancestors` → `[/a/b/c /a/b /a /]`, turning
+  detection, and `rootdir` all want `$env.PWD:ancestors` → `[/a/b/c /a/b /a /]`, turning
   a `cd ..`-in-a-subshell loop into a plain list iteration. Decide the name and
   whether it includes the path itself and the `/` root.)*
 
