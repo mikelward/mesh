@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 
 use crate::builtins::{self, Builtin};
-use crate::{exec, lexer};
+use crate::{exec, expand, lexer};
 
 /// Run the shell until end-of-input or `exit`, returning the last status as the
 /// process exit code.
@@ -47,7 +47,7 @@ enum Step {
 /// Tokenize and dispatch one line of input. Empty lines are a no-op that keeps
 /// the previous status.
 fn run_line(text: &str, last: u8) -> Step {
-    let words = lexer::split(text);
+    let words = expand::expand(lexer::split(text));
     if words.is_empty() {
         return Step::Continue(last);
     }

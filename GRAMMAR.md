@@ -42,7 +42,26 @@ pwd             # print the working directory. No operands.
 puts [ ARG ... ]  # print the args separated by single spaces + newline.
 ```
 
+## Task 4 — tilde and glob expansion
+
+After tokenizing, each word is expanded (before dispatch, so `cd ~` and
+`ls *.rs` work):
+
+- **Tilde:** a word equal to `~`, or starting with `~/`, has the leading `~`
+  replaced by `$HOME`. `~user` is not expanded yet (needs a passwd lookup).
+- **Globs:** a word containing a glob metacharacter (`*`, `?`, `[`) is matched
+  against the filesystem; matches replace the word (sorted; dotfiles excluded
+  unless the pattern starts with `.`). **No match → the word contributes zero
+  args** (the settled empty-list rule). A word with no metacharacter is a
+  literal and passes through even if no such file exists. An invalid pattern is
+  a literal.
+
+**No suppression yet.** Until quoting/escaping (task 5) there is no way to pass a
+literal `*`, `?`, `[`, or a leading `~` — every one is active. `String`-based
+expansion renders a non-UTF-8 `$HOME`/match lossily (fixed when words become
+`OsString`).
+
 ### Not yet parsed
-Quoting, escapes, `$` variables and interpolation, globs, `~`, pipes `|`,
-redirection `>` `<`, sequencing `;` `&&` `||`, `{ }` blocks, `func`. Each arrives
-with the task that needs it, and this file grows to match.
+Quoting, escapes, `$` variables and interpolation, pipes `|`, redirection `>`
+`<`, sequencing `;` `&&` `||`, `{ }` blocks, `func`. Each arrives with the task
+that needs it, and this file grows to match.
