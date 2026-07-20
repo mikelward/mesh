@@ -2230,11 +2230,11 @@ entries to name:
 
 ```
 $sh.prompt.rule = rule                         # a full-width line
-$sh.prompt.head = {                            # ONE line — three keyed inline segments
+$sh.prompt.head = [                            # a MAP literal ([ ], not { }) — one line, keyed inline segments
   host: host-seg,
   dir:  func() { if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() } },
   auth: func() { if ssh-id-missing() { style("no-ssh-id" --fg yellow) } },   # no else → "" → omitted
-}
+]
 $sh.prompt.jobs = func() { … }                 # its own line — omitted when empty
 $sh.prompt.char = func() { "> " }              # its own line
 
