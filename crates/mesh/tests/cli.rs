@@ -336,6 +336,46 @@ fn single_quotes_escape_in_model_b() {
 }
 
 #[test]
+fn assignment_and_interpolation() {
+    let out = run_with_input("x = hello\nputs $x\nn=42\nputs ${n}!\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n42!\n");
+}
+
+#[test]
+fn interpolation_only_in_double_quotes() {
+    let out = run_with_input("x = world\nputs \"hi $x\"\nputs 'hi $x'\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi world\nhi $x\n");
+}
+
+#[test]
+fn env_interpolation_reads_the_environment() {
+    let home = fresh_dir("env_read");
+    let out = run_with_home("puts $env.HOME\n", &home);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", home.display())
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn unbound_variable_is_a_loud_error_that_recovers() {
+    let out = run_with_input("puts $nope\nputs ok\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unbound variable"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+#[test]
+fn interpolated_value_is_not_re_globbed() {
+    // A `$x` holding `*` is one literal value — no word splitting or globbing.
+    let dir = fresh_dir("interp_glob");
+    std::fs::write(dir.join("afile"), "").unwrap();
+    let out = run_with_input(&format!("cd {}\nx = '*'\nputs $x\n", dir.display()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "*\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn trailing_line_continuation_adds_no_empty_argument() {
     // `puts a \<newline>` must yield just `a`, not `a` plus an empty argument.
     let out = run_with_input("puts a \\\n\n");

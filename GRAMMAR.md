@@ -94,14 +94,43 @@ The escape sets (an **unknown escape inside a quote is a syntax error**):
 - An **unterminated quote** or **unknown/bad escape** is a syntax error
   (status 2); the shell recovers and continues with the next line.
 
-Deferred within this area: `$`-interpolation (task 6), heredocs (incl. the raw
-both-quotes `<< 'END'` form), and `\`-newline continuation across multiple input
-lines. Words are still `String`-based, so a non-UTF-8 `$HOME`/match is lossy.
+Deferred within this area: heredocs (incl. the raw both-quotes `<< 'END'` form)
+and `\`-newline continuation across multiple input lines. Words are still
+`String`-based, so a non-UTF-8 `$HOME`/match is lossy.
+
+## Task 6 — variables, assignment, and interpolation
+
+```
+assign  = name "=" value              # unspaced, whole statement
+        | name "=" ws value…          # spaced form (for compound values)
+var     = "$" name                    # $x
+        | "$" "{" name "}"            # ${x}
+        | "$" "env" "." key          # $env.KEY  (member access)
+name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
+```
+
+- **Assignment** binds a session-global variable. `name=value` (unspaced) is the
+  whole statement; `name = value` (spaced) is the compound-value form. Position
+  separates assignment from a `k=v` *argument*: `git commit --author=me` and
+  `env FOO=1 cmd` are commands, not bindings.
+- **`$name` / `${name}`** read a variable; **`$env.KEY`** reads the environment
+  (strict). Interpolation happens in bare words and `"…"`, **not** in `'…'` or
+  `r'…'`.
+- **Reads fail loud**: an **unbound** variable is an error (no null / always-on
+  `set -u`), and the shell recovers to the next line. Assignment always creates.
+- **No word splitting**: an interpolated value is one literal value — `$x`
+  holding `*` is not re-globbed and never splits on spaces.
+- **Hyphens** are interior only: `$a-$b` is `$a` + `-` + `$b`, while
+  `$auto-fetch` is one name.
+
+Deferred: list/map values (only single-value assignment for now — a glob/list
+RHS is an error), the `:` value modifiers (`$f:stem`), `export`, `global`/`unset`,
+function-local scope, the `$sh.*` surface, and `$env:get(K default)`.
 
 ### Not yet parsed
-`$` variables and interpolation, pipes `|`, redirection `>` `<`, sequencing `;`
-`&&` `||`, `{ }` blocks, `func`, heredocs. Each arrives with the task that needs
-it, and this file grows to match.
+Pipes `|`, redirection `>` `<`, sequencing `;` `&&` `||`, `{ }` blocks, `func`,
+`:` modifiers, heredocs. Each arrives with the task that needs it, and this file
+grows to match.
 
 **Design target (still ahead of the lexer above).** The **Model B strings**
 direction from `DESIGN.md` is now implemented (see task 5 above). What the lexer

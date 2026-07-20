@@ -10,6 +10,7 @@ mod exec;
 mod expand;
 mod lexer;
 mod repl;
+mod vars;
 
 use std::process::ExitCode;
 

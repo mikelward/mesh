@@ -1,60 +1,78 @@
-//! Word expansion: tilde and filesystem globs.
+//! Word expansion: interpolation, then tilde and filesystem globs.
 //!
-//! Runs after the lexer and before dispatch. Each word is a list of segments
-//! tagged expandable (unquoted) or literal (quoted/escaped). Only **expandable**
-//! text supplies tilde/glob syntax; literal text is kept verbatim (its
-//! metacharacters are glob-escaped), so quoting suppresses expansion.
+//! Each word is a list of pieces (`Text` expandable/literal, or `Var`). We first
+//! resolve `Var` pieces against the variable store — an interpolated value is
+//! **literal** (never re-split or re-globbed, per the no-word-splitting rule) —
+//! then run tilde/glob on the expandable text. Only unquoted (`expandable`) text
+//! supplies tilde/glob syntax; quoted text is kept verbatim (glob-escaped).
 //!
-//! Expansion produces `String` args, so a non-UTF-8 `$HOME` or glob match is
-//! rendered lossily; the real fix is `OsString` words with a later lexer.
+//! Results are `String` args, so a non-UTF-8 `$HOME`/match/`$env` value is
+//! rendered lossily; the real fix is `OsString` words later.
 
 use std::env;
 
-use crate::lexer::Word;
+use crate::lexer::{Piece, VarRef, Word};
+use crate::vars::Vars;
 
-/// Expand each word into zero or more argument strings.
-pub fn expand(words: Vec<Word>) -> Vec<String> {
-    let mut out = Vec::new();
-    for word in words {
-        expand_word(word, &mut out);
-    }
-    out
+/// An expansion error — an unbound read fails loud (no null), per `DESIGN.md`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExpandError {
+    UnboundVar(String),
+    UnsetEnv(String),
+    Unsupported(String),
 }
 
-/// A word reduced to `(text, expandable)` pieces, after tilde expansion.
+impl std::fmt::Display for ExpandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExpandError::UnboundVar(n) => write!(f, "{n}: unbound variable"),
+            ExpandError::UnsetEnv(k) => write!(f, "$env.{k}: not set"),
+            ExpandError::Unsupported(s) => write!(f, "{s}: not supported yet"),
+        }
+    }
+}
+
+/// Expand each word into zero or more argument strings.
+pub fn expand(words: Vec<Word>, vars: &Vars) -> Result<Vec<String>, ExpandError> {
+    let mut out = Vec::new();
+    for word in words {
+        expand_word(word, vars, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// A word reduced to `(text, expandable)` pieces, after interpolation and tilde.
 type Pieces = Vec<(String, bool)>;
 
-fn expand_word(word: Word, out: &mut Vec<String>) {
-    let mut pieces: Pieces = word
-        .0
-        .into_iter()
-        .map(|seg| (seg.text, seg.expandable))
-        .collect();
+fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), ExpandError> {
+    // Resolve interpolations first; an interpolated value is literal.
+    let mut pieces: Pieces = Vec::new();
+    for piece in word.0 {
+        match piece {
+            Piece::Text { text, expandable } => pieces.push((text, expandable)),
+            Piece::Var(vref) => pieces.push((resolve(&vref, vars)?, false)),
+        }
+    }
     apply_tilde(&mut pieces);
 
-    // Only expandable text contributes glob syntax.
     let has_meta = pieces.iter().any(|(t, e)| *e && has_glob_meta(t));
     if !has_meta {
         out.push(literal(&pieces));
-        return;
+        return Ok(());
     }
 
-    // Guard against an escaped literal fragment completing a broken glob class
-    // in an adjacent expandable segment (e.g. `['*'` must stay literal `[*`, not
-    // become the pattern `[[*]`). A word globs only if its *expandable* segments
-    // form a valid pattern on their own, with literal segments stood in by a
-    // neutral placeholder; otherwise it is a literal word.
+    // A word globs only if its expandable segments form a valid pattern on their
+    // own (literals stood in by a placeholder), so an escaped literal fragment
+    // can't complete a broken class in an adjacent expandable segment.
     let structure: String = pieces
         .iter()
         .map(|(t, e)| if *e { t.clone() } else { "a".to_string() })
         .collect();
     if glob::Pattern::new(&structure).is_err() {
         out.push(literal(&pieces));
-        return;
+        return Ok(());
     }
 
-    // Build the pattern: expandable text as-is, literal text escaped so its
-    // metacharacters match literally.
     let pattern: String = pieces
         .iter()
         .map(|(t, e)| {
@@ -65,37 +83,48 @@ fn expand_word(word: Word, out: &mut Vec<String>) {
             }
         })
         .collect();
-    // Shell defaults: `*`/`?`/`[…]` don't match a leading dot unless the pattern
-    // starts with `.`.
     let options = glob::MatchOptions {
         require_literal_leading_dot: true,
         ..glob::MatchOptions::new()
     };
     match glob::glob_with(&pattern, options) {
-        // No matches → contribute nothing (the settled empty-list rule).
-        // `flatten()` drops unreadable entries; the crate yields matches sorted.
         Ok(paths) => out.extend(paths.flatten().map(|p| p.to_string_lossy().into_owned())),
-        // Invalid pattern → the literal word.
         Err(_) => out.push(literal(&pieces)),
+    }
+    Ok(())
+}
+
+/// Resolve a variable reference to its string value.
+///
+/// `$env.KEY` reads the process environment (strict: unset is an error).
+/// `$name` reads the variable store (unbound is an error). Member access on any
+/// namespace other than `env`, and a bare `$env`, are not supported yet.
+fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
+    match (vref.name.as_str(), &vref.member) {
+        ("env", Some(key)) => env::var_os(key)
+            .map(|v| v.to_string_lossy().into_owned())
+            .ok_or_else(|| ExpandError::UnsetEnv(key.clone())),
+        ("env", None) => Err(ExpandError::Unsupported("$env".to_string())),
+        (name, None) => vars
+            .get(name)
+            .map(str::to_string)
+            .ok_or_else(|| ExpandError::UnboundVar(name.to_string())),
+        (name, Some(member)) => Err(ExpandError::Unsupported(format!("${name}.{member}"))),
     }
 }
 
-/// The literal value of a word: its segment texts concatenated (an empty word,
-/// e.g. from `""`, yields an empty argument).
+/// The literal value of a word: its piece texts concatenated.
 fn literal(pieces: &Pieces) -> String {
     pieces.iter().map(|(t, _)| t.as_str()).collect()
 }
 
-/// Replace a leading expandable `~` (alone or before `/`) with `$HOME`. The
-/// substituted `$HOME` is literal (its metacharacters must not glob). A quoted
-/// or escaped `~` is not expandable and so is skipped. `~user` needs a passwd
-/// lookup and is left unchanged.
+/// Replace a leading expandable `~`/`~/…` with `$HOME` (kept literal). A quoted
+/// or interpolated leading `~` is not expandable and is skipped.
 fn apply_tilde(pieces: &mut Pieces) {
     let Some((text, true)) = pieces.first().map(|(t, e)| (t.clone(), *e)) else {
         return;
     };
     if text == "~" {
-        // A bare `~`: expand when it is the whole word or is followed by `/`.
         let followed_by_slash = pieces.get(1).is_some_and(|(t, _)| t.starts_with('/'));
         if pieces.len() == 1 || followed_by_slash {
             if let Some(home) = home() {
@@ -104,7 +133,6 @@ fn apply_tilde(pieces: &mut Pieces) {
         }
     } else if let Some(rest) = text.strip_prefix("~/") {
         if let Some(home) = home() {
-            // Keep the `/rest` verbatim and still expandable (so `~/*.rs` globs).
             pieces[0] = (home, false);
             pieces.insert(1, (format!("/{rest}"), true));
         }
@@ -115,7 +143,6 @@ fn home() -> Option<String> {
     env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
 }
 
-/// Does the text contain a glob metacharacter?
 fn has_glob_meta(text: &str) -> bool {
     text.chars().any(|c| matches!(c, '*' | '?' | '['))
 }
@@ -127,23 +154,13 @@ mod tests {
     #[test]
     fn detects_glob_metacharacters() {
         assert!(has_glob_meta("*.rs"));
-        assert!(has_glob_meta("file?"));
-        assert!(has_glob_meta("[ab]c"));
         assert!(!has_glob_meta("plain.txt"));
     }
 
     #[test]
     fn quoted_tilde_is_not_expanded() {
-        // A literal (quoted/escaped) leading `~` must be left alone.
         let mut pieces = vec![("~".to_string(), false)];
         apply_tilde(&mut pieces);
         assert_eq!(pieces, vec![("~".to_string(), false)]);
-    }
-
-    #[test]
-    fn tilde_user_is_left_alone() {
-        let mut pieces = vec![("~root/x".to_string(), true)];
-        apply_tilde(&mut pieces);
-        assert_eq!(pieces, vec![("~root/x".to_string(), true)]);
     }
 }

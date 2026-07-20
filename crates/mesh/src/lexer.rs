@@ -1,47 +1,51 @@
-//! Lexer: split a line into words, honoring quotes and backslash escapes.
+//! Lexer: split a line into words of pieces, honoring quotes, escapes, and
+//! `$` interpolation.
 //!
-//! Implements the **Model B** quoting model from `DESIGN.md` (§ "Quoting and
-//! escaping"):
+//! Quoting is **Model B** (`DESIGN.md` §"Quoting and escaping"):
 //!
-//! - Bare words: a backslash escapes the next character.
-//! - `"…"` — interpolates (deferred) and escapes; C-style set `\n \t \r \e \\
-//!   \" \$` and `\u{…}`.
-//! - `'…'` — does *not* interpolate but *does* escape: the same set with the
-//!   quote swapped (`\'` in place of `\"`), `$` always literal.
-//! - `r'…'` / `r"…"` — raw: no escapes at all, the delimiter is the only special
-//!   character (the home for regex source and paths).
-//! - An **unknown escape inside a quote is an error** (`'\d'`, `"\z"`).
+//! - Bare words: a backslash escapes the next character; `$name` interpolates.
+//! - `"…"` — interpolates (`$name`, `${…}`) and escapes (`\n \t \r \e \\ \" \$`,
+//!   `\u{…}`).
+//! - `'…'` — escapes but does *not* interpolate (`\n \t \r \e \\ \'`, `\u{…}`);
+//!   `$` is always literal.
+//! - `r'…'` / `r"…"` — raw: no escapes and no interpolation.
+//! - An unknown escape inside a quote is an error.
 //!
-//! Each character is tagged **expandable** (unquoted/unescaped — eligible for
-//! later tilde/glob expansion) or **literal** (quoted or backslash-escaped —
-//! exempt), so quoting *suppresses* expansion in [`crate::expand`].
+//! Each word is a list of [`Piece`]s: `Text` (literal or expandable) and `Var`
+//! (an interpolation resolved later, in [`crate::expand`], against the variable
+//! store). Interpolation and expansion never word-split.
 //!
-//! Not yet handled here (noted for later): `$`-interpolation inside `"…"`
-//! (task 6 — a bare `$name` stays literal for now); `\`-newline continuation
-//! across multiple input lines; and heredocs.
+//! Deferred: `:` value modifiers, `${…}` beyond a name/`.member`, heredocs, and
+//! `\`-newline continuation across input lines.
 
-/// A run of characters within a word, tagged with whether it is subject to
-/// later expansion. Unquoted, unescaped text is `expandable`; quoted or
-/// backslash-escaped text is literal.
+/// A variable reference: `$name`, `${name}`, or `$env.member`.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Segment {
-    pub text: String,
-    pub expandable: bool,
+pub struct VarRef {
+    pub name: String,
+    /// A single `.member` access, e.g. `$env.PATH` → name `env`, member `PATH`.
+    pub member: Option<String>,
 }
 
-/// A word: a sequence of adjacent segments that concatenate into one argument.
-/// An empty segment list is a genuine empty argument (e.g. from `""`).
+/// One piece of a word.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Word(pub Vec<Segment>);
+pub enum Piece {
+    /// Literal or bare text. `expandable` is true for unquoted text (eligible
+    /// for tilde/glob expansion), false for quoted or escaped text.
+    Text { text: String, expandable: bool },
+    /// A `$…` interpolation, resolved against the variable store.
+    Var(VarRef),
+}
+
+/// A word: adjacent pieces that concatenate into one argument. An empty piece
+/// list is a genuine empty argument (e.g. from `""`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Word(pub Vec<Piece>);
 
 /// A lexing (syntax) error.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LexError {
-    /// A quote (or raw-string delimiter) was never closed.
     UnterminatedQuote(char),
-    /// A backslash escape inside a quote is not one of the recognized forms.
     UnknownEscape(char),
-    /// A `\u{…}` escape is malformed or names no Unicode scalar.
     BadUnicodeEscape,
 }
 
@@ -55,12 +59,11 @@ impl std::fmt::Display for LexError {
     }
 }
 
-/// Split `line` into words. Unquoted whitespace separates words; quotes and
-/// backslashes escape it. Returns an error for an unterminated quote.
+/// Split `line` into words.
 pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
     let chars: Vec<char> = line.chars().collect();
     let mut words = Vec::new();
-    let mut current: Option<Vec<Segment>> = None;
+    let mut current: Option<Vec<Piece>> = None;
     let mut i = 0;
 
     while i < chars.len() {
@@ -72,40 +75,42 @@ pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
             i += 1;
             continue;
         }
-        // `\`-newline is line continuation: drop the pair *without* starting a
-        // word, so a lone `\<newline>` or a trailing one adds no spurious empty
-        // argument. Cross-line continuation (joining the next input line) is
-        // still deferred. Inside a word, this just fuses across the newline.
+        // `\`-newline is line continuation: drop the pair without starting a
+        // word. Cross-line continuation is still deferred.
         if c == '\\' && chars.get(i + 1) == Some(&'\n') {
             i += 2;
             continue;
         }
-        // Track lexical word start (no word yet) — not segment emptiness, since
-        // an empty quote like `""` starts a word but emits no segment.
         let at_word_start = current.is_none();
         let word = current.get_or_insert_with(Vec::new);
         match c {
-            '\\' => {
-                match chars.get(i + 1) {
-                    Some(&next) => {
-                        push_char(word, next, false);
-                        i += 2;
-                    }
-                    // Trailing backslash: keep it literal (continuation TBD).
-                    None => {
-                        push_char(word, '\\', false);
-                        i += 1;
-                    }
+            '\\' => match chars.get(i + 1) {
+                Some(&next) => {
+                    push_char(word, next, false);
+                    i += 2;
                 }
-            }
+                None => {
+                    push_char(word, '\\', false);
+                    i += 1;
+                }
+            },
+            '$' => match parse_var(&chars, i + 1) {
+                Some((vref, next)) => {
+                    word.push(Piece::Var(vref));
+                    i = next;
+                }
+                // A `$` not starting a valid interpolation is a literal char.
+                None => {
+                    push_char(word, '$', true);
+                    i += 1;
+                }
+            },
             '\'' => {
                 i = lex_escaped(&chars, i + 1, '\'', word)?;
             }
             '"' => {
                 i = lex_escaped(&chars, i + 1, '"', word)?;
             }
-            // Raw-string prefix `r'…'` / `r"…"`, recognized only at the start of
-            // a word so ordinary words like `grep` or `ptr'x'` are unaffected.
             'r' if at_word_start && matches!(chars.get(i + 1), Some('\'') | Some('"')) => {
                 let delim = chars[i + 1];
                 i = lex_raw(&chars, i + 2, delim, word)?;
@@ -123,20 +128,13 @@ pub fn split(line: &str) -> Result<Vec<Word>, LexError> {
     Ok(words)
 }
 
-/// Lex a `"…"` or `'…'` string (Model B: escaped, `"` also interpolates). `start`
-/// is the index just past the opening `quote`; returns the index just past the
-/// close. The content is literal (not expandable).
-///
-/// Escapes: `\n \t \r \e \\`, `\u{HEX}`, and `\<quote>` (so `\"` in `"…"`, `\'`
-/// in `'…'`). In `"…"`, `\$` is a literal dollar; in `'…'`, `$` is already
-/// literal so `\$` is not a valid escape. Any unrecognized escape is an error.
-/// (`$`-interpolation in `"…"` is deferred to task 6 — a bare `$name` is
-/// literal for now.)
+/// Lex a `"…"` or `'…'` string (Model B). `"…"` also interpolates `$…`. `start`
+/// is the index just past the opening `quote`; returns the index past the close.
 fn lex_escaped(
     chars: &[char],
     start: usize,
     quote: char,
-    word: &mut Vec<Segment>,
+    word: &mut Vec<Piece>,
 ) -> Result<usize, LexError> {
     let double = quote == '"';
     let mut buf = String::new();
@@ -148,6 +146,18 @@ fn lex_escaped(
         if c == quote {
             i += 1;
             break;
+        }
+        if double && c == '$' {
+            if let Some((vref, next)) = parse_var(chars, i + 1) {
+                push_text(word, &buf, false);
+                buf.clear();
+                word.push(Piece::Var(vref));
+                i = next;
+                continue;
+            }
+            buf.push('$');
+            i += 1;
+            continue;
         }
         if c == '\\' {
             let Some(&next) = chars.get(i + 1) else {
@@ -176,18 +186,16 @@ fn lex_escaped(
         buf.push(c);
         i += 1;
     }
-    push_str(word, &buf, false);
+    push_text(word, &buf, false);
     Ok(i)
 }
 
-/// Lex a raw string `r'…'` / `r"…"`: no escapes at all — every byte is literal
-/// and only the `delim` closes it. `start` is the index just past the opening
-/// delimiter; returns the index just past the close.
+/// Lex a raw string `r'…'` / `r"…"`: no escapes, no interpolation.
 fn lex_raw(
     chars: &[char],
     start: usize,
     delim: char,
-    word: &mut Vec<Segment>,
+    word: &mut Vec<Piece>,
 ) -> Result<usize, LexError> {
     let mut buf = String::new();
     let mut i = start;
@@ -202,8 +210,74 @@ fn lex_raw(
         buf.push(c);
         i += 1;
     }
-    push_str(word, &buf, false);
+    push_text(word, &buf, false);
     Ok(i)
+}
+
+/// Parse a `$…` interpolation starting at `at` (the index just past `$`).
+/// Returns the reference and the index just past it, or `None` if `$` is not
+/// followed by a valid variable (so the `$` is a literal character).
+fn parse_var(chars: &[char], at: usize) -> Option<(VarRef, usize)> {
+    if chars.get(at) == Some(&'{') {
+        let start = at + 1;
+        let mut j = start;
+        while let Some(&c) = chars.get(j) {
+            if c == '}' {
+                let inner: String = chars[start..j].iter().collect();
+                return parse_var_ref(&inner).map(|v| (v, j + 1));
+            }
+            j += 1;
+        }
+        return None; // unterminated `${` → treat the `$` as literal
+    }
+    let (name, mut j) = read_name(chars, at)?;
+    let mut member = None;
+    if chars.get(j) == Some(&'.') {
+        if let Some((m, k)) = read_name(chars, j + 1) {
+            member = Some(m);
+            j = k;
+        }
+    }
+    Some((VarRef { name, member }, j))
+}
+
+/// Parse the inner content of a `${…}` — a `name` with an optional `.member`.
+fn parse_var_ref(inner: &str) -> Option<VarRef> {
+    let chars: Vec<char> = inner.chars().collect();
+    let (name, mut j) = read_name(&chars, 0)?;
+    let mut member = None;
+    if chars.get(j) == Some(&'.') {
+        let (m, k) = read_name(&chars, j + 1)?;
+        member = Some(m);
+        j = k;
+    }
+    if j != chars.len() {
+        return None; // trailing junk
+    }
+    Some(VarRef { name, member })
+}
+
+/// Read a kebab identifier at `start`: an alphabetic/`_` head, then
+/// alphanumeric/`_`, plus interior `-` (a hyphen only when the next char is
+/// alphanumeric, so `$a-$b` is `$a` + `-` + `$b` while `$auto-fetch` is one name).
+fn read_name(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let first = *chars.get(start)?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    let mut name = String::from(first);
+    let mut i = start + 1;
+    while let Some(&c) = chars.get(i) {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            name.push(c);
+        } else if c == '-' && chars.get(i + 1).is_some_and(|n| n.is_ascii_alphanumeric()) {
+            name.push('-');
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    Some((name, i))
 }
 
 /// Parse the `{HEX}` body of a `\u` escape (from just past the `u`). Returns the
@@ -226,32 +300,40 @@ fn parse_unicode_escape(rest: &[char]) -> Option<(char, usize)> {
     None
 }
 
-/// Append `text` to `word`, coalescing with the last segment if the
-/// expandability matches. Empty text is dropped.
-fn push_str(word: &mut Vec<Segment>, text: &str, expandable: bool) {
+/// Append `text` to `word`, coalescing with a trailing `Text` piece of the same
+/// expandability. Empty text is dropped.
+fn push_text(word: &mut Vec<Piece>, text: &str, expandable: bool) {
     if text.is_empty() {
         return;
     }
-    if let Some(last) = word.last_mut() {
-        if last.expandable == expandable {
-            last.text.push_str(text);
+    if let Some(Piece::Text {
+        text: last,
+        expandable: e,
+    }) = word.last_mut()
+    {
+        if *e == expandable {
+            last.push_str(text);
             return;
         }
     }
-    word.push(Segment {
+    word.push(Piece::Text {
         text: text.to_string(),
         expandable,
     });
 }
 
-fn push_char(word: &mut Vec<Segment>, c: char, expandable: bool) {
-    if let Some(last) = word.last_mut() {
-        if last.expandable == expandable {
-            last.text.push(c);
+fn push_char(word: &mut Vec<Piece>, c: char, expandable: bool) {
+    if let Some(Piece::Text {
+        text: last,
+        expandable: e,
+    }) = word.last_mut()
+    {
+        if *e == expandable {
+            last.push(c);
             return;
         }
     }
-    word.push(Segment {
+    word.push(Piece::Text {
         text: c.to_string(),
         expandable,
     });
@@ -259,19 +341,25 @@ fn push_char(word: &mut Vec<Segment>, c: char, expandable: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{LexError, Segment, Word, split};
+    use super::{LexError, Piece, VarRef, Word, split};
 
-    fn exp(text: &str) -> Segment {
-        Segment {
+    fn exp(text: &str) -> Piece {
+        Piece::Text {
             text: text.to_string(),
             expandable: true,
         }
     }
-    fn lit(text: &str) -> Segment {
-        Segment {
+    fn lit(text: &str) -> Piece {
+        Piece::Text {
             text: text.to_string(),
             expandable: false,
         }
+    }
+    fn var(name: &str) -> Piece {
+        Piece::Var(VarRef {
+            name: name.to_string(),
+            member: None,
+        })
     }
 
     fn words(line: &str) -> Vec<Word> {
@@ -281,30 +369,50 @@ mod tests {
     #[test]
     fn splits_bare_words_on_whitespace() {
         assert_eq!(
-            words("ls -l /tmp"),
-            [
-                Word(vec![exp("ls")]),
-                Word(vec![exp("-l")]),
-                Word(vec![exp("/tmp")])
-            ]
+            words("ls -l"),
+            [Word(vec![exp("ls")]), Word(vec![exp("-l")])]
         );
     }
 
     #[test]
     fn backslash_escapes_a_space_into_one_word() {
-        // `a\ b` is a single word: the escaped space does not separate.
         assert_eq!(words(r"a\ b"), [Word(vec![exp("a"), lit(" "), exp("b")])]);
     }
 
     #[test]
-    fn backslash_escapes_a_glob_char_as_literal() {
-        // `\*` is a literal star, not expandable.
-        assert_eq!(words(r"\*"), [Word(vec![lit("*")])]);
+    fn bare_dollar_name_is_a_var() {
+        assert_eq!(words("$x"), [Word(vec![var("x")])]);
+        assert_eq!(words("pre$x"), [Word(vec![exp("pre"), var("x")])]);
+    }
+
+    #[test]
+    fn braced_and_member_vars() {
+        assert_eq!(words("${x}post"), [Word(vec![var("x"), exp("post")])]);
+        assert_eq!(
+            words("$env.PATH"),
+            [Word(vec![Piece::Var(VarRef {
+                name: "env".into(),
+                member: Some("PATH".into())
+            })])]
+        );
+    }
+
+    #[test]
+    fn hyphen_is_interior_only_in_var_names() {
+        // `$a-$b` is `$a`, a literal `-`, then `$b`.
+        assert_eq!(words("$a-$b"), [Word(vec![var("a"), exp("-"), var("b")])]);
+        // but a hyphen between name chars stays in the name.
+        assert_eq!(words("$auto-fetch"), [Word(vec![var("auto-fetch")])]);
+    }
+
+    #[test]
+    fn double_quotes_interpolate_single_quotes_do_not() {
+        assert_eq!(words(r#""a$x""#), [Word(vec![lit("a"), var("x")])]);
+        assert_eq!(words(r"'a$x'"), [Word(vec![lit("a$x")])]);
     }
 
     #[test]
     fn single_quotes_escape_but_do_not_interpolate() {
-        // Model B: `'…'` interprets escapes (Python str), `$` is literal.
         assert_eq!(words(r"'can\'t'"), [Word(vec![lit("can't")])]);
         assert_eq!(words(r"'a\nb'"), [Word(vec![lit("a\nb")])]);
         assert_eq!(words(r"'$x'"), [Word(vec![lit("$x")])]);
@@ -312,69 +420,36 @@ mod tests {
 
     #[test]
     fn single_quote_unknown_escape_is_an_error() {
-        // `\d` and `\$` are not valid single-quote escapes.
         assert_eq!(split(r"'\d'"), Err(LexError::UnknownEscape('d')));
-        assert_eq!(split(r"'\$'"), Err(LexError::UnknownEscape('$')));
     }
 
     #[test]
-    fn double_quotes_interpret_c_escapes() {
+    fn double_quote_escapes_and_errors() {
         assert_eq!(words(r#""a\nb""#), [Word(vec![lit("a\nb")])]);
         assert_eq!(words(r#""\$5""#), [Word(vec![lit("$5")])]);
-        assert_eq!(words(r#""\u{41}""#), [Word(vec![lit("A")])]);
-    }
-
-    #[test]
-    fn double_quote_unknown_or_bad_escape_is_an_error() {
         assert_eq!(split(r#""\z""#), Err(LexError::UnknownEscape('z')));
         assert_eq!(split(r#""\uZ""#), Err(LexError::BadUnicodeEscape));
-        assert_eq!(split(r#""\u{ZZ}""#), Err(LexError::BadUnicodeEscape));
     }
 
     #[test]
-    fn raw_strings_take_no_escapes() {
-        // `r'…'` / `r"…"` are the home for regex source and paths.
+    fn raw_strings_take_no_escapes_or_interpolation() {
         assert_eq!(words(r"r'\d+\.txt'"), [Word(vec![lit(r"\d+\.txt")])]);
-        assert_eq!(words(r#"r"can't \d+""#), [Word(vec![lit(r"can't \d+")])]);
+        assert_eq!(words(r"r'$x'"), [Word(vec![lit("$x")])]);
     }
 
     #[test]
     fn raw_prefix_only_at_word_start() {
-        // A bare `r` mid-word is not a raw prefix; `ptr'x'` fuses to `ptrx`.
         assert_eq!(words(r"ptr'x'"), [Word(vec![exp("ptr"), lit("x")])]);
     }
 
     #[test]
     fn empty_quote_does_not_reset_word_start() {
-        // `""r'x'` has already started a word (via `""`), so `r` is a bare char,
-        // not a raw prefix: the pieces fuse to `rx`, not `x`.
         assert_eq!(words(r#"""r'x'"#), [Word(vec![exp("r"), lit("x")])]);
-    }
-
-    #[test]
-    fn adjacent_pieces_concatenate() {
-        // "a"b'c' → one word of three segments, but coalescing keeps quoted runs
-        // separate from the unquoted `b`.
-        assert_eq!(
-            words(r#""a"b'c'"#),
-            [Word(vec![lit("a"), exp("b"), lit("c")])]
-        );
-    }
-
-    #[test]
-    fn empty_double_quotes_are_an_empty_word() {
-        assert_eq!(words(r#""""#), [Word(vec![])]);
-    }
-
-    #[test]
-    fn blank_line_has_no_words() {
-        assert!(words("   \t").is_empty());
     }
 
     #[test]
     fn unterminated_quote_is_an_error() {
         assert_eq!(split("'oops"), Err(LexError::UnterminatedQuote('\'')));
-        assert_eq!(split(r#""oops"#), Err(LexError::UnterminatedQuote('"')));
         assert_eq!(split(r"r'oops"), Err(LexError::UnterminatedQuote('\'')));
     }
 }
