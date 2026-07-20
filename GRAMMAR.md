@@ -56,12 +56,43 @@ After tokenizing, each word is expanded (before dispatch, so `cd ~` and
   literal and passes through even if no such file exists. An invalid pattern is
   a literal.
 
-**No suppression yet.** Until quoting/escaping (task 5) there is no way to pass a
-literal `*`, `?`, `[`, or a leading `~` — every one is active. `String`-based
-expansion renders a non-UTF-8 `$HOME`/match lossily (fixed when words become
-`OsString`).
+## Task 5 — quoting and escapes (the real lexer)
+
+The placeholder whitespace tokenizer is replaced by a real lexer. A **word** is
+now a sequence of adjacent pieces that concatenate; each piece is *expandable*
+(unquoted — eligible for tilde/glob) or *literal* (quoted or escaped — exempt),
+so **quoting suppresses expansion**.
+
+```
+word   = piece+
+piece  = bare | escape | single | double        # adjacent pieces fuse
+bare   = <unquoted chars, expandable>            # e.g. * ? [ ~ are active here
+escape = "\" <any char>                          # literal next char; \<nl> = line continuation
+single = "'" ( <raw> | "\'" | "\\" )* "'"        # raw: only \' and \\ ; all else literal
+double = '"' ( <text> | c-escape )* '"'          # c-escape: \n \t \r \e \\ \" \$ \u{HEX}
+```
+
+- **Bare words** are expandable; a backslash makes the next char literal
+  (`a\ b` is one word; `\*`, `\~` are literal).
+- **Single quotes** are raw — only `\'` and `\\` are escapes; every other
+  backslash is literal (the home of regex source / paths).
+- **Double quotes** interpret a C-style escape set and are literal text.
+  `$`-interpolation is **deferred to task 6** — a bare `$name` inside `"…"`
+  stays literal for now.
+- **Adjacent pieces concatenate**: `"a"b'c'` is one argument `abc`;
+  `--flag='a b'` is one argument. `""` is one empty argument.
+- **Expansion suppression**: a quoted or escaped `*`/`?`/`[`/`~` is literal, so
+  `puts '*'` prints `*` and `puts '~'` prints `~`, while unquoted `*`/`~` still
+  expand.
+- An **unterminated quote** is a syntax error (status 2); the shell recovers and
+  continues with the next line.
+
+Deferred within this area: `$`-interpolation (task 6), a **heredoc** `<< END`
+for the raw both-quotes form (the chosen raw form — see `TODO.md`), and
+`\`-newline continuation across multiple input lines (needs a multi-line
+reader). Words are still `String`-based, so a non-UTF-8 `$HOME`/match is lossy.
 
 ### Not yet parsed
-Quoting, escapes, `$` variables and interpolation, pipes `|`, redirection `>`
-`<`, sequencing `;` `&&` `||`, `{ }` blocks, `func`. Each arrives with the task
-that needs it, and this file grows to match.
+`$` variables and interpolation, pipes `|`, redirection `>` `<`, sequencing `;`
+`&&` `||`, `{ }` blocks, `func`, heredocs. Each arrives with the task that needs
+it, and this file grows to match.
