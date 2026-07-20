@@ -25,16 +25,20 @@ it names. No mesh language yet.
 - M0 tokenizer: split on whitespace only — an explicit placeholder for the real
   lexer, with no quoting/expansion.
 - Launch external commands with inherited stdio; wait; report status.
-- Builtins `cd` and `exit` (the two that must mutate the shell's own state).
+- Builtin `exit` (`cd` is deferred — see below).
 - Exit-status conventions: `127` not-found, `126` not-executable, `128+signal`
   when signaled; the last command's status becomes the shell's exit code.
 - Zero dependencies; workspace + CI (fmt, clippy, test on Linux and macOS).
+
+`cd` is **punted to M1** (tentative — see `TODO.md`): a correct `cd` pulls in
+logical-cwd tracking, `CDPATH`, `cd -`, and the `$env.PWD`/`OLDPWD` contract from
+`DESIGN.md`, which is more than M0 needs to run `ls`.
 
 **Acceptance**
 - `echo 'ls' | mesh` lists the directory; an interactive session runs `ls`,
   `pwd`, `echo`, etc.
 - Unknown command prints `command not found` and yields status `127`.
-- `cd /` then `pwd` prints `/`; `exit 3` exits `3`.
+- `exit 3` exits `3`; `exit 256` exits `0` (8-bit masking).
 - `cargo test --workspace`, `cargo fmt --check`, and `cargo clippy -D warnings`
   are all green.
 
@@ -54,6 +58,7 @@ the placeholder tokenizer with the first real slice of the mesh lexer.
 - Promote the shell internals into a `crates/mesh-core` library; the binary
   becomes a thin `main` (enables direct unit tests of the lexer).
 - `&&` / `||` sequencing and `;` — the smallest useful control flow.
+- `cd` builtin (deferred from M0): `$env.PWD`/`OLDPWD`, `cd -`, `CDPATH`.
 
 **Acceptance:** edit and recall lines interactively; `echo "a b"` passes one
 argument; `false || echo ok` prints `ok`.

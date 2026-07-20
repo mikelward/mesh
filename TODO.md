@@ -10,7 +10,7 @@ file as tasks land.
 - [x] `crates/mesh` binary: `main` / `repl` / `lexer` / `builtins` / `exec`
 - [x] Read/tokenize/dispatch loop over stdin (TTY + piped)
 - [x] Launch external commands; exit-status conventions (127 / 126 / 128+sig)
-- [x] Builtins: `cd`, `exit`
+- [x] Builtin: `exit` (8-bit masking); `cd` punted to M1 (tentative)
 - [x] Unit tests (lexer) + end-to-end tests (built binary, std-only)
 - [x] CI: fmt + clippy (`-D warnings`) + test on Linux and macOS
 
@@ -21,10 +21,15 @@ file as tasks land.
 - [ ] Lexer v1: single/double quotes and escapes
 - [ ] Promote internals into `crates/mesh-core` (lib); binary becomes thin `main`
 - [ ] `;`, `&&`, `||` sequencing
+- [ ] `cd` builtin (deferred from M0): `$env.PWD`/`OLDPWD`, `cd -`, `CDPATH`
 - [ ] A simple prompt (host/dir), stderr-rendered as today
 
 ## Decisions needed
 
+- [ ] **Revisit punting `cd`.** Deferred from M0 to M1 to keep M0 minimal, but
+      this isn't settled — an interactive shell arguably needs `cd` from day one.
+      Decide whether to pull a minimal `cd` back into M0 or keep it in M1 with
+      the full logical-cwd/`CDPATH`/`cd -` treatment.
 - [ ] **Namespace for the working-directory vars in the mesh language:**
       `$env.PWD` / `$env.OLDPWD` vs `$sh.PWD` / `$sh.OLDPWD`. `DESIGN.md` (~line
       2027) currently writes `$env.PWD` / `$env.OLDPWD` — reconcile with the

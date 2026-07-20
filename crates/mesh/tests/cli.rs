@@ -74,35 +74,10 @@ fn exit_rejects_surplus_operands_without_exiting() {
 }
 
 #[test]
-fn cd_updates_pwd_for_children() {
-    // A child that reads $PWD must see the new directory.
-    let out = run_with_input("cd /\nprintenv PWD\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "/\n");
-}
-
-#[test]
-fn cd_updates_oldpwd() {
-    let out = run_with_input("cd /usr\ncd /\nprintenv OLDPWD\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "/usr\n");
-}
-
-#[test]
-fn cd_rejects_surplus_operands() {
-    let out = run_with_input("cd / extra\n");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("too many arguments"));
-}
-
-#[test]
 fn last_status_becomes_the_exit_code() {
     // `false` exits 1, then EOF; the shell should exit 1.
     let out = run_with_input("false\n");
     assert_eq!(out.status.code(), Some(1));
-}
-
-#[test]
-fn cd_changes_the_working_directory() {
-    let out = run_with_input("cd /\npwd\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "/\n");
 }
 
 #[test]
