@@ -88,8 +88,8 @@ dance:
 [[ $s =~ (.*)\ (.*) ]] && one=${BASH_REMATCH[1]} two=${BASH_REMATCH[2]}
 
 # mesh — bind the groups directly; or test-and-bind in one line
-[one two] = $s:match /(.*) (.*)/
-if [key val] = $line:match /(\w+): (.*)/ { ... }
+[one two] = $s:match(/(.*) (.*)/)
+if [key val] = $line:match(/(\w+): (.*)/) { ... }
 ```
 
 ## `match` and `~` replace `case` and `[[ … ]]`

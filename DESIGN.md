@@ -189,10 +189,10 @@ All four kinds:
   `$xs:rest:last`, `:dedup`, `:values` — never `:first()`. A modifier that **takes
   arguments** uses **parentheses**, space-separated inside like a
   [value call](#calling-for-a-value-and-lambdas): `:split(":")`, `:get(EDITOR vim)`,
-  `:get(99 "-")`. One form, so there is no load-bearing whitespace to trip over and
-  chaining is always unambiguous — `$host:split("."):first` reads exactly one way.
-  The lone exception is a **regex** argument, which is already slash-delimited and
-  needs no parens: `:match /re/` (the `/…/` *is* the delimiter).
+  `:get(99 "-")`, `:match(/re/)`. One form, no exceptions — a **regex** argument is
+  just a `/…/` literal sitting inside the parens like any other value — so there is
+  no load-bearing whitespace to trip over and chaining is always unambiguous:
+  `$host:split("."):first` reads exactly one way.
 - **Disambiguation:** `:` is a modifier only when immediately followed by a
   known modifier keyword. `$host:$port` keeps `:` literal (the token after `:`
   is an expansion, not a keyword), so building `host:port`-style strings — or
@@ -907,20 +907,20 @@ bare for the simple case and in a `match` arm when you need to branch.
 **Regex captures.** The right-hand side is any list, and `:split` is not the only
 way to build one — **`:match`** runs a regex against a string and hands back its
 capture groups, so destructuring names them in one step. Like `~`, it is
-**unanchored** — the first match anywhere in the string, so `[ip] = $line:match
-/\d+\.\d+\.\d+\.\d+/` pulls an address out of the middle of a line; anchor with
+**unanchored** — the first match anywhere in the string, so `[ip] =
+$line:match(/\d+\.\d+\.\d+\.\d+/)` pulls an address out of the middle of a line; anchor with
 `^…$` when you mean the whole string:
 
 ```
-[one two]      = $str:match /(.*) (.*)/          # two groups → two names
-[year mon day] = $date:match /(\d+)-(\d+)-(\d+)/  # an ISO date into fields
-[ip]           = $line:match /\d+\.\d+\.\d+\.\d+/ # no group → the whole match, one element
+[one two]      = $str:match(/(.*) (.*)/)          # two groups → two names
+[year mon day] = $date:match(/(\d+)-(\d+)-(\d+)/)  # an ISO date into fields
+[ip]           = $line:match(/\d+\.\d+\.\d+\.\d+/) # no group → the whole match, one element
 ```
 
 - **Positional groups** come back as a **list**, in order — the parenthesized
-  sub-matches only, *not* the whole match — so `[one two] = …:match /(.*) (.*)/`
+  sub-matches only, *not* the whole match — so `[one two] = …:match(/(.*) (.*)/)`
   binds exactly the two groups. A pattern with **no** group yields the whole match
-  as a one-element list, so `[ip] = …:match /re/` still binds.
+  as a one-element list, so `[ip] = …:match(/re/)` still binds.
 - **An unmatched group keeps its slot as `""`** — a group that didn't participate
   (an optional `(a)?(b)` against `"b"`) contributes an **empty string**, never a
   dropped position, so the list length equals the group count and the following
@@ -928,7 +928,7 @@ capture groups, so destructuring names them in one step. Like `~`, it is
   matched empty and one that didn't both read as `""` — distinguish with an
   explicit optional-group guard if you must).
 - **Named groups** `(?<name>…)` come back as a **map** keyed by name
-  (`m = $str:match /(?<user>\w+)@(?<host>\S+)/` then `$m.user`); an unmatched
+  (`m = $str:match(/(?<user>\w+)@(?<host>\S+)/)` then `$m.user`); an unmatched
   named group is present with value `""`. This pairs with map destructuring once
   that lands (deferred below). **Name all the groups or none** — a pattern that
   *mixes* named and unnamed groups is a **loud error** for the MVP (list or map is
@@ -947,8 +947,8 @@ capture groups, so destructuring names them in one step. Like `~`, it is
 
   ```
   if $str ~ /(.*) (.*)/  { … }                          # yes/no only
-  if [one two] = $str:match /(.*) (.*)/  { puts "$one / $two" }
-  if m = $str:match /(?<user>\w+)@(?<host>\S+)/  { puts $m.user }
+  if [one two] = $str:match(/(.*) (.*)/)  { puts "$one / $two" }
+  if m = $str:match(/(?<user>\w+)@(?<host>\S+)/)  { puts $m.user }
   ```
 
   As a *condition*, `lhs = rhs` is true iff the RHS is **truthy** (a `false` — the
@@ -961,13 +961,13 @@ capture groups, so destructuring names them in one step. Like `~`, it is
   shape:
 
   ```
-  match $line:match /(\w+): (.*)/ {
+  match $line:match(/(\w+): (.*)/) {
     [key val] { … }      # matched — key/val bound
     false     { … }      # no match
   }
   ```
 
-- **A bare, unconditional bind is an assertion.** `[a b] = $str:match /…/` with
+- **A bare, unconditional bind is an assertion.** `[a b] = $str:match(/…/)` with
   no `if` says "I know this matches" — so a miss (`false`, not a two-element list)
   is a **loud error**, the [no-null](#variables-and-assignment) rule again: an
   unconditional bind that silently yielded `a = ""` would bury the bug. (The same
@@ -985,8 +985,8 @@ Named **`:match`** (not `:matches`), the unanchored scripting-world sense — Ru
 with the [`match`](#matching-match) statement and the `~` test, one regex story
 under one word.
 
-*(TODO: **consolidate `~ /re/` and `:match /re/`?** They already overlap — since
-`:match` is falsey on a miss, `if $str:match /re/` covers the yes/no case that `~`
+*(TODO: **consolidate `~ /re/` and `:match(/re/)`?** They already overlap — since
+`:match` is falsey on a miss, `if $str:match(/re/)` covers the yes/no case that `~`
 exists for, so `~` is arguably sugar for `:match`'s truthiness. Keep both for now
 (`~` reads better as a bare predicate, `:match` when you want the captures), but
 revisit whether one should be defined in terms of the other, or dropped, before
@@ -1309,7 +1309,7 @@ Decisions:
   command / nonzero int fails it) **and** its shape **fits** `lhs`; on true the
   names bind for the block, on false it skips and binds nothing. `lhs` may be a
   name (always fits) or a `[…]` [destructuring](#destructuring) pattern, so
-  `if [one two] = $s:match /…/ { … }` and `if line = gets() { … }` both test-and-bind
+  `if [one two] = $s:match(/…/) { … }` and `if line = gets() { … }` both test-and-bind
   in one step, RHS written once. Crucially, **pattern-fit is part of the test**: a
   shape or length mismatch (`[a b]` against a three-element list) makes the
   condition *false and skips* — it does **not** error. That is the deliberate
@@ -1396,7 +1396,7 @@ Rules:
   lenient (a `match` with no arm hit yields `""`, like a no-`else` `if`).
 - **It is an expression**: `x = match … { … }` binds the winning arm's value;
   in statement position the value is discarded and arms run for effect.
-- **Regex captures**: on the *value* side this is **settled** — `str:match /re/`
+- **Regex captures**: on the *value* side this is **settled** — `str:match(/re/)`
   returns the groups (positional → list, named → map); see
   [Destructuring](#destructuring). What stays *(open)* is only whether a `/re/`
   **arm** *auto*-binds its groups into the arm body, or whether you reach for
@@ -1476,7 +1476,7 @@ construct you write* is how you declare whether absence is a bug or expected:
 | Intent | Strict — errors (channel 2) | Soft — yields a value (channel 1) |
 | --- | --- | --- |
 | bind N names from a list | `[a b] = xs` | `if [a b] = xs { … }` — a miss skips |
-| a captured group | `[x] = s:match /re/` | `if [x] = s:match /re/ { … }` |
+| a captured group | `[x] = s:match(/re/)` | `if [x] = s:match(/re/) { … }` |
 | index an element | `$xs[i]` | `$xs:get(i default)` — total, never errors |
 | a map value | `$m.key` | `$m:get(key default)` |
 | read a line | — | `gets()` → `false` at EOF |
