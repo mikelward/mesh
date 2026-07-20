@@ -39,7 +39,7 @@ logical-cwd tracking, `CDPATH`, `cd -`, and the `$env.PWD`/`OLDPWD` contract fro
   `pwd`, `echo`, etc.
 - Unknown command prints `command not found` and yields status `127`.
 - `exit 3` exits `3`; `exit 256` exits `0` (8-bit masking).
-- `cargo test --workspace`, `cargo fmt --check`, and `cargo clippy -D warnings`
+- `cargo test --workspace`, `cargo fmt --check`, and `cargo clippy -- -D warnings`
   are all green.
 
 *(Everything below is planned; scope will firm up as each milestone begins.)*

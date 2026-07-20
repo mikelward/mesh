@@ -41,8 +41,19 @@ pub fn run() -> ExitCode {
             }
         }
 
-        let text = String::from_utf8_lossy(&line);
-        let words = lexer::split(&text);
+        // Reject a malformed line loudly rather than lossily converting it: a
+        // U+FFFD substitution could otherwise launch a *different* executable
+        // than the bytes named. Handling non-UTF-8 command bytes losslessly is a
+        // job for the real lexer (M0's works on `&str`).
+        let text = match std::str::from_utf8(&line) {
+            Ok(text) => text,
+            Err(_) => {
+                eprintln!("mesh: invalid UTF-8 in input");
+                last = 1;
+                continue;
+            }
+        };
+        let words = lexer::split(text);
         if words.is_empty() {
             continue;
         }

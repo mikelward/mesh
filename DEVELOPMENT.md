@@ -130,6 +130,7 @@ mesh/
 │           └── cli.rs      # end-to-end tests driving the built binary
 ├── DESIGN.md               # vision + language design (the "why/what")
 ├── DEVELOPMENT.md          # this file (the "how to build")
+├── GRAMMAR.md              # the grammar actually implemented so far (grows per task)
 ├── ROADMAP.md              # milestones M0 → beyond
 ├── TODO.md                 # current-milestone checklist
 └── docs/                   # INTRO.md, PROMPT.md — design narratives
