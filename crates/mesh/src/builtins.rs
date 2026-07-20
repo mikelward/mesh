@@ -5,7 +5,9 @@
 //! (output), and `exit` (ends the loop). Everything else mesh runs is external.
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 /// Outcome of a builtin. `Status` reports an exit status and continues the loop;
@@ -81,11 +83,24 @@ fn cd(args: &[String]) -> u8 {
         if let Ok(current) = env::current_dir() {
             env::set_var("PWD", &current);
             if echo_destination {
-                println!("{}", current.display());
+                write_path(current.as_os_str());
             }
         }
     }
     0
+}
+
+/// The bytes to print for a path: its raw `OsStr` bytes plus a newline, so a
+/// non-UTF-8 path is emitted exactly rather than lossily via `Display`.
+fn path_line(path: &OsStr) -> Vec<u8> {
+    let mut line = path.as_bytes().to_vec();
+    line.push(b'\n');
+    line
+}
+
+/// Write a path to stdout as raw bytes followed by a newline.
+fn write_path(path: &OsStr) {
+    let _ = std::io::stdout().write_all(&path_line(path));
 }
 
 /// `pwd` — print the current working directory (physical `getcwd`).
@@ -98,7 +113,7 @@ fn pwd(args: &[String]) -> u8 {
     }
     match env::current_dir() {
         Ok(dir) => {
-            println!("{}", dir.display());
+            write_path(dir.as_os_str());
             0
         }
         Err(err) => {
@@ -136,5 +151,18 @@ fn exit(args: &[String]) -> Builtin {
                 Builtin::Exit(2)
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_line;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn path_line_preserves_non_utf8_bytes() {
+        // A 0xff byte must survive verbatim, not become U+FFFD.
+        assert_eq!(path_line(OsStr::from_bytes(b"/x\xffy")), b"/x\xffy\n");
     }
 }
