@@ -78,6 +78,49 @@ fn exit_rejects_surplus_operands_without_exiting() {
 }
 
 #[test]
+fn pwd_prints_the_working_directory() {
+    let out = run_with_input("cd /\npwd\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/\n");
+}
+
+#[test]
+fn pwd_rejects_operands() {
+    let out = run_with_input("pwd extra\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("too many arguments"));
+}
+
+#[test]
+fn puts_joins_arguments_with_spaces() {
+    let out = run_with_input("puts hello   world\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello world\n");
+}
+
+#[test]
+fn puts_with_no_arguments_prints_a_blank_line() {
+    let out = run_with_input("puts\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\n");
+}
+
+#[test]
+fn cd_updates_pwd_and_oldpwd_for_children() {
+    let out = run_with_input("cd /\nprintenv PWD\ncd /usr\nprintenv OLDPWD\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/\n/\n");
+}
+
+#[test]
+fn cd_dash_returns_to_previous_and_prints_it() {
+    // cd /usr, cd /, then `cd -` goes back to /usr and echoes it.
+    let out = run_with_input("cd /usr\ncd /\ncd -\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/usr\n");
+}
+
+#[test]
+fn cd_rejects_surplus_operands() {
+    let out = run_with_input("cd / extra\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("too many arguments"));
+}
+
+#[test]
 fn last_status_becomes_the_exit_code() {
     // `false` exits 1, then EOF; the shell should exit 1.
     let out = run_with_input("false\n");

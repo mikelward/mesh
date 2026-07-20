@@ -30,6 +30,18 @@ exit [ N ]      # leave the shell. N is masked to 0-255 (default 0);
 Input must be valid UTF-8; a malformed line is rejected loudly. (Lossless
 handling of non-UTF-8 command bytes is deferred to the real lexer.)
 
+## Task 2 — basic builtins
+
+No change to the line grammar; three more builtin names are recognized in
+command position (still whitespace-split words, no quoting yet):
+
+```
+cd [ DIR ]      # DIR omitted → $HOME; DIR "-" → $OLDPWD (prints destination).
+                # Updates $PWD/$OLDPWD. At most one operand.
+pwd             # print the working directory. No operands.
+puts [ ARG ... ]  # print the args separated by single spaces + newline.
+```
+
 ### Not yet parsed
 Quoting, escapes, `$` variables and interpolation, globs, `~`, pipes `|`,
 redirection `>` `<`, sequencing `;` `&&` `||`, `{ }` blocks, `func`. Each arrives

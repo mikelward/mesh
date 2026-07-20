@@ -21,8 +21,10 @@ file as tasks land.
 - [ ] Lexer v1: single/double quotes and escapes
 - [ ] Promote internals into `crates/mesh-core` (lib); binary becomes thin `main`
 - [ ] `;`, `&&`, `||` sequencing
-- [ ] `cd` builtin (deferred from M0): `$env.PWD`/`OLDPWD`, `cd -`, `CDPATH`
-- [ ] `pwd` and `puts` builtins
+- [x] `cd` builtin (basic): `$HOME` default, `cd -`, updates `$PWD`/`$OLDPWD`,
+      rejects surplus operands. Still deferred: `CDPATH`, `--physical`, autocd,
+      logical cwd.
+- [x] `pwd` and `puts` builtins
 - [ ] Globs + `~` expansion (glob no-match → **empty**, see Decisions made)
 - [ ] A simple prompt (host/dir), stderr-rendered as today
 
@@ -37,18 +39,16 @@ file as tasks land.
 - **Merge method:** rebase. **Toolchain:** floating `stable`. **Loop autonomy:**
   proceed with best call, documented + overridable; pause only for grammar-level
   design decisions.
-- **Glob no-match → empty** (nullglob-style: the pattern expands to zero words,
-  "as if it weren't there"). Rejects bash's literal pass-through as a footgun.
-  Caveat to revisit: a silently-vanishing no-match is a mild version of the
-  "absence is loud" concern elsewhere in `DESIGN.md` (e.g. `rm *.bak` with no
-  matches becomes a bare `rm`); the alternative was erroring like zsh `nomatch`.
+- **Glob no-match → empty** (nullglob-style: the pattern expands to zero words).
+  This is *principled*, not a compromise, and fully consistent with "absence is
+  loud": specific-element access (`xs[99]`, `$map.key`) errors because you asked
+  for one thing that isn't there and there is no null; a glob (`*.txt`) is a
+  **collection query** whose result type is a *list*, so zero matches = the empty
+  list = a complete, honest answer, not an absence. Rejects bash's literal
+  pass-through as a footgun.
 
 ## Decisions needed
 
-- [ ] **Revisit punting `cd`.** Deferred from M0 to M1 to keep M0 minimal, but
-      this isn't settled — an interactive shell arguably needs `cd` from day one.
-      Decide whether to pull a minimal `cd` back into M0 or keep it in M1 with
-      the full logical-cwd/`CDPATH`/`cd -` treatment.
 - [ ] **Namespace for the working-directory vars in the mesh language:**
       `$env.PWD` / `$env.OLDPWD` vs `$sh.PWD` / `$sh.OLDPWD`. `DESIGN.md` (~line
       2027) currently writes `$env.PWD` / `$env.OLDPWD` — reconcile with the
@@ -66,6 +66,13 @@ file as tasks land.
 
 ## Icebox / decide later
 
+- [ ] **Empty-glob warning (optional).** Keep behavior "empty always", but
+      consider *warning* on an empty glob expansion while still proceeding — mesh
+      is the only party that can detect it (the argv boundary carries bytes, not
+      lists, so the emptiness is erased at `execve`; a downstream `grep` can't
+      tell `grep foo *.log`-matched-nothing from `grep foo`). Interactively it
+      could even prompt what to do. Warn on an empty *glob*, not on a genuinely
+      empty `$list`.
 - [ ] Reading a script file as an argument (`mesh script.msh`) vs. stdin only
 - [ ] `-c "…"` one-shot command flag
 - [ ] Whether satellite helpers (`vcs`, prompt) are Rust workspace members or
