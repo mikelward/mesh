@@ -2501,6 +2501,28 @@ zsh solves this with a `zle-keymap-select` widget that redraws a mode indicator
 reactively. Decide how to surface the active keymap (e.g. a `$sh.keymap` a segment
 can read) plus the on-mode-change **redraw** a reactive indicator needs.)*
 
+**Typed input renders in bold.** Input you enter at the prompt is shown in
+**bold**, so it stands out at a glance from everything the shell itself puts on
+screen — the prompt segments, the completion menu, `hint`/autosuggestions, and
+the scrollback of earlier command output. This is the interactive mirror of the
+written docs, where the mesh you'd type is set in bold against the plain
+`# bash` and output lines. It is a uniform **weight** emphasis — every character
+bold, command or argument or string alike — *not* the token-aware syntax
+highlighting deferred below; weight, not color, so it needs no palette and stays
+legible in any theme, light or dark.
+
+**The rendering is live.** It is **reedline's own buffer highlighter** that
+paints the line bold *as you type* — so the in-progress input is bold the moment
+it is entered, visibly distinct from the hint/completion UI drawn around it — and
+the accepted line **stays bold after Enter**, scrolling into history as rendered.
+This is a minimal highlighter — uniform weight, no token analysis — that the
+deferred token-aware [syntax highlighting](#line-editing) will later *extend*,
+not replace. It ships **on by default**, bound on the line editor **before each
+read** — reedline takes its highlighter up front, before the prompt is drawn, so
+bold is a property of the editor itself — and honors the
+**`$sh.options.bold-input`** setting (`= off` for plain
+input, or a terminal that renders bold poorly).
+
 *(deferred: exposing the **keybinding config** from `rc.mesh` — the whole reason
 for the library choice — plus a vi mode, custom widgets, fish-style
 autosuggestions, and syntax highlighting.)* Completion runs *through* the editor's
