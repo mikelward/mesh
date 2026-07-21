@@ -203,8 +203,11 @@ a syntax error** rather than silently reinterpreted. Also deferred: here-strings
 and a redirection with no command (`> f`).
 
 ### Not yet parsed
-`{ }` blocks, `func`, `:` modifiers, heredocs. Each arrives with the task that
-needs it, and this file grows to match.
+`{ }` blocks, `func`, `fork`, `in`, `:` modifiers, heredocs. Each arrives with
+the task that needs it, and this file grows to match. In particular, the
+eventual isolation forms are `fork { … }` for an isolated block and
+`fork func name(params) { … }` for a function whose body is always isolated;
+parenthesized command bodies are not subshell syntax.
 
 **Design target (still ahead of the lexer above).** The **Model B strings**
 direction from `DESIGN.md` is now implemented (see task 5 above). What the lexer
