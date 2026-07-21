@@ -534,24 +534,35 @@ pub fn is_ident(s: &str) -> bool {
 /// (`func f()`) is not "open" either — it runs and reports the missing body
 /// rather than buffering forever.
 pub fn needs_more_input(text: &str) -> bool {
-    // Skip `func name(params)` so a `{`/`}` inside the signature is not counted;
-    // if the `(…)` isn't closed yet, fall back to the whole text (unchanged
-    // behavior — a signature does not span input lines).
-    let body = body_after_params(text).unwrap_or(text);
+    // Balance only the body (past `func name(params)`) so a brace inside the
+    // signature is not counted; if the `(…)` isn't closed yet, fall back to the
+    // whole text (unchanged — a signature does not span input lines).
+    let body = body_region(text).unwrap_or(text);
     let scan = scan_braces(body, 0);
     scan.close.is_none() && scan.depth > 0
 }
 
-/// The slice just past the parameter list's `)` in a `func name(params) …`
-/// header, or `None` if there is no `(…)` closed yet. The name can't contain
-/// `(` and v1 parameters can't contain `)`, so the first `(` and the first `)`
-/// after it delimit the signature; anything (including a stray brace) inside is
-/// header text, not body structure.
-fn body_after_params(text: &str) -> Option<&str> {
-    let open = text.find('(')?;
-    let rest = &text[open + 1..];
-    let close = rest.find(')')?;
-    Some(&rest[close + 1..])
+/// The body region of a `func` definition — everything past the header — used to
+/// balance braces without counting the signature. A parameter list is `(…)` that
+/// appears **before** the body's opening `{`; when present, the body starts past
+/// its `)` (so a stray brace inside the signature isn't block structure). When no
+/// `(` precedes the first `{` the header has no parameter list and that `{` opens
+/// the body — so a `(` on a later body line (`puts ()`) is never mistaken for the
+/// signature. `None` means the definition isn't open yet (no body `{`, or a
+/// parameter list still waiting for its `)`).
+fn body_region(text: &str) -> Option<&str> {
+    let paren = text.find('(');
+    let brace = text.find('{');
+    if let Some(p) = paren {
+        // A `(` before the first `{` (or before any `{`) is the signature.
+        if brace.is_none_or(|b| p < b) {
+            let rest = &text[p + 1..];
+            let close = rest.find(')')?; // param list not closed yet → keep buffering
+            return Some(&rest[close + 1..]);
+        }
+    }
+    // No signature before the body: the first `{`, if any, opens the body.
+    brace.map(|b| &text[b..])
 }
 
 /// The result of a bare-level brace scan (see [`scan_braces`]).

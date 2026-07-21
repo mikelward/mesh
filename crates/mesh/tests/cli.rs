@@ -960,6 +960,18 @@ fn invalid_utf8_in_a_function_body_discards_the_definition() {
 }
 
 #[test]
+fn a_body_paren_is_not_mistaken_for_the_parameter_list() {
+    // A malformed header with no param list still buffers through the body's `}`;
+    // a `(` on a later body line must not be read as the signature and release
+    // the rest of the body. The definition fails to parse and is discarded, so
+    // its body never runs and the following command does.
+    let out = run_with_input("func f {\nputs ()\nputs LEAKED\n}\nputs after\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("LEAKED"), "body leaked: {stdout}");
+    assert_eq!(stdout, "after\n");
+}
+
+#[test]
 fn a_brace_in_the_parameter_list_does_not_swallow_later_commands() {
     // A stray `{` in the signature is header text, not block structure, so the
     // body's `}` still closes the (malformed) definition: the invalid parameter
