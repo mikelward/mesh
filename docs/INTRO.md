@@ -51,7 +51,7 @@ name=$(basename "$f" .tar.gz)
 dir=$(dirname "$f")
 
 # mesh
-name = $f:bare      # strips every extension; :stem drops just the last
+name = $f:bare      # every extension; :stem drops the last, :replace('.tar.gz', '') just that suffix
 dir  = $f:dir
 ```
 
