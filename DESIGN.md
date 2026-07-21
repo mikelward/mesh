@@ -1553,8 +1553,9 @@ Rules:
   `f(…):capture` runs the call and returns a **record of every channel**: `.value`
   (the return value), `.out` and `.err` (its stdout / stderr, as **raw byte-strings**
   — split them with the usual [`:lines`](#modifiers) / `:split` / `:nulls` modifiers
-  as needed, so the record bakes in no split policy), and `.status`. Read them with
-  ordinary field access (`r = f(x):capture` then `r.value` / `r.out:lines`). It is an
+  as needed, so the record bakes in no split policy), and `.status` (the exit **int**;
+  *TODO — a richer status value if one is wanted later*). Read them with ordinary field
+  access — `r = f(x):capture` binds `r`, then `$r.value` / `$r.out:lines` read it. It is an
   *invocation-level* modifier, not a plain value [modifier](#modifiers) — it has to
   wrap execution, since by the time a value modifier saw the return value the stdout
   would already have streamed away, the same reason `$(…)` is a wrapper rather than a
