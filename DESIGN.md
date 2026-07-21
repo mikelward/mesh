@@ -292,13 +292,14 @@ appears.)*
   *:files   ==  *(f)         #   ...spelled out
   *:d       ==  *(d)         # directories
   *:l       ==  *(l)         # symlinks
-  *:f:x     ==  *(f x)       # chain for AND: executable files
+  *:f:x     ==  *(f, x)      # chain for AND: executable files
   **:files  ==  **(f)        # recursive, files only
   ```
 
   Type letters follow `find -type` (`f d l p s b c`) plus `x` (executable),
   each with a word alias (`files dirs links … exec`); in `(...)` they are a
-  space-separated ANDed list (bare letters may run together, `*(fx)`). The `:`
+  **comma-separated** ANDed list (`*(f, x)` = executable files), the same
+  parens-are-comma rule as a value call. The `:`
   forms are **filter modifiers** (see [Modifiers](#modifiers)) — they select a
   path list by a file-type predicate, so they also work on a plain list
   (`$paths:files`), and on a glob the engine **fuses** the filter into matching,
@@ -306,7 +307,7 @@ appears.)*
 
 - **Predicate qualifiers** *(open — direction)*: the arg-carrying predicates
   (`size>1M`, `age<1d`, `empty`) stay in `(...)` since they do not fit a bare
-  `:word` — `*(f size>1M)`, `*(f age<1d)`. Comparisons (`>` / `<`) read better
+  `:word` — `*(f, size>1M)`, `*(f, age<1d)`. Comparisons (`>` / `<`) read better
   than zsh's `+/-` age codes; whether these also grow `:word(arg)` modifier
   spellings is folded into this open question.
 
@@ -1015,7 +1016,10 @@ builds, say, an ordered alias table.
 `...` is the one operator that moves between "a list" and "several arguments,"
 in both directions:
 
-- **At a call site**, `...$xs` **explodes** a list into separate arguments.
+- **At a call site**, `...$xs` **explodes** a **list** into separate positional
+  arguments — or a **map** into named options, each `key: value` pair binding the `key`
+  option (the two shapes a call takes; see
+  [Calling for a value](#calling-for-a-value-and-lambdas)).
 - **In a signature**, `...name` **collects** trailing arguments into a list.
 
 ```
@@ -1101,7 +1105,7 @@ the same step:
 match $args {
   []            { usage() }                # empty
   [cmd]         { run($cmd) }              # exactly one, bound as cmd
-  [cmd ...rest] { run($cmd ...$rest) }     # one-or-more; rest bound
+  [cmd ...rest] { run($cmd, ...$rest) }    # one-or-more; rest bound
 }
 ```
 
@@ -1224,7 +1228,7 @@ into one, you use the constructor **`re($str)`**: `$line ~ re($to)`,
 `$line:match(re($to))`. `re` is a
 **[built-in](#built-ins)** (a rich value can't come from an external) and
 **fail-loud** (a malformed pattern errors at the call, not silently), carries flags
-on the value (`re($x, --ignore-case)`), and `re($s, --literal)` quotes the string to
+on the value (`re($x, ignore-case: true)`), and `re($s, literal: true)` quotes the string to
 match **verbatim** (Perl's `\Q…\E`) — the common "match exactly what the user typed"
 case. A **bare string is never auto-converted** *(decided — no RHS coercion, for
 now)*: `$s ~ "a.b"` is an **error** pointing at `re("a.b")` or `/a.b/`, so a string
@@ -1237,8 +1241,8 @@ above). Flags are set with the ordinary
 `:ignorecase`, `:m` / `:multiline`, `:s` / `:dotall`, `:x` / `:extended` —
 chainable, and carrying the readable-or-terse dual spelling used elsewhere. This
 applies to `re(…)` and to the `/…/` literal (`/\d+/:i`). *(Decided: the `:` modifiers
-**coexist** with the `--ignore-case` constructor flag — both spellings are
-supported.)* `--literal` stays a
+**coexist** with the `ignore-case:` constructor argument — both spellings are
+supported.)* `literal:` stays a
 **constructor** argument regardless, since it
 changes how the string becomes a pattern rather than being a post-hoc flag on a
 finished regex. Match-behavior flags (`:i` `:m` `:s`) work as post-hoc modifiers on
@@ -1247,7 +1251,7 @@ fail-loud and compiles the *unflagged* pattern first — `re('foo # (')` errors 
 a trailing `:x` could make it valid in extended mode. Parse-affecting flags must
 therefore be known at construction: folded in pre-compile on a `/…/` literal
 (`/foo # (/:x`, compiled once) or passed as a constructor argument
-(`re($x, --extended)`), never as a post-hoc modifier on a finished value.)*
+(`re($x, extended: true)`), never as a post-hoc modifier on a finished value.)*
 
 *(decided: **`/…/` does not interpolate** — it is a **raw** regex literal (raw except
 the `\/` delimiter escape; see the regex-value section above), so a `$` inside `/…/`
@@ -1261,7 +1265,7 @@ dropped.*
 pattern from parts is what `re()`-from-a-string means). To splice a value as a
 **literal** (match it verbatim, the regex-injection-safe case), quote it with the
 **`:quotemeta`** modifier — `re("^${user:quotemeta}@")` — Perl's `\Q…\E` / Python's
-`re.escape` as an ordinary modifier. It is the per-value cousin of `re($s, --literal)`
+`re.escape` as an ordinary modifier. It is the per-value cousin of `re($s, literal: true)`
 (which quotes a whole string); use `:quotemeta` when only the hole is literal and the
 skeleton is a real pattern.)*
 
@@ -1554,8 +1558,9 @@ option*:
   call's options *are* a little map — and one can be **spread**: `deploy(prod, ...$opts)`
   where `opts = [region: us-west, force: true]`. Values compose (`port: $base + 1`).
 - **Command mode / dashed sugar — `--flag` / `--flag=value`**, with a bare `--flag` ≡
-  `flag: true` (`--region=us-west` ≡ `region: us-west`; `--force` ≡ `force: true`;
-  `--no-force` ≡ `force: false`).
+  `flag: true` (`--region=us-west` ≡ `region: us-west`; `--force` ≡ `force: true`). An
+  explicit **false** is the `force: false` pair; there is no `--no-flag` negation sugar
+  (whether a switch auto-derives one is left open under [Functions](#functions)).
 - The two are **interchangeable** — you *may* write `--flag` inside `f(...)`, it is just
   clumsier than the `key: value` it equals; and `key: value` is **value-mode only** (a
   bare `key: value` in space-separated command position tokenizes awkwardly, and maps
@@ -2311,7 +2316,7 @@ programs or user functions:
     validated against the real directory and recomputed if a stale or forged
     `$env.PWD` has diverged, so `pwd` can't lie. Run bare it **prints** the path; the
     **value call `pwd()` returns** the same validated cwd as a string value — so
-    `pwd():ancestors` and `style(pwd(), --fg=blue)` read the authoritative path, never
+    `pwd():ancestors` and `style(pwd(), fg: blue)` read the authoritative path, never
     the raw `$env.PWD`. **`--physical` / `-P`** calls `getcwd` for the symlink-resolved
     path.
   - **Autocd** — a bare word in command position that is a **directory path ending
@@ -2365,7 +2370,7 @@ programs or user functions:
   redirections and no command it applies them to the current shell (bash's `exec >log`).
 - **Values** — **`re(STR)`** builds a [regex value](#tests-and-comparisons) from a
   string — a built-in constructor, since a rich value can't come from an external —
-  with `re(STR, --literal)` for verbatim matching. **`glob(STR)`** is *not* a value
+  with `re(STR, literal: true)` for verbatim matching. **`glob(STR)`** is *not* a value
   constructor — it **expands** a (runtime-built or absolute) pattern to its matching
   **paths**, a [list](#arrays-lists), since globbing is filesystem expansion, not a
   pattern object; its match-side twin **`fnmatch(STR, PAT)`** returns a bool for
@@ -2687,7 +2692,7 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
   `postcd`, so a new terminal tab/split opens in the same directory even before the
   first `cd` (a fresh remote shell must report immediately, not only after a change).
 - ***Hyperlinks*** *(OSC 8)* — clickable paths/URLs in output; likely a `style()`
-  sibling (`link(text url)`) rather than a raw escape, keeping color-as-data.
+  sibling (`link(text, url)`) rather than a raw escape, keeping color-as-data.
 - ***Clipboard*** *(OSC 52)* — copy to the terminal's clipboard (works over ssh); a
   builtin.
 - ***Notifications*** *(OSC 9 / 777)* — desktop notification, e.g. auto-notify when a
@@ -2771,9 +2776,9 @@ $sh.prompt.line1     = [host: host-info, dir: dir-info, auth: auth-info]
 $sh.prompt.line1.dir = my-dir-info             # swap ONE piece by name
 unset $sh.prompt.line1.auth                    # drop the auth warning
 
-func host-info() { style("$(hostname)", --fg=red) }    # `style` (not styled); comma-separated args; parens on the func
-func dir-info()  { if inside-project() { "$(vcs prompt-info)" } else { style(tilde-pwd() --fg blue) } }
-func auth-info() { if ssh-id-missing() { style("SSH" --fg yellow) } }   # no else → "" → omitted
+func host-info() { style("$(hostname)", fg: red) }     # `style` (not styled); comma-separated args; parens on the func
+func dir-info()  { if inside-project() { "$(vcs prompt-info)" } else { style(tilde-pwd(), fg: blue) } }
+func auth-info() { if ssh-id-missing() { style("SSH", fg: yellow) } }   # no else → "" → omitted
 ```
 
 (Segments use `if` *expressions* to pick a string — not `and`/`or`, which combine
@@ -2784,7 +2789,7 @@ map's shape, and the only structural entries — `rule`, a deliberate blank
 `newline` — carry *meaningful* names, never a positional filler like `nl3`.)
 
 **Color comes from a `style` helper, not raw escapes.** The value call
-`style("no-ssh-id", --fg=yellow, --bold)` returns a **styled value** — text and
+`style("no-ssh-id", fg: yellow, bold: true)` returns a **styled value** — text and
 style attributes kept apart — rather than baked-in ANSI. It is an ordinary value
 call, so it takes attached parens and `--flag` arguments like any other; a *bare*
 `style …` would run it in command position and yield a status, not the value
@@ -2813,7 +2818,7 @@ therefore one of two things:
 So width is accurate either way for the styling (SGR) case — the reason to prefer
 `style` is that structured attributes stay *restylable*, which raw escapes are
 not. A renderable whose
-**text** is empty contributes nothing — a plain `""` or `style("", --fg=yellow)`
+**text** is empty contributes nothing — a plain `""` or `style("", fg: yellow)`
 alike, since emptiness is judged by the payload text (not emitted as bare control
 codes). `style` is the one styling primitive in the MVP (color + bold).
 
