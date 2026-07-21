@@ -735,7 +735,7 @@ glob**:
 | `/tmp` | **path** | no closing `/` |
 | `/*.txt` | **glob** at root | leading `/`, no closing `/` |
 
-The win over the old rule: **absolute globs and paths need no `fnmatch("…")` wrapper** —
+The win over the old rule: **absolute globs and paths need no wrapper** —
 `$p ~ /tmp/*` and `$p ~ /usr/bin` just work, where before *every* absolute pattern
 had to be wrapped.
 
@@ -1019,7 +1019,11 @@ in both directions:
 - **At a call site**, `...$xs` **explodes** a **list** into separate positional
   arguments — or a **map** into named options, each `key: value` pair binding the `key`
   option (the two shapes a call takes; see
-  [Calling for a value](#calling-for-a-value-and-lambdas)).
+  [Calling for a value](#calling-for-a-value-and-lambdas)). A **list** spread reaches an
+  **external** command as plain argv tokens, but a **map** spread binds *named options*
+  and so needs a signature — spreading a map to an external is an **error** (a map has
+  no canonical argv encoding — mesh will not guess `--k=v` vs `--k v` vs `k=v`), the
+  same bytes-boundary rule that rejects an un-spread list at the process edge.
 - **In a signature**, `...name` **collects** trailing arguments into a list.
 
 ```
