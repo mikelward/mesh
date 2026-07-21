@@ -133,7 +133,7 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
 
 Deferred: list/map values (only single-value assignment for now — a glob/list
 RHS is an error), the `:` value modifiers (`$f:stem`), `export`, `global`/`unset`,
-function-local scope, the `$sh.*` surface, and `$env:get(K default)`.
+function-local scope, the `$sh.*` surface, and `$env:get(K, default)`.
 
 ## Task 7 — sequencing (`;`, `&&`, `||`)
 

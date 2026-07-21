@@ -147,7 +147,7 @@ isn't there. Asking for a missing element is a bug and says so; when absence is
 
 ```
 $xs[99]              # error — names the index; a missing element is a mistake
-$xs:get(99 "-")       # "-" — the total accessor, when absence is normal
+$xs:get(99, "-")      # "-" — the total accessor, when absence is normal
 [a b] = $xs          # error if $xs isn't exactly two long
 if [a b] = $xs { }   # soft: a wrong shape just skips the block
 ```
@@ -164,8 +164,8 @@ instead of swallowing them. See [`docs/PROMPT.md`](PROMPT.md) for a real prompt
 built this way.
 
 ```
-$sh.prompt.dir  = func() { style(if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() } --fg blue) }
-$sh.prompt.auth = func() { if not ssh-id-loaded() { style("SSH" --fg yellow) } }   # nothing to show → omitted
+$sh.prompt.dir  = func() { style(if inside-project() { "$(vcs prompt-info)" } else { tilde-pwd() }, fg: blue) }
+$sh.prompt.auth = func() { if not ssh-id-loaded() { style("SSH", fg: yellow) } }   # nothing to show → omitted
 $sh.postcd.fetch = func() { vcs auto-fetch & }                                     # runs only on a real cd
 ```
 
