@@ -1538,6 +1538,19 @@ Rules:
   stdout still goes wherever stdout goes — the value call reads the *return*
   value, it does not capture or suppress output. A well-behaved value function
   simply does not print; one that legitimately does both streams *and* returns.
+- **Both channels at once — `:capture`.** When you genuinely need more than one,
+  `f(…):capture` runs the call and returns a **record of every channel**: `.value`
+  (the return value), `.out` and `.err` (its captured stdout / stderr), and
+  `.status`. Read them with ordinary field access (`r = f(x):capture` then
+  `r.value` / `r.out`). It is an *invocation-level* modifier, not a plain value
+  [modifier](#modifiers) — it has to wrap execution, since by the time a value
+  modifier saw the return value the stdout would already have streamed away, the
+  same reason `$(…)` is a wrapper rather than a postfix. It generalizes across the
+  external boundary: on a command the record is the same **minus `.value`** (there
+  is none — accessing it is a loud no-such-field error). Reaching for `:capture` is
+  the sign a function is doing two jobs at once; a single-channel function needs
+  none of it. *(TODO — further fields such as timing and a `pipestatus` list; today
+  it is the four above.)*
 - **Externals have no return value**, so `grep(foo)` is a **runtime error** that
   points you at `$(grep foo)`. Rich values stay in-shell — the same bytes-only
   boundary as `export` and subshells. (`f` resolves at call time, so this is a
