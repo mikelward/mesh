@@ -187,9 +187,9 @@ All four kinds:
 - **No-argument modifiers are bare; arguments are parenthesized.** A modifier that
   takes **no** argument is written bare and chains by adjacency — `$f:stem:dir`,
   `$xs:rest:last`, `:dedup`, `:values` — never `:first()`. A modifier that **takes
-  arguments** uses **parentheses**, space-separated inside like a
-  [value call](#calling-for-a-value-and-lambdas): `:split(":")`, `:get(EDITOR vim)`,
-  `:get(99 "-")`, `:match(/re/)`. One form, no exceptions — a **regex** argument is
+  arguments** uses **parentheses**, comma-separated inside like a
+  [value call](#calling-for-a-value-and-lambdas): `:split(":")`, `:get(EDITOR, vim)`,
+  `:get(99, "-")`, `:match(/re/)`. One form, no exceptions — a **regex** argument is
   just a `/…/` literal sitting inside the parens like any other value — so there is
   no load-bearing whitespace to trip over and chaining is always unambiguous:
   `$host:split("."):first` reads exactly one way.
@@ -263,7 +263,7 @@ This modifier system is the direct answer to
 dead-simple way to strip a suffix"): it is a first-class language feature, not a
 custom function.
 
-**String** *(open — initial set)*: `:strip(PREFIX/SUFFIX)`, `:replace(OLD NEW)`,
+**String** *(open — initial set)*: `:strip(PREFIX/SUFFIX)`, `:replace(OLD, NEW)`,
 and likely `:upper` / `:lower`. To be fleshed out.
 
 **String→number parse** *(decided — porting `total`, `bisect`)*. Values from argv /
@@ -271,7 +271,7 @@ and likely `:upper` / `:lower`. To be fleshed out.
 coercion — `n += "x"` fails) with `<` / `>` comparing strings *lexically*. The
 **`:int`** modifier parses a string to an integer, **fail-loud** — the inverse of
 the canonical int→decimal rendering, erroring on non-numeric input rather than
-silently yielding `0`. So `$line:words:get(0 "0"):int` sums a column and
+silently yielding `0`. So `$line:words:get(0, "0"):int` sums a column and
 `$good:int < $bad:int` compares numerically. *(A float type and a `:num` parse are
 deferred — mesh has no non-integer number type today; add both together if the need
 appears.)*
@@ -369,7 +369,7 @@ asking "does this *string* look like this pattern" (no disk at all) split the wa
 Python splits `glob` from `fnmatch`. The `~` operator carries the match side:
 `$f ~ *.txt` is a bool — whole-string fnmatch, **no filesystem access** (see [Tests and
 comparisons](#tests-and-comparisons)). A pattern built at runtime is matched by the
-predicate directly — [`fnmatch($f $pat)`](#built-ins) — so no first-class glob value
+predicate directly — [`fnmatch($f, $pat)`](#built-ins) — so no first-class glob value
 is needed to test against a computed pattern. (Regex keeps its `re(STR)` *value*
 because regexes are complex and reused; a glob stays a literal or an `fnmatch` call.)
 
@@ -505,12 +505,12 @@ hyphen between — the third payoff of that one spacing rule.
   that maps use, because the **environment is a first-class map named `env`**:
 
   ```
-  editor = $env:get(EDITOR vim)  # total: value, or "vim" if unset — never errors
+  editor = $env:get(EDITOR, vim)  # total: value, or "vim" if unset — never errors
   $env.EDITOR                   # strict: errors if unset (like any $m.key)
   if $env:has(SSH_AUTH_SOCK) { … }
   ```
 
-  So `$env.EDITOR` (a strict read) errors when unset, and `$env:get(EDITOR vim)`
+  So `$env.EDITOR` (a strict read) errors when unset, and `$env:get(EDITOR, vim)`
   is the safe defaulting form — no new syntax, just the map surface applied to
   the environment.
 - **No block scope; `unset` removes a scope's binding.** Control-flow blocks
@@ -597,12 +597,12 @@ hyphen between — the third payoff of that one spacing rule.
 - **No null.** mesh has **no `nil`/`null`/`none`** value — the billion-dollar
   mistake is left out. The consequence is a consistent rule wherever a value
   might be absent: **exact** access fails loud (`$xs[99]`, `$m[absent]` are
-  errors), **total** access takes a default (`$xs:get(i d)`, `$m:get(k d)`), and
+  errors), **total** access takes a default (`$xs:get(i, d)`, `$m:get(k, d)`), and
   a **control-flow gap** yields the empty string (a no-`else` `if`). Nothing
   silently returns a null that has to be checked for downstream. *(open — the
   one genuine fork this leaves: is a first-class absent value ever worth adding
   back for, e.g., "key present but unset"? Current answer: no; `:has` +
-  `:get(key default)` cover it.)*
+  `:get(key, default)` cover it.)*
 
 **Special variables live in two namespace maps** — the *(decided)* way to keep
 the shell's built-in state out of your variable namespace. The whole lowercase
@@ -741,7 +741,7 @@ had to be wrapped.
 **The one residual.** A single segment with a trailing slash still reads as a regex:
 `$p ~ /tmp/` is the regex `tmp`, not the path. Three teachable outs — drop the slash
 (`$p ~ /tmp`, the path, and the more usual spelling anyway), add structure
-(`$p ~ /tmp/*`), or force it (`fnmatch($p "/tmp/")` / `== "/tmp/"`). That is the entire
+(`$p ~ /tmp/*`), or force it (`fnmatch($p, "/tmp/")` / `== "/tmp/"`). That is the entire
 residual, versus the old rule's blanket wrapper requirement.
 
 **Recognized only in match slots.** Everywhere else a `/…/` word stays a path or
@@ -845,10 +845,10 @@ access is **strict** (fail loud), range access is **lenient** (clamp), and a
 | `$xs:first` / `$xs:last` | **error** on empty | no first/last element exists |
 | `$xs:rest` / `$xs:init` | **`[]`** | "all but one" of a 0- or 1-element list is genuinely empty — total, no error |
 | `$xs[a..b]` (slice) | **clamped** | `$xs[2..99]` → to the end; `$xs[5..]` on a short list → `[]` (a range is a request, a partial answer is fine) |
-| `$xs:get(i default)` | returns `default` | total, never errors — the safe accessor when absence is expected |
+| `$xs:get(i, default)` | returns `default` | total, never errors — the safe accessor when absence is expected |
 
 So `$xs[99]` on a 4-element list is an error that names the index, but
-`$xs:get(99 "-")` yields `"-"`, and `$xs[1..99]` just runs to the end. Fail loud
+`$xs:get(99, "-")` yields `"-"`, and `$xs[1..99]` just runs to the end. Fail loud
 where a missing element means a mistake; stay total where absence is normal.
 
 **Build** goes through the spread operator `...` (see
@@ -990,7 +990,7 @@ for `$m[key]` or `${m.key}` when you need a map access *inside* a string.
 | `$m:values` | list | values |
 | `$m:len` | int | entry count (same word as lists) |
 | `$m:has(KEY)` | bool | membership — the decided spelling |
-| `$m:get(KEY default)` | value | total lookup — `default` when absent |
+| `$m:get(KEY, default)` | value | total lookup — `default` when absent |
 
 **Membership is `:has`.** The terser `?` postfix (`$m[key]?`) was considered and
 dropped — it fights the "words, not punctuation" grain the modifiers are built
@@ -1004,7 +1004,7 @@ has no null: `$m[absent]` is an **error** (a bad key is usually a typo in
 config, and should fail loud, not silently yield `""`), while `$m:get(key
 default)` is the total form that returns `default` when the key is absent, and
 `if $m:has(key) { … }` is the guard. So a dynamic lookup that may legitimately
-miss is written `$m:get($name unknown)`, never a bare `$m[$name]`.
+miss is written `$m:get($name, unknown)`, never a bare `$m[$name]`.
 
 Insertion order is **preserved** (like Python dict / a `Vec<(K,V)>` behind the
 scenes) so `for k in $m:keys` is deterministic — important for an rc file that
@@ -1214,7 +1214,7 @@ The `~` RHS *also* takes a **glob**: a **relative** one is bare (`*.txt`, `src/*
 and an **absolute** one now also goes bare — `$p ~ /usr/*/bin`, `$p ~ /tmp/*` — with
 `$p ~ /usr/bin` reading as the path. The one residual is a single segment with a
 trailing slash: `$p ~ /tmp/` is the regex `tmp`; write `$p ~ /tmp` for the path (or
-`fnmatch($p "/tmp/")` / `== "/tmp/"`).
+`fnmatch($p, "/tmp/")` / `== "/tmp/"`).
 **Everywhere else a `/…/` word is a path or string** — `cd /tmp/`, `grep /usr/bin`,
 `$env.PATH:has(/usr/bin)`, `p = /etc/hosts` are all unaffected (a `/…/` is only a
 regex next to the match operators, never in a plain argument or modifier slot). To
@@ -1224,7 +1224,7 @@ into one, you use the constructor **`re($str)`**: `$line ~ re($to)`,
 `$line:match(re($to))`. `re` is a
 **[built-in](#built-ins)** (a rich value can't come from an external) and
 **fail-loud** (a malformed pattern errors at the call, not silently), carries flags
-on the value (`re($x --ignore-case)`), and `re($s --literal)` quotes the string to
+on the value (`re($x, --ignore-case)`), and `re($s, --literal)` quotes the string to
 match **verbatim** (Perl's `\Q…\E`) — the common "match exactly what the user typed"
 case. A **bare string is never auto-converted** *(decided — no RHS coercion, for
 now)*: `$s ~ "a.b"` is an **error** pointing at `re("a.b")` or `/a.b/`, so a string
@@ -1247,7 +1247,7 @@ fail-loud and compiles the *unflagged* pattern first — `re('foo # (')` errors 
 a trailing `:x` could make it valid in extended mode. Parse-affecting flags must
 therefore be known at construction: folded in pre-compile on a `/…/` literal
 (`/foo # (/:x`, compiled once) or passed as a constructor argument
-(`re($x --extended)`), never as a post-hoc modifier on a finished value.)*
+(`re($x, --extended)`), never as a post-hoc modifier on a finished value.)*
 
 *(decided: **`/…/` does not interpolate** — it is a **raw** regex literal (raw except
 the `\/` delimiter escape; see the regex-value section above), so a `$` inside `/…/`
@@ -1261,7 +1261,7 @@ dropped.*
 pattern from parts is what `re()`-from-a-string means). To splice a value as a
 **literal** (match it verbatim, the regex-injection-safe case), quote it with the
 **`:quotemeta`** modifier — `re("^${user:quotemeta}@")` — Perl's `\Q…\E` / Python's
-`re.escape` as an ordinary modifier. It is the per-value cousin of `re($s --literal)`
+`re.escape` as an ordinary modifier. It is the per-value cousin of `re($s, --literal)`
 (which quotes a whole string); use `:quotemeta` when only the hole is literal and the
 skeleton is a real pattern.)*
 
@@ -1328,13 +1328,19 @@ Rules:
   do **not** usefully coexist (the rest would swallow anything meant for the
   optional), so a signature with `...rest` keeps its positionals required.
 - **Flags** are declared with a leading `--`. `--force` (no `=`) is a boolean
-  **switch**, false unless passed. `--tag = default` is a **valued flag**, and at
-  the call site it accepts **both spellings** — attached `--tag=v2` and separate
-  `--tag v2` (the flag consumes the next argument) — the two getopt forms every
-  shell user knows. A valued flag with **no value to consume** (nothing follows,
-  or the next token is `--`/another flag) is an **error** — a missing value fails
-  loud rather than silently swallowing an unrelated token. A **switch** never
-  consumes a following argument (`--force web1` leaves `web1` a positional).
+  **switch**, false unless passed; `--tag = default` is a **valued flag**. At the call
+  site each has the two equivalent spellings from
+  [Calling for a value](#calling-for-a-value-and-lambdas): the dashed sugar
+  (`--force`, `--tag=v2`) and the value-mode `key: value` pair (`force: true`,
+  `tag: v2`) — `--force` ≡ `force: true`, `--tag=v2` ≡ `tag: v2`. A valued flag in
+  dashed form is **attached only** (`--tag=v2`, never a separate `--tag v2` that
+  consumes the next token), so every argument stays **self-contained** — which matters
+  because a value-mode call's arguments are comma-separated. Neither a switch nor a
+  valued flag ever swallows a following argument: `--force web1` is the switch `--force`
+  plus a positional `web1`, and a bare `--tag` with **no `=value`** is a missing-value
+  **error**, not a consume-the-next-token. (An **external** command still accepts the
+  separate `--tag v2` getopt form — mesh does not parse its flags, it only passes the
+  tokens through.)
   Flags may appear in any order at the call site and are *not* consumed as
   positionals — this is why a shell wants real flag parsing in the signature
   rather than hand-rolled `case $1` juggling. An argument that begins with `--`
@@ -1359,7 +1365,7 @@ Rules:
     three separate switches where at most one is allowed — a *different* requirement
     from a single enum value (a plain allowed-set check would still pass
     `setup --kde --sway`). Either steer such interfaces toward one enum-valued option
-    (`--desktop kde|hypr|sway`) or grow a mutex-group constraint in the signature.
+    (`--desktop=kde|hypr|sway`) or grow a mutex-group constraint in the signature.
   - ***Negatable / tri-state flags.*** `setup`'s `--gui`/`--no-gui` auto/yes/no
     pairs have no expression: a switch is binary, false-unless-passed, with no
     `--no-` negation. Allow a switch to auto-derive a `--no-` form (a
@@ -1523,32 +1529,63 @@ or opt-in dynamic — scope against the lexical default decided above.)*
 
 A `func` has two outputs — the **bytes** it writes to stdout (composes in pipes,
 like any command) and the **value** it returns (last expression / `return val`,
-a rich list/map/scalar). Which one you get is chosen by **how you write the
-call**, not by context — and it *has* to be syntactic, because a bare word on an
-assignment RHS is already a [literal string](#variables-and-assignment)
-(`x = greet` binds `"greet"`), so reaching a function's value needs an explicit
-marker. That marker is **parens attached to the name** (the C/JS/Python call
-shape):
+a rich list/map/scalar). Which you get is chosen by **how you write the call**,
+and that choice is really a choice of **mode**:
 
-| Form | Purpose | Yields |
-| --- | --- | --- |
-| `f arg` (bare, command-style) | **run it** — for effect or in a pipe | stdout streams; exit status = result-as-status |
-| `$(f arg)` | **capture its stdout** (bytes) | a list (or `:raw`, one string) — works on externals too |
-| `f(arg)` (parens, attached) | **use its return value** (rich) | the mesh value |
+| Mode | Form | You get | Idiomatic args |
+| --- | --- | --- | --- |
+| **command** — run it | `f arg --flag` (bare), or `$(f arg)` | stdout streams (status is the result); `$(…)` captures the bytes | **space**-separated positionals, `--flag` / `--flag=value` |
+| **value** — call for its return | `f(arg, key: value)` (parens attached) | the mesh value | **comma**-separated positionals, `key: value` options |
+
+The split is by **mode, not callee**. A function *run* in command position looks
+like a command on purpose — that is how you use it at the prompt (`co main --amend`,
+bare, no ceremony) — and the *same* function *called for a value* looks like a
+function (`x = co(main, amend: true)`). Command position is unchanged from any shell;
+the comma grammar appears **only** inside `f(...)`, so the prompt stays all spaces and
+commas live in expressions. (The `f(...)` marker is required at all because a bare word
+on an assignment RHS is already a [literal string](#variables-and-assignment) —
+`x = greet` binds `"greet"`, so reaching a function's value needs the parens.)
+
+**Options have two equivalent spellings, one idiomatic per mode.** The `--force` you
+type at the prompt and the `force: true` you write in a value call are the *same
+option*:
+
+- **Value mode — `key: value`**, the [map literal](#maps-associative-arrays) shape, so a
+  call's options *are* a little map — and one can be **spread**: `deploy(prod, ...$opts)`
+  where `opts = [region: us-west, force: true]`. Values compose (`port: $base + 1`).
+- **Command mode / dashed sugar — `--flag` / `--flag=value`**, with a bare `--flag` ≡
+  `flag: true` (`--region=us-west` ≡ `region: us-west`; `--force` ≡ `force: true`;
+  `--no-force` ≡ `force: false`).
+- The two are **interchangeable** — you *may* write `--flag` inside `f(...)`, it is just
+  clumsier than the `key: value` it equals; and `key: value` is **value-mode only** (a
+  bare `key: value` in space-separated command position tokenizes awkwardly, and maps
+  need `[...]` anyway).
+- A bare `key=value` (no colon, no `--`) stays a **literal string** positional — that is
+  the `env FOO=1` / `make CC=gcc` / `git commit --author=me` case — so `=` is never an
+  option separator on its own; it only appears attached to a `--flag`.
 
 ```
-config = load-env($path)          # value call: the returned map
-n      = add($a $b)               # args are SPACE-separated, exactly like a
-                                  #   command call — parens only mean "value call"
-deploy(prod --force ...$hosts)    # flags and ... spread work the same way
-config = load-config()            # zero args still needs () — bare name is a string
+config = load-env($path)                     # value call, one arg
+n      = add($a, $b)                         # positionals comma-separated
+deploy(prod, region: us-west, force: true)   # value mode: key: value options
+deploy prod --region=us-west --force         # command mode: the same options as --flags
+deploy(prod, ...$opts)                       # opts = [region: us-west, force: true]
+config = load-config()                       # zero args still needs () — a bare name is a string
 ```
 
 Rules:
 
-- **Args inside `f(…)` use the same space-separated grammar as a command call** —
-  positionals, `--flags`, `...spread`. The parens add nothing but "take the
-  return value"; there is no second argument syntax to learn.
+- **Positionals are positional-only** — passed by position, never by name
+  (`cp(a, b)`, not `cp(dest: b, src: a)`), exactly like a shell command's
+  positional arguments. A parameter's *name* is therefore never part of the
+  positional call surface, so `f(help)` is unambiguously the string `"help"` in
+  first position, and a `--help` **option** is told apart by its leading `--` — the
+  same way a shell already separates flags from arguments.
+- **A signature declares options with the `--name` spelling**
+  (`func deploy(env, --force, --region = us-west, --out = -) { … }`) and positionals as
+  bare names (`env`); either call spelling (`--region=us-west` or `region: us-west`)
+  binds the same parameter. `...spread` works in both modes — a list of positionals or
+  a map of options.
 - **The channels are independent.** During `x = f(…)`, whatever `f` writes to
   stdout still goes wherever stdout goes — the value call reads the *return*
   value, it does not capture or suppress output. A well-behaved value function
@@ -1854,8 +1891,8 @@ construct you write* is how you declare whether absence is a bug or expected:
 | --- | --- | --- |
 | bind N names from a list | `[a b] = xs` | `if [a b] = xs { … }` — a miss skips |
 | a captured group | `[x] = s:match(/re/)` | `if [x] = s:match(/re/) { … }` |
-| index an element | `$xs[i]` | `$xs:get(i default)` — total, never errors |
-| a map value | `$m.key` | `$m:get(key default)` |
+| index an element | `$xs[i]` | `$xs:get(i, default)` — total, never errors |
+| a map value | `$m.key` | `$m:get(key, default)` |
 | read a line | — | `gets()` → `false` at EOF |
 | a branch's value | — | `if cond { v }` → `""` when false |
 
@@ -2274,7 +2311,7 @@ programs or user functions:
     validated against the real directory and recomputed if a stale or forged
     `$env.PWD` has diverged, so `pwd` can't lie. Run bare it **prints** the path; the
     **value call `pwd()` returns** the same validated cwd as a string value — so
-    `pwd():ancestors` and `style(pwd() --fg=blue)` read the authoritative path, never
+    `pwd():ancestors` and `style(pwd(), --fg=blue)` read the authoritative path, never
     the raw `$env.PWD`. **`--physical` / `-P`** calls `getcwd` for the symlink-resolved
     path.
   - **Autocd** — a bare word in command position that is a **directory path ending
@@ -2328,10 +2365,10 @@ programs or user functions:
   redirections and no command it applies them to the current shell (bash's `exec >log`).
 - **Values** — **`re(STR)`** builds a [regex value](#tests-and-comparisons) from a
   string — a built-in constructor, since a rich value can't come from an external —
-  with `re(STR --literal)` for verbatim matching. **`glob(STR)`** is *not* a value
+  with `re(STR, --literal)` for verbatim matching. **`glob(STR)`** is *not* a value
   constructor — it **expands** a (runtime-built or absolute) pattern to its matching
   **paths**, a [list](#arrays-lists), since globbing is filesystem expansion, not a
-  pattern object; its match-side twin **`fnmatch(STR PAT)`** returns a bool for
+  pattern object; its match-side twin **`fnmatch(STR, PAT)`** returns a bool for
   "does this string match this glob pattern" with no filesystem access. `style` (above)
   is the styled-value constructor.
 - **Session** — `exit [status]`.
@@ -2734,7 +2771,7 @@ $sh.prompt.line1     = [host: host-info, dir: dir-info, auth: auth-info]
 $sh.prompt.line1.dir = my-dir-info             # swap ONE piece by name
 unset $sh.prompt.line1.auth                    # drop the auth warning
 
-func host-info() { style("$(hostname)" --fg red) }     # `style` (not styled); space-separated args; parens on the func
+func host-info() { style("$(hostname)", --fg=red) }    # `style` (not styled); comma-separated args; parens on the func
 func dir-info()  { if inside-project() { "$(vcs prompt-info)" } else { style(tilde-pwd() --fg blue) } }
 func auth-info() { if ssh-id-missing() { style("SSH" --fg yellow) } }   # no else → "" → omitted
 ```
@@ -2747,7 +2784,7 @@ map's shape, and the only structural entries — `rule`, a deliberate blank
 `newline` — carry *meaningful* names, never a positional filler like `nl3`.)
 
 **Color comes from a `style` helper, not raw escapes.** The value call
-`style("no-ssh-id" --fg yellow --bold)` returns a **styled value** — text and
+`style("no-ssh-id", --fg=yellow, --bold)` returns a **styled value** — text and
 style attributes kept apart — rather than baked-in ANSI. It is an ordinary value
 call, so it takes attached parens and `--flag` arguments like any other; a *bare*
 `style …` would run it in command position and yield a status, not the value
@@ -2776,7 +2813,7 @@ therefore one of two things:
 So width is accurate either way for the styling (SGR) case — the reason to prefer
 `style` is that structured attributes stay *restylable*, which raw escapes are
 not. A renderable whose
-**text** is empty contributes nothing — a plain `""` or `style("" --fg yellow)`
+**text** is empty contributes nothing — a plain `""` or `style("", --fg=yellow)`
 alike, since emptiness is judged by the payload text (not emitted as bare control
 codes). `style` is the one styling primitive in the MVP (color + bold).
 
@@ -3044,7 +3081,7 @@ to avoid" rather than promising the latter as done.
   **isolation** is explicit — plain `func` persists cwd/state, `( )` /
   `func f() ( )` subshell-isolate, `in DIR { }` scopes cwd without forking.
 - **Value calls & lambdas — decided** ([section](#calling-for-a-value-and-lambdas)):
-  `f(arg)` (parens attached, space-separated args) takes a function's **return
+  `f(arg)` (parens attached, comma-separated args) takes a function's **return
   value**, `$(f arg)` its **stdout**, bare `f arg` runs it; stdout streams during
   a value call (independent channels); externals have no return value (runtime
   error → `$(…)`). Lambdas are `func(params) { … }` (anonymous, one param
