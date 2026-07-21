@@ -47,11 +47,11 @@ A `:`-modifier transforms a value, and maps over a list automatically — so a l
 
 ```
 # bash
-stem=$(basename "$f" .tar.gz)
+name=$(basename "$f" .tar.gz)
 dir=$(dirname "$f")
 
 # mesh
-stem = $f:stem
+name = $f:bare      # strips every extension; :stem drops just the last
 dir  = $f:dir
 ```
 

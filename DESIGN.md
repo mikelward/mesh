@@ -229,20 +229,24 @@ at all (it is the [no-split capture member](#modifiers), one byte-string).
 | `:dir` | `a/b` | dirname |
 | `:base` | `foo.tar.gz` | basename |
 | `:ext` | `gz` | last extension (no leading dot) |
+| `:exts` | `tar.gz` | **all** extensions (no leading dot) |
 | `:stem` | `foo.tar` | basename minus the **last** extension |
-| `:root` | `foo` | basename minus **all** extensions |
+| `:bare` | `foo` | basename minus **all** extensions |
 | `:real` | *(absolute)* | resolved real path |
 
 Rules:
 
 - `:ext` **excludes the dot** (`txt`, not `.txt`) — better for comparisons
   (`if $f:ext == md`). Rebuild with `($f:stem).png`.
-- A **leading** dot is not an extension: `.bashrc:ext` is empty, `.bashrc:base`
-  and `.bashrc:stem` are both `.bashrc` (dotfiles stay whole).
-- `:root` strips *every* dot-suffix, so on a dotted non-extension name like
+- A **leading** dot is not an extension: `.bashrc:ext` is empty, and `.bashrc:base`,
+  `.bashrc:stem`, and `.bashrc:bare` are all `.bashrc` (dotfiles stay whole).
+- `:base` splits into `:bare` + `:exts` (first dot); `:base` also splits into
+  `:stem` + `:ext` (last dot) — `foo.tar.gz` is `foo`+`tar.gz` or `foo.tar`+`gz`.
+- `:bare` strips *every* dot-suffix, so on a dotted non-extension name like
   `2024.01.report` it yields `2024`. `:stem` (last only) is the safe default;
-  reach for `:root` when you mean "strip it all." Controlled peeling is also
-  available via chaining (`$f:stem:stem`).
+  reach for `:bare` when you mean "strip it all." Controlled peeling is also
+  available via chaining (`$f:stem:stem`). `:bare` is one letter from `:base`
+  (basename, extensions **kept**) — the mnemonic is *bare* = stripped down.
 
 *(TODO — decisions surfaced porting real `PATH` / `find_up` code:*
 - ***Transform-vs-predicate overlap.*** Keeping directories is the settled
