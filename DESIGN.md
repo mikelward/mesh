@@ -1002,7 +1002,7 @@ it adds a second way to phrase the same test, so weigh it before adding.)*
 
 **Missing keys** follow the same strict/total split as list access, since mesh
 has no null: `$m[absent]` is an **error** (a bad key is usually a typo in
-config, and should fail loud, not silently yield `""`), while `$m:get(key
+config, and should fail loud, not silently yield `""`), while `$m:get(key,
 default)` is the total form that returns `default` when the key is absent, and
 `if $m:has(key) { … }` is the guard. So a dynamic lookup that may legitimately
 miss is written `$m:get($name, unknown)`, never a bare `$m[$name]`.
@@ -1365,7 +1365,7 @@ Rules:
     attached values (`-ffile`). Decide whether a function can declare short aliases
     (`--verbose | -v`) and a numeric-count form, or whether short/numeric flags stay
     an external-tool-only convention and in-shell functions are `--long`-only.
-  - ***Enum / choice-constrained values.*** `homepkg --backend mamba|conda|github`
+  - ***Enum / choice-constrained values.*** `homepkg --backend=mamba|conda|github`
     has no parse-time validation — "enum" exists only as a *completion* value type.
     Let a flag or positional declare an allowed-value set that validates at the call
     and feeds completion.
@@ -1908,7 +1908,7 @@ construct you write* is how you declare whether absence is a bug or expected:
 So absence is loud when you **asserted** the value is there (a bare bind, a direct
 `[i]`) and quiet when you **asked whether** it is (`if`-binding, `:get`, `gets`, a
 no-`else` `if`). You never get bash's silent-empty-*by-default*; softness is
-explicit. The soft index accessor is the existing two-arg [`$xs:get(i
+explicit. The soft index accessor is the existing two-arg [`$xs:get(i,
 default)`](#arrays-lists) rather than a `:get(i)` that returns a bare `false` or a
 `:get():default()` chain — deliberately, because the two-arg form does the bounds
 check *internally* and so can still distinguish "element `i` is genuinely `false` /
