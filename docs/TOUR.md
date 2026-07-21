@@ -176,7 +176,7 @@ fell-back
 A `|` feeds one command's output straight into the next:
 
 ```
-mesh$ puts hello world | wc -w
+mesh$ echo hello world | wc -w
 2
 ```
 
@@ -186,11 +186,15 @@ mesh$ puts hello world | wc -w
 command's input from a file:
 
 ```
-mesh$ puts saved > note.txt
-mesh$ puts appended >> note.txt
+mesh$ echo saved > note.txt
+mesh$ echo appended >> note.txt
 mesh$ wc -l < note.txt
 2
 ```
+
+> `puts` and the other builtins can't be piped or redirected just yet — reach for
+> an external command like `echo` or `cat` when you need output in a pipe or a
+> file.
 
 ## Defining your own commands
 
