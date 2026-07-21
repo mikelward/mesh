@@ -703,6 +703,10 @@ fn run_piped() -> ExitCode {
     let mut last: u8 = 0;
     let mut shell = Shell::new();
     let mut pending = String::new();
+    // The buffered definition contained invalid UTF-8: keep buffering to its
+    // closing brace (so its body can't leak), then discard it whole rather than
+    // storing/executing the lossy source.
+    let mut poisoned = false;
     let mut line = Vec::new();
 
     loop {
@@ -730,10 +734,10 @@ fn run_piped() -> ExitCode {
                 // Mid-definition: a bare `pending.clear()` here would release the
                 // rest of the buffered `func` body into the top-level loop (a
                 // destructive body command would then run during definition).
-                // Substitute U+FFFD for the invalid bytes and keep buffering, so
-                // the open `{` stays open and the body stays quarantined until its
-                // brace closes; the definition then parses (its lossy body errors
-                // when called) rather than leaking.
+                // Poison the definition and substitute U+FFFD only so brace
+                // counting (real braces survive) keeps buffering to the close;
+                // the whole definition is discarded below, never stored/run lossy.
+                poisoned = true;
                 lossy = String::from_utf8_lossy(&line).into_owned();
                 &lossy
             }
@@ -744,6 +748,11 @@ fn run_piped() -> ExitCode {
             continue;
         }
         let full = std::mem::take(&mut pending);
+        if std::mem::take(&mut poisoned) {
+            // Discard the definition that contained invalid UTF-8 (error already
+            // reported when the bad line was read); do not define or run it.
+            continue;
+        }
         match run_line(&full, last, false, &mut shell) {
             Step::Exit(code) => return ExitCode::from(code),
             Step::Continue(code) => last = code,
@@ -752,8 +761,10 @@ fn run_piped() -> ExitCode {
             Step::Return(_) => unreachable!("top-level return is handled in run_line"),
         }
     }
-    // A truncated `func` definition at EOF: run it so the parse error is reported.
-    if !pending.trim().is_empty() {
+    // A truncated (or poisoned) `func` definition at EOF: a poisoned one is
+    // discarded (its error was already reported); otherwise run it so the parse
+    // error is reported.
+    if !poisoned && !pending.trim().is_empty() {
         match run_line(&pending, last, false, &mut shell) {
             Step::Exit(code) => return ExitCode::from(code),
             Step::Continue(code) => last = code,

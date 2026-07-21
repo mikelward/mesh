@@ -522,10 +522,17 @@ pub fn is_ident(s: &str) -> bool {
     matches!(read_name(&chars, 0), Some((_, n)) if n == chars.len())
 }
 
-/// Does `text` leave an unclosed `{` at the bare (unquoted) level? The read loop
-/// uses this to keep buffering the lines of a multi-line `func … { … }` body.
+/// Is a multi-line `func … { … }` body still open — its opening `{` seen but its
+/// matching close not yet reached? The read loop uses this to keep buffering.
+///
+/// Keyed on the body's **first** close, not net depth: once the opening brace has
+/// matched, the definition is complete and any trailing text (`func f() {} {`) is
+/// an error to report now, not a reason to keep swallowing later commands. A
+/// `func` head with no `{` yet (`func f()`) is not "open" either — it runs and
+/// reports the missing body rather than buffering forever.
 pub fn needs_more_input(text: &str) -> bool {
-    scan_braces(text, 0).depth > 0
+    let scan = scan_braces(text, 0);
+    scan.close.is_none() && scan.depth > 0
 }
 
 /// The result of a bare-level brace scan (see [`scan_braces`]).

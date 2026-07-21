@@ -939,6 +939,26 @@ fn invalid_utf8_mid_function_does_not_leak_the_body() {
 }
 
 #[test]
+fn invalid_utf8_in_a_function_body_discards_the_definition() {
+    // Invalid UTF-8 mid-definition quarantines through the brace, then discards
+    // the whole definition — the lossy source is never stored or executed, so
+    // `f` is undefined and its body never runs (only "done" prints).
+    let out = run_with_bytes(b"func f() {\n  puts \"a\xffb\"\n}\nf\nputs done\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid UTF-8"));
+}
+
+#[test]
+fn trailing_text_after_a_closed_definition_does_not_swallow_later_commands() {
+    // `func f() {} {` — the body's first `}` closes it, so the trailing `{` is a
+    // trailing-text error reported now; the next line must run independently
+    // rather than being absorbed into the still-"open" definition.
+    let out = run_with_input("func f() {} {\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected text"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
 fn a_lexer_error_inside_a_body_does_not_release_it_to_the_top_level() {
     // A body line the runtime lexer rejects (here the unsupported `2>` form)
     // must not stop brace buffering: the still-open `{` keeps the rest of the
