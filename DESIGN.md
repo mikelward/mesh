@@ -917,6 +917,60 @@ Insertion order is **preserved** (like Python dict / a `Vec<(K,V)>` behind the
 scenes) so `for k in $m:keys` is deterministic — important for an rc file that
 builds, say, an ordered alias table.
 
+### Separators: space vs comma
+
+mesh separates the elements of a list, an argv, or a call with a **space**, not a
+comma — the deliberate answer to "should lists use commas?" The comma is kept for
+the few grammar spots that pair or name their items.
+
+- **Space is the everyday element separator** in the argv-rhythm contexts: list
+  elements `[a b c]`, command arguments `cmd a b c`,
+  [value-call](#calling-for-a-value-and-lambdas) arguments `f(a b c)`, and
+  modifier arguments `:get(EDITOR vim)`. One rhythm, so a list literal reads
+  exactly like the argv it would spread into. Each element is a whole value
+  expression — a bareword, a quoted or escaped string, a `$x` expansion (which
+  stays *one* value whether or not it holds a list — the
+  [no-word-splitting](#spread--flattening) guarantee), a bracketed literal, or a
+  keyword-led block expression — and only a *top-level* space, outside every
+  bracket and block, divides one element from the next. The exact grammar of
+  where an element ends is the parser's job (the EBNF is a TODO); the design point
+  here is simply that the separator is a space.
+- **Comma is reserved for the grammar's paired or named forms**, where a bare
+  space would be ambiguous because the items carry internal spaces or come in
+  pairs: map entries `[http: 80, https: 443]`, signature parameters
+  `func f(env, --tag = latest, ...hosts)`, and the map-iteration binder
+  `for host, addr in $m`. There the comma is structural, not a general element
+  separator.
+
+**Should mesh broaden commas — allow `[a, b]`, or comma-separated call args?**
+The settled answer is **no**:
+
+- It would fork the muscle memory that makes `[a b c]`, `f(a b c)`, and
+  `cmd a b c` the *same* shape — the core "reuse what your fingers know" bet. A
+  comma in argument position reads as a token that isn't in the command it
+  mirrors.
+- It reintroduces a small ambiguity mesh is otherwise free of — "is the comma a
+  separator or part of the token?" — and the comma-in-filename edge that the
+  "operators need surrounding space" rule elsewhere exists to avoid.
+- The comma already earns its keep at the paired/named forms above; a comma
+  between plain elements would be redundant with the space — a second way to
+  spell one thing.
+
+A comma in a **list** (non-pair) position is therefore a **loud error**, not a
+tolerated synonym: `[a, b]` reports that lists are space-separated and asks
+whether a map (`[a: …, b: …]`) was meant — catching the JSON/Python reflex
+rather than silently accepting it. The one ergonomic allowance is a **trailing
+comma** in the comma contexts (maps and signatures), so a multi-line literal or
+signature edits cleanly:
+
+```
+ports = [
+  http:  80,
+  https: 443,
+  ssh:   22,        # trailing comma OK — reorder/append lines without fixups
+]
+```
+
 ### Spread / flattening
 
 `...` is the one operator that moves between "a list" and "several arguments,"
@@ -1405,20 +1459,48 @@ dynamic-scope TODO below is about — and moving a `return`/`break` retargets it
 as in any language.) Isolation is therefore **explicit**, in three grades:
 
 ```
-( cd build; make )                      # subshell: forks; cwd/env/umask/vars
-                                        #   isolated, nonzero exit can't kill
-                                        #   the outer shell
-func build() ( cd build; make )         # a func whose *body* is a subshell — the
-                                        #   `( )` body (vs `{ }`) is the isolation
-                                        #   flag (bash/POSIX spell it this way)
+fork { cd build; make }                 # forks: cwd/env/umask/vars isolated, a
+                                        #   nonzero exit can't kill the outer shell
+fork func build() { cd build; make }    # a func that forks on every call —
+                                        #   run/capture only, never value-called
 in dist { rm -rf * }                    # scoped cwd: run the block there, restore
-                                        #   after — NO fork (cheaper than subshell)
+                                        #   after — NO fork (cheaper than a fork)
 ```
 
-A **subshell forks**, so — like `export` — only **bytes** cross back out (its
-stdout); rich list/map values do not survive the process boundary. `in DIR { }`
-does not fork: it is the lightweight "do this over there without stranding me,"
-covering the common `pushd`/`popd` pattern with a block.
+`fork` is the isolation keyword, and `fork { … }` is the one primitive; the
+`fork func` prefix runs the whole body in a `fork` block **and** marks the
+function itself *forking*. It is not merely rewritten to `func f() { fork { … } }`
+— that would be an ordinary function the value-call contract still lets you call
+as `f()`; the explicit `fork` marker is what the value-call rejection below
+attaches to, so a forked function stays run/capture-only however its body is
+spelled. **Every block is `{ … }`**, so isolation is now a *keyword*, never a
+swapped delimiter — the
+older POSIX spelling (a bare `( … )` subshell, and a `func f() ( … )` whose
+parenthesized body was the isolation flag) is **dropped**. That leaves a
+**standalone** `( )` a single theme — the
+[value-and-argument world](#calling-for-a-value-and-lambdas) (calls, signatures,
+modifier arguments) — with no attached-vs-spaced whitespace rule needed to tell a
+value call `f(x)` apart from a subshell `( x )`. (Process substitution
+[`<(cmd)`](#redirection) is untouched: there the paren is bound to the `<` as a
+single lexical token — `<(` — not a bare group, so it is not what "the subshell
+is dropped" refers to and stays a retained form. The output form `>(cmd)` is a
+separate open question — still a TODO under [Redirection](#redirection) — and is
+neither settled nor unsettled by this change.)
+
+A **`fork` block forks**, so — like `export` — only **bytes** cross back out (its
+stdout); rich list/map values do not survive the process boundary. A direct
+consequence, and one the `fork`-at-the-declaration spelling makes visible: a
+`fork func` can only be **run** (command-style) or **captured** (`$(…)`), never
+**value-called** `f(…)` — there is no live value to carry across the fork, so the
+value channel belongs to the plain `func` alone. `in DIR { }` does not fork: it
+is the lightweight "do this over there without stranding me," covering the common
+`pushd`/`popd` pattern with a block.
+
+*Cost, kept honest:* this spends the bash muscle memory that `( … )` means a
+subshell. The trade buys one theme per delimiter (`{ }` every block, `( )` every
+value/argument), drops the paren-body special case for `func`, and names the
+process cost out loud with `fork` — the opposite end of the same axis as the
+fork-free `in DIR { }`.
 
 *(open, deferred cluster: whether a `func` defined inside a `func` is visible
 only there. Also a **TODO — dynamic scope**: the same "extract a chunk into a
@@ -1462,7 +1544,7 @@ Rules:
   simply does not print; one that legitimately does both streams *and* returns.
 - **Externals have no return value**, so `grep(foo)` is a **runtime error** that
   points you at `$(grep foo)`. Rich values stay in-shell — the same bytes-only
-  boundary as `export` and subshells. (`f` resolves at call time, so this is a
+  boundary as `export` and `fork` blocks. (`f` resolves at call time, so this is a
   runtime, not parse, distinction.)
 
 **Lambdas** are then just anonymous functions — the `func` declaration minus the
@@ -1482,6 +1564,18 @@ syntax** for named and anonymous functions, and the transform modifiers
 (`:map` / `:filter` / `:each` / `:sort …`) are where lambdas earn their keep,
 complementing the auto-mapping value modifiers for the cases a bare modifier
 can't express.
+
+**The `func` keyword is what makes a function; a bare `{ … }` never does.** In
+mesh a brace block is *always* the body of a construct — `if`, `for`, `match`,
+`in DIR`, `fork`, or a `func` — and only the `func` keyword turns one into a
+callable value. So `fork { … }` and a lambda `func() { … }` do not collide: the
+first is *keyword + block*, the second is a value whose signature `( )` and body
+`{ }` each play their single role (arguments, then block). mesh deliberately does
+**not** take the Elvish/Ruby route where a bare `{ … }` is itself an anonymous
+callable — that is exactly the collision that would make `fork { … }` ambiguous.
+A forked block is therefore never a value: to isolate *and* name something you
+write `fork func f() { … }`, and since a fork can only return bytes there is no
+"forking lambda" (a value-call would have nothing to carry back).
 
 A **bare modifier reference is itself a callable value**, so where a predicate or
 mapper is wanted you can hand a modifier directly instead of wrapping it in a
@@ -2912,8 +3006,8 @@ to avoid" rather than promising the latter as done.
   one-test case); **tests** replace `[[ ]]` (`~`/`!~` pattern-match, type-directed
   comparisons, `$p:type`/`:exists`/`:exec` file tests, `and`/`or`/`not` vs command
   `&&`/`||`); the **postfix guard** `stmt if/unless cond` is the one-line form;
-  **isolation** is explicit — plain `func` persists cwd/state, `( )` /
-  `func f() ( )` subshell-isolate, `in DIR { }` scopes cwd without forking.
+  **isolation** is explicit — plain `func` persists cwd/state, `fork { }` /
+  `fork func f() { }` fork-isolate, `in DIR { }` scopes cwd without forking.
 - **Value calls & lambdas — decided** ([section](#calling-for-a-value-and-lambdas)):
   `f(arg)` (parens attached, space-separated args) takes a function's **return
   value**, `$(f arg)` its **stdout**, bare `f arg` runs it; stdout streams during
