@@ -596,6 +596,13 @@ pub fn scan_braces(text: &str, start_depth: i32) -> BraceScan {
                     None => return BraceScan { close, depth },
                 }
             }
+            // A bare `${…}` interpolation: its braces belong to the interpolation,
+            // not to block structure, so skip to its close (as `parse_var` does)
+            // without counting them. An unterminated `${` is a line-local error, so
+            // it ends at the line boundary and leaves no dangling `{`.
+            '$' if chars.get(k + 1).map(|&(_, c)| c) == Some('{') => {
+                k = skip_interpolation(&chars, k + 2);
+            }
             '{' => {
                 depth += 1;
                 k += 1;
@@ -640,6 +647,22 @@ pub fn scan_braces(text: &str, start_depth: i32) -> BraceScan {
 /// returns the newline's index, and brace counting resumes on the next line
 /// rather than swallowing it (and a later `}` or command) as quoted text.
 /// `None` means the input ended mid-quote.
+/// Skip a bare `${…}` interpolation from `start` (just past `${`), as
+/// [`parse_var`] does — to the first `}`. An unterminated `${` ends at the
+/// physical line boundary (a line-local error), leaving no structural brace.
+/// Returns the index just past the close (or at the newline / end of input).
+fn skip_interpolation(chars: &[(usize, char)], start: usize) -> usize {
+    let mut k = start;
+    while k < chars.len() {
+        match chars[k].1 {
+            '}' => return k + 1,
+            '\n' => return k,
+            _ => k += 1,
+        }
+    }
+    k
+}
+
 fn skip_quote(chars: &[(usize, char)], start: usize, quote: char, escapes: bool) -> Option<usize> {
     let mut k = start;
     while k < chars.len() {
