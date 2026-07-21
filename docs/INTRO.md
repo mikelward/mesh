@@ -18,7 +18,7 @@ Assign a value with `=` and read it back with `$name`:
 
 ```
 file = 'My Report.pdf'
-rm $file          # one argument — "My Report.pdf", space and all
+puts $file          # My Report.pdf — one argument, space and all
 ```
 
 A value is always exactly one value. The space in `$file` can't split it into two
