@@ -158,7 +158,7 @@ There are four kinds of modifier, and the difference matters:
   it yields the raw bytes as **one string**, not a list (it is what turns the
   default newline-splitting off). So every split modifier produces a list
   *except* `:raw`, whose whole job is to hand back a single byte-string.
-- **Value modifiers** (path and string — `:stem`, `:dir`, `:strip`, …) transform
+- **Value modifiers** (path and string — `:stem`, `:dir`, `:stripend`, …) transform
   a value, and **map over a list** automatically (applied to each element).
 - **Collection modifiers** (`:len :first :last :rest :init :keys :values
   :has :get :join :dedup`) consume a list or map **as a whole** — they do *not* map element-wise
@@ -267,10 +267,28 @@ This modifier system is the direct answer to
 dead-simple way to strip a suffix"): it is a first-class language feature, not a
 custom function.
 
-**String** *(open — initial set)*: `:strip(PREFIX/SUFFIX)`, `:replace(OLD, NEW)`,
-and likely `:upper` / `:lower`. To be fleshed out.
+**String** *(open — initial set)*: `:replaceall(OLD, NEW)` and its anchored/removal
+kin (`:replacestart` / `:replaceend` / `:stripstart` / `:stripend`, plus
+`:trimstart` / `:trimend` for whitespace), and likely `:upper` / `:lower`. To be
+fleshed out.
 
-**Regex substitution is `:replace` with a regex `OLD`** *(decided — the "sed
+**Anchored and removal variants** *(decided; lower priority to implement)*. Alongside
+the global `:replaceall`, a start/end-anchored
+`:replacestart(OLD, NEW)` / `:replaceend(OLD, NEW)` act only on a **leading** /
+**trailing** match — their `OLD` is a match slot exactly like `:replaceall`'s (a
+string is literal, a `/…/` is a regex, so `$s:replaceend(/\.js$/, ".ts")` works).
+`:stripstart(PREFIX)` / `:stripend(SUFFIX)` are the removal
+shorthand (`:stripend(x)` == `:replaceend(x, "")`): each drops the affix **once if the
+string starts / ends with it**, and is a no-op otherwise — `"report.tar.gz":stripend(".tar.gz")`
+is `report`. This is the everyday "drop a known suffix" reach — the spirit of bash's
+`basename "$f" .tar.gz`, though a pure string op, not its equal (it doesn't strip the
+dirname, and has none of basename's POSIX corner cases) — with no regex escaping and no
+interior-match surprise (a global `:replaceall(".tar.gz", "")` would also rewrite
+`a.tar.gz.bak`). Separately,
+`:trimstart` / `:trimend` peel **whitespace** (or a given **char set**) repeatedly —
+the trailing-newline case, not a known suffix.
+
+**Regex substitution is `:replaceall` with a regex `OLD`** *(decided — the "sed
 `s///` in a modifier" case)*. There is **no `:s/old/new/` form**. It would fight
 three settled decisions at once: **`:s` is already taken** — it is the terse
 spelling of the `:dotall` regex flag (see [`re()`](#tests-and-comparisons)), so `$f:s/…/…/` is
@@ -283,35 +301,37 @@ Reintroducing `s///` here would make it the sole place slashes delimit a modifie
 argument.
 
 Instead, the everyday substitution the user reaches for is the **existing
-`:replace(OLD, NEW)`** with a **regex** `OLD`:
+`:replaceall(OLD, NEW)`** with a **regex** `OLD`:
 
 ```
-$f:replace("foo", "bar")     # literal substring replace
-$f:replace(/foo/, bar)       # regex replace  — the :s/foo/bar case
-$f:replace(/foo/:i, bar)     # flags ride on the regex value (case-insensitive)
-$line:replace(re($pat), $new) # pattern arrives as a string → re()
+$f:replaceall("foo", "bar")     # literal substring replace
+$f:replaceall(/foo/, bar)       # regex replace  — the :s/foo/bar case
+$f:replaceall(/foo/:i, bar)     # flags ride on the regex value (case-insensitive)
+$line:replaceall(re($pat), $new) # pattern arrives as a string → re()
 ```
 
 - **The argument type decides**, no second operator: a **string** `OLD` matches
   **verbatim** (metacharacters are literal), a **regex** `OLD` (`/…/` or an `re()`
   value) matches as a pattern. This is the same no-silent-coercion rule as `~` and
-  `:int` — a string full of `.`/`*` never quietly becomes a pattern. `:replace`'s
-  **first argument is a [regex match slot](#tests-and-comparisons)** — the fourth,
-  alongside the `~`/`!~` RHS, the `:match` argument, and a `match` arm — so a bare
-  `/foo/` there is a regex, not a path. (`NEW` is an ordinary value slot; a `/…/`
-  there is a literal string.)
-- **Global by default** — every occurrence, matching the [history `old=new`](#history-expansion)
+  `:int` — a string full of `.`/`*` never quietly becomes a pattern. The **first
+  (`OLD`) argument of the replace family** — `:replaceall` and its anchored
+  `:replacestart` / `:replaceend` kin — is a [regex match slot](#tests-and-comparisons),
+  the fourth, alongside the `~`/`!~` RHS, the `:match` argument, and a `match` arm — so
+  a bare `/foo/` there is a regex, not a path. (`NEW` is an ordinary value slot; a
+  `/…/` there is a literal string.)
+- **Global by default** — the name says so: every occurrence, matching the [history `old=new`](#history-expansion)
   precedent (mesh has no per-line notion here for a `/g` toggle to hang off).
 - It is a **value modifier**, so it **maps over a list** element-wise like `:stem`
-  — `$paths:replace(/\.js$/, .ts)` rewrites each path.
+  — `$paths:replaceall(/\.js$/, .ts)` rewrites each path.
 - **Capture backreferences** in `NEW` for a regex `OLD`: `${1}` / `${name}` splice
   the numbered / named group of *this match* (a replacement-local scope, not an
   outer variable — bare `$1` stays reserved, mesh having no positional `$1`). For a
-  **computed** replacement, `NEW` may be a **lambda** taking the match — `:replace(/(\d+)/, func(m) { $m:int + 1 })` — the callback form, consistent with `:map` / `:filter` / `:each`.
+  **computed** replacement, `NEW` may be a **lambda** taking the match — `:replaceall(/(\d+)/, func(m) { $m:int + 1 })` — the callback form, consistent with `:map` / `:filter` / `:each`.
 
 *(Open sub-questions: the exact backref spelling (`${1}` vs `$1` inside the
-replacement string), and whether to keep the global default absolute or offer a
-first-only cap (`:replace(/re/, new, count: 1)`) — deferred until a port needs it.)*
+replacement string), and whether a first-only variant is ever needed — it would be a
+separate `:replace`, mirroring JavaScript's `replace` / `replaceAll` split — deferred
+until a port needs it.)*
 
 **String→number parse** *(decided — porting `total`, `bisect`)*. Values from argv /
 `gets` / `$(…)` captures are **strings**, and arithmetic / `+=` are int-only (no
@@ -762,8 +782,8 @@ real problem it creates — an absolute path or glob also begins with `/` — wi
 **word-shape rule**, replacing the blunt "any leading slash in a match slot is a
 regex."
 
-In a **match slot** (the `~` / `!~` RHS, a `:match` argument, `:replace`'s first
-argument, a `match` arm), a word
+In a **match slot** (the `~` / `!~` RHS, a `:match` argument, the replace family's
+`OLD` argument — `:replaceall` / `:replacestart` / `:replaceend` — a `match` arm), a word
 beginning with `/` is a **regex** *only* when its **base** — the word stripped of any
 trailing recognized `:` flag modifiers — is a clean `/BODY/`: the closing `/` is the
 final character of the base and `BODY` has no unescaped interior `/`. So `/\d+/:i` is
@@ -1258,7 +1278,8 @@ in the pattern, since `/` bounds the literal), and the lexer strips only that
 backslash. Every *other* backslash reaches the regex engine verbatim (`\d`, `\.`,
 `\\`), and `$` inside it is always the anchor; build a regex with a variable hole via
 `re("…$var…")` (see the interpolation note below). A regex literal is recognized **only in the match slots** — the
-`~`/`!~` RHS, the `:match` argument, `:replace`'s **first** (`OLD`) argument, and a
+`~`/`!~` RHS, the `:match` argument, the replace family's **first** (`OLD`) argument
+(`:replaceall` / `:replacestart` / `:replaceend`), and a
 `match` arm — and there a leading-slash
 word is a regex **only when its base is a clean `/BODY/`** (the base is the word minus
 any trailing `:` flag modifiers, so `/\d+/:i` qualifies; the closing `/` is the base's
@@ -1271,8 +1292,9 @@ trailing slash: `$p ~ /tmp/` is the regex `tmp`; write `$p ~ /tmp` for the path 
 `fnmatch($p, "/tmp/")` / `== "/tmp/"`).
 **Everywhere else a `/…/` word is a path or string** — `cd /tmp/`, `grep /usr/bin`,
 `$env.PATH:has(/usr/bin)`, `p = /etc/hosts` are all unaffected (a `/…/` is a regex
-only in the enumerated match slots above — including the `:match` / `:replace`
-argument slots — never in a plain argument or any *other* modifier slot, so
+only in the enumerated match slots above — including the `:match` and replace-family
+(`:replaceall` / `:replacestart` / `:replaceend`) `OLD` argument slots — never in a
+plain argument or any *other* modifier slot, so
 `:has(/usr/bin)` stays a path). To
 hold a regex as a **value** anywhere else — a variable, a list, another argument — or
 to turn a pattern that arrives as a **string** (`fromto $from $to`, any `grep`-like)
@@ -3089,10 +3111,13 @@ to avoid" rather than promising the latter as done.
 - **Exclusion `~` alias** — resolved by elimination: `~` / `!~` is now the
   **pattern-match** operator ([Tests and comparisons](#tests-and-comparisons)),
   so glob exclusion keeps the spaced infix `-` only.
-- **String modifier set** — beyond `:strip` / `:replace`. Substitution is settled:
-  a **regex `OLD` in `:replace`** (`:replace(/foo/, bar)`), **not** a `:s/old/new/`
-  form (`:s` is the `:dotall` flag; arguments stay parenthesized) — see
-  [Modifiers](#modifiers). Remaining: backref spelling and a first-only cap.
+- **String modifier set** — `:replaceall` (global substitution) with decided but
+  lower-priority anchored/removal kin (`:replacestart` / `:replaceend` /
+  `:stripstart` / `:stripend`, plus `:trimstart` / `:trimend` for whitespace).
+  Substitution is settled: a **regex `OLD` in `:replaceall`** (`:replaceall(/foo/, bar)`),
+  **not** a `:s/old/new/` form (`:s` is the `:dotall` flag; arguments stay
+  parenthesized) — see [Modifiers](#modifiers). Remaining: backref spelling and
+  whether a first-only `:replace` is ever needed.
 - **Member access inside string interpolation** — currently *(decided)* a bare
   `$name` inside `"…"` interpolates just the variable, so a following `.`/`[` is
   literal (`"$file.txt"` appends `.txt`; `"$m.key"` is `$m` then `.key`), and any
