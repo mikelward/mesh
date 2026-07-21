@@ -2,7 +2,7 @@
 
 **mesh** is an interactive-first Unix shell: the familiar POSIX spine you already
 have in your fingers (`$()`, `&&`/`||`, `~`, pipes, redirection), with the sharp
-edges removed and a few things that should have been ergonomic all along made so.
+edges removed and several things made more ergonomic and consistent.
 Pipes still carry **bytes** — every external program and coreutil works exactly as
 elsewhere — but *inside* the shell you get **real values**: lists, maps, and
 type-directed operations, with no word-splitting footguns.

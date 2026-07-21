@@ -108,13 +108,6 @@ mesh$ puts '*'
 *
 ```
 
-Pieces sitting next to each other join into one argument:
-
-```
-mesh$ puts --flag='a b'
---flag=a b
-```
-
 ## Variables
 
 Bind a value with `=`, read it back with `$name`:
@@ -133,11 +126,15 @@ mesh$ puts "$greeting, world"
 hello, world
 ```
 
-Wrap the name in braces when the next character would otherwise run into it:
+Wrap the name in braces when the next character would otherwise run into it — or
+keep the literal part in its own quotes, since pieces sitting next to each other
+join into one argument:
 
 ```
 mesh$ n = 42
 mesh$ puts "${n}nd"
+42nd
+mesh$ puts $n"nd"
 42nd
 ```
 
