@@ -17,12 +17,12 @@ and the rationale behind each choice.
 Assign a value with `=` and read it back with `$name`:
 
 ```
-dir = 'My Documents'
-rm $dir          # one argument — "My Documents", space and all
+file = 'My Report.pdf'
+rm $file          # one argument — "My Report.pdf", space and all
 ```
 
-A value is always exactly one value. The space in `$dir` can't split it into two
-arguments, and an unquoted `$dir` is never re-matched against filenames — so
+A value is always exactly one value. The space in `$file` can't split it into two
+arguments, and an unquoted `$file` is never re-matched against filenames — so
 there's no quoting to remember and nothing splits behind your back.
 
 `$PATH` is a **list**, not a colon-string, so the `IFS=:` juggling disappears.
