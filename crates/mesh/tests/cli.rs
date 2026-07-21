@@ -927,6 +927,18 @@ fn a_bare_return_before_any_command_reports_success() {
 }
 
 #[test]
+fn invalid_utf8_mid_function_does_not_leak_the_body() {
+    // An invalid-UTF-8 line while a `func` body is buffered must not release the
+    // remaining body lines to the top level. `f` is never called, so its body
+    // (the `puts`) must not run during definition.
+    let out = run_with_bytes(b"func f() {\n\xff\nputs SHOULD_NOT_LEAK\n}\nputs after\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("SHOULD_NOT_LEAK"), "body leaked: {stdout}");
+    assert_eq!(stdout, "after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid UTF-8"));
+}
+
+#[test]
 fn a_lexer_error_inside_a_body_does_not_release_it_to_the_top_level() {
     // A body line the runtime lexer rejects (here the unsupported `2>` form)
     // must not stop brace buffering: the still-open `{` keeps the rest of the

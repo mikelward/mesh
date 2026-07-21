@@ -716,13 +716,26 @@ fn run_piped() -> ExitCode {
             }
         }
 
-        let text = match std::str::from_utf8(&line) {
+        // Hold a lossy copy alive if we substitute invalid bytes below.
+        let lossy;
+        let text: &str = match std::str::from_utf8(&line) {
             Ok(text) => text,
             Err(_) => {
                 eprintln!("mesh: invalid UTF-8 in input");
                 last = 1;
-                pending.clear();
-                continue;
+                if pending.is_empty() {
+                    // Not mid-definition: reject and skip the malformed line.
+                    continue;
+                }
+                // Mid-definition: a bare `pending.clear()` here would release the
+                // rest of the buffered `func` body into the top-level loop (a
+                // destructive body command would then run during definition).
+                // Substitute U+FFFD for the invalid bytes and keep buffering, so
+                // the open `{` stays open and the body stays quarantined until its
+                // brace closes; the definition then parses (its lossy body errors
+                // when called) rather than leaking.
+                lossy = String::from_utf8_lossy(&line).into_owned();
+                &lossy
             }
         };
         pending.push_str(text);
