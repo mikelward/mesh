@@ -384,7 +384,7 @@ files = glob($p)          # or bind the list and reuse it
 ```
 
 Because `glob()` is eager, deferring it needs no special lazy type — just wrap it in a
-thunk: `later = func() { glob("*.txt") }` stores the *call*, and each `later()` re-globs
+thunk: `later = func() { glob("*.txt") }` stores the *call*, and each `$later()` re-globs
 against the **current** filesystem (fresh every time, which is what "lazy" is usually
 for).
 
