@@ -127,6 +127,22 @@ for line in $(seq 3) { n += 1 }
 puts $n
 ```
 
+Isolation is opt-in when you actually want it. A `fork` block runs in a child,
+so changes to its working directory, environment, umask, and variables do not
+leak back into the shell:
+
+```
+fork { cd build; make }
+```
+
+Functions likewise run in the current process by default. Prefix the definition
+with `fork` when every call should be isolated:
+
+```
+func enter-project(name) { cd ~/work/$name }       # the cd persists
+fork func build() { cd build; make }                # the cd is isolated
+```
+
 Here's a real one — "list this machine's IPs" — from a hand-rolled config,
 in mesh:
 

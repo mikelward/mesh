@@ -99,7 +99,8 @@ build track and the design track converge.
 
 **Scope (indicative — driven by `DESIGN.md` as it settles):** parser for the
 clean-break grammar; real values (lists, maps) with no word-splitting;
-`$`-expansion and the `...` spread; `:`-modifiers; `if`/`for`/`match`; `func`.
+`$`-expansion and the `...` spread; `:`-modifiers; `if`/`for`/`match`; `func`;
+explicit isolation with `fork { … }` and `fork func name(params) { … }`.
 
 **Acceptance:** the `DESIGN.md`/`docs/INTRO.md` examples run as written.
 

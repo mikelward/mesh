@@ -15,8 +15,10 @@
 //! (an interpolation resolved later, in [`crate::expand`], against the variable
 //! store). Interpolation and expansion never word-split.
 //!
-//! Deferred: `:` value modifiers, `${…}` beyond a name/`.member`, heredocs, and
-//! `\`-newline continuation across input lines.
+//! Deferred: structured syntax (`{ … }`, `func`, `fork`, and `in`), `:` value
+//! modifiers, `${…}` beyond a name/`.member`, heredocs, and `\`-newline
+//! continuation across input lines. The eventual isolated forms are explicit
+//! `fork { … }` / `fork func name(params) { … }`, not parenthesized bodies.
 
 /// A variable reference: `$name`, `${name}`, or `$env.member`.
 #[derive(Debug, PartialEq, Eq)]
