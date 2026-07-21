@@ -960,6 +960,17 @@ fn invalid_utf8_in_a_function_body_discards_the_definition() {
 }
 
 #[test]
+fn a_brace_in_the_parameter_list_does_not_swallow_later_commands() {
+    // A stray `{` in the signature is header text, not block structure, so the
+    // body's `}` still closes the (malformed) definition: the invalid parameter
+    // is reported and the next command runs, rather than buffering through EOF.
+    let out = run_with_input("func f({) { puts bad }\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("parameter name"), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
 fn an_unterminated_interpolation_in_a_body_does_not_swallow_later_commands() {
     // A bare `${x` is a line-local interpolation error, not a structural brace,
     // so the body's `}` still closes the definition and the next command runs.

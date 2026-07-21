@@ -525,14 +525,33 @@ pub fn is_ident(s: &str) -> bool {
 /// Is a multi-line `func … { … }` body still open — its opening `{` seen but its
 /// matching close not yet reached? The read loop uses this to keep buffering.
 ///
-/// Keyed on the body's **first** close, not net depth: once the opening brace has
-/// matched, the definition is complete and any trailing text (`func f() {} {`) is
-/// an error to report now, not a reason to keep swallowing later commands. A
-/// `func` head with no `{` yet (`func f()`) is not "open" either — it runs and
-/// reports the missing body rather than buffering forever.
+/// Balances only the **body**, past the parameter list, so a stray brace in the
+/// signature (`func f({) { … }`) isn't mistaken for block structure and doesn't
+/// keep the reader buffering. Keyed on the body's **first** close, not net depth:
+/// once the opening brace has matched, the definition is complete and any
+/// trailing text (`func f() {} {`) is an error to report now, not a reason to
+/// keep swallowing later commands. A `func` head with no body `{` yet
+/// (`func f()`) is not "open" either — it runs and reports the missing body
+/// rather than buffering forever.
 pub fn needs_more_input(text: &str) -> bool {
-    let scan = scan_braces(text, 0);
+    // Skip `func name(params)` so a `{`/`}` inside the signature is not counted;
+    // if the `(…)` isn't closed yet, fall back to the whole text (unchanged
+    // behavior — a signature does not span input lines).
+    let body = body_after_params(text).unwrap_or(text);
+    let scan = scan_braces(body, 0);
     scan.close.is_none() && scan.depth > 0
+}
+
+/// The slice just past the parameter list's `)` in a `func name(params) …`
+/// header, or `None` if there is no `(…)` closed yet. The name can't contain
+/// `(` and v1 parameters can't contain `)`, so the first `(` and the first `)`
+/// after it delimit the signature; anything (including a stray brace) inside is
+/// header text, not body structure.
+fn body_after_params(text: &str) -> Option<&str> {
+    let open = text.find('(')?;
+    let rest = &text[open + 1..];
+    let close = rest.find(')')?;
+    Some(&rest[close + 1..])
 }
 
 /// The result of a bare-level brace scan (see [`scan_braces`]).
