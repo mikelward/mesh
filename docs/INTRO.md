@@ -14,18 +14,16 @@ and the rationale behind each choice.
 
 ## Values don't split behind your back
 
-The single most common bash bug is that an unquoted variable word-splits and globs.
-mesh has no word splitting: a value is one value.
+Assign a value with `=` and read it back with `$name`:
 
 ```
-# bash: breaks on any space in $file; empty $file makes `[ ]` a parse error
-rm $file
-[ $x = y ] && ...
-
-# mesh: $file is exactly one argument, always
-rm $file
-if $x == y { ... }
+dir = 'My Documents'
+rm $dir          # one argument — "My Documents", space and all
 ```
+
+A value is always exactly one value. The space in `$dir` can't split it into two
+arguments, and an unquoted `$dir` is never re-matched against filenames — so
+there's no quoting to remember and nothing splits behind your back.
 
 `$PATH` is a **list**, not a colon-string, so the `IFS=:` juggling disappears.
 To **prepend** (bash's `PATH="/opt/bin:$PATH"` — new dir wins), build the list with
