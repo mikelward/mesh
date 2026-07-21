@@ -280,42 +280,39 @@ appears.)*
 
 - `**` — recursive, **on by default** (no `globstar`-style opt-in).
 - `*/`, `**/` — directories (trailing slash, existing muscle memory).
-- **Type qualifiers** — **two equivalent spellings**. The `:`-modifier form
-  `*:files` / `*:f` (a readable word *or* the terse letter, exactly like every
-  other `:` modifier) is the idiom for the common single-type filter; the
-  `(...)` form `*(f)` (from `find -type`, not zsh punctuation) is retained and
-  is the general form for ANDed sets and arg-carrying predicates. They coincide
-  for a single type:
+- **Qualifiers are the glob's argument list.** The `(...)` after a glob carries its
+  **options**, the same comma grammar as any [value call](#calling-for-a-value-and-lambdas)
+  — `*(...)` is sugar for `glob("*", ...)`. The options are **ANDed predicates** of
+  three kinds:
+  - **`type:`** — the file-type dimension, *mutually exclusive*: `type: file`,
+    `type: dir`, `type: symlink`, or an alternation `type: file|dir` for "either." The
+    `find -type` **letters are shorthand** — `f` ≡ `type: file`, `d` ≡ `type: dir`,
+    `l` ≡ `type: symlink` (and the rarer `p s b c` for fifo/socket/block/char).
+  - **boolean predicates** — orthogonal tests: `exec: true` (shorthand `x`),
+    `empty: true`. A file can be executable *and* over a size, so these are independent
+    booleans, not part of the exclusive `type:`.
+  - **comparisons** — real predicate expressions with the type-directed operators,
+    `size > 1M`, `age < 1d` (`>` / `<` read better than zsh's `+/-` age codes).
 
   ```
-  *:f       ==  *(f)         # plain files             (find -type f)
-  *:files   ==  *(f)         #   ...spelled out
-  *:d       ==  *(d)         # directories
-  *:l       ==  *(l)         # symlinks
-  *:f:x     ==  *(f, x)      # chain for AND: executable files
-  **:files  ==  **(f)        # recursive, files only
+  *(type: file)             # long form
+  *(f)                      # shorthand ≡ type: file
+  *(f, x)                   # ≡ type: file, exec: true — executable files
+  *(f, size > 1M)           # type + a comparison predicate
+  *(type: file|dir)         # either type
+  glob("*", type: file, size > 1M)   # the same options, via the function
   ```
 
-  Type letters follow `find -type` (`f d l p s b c`) plus `x` (executable),
-  each with a word alias (`files dirs links … exec`); in `(...)` they are a
-  **comma-separated** ANDed list (`*(f, x)` = executable files), the same
-  parens-are-comma rule as a value call. The `:`
-  forms are **filter modifiers** (see [Modifiers](#modifiers)) — they select a
-  path list by a file-type predicate, so they also work on a plain list
-  (`$paths:files`), and on a glob the engine **fuses** the filter into matching,
-  so `**:files` never materializes non-files.
-
-- **Predicate qualifiers** *(open — direction)*: the arg-carrying predicates
-  (`size>1M`, `age<1d`, `empty`) stay in `(...)` since they do not fit a bare
-  `:word` — `*(f, size>1M)`, `*(f, age<1d)`. Comparisons (`>` / `<`) read better
-  than zsh's `+/-` age codes; whether these also grow `:word(arg)` modifier
-  spellings is folded into this open question.
+  There is also a terse **`:`-modifier** shorthand for the common single-type filter,
+  usable on a glob *or* a plain list — `*:f` / `*:files` / `$paths:files`, so
+  `*:f == *(f)` — which the engine **fuses** into matching, so `**:files` never
+  materializes non-files.
 
 - **These qualifiers are expansion-only.** `(f)` / `(d)` / `(x)` and the `size` /
   `age` / `empty` predicates all inspect the **filesystem**, so they belong to
   globbing (finding files), never to string matching. A `~` / `match` / `fnmatch`
   pattern uses only the plain glob metacharacters (`* ? [ ] { } **`), which need no
-  disk: `$f ~ *.txt` tests the string alone, while `*(f)` / `*(size>1M)` are
+  disk: `$f ~ *.txt` tests the string alone, while `*(f)` / `*(size > 1M)` are
   meaningful only where real files exist to stat.
 
 - **Exclusion** — a spaced infix `-`:
@@ -1811,7 +1808,7 @@ to a bool):
   `$p:exec` / `$p:read` / `$p:write` are `-x` / `-r` / `-w`. (`-z`/`-n` are just
   `$s == ""` / `$s:len > 0`.) The **binary** file relations `-nt` / `-ot` / `-ef`
   (newer / older / same-inode) are the same comparison family as the
-  [predicate qualifiers](#globbing) (`age<`), spelled `$a:mtime > $b:mtime` and
+  [predicate qualifiers](#globbing) (`age < 1d`), spelled `$a:mtime > $b:mtime` and
   `$a:same($b)` rather than cryptic digraphs. Like `test`, these **dereference
   symlinks** — `:mtime`/`:atime`/`:ctime` and `:same` act on the link *target*, so a
   symlink and its target share an mtime and are `:same`; `:type == link` is how you
@@ -1852,7 +1849,7 @@ to a bool):
   integer is **not** a
   Duration (the ms-vs-s footgun mesh kills), but the process boundary stays bytes, so
   an external `sleep 2` still passes `"2"` — the type governs only *in-shell* values.
-  One literal grammar then unifies the glob `age<1d` predicate, file-time
+  One literal grammar then unifies the glob `age < 1d` predicate, file-time
   comparisons, `retry --sleep 2s`, and the prompt's `took 3s`. *(TODO — **timezone /
   calendar handling** deferred: `Instant` parse and format (`$t:format("%F %T")`,
   `"…":datetime`, and the tz conversion behind `tz2tz`/`udate`/`utc2`) delegate to
@@ -3054,7 +3051,7 @@ to avoid" rather than promising the latter as done.
   `"$file".bak`, which reintroduces a "what does `.` after a closing quote mean"
   ambiguity once `.` binds access to expressions. Interactive path-building leans to
   the current rule; data-heavy scripting leans to the flip.
-- **Predicate qualifier syntax** — confirm `size>` / `age<` / `mtime<` forms.
+- **Predicate qualifier syntax** — confirm `size >` / `age <` / `mtime <` forms.
 - **History expansion — decided** ([History expansion](#history-expansion)):
   interactive-only, quote-safe `!!` / `!string` / `!$` (with `!*` / `!n` deferred);
   the `!` clash resolved lexically (a designator must follow, so `!=` / `!~` and a
