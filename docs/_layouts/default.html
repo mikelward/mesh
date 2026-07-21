@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page.title | default: site.title }}</title>
+  <!-- Ubuntu Mono, loaded as a web font so it renders on every device (Android, iOS,
+       Windows, Linux) rather than only where it happens to be installed. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Ubuntu+Mono:wght@400;700&display=swap">
+  <style>
+    :root {
+      /* Inherit the reader's own light/dark text, background, and link colors —
+         no custom palette imposed. */
+      color-scheme: light dark;
+      --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      /* Ubuntu Mono is web-loaded (primary, everywhere). The rest are local
+         fallbacks if it fails to load: Menlo (macOS), Consolas (Windows), then
+         clean Linux/Android monos, ending at the generic keyword. */
+      --mono: "Ubuntu Mono", Menlo, Consolas, "Roboto Mono", "DejaVu Sans Mono",
+              ui-monospace, monospace;
+      /* Theme-neutral surfaces: a translucent gray reads correctly on both a
+         light and a dark background without committing to a color. */
+      --code-surface: rgba(127, 127, 127, 0.12);
+      --rule: rgba(127, 127, 127, 0.28);
+    }
+
+    * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      margin: 0 auto;
+      max-width: 46rem;
+      padding: 2rem 1.1rem 5rem;
+      font-family: var(--sans);
+      font-size: 17px;
+      line-height: 1.65;
+      overflow-wrap: break-word;
+    }
+
+    h1, h2, h3, h4 { line-height: 1.25; margin-top: 2.2rem; }
+    h2 { padding-bottom: .3rem; border-bottom: 1px solid var(--rule); }
+    hr { border: 0; border-top: 1px solid var(--rule); margin: 2.2rem 0; }
+
+    /* Monospace everywhere code appears — a clear mono, never Courier New. */
+    code, pre, kbd, samp { font-family: var(--mono); }
+    code {
+      background: var(--code-surface);
+      padding: .15em .4em;
+      border-radius: 6px;
+      font-size: .88em;
+    }
+    pre {
+      background: var(--code-surface);
+      border: 1px solid var(--rule);
+      border-radius: 8px;
+      padding: .9rem 1rem;
+      overflow-x: auto;                /* long lines scroll instead of wrapping — key on mobile */
+      font-size: .9rem;
+      line-height: 1.5;
+    }
+    pre code { background: none; padding: 0; font-size: inherit; }
+
+    /* The convention in these transcripts: bold is what YOU type. Weight only,
+       no color, so typed input stands out while staying in the reader's palette. */
+    pre strong, pre b { font-weight: 700; }
+
+    blockquote {
+      margin: 1rem 0;
+      padding: .2rem 1rem;
+      border-left: 3px solid var(--rule);
+      opacity: .85;
+    }
+    table { border-collapse: collapse; display: block; overflow-x: auto; }
+    th, td { border: 1px solid var(--rule); padding: .4rem .7rem; }
+    img { max-width: 100%; }
+  </style>
+</head>
+<body>
+  {{ content }}
+</body>
+</html>

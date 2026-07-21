@@ -1,0 +1,16 @@
+# Jekyll config for the GitHub Pages site served from this /docs folder.
+# Kept intentionally small: a self-contained default layout (_layouts/default.html)
+# supplies the styling, so no external theme gem is needed.
+title: mesh
+description: An interactive-first Unix shell, by example.
+
+markdown: kramdown
+kramdown:
+  input: GFM            # keep GitHub-flavored fenced code blocks and tables
+
+# Apply the default layout to every page without adding front matter to each file.
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
