@@ -266,6 +266,49 @@ custom function.
 **String** *(open — initial set)*: `:strip(PREFIX/SUFFIX)`, `:replace(OLD, NEW)`,
 and likely `:upper` / `:lower`. To be fleshed out.
 
+**Regex substitution is `:replace` with a regex `OLD`** *(decided — the "sed
+`s///` in a modifier" case)*. There is **no `:s/old/new/` form**. It would fight
+three settled decisions at once: **`:s` is already taken** — it is the terse
+spelling of the `:dotall` regex flag (see [`re()`](#tests-and-comparisons)), so `$f:s/…/…/` is
+ambiguous with a flagged value; **arguments are parenthesized, with no exceptions**
+(a regex argument is a `/…/` literal *inside* the parens like any other value — see
+[Modifiers](#modifiers)), so a slash-delimited inline argument is the one shape the
+grammar deliberately doesn't have; and mesh **already declined sed's `s///`** for
+[history substitution](#history-expansion) in favor of the `old=new` mapping form.
+Reintroducing `s///` here would make it the sole place slashes delimit a modifier
+argument.
+
+Instead, the everyday substitution the user reaches for is the **existing
+`:replace(OLD, NEW)`** with a **regex** `OLD`:
+
+```
+$f:replace("foo", "bar")     # literal substring replace
+$f:replace(/foo/, bar)       # regex replace  — the :s/foo/bar case
+$f:replace(/foo/:i, bar)     # flags ride on the regex value (case-insensitive)
+$line:replace(re($pat), $new) # pattern arrives as a string → re()
+```
+
+- **The argument type decides**, no second operator: a **string** `OLD` matches
+  **verbatim** (metacharacters are literal), a **regex** `OLD` (`/…/` or an `re()`
+  value) matches as a pattern. This is the same no-silent-coercion rule as `~` and
+  `:int` — a string full of `.`/`*` never quietly becomes a pattern. `:replace`'s
+  **first argument is a [regex match slot](#tests-and-comparisons)** — the fourth,
+  alongside the `~`/`!~` RHS, the `:match` argument, and a `match` arm — so a bare
+  `/foo/` there is a regex, not a path. (`NEW` is an ordinary value slot; a `/…/`
+  there is a literal string.)
+- **Global by default** — every occurrence, matching the [history `old=new`](#history-expansion)
+  precedent (mesh has no per-line notion here for a `/g` toggle to hang off).
+- It is a **value modifier**, so it **maps over a list** element-wise like `:stem`
+  — `$paths:replace(/\.js$/, .ts)` rewrites each path.
+- **Capture backreferences** in `NEW` for a regex `OLD`: `${1}` / `${name}` splice
+  the numbered / named group of *this match* (a replacement-local scope, not an
+  outer variable — bare `$1` stays reserved, mesh having no positional `$1`). For a
+  **computed** replacement, `NEW` may be a **lambda** taking the match — `:replace(/(\d+)/, func(m) { $m:int + 1 })` — the callback form, consistent with `:map` / `:filter` / `:each`.
+
+*(Open sub-questions: the exact backref spelling (`${1}` vs `$1` inside the
+replacement string), and whether to keep the global default absolute or offer a
+first-only cap (`:replace(/re/, new, count: 1)`) — deferred until a port needs it.)*
+
 **String→number parse** *(decided — porting `total`, `bisect`)*. Values from argv /
 `gets` / `$(…)` captures are **strings**, and arithmetic / `+=` are int-only (no
 coercion — `n += "x"` fails) with `<` / `>` comparing strings *lexically*. The
@@ -715,7 +758,8 @@ real problem it creates — an absolute path or glob also begins with `/` — wi
 **word-shape rule**, replacing the blunt "any leading slash in a match slot is a
 regex."
 
-In a **match slot** (the `~` / `!~` RHS, a `:match` argument, a `match` arm), a word
+In a **match slot** (the `~` / `!~` RHS, a `:match` argument, `:replace`'s first
+argument, a `match` arm), a word
 beginning with `/` is a **regex** *only* when its **base** — the word stripped of any
 trailing recognized `:` flag modifiers — is a clean `/BODY/`: the closing `/` is the
 final character of the base and `BODY` has no unescaped interior `/`. So `/\d+/:i` is
@@ -1210,7 +1254,8 @@ in the pattern, since `/` bounds the literal), and the lexer strips only that
 backslash. Every *other* backslash reaches the regex engine verbatim (`\d`, `\.`,
 `\\`), and `$` inside it is always the anchor; build a regex with a variable hole via
 `re("…$var…")` (see the interpolation note below). A regex literal is recognized **only in the match slots** — the
-`~`/`!~` RHS, the `:match` argument, and a `match` arm — and there a leading-slash
+`~`/`!~` RHS, the `:match` argument, `:replace`'s **first** (`OLD`) argument, and a
+`match` arm — and there a leading-slash
 word is a regex **only when its base is a clean `/BODY/`** (the base is the word minus
 any trailing `:` flag modifiers, so `/\d+/:i` qualifies; the closing `/` is the base's
 final character and `BODY` has no unescaped interior `/`); every other leading-`/`
@@ -1221,8 +1266,10 @@ and an **absolute** one now also goes bare — `$p ~ /usr/*/bin`, `$p ~ /tmp/*` 
 trailing slash: `$p ~ /tmp/` is the regex `tmp`; write `$p ~ /tmp` for the path (or
 `fnmatch($p, "/tmp/")` / `== "/tmp/"`).
 **Everywhere else a `/…/` word is a path or string** — `cd /tmp/`, `grep /usr/bin`,
-`$env.PATH:has(/usr/bin)`, `p = /etc/hosts` are all unaffected (a `/…/` is only a
-regex next to the match operators, never in a plain argument or modifier slot). To
+`$env.PATH:has(/usr/bin)`, `p = /etc/hosts` are all unaffected (a `/…/` is a regex
+only in the enumerated match slots above — including the `:match` / `:replace`
+argument slots — never in a plain argument or any *other* modifier slot, so
+`:has(/usr/bin)` stays a path). To
 hold a regex as a **value** anywhere else — a variable, a list, another argument — or
 to turn a pattern that arrives as a **string** (`fromto $from $to`, any `grep`-like)
 into one, you use the constructor **`re($str)`**: `$line ~ re($to)`,
@@ -3038,7 +3085,10 @@ to avoid" rather than promising the latter as done.
 - **Exclusion `~` alias** — resolved by elimination: `~` / `!~` is now the
   **pattern-match** operator ([Tests and comparisons](#tests-and-comparisons)),
   so glob exclusion keeps the spaced infix `-` only.
-- **String modifier set** — beyond `:strip` / `:replace`.
+- **String modifier set** — beyond `:strip` / `:replace`. Substitution is settled:
+  a **regex `OLD` in `:replace`** (`:replace(/foo/, bar)`), **not** a `:s/old/new/`
+  form (`:s` is the `:dotall` flag; arguments stay parenthesized) — see
+  [Modifiers](#modifiers). Remaining: backref spelling and a first-only cap.
 - **Member access inside string interpolation** — currently *(decided)* a bare
   `$name` inside `"…"` interpolates just the variable, so a following `.`/`[` is
   literal (`"$file.txt"` appends `.txt`; `"$m.key"` is `$m` then `.key`), and any
