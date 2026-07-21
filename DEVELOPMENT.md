@@ -133,7 +133,8 @@ mesh/
 │           ├── repl.rs     # read / tokenize / dispatch loop
 │           ├── lexer.rs    # quotes + escapes + $interpolation → words of pieces
 │           ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
-│           ├── vars.rs     # session-global variable store
+│           ├── vars.rs     # variable store (global + function-local scopes)
+│           ├── funcs.rs    # defined-function store (func name(params) { body })
 │           ├── builtins.rs # cd, pwd, puts, exit
 │           └── exec.rs     # launch external commands + pipelines/redirection
 ├── DESIGN.md               # vision + language design (the "why/what")

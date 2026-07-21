@@ -7,6 +7,7 @@
 mod builtins;
 mod exec;
 mod expand;
+mod funcs;
 pub mod lexer;
 mod repl;
 mod vars;

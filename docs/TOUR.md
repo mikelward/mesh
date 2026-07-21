@@ -151,6 +151,99 @@ mesh$ puts $env.HOME
 /home/you
 ```
 
+## Running several commands
+
+Put more than one command on a line. A `;` just runs them in order:
+
+```
+mesh$ puts one; puts two
+one
+two
+```
+
+`&&` runs the next command only if the one before it succeeded; `||` only if it
+failed:
+
+```
+mesh$ true && puts it-worked
+it-worked
+mesh$ false || puts fell-back
+fell-back
+```
+
+## Pipelines
+
+A `|` feeds one command's output straight into the next:
+
+```
+mesh$ echo hello world | wc -w
+2
+```
+
+## Sending output to files
+
+`>` writes output to a file, `>>` adds to the end of one, and `<` reads a
+command's input from a file:
+
+```
+mesh$ echo saved > note.txt
+mesh$ echo appended >> note.txt
+mesh$ wc -l < note.txt
+2
+```
+
+> `puts` and the other builtins can't be piped or redirected just yet — reach for
+> an external command like `echo` or `cat` when you need output in a pipe or a
+> file.
+
+## Defining your own commands
+
+`func` gives a block of commands a name. List the values it needs in the
+parentheses; inside the body they are ordinary variables:
+
+```
+mesh$ func greet(who) {
+...   puts "hello, $who"
+... }
+mesh$ greet world
+hello, world
+```
+
+The `... ` prompt means mesh is still reading the body — it keeps going until the
+closing `}`. A short function fits on one line:
+
+```
+mesh$ func greet(who) { puts "hello, $who" }
+```
+
+Call it with exactly the values it names. Variables you set inside a function are
+its own: they don't leak out, and one function never sees another's:
+
+```
+mesh$ label = outer
+mesh$ func relabel() { label = inner; puts $label }
+mesh$ relabel
+inner
+mesh$ puts $label
+outer
+```
+
+> The body sees the session's variables, but its own bindings stay inside. A
+> value set in a function is gone once the function returns.
+
+`return` ends a function early — on its own it just stops, and with a number it
+sets the status:
+
+```
+mesh$ func check(n) {
+...   puts "checking $n"
+...   return
+...   puts unreachable
+... }
+mesh$ check 7
+checking 7
+```
+
 ## When something is missing
 
 Reading a name you never set is an error, not a silent blank — and the shell

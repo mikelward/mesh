@@ -522,6 +522,200 @@ pub fn is_ident(s: &str) -> bool {
     matches!(read_name(&chars, 0), Some((_, n)) if n == chars.len())
 }
 
+/// Is a multi-line `func … { … }` body still open — its opening `{` seen but its
+/// matching close not yet reached? The read loop uses this to keep buffering.
+///
+/// Balances only the **body**, past the parameter list, so a stray brace in the
+/// signature (`func f({) { … }`) isn't mistaken for block structure and doesn't
+/// keep the reader buffering. Keyed on the body's **first** close, not net depth:
+/// once the opening brace has matched, the definition is complete and any
+/// trailing text (`func f() {} {`) is an error to report now, not a reason to
+/// keep swallowing later commands. A `func` head with no body `{` yet
+/// (`func f()`) is not "open" either — it runs and reports the missing body
+/// rather than buffering forever.
+pub fn needs_more_input(text: &str) -> bool {
+    // Balance only the body (past `func name(params)`) so a brace inside the
+    // signature is not counted; if the `(…)` isn't closed yet, fall back to the
+    // whole text (unchanged — a signature does not span input lines).
+    let body = body_region(text).unwrap_or(text);
+    let scan = scan_braces(body, 0);
+    scan.close.is_none() && scan.depth > 0
+}
+
+/// The body region of a `func` definition — everything past the header — used to
+/// balance braces without counting the signature. A parameter list is `(…)` that
+/// appears **before** the body's opening `{`; when present, the body starts past
+/// its `)` (so a stray brace inside the signature isn't block structure). When no
+/// `(` precedes the first `{` the header has no parameter list and that `{` opens
+/// the body — so a `(` on a later body line (`puts ()`) is never mistaken for the
+/// signature. `None` means the definition isn't open yet (no body `{`, or a
+/// parameter list still waiting for its `)`).
+fn body_region(text: &str) -> Option<&str> {
+    let paren = text.find('(');
+    let brace = text.find('{');
+    if let Some(p) = paren {
+        // A `(` before the first `{` (or before any `{`) is the signature.
+        if brace.is_none_or(|b| p < b) {
+            let rest = &text[p + 1..];
+            let close = rest.find(')')?; // param list not closed yet → keep buffering
+            return Some(&rest[close + 1..]);
+        }
+    }
+    // No signature before the body: the first `{`, if any, opens the body.
+    brace.map(|b| &text[b..])
+}
+
+/// The result of a bare-level brace scan (see [`scan_braces`]).
+pub struct BraceScan {
+    /// Byte offset of the `}` that first returned the depth to 0, if one was
+    /// reached — used to split a `func` body from whatever follows its `}`.
+    pub close: Option<usize>,
+    /// Net `{` minus `}` at the bare (unquoted) level over the whole input.
+    pub depth: i32,
+}
+
+/// Scan `text` for `{`/`}` nesting at the bare (unquoted) level, applying the
+/// same quote/raw-string/escape rules as [`split_line`], so a brace inside
+/// `'…'`, `"…"`, `r'…'`, `r"…"`, or after a `\` is never counted. Both the
+/// multi-line `func` reader ([`needs_more_input`]) and the body extractor
+/// (`repl::split_braced_body`) go through this one scanner, so the two cannot
+/// disagree about where a body ends.
+///
+/// Unlike `split_line`, it never fails: a line that lexes cleanly at the quote
+/// level but is unsupported higher up (a bare `2>`, a target-less `>`) does not
+/// change brace nesting, so a still-open `func` body keeps buffering instead of
+/// being released into the top-level loop. Only an unterminated quote stops the
+/// scan (the rest of the input is inside that string); the depth returned still
+/// reflects the open brace, so buffering continues and the syntax error surfaces
+/// when the completed definition is finally parsed.
+///
+/// Counting starts from `start_depth` (0 for a whole-line check, 1 for a body
+/// whose opening `{` has already been consumed).
+pub fn scan_braces(text: &str, start_depth: i32) -> BraceScan {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut depth = start_depth;
+    let mut close = None;
+    // Raw-string eligibility, tracked exactly as `split_line`: a raw prefix
+    // `r'`/`r"` is recognized only at a word start or right after a bare `=`.
+    let mut word_start = true;
+    let mut after_equals = false;
+    let mut k = 0;
+    while k < chars.len() {
+        let (byte, c) = chars[k];
+        let raw_eligible = word_start || after_equals;
+        // Default: an ordinary bare-word char. Boundary arms below re-enable
+        // raw eligibility exactly where the lexer would start a fresh word.
+        word_start = false;
+        after_equals = false;
+        match c {
+            _ if c.is_whitespace() => {
+                word_start = true;
+                k += 1;
+            }
+            // A backslash escapes the next char, so `\{` / `\}` are literal.
+            '\\' => k += 2,
+            '\'' | '"' => match skip_quote(&chars, k + 1, c, true) {
+                Some(next) => k = next,
+                None => return BraceScan { close, depth },
+            },
+            'r' if raw_eligible
+                && matches!(chars.get(k + 1).map(|&(_, c)| c), Some('\'') | Some('"')) =>
+            {
+                match skip_quote(&chars, k + 2, chars[k + 1].1, false) {
+                    Some(next) => k = next,
+                    None => return BraceScan { close, depth },
+                }
+            }
+            // A bare `${…}` interpolation: its braces belong to the interpolation,
+            // not to block structure, so skip to its close (as `parse_var` does)
+            // without counting them. An unterminated `${` is a line-local error, so
+            // it ends at the line boundary and leaves no dangling `{`.
+            '$' if chars.get(k + 1).map(|&(_, c)| c) == Some('{') => {
+                k = skip_interpolation(&chars, k + 2);
+            }
+            '{' => {
+                depth += 1;
+                k += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 && close.is_none() {
+                    close = Some(byte);
+                }
+                k += 1;
+            }
+            // Operators the lexer starts a fresh word after (so a following
+            // `r'…'` is raw): `;`, `|`/`||`, `<`, `>`/`>>`.
+            ';' | '|' | '<' | '>' => {
+                word_start = true;
+                k += 1;
+            }
+            // `&&` is a separator (fresh word after it); a lone `&` is a literal
+            // character and is *not* a word boundary.
+            '&' if chars.get(k + 1).map(|&(_, c)| c) == Some('&') => {
+                word_start = true;
+                k += 2;
+            }
+            // A bare `=` lets a raw prefix begin the value (`k=r'v'`).
+            '=' => {
+                after_equals = true;
+                k += 1;
+            }
+            _ => k += 1,
+        }
+    }
+    BraceScan { close, depth }
+}
+
+/// Advance past a quoted region in a `(byte, char)` slice. `start` is the index
+/// just past the opening quote. With `escapes`, a `\` escapes the next char
+/// (`'…'` / `"…"`); without, `\` is literal (raw `r'…'` / `r"…"`). Returns the
+/// index just past the closing `quote`.
+///
+/// mesh strings are **line-level** — the real lexer runs a line at a time — so an
+/// unterminated quote stops at the physical line boundary: on a newline this
+/// returns the newline's index, and brace counting resumes on the next line
+/// rather than swallowing it (and a later `}` or command) as quoted text.
+/// `None` means the input ended mid-quote.
+/// Skip a bare `${…}` interpolation from `start` (just past `${`), as
+/// [`parse_var`] does — to the first `}`. An unterminated `${` ends at the
+/// physical line boundary (a line-local error), leaving no structural brace.
+/// Returns the index just past the close (or at the newline / end of input).
+fn skip_interpolation(chars: &[(usize, char)], start: usize) -> usize {
+    let mut k = start;
+    while k < chars.len() {
+        match chars[k].1 {
+            '}' => return k + 1,
+            '\n' => return k,
+            _ => k += 1,
+        }
+    }
+    k
+}
+
+fn skip_quote(chars: &[(usize, char)], start: usize, quote: char, escapes: bool) -> Option<usize> {
+    let mut k = start;
+    while k < chars.len() {
+        let c = chars[k].1;
+        if c == '\n' {
+            return Some(k); // unterminated quote ends at the line boundary
+        }
+        if escapes && c == '\\' {
+            // A backslash escapes the next char, but never across a line break.
+            if chars.get(k + 1).map(|&(_, c)| c) == Some('\n') {
+                return Some(k + 1);
+            }
+            k += 2;
+            continue;
+        }
+        if c == quote {
+            return Some(k + 1);
+        }
+        k += 1;
+    }
+    None
+}
+
 /// Parse the inner content of a `${…}` — a `name` with an optional `.member`.
 fn parse_var_ref(inner: &str) -> Option<VarRef> {
     let chars: Vec<char> = inner.chars().collect();

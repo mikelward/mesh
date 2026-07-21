@@ -15,9 +15,26 @@ use std::process::ExitCode;
 use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 
 use crate::builtins::{self, Builtin};
+use crate::funcs::{FuncDef, Funcs};
 use crate::lexer::{Piece, Redir, RedirKind, Sep, Stage, Word};
 use crate::vars::Vars;
 use crate::{exec, expand, lexer};
+
+/// The mutable shell session threaded through the run loop: variable scopes and
+/// defined functions.
+struct Shell {
+    vars: Vars,
+    funcs: Funcs,
+}
+
+impl Shell {
+    fn new() -> Self {
+        Self {
+            vars: Vars::new(),
+            funcs: Funcs::new(),
+        }
+    }
+}
 
 /// Run the shell until end-of-input or `exit`, returning the last status as the
 /// process exit code.
@@ -44,13 +61,21 @@ enum Step {
     Continue(u8),
     /// `exit` was invoked; leave the shell with this status.
     Exit(u8),
+    /// `return` was invoked; unwind the current function with this status. At top
+    /// level (no function) this is reported as an error.
+    Return(u8),
 }
 
 /// Tokenize and run one line of input against the variable store. A line is a
 /// sequence of commands joined by `;` / `&&` / `||`; each connector decides
 /// whether its command runs from the previous command's status. Empty lines (and
 /// empty segments, e.g. a trailing `;`) are a no-op that keeps the last status.
-fn run_line(text: &str, last: u8, vars: &mut Vars) -> Step {
+fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
+    // A `func name(params) { … }` definition is parsed from raw text, since its
+    // body spans lines that the per-line lexer would otherwise flatten.
+    if is_func_start(text) {
+        return define_func(text, shell);
+    }
     let segments = match lexer::split_line(text) {
         Ok(segments) => segments,
         Err(err) => {
@@ -70,9 +95,21 @@ fn run_line(text: &str, last: u8, vars: &mut Vars) -> Step {
             // `;`): a no-op that leaves the status unchanged.
             continue;
         }
-        match run_pipeline(segment.stages, status, vars) {
-            Step::Exit(code) => return Step::Exit(code),
+        match run_pipeline(segment.stages, status, shell) {
             Step::Continue(code) => status = code,
+            // `exit` aborts the rest of the line immediately.
+            Step::Exit(code) => return Step::Exit(code),
+            Step::Return(code) => {
+                if in_function {
+                    // Inside a function, `return` unwinds — abort the line so the
+                    // caller (`call_func`) can stop the body.
+                    return Step::Return(code);
+                }
+                // At top level `return` is a recoverable error; the `;` sequence
+                // still runs the following command unconditionally.
+                eprintln!("mesh: return: not inside a function");
+                status = 1;
+            }
         }
     }
     Step::Continue(status)
@@ -80,23 +117,23 @@ fn run_line(text: &str, last: u8, vars: &mut Vars) -> Step {
 
 /// Run one pipeline. A single stage keeps the full command surface (assignments,
 /// builtins). A multi-stage pipeline (`|`) is external commands only for now.
-fn run_pipeline(mut stages: Vec<Stage>, last: u8, vars: &mut Vars) -> Step {
+fn run_pipeline(mut stages: Vec<Stage>, last: u8, shell: &mut Shell) -> Step {
     if stages.len() == 1 {
-        run_single(stages.pop().unwrap(), last, vars)
+        run_single(stages.pop().unwrap(), last, shell)
     } else {
-        run_multi(stages, vars)
+        run_multi(stages, shell)
     }
 }
 
 /// Run a one-stage pipeline. Without redirections this is the full command
 /// surface: an assignment or a builtin/external command. With redirections it is
 /// a command only (external for now — a redirected builtin is not supported yet).
-fn run_single(stage: Stage, last: u8, vars: &mut Vars) -> Step {
+fn run_single(stage: Stage, last: u8, shell: &mut Shell) -> Step {
     let Stage { words, redirs } = stage;
     if redirs.is_empty() {
-        return run_command_or_assign(words, last, vars);
+        return run_command_or_assign(words, last, shell);
     }
-    let argv = match expand::expand(words, vars) {
+    let argv = match expand::expand(words, &shell.vars) {
         Ok(argv) => argv,
         Err(err) => {
             eprintln!("mesh: {err}");
@@ -107,14 +144,22 @@ fn run_single(stage: Stage, last: u8, vars: &mut Vars) -> Step {
         eprintln!("mesh: redirection with no command is not supported yet");
         return Step::Continue(1);
     }
-    if builtins::is_builtin(&argv[0]) {
+    // `return` is a control word handled in `run_command_or_assign` (the
+    // no-redirection path). With a redirection it never reaches that handler, so
+    // reject it here rather than truncating the target and launching an external
+    // `return` that fails while the body keeps running.
+    if argv[0] == "return" {
+        eprintln!("mesh: return: cannot be redirected");
+        return Step::Continue(2);
+    }
+    if builtins::is_builtin(&argv[0]) || shell.funcs.get(&argv[0]).is_some() {
         eprintln!(
-            "mesh: {}: redirection of a builtin is not supported yet",
+            "mesh: {}: redirection of a builtin or function is not supported yet",
             argv[0]
         );
         return Step::Continue(1);
     }
-    match expand_redirs(redirs, vars) {
+    match expand_redirs(redirs, &shell.vars) {
         Ok(redirs) => Step::Continue(exec::run_pipeline(vec![exec::Cmd {
             words: argv,
             redirs,
@@ -128,11 +173,11 @@ fn run_single(stage: Stage, last: u8, vars: &mut Vars) -> Step {
 
 /// Run a multi-stage pipeline (`a | b | c`). Every stage must be an external
 /// command; a builtin in a pipeline is not supported yet.
-fn run_multi(stages: Vec<Stage>, vars: &mut Vars) -> Step {
+fn run_multi(stages: Vec<Stage>, shell: &Shell) -> Step {
     let mut cmds = Vec::with_capacity(stages.len());
     for stage in stages {
         let Stage { words, redirs } = stage;
-        let argv = match expand::expand(words, vars) {
+        let argv = match expand::expand(words, &shell.vars) {
             Ok(argv) => argv,
             Err(err) => {
                 eprintln!("mesh: {err}");
@@ -143,14 +188,20 @@ fn run_multi(stages: Vec<Stage>, vars: &mut Vars) -> Step {
             eprintln!("mesh: empty command in a pipeline");
             return Step::Continue(1);
         }
-        if builtins::is_builtin(&argv[0]) {
+        // `return` unwinds the enclosing function; it has no meaning as a pipeline
+        // stage, so reject it rather than launching an external `return`.
+        if argv[0] == "return" {
+            eprintln!("mesh: return: cannot be used in a pipeline");
+            return Step::Continue(2);
+        }
+        if builtins::is_builtin(&argv[0]) || shell.funcs.get(&argv[0]).is_some() {
             eprintln!(
-                "mesh: {}: builtins are not supported in a pipeline yet",
+                "mesh: {}: builtins and functions are not supported in a pipeline yet",
                 argv[0]
             );
             return Step::Continue(1);
         }
-        let redirs = match expand_redirs(redirs, vars) {
+        let redirs = match expand_redirs(redirs, &shell.vars) {
             Ok(redirs) => redirs,
             Err(err) => {
                 eprintln!("mesh: {err}");
@@ -184,9 +235,9 @@ fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<(RedirKind, Stri
 
 /// Run one command with no redirections: classify it as an assignment or a
 /// command and act. `last` is the previous status (the default for a bare `exit`).
-fn run_command_or_assign(tokens: Vec<Word>, last: u8, vars: &mut Vars) -> Step {
+fn run_command_or_assign(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
     match classify(tokens) {
-        Line::Assign { name, rhs } => match assign(&name, rhs, vars) {
+        Line::Assign { name, rhs } => match assign(&name, rhs, &mut shell.vars) {
             Ok(()) => Step::Continue(0),
             Err(msg) => {
                 eprintln!("mesh: {msg}");
@@ -194,7 +245,7 @@ fn run_command_or_assign(tokens: Vec<Word>, last: u8, vars: &mut Vars) -> Step {
             }
         },
         Line::Command(tokens) => {
-            let words = match expand::expand(tokens, vars) {
+            let words = match expand::expand(tokens, &shell.vars) {
                 Ok(words) => words,
                 Err(err) => {
                     eprintln!("mesh: {err}");
@@ -206,12 +257,259 @@ fn run_command_or_assign(tokens: Vec<Word>, last: u8, vars: &mut Vars) -> Step {
                 // matches) is an empty-list result — status 0 per `DESIGN.md`.
                 return Step::Continue(0);
             }
-            match builtins::dispatch(&words, last) {
-                Some(Builtin::Exit(code)) => Step::Exit(code),
-                Some(Builtin::Status(code)) => Step::Continue(code),
-                None => Step::Continue(exec::run(&words)),
+            // `return` ends the enclosing function (an error at top level).
+            if words[0] == "return" {
+                return make_return(&words[1..], last);
             }
+            // Command resolution: builtins, then user functions, then external.
+            if let Some(step) = builtins::dispatch(&words, last).map(|b| match b {
+                Builtin::Exit(code) => Step::Exit(code),
+                Builtin::Status(code) => Step::Continue(code),
+            }) {
+                return step;
+            }
+            if shell.funcs.get(&words[0]).is_some() {
+                let name = words[0].clone();
+                let args = words[1..].to_vec();
+                return call_func(&name, args, shell);
+            }
+            Step::Continue(exec::run(&words))
         }
+    }
+}
+
+/// Build the [`Step::Return`] for a `return` command: no argument uses the last
+/// status; a numeric argument is masked to 0–255. A surplus or non-numeric
+/// operand is reported and does not unwind (the function keeps running).
+fn make_return(args: &[String], last: u8) -> Step {
+    match args {
+        [] => Step::Return(last),
+        [n] => match n.parse::<i64>() {
+            Ok(code) => Step::Return(code.rem_euclid(256) as u8),
+            Err(_) => {
+                eprintln!("mesh: return: {n}: numeric argument required");
+                Step::Continue(2)
+            }
+        },
+        _ => {
+            eprintln!("mesh: return: too many arguments");
+            Step::Continue(1)
+        }
+    }
+}
+
+/// Call the function `name` with already-expanded `args`. Binds the positional
+/// parameters in a fresh local scope, runs the body line by line, and returns the
+/// function's status — an explicit `return`, else the last command's status. An
+/// arity mismatch is an error.
+fn call_func(name: &str, args: Vec<String>, shell: &mut Shell) -> Step {
+    let (params, body) = match shell.funcs.get(name) {
+        Some(def) => (def.params.clone(), def.body.clone()),
+        None => return Step::Continue(exec::run(&[name.to_string()])),
+    };
+    if args.len() != params.len() {
+        eprintln!(
+            "mesh: {name}: expected {} argument(s), got {}",
+            params.len(),
+            args.len()
+        );
+        return Step::Continue(2);
+    }
+
+    shell.vars.push_scope();
+    for (param, arg) in params.iter().zip(args) {
+        shell.vars.set(param, arg);
+    }
+
+    let result = run_func_body(&body, shell);
+
+    shell.vars.pop_scope();
+    result
+}
+
+/// Run a function body line by line, buffering a nested multi-line `func`
+/// definition until its braces balance — exactly as the top-level reader does —
+/// so a nested definition is stored rather than having only its first line reach
+/// `run_line` and the rest run as loose commands.
+///
+/// A function starts fresh, not inheriting the caller's `$?`: an empty body (or a
+/// bare `return` before any command) yields status 0 (`DESIGN.md` — "no
+/// expression to yield … status 0"), and the first line likewise sees `$?` = 0.
+/// `return` ends the body early with its status; `exit` propagates out.
+fn run_func_body(body: &str, shell: &mut Shell) -> Step {
+    let mut status = 0;
+    let mut result = Step::Continue(status);
+    let mut pending = String::new();
+    for line in body.lines() {
+        pending.push_str(line);
+        pending.push('\n');
+        if is_func_start(&pending) && lexer::needs_more_input(&pending) {
+            continue;
+        }
+        let full = std::mem::take(&mut pending);
+        match run_line(&full, status, true, shell) {
+            Step::Continue(code) => {
+                status = code;
+                result = Step::Continue(code);
+            }
+            Step::Return(code) => return Step::Continue(code),
+            Step::Exit(code) => return Step::Exit(code),
+        }
+    }
+    // A truncated nested definition still buffered at the end of the body: run it
+    // so its "missing }" error is reported rather than silently swallowed.
+    if !pending.trim().is_empty() {
+        return match run_line(&pending, status, true, shell) {
+            Step::Return(code) => Step::Continue(code),
+            other => other,
+        };
+    }
+    result
+}
+
+/// Does `text` begin a `func` definition? (`func` followed by a space or `(`.)
+fn is_func_start(text: &str) -> bool {
+    match text.trim_start().strip_prefix("func") {
+        Some(rest) => rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == '('),
+        None => false,
+    }
+}
+
+/// Parse and store a `func name(params) { body }` definition.
+fn define_func(text: &str, shell: &mut Shell) -> Step {
+    match parse_func_def(text) {
+        Ok((name, def)) => {
+            shell.funcs.define(name, def);
+            Step::Continue(0)
+        }
+        Err(msg) => {
+            eprintln!("mesh: {msg}");
+            Step::Continue(2)
+        }
+    }
+}
+
+/// Parse `func name(params) { body }` from raw text into a name and definition.
+/// v1 accepts required named positionals only.
+fn parse_func_def(text: &str) -> Result<(String, FuncDef), String> {
+    let rest = text
+        .trim()
+        .strip_prefix("func")
+        .ok_or("func: internal error")?
+        .trim_start();
+    let name_end = rest
+        .find(|c: char| c == '(' || c.is_whitespace())
+        .ok_or("func: missing parameter list `(...)`")?;
+    let name = &rest[..name_end];
+    if !lexer::is_ident(name) {
+        return Err(format!("func: `{name}` is not a valid function name"));
+    }
+    // A name resolves as builtin → function → external, and `func`/`return` are
+    // intercepted even earlier (the reader reads `func …` as a definition, and
+    // `return` is control flow). A function named after any of these would be
+    // stored but never reachable, so reject it rather than accept a dead
+    // definition.
+    if name == "func" || name == "return" || builtins::is_builtin(name) {
+        return Err(format!(
+            "func: `{name}` is a reserved name and cannot be a function name"
+        ));
+    }
+    let after_open = rest[name_end..]
+        .trim_start()
+        .strip_prefix('(')
+        .ok_or("func: missing parameter list `(...)`")?;
+    let close = after_open.find(')').ok_or("func: missing `)`")?;
+    let params = parse_params(&after_open[..close])?;
+    let body_src = after_open[close + 1..]
+        .trim_start()
+        .strip_prefix('{')
+        .ok_or("func: missing body `{ ... }`")?;
+    let (body, after_body) = split_braced_body(body_src)?;
+    if !after_body.trim().is_empty() {
+        return Err("func: unexpected text after the closing `}`".to_string());
+    }
+    Ok((
+        name.to_string(),
+        FuncDef {
+            params,
+            body: body.to_string(),
+        },
+    ))
+}
+
+/// Parse a parameter list: names separated by commas and/or whitespace. A comma
+/// is a real separator, not ignorable filler — it must sit between two names, so
+/// a leading, trailing, or doubled comma (`,x`, `x,`, `x,,y`) is a loud error
+/// rather than a silently dropped empty. v1 also rejects the deferred flag /
+/// optional / rest forms with a clear message.
+fn parse_params(list: &str) -> Result<Vec<String>, String> {
+    let chars: Vec<char> = list.chars().collect();
+    let mut params: Vec<String> = Vec::new();
+    // A comma needs a name on each side: it is only valid once at least one name
+    // has been read, and never immediately after another comma.
+    let mut have_name = false;
+    let mut pending_comma = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == ',' {
+            if !have_name || pending_comma {
+                return Err("func: missing parameter name before `,`".to_string());
+            }
+            pending_comma = true;
+            i += 1;
+            continue;
+        }
+        // Read a name token: a run up to the next comma or whitespace.
+        let start = i;
+        while i < chars.len() && chars[i] != ',' && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        let tok: String = chars[start..i].iter().collect();
+        if tok.starts_with("...") {
+            return Err("func: rest parameters (`...name`) are not supported yet".to_string());
+        }
+        if tok.starts_with('-') {
+            return Err("func: flag parameters (`--name`) are not supported yet".to_string());
+        }
+        if tok.contains('=') {
+            return Err("func: optional/default parameters are not supported yet".to_string());
+        }
+        if !lexer::is_ident(&tok) {
+            return Err(format!("func: `{tok}` is not a valid parameter name"));
+        }
+        // `env` is the environment namespace (`$env.KEY`), so a parameter named
+        // `env` would bind but never read back — reject it, as assignment does.
+        if tok == "env" {
+            return Err("func: `env` is a reserved name and cannot be a parameter".to_string());
+        }
+        // A repeated name would silently overwrite the earlier positional in the
+        // local scope, making one argument unreachable; diagnose it here.
+        if params.iter().any(|p| p == &tok) {
+            return Err(format!("func: duplicate parameter `{tok}`"));
+        }
+        params.push(tok);
+        have_name = true;
+        pending_comma = false;
+    }
+    if pending_comma {
+        return Err("func: missing parameter name after `,`".to_string());
+    }
+    Ok(params)
+}
+
+/// Given the text right after a body's opening `{`, split off the body (up to
+/// the matching `}`) and whatever follows it. Delegates to the lexer's shared
+/// [`lexer::scan_braces`] so the boundary honors the same quote/raw/escape rules
+/// as execution — the definition scanner and the runtime lexer cannot disagree.
+fn split_braced_body(src: &str) -> Result<(&str, &str), String> {
+    match lexer::scan_braces(src, 1).close {
+        Some(byte) => Ok((&src[..byte], &src[byte + 1..])),
+        None => Err("func: missing closing `}`".to_string()),
     }
 }
 
@@ -334,13 +632,23 @@ fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
 fn run_interactive() -> ExitCode {
     let mut editor = Reedline::create();
     let mut last: u8 = 0;
-    let mut vars = Vars::new();
+    let mut shell = Shell::new();
+    let mut pending = String::new();
     loop {
-        let prompt = MeshPrompt { failed: last != 0 };
+        let prompt = MeshPrompt {
+            failed: last != 0,
+            continuation: !pending.is_empty(),
+        };
         match editor.read_line(&prompt) {
-            Ok(signal) => match handle_signal(signal, last, &mut vars) {
-                Step::Exit(code) => return ExitCode::from(code),
-                Step::Continue(code) => last = code,
+            Ok(signal) => match handle_signal(signal, last, &mut shell, &mut pending) {
+                None => continue, // an unfinished `func` body: read the next line
+                Some(step) => match step {
+                    Step::Exit(code) => return ExitCode::from(code),
+                    Step::Continue(code) => last = code,
+                    // Top-level `run_line` reports a stray `return` itself, so one
+                    // never reaches here.
+                    Step::Return(_) => unreachable!("top-level return is handled in run_line"),
+                },
             },
             Err(err) => {
                 eprintln!("mesh: line editor error: {err}");
@@ -350,17 +658,39 @@ fn run_interactive() -> ExitCode {
     }
 }
 
-/// Map a reedline signal to the next [`Step`]. Extracted from the read loop so
-/// the interactive control flow is unit-testable without a terminal.
+/// Handle a reedline signal, buffering the lines of a multi-line `func` body in
+/// `pending`. Returns `None` when more input is needed (a `func` body is still
+/// open), else `Some(step)`. Extracted from the read loop so the interactive
+/// control flow is unit-testable without a terminal.
 ///
-/// `Ctrl-D` exits (reedline only emits it on an empty line, so this is the
-/// exit-on-empty behavior); `Ctrl-C` — and any future signal — cancels the
-/// current line and re-prompts, keeping the last status.
-fn handle_signal(signal: Signal, last: u8, vars: &mut Vars) -> Step {
+/// `Ctrl-D` on an empty line exits (and abandons any in-progress `func`);
+/// `Ctrl-C` cancels the current line/buffer and re-prompts, keeping the status.
+fn handle_signal(
+    signal: Signal,
+    last: u8,
+    shell: &mut Shell,
+    pending: &mut String,
+) -> Option<Step> {
     match signal {
-        Signal::Success(line) => run_line(&line, last, vars),
-        Signal::CtrlD => Step::Exit(last),
-        _ => Step::Continue(last),
+        Signal::Success(line) => {
+            pending.push_str(&line);
+            pending.push('\n');
+            if is_func_start(pending) && lexer::needs_more_input(pending) {
+                return None;
+            }
+            let text = std::mem::take(pending);
+            Some(run_line(&text, last, false, shell))
+        }
+        // Ctrl-D (EOF) exits with the last status, abandoning any in-progress
+        // `func` — the buffered lines are dropped as the shell leaves. reedline
+        // only emits this on an empty editor line, so a half-typed line is safe.
+        Signal::CtrlD => Some(Step::Exit(last)),
+        _ => {
+            // Ctrl-C: cancel the current line (and any buffered `func` body) and
+            // re-prompt, keeping the status.
+            pending.clear();
+            Some(Step::Continue(last))
+        }
     }
 }
 
@@ -371,7 +701,12 @@ fn run_piped() -> ExitCode {
     // `ManuallyDrop` keeps us from closing fd 0 when the shell exits.
     let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
     let mut last: u8 = 0;
-    let mut vars = Vars::new();
+    let mut shell = Shell::new();
+    let mut pending = String::new();
+    // The buffered definition contained invalid UTF-8: keep buffering to its
+    // closing brace (so its body can't leak), then discard it whole rather than
+    // storing/executing the lossy source.
+    let mut poisoned = false;
     let mut line = Vec::new();
 
     loop {
@@ -385,17 +720,56 @@ fn run_piped() -> ExitCode {
             }
         }
 
-        let text = match std::str::from_utf8(&line) {
+        // Hold a lossy copy alive if we substitute invalid bytes below.
+        let lossy;
+        let text: &str = match std::str::from_utf8(&line) {
             Ok(text) => text,
             Err(_) => {
                 eprintln!("mesh: invalid UTF-8 in input");
                 last = 1;
-                continue;
+                lossy = String::from_utf8_lossy(&line).into_owned();
+                // A malformed line that opens (pending empty) or continues (mid-
+                // definition) a `func` body must be quarantined: poison it and
+                // substitute U+FFFD only so real braces still count, keep buffering
+                // to the matching close, then discard the whole definition below —
+                // never storing or running lossy source, and never leaking the body
+                // to the top level. A standalone malformed line with no open
+                // definition is simply rejected and skipped.
+                let opens_definition = is_func_start(&lossy) && lexer::needs_more_input(&lossy);
+                if pending.is_empty() && !opens_definition {
+                    continue;
+                }
+                poisoned = true;
+                &lossy
             }
         };
-        match run_line(text, last, &mut vars) {
+        pending.push_str(text);
+        // Keep reading the lines of a multi-line `func` body before running it.
+        if is_func_start(&pending) && lexer::needs_more_input(&pending) {
+            continue;
+        }
+        let full = std::mem::take(&mut pending);
+        if std::mem::take(&mut poisoned) {
+            // Discard the definition that contained invalid UTF-8 (error already
+            // reported when the bad line was read); do not define or run it.
+            continue;
+        }
+        match run_line(&full, last, false, &mut shell) {
             Step::Exit(code) => return ExitCode::from(code),
             Step::Continue(code) => last = code,
+            // A top-level `run_line` reports a stray `return` itself and returns
+            // `Continue`, so it never hands one back here.
+            Step::Return(_) => unreachable!("top-level return is handled in run_line"),
+        }
+    }
+    // A truncated (or poisoned) `func` definition at EOF: a poisoned one is
+    // discarded (its error was already reported); otherwise run it so the parse
+    // error is reported.
+    if !poisoned && !pending.trim().is_empty() {
+        match run_line(&pending, last, false, &mut shell) {
+            Step::Exit(code) => return ExitCode::from(code),
+            Step::Continue(code) => last = code,
+            Step::Return(_) => unreachable!("top-level return is handled in run_line"),
         }
     }
     ExitCode::from(last)
@@ -426,6 +800,7 @@ fn read_line(reader: &mut impl Read, out: &mut Vec<u8>) -> io::Result<usize> {
 /// The full status-dashboard prompt from `DESIGN.md` is a later milestone.
 struct MeshPrompt {
     failed: bool,
+    continuation: bool,
 }
 
 impl Prompt for MeshPrompt {
@@ -436,7 +811,9 @@ impl Prompt for MeshPrompt {
         Cow::Borrowed("")
     }
     fn render_prompt_indicator(&self, _edit_mode: PromptEditMode) -> Cow<'_, str> {
-        if self.failed {
+        if self.continuation {
+            Cow::Borrowed("... ")
+        } else if self.failed {
             Cow::Borrowed("mesh! ")
         } else {
             Cow::Borrowed("mesh$ ")
@@ -455,49 +832,116 @@ impl Prompt for MeshPrompt {
 
 #[cfg(test)]
 mod tests {
-    use super::{Step, handle_signal, run_line};
-    use crate::vars::Vars;
+    use super::{Shell, Step, handle_signal, run_line};
     use reedline::Signal;
 
     #[test]
     fn ctrl_d_exits_with_the_last_status() {
-        let mut vars = Vars::new();
-        assert_eq!(handle_signal(Signal::CtrlD, 7, &mut vars), Step::Exit(7));
+        let mut shell = Shell::new();
+        let mut pending = String::new();
+        assert_eq!(
+            handle_signal(Signal::CtrlD, 7, &mut shell, &mut pending),
+            Some(Step::Exit(7))
+        );
+    }
+
+    #[test]
+    fn ctrl_d_exits_even_mid_function_definition() {
+        // With a `func` body still buffered, Ctrl-D still exits (abandoning it),
+        // matching the documented Ctrl-D-on-empty-line behavior.
+        let mut shell = Shell::new();
+        let mut pending = String::from("func f() {\n");
+        assert_eq!(
+            handle_signal(Signal::CtrlD, 4, &mut shell, &mut pending),
+            Some(Step::Exit(4))
+        );
     }
 
     #[test]
     fn ctrl_c_re_prompts_keeping_status() {
-        let mut vars = Vars::new();
+        let mut shell = Shell::new();
+        let mut pending = String::new();
         assert_eq!(
-            handle_signal(Signal::CtrlC, 7, &mut vars),
-            Step::Continue(7)
+            handle_signal(Signal::CtrlC, 7, &mut shell, &mut pending),
+            Some(Step::Continue(7))
         );
     }
 
     #[test]
     fn a_submitted_exit_line_exits() {
-        let mut vars = Vars::new();
+        let mut shell = Shell::new();
+        let mut pending = String::new();
         let signal = Signal::Success("exit 5".to_string());
-        assert_eq!(handle_signal(signal, 0, &mut vars), Step::Exit(5));
+        assert_eq!(
+            handle_signal(signal, 0, &mut shell, &mut pending),
+            Some(Step::Exit(5))
+        );
     }
 
     #[test]
     fn a_submitted_blank_line_keeps_the_status() {
-        let mut vars = Vars::new();
-        assert_eq!(run_line("   ", 3, &mut vars), Step::Continue(3));
+        let mut shell = Shell::new();
+        assert_eq!(run_line("   ", 3, false, &mut shell), Step::Continue(3));
     }
 
     #[test]
     fn assignment_then_read() {
-        let mut vars = Vars::new();
-        assert_eq!(run_line("x = hello", 0, &mut vars), Step::Continue(0));
-        assert_eq!(vars.get("x"), Some("hello"));
+        let mut shell = Shell::new();
+        assert_eq!(
+            run_line("x = hello", 0, false, &mut shell),
+            Step::Continue(0)
+        );
+        assert_eq!(shell.vars.get("x"), Some("hello"));
     }
 
     #[test]
     fn unspaced_assignment() {
-        let mut vars = Vars::new();
-        assert_eq!(run_line("n=42", 0, &mut vars), Step::Continue(0));
-        assert_eq!(vars.get("n"), Some("42"));
+        let mut shell = Shell::new();
+        assert_eq!(run_line("n=42", 0, false, &mut shell), Step::Continue(0));
+        assert_eq!(shell.vars.get("n"), Some("42"));
+    }
+
+    #[test]
+    fn a_multi_line_func_buffers_until_the_brace_closes() {
+        let mut shell = Shell::new();
+        let mut pending = String::new();
+        // The opening line leaves the body open — no step yet.
+        assert_eq!(
+            handle_signal(
+                Signal::Success("func greet(who) {".into()),
+                0,
+                &mut shell,
+                &mut pending
+            ),
+            None
+        );
+        assert_eq!(
+            handle_signal(
+                Signal::Success("  puts \"hi $who\"".into()),
+                0,
+                &mut shell,
+                &mut pending
+            ),
+            None
+        );
+        // The closing brace completes and defines the function.
+        assert_eq!(
+            handle_signal(Signal::Success("}".into()), 0, &mut shell, &mut pending),
+            Some(Step::Continue(0))
+        );
+        assert!(pending.is_empty());
+        // Calling it now runs the body.
+        assert_eq!(
+            run_line("greet world", 0, false, &mut shell),
+            Step::Continue(0)
+        );
+    }
+
+    #[test]
+    fn a_bare_return_at_top_level_is_reported() {
+        // Outside a function, `return` is a recoverable error (status 1), not an
+        // unwind — `run_line` reports it and continues rather than propagating it.
+        let mut shell = Shell::new();
+        assert_eq!(run_line("return", 0, false, &mut shell), Step::Continue(1));
     }
 }

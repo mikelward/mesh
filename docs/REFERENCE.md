@@ -98,8 +98,63 @@ of `x` followed by `.txt`); use `${…}` for anything more. A malformed `${…}`
 closing `}`, or an invalid name inside) is a syntax error. A `$` not followed by
 a name (`$5`) is a literal `$`; a literal `$` in a string is `\$`.
 
+## Sequencing
+
+Join commands on one line; the connector decides whether the next one runs from
+the previous command's status.
+
+| Form | Runs the next command |
+| --- | --- |
+| `a ; b` | Always. |
+| `a && b` | Only if `a` succeeded (status `0`). |
+| `a \|\| b` | Only if `a` failed (status ≠ `0`). |
+
+The line's status is that of the last command actually run.
+
+## Pipelines
+
+`a | b` connects `a`'s standard output to `b`'s standard input; any number of
+stages chain with `|`. A pipeline's status is `0` only when every stage
+succeeded; otherwise it reports a failing stage. A stage cut short because a
+later stage closed the pipe (SIGPIPE) is not counted as a failure.
+
+## Redirection
+
+Redirections attach to a command; each target is a single file.
+
+| Form | Effect |
+| --- | --- |
+| `> file` | Send standard output to `file`, replacing it. |
+| `>> file` | Append standard output to `file`. |
+| `< file` | Read standard input from `file`. |
+
+A target that expands to zero or several words is an error. Descriptor forms
+(`2>`, `&>`, `>&2`) are not supported yet.
+
+## Functions
+
+```
+func name(param …) { body }
+```
+
+Define a named command. Parameters are required named positionals — a call must
+pass exactly that many arguments — and bind as local variables in the body. The
+body is one or more lines; write it across lines (mesh reads until the closing
+`}`) or on a single line. Parameter names must be distinct and cannot be the
+reserved name `env`.
+
+| Form | Effect |
+| --- | --- |
+| `return` | End the function now, keeping the status so far. |
+| `return n` | End the function now with status `n` (masked to 0–255). |
+
+A function's result is its last command's status, or `0` for an empty body or a
+bare `return` before anything ran. A variable set in the body is **local**: it
+shadows a global of the same name and is dropped when the function returns. Reads
+reach the body's own locals and the session globals — never another function's
+locals. Functions cannot yet appear in a pipeline or take a redirection.
+
 ## Not yet implemented
 
-Sequencing (`;`, `&&`, `||`), pipes, redirection, list and map values, `:`
-modifiers, regex literals, functions, and heredocs. See
+List and map values, `:` modifiers, regex literals, and heredocs. See
 [`ROADMAP.md`](../ROADMAP.md).
