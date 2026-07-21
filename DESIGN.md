@@ -1509,12 +1509,12 @@ dynamic-scope TODO below is about — and moving a `return`/`break` retargets it
 as in any language.) Isolation is therefore **explicit**, in three grades:
 
 ```
-( cd build; make )                      # subshell: forks; cwd/env/umask/vars
+fork { cd build; make }                 # subshell: forks; cwd/env/umask/vars
                                         #   isolated, nonzero exit can't kill
                                         #   the outer shell
-func build() ( cd build; make )         # a func whose *body* is a subshell — the
-                                        #   `( )` body (vs `{ }`) is the isolation
-                                        #   flag (bash/POSIX spell it this way)
+fork func build() { cd build; make }    # a func whose *body* is a subshell — the
+                                        #   `fork` prefix (vs a plain `func`) is the
+                                        #   isolation flag
 in dist { rm -rf * }                    # scoped cwd: run the block there, restore
                                         #   after — NO fork (cheaper than subshell)
 ```
@@ -3086,8 +3086,8 @@ to avoid" rather than promising the latter as done.
   one-test case); **tests** replace `[[ ]]` (`~`/`!~` pattern-match, type-directed
   comparisons, `$p:type`/`:exists`/`:exec` file tests, `and`/`or`/`not` vs command
   `&&`/`||`); the **postfix guard** `stmt if/unless cond` is the one-line form;
-  **isolation** is explicit — plain `func` persists cwd/state, `( )` /
-  `func f() ( )` subshell-isolate, `in DIR { }` scopes cwd without forking.
+  **isolation** is explicit — plain `func` persists cwd/state, `fork { }` /
+  `fork func f() { }` subshell-isolate, `in DIR { }` scopes cwd without forking.
 - **Value calls & lambdas — decided** ([section](#calling-for-a-value-and-lambdas)):
   `f(arg)` (parens attached, comma-separated args) takes a function's **return
   value**, `$(f arg)` its **stdout**, bare `f arg` runs it; stdout streams during
