@@ -633,13 +633,25 @@ pub fn scan_braces(text: &str, start_depth: i32) -> BraceScan {
 /// Advance past a quoted region in a `(byte, char)` slice. `start` is the index
 /// just past the opening quote. With `escapes`, a `\` escapes the next char
 /// (`'…'` / `"…"`); without, `\` is literal (raw `r'…'` / `r"…"`). Returns the
-/// index just past the closing `quote`, or `None` if the input ends first
-/// (an unterminated quote).
+/// index just past the closing `quote`.
+///
+/// mesh strings are **line-level** — the real lexer runs a line at a time — so an
+/// unterminated quote stops at the physical line boundary: on a newline this
+/// returns the newline's index, and brace counting resumes on the next line
+/// rather than swallowing it (and a later `}` or command) as quoted text.
+/// `None` means the input ended mid-quote.
 fn skip_quote(chars: &[(usize, char)], start: usize, quote: char, escapes: bool) -> Option<usize> {
     let mut k = start;
     while k < chars.len() {
         let c = chars[k].1;
+        if c == '\n' {
+            return Some(k); // unterminated quote ends at the line boundary
+        }
         if escapes && c == '\\' {
+            // A backslash escapes the next char, but never across a line break.
+            if chars.get(k + 1).map(|&(_, c)| c) == Some('\n') {
+                return Some(k + 1);
+            }
             k += 2;
             continue;
         }

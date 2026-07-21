@@ -949,6 +949,15 @@ fn invalid_utf8_in_a_function_body_discards_the_definition() {
 }
 
 #[test]
+fn an_unterminated_quote_in_a_body_does_not_swallow_later_commands() {
+    // A quote is line-level, so an unterminated one ends at the newline: the
+    // body's `}` still closes the definition and the following command runs,
+    // rather than the quote swallowing them through EOF.
+    let out = run_with_input("func f() {\n  puts \"oops\n}\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
 fn trailing_text_after_a_closed_definition_does_not_swallow_later_commands() {
     // `func f() {} {` — the body's first `}` closes it, so the trailing `{` is a
     // trailing-text error reported now; the next line must run independently
