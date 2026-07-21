@@ -939,6 +939,17 @@ fn invalid_utf8_mid_function_does_not_leak_the_body() {
 }
 
 #[test]
+fn invalid_utf8_on_the_opening_line_does_not_leak_the_body() {
+    // Invalid UTF-8 on the opening `func … {` line (pending still empty) must
+    // quarantine the whole definition, not skip only the opener and then run the
+    // body lines as top-level commands.
+    let out = run_with_bytes(b"func f() {\xff\nputs SHOULD_NOT_LEAK\n}\nputs after\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("SHOULD_NOT_LEAK"), "body leaked: {stdout}");
+    assert_eq!(stdout, "after\n");
+}
+
+#[test]
 fn invalid_utf8_in_a_function_body_discards_the_definition() {
     // Invalid UTF-8 mid-definition quarantines through the brace, then discards
     // the whole definition — the lossy source is never stored or executed, so

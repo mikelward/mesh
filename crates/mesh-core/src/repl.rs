@@ -727,18 +727,19 @@ fn run_piped() -> ExitCode {
             Err(_) => {
                 eprintln!("mesh: invalid UTF-8 in input");
                 last = 1;
-                if pending.is_empty() {
-                    // Not mid-definition: reject and skip the malformed line.
+                lossy = String::from_utf8_lossy(&line).into_owned();
+                // A malformed line that opens (pending empty) or continues (mid-
+                // definition) a `func` body must be quarantined: poison it and
+                // substitute U+FFFD only so real braces still count, keep buffering
+                // to the matching close, then discard the whole definition below —
+                // never storing or running lossy source, and never leaking the body
+                // to the top level. A standalone malformed line with no open
+                // definition is simply rejected and skipped.
+                let opens_definition = is_func_start(&lossy) && lexer::needs_more_input(&lossy);
+                if pending.is_empty() && !opens_definition {
                     continue;
                 }
-                // Mid-definition: a bare `pending.clear()` here would release the
-                // rest of the buffered `func` body into the top-level loop (a
-                // destructive body command would then run during definition).
-                // Poison the definition and substitute U+FFFD only so brace
-                // counting (real braces survive) keeps buffering to the close;
-                // the whole definition is discarded below, never stored/run lossy.
                 poisoned = true;
-                lossy = String::from_utf8_lossy(&line).into_owned();
                 &lossy
             }
         };
