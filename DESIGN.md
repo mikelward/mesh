@@ -330,60 +330,64 @@ appears.)*
 - **ksh extended globs** (`!(…)`, `@(…)`, `+(…)`) — **dropped.** Cryptic, and
   their jobs are covered by braces + exclusion.
 
-**The `glob()` family — one primitive, sugar on top.** The literal forms above are
-surface sugar for a single built-in: **`glob(STR)`** (already the constructor for an
-absolute or runtime-built pattern — see [Built-ins](#built-ins)). A bare `*.txt` in a
-command's argument position *is* `glob("*.txt")` — same engine, same match rules, the
-same type qualifiers and exclusion. Two ergonomic wrappers cover the common filters,
-named for the same file-type words as the `:files` / `(f)` qualifiers so the
-vocabulary stays one — `files` / `dirs` mean "restrict to that type" whether they
-appear as a wrapper here, a `(f)` glob qualifier, or a `:files` list
-[modifier](#modifiers):
+**The `glob()` family — construction vs. expansion.** Globbing splits into two
+operations, and keeping them apart is what lets a runtime-built pattern stay safe:
+
+- **Construction** — **`glob(STR)`** (the existing [built-in](#built-ins), parallel to
+  `re(STR)`) builds a **glob value** from a string: a first-class *pattern*, not yet
+  matched against anything. It is what a `~` RHS tests against (`$p ~ glob($pat)`) and
+  the way to name an absolute or runtime-built pattern. It does *not* by itself yield a
+  path list.
+- **Expansion** — turning a pattern into the paths it matches, against the filesystem.
+  A bare glob **literal** (`*.txt`, `**`, `*(f)`) expands where it sits, and a
+  `glob(STR)` value expands the same way once it lands in argument, `for`, or value
+  position.
+
+The two ergonomic wrappers are **expansion** helpers — they match now and return a
+plain [list](#arrays-lists), so they read naturally in a `for`. They enumerate a
+**directory's** immediate entries (`find -maxdepth 1`) filtered by type — reusing the
+`files` / `dirs` words that name the same filter as the `:files` / `(f)`
+[qualifiers](#modifiers):
 
 ```
-glob(PAT)                 # the primitive: PAT → matching paths
-files(PAT=.)              # files only, one level      ≡ glob(PAT):files, non-recursive
-dirs(PAT=.)               # directories only, one level ≡ glob(PAT):dirs
+files(DIR=.)              # files directly in DIR      (find DIR -maxdepth 1 -type f)
+dirs(DIR=.)               # subdirectories of DIR       (…-type d)
 
 for f in files() { … }    # PWD by default
 for d in dirs()  { … }
 for f in files(src) { … } # a named directory
 ```
 
-Recursion stays the pattern's job, not a flag: `files(**)` / `glob(src/**):files`
-descend, matching the `**`-on-by-default rule above.
+For pattern matching rather than directory listing, expand a `glob` and filter it —
+`glob("*.log"):files` — with recursion the pattern's job, `glob("src/**"):files`.
 
-**Why a function at all — the runtime pattern.** Because a bareword and a `$var` are
-*both just strings* to `glob()`, a pattern built at runtime expands through exactly the
-same path as a literal one:
+**Why the split matters — the runtime pattern.** A pattern held in a value is just a
+**string**, so it never expands by accident; expansion is always an explicit glob:
 
 ```
-p = *.jpg                 # p is the LITERAL string "*.jpg" — barewords don't glob
-ls $p                     # a file literally named *.jpg (usually: no such file)
-ls files($p)              # NOW it globs — the function is the expansion boundary
-ls files(*.jpg)           # identical: files() sees the same string either way
+p = "*.jpg"               # a literal string — quoted, since a bare *.jpg would expand here
+ls $p                     # passes the literal string *.jpg — a value never re-globs
+ls glob($p)               # NOW it matches — glob() is the expansion boundary
+ls glob("*.jpg")          # identical: glob() takes a string either way
 ```
 
 This is the deliberate resolution of the "build a pattern, then use it" case that a
-purely syntactic glob leaves stranded. Expansion of a *value* never happens by
-accident — only where you *name* `glob` / `files` / `dirs`. Typing the pattern is
-opt-in (the sugar); expanding a stored one is opt-in (the call); there is no third,
-implicit path. It is the same discipline as [`...`](#spread--flattening): the
-dangerous operation is always a visible keystroke, never a default.
+purely syntactic glob leaves stranded. Typing a glob literal is opt-in; expanding a
+stored one is the opt-in `glob(...)` call; a bare variable read is never a hidden third
+path. Same discipline as [`...`](#spread--flattening): the expanding operation is
+always a visible keystroke, never a default.
 
-**Splatting to a command.** A **literal** glob in argument position splats its matches
-into argv directly — `ls *.txt` is N arguments — because you wrote it there. A glob
-result from a function is an ordinary [list](#arrays-lists), so handing it to an
-**external** takes the explicit [`...`](#spread--flattening) that every list does:
+**Splatting to a command.** A glob that expands in place — a bare literal, or a
+`glob(…)` value in argument position — drops its matches straight into argv (`ls *.txt`
+and `ls glob($p)` are each N arguments), because expanding-to-many is what a glob *is*.
+A wrapper result is an ordinary **list**, so reaching an external with it takes the
+explicit [`...`](#spread--flattening) that every list does — or just iterate it:
 
 ```
-ls *.txt                  # literal: auto-splat, N argv entries
-ls ...files($pat)         # runtime list → external: spread, as any list
-for f in files($pat) { }  # or iterate it — no spread needed
+ls *.txt                  # literal: expands in place, N argv entries
+ls ...files(src)          # a plain list → external: spread, as any list
+for f in files(src) { }   # or iterate it — no spread needed
 ```
-
-The asymmetry is intentional and on-theme: the pattern you *typed* is trusted to
-expand in place; a pattern you *computed* makes the expansion visible with `...`.
 
 **Functions look like functions.** `glob` / `files` / `dirs` are
 [value calls](#calling-for-a-value-and-lambdas) — `files(.)`, parens attached — never
