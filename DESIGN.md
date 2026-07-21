@@ -310,6 +310,13 @@ appears.)*
   than zsh's `+/-` age codes; whether these also grow `:word(arg)` modifier
   spellings is folded into this open question.
 
+- **These qualifiers are expansion-only.** `(f)` / `(d)` / `(x)` and the `size` /
+  `age` / `empty` predicates all inspect the **filesystem**, so they belong to
+  globbing (finding files), never to string matching. A `~` / `match` / `fnmatch`
+  pattern uses only the plain glob metacharacters (`* ? [ ] { } **`), which need no
+  disk: `$f ~ *.txt` tests the string alone, while `*(f)` / `*(size>1M)` are
+  meaningful only where real files exist to stat.
+
 - **Exclusion** — a spaced infix `-`:
 
   ```
@@ -1704,7 +1711,7 @@ Arm patterns, in one vocabulary:
 | Pattern | Matches | Notes |
 | --- | --- | --- |
 | `foo`, `42` | a literal value | exact |
-| `*.txt`, `foo*` | a **glob** | fnmatch, same syntax as [Globbing](#globbing) |
+| `*.txt`, `foo*` | a **glob** | fnmatch — the string metacharacters of [Globbing](#globbing) (`* ? [] {} **`); the filesystem qualifiers (`(f)`, `size`, `age`) are expansion-only |
 | `/re/` | a **regex** | slash-delimited; this is mesh's whole regex story (no separate `=~`) |
 | `a \| b` | either | alternation |
 | `1..=9` | a **range** | the `..` / `..=` from slices |
