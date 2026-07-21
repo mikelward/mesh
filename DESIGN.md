@@ -338,10 +338,20 @@ operations, and keeping them apart is what lets a runtime-built pattern stay saf
   matched against anything. It is what a `~` RHS tests against (`$p ~ glob($pat)`) and
   the way to name an absolute or runtime-built pattern. It does *not* by itself yield a
   path list.
-- **Expansion** — turning a pattern into the paths it matches, against the filesystem.
-  A bare glob **literal** (`*.txt`, `**`, `*(f)`) expands where it sits, and a
-  `glob(STR)` value expands the same way once it lands in argument, `for`, or value
-  position.
+- **Expansion** — turning a pattern into the paths it matches, against the filesystem —
+  is decided by **position**, and two contexts deliberately do *not* expand:
+  - **Filesystem positions expand.** A bare glob **literal** (`*.txt`, `**`, `*(f)`) in
+    a command argument, a `for` subject, or a value position (`files = *.txt`) yields
+    its match list; a `glob(STR)` value dropped into those same positions expands the
+    same way.
+  - **Match slots keep the pattern.** In a `~` / `!~` RHS or a glob `match` arm
+    (`$p ~ *.txt`, [Tests and comparisons](#tests-and-comparisons)) the literal is
+    consumed as a **pattern** and never touched against the filesystem.
+  - **`glob(STR)` storage keeps the value.** Binding a constructed glob —
+    `g = glob($pat)` — **retains** the first-class glob value; it is an explicit
+    construction, not a bare literal, so it is stored to expand or match later. Only a
+    *bare* literal auto-expands on an assignment RHS (`files = *.txt`), which is why a
+    runtime pattern you want to keep is written `glob(…)`, not bare.
 
 The two ergonomic wrappers are **expansion** helpers — they match now and return a
 plain [list](#arrays-lists), so they read naturally in a `for`. They enumerate a
