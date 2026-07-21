@@ -330,6 +330,78 @@ appears.)*
 - **ksh extended globs** (`!(…)`, `@(…)`, `+(…)`) — **dropped.** Cryptic, and
   their jobs are covered by braces + exclusion.
 
+**The `glob()` family — one primitive, sugar on top.** The literal forms above are
+surface sugar for a single built-in: **`glob(STR)`** (already the constructor for an
+absolute or runtime-built pattern — see [Built-ins](#built-ins)). A bare `*.txt` in a
+command's argument position *is* `glob("*.txt")` — same engine, same match rules, the
+same type qualifiers and exclusion. Two ergonomic wrappers cover the common filters,
+named for the same file-type words as the `:files` / `(f)` qualifiers so the
+vocabulary stays one — `files` / `dirs` mean "restrict to that type" whether they
+appear as a wrapper here, a `(f)` glob qualifier, or a `:files` list
+[modifier](#modifiers):
+
+```
+glob(PAT)                 # the primitive: PAT → matching paths
+files(PAT=.)              # files only, one level      ≡ glob(PAT):files, non-recursive
+dirs(PAT=.)               # directories only, one level ≡ glob(PAT):dirs
+
+for f in files() { … }    # PWD by default
+for d in dirs()  { … }
+for f in files(src) { … } # a named directory
+```
+
+Recursion stays the pattern's job, not a flag: `files(**)` / `glob(src/**):files`
+descend, matching the `**`-on-by-default rule above.
+
+**Why a function at all — the runtime pattern.** Because a bareword and a `$var` are
+*both just strings* to `glob()`, a pattern built at runtime expands through exactly the
+same path as a literal one:
+
+```
+p = *.jpg                 # p is the LITERAL string "*.jpg" — barewords don't glob
+ls $p                     # a file literally named *.jpg (usually: no such file)
+ls files($p)              # NOW it globs — the function is the expansion boundary
+ls files(*.jpg)           # identical: files() sees the same string either way
+```
+
+This is the deliberate resolution of the "build a pattern, then use it" case that a
+purely syntactic glob leaves stranded. Expansion of a *value* never happens by
+accident — only where you *name* `glob` / `files` / `dirs`. Typing the pattern is
+opt-in (the sugar); expanding a stored one is opt-in (the call); there is no third,
+implicit path. It is the same discipline as [`...`](#spread--flattening): the
+dangerous operation is always a visible keystroke, never a default.
+
+**Splatting to a command.** A **literal** glob in argument position splats its matches
+into argv directly — `ls *.txt` is N arguments — because you wrote it there. A glob
+result from a function is an ordinary [list](#arrays-lists), so handing it to an
+**external** takes the explicit [`...`](#spread--flattening) that every list does:
+
+```
+ls *.txt                  # literal: auto-splat, N argv entries
+ls ...files($pat)         # runtime list → external: spread, as any list
+for f in files($pat) { }  # or iterate it — no spread needed
+```
+
+The asymmetry is intentional and on-theme: the pattern you *typed* is trusted to
+expand in place; a pattern you *computed* makes the expansion visible with `...`.
+
+**Functions look like functions.** `glob` / `files` / `dirs` are
+[value calls](#calling-for-a-value-and-lambdas) — `files(.)`, parens attached — never
+bare `files .`, so at a glance a glob **function** stays distinct from an external
+**command** even in statement position.
+
+**Two policies the primitive pins.** `*` matches *everything not hidden* — files,
+dirs, and symlinks alike — and is deliberately **not** narrowed to files-only (else
+`cp -r * dst` would silently skip subdirectories, a fresh footgun traded for the old
+one); the file / dir / special split lives entirely in the `(f)` / `(d)` / `:files`
+vocabulary. A leading-dot name matches only when the pattern's own first character is
+a literal `.` (the usual hidden-file rule). **No-match** *(half-settled)*: the
+*function* form yields the empty list `[]` (programmatic use never throws); a bare
+*literal* matching nothing **warns but does not error** — it expands to nothing rather
+than passing the literal through (bash's footgun), staying a non-fatal diagnostic
+rather than aborting the line. *(TODO — interactively, **prompt** on no match instead
+of only warning.)*
+
 ### Variables and assignment
 
 Assignment is `name=value`, the **bash spelling** — the most ingrained shell
@@ -500,7 +572,9 @@ hyphen between — the third payoff of that one spacing rule.
   **`${…}`** form, which also delimits where it ends: `"${m.key}"`, `"${xs[0]}"`,
   `"${dir}s"`. One rule — unbraced `$name` is the variable, `${…}` is everything
   more — so the two never parse ambiguously. (Outside strings there is no
-  ambiguity: `$m.key` / `$xs[0]` are ordinary access.)
+  ambiguity: `$m.key` / `$xs[0]` are ordinary access.) *(open — whether to extend
+  bare `$name.key` access into strings too, flipping which case pays the ceremony;
+  see [Open questions](#open-questions).)*
 - **No null.** mesh has **no `nil`/`null`/`none`** value — the billion-dollar
   mistake is left out. The consequence is a consistent rule wherever a value
   might be absent: **exact** access fails loud (`$xs[99]`, `$m[absent]` are
@@ -2879,6 +2953,20 @@ to avoid" rather than promising the latter as done.
   **pattern-match** operator ([Tests and comparisons](#tests-and-comparisons)),
   so glob exclusion keeps the spaced infix `-` only.
 - **String modifier set** — beyond `:strip` / `:replace`.
+- **Member access inside string interpolation** — currently *(decided)* a bare
+  `$name` inside `"…"` interpolates just the variable, so a following `.`/`[` is
+  literal (`"$file.txt"` appends `.txt`; `"$m.key"` is `$m` then `.key`), and any
+  access inside a string takes the braced `${…}` form
+  ([Variables and assignment](#variables-and-assignment)). Outside strings, `$m.key` / `$xs[0]`
+  are already ordinary access — so the fork is only *inside* strings: keep the
+  current rule, or extend bare `$name.key` access into strings too. The trade is
+  **consistency** (one meaning for `$x.y` everywhere, member access always free)
+  **vs. keeping literal-append free** (the common `"$file.txt"` / `"$host.$domain"`
+  needs no ceremony). If flipped, literal-append needs an explicit terminator —
+  leading candidate **`${file}.bak`** (the brace closes the reference cleanly), over
+  `"$file".bak`, which reintroduces a "what does `.` after a closing quote mean"
+  ambiguity once `.` binds access to expressions. Interactive path-building leans to
+  the current rule; data-heavy scripting leans to the flip.
 - **Predicate qualifier syntax** — confirm `size>` / `age<` / `mtime<` forms.
 - **History expansion — decided** ([History expansion](#history-expansion)):
   interactive-only, quote-safe `!!` / `!string` / `!$` (with `!*` / `!n` deferred);
