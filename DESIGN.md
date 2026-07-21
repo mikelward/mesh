@@ -2375,8 +2375,10 @@ programs or user functions:
   constructor — it **expands** a (runtime-built or absolute) pattern to its matching
   **paths**, a [list](#arrays-lists), since globbing is filesystem expansion, not a
   pattern object; its match-side twin **`fnmatch(STR, PAT)`** returns a bool for
-  "does this string match this glob pattern" with no filesystem access. `style` (above)
-  is the styled-value constructor.
+  "does this string match this glob pattern" with no filesystem access. **`files(DIR=.)`**
+  and **`dirs(DIR=.)`** are the [wrapper](#globbing) expansions — `glob` over a
+  directory's immediate entries preset to `type: file` / `type: dir` — returning a
+  path [list](#arrays-lists). `style` (above) is the styled-value constructor.
 - **Session** — `exit [status]`.
 
 **No aliases.** mesh drops the alias mechanism entirely: a **function** is just
