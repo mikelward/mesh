@@ -919,42 +919,28 @@ builds, say, an ordered alias table.
 
 ### Separators: space vs comma
 
-Two separators appear inside `[ … ]` and `( … )`, and which one is used is
-mechanical, not stylistic — each marks a different kind of thing:
+mesh separates the elements of a list, an argv, or a call with a **space**, not a
+comma — the deliberate answer to "should lists use commas?" The comma is kept for
+the few grammar spots that pair or name their items.
 
-- **Space separates *atomic elements*.** List elements `[a b c]`, command
-  arguments `cmd a b c`, [value-call](#calling-for-a-value-and-lambdas) arguments
-  `f(a b c)`, and modifier arguments `:get(EDITOR vim)` are all space-separated —
-  one rhythm, so a list literal reads exactly like the argv it would spread into.
-- **Comma separates *compound entries* that can hold an internal space.** A map
-  pair `key: value` has a space in it, and a signature parameter like
-  `--tag = latest` does too, so those are comma-delimited to keep the entry
-  boundary unambiguous: `[http: 80, https: 443]`,
-  `func f(env, --tag = latest, ...hosts)`.
-
-So the rule is: **a comma appears exactly where an entry may itself contain a
-space, and nowhere else.** In the space-separated contexts the separator is only
-the *top-level* space — the one outside every bracket and block — and each
-element is a self-contained expression, in one of these shapes:
-
-- an **atomic token** — a bareword or a scalar; to hold a space, quote it
-  (`["a b" "c d"]`) or backslash-escape the space (`[a\ b c]` is two elements,
-  `a\ b` and `c`, per the [bare-word escape](#quoting-and-escaping)), since an
-  *unescaped* bare space would read as two tokens;
-- a **self-delimited expression** — one whose own grammar closes it, so its
-  internal spaces are structural, it needs no quoting (quoting would turn it into
-  a string), and it takes no comma. This spans both **bracket-delimited** values
-  — a nested list `[a b]`, a map `[k: v]`, a command substitution `$(cmd sub
-  args)`, a call or lambda `func(f) { $f:stem }` — and **keyword-led block
-  expressions** used in argument position, e.g.
-  `style(if inside-project() { … } else { … } --fg blue)`, `match … { … }`, or
-  `fork { … }`, which a keyword plus its `{ }` blocks close just as brackets do.
-
-The precise point where one element ends and the next begins is the parser's to
-fix (the EBNF is still a TODO); the principle here is only that an *unescaped,
-unquoted top-level* space separates elements and a comma never separates them —
-an internal space survives inside one element only
-when it is quoted, backslash-escaped, or enclosed in balanced brackets.
+- **Space is the everyday element separator** in the argv-rhythm contexts: list
+  elements `[a b c]`, command arguments `cmd a b c`,
+  [value-call](#calling-for-a-value-and-lambdas) arguments `f(a b c)`, and
+  modifier arguments `:get(EDITOR vim)`. One rhythm, so a list literal reads
+  exactly like the argv it would spread into. Each element is a whole value
+  expression — a bareword, a quoted or escaped string, a `$x` expansion (which
+  stays *one* value whether or not it holds a list — the
+  [no-word-splitting](#spread--flattening) guarantee), a bracketed literal, or a
+  keyword-led block expression — and only a *top-level* space, outside every
+  bracket and block, divides one element from the next. The exact grammar of
+  where an element ends is the parser's job (the EBNF is a TODO); the design point
+  here is simply that the separator is a space.
+- **Comma is reserved for the grammar's paired or named forms**, where a bare
+  space would be ambiguous because the items carry internal spaces or come in
+  pairs: map entries `[http: 80, https: 443]`, signature parameters
+  `func f(env, --tag = latest, ...hosts)`, and the map-iteration binder
+  `for host, addr in $m`. There the comma is structural, not a general element
+  separator.
 
 **Should mesh broaden commas — allow `[a, b]`, or comma-separated call args?**
 The settled answer is **no**:
@@ -966,9 +952,9 @@ The settled answer is **no**:
 - It reintroduces a small ambiguity mesh is otherwise free of — "is the comma a
   separator or part of the token?" — and the comma-in-filename edge that the
   "operators need surrounding space" rule elsewhere exists to avoid.
-- The comma already earns its keep *only* at compound entries; a comma between
-  atomic elements would be redundant with the space — a second way to spell one
-  thing.
+- The comma already earns its keep at the paired/named forms above; a comma
+  between plain elements would be redundant with the space — a second way to
+  spell one thing.
 
 A comma in a **list** (non-pair) position is therefore a **loud error**, not a
 tolerated synonym: `[a, b]` reports that lists are space-separated and asks
