@@ -362,7 +362,7 @@ asking "does this *string* look like this pattern" (no disk at all) split the wa
 Python splits `glob` from `fnmatch`. The `~` operator carries the match side:
 `$f ~ *.txt` is a bool — whole-string fnmatch, **no filesystem access** (see [Tests and
 comparisons](#tests-and-comparisons)). A pattern built at runtime is matched by the
-predicate directly — [`fnmatch($f, $pat)`](#built-ins) — so no first-class glob value
+predicate directly — [`fnmatch($f $pat)`](#built-ins) — so no first-class glob value
 is needed to test against a computed pattern. (Regex keeps its `re(STR)` *value*
 because regexes are complex and reused; a glob stays a literal or an `fnmatch` call.)
 
@@ -734,7 +734,7 @@ had to be wrapped.
 **The one residual.** A single segment with a trailing slash still reads as a regex:
 `$p ~ /tmp/` is the regex `tmp`, not the path. Three teachable outs — drop the slash
 (`$p ~ /tmp`, the path, and the more usual spelling anyway), add structure
-(`$p ~ /tmp/*`), or force it (`fnmatch($p, "/tmp/")` / `== "/tmp/"`). That is the entire
+(`$p ~ /tmp/*`), or force it (`fnmatch($p "/tmp/")` / `== "/tmp/"`). That is the entire
 residual, versus the old rule's blanket wrapper requirement.
 
 **Recognized only in match slots.** Everywhere else a `/…/` word stays a path or
@@ -1207,7 +1207,7 @@ The `~` RHS *also* takes a **glob**: a **relative** one is bare (`*.txt`, `src/*
 and an **absolute** one now also goes bare — `$p ~ /usr/*/bin`, `$p ~ /tmp/*` — with
 `$p ~ /usr/bin` reading as the path. The one residual is a single segment with a
 trailing slash: `$p ~ /tmp/` is the regex `tmp`; write `$p ~ /tmp` for the path (or
-`fnmatch($p, "/tmp/")` / `== "/tmp/"`).
+`fnmatch($p "/tmp/")` / `== "/tmp/"`).
 **Everywhere else a `/…/` word is a path or string** — `cd /tmp/`, `grep /usr/bin`,
 `$env.PATH:has(/usr/bin)`, `p = /etc/hosts` are all unaffected (a `/…/` is only a
 regex next to the match operators, never in a plain argument or modifier slot). To
@@ -1401,7 +1401,7 @@ Rules:
   | command | its own exit status |
   | int | the integer itself — `0` success (the shell `return N`) |
   | bool | `true` → `0`, `false` → `1` (the Unix inversion) |
-  | string / list / map / styled value / Instant / Duration / regex / glob / stream handle (incl. empty or zero) | `0` — producing a value *is* success |
+  | string / list / map / styled value / Instant / Duration / regex / stream handle (incl. empty or zero) | `0` — producing a value *is* success |
 
   So `have_command` ends in a test whose bool becomes the status and
   `if have_command fzf { … }` reads correctly; `return $cond` exits `0`/`1`;
@@ -2324,7 +2324,7 @@ programs or user functions:
   with `re(STR --literal)` for verbatim matching. **`glob(STR)`** is *not* a value
   constructor — it **expands** a (runtime-built or absolute) pattern to its matching
   **paths**, a [list](#arrays-lists), since globbing is filesystem expansion, not a
-  pattern object; its match-side twin **`fnmatch(STR, PAT)`** returns a bool for
+  pattern object; its match-side twin **`fnmatch(STR PAT)`** returns a bool for
   "does this string match this glob pattern" with no filesystem access. `style` (above)
   is the styled-value constructor.
 - **Session** — `exit [status]`.
