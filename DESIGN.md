@@ -350,8 +350,8 @@ plain [list](#arrays-lists), so they read naturally in a `for`. They enumerate a
 [qualifiers](#modifiers):
 
 ```
-files(DIR=.)              # files directly in DIR      (find DIR -maxdepth 1 -type f)
-dirs(DIR=.)               # subdirectories of DIR       (…-type d)
+files(DIR=.)              # files directly in DIR   (find DIR -mindepth 1 -maxdepth 1 -type f)
+dirs(DIR=.)               # subdirectories of DIR   (find DIR -mindepth 1 -maxdepth 1 -type d)
 
 for f in files() { … }    # PWD by default
 for d in dirs()  { … }
@@ -398,8 +398,9 @@ bare `files .`, so at a glance a glob **function** stays distinct from an extern
 dirs, and symlinks alike — and is deliberately **not** narrowed to files-only (else
 `cp -r * dst` would silently skip subdirectories, a fresh footgun traded for the old
 one); the file / dir / special split lives entirely in the `(f)` / `(d)` / `:files`
-vocabulary. A leading-dot name matches only when the pattern's own first character is
-a literal `.` (the usual hidden-file rule). **No-match** *(half-settled)*: the
+vocabulary. A hidden (leading-dot) entry matches only when the corresponding **path
+component** of the pattern itself begins with a literal `.` — the usual per-component
+rule, so `*` skips `.git` while `.*` and `src/.*` match it. **No-match** *(half-settled)*: the
 *function* form yields the empty list `[]` (programmatic use never throws); a bare
 *literal* matching nothing **warns but does not error** — it expands to nothing rather
 than passing the literal through (bash's footgun), staying a non-fatal diagnostic
@@ -1540,21 +1541,26 @@ Rules:
   simply does not print; one that legitimately does both streams *and* returns.
 - **Both channels at once — `:capture`.** When you genuinely need more than one,
   `f(…):capture` runs the call and returns a **record of every channel**: `.value`
-  (the return value), `.out` and `.err` (its captured stdout / stderr), and
-  `.status`. Read them with ordinary field access (`r = f(x):capture` then
-  `r.value` / `r.out`). It is an *invocation-level* modifier, not a plain value
-  [modifier](#modifiers) — it has to wrap execution, since by the time a value
-  modifier saw the return value the stdout would already have streamed away, the
-  same reason `$(…)` is a wrapper rather than a postfix. It generalizes across the
-  external boundary: on a command the record is the same **minus `.value`** (there
+  (the return value), `.out` and `.err` (its stdout / stderr, as **raw byte-strings**
+  — split them with the usual [`:lines`](#modifiers) / `:split` / `:nulls` modifiers
+  as needed, so the record bakes in no split policy), and `.status`. Read them with
+  ordinary field access (`r = f(x):capture` then `r.value` / `r.out:lines`). It is an
+  *invocation-level* modifier, not a plain value [modifier](#modifiers) — it has to
+  wrap execution, since by the time a value modifier saw the return value the stdout
+  would already have streamed away, the same reason `$(…)` is a wrapper rather than a
+  postfix. The **same `cmd(…):capture` spelling works on an external** — and is the
+  single exception to the value-call error below: a bare `grep(foo)` errors because it
+  asks for a return value the command lacks, but `grep(foo):capture` asks for the
+  channel record, so it is allowed and comes back the same **minus `.value`** (there
   is none — accessing it is a loud no-such-field error). Reaching for `:capture` is
-  the sign a function is doing two jobs at once; a single-channel function needs
-  none of it. *(TODO — further fields such as timing and a `pipestatus` list; today
-  it is the four above.)*
-- **Externals have no return value**, so `grep(foo)` is a **runtime error** that
-  points you at `$(grep foo)`. Rich values stay in-shell — the same bytes-only
-  boundary as `export` and subshells. (`f` resolves at call time, so this is a
-  runtime, not parse, distinction.)
+  the sign a function is doing two jobs at once; a single-channel function needs none
+  of it. *(TODO — further fields such as timing and a `pipestatus` list; today it is
+  the four above.)*
+- **Externals have no return value**, so a bare `grep(foo)` is a **runtime error**
+  that points you at `$(grep foo)` for stdout, or `grep(foo):capture` for the full
+  channel record. Rich values stay in-shell — the same bytes-only boundary as
+  `export` and subshells. (`f` resolves at call time, so this is a runtime, not parse,
+  distinction.)
 
 **Lambdas** are then just anonymous functions — the `func` declaration minus the
 name, reusing its whole signature grammar (defaults, `--flags`, `...rest`) — and
