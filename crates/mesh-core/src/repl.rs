@@ -1233,12 +1233,7 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
 
 /// Return whether the parser needs another physical line to complete the input.
 fn needs_more_input(text: &str) -> bool {
-    let parser_incomplete = matches!(parser::parse(text), Ok(parser::ParseOutcome::Incomplete));
-    let trimmed = text.trim_start();
-    let compound = ["func ", "if ", "for "]
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix));
-    parser_incomplete || (compound && text.contains('{') && crate::lexer::needs_more_input(text))
+    matches!(parser::parse(text), Ok(parser::ParseOutcome::Incomplete))
 }
 
 fn run_interactive() -> ExitCode {

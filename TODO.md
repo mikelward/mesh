@@ -66,7 +66,7 @@ file as tasks land.
       (`xs = [a "b c"]`), including the distinct empty list (`xs = []`).
 - [x] Explicit list spread into command arguments (`puts ...$xs`); using a list
       without `...` is a loud error rather than implicit word splitting.
-- [ ] Replace the incremental command lexer with the clean-break expression and
+- [x] Replace the incremental command lexer with the clean-break expression and
       block parser.
   - [x] Fix the parser grammar, precedence, attachment, and completeness contract
         in [`PARSER.md`](PARSER.md).
@@ -76,7 +76,7 @@ file as tasks land.
         execution entry, including chained comparisons and arithmetic assignment
         syntax, while command words remain compatibility-owned until their AST
         adapter lands below.
-  - [ ] Add recursive AST execution for `Source`, `Statement`, `AndOr`,
+  - [x] Add recursive AST execution for `Source`, `Statement`, `AndOr`,
         `Executable`, `Pipeline`, `Command`, and `Expr`; implement sequencing,
         `&&` / `||`, background execution, and control flow from those nodes.
   - [x] Adapt parser-native `Word` / `WordPiece` and redirects directly into the
@@ -90,11 +90,11 @@ file as tasks land.
         recursively instead of retaining and reparsing raw body text.
   - [x] Remove the raw-text function, `if`, and `for` recognizers and their brace
         scanners; use only `ParseOutcome::Incomplete` to buffer compound input.
-  - [ ] Retire `lexer::split_line` and compatibility lexer types from the REPL
+  - [x] Retire `lexer::split_line` and compatibility lexer types from the REPL
         execution path once commands and expressions run from the AST; retain
         the old lexer only where a temporary public compatibility surface or its
         tests still require it.
-  - [ ] Add regression coverage for parser-authoritative errors and completeness,
+  - [x] Add regression coverage for parser-authoritative errors and completeness,
         stored function ASTs, nested compound bodies, quoting, interpolation,
         globbing, redirects, pipelines, guards, and background commands; verify
         that `repl.rs` has no raw compound recognizers or `lexer::split_line`.

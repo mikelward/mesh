@@ -369,6 +369,14 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
 /// [`ParseOutcome::Incomplete`]; malformed complete input returns an error.
 pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
     let tokens = tokenize(source)?;
+    let open_block = tokens
+        .iter()
+        .fold(0_usize, |depth, token| match token.value {
+            TokenKind::LBrace => depth + 1,
+            TokenKind::RBrace => depth.saturating_sub(1),
+            _ => depth,
+        })
+        > 0;
     let mut parser = Parser {
         tokens,
         position: 0,
@@ -377,10 +385,11 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
     match parser.source(None) {
         Ok(tree) => Ok(ParseOutcome::Complete(tree)),
         Err(error)
-            if matches!(
-                error.kind,
-                ParseErrorKind::UnexpectedEnd | ParseErrorKind::Unterminated(_)
-            ) =>
+            if open_block
+                || matches!(
+                    error.kind,
+                    ParseErrorKind::UnexpectedEnd | ParseErrorKind::Unterminated(_)
+                ) =>
         {
             Ok(ParseOutcome::Incomplete)
         }
@@ -2198,6 +2207,11 @@ mod tests {
     fn reports_incomplete_delimiters_and_connectors() {
         assert_eq!(parse("x = (1").unwrap(), ParseOutcome::Incomplete);
         assert_eq!(parse("a &&").unwrap(), ParseOutcome::Incomplete);
+        assert_eq!(
+            parse("func f(x {\nputs )").unwrap(),
+            ParseOutcome::Incomplete
+        );
+        assert!(parse("func f(x {\nputs )\n}").is_err());
     }
 
     #[test]
