@@ -78,6 +78,24 @@ enum Step {
 /// while running a `func` body: there a `return` unwinds; at top level it is a
 /// recoverable error.
 fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
+    // Expression assignments already use the clean-break grammar. Commands
+    // still need the compatibility parser until parser words can be expanded.
+    let parser_owned = parser_owned_assignment(text);
+    match parser::parse(text) {
+        Ok(parser::ParseOutcome::Complete(_)) => {}
+        Ok(parser::ParseOutcome::Incomplete) if parser_owned => {
+            eprintln!("mesh: syntax error: unexpected end of input");
+            return Step::Continue(2);
+        }
+        Err(error)
+            if parser_owned || matches!(error.kind, parser::ParseErrorKind::ChainedComparison) =>
+        {
+            eprintln!("mesh: {error}");
+            return Step::Continue(2);
+        }
+        Ok(parser::ParseOutcome::Incomplete) | Err(_) => {}
+    }
+
     if is_func_start(text) {
         return define_func(text, shell);
     }
@@ -138,6 +156,26 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
         }
     }
     Step::Continue(status)
+}
+
+fn parser_owned_assignment(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let name_len = trimmed
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_alphanumeric())
+        .last()
+        .map_or(0, |(index, c)| index + c.len_utf8());
+    let assignment = name_len > 0
+        && trimmed[..name_len]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        && matches!(
+            trimmed[name_len..].trim_start().as_bytes(),
+            [b'=', ..] | [b'+', b'=', ..]
+        );
+    let rhs = trimmed.split_once('=').map_or("", |(_, rhs)| rhs);
+    assignment && (rhs.contains(" + ") || rhs.trim_end().ends_with(" +"))
 }
 
 /// Run one pipeline. A single stage keeps the full command surface (assignments,
