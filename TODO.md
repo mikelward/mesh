@@ -55,14 +55,10 @@ file as tasks land.
       resumption land with the job table below.
 - [x] Job table plus `jobs`, `fg`, and `bg` builtins for stopped foreground jobs.
       `N` and `%N` select a job; no operand selects the newest job. Background
-      launch with `&` remains a separate lexer/parser task.
+      launch with bare `&` registers running commands and pipelines in the same
+      table; background stdin defaults to `/dev/null`.
 - [x] Hand the terminal to full-screen programs and restore the shell's terminal
       modes cleanly when they exit or stop.
-
-## Known limitations
-
-- Jobs enter the table through Ctrl-Z; `&` background-launch syntax is not
-  implemented yet.
 
 ## Decisions made
 

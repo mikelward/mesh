@@ -979,6 +979,41 @@ fn a_three_stage_pipeline_works() {
 }
 
 #[test]
+fn a_pipeline_can_run_in_the_background() {
+    let dir = fresh_dir("background_pipeline");
+    let out = run_with_input(&format!(
+        "sh -c 'sleep 0.05; echo background > {0}/result' | cat & puts foreground\nsleep 0.15\ncat {0}/result\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "foreground\nbackground\n"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("[1]"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_background_command_does_not_consume_shell_input() {
+    let out = run_with_input("cat & puts after\nsleep 0.05\njobs\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("[1]"));
+}
+
+#[test]
+fn quoted_and_escaped_ampersands_are_literal() {
+    let out = run_with_input("echo 'a&b' c\\&d\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a&b c&d\n");
+}
+
+#[test]
+fn an_empty_background_command_is_a_syntax_error() {
+    let out = run_with_input("&\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("needs a command"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
 fn output_redirection_writes_a_file_and_input_reads_it() {
     let dir = fresh_dir("redir_io");
     let out = run_with_input(&format!("cd {}\necho hello > f\ncat < f\n", dir.display()));

@@ -52,6 +52,7 @@ pub enum LexError {
     MissingRedirectTarget,
     EmptyPipelineStage,
     UnsupportedRedirect,
+    EmptyBackgroundCommand,
 }
 
 impl std::fmt::Display for LexError {
@@ -76,6 +77,9 @@ impl std::fmt::Display for LexError {
                 f,
                 "syntax error: descriptor redirection (e.g. `2>`, `&>`) is not supported yet"
             ),
+            LexError::EmptyBackgroundCommand => {
+                write!(f, "syntax error: background operator needs a command")
+            }
         }
     }
 }
@@ -121,13 +125,14 @@ pub struct Stage {
 pub struct Segment {
     pub sep_before: Sep,
     pub stages: Vec<Stage>,
+    pub background: bool,
 }
 
 /// Split `line` into command segments joined by `;` / `&&` / `||`, each a
 /// pipeline of `|`-joined stages with optional `>` / `>>` / `<` redirections. A
-/// line with no separator is a single segment. Operators are recognized only at
-/// the bare (unquoted, unescaped) level; a lone `&` (background) is not one yet
-/// and stays a literal character.
+/// line with no separator is a single segment. A bare `&` ends a pipeline and
+/// launches it in the background. Operators are recognized only at the bare
+/// (unquoted, unescaped) level.
 pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
     let chars: Vec<char> = line.chars().collect();
     let mut segments = Vec::new();
@@ -167,9 +172,30 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
                 &mut stages,
                 &mut words,
                 &mut redirs,
+                false,
             )?;
             sep_before = sep;
             i += len;
+            continue;
+        }
+        if chars[i] == '&' && chars.get(i + 1) != Some(&'>') {
+            finish_word(&mut current, &mut words, &mut redirs, &mut pending_redir);
+            if pending_redir.is_some() {
+                return Err(LexError::MissingRedirectTarget);
+            }
+            if stages.is_empty() && words.is_empty() && redirs.is_empty() {
+                return Err(LexError::EmptyBackgroundCommand);
+            }
+            finish_segment(
+                &mut segments,
+                sep_before,
+                &mut stages,
+                &mut words,
+                &mut redirs,
+                true,
+            )?;
+            sep_before = Sep::Seq;
+            i += 1;
             continue;
         }
         if chars[i] == '|' {
@@ -259,6 +285,7 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
         &mut stages,
         &mut words,
         &mut redirs,
+        false,
     )?;
     Ok(segments)
 }
@@ -290,6 +317,7 @@ fn finish_segment(
     stages: &mut Vec<Stage>,
     words: &mut Vec<Word>,
     redirs: &mut Vec<Redir>,
+    background: bool,
 ) -> Result<(), LexError> {
     let last_empty = words.is_empty() && redirs.is_empty();
     if !stages.is_empty() {
@@ -309,6 +337,7 @@ fn finish_segment(
     segments.push(Segment {
         sep_before,
         stages: std::mem::take(stages),
+        background,
     });
     Ok(())
 }
@@ -673,6 +702,7 @@ mod tests {
         Segment {
             sep_before,
             stages: vec![stage(ws)],
+            background: false,
         }
     }
 
@@ -692,6 +722,17 @@ mod tests {
                 seg(Sep::Or, &["d"]),
             ]
         );
+    }
+
+    #[test]
+    fn background_operator_ends_a_segment() {
+        let mut first = seg(Sep::Seq, &["sleep", "1"]);
+        first.background = true;
+        assert_eq!(
+            split_line("sleep 1 & echo ready").unwrap(),
+            [first, seg(Sep::Seq, &["echo", "ready"]),]
+        );
+        assert_eq!(split_line("&"), Err(LexError::EmptyBackgroundCommand));
     }
 
     #[test]
@@ -719,12 +760,6 @@ mod tests {
             escaped[0].stages[0].words,
             [Word(vec![exp("a"), lit("&&"), exp("b")])]
         );
-    }
-
-    #[test]
-    fn a_lone_amp_is_not_a_separator() {
-        // `&` (background) is not an operator yet — it stays a literal character.
-        assert_eq!(split_line("a&b").unwrap(), [seg(Sep::Seq, &["a&b"])]);
     }
 
     #[test]

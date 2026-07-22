@@ -70,7 +70,7 @@ fn run_line(text: &str, last: u8, vars: &mut Vars, jobs: &mut exec::JobTable) ->
             // `;`): a no-op that leaves the status unchanged.
             continue;
         }
-        match run_pipeline(segment.stages, status, vars, jobs) {
+        match run_pipeline(segment.stages, segment.background, status, vars, jobs) {
             Step::Exit(code) => return Step::Exit(code),
             Step::Continue(code) => status = code,
         }
@@ -82,24 +82,40 @@ fn run_line(text: &str, last: u8, vars: &mut Vars, jobs: &mut exec::JobTable) ->
 /// builtins). A multi-stage pipeline (`|`) is external commands only for now.
 fn run_pipeline(
     mut stages: Vec<Stage>,
+    background: bool,
     last: u8,
     vars: &mut Vars,
     jobs: &mut exec::JobTable,
 ) -> Step {
     if stages.len() == 1 {
-        run_single(stages.pop().unwrap(), last, vars, jobs)
+        run_single(stages.pop().unwrap(), background, last, vars, jobs)
     } else {
-        run_multi(stages, vars, jobs)
+        run_multi(stages, background, vars, jobs)
     }
 }
 
 /// Run a one-stage pipeline. Without redirections this is the full command
 /// surface: an assignment or a builtin/external command. With redirections it is
 /// a command only (external for now — a redirected builtin is not supported yet).
-fn run_single(stage: Stage, last: u8, vars: &mut Vars, jobs: &mut exec::JobTable) -> Step {
-    let Stage { words, redirs } = stage;
+fn run_single(
+    stage: Stage,
+    background: bool,
+    last: u8,
+    vars: &mut Vars,
+    jobs: &mut exec::JobTable,
+) -> Step {
+    let Stage { mut words, redirs } = stage;
     if redirs.is_empty() {
-        return run_command_or_assign(words, last, vars, jobs);
+        if !background {
+            return run_command_or_assign(words, last, vars, jobs);
+        }
+        words = match classify(words) {
+            Line::Command(words) => words,
+            Line::Assign { .. } => {
+                eprintln!("mesh: assignments cannot run in the background");
+                return Step::Continue(1);
+            }
+        };
     }
     let argv = match expand::expand(words, vars) {
         Ok(argv) => argv,
@@ -113,10 +129,17 @@ fn run_single(stage: Stage, last: u8, vars: &mut Vars, jobs: &mut exec::JobTable
         return Step::Continue(1);
     }
     if builtins::is_builtin(&argv[0]) {
-        eprintln!(
-            "mesh: {}: redirection of a builtin is not supported yet",
-            argv[0]
-        );
+        if background {
+            eprintln!(
+                "mesh: {}: builtins cannot run in the background yet",
+                argv[0]
+            );
+        } else {
+            eprintln!(
+                "mesh: {}: redirection of a builtin is not supported yet",
+                argv[0]
+            );
+        }
         return Step::Continue(1);
     }
     match expand_redirs(redirs, vars) {
@@ -126,6 +149,7 @@ fn run_single(stage: Stage, last: u8, vars: &mut Vars, jobs: &mut exec::JobTable
                 redirs,
             }],
             jobs,
+            background,
         )),
         Err(err) => {
             eprintln!("mesh: {err}");
@@ -136,7 +160,12 @@ fn run_single(stage: Stage, last: u8, vars: &mut Vars, jobs: &mut exec::JobTable
 
 /// Run a multi-stage pipeline (`a | b | c`). Every stage must be an external
 /// command; a builtin in a pipeline is not supported yet.
-fn run_multi(stages: Vec<Stage>, vars: &mut Vars, jobs: &mut exec::JobTable) -> Step {
+fn run_multi(
+    stages: Vec<Stage>,
+    background: bool,
+    vars: &mut Vars,
+    jobs: &mut exec::JobTable,
+) -> Step {
     let mut cmds = Vec::with_capacity(stages.len());
     for stage in stages {
         let Stage { words, redirs } = stage;
@@ -170,7 +199,7 @@ fn run_multi(stages: Vec<Stage>, vars: &mut Vars, jobs: &mut exec::JobTable) -> 
             redirs,
         });
     }
-    Step::Continue(exec::run_pipeline(cmds, jobs))
+    Step::Continue(exec::run_pipeline(cmds, jobs, background))
 }
 
 /// Expand each redirection target to exactly one path. Zero or several words is

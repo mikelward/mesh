@@ -77,7 +77,7 @@ makes a shell a shell.
 - Pipelines (`a | b | c`) and basic redirection (`>`, `>>`, `<`) ✅ landed.
   Descriptor/stderr redirection (`2>`) remains planned.
 - Process groups, `tcsetpgrp`, foreground signal handling, stopped-job tracking,
-  and `jobs` / `fg` / `bg` ✅ landed; `&` background launch remains.
+  `&` background launch, and `jobs` / `fg` / `bg` ✅ landed.
 - **Ctrl-C returns to the prompt** with status `130` (child gets SIGINT, shell
   survives) ✅ landed.
 - Hand the terminal to full-screen programs (`vim`) and get it back cleanly ✅

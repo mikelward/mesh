@@ -16,6 +16,9 @@ Interactive startup follows Unix job-control rules: a mesh launched as a
 background job stops before reading its terminal and can be resumed with `fg`.
 Foreground commands receive the terminal, and mesh restores both terminal
 ownership and its saved terminal modes when they finish or stop.
+Bare `&` launches an external command or pipeline in its own background process
+group and registers it in the job table; background stdin defaults to
+`/dev/null`, so a job cannot consume later shell input.
 
 ## Prerequisites
 
@@ -154,7 +157,7 @@ mesh/
 
 `main` calls `mesh_core::run`, which enters the REPL and loops: read a line →
 `lexer::split_line` into
-command segments joined by `;` / `&&` / `||`, each a list of words of pieces →
+command segments joined by `;` / `&&` / `||` / `&`, each a list of words of pieces →
 run the segments left to right, each connector deciding from the previous status
 whether its command runs → per command, classify as an assignment or a command →
 for a command, `expand::expand` (resolve `$` interpolation against `vars`, then
