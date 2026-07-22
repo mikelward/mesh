@@ -14,3 +14,6 @@ workspace = true
 # library crate so it can be reused and tested independently.
 [dependencies]
 mesh-core = { path = "../mesh-core" }
+
+[dev-dependencies]
+libc = "0.2.186"

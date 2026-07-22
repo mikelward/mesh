@@ -332,6 +332,10 @@ fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
 /// an empty line exits (reedline's default — a non-empty line is unaffected);
 /// Ctrl-C cancels the current line and returns to the prompt without exiting.
 fn run_interactive() -> ExitCode {
+    if let Err(err) = wait_until_foreground() {
+        eprintln!("mesh: could not acquire terminal foreground: {err}");
+        return ExitCode::from(1);
+    }
     if let Err(err) = ignore_interactive_signals() {
         eprintln!("mesh: could not configure interactive signals: {err}");
         return ExitCode::from(1);
@@ -354,6 +358,34 @@ fn run_interactive() -> ExitCode {
     }
 }
 
+/// Let the parent job-control shell stop and later foreground mesh before the
+/// line editor performs its first terminal read.
+fn wait_until_foreground() -> io::Result<()> {
+    // A parent shell may itself ignore SIGTTIN. Startup needs the default
+    // disposition so the kernel can suspend `mesh &` until the user runs `fg`.
+    if unsafe { libc::signal(libc::SIGTTIN, libc::SIG_DFL) } == libc::SIG_ERR {
+        return Err(io::Error::last_os_error());
+    }
+    loop {
+        // SAFETY: these calls take no pointers; fd 0 is known to be a terminal
+        // because only the interactive path calls this function.
+        let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+        if foreground < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: getpgrp cannot fail and returns mesh's process group.
+        let shell_group = unsafe { libc::getpgrp() };
+        if foreground == shell_group {
+            return Ok(());
+        }
+        // SAFETY: a zero PID sends SIGTTIN to mesh's process group. With the
+        // default disposition above, execution resumes here after `fg`/SIGCONT.
+        if unsafe { libc::kill(0, libc::SIGTTIN) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+}
+
 /// Keep terminal-generated signals from stopping or ending mesh itself.
 /// Foreground children restore their default dispositions before `exec` and
 /// receive these signals after the executor hands them the terminal.
@@ -362,7 +394,6 @@ fn ignore_interactive_signals() -> io::Result<()> {
         libc::SIGINT,
         libc::SIGQUIT,
         libc::SIGTSTP,
-        libc::SIGTTIN,
         libc::SIGTTOU,
         libc::SIGTERM,
     ] {

@@ -54,7 +54,8 @@ file as tasks land.
       Ctrl-Z/Ctrl-\\ do not suspend or terminate mesh. Stopped-job tracking and
       resumption land with the job table below.
 - [ ] Job table plus `fg` / `bg` builtins.
-- [ ] Hand the terminal to full-screen programs and restore it cleanly.
+- [x] Hand the terminal to full-screen programs and restore the shell's terminal
+      modes cleanly when they exit or stop.
 
 ## Known limitations
 
