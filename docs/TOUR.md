@@ -169,6 +169,35 @@ the available range, and `+=` appends a scalar or extends with a list. A nested
 list cannot be passed to a command by accident: select and spread the inner list
 explicitly.
 
+## Maps preserve insertion order
+
+A bracket literal containing `key: value` pairs is a map. Map keys are strings,
+and `[:]` is the empty map (`[]` remains the empty list). Read identifier keys
+with dot syntax or use brackets for a computed key:
+
+<pre>
+mesh$ <strong>ports = [http: 80, https: 443, http: 8080]</strong>
+mesh$ <strong>protocol = https</strong>
+mesh$ <strong>puts $ports.http ${ports[$protocol]}</strong>
+8080 443
+</pre>
+
+Duplicate keys are last-value-wins without changing their original position.
+Spreading a map and merging with `+=` follow the same rule:
+
+<pre>
+mesh$ <strong>ports += [ssh: 22, http: 8000]</strong>
+mesh$ <strong>copy = [...$ports, ssh: 2222]</strong>
+mesh$ <strong>puts ...$copy:keys</strong>
+http https ssh
+mesh$ <strong>puts ...$copy:values</strong>
+8000 443 2222
+</pre>
+
+`:len` counts map entries. `:keys` and `:values` return real lists in insertion
+order, so they need `...` when passed to a command. A missing key is an error,
+and a whole map cannot be passed to an external command implicitly.
+
 ## Transforming values with modifiers
 
 A postfix `:` modifier transforms a value. Path modifiers provide the common
@@ -241,7 +270,7 @@ yes
 </pre>
 
 An `if` is also a value in an assignment. The selected body's final line is the
-value; it can currently be one string, a list literal, a whole variable
+value; it can currently be one string, a list or map literal, a whole variable
 value, or another `if`:
 
 <pre>
