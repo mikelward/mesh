@@ -727,13 +727,19 @@ fn ends_with_bare_equals(word: &[Piece]) -> bool {
 }
 
 /// Does the buffered `func` definition in `text` need more input lines? True
-/// while its body braces have not balanced — i.e. an opening `{` has been seen
-/// with no matching `}` yet. Buffering is **brace-driven only**: it does not try
-/// to reason about the signature's `(…)`, so a malformed header such as
-/// `func f(x {` still buffers through to the matching `}` and is quarantined,
-/// rather than releasing later body lines to the top level.
+/// while an opening `{` has been seen with **no matching `}` yet** — completion
+/// is based on the **first** brace that returns the depth to zero, not the final
+/// net depth, so trailing text that reopens a brace (`func f() {} {`) does not
+/// keep the definition pending; it is dispatched so the parser reports the
+/// documented "unexpected text after the closing `}`" error.
+///
+/// Buffering is **brace-driven only**: it does not reason about the signature's
+/// `(…)`, so a malformed header such as `func f(x {` still buffers through to the
+/// matching `}` and is quarantined rather than releasing later body lines to the
+/// top level.
 pub fn needs_more_input(text: &str) -> bool {
-    scan_braces(text, 0).depth > 0
+    let scan = scan_braces(text, 0);
+    scan.close.is_none() && scan.depth > 0
 }
 
 /// The result of a bare-level brace scan (see [`scan_braces`]).
@@ -781,8 +787,16 @@ pub fn scan_braces(text: &str, start_depth: i32) -> BraceScan {
                 word_start = true;
                 k += 1;
             }
-            // A backslash escapes the next char, so `\{` / `\}` are literal.
-            '\\' => k += 2,
+            // A backslash escapes the next char, so `\{` / `\}` are literal. A
+            // `\`-newline is a line boundary, though: a function body runs line by
+            // line, so the next word starts fresh there (a following raw prefix is
+            // raw), exactly as an unescaped newline would reset it.
+            '\\' => {
+                if chars.get(k + 1).map(|&(_, c)| c) == Some('\n') {
+                    word_start = true;
+                }
+                k += 2;
+            }
             '\'' | '"' => match skip_quote(&chars, k + 1, c, true) {
                 Some(next) => k = next,
                 None => return BraceScan { close, depth },
@@ -1273,5 +1287,22 @@ mod tests {
         // so its later body lines cannot leak to the top level (the P1 case).
         assert!(needs_more_input("func f(x {\nputs )\nputs LEAKED\n"));
         assert!(!needs_more_input("func f(x {\nputs )\nputs LEAKED\n}\n"));
+    }
+
+    #[test]
+    fn needs_more_input_stops_at_the_first_body_close() {
+        // Trailing text that reopens a brace does not keep the definition pending:
+        // once the body's matching `}` is found, it is dispatched so the parser
+        // reports the trailing-text error rather than swallowing later commands.
+        assert!(!needs_more_input("func f() {} {\n"));
+        assert!(!needs_more_input("func f() { puts hi } extra {\n"));
+    }
+
+    #[test]
+    fn scan_braces_resets_word_start_after_an_escaped_newline() {
+        // A `\`-newline is a line boundary: the raw prefix on the next physical
+        // line is raw, so its trailing backslash does not escape the quote and
+        // swallow the block's `}` (mirrors how the body is run line by line).
+        assert_eq!(scan_braces("func f() { true \\\nr'\\' }", 0).depth, 0);
     }
 }
