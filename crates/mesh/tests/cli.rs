@@ -676,18 +676,7 @@ fn spawn_failure_harness() -> i32 {
 
     let mut master = -1;
     let mut slave = -1;
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    } != 0
-        || unsafe { libc::setsid() } < 0
-        || unsafe { libc::ioctl(slave, libc::TIOCSCTTY, 0) } < 0
-    {
+    if !open_controlling_pty(&mut master, &mut slave) {
         return 30;
     }
     unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
@@ -753,27 +742,36 @@ fn spawn_failure_harness() -> i32 {
     0
 }
 
+fn open_controlling_pty(master: &mut libc::c_int, slave: &mut libc::c_int) -> bool {
+    let opened = unsafe {
+        libc::openpty(
+            master,
+            slave,
+            std::ptr::null_mut::<libc::c_char>(),
+            std::ptr::null_mut::<libc::termios>(),
+            std::ptr::null_mut::<libc::winsize>(),
+        )
+    } == 0;
+    if !opened || unsafe { libc::setsid() } < 0 {
+        return false;
+    }
+
+    // Darwin exposes TIOCSCTTY as c_uint although ioctl takes c_ulong. Other
+    // targets already expose the request with the type their ioctl expects;
+    // notably, musl's ioctl request is c_int.
+    #[cfg(target_os = "macos")]
+    let request = libc::c_ulong::from(libc::TIOCSCTTY);
+    #[cfg(not(target_os = "macos"))]
+    let request = libc::TIOCSCTTY;
+    (unsafe { libc::ioctl(*slave, request, 0) }) >= 0
+}
+
 fn sigcont_harness() -> i32 {
     use std::ffi::CString;
 
     let mut master = -1;
     let mut slave = -1;
-    #[cfg(target_os = "macos")]
-    let tiocsctty = libc::c_ulong::from(libc::TIOCSCTTY);
-    #[cfg(not(target_os = "macos"))]
-    let tiocsctty = libc::TIOCSCTTY;
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    } != 0
-        || unsafe { libc::setsid() } < 0
-        || unsafe { libc::ioctl(slave, tiocsctty, 0) } < 0
-    {
+    if !open_controlling_pty(&mut master, &mut slave) {
         return 20;
     }
     unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
@@ -842,26 +840,9 @@ fn sigcont_harness() -> i32 {
 
 fn background_startup_harness() -> i32 {
     use std::ffi::CString;
-    use std::os::fd::RawFd;
-
-    let mut master: RawFd = -1;
-    let mut slave: RawFd = -1;
-    #[cfg(target_os = "macos")]
-    let tiocsctty = libc::c_ulong::from(libc::TIOCSCTTY);
-    #[cfg(not(target_os = "macos"))]
-    let tiocsctty = libc::TIOCSCTTY;
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    } != 0
-        || unsafe { libc::setsid() } < 0
-        || unsafe { libc::ioctl(slave, tiocsctty, 0) } < 0
-    {
+    let mut master = -1;
+    let mut slave = -1;
+    if !open_controlling_pty(&mut master, &mut slave) {
         return 10;
     }
     // Closing the last PTY descriptor can hang up this isolated session while

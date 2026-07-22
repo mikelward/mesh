@@ -30,3 +30,31 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  freebsd-check:
+    name: Check (FreeBSD target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain and FreeBSD target
+        run: rustup toolchain install stable --profile minimal --target x86_64-unknown-freebsd
+
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --target x86_64-unknown-freebsd
+
+  musl-check:
+    name: Check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain and target
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --target ${{ matrix.target }}
