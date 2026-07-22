@@ -6,11 +6,12 @@
 //! follow its command line and the integration tests need no terminal.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -1946,6 +1947,7 @@ fn run_interactive() -> ExitCode {
 #[derive(Default)]
 struct CompletionState {
     commands: Vec<String>,
+    help: HashMap<String, String>,
     variables: Vec<(String, Value)>,
 }
 
@@ -1968,8 +1970,19 @@ impl CompletionState {
         }
         commands.sort();
         commands.dedup();
+        let mut help: HashMap<_, _> = builtins::NAMES
+            .iter()
+            .filter_map(|name| builtins::help(name).map(|text| ((*name).into(), text)))
+            .collect();
+        help.extend(shell.funcs.names().filter_map(|name| {
+            shell
+                .funcs
+                .get(name)
+                .map(|def| (name.into(), def.help(name)))
+        }));
         Self {
             commands,
+            help,
             variables: shell
                 .vars
                 .visible()
@@ -1998,19 +2011,111 @@ impl Completer for MeshCompleter {
                 .filter(|name| name.starts_with(word))
                 .cloned()
                 .collect()
+        } else if let Some((help_start, prefix, words)) = help_request(line, start, word) {
+            let help = state
+                .help
+                .get(&words[0])
+                .cloned()
+                .unwrap_or_else(|| command_help(&words));
+            let mut values = help_completions(&help, prefix);
+            if !values.is_empty() {
+                if prefix.is_empty() && !word.is_empty() {
+                    values = values
+                        .into_iter()
+                        .map(|value| format!("{word} {value}"))
+                        .collect();
+                }
+                return suggestions(values, help_start, pos);
+            }
+            path_completions(word)
         } else {
             path_completions(word)
         };
-        values
-            .into_iter()
-            .map(|value| Suggestion {
-                value,
-                span: Span::new(start, pos),
-                append_whitespace: false,
-                ..Suggestion::default()
-            })
-            .collect()
+        suggestions(values, start, pos)
     }
+}
+
+fn suggestions(values: Vec<String>, start: usize, pos: usize) -> Vec<Suggestion> {
+    values
+        .into_iter()
+        .map(|value| Suggestion {
+            value,
+            span: Span::new(start, pos),
+            append_whitespace: false,
+            ..Suggestion::default()
+        })
+        .collect()
+}
+
+/// Build the help invocation. A leading `-` word is the word being completed;
+/// other words are passed through so `git reset<Tab>` asks `git reset --help`.
+fn help_request<'a>(
+    line: &'a str,
+    start: usize,
+    word: &'a str,
+) -> Option<(usize, &'a str, Vec<String>)> {
+    let mut words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+    if words.is_empty() {
+        return None;
+    }
+    if word.starts_with('-') {
+        words.pop();
+        Some((start, word, words))
+    } else {
+        Some((start, "", words))
+    }
+}
+
+fn command_help(words: &[String]) -> String {
+    let Some((command, args)) = words.split_first() else {
+        return String::new();
+    };
+    let Ok(output) = Command::new(command).args(args).arg("--help").output() else {
+        return String::new();
+    };
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    text
+}
+
+fn help_completions(help: &str, prefix: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut commands = false;
+    for line in help.lines() {
+        let trimmed = line.trim();
+        let heading = trimmed.trim_end_matches(':').to_ascii_lowercase();
+        if matches!(
+            heading.as_str(),
+            "commands" | "subcommands" | "available commands"
+        ) {
+            commands = true;
+            continue;
+        }
+        if trimmed.ends_with(':') || trimmed.is_empty() {
+            commands = false;
+        }
+        for token in trimmed.split_whitespace() {
+            let option = token.trim_end_matches([',', ';']);
+            if option.starts_with('-') && option.len() > 1 {
+                let option = option.split(['=', '[', '<']).next().unwrap_or(option);
+                if option.starts_with(prefix) {
+                    values.push(option.to_owned());
+                }
+            }
+        }
+        if commands
+            && let Some(command) = trimmed.split_whitespace().next()
+            && command.starts_with(prefix)
+            && command
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            values.push(command.to_owned());
+        }
+    }
+    values.sort();
+    values.dedup();
+    values
 }
 
 fn command_position(before: &str) -> bool {
@@ -2328,9 +2433,9 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        MeshPrompt, PromptEvent, PromptHook, Shell, Step, command_position, eval_binary,
-        expansion_word, handle_signal, needs_more_input, run_line, run_prompt_hooks, run_source,
-        variable_completions,
+        MeshPrompt, PromptEvent, PromptHook, Shell, Step, command_help, command_position,
+        eval_binary, expansion_word, handle_signal, help_completions, help_request,
+        needs_more_input, run_line, run_prompt_hooks, run_source, variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
@@ -2361,6 +2466,55 @@ mod tests {
             variable_completions("$config.user.n", &variables),
             ["$config.user.name"]
         );
+    }
+
+    #[test]
+    fn completion_passes_subcommands_to_help_and_filters_option_prefixes() {
+        assert_eq!(
+            help_request("git reset", 4, "reset"),
+            Some((4, "", vec!["git".into(), "reset".into()]))
+        );
+        assert_eq!(
+            help_request("git reset --h", 10, "--h"),
+            Some((10, "--h", vec!["git".into(), "reset".into()]))
+        );
+        assert_eq!(
+            help_completions(
+                "Commands:\n  soft  reset softly\n  hard  reset hard\n\nOptions:\n  -h, --help  help\n  --quiet=<WHEN> quiet\n",
+                "--h"
+            ),
+            ["--help"]
+        );
+        assert_eq!(
+            help_completions("Commands:\n  soft  reset softly\n  hard  reset hard\n", ""),
+            ["hard", "soft"]
+        );
+    }
+
+    #[test]
+    fn command_completion_captures_help_from_stdout_and_stderr() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("mesh-help-{}", std::process::id()));
+        let command = dir.join("helper");
+        let args = dir.join("args");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '  --stdout  output option'\nprintf '%s\\n' '  --stderr  error option' >&2\n",
+                args.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = command_help(&[command.to_string_lossy().into_owned(), "subcommand".into()]);
+        assert!(output.contains("--stdout"));
+        assert!(output.contains("--stderr"));
+        assert_eq!(fs::read_to_string(&args).unwrap(), "subcommand\n--help\n");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
