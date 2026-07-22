@@ -289,7 +289,9 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
   `$name` in the body (never `$1`). Bodies may span **multiple input lines**: the
   reader buffers input until the body's `{ … }` braces balance (a brace inside a
   quote/`r'…'`/escape or a `${…}` interpolation does not count), then defines the
-  function. A single-line `func f(x) { … }` and a nested multi-line definition
+  function. The opening `{` may sit on a later line than the signature (the
+  `")" ws? "{"` above, `ws` including a newline); an already-malformed header
+  (non-whitespace after the `)`) is reported at once rather than buffered. A single-line `func f(x) { … }` and a nested multi-line definition
   inside a body are buffered the same way. A definition is a **standalone
   statement**: it does not yet compose with `;` / `&&` / `||` / `|` (text after
   the closing `}` is an error).

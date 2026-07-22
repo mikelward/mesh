@@ -1696,3 +1696,30 @@ fn trailing_text_after_a_body_close_is_reported_not_swallowed() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn a_body_opening_brace_may_sit_on_the_next_line() {
+    // `func f()` then `{` on the following line is a valid layout (the grammar's
+    // `")" ws? "{"`), so the reader buffers through to the body's `}` and defines
+    // the function rather than running the body at top level.
+    let out = run_with_input("func f()\n{\n  puts body-ran\n}\nf\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "body-ran\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("command not found"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_malformed_header_does_not_swallow_following_commands() {
+    // Non-whitespace after the signature `)` is a malformed header: it is
+    // reported immediately, and the next command still runs (not buffered away).
+    let out = run_with_input("func f() oops\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("missing body"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
