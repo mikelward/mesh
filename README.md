@@ -21,8 +21,9 @@ cargo test --workspace # run the tests
 
 The shell launches external commands and the builtins `cd`, `pwd`, `puts`, and
 `exit`, with a growing slice of the language in place: quoting and escapes, `~`
-and filename globs, typed lists and ordered maps, functions, and value-producing
-`if` expressions, plus an initial set of postfix value modifiers.
+and filename globs, typed scalar/list/map values, arithmetic and comparisons,
+regex and glob matching with `~`, collection iteration and destructuring,
+functions, `if`/`match` expressions, and postfix value modifiers.
 For a hands-on walk through what runs today, see
 [`docs/TOUR.md`](docs/TOUR.md); for a terse lookup,
 [`docs/REFERENCE.md`](docs/REFERENCE.md). The full language is still landing task
@@ -38,6 +39,6 @@ overloaded in infra (service mesh, mesh networking) and sits one letter from
 
 Language design remains in draft. Implementation has completed the M2 shell
 runtime (pipelines, redirection, and job control) and begun **M3** with typed
-list and map literals, explicit `...$list` argument spread, functions, and the
-first `if` expression and postfix modifier slices. See
+values, explicit `...$list` argument spread, functions, conditionals, collection
+loops and matching. See
 [`ROADMAP.md`](ROADMAP.md).

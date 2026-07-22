@@ -236,6 +236,47 @@ modifiers map over a list element by element. An unknown name is not consumed as
 a modifier, which keeps constructions such as `$host:$port` working literally.
 Modifier arguments such as `:join(",")` are not implemented yet.
 
+## Numbers, booleans, and operators
+
+Decimal numbers and `true` / `false` are typed values. Arithmetic operates only
+on integers, and comparisons produce booleans:
+
+<pre>
+mesh$ <strong>answer = 20 * 2 + 2</strong>
+mesh$ <strong>is-answer = $answer == 42</strong>
+mesh$ <strong>puts $answer $is-answer</strong>
+42 true
+</pre>
+
+Strings are not silently converted to numbers; use `:int` when conversion is
+intentional. Besides `==`, `!=`, `<`, `<=`, `>`, and `>=`, value expressions
+support `in` for membership and `not`, `and`, and `or` for boolean logic.
+
+## Matching strings with `~`
+
+The infix `~` operator matches a string against either a bare filename-style
+glob or a slash-delimited regex. `!~` is the negative form. Globs cover the
+whole string; regexes search within it unless you add anchors:
+
+<pre>
+mesh$ <strong>is-source = src/main.rs ~ src/*.rs</strong>
+mesh$ <strong>puts $is-source</strong>
+true
+mesh$ <strong>has-number = item42 ~ /\d+$/</strong>
+mesh$ <strong>puts $has-number</strong>
+true
+mesh$ <strong>not-source = notes.txt !~ *.rs</strong>
+mesh$ <strong>puts $not-source</strong>
+true
+</pre>
+
+Regex bodies are raw (`$` is an anchor, not interpolation), with `\/` for a
+literal slash. Flags are postfix modifiers: `/error/:i` ignores case, `:m`
+enables multiline anchors, and `:s` lets `.` match newlines. For a reusable or
+computed regex, construct a value with `re(r'^a.c$')`; use
+`re('a.c', literal: true)` when the input text must be matched literally. Quoted
+strings are deliberately not accepted as patterns on the right of `~`.
+
 ## When something is missing
 
 Reading a name you never set is an error, not a silent blank — and the shell
@@ -283,9 +324,62 @@ Ada Grace Hopper
 </pre>
 
 When a false value-producing `if` has no `else`, it yields the empty string.
-Only the selected body runs. General boolean/comparison conditions and `if`
-destructuring patterns are still ahead; conditions today are commands and
-functions, including standard commands such as `true` and `false`.
+Only the selected body runs. A condition can be a command/function status or a
+value expression such as `$answer == 42`.
+
+List patterns can test a shape and bind its pieces at the same time. `_` ignores
+one element and `...rest` captures any number of middle elements. A mismatch in
+an `if` simply chooses `else` without changing any bindings:
+
+<pre>
+mesh$ <strong>items = [first middle last]</strong>
+mesh$ <strong>if [head ...rest] = $items { puts $head ...$rest }</strong>
+first middle last
+</pre>
+
+The same patterns work in assignment, `for`, and `match`. A mismatched plain
+assignment is an error rather than a partial binding.
+
+## Iterating collections
+
+`for` iterates lists without splitting their elements, integer ranges by value,
+and maps in insertion order. Map loops use a key and value binder:
+
+<pre>
+mesh$ <strong>for item in [one "two words"] { puts $item }</strong>
+one
+two words
+mesh$ <strong>for n in 1..=3 { puts $n }</strong>
+1
+2
+3
+mesh$ <strong>ports = [http: 80, https: 443]</strong>
+mesh$ <strong>for protocol, port in $ports { puts "$protocol=$port" }</strong>
+http=80
+https=443
+</pre>
+
+`1..3` excludes `3`; `1..=3` includes it. `break` exits the nearest loop and
+`continue` skips to its next iteration. A list-pattern binder destructures each
+list element, for example `for [key value] in $pairs { ... }`.
+
+## Selecting a value with `match`
+
+`match` tries arms from top to bottom. The implemented surface supports exact
+values, list patterns, `_`, and `if` guards:
+
+<pre>
+mesh$ <strong>command = [start server verbose]</strong>
+mesh$ <strong>result = match $command {
+...   [verb ...args] if $verb == start { [$verb ...$args] }
+...   _ { [] }
+... }</strong>
+mesh$ <strong>puts ...$result</strong>
+start server verbose
+</pre>
+
+Glob, regex, range, and alternate `match` arms are still ahead; use the `~`
+operator for a one-line glob or regex test today.
 
 ## Functions
 

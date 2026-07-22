@@ -176,6 +176,39 @@ requiring an explicit spread, access, or modifier at the byte-oriented command
 boundary. A whole typed value, including a list or map, passes unchanged as one
 positional argument to an in-shell function.
 
+## Operators and matching
+
+Value expressions support integer arithmetic (`+`, `-`, `*`, `/`, `%`), unary
+`-`, equality (`==`, `!=`), ordered comparisons (`<`, `<=`, `>`, `>=`),
+membership (`in`), and boolean `not`, `and`, and `or`. Ordered comparisons
+require two integers or two strings; arithmetic never implicitly parses a
+string (use `:int` explicitly). Comparisons cannot be chained.
+
+`~` tests a string against a bare glob or a regex; `!~` negates the result.
+Globs match the whole string, while regexes search for a match unless explicitly
+anchored:
+
+```mesh
+is_source = src/main.rs ~ src/*.rs
+has_number = item42 ~ /\d+/
+exact_number = item42 ~ /^item\d+$/
+not_source = notes.txt !~ *.rs
+```
+
+A slash-delimited regex is recognized only in the right operand of `~` or `!~`.
+Its body is raw except that `\/` includes a literal slash. Append `:i`, `:m`, or
+`:s` for case-insensitive, multiline, or dot-matches-newline behavior:
+
+```mesh
+case_insensitive = ERROR ~ /error/:i
+contains_slash = a/b ~ /a\/b/
+```
+
+Use `re(STRING)` to compile a regex for reuse or to build one from a value, and
+`re(STRING, literal: true)` to quote regex metacharacters and match the supplied
+text literally. A quoted string on the right of `~` is rejected rather than
+silently treated as either a glob or regex.
+
 ## Conditionals
 
 ```
@@ -185,18 +218,16 @@ if command { body } else if command { body }
 name = if command { value } else { value }
 ```
 
-An `if` runs its condition as a command. Status `0` selects the first body; a
-nonzero status selects `else`, if present. Only the selected body runs. Bodies
-may span lines, and `return` or `exit` in a selected body keeps its normal
-control-flow effect.
+An `if` accepts either a command condition (status `0` is true) or a value
+expression condition. Only the selected body runs. Bodies may span lines, and
+`return` or `exit` in a selected body keeps its normal control-flow effect.
 
 In assignment position, the selected body's final physical line supplies the
 value. The current value forms are one string, a list or map literal, a whole
 variable value, or a nested `if`; earlier lines in that body run for effect. A
-false conditional with no `else` yields `""`. General boolean/comparison
-expressions are not implemented yet. A list-pattern condition binds only when
-the value has the requested shape; a mismatch selects `else` without changing
-any bindings:
+false conditional with no `else` yields `""`. A list-pattern condition binds
+only when the value has the requested shape; a mismatch selects `else` without
+changing any bindings:
 
 ```mesh
 if [head ...tail] = $items { puts $head ...$tail }
@@ -236,6 +267,7 @@ for item in $items {
 }
 for i in 1..=3 { puts $i }
 for key, value in $settings { puts "$key=$value" }
+for [key value] in $pairs { puts "$key=$value" }
 ```
 
 `break` exits the nearest loop and `continue` skips to its next iteration.
@@ -290,7 +322,7 @@ background), and calling for a value (`f(arg)`) as opposed to running it.
 
 ## Not yet implemented
 
-General boolean/comparison expressions, conditional destructuring,
-`match`, modifier arguments, regex literals, and heredocs. Function
-flags/optional/rest parameters and functions in pipelines are also still ahead. See
+The remaining `match` pattern forms (glob/regex/range and alternation), modifier
+arguments, regex capture modifiers, and heredocs are not yet implemented.
+Function flags/optional/rest parameters and functions in pipelines are also still ahead. See
 [`ROADMAP.md`](../ROADMAP.md).
