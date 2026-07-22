@@ -128,7 +128,9 @@ file as tasks land.
 - [ ] `for` / `match`.
   - [x] First `for` slice over string lists and expanded word expressions, with
         brace-delimited multiline bodies and current-scope bindings.
-  - [ ] Map/range iteration, destructured binders, `break`, and `continue`.
+  - [x] Ordered map iteration with `key, value` binders, bounded integer range
+        iteration, `break`, and `continue`.
+  - [ ] General list-pattern destructuring.
 
 ## Decisions made
 
