@@ -43,10 +43,6 @@ and `puts`) subsequently landed in M1.
 - `cargo test --workspace`, `cargo fmt --check`, and `cargo clippy -- -D warnings`
   are all green.
 
-**Former M0 limitation:** foreground process groups, terminal handoff, and signal
-dispositions now keep Ctrl-C from killing mesh; it interrupts the foreground job
-and returns status `130`. Stopped-job tracking remains in M2.
-
 *(Everything below is planned; scope will firm up as each milestone begins.)*
 
 ---
@@ -83,7 +79,7 @@ makes a shell a shell.
 - Process groups, `tcsetpgrp`, and foreground signal handling ✅ landed; job
   tracking and `fg` / `bg` remain.
 - **Ctrl-C returns to the prompt** with status `130` (child gets SIGINT, shell
-  survives) ✅ landed — fixes the M0 known limitation.
+  survives) ✅ landed.
 - Hand the terminal to full-screen programs (`vim`) and get it back cleanly.
 
 **Acceptance:** `ls | grep foo > out.txt` works; `Ctrl-Z` a `vim`, `bg`/`fg` it,
