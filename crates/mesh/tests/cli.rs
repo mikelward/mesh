@@ -1723,3 +1723,16 @@ fn a_malformed_header_does_not_swallow_following_commands() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn a_header_malformed_before_its_paren_does_not_swallow_commands() {
+    // `func f)` has no opening `(` before its `)`, so it can never be a valid
+    // signature: it is reported at once and the following command still runs.
+    let out = run_with_input("func f)\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("func:"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

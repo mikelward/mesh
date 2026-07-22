@@ -755,19 +755,30 @@ pub fn needs_more_input(text: &str) -> bool {
 }
 
 /// With no body `{` seen yet, is `text` a valid *incomplete* `func` header still
-/// awaiting its `{`? True while the signature is still forming (no `)` yet, and
-/// no command punctuation a parameter list can never contain), or once the
-/// signature has closed with only whitespace after the `)`. False otherwise, so a
-/// malformed header is dispatched immediately (its parse error reported) rather
-/// than buffering and swallowing the commands that follow it.
+/// awaiting its `{`? True only while the header could still become a well-formed
+/// `func name(params)` — the name so far is a valid identifier (or empty), and
+/// once the signature's `)` is present it is preceded by a proper `name(` and
+/// followed by only whitespace. Anything already impossible (a bad name, a
+/// missing `(`, non-whitespace after `)`) returns false, so a malformed header is
+/// dispatched immediately — its parse error reported — rather than buffering and
+/// swallowing the commands that follow it.
 fn header_awaits_body(text: &str) -> bool {
     let rest = text.trim().strip_prefix("func").unwrap_or("").trim_start();
-    match rest.find(')') {
+    let Some(paren) = rest.find('(') else {
+        // No `(` yet: still forming the name. Keep reading while what we have is a
+        // valid identifier (or just `func`); anything else can never be a name.
+        let name = rest.trim_end();
+        return name.is_empty() || is_ident(name);
+    };
+    // The name is everything before the `(` and must be a valid identifier.
+    if !is_ident(rest[..paren].trim()) {
+        return false;
+    }
+    match rest[paren + 1..].find(')') {
+        // Params still forming (their validity is checked at parse time).
+        None => true,
         // Signature closed: only whitespace may sit between `)` and the `{`.
-        Some(close) => rest[close + 1..].trim().is_empty(),
-        // Signature still forming: keep reading unless it already contains command
-        // punctuation (`;`, `|`, `&`, `<`, `>`) that a signature never holds.
-        None => !rest.contains([';', '|', '&', '<', '>']),
+        Some(close) => rest[paren + 1 + close + 1..].trim().is_empty(),
     }
 }
 
@@ -1328,11 +1339,15 @@ mod tests {
         // A still-forming signature also keeps reading.
         assert!(needs_more_input("func f(a,\n"));
         assert!(needs_more_input("func\n"));
-        // A malformed header (non-whitespace after `)`, or command punctuation in
-        // the signature position) is NOT buffered — it dispatches to a parse error
-        // so following commands are not swallowed.
+        // A malformed header is NOT buffered — it dispatches to a parse error so
+        // following commands are not swallowed: non-whitespace after `)`, a
+        // signature `)` with no opening `(`/name before it, an invalid name, or a
+        // name not followed by `(`.
         assert!(!needs_more_input("func f() oops\n"));
         assert!(!needs_more_input("func f() ; puts hi\n"));
+        assert!(!needs_more_input("func f)\n"));
+        assert!(!needs_more_input("func 1f(\n"));
+        assert!(!needs_more_input("func f oops\n"));
     }
 
     #[test]
