@@ -185,3 +185,591 @@ file as tasks land.
 - [ ] `-c "…"` one-shot command flag
 - [ ] Whether satellite helpers (`vcs`, prompt) are Rust workspace members or
       standalone (per-helper call; see `DEVELOPMENT.md`)
+
+## Review Comments
+
+Unresolved review threads swept from the PRs (open and merged). Each entry is
+the full reviewer comment plus a link to the PR and the specific thread. Many
+of these already carry a maintainer reply describing a fix but were never
+marked "resolved" on GitHub; the ones with no reply (or an explicit
+"declining"/"raising with maintainer") are the genuinely open items. PRs 1–18
+were not swept in this pass.
+
+### PR #20 — Design: modifier grammar cleanup + decisions & TODOs ([#20](https://github.com/mikelward/mesh/pull/20))
+
+- `DESIGN.md:1479` — [thread](https://github.com/mikelward/mesh/pull/20#discussion_r3612463317)
+  **[P2] Preserve `-nt` behavior when the source is missing** — When `$a` is
+  absent, this replacement does not match Bash: with both files absent,
+  `not $b:exists` makes it true, while with only `$a` absent it evaluates
+  `$a:mtime` and errors; checked Bash's `[[ ]]`, which returns false in both
+  cases and true only when the source exists while the target does not. Fresh
+  evidence beyond the earlier missing-target finding is this newly added
+  fallback expression, which still needs the source-existence side of the
+  operand truth table. *(no maintainer reply)*
+- `DESIGN.md:1489` — [thread](https://github.com/mikelward/mesh/pull/20#discussion_r3612463322)
+  **[P2] Replace the unsupported microsecond literal** — The conversion example
+  is written as executable mesh syntax, but `1900µs` cannot be parsed under the
+  contract immediately below that says literals only reach down to `ms`. This
+  can lead implementers to add an unintended `µs` literal or leave the
+  documented example unusable; demonstrate the remainder using a computed
+  nanosecond-resolution `Duration`, or explicitly add the smaller literal unit.
+  *(no maintainer reply)*
+- `DESIGN.md:1508` — [thread](https://github.com/mikelward/mesh/pull/20#discussion_r3612463326)
+  **[P2] Specify the timezone and precision of `:iso`** — For the same
+  `Instant`, `$t:iso` can validly produce UTC, local time with an offset, or a
+  zone-less ISO-8601 string, with multiple valid fractional-second precisions.
+  That leaves the timezone guess this paragraph says must be made explicit and
+  makes output vary between implementations or hosts; define the exact timezone,
+  offset spelling, and fractional precision for `:iso`, or require the
+  argument-bearing `:format(...)` path instead. *(no maintainer reply)*
+
+### PR #21 — Design: TODOs for runtime-string typing and flag-grammar extensions ([#21](https://github.com/mikelward/mesh/pull/21))
+
+- `DESIGN.md:271` — [thread](https://github.com/mikelward/mesh/pull/21#discussion_r3612535980)
+  **[P2] Narrow the claim that arithmetic and `+=` are int-only** — This
+  contradicts the settled polymorphic `+=` table in `DESIGN.md:684-701`, which
+  also defines list extension, map merging, and string concatenation, as well as
+  the `Duration`/`Instant` arithmetic in `DESIGN.md:1515-1517`. The actual
+  porting gap is that numeric operations do not coerce string operands;
+  describing the operators themselves as int-only could cause those
+  already-specified cases to be omitted from an implementation. *(no maintainer
+  reply)*
+- `DESIGN.md:1123` — [thread](https://github.com/mikelward/mesh/pull/21#discussion_r3612535987)
+  **[P2] Represent the tri-state without an unset value** — When neither
+  spelling is supplied, the proposed `unset` state cannot be read as the third
+  flag value under the settled model: `DESIGN.md:502-510` says mesh has no
+  absent value, and reads of unbound names fail loudly, while ordinary switches
+  are always bound to `false` when omitted (`DESIGN.md:1087-1088`). Define the
+  auto state using an existing value such as an enum string, or explicitly
+  reopen the no-null and parameter-binding rules; otherwise a function body
+  cannot safely observe the advertised tri-state. *(no maintainer reply)*
+
+### PR #23 — Design: stream-tty tests under $sh; drop undefined run reference ([#23](https://github.com/mikelward/mesh/pull/23))
+
+- `DESIGN.md:1805` — [thread](https://github.com/mikelward/mesh/pull/23#discussion_r3612570492)
+  **[P2] Limit the child-process contrast to external commands** — When the
+  invoked command resolves to a mesh function or stateful builtin, ordinary
+  invocation does not run it as a child: the isolation section explicitly says a
+  plain function runs in the current process so `cd` and `export` persist
+  (DESIGN.md:1237-1242). The new blanket statement therefore contradicts the
+  settled execution model and leaves the behavior of `exec` with
+  functions/builtins ambiguous; constrain this comparison to external
+  executables or specify that `exec` only accepts them. *(no maintainer reply)*
+
+### PR #24 — Design: settle regex-as-value/re(), :int, exec, per-stream tty tests ([#24](https://github.com/mikelward/mesh/pull/24))
+
+- `DESIGN.md` — [thread](https://github.com/mikelward/mesh/pull/24#discussion_r3612864631)
+  **[P2] Preserve trailing-slash absolute globs on match RHS** — The remaining
+  counterexample after the earlier `/usr/*/bin` fix is an absolute glob or path
+  that ends in `/`: `$p ~ /tmp/` and `$p ~ /usr/*/` are both complete `/…/`
+  atoms under this rule, so they are interpreted as unanchored regexes rather
+  than whole-string globs. For example, `/tmp/` becomes the regex `tmp` and
+  unexpectedly matches `/var/tmp/file`. Add a disambiguation or escape mechanism
+  that preserves these valid trailing-slash absolute patterns.
+  _Maintainer reply:_ Valid — `$p ~ /tmp/` reading as the unanchored regex `tmp`
+  (matching `/var/tmp/…`) is a real footgun. This is the third distinct edge
+  case from the same root cause — the `~` RHS overloads glob and regex with
+  colliding `/…/` syntax — so rather than patch the lexer rule a fourth time,
+  I'm raising the disambiguation as a design decision with the maintainer
+  instead of guessing. Will update here once it's resolved.
+- `DESIGN.md:884` — [thread](https://github.com/mikelward/mesh/pull/24#discussion_r3615024345)
+  **[P2] Define byte rendering for glob values** — The new `glob(STR)`
+  constructor creates a first-class glob value, but this exhaustive
+  argv-rendering table omits that type, and the corresponding `puts` rule
+  likewise omits it. Passing one outside a matcher, such as `echo glob($pattern)`
+  or `puts glob($pattern)`, therefore leaves implementations to choose between
+  emitting the source, expanding filesystem matches, or raising an error; add an
+  explicit glob rule at both byte boundaries. *(no maintainer reply)*
+- `DESIGN.md:884` — [thread](https://github.com/mikelward/mesh/pull/24#discussion_r3615024349)
+  **[P2] Reject no-byte-form values during interpolation** — Classifying regexes
+  and stream handles as having no canonical byte form settles argv and the newly
+  updated `puts`/`print` behavior, but string interpolation still accepts `${…}`
+  without defining what happens for these new values. Expressions such as
+  `r = re("x"); s = "pattern=${r}"` and `s = "${sh.stdin}"` consequently have no
+  specified rendering; make interpolation a loud error for no-byte-form values,
+  matching the existing explicit rule for `Instant`. *(no maintainer reply)*
+
+### PR #25 — Start the M0 build track: a shell that runs external commands ([#25](https://github.com/mikelward/mesh/pull/25))
+
+- `crates/mesh/src/exec.rs:18` — [thread](https://github.com/mikelward/mesh/pull/25#discussion_r3615390637)
+  **[P1] Keep the interactive shell alive on Ctrl-C** — When stdin is a TTY and
+  a foreground command is running, mesh and the child remain in the same
+  foreground process group with the default SIGINT disposition, so pressing
+  Ctrl-C kills the shell along with the child. For example, running `sleep 10`
+  and pressing Ctrl-C exits mesh with signal 2 instead of returning to a prompt
+  with status 130, contradicting the interactive signal behavior in `DESIGN.md`;
+  the parent must survive SIGINT while ensuring the foreground child still
+  receives its default signal handling.
+  _Maintainer reply:_ Real and correct, but **deferred by decision** to the
+  dedicated job-control task, not fixed in this PR. A proper fix is job control —
+  give the foreground child its own process group and hand it the terminal with
+  `tcsetpgrp`. Tracked as a known limitation in `ROADMAP.md`/`TODO.md`. Leaving
+  this thread open until the job-control task lands. *(now addressed by the M2
+  job-control work — verify and resolve)*
+
+### PR #28 — Add tilde and glob expansion ([#28](https://github.com/mikelward/mesh/pull/28))
+
+- `crates/mesh/src/expand.rs:90` — [thread](https://github.com/mikelward/mesh/pull/28#discussion_r3616000820)
+  **[P2] Preserve the HOME prefix when formatting glob matches** — When `$HOME`
+  ends in `/` and the user-typed suffix contains glob syntax (for example,
+  `HOME=/tmp/home/` with `puts ~/*`), this path goes through `glob_with`, whose
+  returned `PathBuf` matches normalize the doubled separator, so the result
+  becomes `/tmp/home/file` rather than the documented verbatim substitution
+  `/tmp/home//file`. With `HOME=/`, this similarly changes `//file` to `/file`,
+  which can name a different pathname on POSIX systems. Reconstruct each match
+  with the original `$HOME` prefix spelling.
+  _Maintainer reply:_ Declining this one as a known, near-zero-impact limitation
+  rather than fixing it now (redundant slashes collapse to the same file on
+  POSIX; the `//` leading-slash corner is implementation-defined and Linux/macOS
+  both treat as `/`). Sits in the same bucket as the documented String-model
+  limitation; the whole expansion path gets revisited with the `OsString` rework.
+  *(declined — tracked limitation)*
+
+### PR #29 — Design: regex literal, absolute-path rule, and string quoting (Model B) ([#29](https://github.com/mikelward/mesh/pull/29))
+
+- `DESIGN.md:1151` — [thread](https://github.com/mikelward/mesh/pull/29#discussion_r3616490841)
+  **[P2] Keep the extended-mode literal in one word** — With the newly adopted
+  word-shape rule, the unquoted space terminates this word before its closing
+  `/`, so `/foo # (/:x` cannot be recognized as a clean `/BODY/` literal and
+  never reaches extended-mode compilation. Use a single-word example such as
+  `/foo#(/:x`, where `# (` is ignored only by extended regex parsing, or
+  explicitly define slash-delimited regex tokens as spanning unescaped
+  whitespace. *(no maintainer reply)*
+
+### PR #30 — Add the real lexer: quoting, escapes, and expansion suppression ([#30](https://github.com/mikelward/mesh/pull/30))
+
+- `crates/mesh/src/expand.rs:64` — [thread](https://github.com/mikelward/mesh/pull/30#discussion_r3616268047)
+  **[P2] Keep quoted class characters from becoming glob syntax** — When quoted
+  text occurs inside an unquoted bracket expression, context-free
+  `Pattern::escape` does not prevent every literal character from acquiring class
+  syntax. For example, `[a'-'z]` passes the new structure guard as `[aaz]`, but
+  escaping `-` leaves it unchanged, so the final pattern is `[a-z]` and
+  unexpectedly matches a file named `m` rather than limiting the class to literal
+  `a`, `-`, and `z`. Pattern construction needs to account for whether each
+  literal fragment is inside an active character class. *(no maintainer reply;
+  related `['*'` case fixed in 4148687, this class-context corner left open)*
+
+### PR #38 — Add pipes and redirection ([#38](https://github.com/mikelward/mesh/pull/38))
+
+- `crates/mesh/src/lexer.rs:356` — [thread](https://github.com/mikelward/mesh/pull/38#discussion_r3617704138)
+  **[P2] Stop the descriptor-prefix scan at preceding operators** — When a
+  descriptor redirect begins immediately after another operator, the backward
+  scan crosses that operator and incorrectly decides the prefix is not numeric.
+  For example, `true;2>f` or `echo x|2>f` treats `2` as a command/argument and
+  creates `f` instead of raising the documented unsupported-descriptor syntax
+  error. Fresh evidence after the earlier descriptor fixes is that the scan stops
+  only at whitespace, even though `finish_segment`/the pipe handler has already
+  started a new word after `;`, `&&`, `||`, or `|`. *(no maintainer reply)*
+
+### PR #40 — Split core into `crates/mesh-core` and add stderr redirection ([#40](https://github.com/mikelward/mesh/pull/40))
+
+- `crates/mesh-core/src/exec.rs:125` — [thread](https://github.com/mikelward/mesh/pull/40#discussion_r3617863908)
+  **[P2] Redirect spawn diagnostics through the requested stderr file** — When
+  the executable cannot be spawned, such as `optional-tool 2>/dev/null`, this
+  configures only the prospective child's stderr; `spawn_error_code` later prints
+  the command-not-found or permission diagnostic from the parent, so the redirect
+  file remains empty and the message leaks to the shell's stderr. Since `2>` is
+  documented as redirecting the command's stderr and redirection is otherwise
+  bash-like, the spawn-failure diagnostic must also use the opened stderr
+  destination. *(no maintainer reply)*
+- `crates/mesh-core/src/lexer.rs:342` — [thread](https://github.com/mikelward/mesh/pull/40#discussion_r3617863911)
+  **[P2] Accept stderr redirects after an unspaced operator** — The
+  whitespace-only boundary check misclassifies a valid `2>` when the stage begins
+  immediately after another operator. For example, `true;2>err sh -c 'echo x >&2'`
+  or `producer|2>err consumer` treats `2` as the command/argument and `>` as
+  stdout redirection instead of recognizing stderr redirection. Separators and
+  redirection operators are explicitly allowed without surrounding spaces, so
+  operator boundaries such as `;`, `&&`, `||`, and `|` must also qualify as the
+  start of the descriptor prefix. *(no maintainer reply)*
+
+### PR #42 — Add functions with named positionals and local scope ([#42](https://github.com/mikelward/mesh/pull/42))
+
+- `crates/mesh-core/src/lexer.rs:560` — [thread](https://github.com/mikelward/mesh/pull/42#discussion_r3618697563)
+  **[P1] Keep unmatched parameter lists quarantined** — When an opener contains
+  the body `{` but omits the signature's `)`, this searches the entire buffered
+  definition and can consume a `)` from a later body line. The latest `p < b`
+  guard does not cover this unmatched-`(` case: piped input
+  `func f(x {\nputs )\nputs LEAKED\n}\n` stops buffering at `puts )`, rejects the
+  partial definition, then executes `puts LEAKED` at top level. Limit the close
+  search to the header (before the body `{`) so malformed definitions remain
+  quarantined through their matching body close. *(no maintainer reply)*
+
+### PR #44 — Design the glob() function family and string member-access question ([#44](https://github.com/mikelward/mesh/pull/44))
+
+- `DESIGN.md:303` — [thread](https://github.com/mikelward/mesh/pull/44#discussion_r3624114875)
+  **[P2] Bind qualifier comparisons to each candidate path** — When evaluating
+  `glob("*", type: file, size > 1M)`, the comparison now occupies an ordinary
+  value-call argument, but the value-call grammar provides no candidate path or
+  implicit `size` binding. Consequently, an implementation must either evaluate
+  `size > 1M` once before `glob` runs or invent an undocumented
+  deferred-expression context, and the advertised equivalence with
+  `*(size > 1M)` is not implementable consistently. Define the per-match binding
+  or use an explicit predicate representation. *(no maintainer reply)*
+- `DESIGN.md:1567` — [thread](https://github.com/mikelward/mesh/pull/44#discussion_r3624114880)
+  **[P2] Reject named options for external value-mode captures** — When an
+  external is invoked through the newly allowed `cmd(…):capture` form, this rule
+  also permits a direct named option such as `grep(foo, color: never):capture`,
+  but an external has no signature against which `color` can bind and there is no
+  canonical argv encoding for it. Although the resolved map-spread case now
+  rejects external named options for exactly that reason, the fresh direct
+  `key: value` form remains accepted by the blanket value-mode rule; restrict it
+  to signed in-shell callees or define its external encoding. *(no maintainer
+  reply)*
+
+### PR #46 — Settle regex substitution as :replace with a regex OLD ([#46](https://github.com/mikelward/mesh/pull/46))
+
+- `DESIGN.md:303` — [thread](https://github.com/mikelward/mesh/pull/46#discussion_r3624611481)
+  **[P2] Mark the backreference spelling as provisional** — This normative
+  bullet says `${1}` and `${name}` splice captures, but the immediately following
+  open-question paragraph explicitly says the `${1}` versus `$1` spelling remains
+  undecided, and the Open questions section repeats that status. Because
+  `DESIGN.md` serves as the language specification, this gives implementers
+  conflicting guidance about which grammar to accept; either decide the spelling
+  here or label these forms as provisional placeholders.
+  _Maintainer reply:_ Agreed, that's a real contradiction. The intent is
+  "provisional placeholder," not a settled grammar. This PR is already merged, so
+  the wording fix will land in a follow-up (either standalone or folded into
+  whichever change settles the spelling). Tracking it now.
+
+### PR #57 — Run foreground commands in process groups ([#57](https://github.com/mikelward/mesh/pull/57))
+
+- `crates/mesh-core/src/exec.rs:166` — [thread](https://github.com/mikelward/mesh/pull/57#discussion_r3626714504)
+  **[P1] Hand off the terminal before children can read** — When an interactive
+  pipeline whose first stages read fd 0, every child is spawned before the
+  terminal is transferred here. A scheduled child can therefore read while its
+  new process group is still in the background and be stopped by `SIGTTIN`; this
+  is readily reproducible with a sufficiently long `cat | cat | ...` pipeline.
+  Because the subsequent waits neither observe stopped children nor send
+  `SIGCONT`, mesh then hangs indefinitely. Coordinate startup with the terminal
+  handoff, or resume the group after transferring it. *(no maintainer reply)*
+- `crates/mesh-core/src/exec.rs:113` — [thread](https://github.com/mikelward/mesh/pull/57#discussion_r3626714507)
+  **[P1] Preserve signal delivery for non-TTY executions** — When mesh reads a
+  script from a file or pipe, this unconditionally moves each command into a
+  process group separate from mesh, while the later `is_terminal()` check does
+  not hand that group the terminal or otherwise forward signals. Consequently,
+  Ctrl-C delivered to the invoking foreground group — or a supervisor signal sent
+  to mesh's group — kills mesh but not the running command, which continues as an
+  orphan. Keep non-TTY children in mesh's group until signal forwarding is
+  implemented, or explicitly relay termination signals. *(no maintainer reply)*
+
+### PR #58 — Handle foreground job signals ([#58](https://github.com/mikelward/mesh/pull/58))
+
+- `crates/mesh-core/src/repl.rs:365` — [thread](https://github.com/mikelward/mesh/pull/58#discussion_r3626735482)
+  **[P2] Preserve the background-startup stop before ignoring SIGTTIN** — When
+  `mesh` is launched from another interactive shell as a background job
+  (`mesh &`), this ignore prevents the kernel from suspending it on its first
+  terminal read. In a PTY with another foreground process group, the new code
+  instead makes reedline report `line editor error` and mesh exits with status 1,
+  so the parent shell cannot later resume it with `fg`. Keep SIGTTIN at its
+  default disposition — or explicitly stop until `tcgetpgrp` matches the shell's
+  group — during startup, and add PTY regression coverage for this flow. *(no
+  maintainer reply)*
+- `crates/mesh-core/src/exec.rs:125` — [thread](https://github.com/mikelward/mesh/pull/58#discussion_r3626775540)
+  **[P2] Preserve inherited ignored signals in noninteractive mode** — When mesh
+  is run noninteractively by a caller that intentionally ignores one of these
+  signals, this unconditional hook resets that inherited disposition for every
+  external command. For example, with the parent ignoring SIGINT,
+  `sh -c 'kill -INT $$; echo survived'` exits with 130 through mesh instead of
+  printing `survived`, unlike direct execution through `sh` or `bash`. Apply the
+  reset only when the interactive REPL installed these ignores, and add
+  noninteractive regression coverage. *(no maintainer reply)*
+- `crates/mesh-core/src/exec.rs:186` — [thread](https://github.com/mikelward/mesh/pull/58#discussion_r3626775550)
+  **[P2] Avoid sending SIGCONT to every newly launched job** — When a foreground
+  program installs a SIGCONT handler or deliberately stops during startup before
+  the parent reaches this call, the unconditional group signal either invokes an
+  unsolicited handler or resumes an intentional stop. Newly launched jobs that
+  never stopped on SIGTTIN should not receive SIGCONT; synchronize the terminal
+  handoff before allowing exec, or continue only a group confirmed to have
+  stopped, with PTY regression coverage. *(no maintainer reply)*
+
+### PR #60 — Fix macOS PTY null pointer types ([#60](https://github.com/mikelward/mesh/pull/60))
+
+- `crates/mesh-core/src/exec.rs:393` — [thread](https://github.com/mikelward/mesh/pull/60#discussion_r3626808743)
+  **[P1] Update the second macOS openpty call** — On macOS, this corrects only
+  the `mesh-core` unit-test call; `crates/mesh/tests/cli.rs:627-628` still passes
+  `std::ptr::null()` where `libc::openpty` requires mutable `termios` and
+  `winsize` pointers. Because the macOS CI job compiles all targets, the
+  workspace still fails with E0308 before the integration tests run, so apply the
+  same `null_mut()` change to that call. *(no maintainer reply)*
+
+### PR #61 — Preserve signal intent when launching jobs ([#61](https://github.com/mikelward/mesh/pull/61))
+
+- `crates/mesh-core/src/exec.rs:130` — [thread](https://github.com/mikelward/mesh/pull/61#discussion_r3626831916)
+  **[P1] Reclaim the terminal when exec fails** — When an interactive user enters
+  a missing or non-executable command, this pre-exec hook transfers the terminal
+  to the child, but `Command::spawn()` then returns `Err`; consequently
+  `process_group` remains `None` and the later terminal-reclaim path is skipped.
+  The terminal remains assigned to the dead child's process group, so entering
+  another command stops mesh with `SIGTTIN`. Record the child group before the
+  exec result or explicitly restore mesh's group on this error path. *(no
+  maintainer reply; addressed by PR #64 "Reclaim terminal after command spawn
+  failure" — verify and resolve)*
+
+### PR #64 — Reclaim terminal after command spawn failure ([#64](https://github.com/mikelward/mesh/pull/64))
+
+- `crates/mesh/tests/cli.rs:685` — [thread](https://github.com/mikelward/mesh/pull/64#discussion_r3626866033)
+  **[P1] Preserve the macOS-compatible PTY argument handling** — On macOS,
+  `libc::openpty` expects mutable pointers for its `termp` and `winp` arguments,
+  so these `null()` values fail to type-check; this helper also passes the
+  `c_uint` `TIOCSCTTY` directly to an `ioctl` request expecting `c_ulong`.
+  Because `.github/workflows/ci.yml` builds all targets on `macos-latest`, the
+  new test prevents that job from compiling. Mirror the mutable null pointers and
+  target-specific `tiocsctty` normalization already used by
+  `background_startup_harness`. *(no maintainer reply)*
+
+### PR #65 — Normalize TIOCSCTTY for BSD ioctl ABI and add FreeBSD CI ([#65](https://github.com/mikelward/mesh/pull/65))
+
+- `crates/mesh/tests/cli.rs` — [thread](https://github.com/mikelward/mesh/pull/65#discussion_r3626885654)
+  **[P2] Keep the ioctl request type target-specific** — On
+  `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, `libc` declares
+  `ioctl`'s request parameter as `c_int`; forcing `TIOCSCTTY` to `c_ulong`
+  therefore makes both PTY harness calls fail type checking, so `cargo test` no
+  longer builds on these primary Linux configurations. Preserve the inferred
+  `TIOCSCTTY` type for musl while applying the widening only on targets whose
+  `ioctl` ABI requires it. *(no maintainer reply)*
+
+### PR #66 — Add stopped-job tracking and job-control builtins (jobs, fg, bg) ([#66](https://github.com/mikelward/mesh/pull/66))
+
+- `crates/mesh-core/src/exec.rs:61` — [thread](https://github.com/mikelward/mesh/pull/66#discussion_r3626898554)
+  **[P1] Restore each job's terminal modes before continuing it** — When a
+  foreground program switches the terminal to raw/no-echo mode and then stops,
+  this path gives it the terminal and sends `SIGCONT` without reinstalling the
+  terminal attributes it left behind. The stored `shell_modes` value is the
+  pre-launch shell snapshot, so programs such as editors resume under the shell's
+  canonical settings and can mis-handle input; capture the job's modes when it
+  stops and apply them before continuing it. Add a PTY regression that changes
+  terminal modes, stops, and verifies the resumed process sees those modes.
+  *(no maintainer reply)*
+- `crates/mesh-core/src/exec.rs:384` — [thread](https://github.com/mikelward/mesh/pull/66#discussion_r3626898559)
+  **[P1] Persist reaped stage statuses across job resumes** — When an earlier
+  pipeline stage exits before another stage is stopped, the initial
+  `wait_outcomes` call reaps that child but leaves its outcome as `Running`.
+  After `fg`, this code waits for the same PID again, gets `ECHILD`, and
+  substitutes status 1, so even `true | sleep 3` followed by Ctrl-Z and `fg`
+  finishes as a failure; background polling similarly loses statuses observed on
+  earlier polls. Persist completed outcomes and their codes instead of re-waiting
+  for reaped children, with a stopped multi-stage PTY regression. *(no maintainer
+  reply)*
+- `crates/mesh/tests/cli.rs:857` — [thread](https://github.com/mikelward/mesh/pull/66#discussion_r3626898563)
+  **[P2] Return failed prompts after recognizing them** — When a PTY command
+  leaves a nonzero status — particularly after Ctrl-Z, which produces `mesh!` —
+  this new condition stops reading at that prompt, but the final predicate still
+  returns `Some` only for `mesh$`. The helper therefore reports a timeout/failure
+  after successfully finding `mesh!`, preventing it from covering the newly added
+  stopped-job flow; accept both prompt forms in the return predicate as well.
+  *(no maintainer reply)*
+- `crates/mesh-core/src/exec.rs:25` — [thread](https://github.com/mikelward/mesh/pull/66#discussion_r3626928169)
+  **[P1] Hang up retained jobs when the shell exits** — When a user stops a
+  long-running command, resumes it with `bg`, and then runs `exit` or loses the
+  terminal, this new table is discarded without signaling the job's process
+  group; terminal-loss SIGHUP also terminates mesh via the default disposition
+  before it can forward anything. I reproduced `sleep 1000` remaining alive and
+  reparented to PID 1 after `bg` followed by `exit`, contrary to the
+  no-persistence-until-`disown` behavior in `DESIGN.md:2255-2256` and the
+  explicit HUP/CONT shutdown sequence in `DESIGN.md:2280-2284`. Add an orderly
+  shutdown and SIGHUP path that sends SIGHUP to every retained group and SIGCONT
+  to stopped groups, plus a PTY regression covering `bg` followed by shell exit.
+  *(no maintainer reply)*
+
+### PR #67 — Add background command launch (bare `&`) ([#67](https://github.com/mikelward/mesh/pull/67))
+
+- `crates/mesh-core/src/exec.rs:225` — [thread](https://github.com/mikelward/mesh/pull/67#discussion_r3627015317)
+  **[P1] Keep terminal stdin usable after `fg`** — In an interactive session,
+  assigning `/dev/null` to every background job's stdin is permanent, so `cat &`
+  followed by `fg` immediately receives EOF even after the job owns the terminal.
+  Terminal job control already prevents a background process group from consuming
+  prompt input via `SIGTTIN`; use `/dev/null` only where that protection is
+  unavailable, otherwise foregrounding input-driven jobs is unusable. *(no
+  maintainer reply)*
+- `crates/mesh-core/src/exec.rs:360` — [thread](https://github.com/mikelward/mesh/pull/67#discussion_r3627015322)
+  **[P1] Retain statuses reaped on earlier prompts** — When stages of a
+  registered background pipeline finish between different prompt iterations,
+  `poll_outcomes` reaps each stage but never stores its status in `Outcome`; its
+  local `status` is discarded whenever another stage remains running. For
+  example, `sh -c 'exit 7' | sleep 1 &` can be reported as `Done (0)` after an
+  intervening prompt, and foregrounding a partially reaped pipeline can similarly
+  return a spurious status, violating the documented pipefail result. *(no
+  maintainer reply)*
+- `crates/mesh-core/src/exec.rs:352` — [thread](https://github.com/mikelward/mesh/pull/67#discussion_r3627015323)
+  **[P2] Defer blocking redirects for background jobs** — This background branch
+  is reached only after all `open_redirs` threads have been joined, so a command
+  such as `cat < fifo & puts ready` blocks the shell while opening the FIFO and
+  never launches `puts ready` until an external writer appears. A background
+  launch must return control before potentially blocking redirection setup, or
+  otherwise perform those opens in the child. *(no maintainer reply)*
+
+### PR #70 — Preserve background job input and outcomes ([#70](https://github.com/mikelward/mesh/pull/70))
+
+- `crates/mesh-core/src/exec.rs:507` — [thread](https://github.com/mikelward/mesh/pull/70#discussion_r3627151268)
+  **[P2] Avoid requiring PATH-resolved sh for redirects** — When `PATH` does not
+  contain `sh`, every background command with a redirection now fails before
+  running, even if the requested executable uses an absolute path. For example,
+  with `PATH=/definitely-missing`, `/bin/echo ok > out &` reports the original
+  command as not found and never creates `out`; foreground redirection still
+  works. Resolve the wrapper independently of the user's command-search path or
+  avoid introducing this extra executable dependency. *(no maintainer reply)*
+- `crates/mesh-core/src/exec.rs:503` — [thread](https://github.com/mikelward/mesh/pull/70#discussion_r3627151270)
+  **[P2] Preserve Mesh's redirection-failure status** — When a background
+  redirect cannot be opened, delegating the operation to `sh` changes the result
+  from Mesh's established status 1 to a shell-dependent value. On this workspace,
+  `/bin/echo ok > missing/dir/out &` is later reported as `Done (2)`, while the
+  same foreground command exits 1; the diagnostic also leaks `mesh-redir` instead
+  of using Mesh's normal error format. Normalize wrapper-side open failures so
+  foreground and background execution retain the same status semantics. *(no
+  maintainer reply)*
+
+### PR #73 — Add typed list values and explicit `...$list` argument spread ([#73](https://github.com/mikelward/mesh/pull/73))
+
+- `crates/mesh-core/src/repl.rs:422` — [thread](https://github.com/mikelward/mesh/pull/73#discussion_r3627309850)
+  **[P2] Preserve empty-string elements in list literals** — When a list
+  contains a quoted empty string, such as `xs = ["" a]`, the lexer represents
+  that element as a `Word` with no pieces, so `all(...)` is vacuously true and
+  this predicate silently removes it. Consequently, spreading the list loses
+  positional arguments, and `[""]` becomes indistinguishable from `[]`, violating
+  the new typed-list arity guarantee. Strip only the synthetic words emptied by
+  removing the outer brackets while retaining genuine empty words. *(no
+  maintainer reply; addressed by PR #76 "Preserve empty strings in list
+  literals" — verify and resolve)*
+
+### PR #74 — Add exact list indexing ([#74](https://github.com/mikelward/mesh/pull/74))
+
+- `crates/mesh-core/src/lexer.rs:546` — [thread](https://github.com/mikelward/mesh/pull/74#discussion_r3627329099)
+  **[P2] Keep unbraced bracket suffixes literal inside strings** — When
+  interpolation occurs inside double quotes, this unconditional `parse_index`
+  call also consumes the index even though `member_after_name` is false. This
+  violates `DESIGN.md:652-659`, where `"$x[0]"` means the value of `$x` followed
+  by literal `[0]`, while indexing requires `"${x[0]}"`; for example, with
+  `x = text`, `puts "$x[0]"` now errors with "cannot index a string value"
+  instead of printing `text[0]`. Gate unbraced index parsing the same way as
+  member parsing while retaining indexing in the braced parser. *(no maintainer
+  reply; the `"$x[0]"` interpolation rule is the subject of PRs #75/#78/#79 —
+  verify and resolve)*
+
+### PR #75 — Require braces for quoted list indexing ([#75](https://github.com/mikelward/mesh/pull/75))
+
+- `crates/mesh-core/src/lexer.rs:906` — [thread](https://github.com/mikelward/mesh/pull/75#discussion_r3627383581)
+  **[P2] Enforce the advertised bracing rule** — For double-quoted input such as
+  `"$xs[0]"`, this assertion explicitly preserves unbraced indexing, and the
+  commit makes no production-code change to require braces; it therefore does the
+  opposite of its subject and detailed description, while also reversing the
+  previous `DESIGN.md` requirement. Either make `parse_var` leave the index
+  suffix literal inside quotes and restore the corresponding tests/docs, or
+  rename and rewrite the commit if supporting unbraced indexing is intentional.
+  *(no maintainer reply)*
+
+### PR #76 — Preserve empty strings in list literals ([#76](https://github.com/mikelward/mesh/pull/76))
+
+- `crates/mesh-core/src/lexer.rs:480` — [thread](https://github.com/mikelward/mesh/pull/76#discussion_r3627370806)
+  **[P2] Preserve tilde expansion across trailing empty quotes** — For inputs
+  such as `puts ~""` or `puts ~""/child`, this zero-length literal becomes the
+  next entry in `pieces`; `apply_tilde` then refuses to expand because it only
+  accepts a lone `~` or a slash in the immediately following piece. The commands
+  consequently emit `~`/`~/child` instead of paths under `$HOME`, even though the
+  empty suffix contributes no characters and does not quote the preceding tilde.
+  Make tilde adjacency ignore zero-length pieces and add regression coverage for
+  these forms. *(no maintainer reply)*
+
+### PR #77 — Preserve background redirection semantics ([#77](https://github.com/mikelward/mesh/pull/77))
+
+- `crates/mesh-core/src/exec.rs:506` — [thread](https://github.com/mikelward/mesh/pull/77#discussion_r3627400544)
+  **[P2] Decouple the redirect helper from the embedding executable** — When
+  another frontend uses the advertised `mesh_core::run` entry point,
+  `current_exe()` names that frontend rather than the `mesh` binary, and the
+  frontend is not required to implement `--mesh-background-redirect`. For
+  example, a frontend whose `main` only calls `mesh_core::run()` handles
+  `/bin/echo ok > out &` by restarting itself, entering its REPL with
+  `/dev/null`, and reporting `Done (0)` without executing `echo` or creating
+  `out`. The helper must not assume every consumer of `mesh-core` has the private
+  dispatch added specifically to `crates/mesh/src/main.rs`. *(no maintainer
+  reply)*
+
+### PR #78 — Support member access in quoted interpolation ([#78](https://github.com/mikelward/mesh/pull/78))
+
+- `DESIGN.md:654` — [thread](https://github.com/mikelward/mesh/pull/78#discussion_r3627423330)
+  **[P2] Update all docs for the new interpolation rule** — This newly documented
+  rule conflicts with two remaining authoritative descriptions:
+  `DESIGN.md:1043-1046` still says `"$file.txt"` appends a literal suffix, and
+  `docs/REFERENCE.md:96-99` gives users the same now-invalid behavior. With this
+  commit, that expression instead attempts member access and fails for a string
+  variable, so users following either passage will get runtime errors; update
+  those sections to require `"${file}.txt"` and describe unbraced member access.
+  *(no maintainer reply)*
+
+### PR #79 — Align quoted interpolation documentation and coverage ([#79](https://github.com/mikelward/mesh/pull/79))
+
+- `GRAMMAR.md:115` — [thread](https://github.com/mikelward/mesh/pull/79#discussion_r3627447406)
+  **[P2] Add braced access forms to the grammar** — The new production documents
+  only unbraced `$xs[N]`, even though this commit's lexer test and prose
+  explicitly support `${xs[N]}` and `${name.member}`. Because `GRAMMAR.md`
+  defines the grammar currently parsed, consumers following this EBNF would
+  reject valid forms such as `"${items[-1]}"`; add braced member and index
+  alternatives, or factor the optional access suffix into both braced and
+  unbraced forms. *(no maintainer reply)*
+
+### PR #81 — Add clamped list slicing and spread support ([#81](https://github.com/mikelward/mesh/pull/81))
+
+- `crates/mesh-core/src/expand.rs:215` — [thread](https://github.com/mikelward/mesh/pull/81#discussion_r3627480804)
+  **[P2] Apply inclusivity before clamping the end bound** — For inclusive slices
+  whose negative end lies before the list (for example, `...$xs[..=-5]` on
+  `[a b c d]`), clamping first changes the end to index 0 and then increments it,
+  incorrectly returning `a`; every end below `-len` therefore behaves like
+  exactly `-len` instead of producing the empty intersection required by clamped
+  slicing. Resolve the inclusive end to an exclusive position by adding one
+  before clamping (using the existing wider integer representation to avoid
+  overflow). *(no maintainer reply; the inclusive-slice clamping order is the
+  subject of PRs #83/#85 — verify and resolve)*
+
+### PR #82 — Add append assignment (`+=`) for strings and lists ([#82](https://github.com/mikelward/mesh/pull/82))
+
+- `crates/mesh-core/src/repl.rs:429` — [thread](https://github.com/mikelward/mesh/pull/82#discussion_r3627499447)
+  **[P2] Support list slices as append operands** — When the RHS is a list slice
+  such as `xs += $more[1..]`, the `access.is_none()` condition sends it through
+  `scalar_value`, where expansion rejects the slice with "list value needs `...`"
+  and leaves `xs` unchanged. `GRAMMAR.md:241-247` defines a slice as a list value
+  and says list-to-list `+=` extends the target, so this path should materialize
+  the selected slice as `Value::List` just as a whole-list variable does. *(no
+  maintainer reply; addressed by PR #84 "Support sliced RHS for `+=`" — verify
+  and resolve)*
+
+### PR #83 — Apply inclusive slice ends before clamping ([#83](https://github.com/mikelward/mesh/pull/83))
+
+- `crates/mesh-core/src/expand.rs:210` — [thread](https://github.com/mikelward/mesh/pull/83#discussion_r3627504423)
+  **[P1] Preserve the relative meaning of an inclusive -1 end** — For any
+  non-empty list, an inclusive end of `-1` should include the final element, but
+  adding the inclusive offset before resolving negative indices changes `-1` to
+  absolute `0`; consequently, `$xs[..=-1]` now produces an empty slice instead of
+  the entire list. Resolve the original signed endpoint relative to `len` in
+  `i128`, then add one and clamp, and add a `..=-1` regression case. *(no
+  maintainer reply; addressed by PR #85 "Resolve negative inclusive slice ends
+  correctly" — verify and resolve)*
+
+### PR #84 — Support sliced RHS for `+=` and preserve inclusive `..=-1` semantics ([#84](https://github.com/mikelward/mesh/pull/84))
+
+- `GRAMMAR.md:248` — [thread](https://github.com/mikelward/mesh/pull/84#discussion_r3627546056)
+  **[P1] Support a spread immediately before `]`** — When a spread is the last or
+  only list item (for example, `ys = [first ...$xs]` or `ys = [...$xs]`),
+  `list_literal` removes `]` but leaves an empty trailing `Piece::Text`;
+  `expand::spread_var` then rejects the word because it requires exactly the
+  `"..."` and variable pieces, so the assignment fails with `list value needs
+  ...`. This makes the newly documented whole-word spread incomplete and breaks
+  the canonical concatenation forms in `DESIGN.md`; discard empty edge pieces
+  after removing the brackets and add a final-position regression test. *(no
+  maintainer reply; addressed by PR #86 "Support spreads before list closing
+  brackets" — verify and resolve)*
+
+### PR #88 — Preserve lists in variable assignments ([#88](https://github.com/mikelward/mesh/pull/88))
+
+- `crates/mesh-core/src/repl.rs:400` — [thread](https://github.com/mikelward/mesh/pull/88#discussion_r3627794224)
+  **[P2] Preserve quote context before copying list values** — When the RHS is
+  solely a double-quoted interpolation, such as `ys = "$xs"` or
+  `ys = "${xs[1..]}"`, the lexer produces the same single-`Piece::Var` shape as a
+  bare reference, so this fast path silently binds a list. That contradicts the
+  double-quoted string behavior in `DESIGN.md:755-764` and is inconsistent with
+  `ys = "x$xs"`, which correctly rejects rendering the list as text. Retain
+  whether the reference was quoted or restrict this path to bare references, and
+  cover the quoted whole-list and slice cases with a regression test. *(no
+  maintainer reply)*
+
+### PRs with no unresolved review threads
+
+37, 39, 41, 45, 47–56, 59, 62, 63, 68, 69, 71, 72, 80, 85, 86, 87, 89, 90.
