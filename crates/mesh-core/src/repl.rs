@@ -385,6 +385,16 @@ fn run_func_body(body: &str, shell: &mut Shell) -> Step {
     let mut status = 0;
     let mut pending = String::new();
     for line in body.lines() {
+        if line_invalidates_awaited_body(&pending, line) {
+            // A nested header awaiting its body, invalidated by this line: flush
+            // the header (its missing-body error), then reprocess the line below.
+            let header = std::mem::take(&mut pending);
+            match run_line(&header, status, true, shell) {
+                Step::Continue(code) => status = code,
+                Step::Return(code) => return Step::Continue(code),
+                Step::Exit(code) => return Step::Exit(code),
+            }
+        }
         pending.push_str(line);
         pending.push('\n');
         if is_func_start(&pending) && lexer::needs_more_input(&pending) {
@@ -415,6 +425,27 @@ fn is_func_start(text: &str) -> bool {
         Some(rest) => rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == '('),
         None => false,
     }
+}
+
+/// When `pending` holds a `func` header still awaiting its body — `func f()` with
+/// the `{` expected on a later line — does the next physical line `next` fail to
+/// open that body? If so the header is invalid on its own and `next` is a
+/// separate command, so the reader flushes the header (reporting its "missing
+/// body" error) and reprocesses `next` fresh rather than swallowing it into the
+/// rejected definition. False once a body brace has opened (then `next` continues
+/// the body) or when `next` still leaves the header validly incomplete.
+fn line_invalidates_awaited_body(pending: &str, next: &str) -> bool {
+    if pending.is_empty() || !is_func_start(pending) {
+        return false;
+    }
+    let before = lexer::scan_braces(pending, 0);
+    if before.close.is_some() || before.depth != 0 {
+        return false; // a body brace is already open or closed — not awaiting one
+    }
+    let mut combined = pending.to_string();
+    combined.push_str(next);
+    let after = lexer::scan_braces(&combined, 0);
+    after.close.is_none() && after.depth == 0 && !lexer::needs_more_input(&combined)
 }
 
 /// Parse and store a `func name(params) { body }` definition.
@@ -856,12 +887,23 @@ fn ignore_interactive_signals() -> io::Result<()> {
 /// `Ctrl-C` cancels the current line/buffer and re-prompts, keeping the status.
 fn handle_signal(
     signal: Signal,
-    last: u8,
+    mut last: u8,
     shell: &mut Shell,
     pending: &mut String,
 ) -> Option<Step> {
     match signal {
         Signal::Success(line) => {
+            if line_invalidates_awaited_body(pending, &line) {
+                // The awaited body never came: flush the header (its missing-body
+                // error) now, then reprocess this line fresh below rather than
+                // swallowing it into the rejected definition.
+                let header = std::mem::take(pending);
+                match run_line(&header, last, false, shell) {
+                    Step::Exit(code) => return Some(Step::Exit(code)),
+                    Step::Continue(code) => last = code,
+                    Step::Return(_) => unreachable!("top-level return handled in run_line"),
+                }
+            }
             pending.push_str(&line);
             pending.push('\n');
             if is_func_start(pending) && lexer::needs_more_input(pending) {
@@ -931,6 +973,18 @@ fn run_piped() -> ExitCode {
                 &lossy
             }
         };
+        // A buffered header still awaiting its body, followed by a line that
+        // cannot open one: flush the header (its missing-body error) and reprocess
+        // this line fresh rather than swallowing it. Skip while poisoning, whose
+        // discard path owns the buffer.
+        if !poisoned && line_invalidates_awaited_body(&pending, text) {
+            let header = std::mem::take(&mut pending);
+            match run_line(&header, last, false, &mut shell) {
+                Step::Exit(code) => return ExitCode::from(code),
+                Step::Continue(code) => last = code,
+                Step::Return(_) => unreachable!("top-level return handled in run_line"),
+            }
+        }
         pending.push_str(text);
         // Keep reading the lines of a multi-line `func` body before running it.
         if is_func_start(&pending) && lexer::needs_more_input(&pending) {
@@ -1125,6 +1179,34 @@ mod tests {
             run_line("greet world", 0, false, &mut shell),
             Step::Continue(0)
         );
+    }
+
+    #[test]
+    fn a_non_brace_line_after_an_awaited_header_is_reprocessed() {
+        // `func f()` buffers awaiting its body; the next line is not `{`, so the
+        // header is rejected and that line runs as its own command (not swallowed).
+        let mut shell = Shell::new();
+        let mut pending = String::new();
+        assert_eq!(
+            handle_signal(
+                Signal::Success("func f()".into()),
+                0,
+                &mut shell,
+                &mut pending
+            ),
+            None
+        );
+        // The following line invalidates the awaited body: it runs on its own.
+        let step = handle_signal(
+            Signal::Success("puts after".into()),
+            0,
+            &mut shell,
+            &mut pending,
+        );
+        assert_eq!(step, Some(Step::Continue(0)));
+        assert!(pending.is_empty());
+        // `f` was never defined.
+        assert!(shell.funcs.get("f").is_none());
     }
 
     #[test]
