@@ -8,8 +8,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::io::IsTerminal;
+use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirKind {
@@ -23,6 +24,7 @@ pub enum RedirKind {
 pub struct Cmd {
     pub words: Vec<String>,
     pub redirs: Vec<(RedirKind, String)>,
+    pub pipe_stderr: bool,
 }
 
 /// Running background jobs and foreground jobs suspended with Ctrl-Z.
@@ -37,6 +39,7 @@ struct Job {
     command: String,
     outcomes: Vec<Outcome>,
     shell_modes: Option<libc::termios>,
+    job_modes: Option<libc::termios>,
     state: JobState,
 }
 
@@ -62,16 +65,23 @@ impl JobTable {
         };
         let mut job = self.jobs.remove(index);
         set_foreground_group(job.pgid);
+        if let Some(modes) = &job.job_modes {
+            restore_terminal_modes(modes);
+        }
         if signal_group(job.pgid, libc::SIGCONT, "fg").is_err() {
             reclaim_terminal(job.shell_modes.as_ref());
             return 1;
         }
         job.state = JobState::Running;
         let result = wait_outcomes(&mut job.outcomes);
+        let stopped_modes = matches!(result, WaitResult::Stopped(_))
+            .then(terminal_modes)
+            .flatten();
         reclaim_terminal(job.shell_modes.as_ref());
         match result {
             WaitResult::Complete(status) => status,
             WaitResult::Stopped(status) => {
+                job.job_modes = stopped_modes;
                 job.state = JobState::Stopped;
                 eprintln!("[{}] Stopped {}", job.id, job.command);
                 self.jobs.push(job);
@@ -159,6 +169,17 @@ impl JobTable {
     }
 }
 
+impl Drop for JobTable {
+    fn drop(&mut self) {
+        for job in &self.jobs {
+            let _ = signal_group(job.pgid, libc::SIGHUP, "exit");
+            if job.state == JobState::Stopped {
+                let _ = signal_group(job.pgid, libc::SIGCONT, "exit");
+            }
+        }
+    }
+}
+
 /// `128 + SIGPIPE(13)` — an upstream stage killed because a later stage closed
 /// the pipe early. Under our pipefail rule this does not count as a failure.
 const SIGPIPE_CODE: u8 = 128 + 13;
@@ -174,6 +195,7 @@ pub fn run(words: &[String], jobs: &mut JobTable) -> u8 {
         vec![Cmd {
             words: words.to_vec(),
             redirs: Vec::new(),
+            pipe_stderr: false,
         }],
         jobs,
         false,
@@ -188,7 +210,7 @@ enum NextIn {
     /// redirect) or failed to spawn, so there is no producer for this stage.
     Null,
     /// The previous stage's stdout, piped in.
-    Pipe(ChildStdout),
+    Pipe(Stdio),
 }
 
 /// A spawned stage awaiting its status, or a stage that failed before running.
@@ -324,7 +346,28 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
         // stdout: an output redirection wins over the pipe to the next stage;
         // otherwise pipe to the next stage; otherwise inherit (only the last).
         let mut piped_out = false;
-        if let Some(file) = out_file {
+        let mut combined_pipe = None;
+        if cmd.pipe_stderr && !is_last {
+            let mut fds = [0; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+                eprintln!("mesh: pipe: {}", std::io::Error::last_os_error());
+                outcomes.push(Outcome::Failed(1));
+                continue;
+            }
+            let read = unsafe { File::from_raw_fd(fds[0]) };
+            let write = unsafe { File::from_raw_fd(fds[1]) };
+            let stderr = match write.try_clone() {
+                Ok(file) => file,
+                Err(error) => {
+                    eprintln!("mesh: pipe: {error}");
+                    outcomes.push(Outcome::Failed(1));
+                    continue;
+                }
+            };
+            command.stdout(write).stderr(stderr);
+            combined_pipe = Some(Stdio::from(read));
+            piped_out = true;
+        } else if let Some(file) = out_file {
             command.stdout(file);
         } else if !is_last {
             command.stdout(Stdio::piped());
@@ -344,10 +387,12 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
                         libc::setpgid(child.id() as libc::pid_t, pgid);
                     }
                 }
-                if piped_out {
-                    if let Some(out) = child.stdout.take() {
-                        next_stdin = NextIn::Pipe(out);
+                if cmd.pipe_stderr && !is_last {
+                    if let Some(pipe) = combined_pipe {
+                        next_stdin = NextIn::Pipe(pipe);
                     }
+                } else if piped_out && let Some(out) = child.stdout.take() {
+                    next_stdin = NextIn::Pipe(out.into());
                 }
                 outcomes.push(Outcome::Running { child, piped_out });
             }
@@ -380,6 +425,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
                 command: command_text,
                 outcomes,
                 shell_modes: None,
+                job_modes: None,
                 state: JobState::Running,
             });
             return 0;
@@ -392,6 +438,9 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
     // pipefail: the last stage to fail wins. A SIGPIPE is ignored only for a
     // stage whose stdout fed a pipe (a downstream stage could have closed it).
     let result = wait_outcomes(&mut outcomes);
+    let job_modes = matches!(result, WaitResult::Stopped(_))
+        .then(terminal_modes)
+        .flatten();
     if interactive {
         // getpgrp, rather than getpid, also handles a mesh process launched in
         // a process group established by its parent shell. Reclaim even when
@@ -418,6 +467,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
                     command: command_text,
                     outcomes,
                     shell_modes,
+                    job_modes,
                     state: JobState::Stopped,
                 });
             }
@@ -443,14 +493,17 @@ fn wait_outcomes(outcomes: &mut [Outcome]) -> WaitResult {
     let mut status = 0;
     let mut stopped = None;
     for outcome in &mut *outcomes {
-        let (code, piped_out, did_stop) = match outcome {
+        let (code, piped_out, did_stop, completed) = match outcome {
             Outcome::Running { child, piped_out } => {
                 let (code, stopped) = wait_for_job(child).unwrap_or((1, false));
-                (code, *piped_out, stopped)
+                (code, *piped_out, stopped, !stopped)
             }
-            Outcome::Completed { code, piped_out } => (*code, *piped_out, false),
-            Outcome::Failed(code) => (*code, false, false),
+            Outcome::Completed { code, piped_out } => (*code, *piped_out, false, false),
+            Outcome::Failed(code) => (*code, false, false, false),
         };
+        if completed {
+            *outcome = Outcome::Completed { code, piped_out };
+        }
         if did_stop {
             stopped = Some(code);
         }

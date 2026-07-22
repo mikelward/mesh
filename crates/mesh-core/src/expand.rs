@@ -266,6 +266,7 @@ fn glob_pattern(pieces: &Pieces) -> String {
     let mut pattern = String::new();
     let mut in_class = false;
     let mut literal_hyphens = 0;
+    let mut class_start = 0;
 
     for (text, expandable) in pieces {
         if !*expandable {
@@ -285,11 +286,12 @@ fn glob_pattern(pieces: &Pieces) -> String {
 
         for ch in text.chars() {
             if in_class && ch == ']' {
-                pattern.extend(std::iter::repeat_n('-', literal_hyphens));
+                pattern.insert_str(class_start, &"-".repeat(literal_hyphens));
                 literal_hyphens = 0;
                 in_class = false;
             } else if !in_class && ch == '[' {
                 in_class = true;
+                class_start = pattern.len() + 1;
             }
             pattern.push(ch);
         }
@@ -543,8 +545,8 @@ fn apply_tilde(pieces: &mut Pieces) {
         return;
     };
     if text == "~" {
-        let followed_by_slash = pieces.get(1).is_some_and(|(t, _)| t.starts_with('/'));
-        if pieces.len() == 1 || followed_by_slash {
+        let next = pieces.iter().skip(1).find(|(text, _)| !text.is_empty());
+        if next.is_none() || next.is_some_and(|(text, _)| text.starts_with('/')) {
             if let Some(home) = home() {
                 pieces[0] = (home, false);
             }
