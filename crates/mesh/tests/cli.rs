@@ -1736,3 +1736,22 @@ fn a_header_malformed_before_its_paren_does_not_swallow_commands() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn an_invalid_closed_signature_does_not_swallow_following_commands() {
+    // A closed-but-invalid parameter list is provably malformed, so it is
+    // reported at once and the following command still runs (not buffered away).
+    for sig in ["func f(,)", "func f(...xs)", "func f(a,a)"] {
+        let out = run_with_input(&format!("{sig}\nputs after\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "after\n",
+            "signature {sig:?} swallowed the following command"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("func:"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
