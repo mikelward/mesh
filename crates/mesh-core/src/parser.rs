@@ -448,8 +448,9 @@ impl<'a> Lexer<'a> {
                     self.position += next.len_utf8();
                     continue;
                 }
-                let raw =
-                    here == 'r' && matches!(self.char_at(self.position + 1), Some('\'' | '"'));
+                let raw = here == 'r'
+                    && pieces.is_empty()
+                    && matches!(self.char_at(self.position + 1), Some('\'' | '"'));
                 if matches!(here, '\'' | '"') || raw {
                     let quote = if raw {
                         self.position += 1;
@@ -512,12 +513,16 @@ impl<'a> Lexer<'a> {
                             self.position += escaped.len_utf8();
                             push_text(&mut pieces, &decoded.to_string(), mode);
                         } else if inner == '$' && mode == QuoteMode::Double {
-                            let end = variable_end(self.source, self.position);
-                            push_variable(
-                                &mut pieces,
-                                &self.source[self.position..end],
-                                QuoteMode::Double,
-                            );
+                            let end = variable_end(self.source, self.position)?;
+                            if end == self.position + 1 {
+                                push_text(&mut pieces, "$", QuoteMode::Double);
+                            } else {
+                                push_variable(
+                                    &mut pieces,
+                                    &self.source[self.position..end],
+                                    QuoteMode::Double,
+                                );
+                            }
                             self.position = end;
                         } else {
                             push_text(&mut pieces, &inner.to_string(), mode);
@@ -536,12 +541,16 @@ impl<'a> Lexer<'a> {
                     continue;
                 }
                 if here == '$' {
-                    let end = variable_end(self.source, self.position);
-                    push_variable(
-                        &mut pieces,
-                        &self.source[self.position..end],
-                        QuoteMode::Bare,
-                    );
+                    let end = variable_end(self.source, self.position)?;
+                    if end == self.position + 1 {
+                        push_text(&mut pieces, "$", QuoteMode::Bare);
+                    } else {
+                        push_variable(
+                            &mut pieces,
+                            &self.source[self.position..end],
+                            QuoteMode::Bare,
+                        );
+                    }
                     self.position = end;
                 } else {
                     push_text(&mut pieces, &here.to_string(), QuoteMode::Bare);
@@ -688,7 +697,12 @@ impl<'a> Lexer<'a> {
                 let boundary = |value: Option<char>| {
                     value.is_none_or(|c| c.is_whitespace() || ",()[]{};".contains(c))
                 };
-                if !boundary(before) || !boundary(after) {
+                // A prefix minus belongs to the expression grammar even when it
+                // is attached to its operand (`-$n`). Binary operators retain
+                // their whitespace/delimiter boundary requirement.
+                let attached_prefix_operand = s == "-"
+                    && after.is_some_and(|c| c == '$' || c.is_ascii_digit() || "'\"([".contains(c));
+                if !boundary(before) || (!boundary(after) && !attached_prefix_operand) {
                     return None;
                 }
                 return Some((
@@ -732,13 +746,32 @@ fn push_variable(pieces: &mut Vec<WordPiece>, variable: &str, quote: QuoteMode) 
     });
 }
 
-fn variable_end(source: &str, start: usize) -> usize {
+fn variable_end(source: &str, start: usize) -> Result<usize, ParseError> {
     let rest = &source[start..];
     if let Some(braced) = rest.strip_prefix("${") {
-        return braced.find('}').map_or(start + 1, |end| start + 3 + end);
+        let Some(close) = braced.find('}') else {
+            return Err(ParseError {
+                kind: ParseErrorKind::Unterminated('}'),
+                span: start..source.len(),
+            });
+        };
+        if !valid_variable_access(&braced[..close]) {
+            return Err(ParseError {
+                kind: ParseErrorKind::Expected("a variable name or access"),
+                span: start + 2..start + 2 + close,
+            });
+        }
+        return Ok(start + 3 + close);
     }
     let mut end = start + 1;
     let mut chars = source[end..].char_indices().peekable();
+    let Some((offset, head)) = chars.next() else {
+        return Ok(end);
+    };
+    if !head.is_alphabetic() {
+        return Ok(end);
+    }
+    end = start + 1 + offset + head.len_utf8();
     while let Some((offset, c)) = chars.next() {
         if c == '_' || c.is_alphanumeric() {
             end = start + 1 + offset + c.len_utf8();
@@ -752,7 +785,37 @@ fn variable_end(source: &str, start: usize) -> usize {
             break;
         }
     }
-    end
+    Ok(end)
+}
+
+fn valid_variable_access(value: &str) -> bool {
+    let name_end = value.find(['.', '[']).unwrap_or(value.len());
+    if !valid_name(&value[..name_end]) {
+        return false;
+    }
+    let mut rest = &value[name_end..];
+    while !rest.is_empty() {
+        if let Some(member) = rest.strip_prefix('.') {
+            let end = member.find(['.', '[']).unwrap_or(member.len());
+            if !valid_name(&member[..end]) {
+                return false;
+            }
+            rest = &member[end..];
+        } else if let Some(index) = rest.strip_prefix('[') {
+            let Some(close) = index.find(']') else {
+                return false;
+            };
+            let contents = &index[..close];
+            let digits = contents.strip_prefix('-').unwrap_or(contents);
+            if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            rest = &index[close + 1..];
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 fn decode_unicode_escape(source: &str, start: usize) -> Option<(char, usize)> {
@@ -1579,16 +1642,23 @@ impl Parser {
                 | TokenKind::RangeInclusive,
             ) => true,
             Some(TokenKind::Word(word)) => {
-                matches!(
+                let variable = matches!(
                     word.pieces.as_slice(),
                     [WordPiece::Variable {
                         quote: QuoteMode::Bare,
                         ..
                     }]
-                ) || self.tokens.get(self.position + 1).is_some_and(|next| {
+                );
+                let quoted = word_is_quoted(word);
+                let attached_call = self.tokens.get(self.position + 1).is_some_and(|next| {
                     matches!(next.value, TokenKind::LParen)
                         && next.span.start == self.peek().unwrap().span.end
-                })
+                });
+                let followed_by_operator = self
+                    .tokens
+                    .get(self.position + 1)
+                    .is_some_and(|next| value_operator(&next.value));
+                variable || quoted || attached_call || followed_by_operator
             }
             _ => false,
         }
@@ -1710,6 +1780,13 @@ impl Parser {
             span: self.source_len..self.source_len,
         }
     }
+}
+
+fn value_operator(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Operator(_) | TokenKind::Range | TokenKind::RangeInclusive
+    )
 }
 
 fn valid_name(name: &str) -> bool {
@@ -2012,6 +2089,94 @@ mod tests {
                 .iter()
                 .all(|statement| matches!(statement.and_or.first, Executable::Expression { .. }))
         );
+    }
+
+    #[test]
+    fn dispatches_literal_led_expressions_as_values() {
+        let tree = complete("if 1 == 1 { puts yes }\n'final value'");
+        let Executable::If(condition) = &tree.statements[0].and_or.first else {
+            panic!()
+        };
+        assert!(matches!(
+            condition.condition.as_ref(),
+            Executable::Expression {
+                expression: Expr::Binary {
+                    op: BinaryOp::Equal,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            tree.statements[1].and_or.first,
+            Executable::Expression {
+                expression: Expr::Scalar(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tokenizes_attached_negation_as_an_operator() {
+        let tree = complete("x = -$n");
+        assert!(matches!(
+            tree.statements[0].and_or.first,
+            Executable::Assignment {
+                value: Expr::Unary {
+                    op: UnaryOp::Negate,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn raw_prefix_requires_a_valid_word_position() {
+        let tokens = tokenize("car'pet' x=r'raw'").unwrap();
+        let TokenKind::Word(first) = &tokens[0].value else {
+            panic!()
+        };
+        assert_eq!(first.text(), "carpet");
+        assert!(matches!(
+            first.pieces.as_slice(),
+            [
+                WordPiece::Text { text, quote: QuoteMode::Bare },
+                WordPiece::Text { quote: QuoteMode::Single, .. }
+            ] if text == "car"
+        ));
+        assert!(matches!(
+            &tokens[3].value,
+            TokenKind::Word(Word { pieces })
+                if matches!(pieces.as_slice(), [WordPiece::Text { quote: QuoteMode::Raw, .. }])
+        ));
+    }
+
+    #[test]
+    fn invalid_unbraced_variable_heads_remain_literal() {
+        for source in ["$5", "$_name"] {
+            let tokens = tokenize(source).unwrap();
+            let TokenKind::Word(word) = &tokens[0].value else {
+                panic!()
+            };
+            assert!(matches!(
+                word.pieces.as_slice(),
+                [WordPiece::Text { text, quote: QuoteMode::Bare }] if text == source
+            ));
+        }
+    }
+
+    #[test]
+    fn validates_braced_variable_access() {
+        assert!(tokenize("${user.name}").is_ok());
+        assert!(tokenize("${items[0]}").is_ok());
+        assert!(matches!(
+            tokenize("${bad name}"),
+            Err(ParseError {
+                kind: ParseErrorKind::Expected(_),
+                ..
+            })
+        ));
     }
 
     #[test]
