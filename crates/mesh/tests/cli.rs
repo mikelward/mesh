@@ -993,6 +993,18 @@ fn a_background_command_does_not_consume_shell_input() {
 }
 
 #[test]
+fn background_pipeline_retains_statuses_reaped_on_earlier_prompts() {
+    let out = run_with_input("sh -c 'exit 7' | sleep 0.2 &\nsleep 0.05\njobs\nsleep 0.25\njobs\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Done (7)"));
+}
+
+#[test]
+fn foreground_pipeline_retains_statuses_reaped_on_earlier_prompts() {
+    let out = run_with_input("sh -c 'exit 7' | sleep 0.2 &\nsleep 0.05\njobs\nfg\nexit\n");
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
 fn quoted_and_escaped_ampersands_are_literal() {
     let out = run_with_input("echo 'a&b' c\\&d\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a&b c&d\n");
@@ -1203,5 +1215,26 @@ fn a_fifo_redirect_in_a_pipeline_does_not_deadlock() {
     }
     let out = child.wait_with_output().expect("wait");
     assert!(String::from_utf8_lossy(&out.stdout).contains("done"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_background_fifo_redirect_does_not_block_the_shell() {
+    let dir = fresh_dir("fifo_background");
+    let fifo = dir.join("f");
+    if !Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let out = run_with_input(&format!(
+        "cd {}\ncat < f &\nputs ready\necho payload > f\nsleep 0.05\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ready\npayload\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
