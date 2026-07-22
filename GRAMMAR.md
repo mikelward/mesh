@@ -17,8 +17,9 @@ expressions, the following simplifications would reduce special cases and make
 future parsing errors more predictable:
 
 1. **Empty command positions are errors (completed).** Leading and repeated
-   separators are rejected, as are trailing `&&` and `||`. A single trailing
-   `;` is permitted as a statement terminator. Every conditional operator thus
+   separators are rejected. Trailing `&&` and `||` are incomplete while input
+   is being edited and become errors only at EOF. A single trailing `;` is
+   permitted as a statement terminator. Every conditional operator thus
    has two operands, without status-preservation edge cases.
 2. **Tokenize first, validate structure second.** `split_line` currently finds
    words, separators, pipes, redirections, and unsupported descriptor redirects

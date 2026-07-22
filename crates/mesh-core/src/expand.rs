@@ -436,13 +436,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             Value::String(value) => Ok(Value::String(modify_string(value, modifier))),
             Value::List(values) => values
                 .into_iter()
-                .map(|value| match value {
-                    Value::String(value) => Ok(Value::String(modify_string(value, modifier))),
-                    Value::List(_) => Err(ExpandError::Modifier {
-                        name: name.into(),
-                        message: "cannot map over a nested list".into(),
-                    }),
-                })
+                .map(|value| apply_modifier(value, modifier))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::List),
         },
@@ -472,9 +466,17 @@ fn modify_string(value: String, modifier: Modifier) -> String {
     use std::path::Path;
     let path = Path::new(&value);
     match modifier {
-        Modifier::Dir => path
-            .parent()
-            .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
+        Modifier::Dir => path.parent().map_or_else(
+            || if path.has_root() { "/" } else { "." }.to_string(),
+            |p| {
+                let parent = p.to_string_lossy();
+                if parent.is_empty() {
+                    ".".into()
+                } else {
+                    parent.into_owned()
+                }
+            },
+        ),
         Modifier::Base => path
             .file_name()
             .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
@@ -494,19 +496,18 @@ fn modify_string(value: String, modifier: Modifier) -> String {
 
 fn extensions(name: Option<&str>) -> &str {
     let Some(name) = name else { return "" };
-    if name.starts_with('.') {
-        return "";
-    }
-    name.split_once('.')
+    name.strip_prefix('.')
+        .unwrap_or(name)
+        .split_once('.')
         .map_or("", |(_, extensions)| extensions)
 }
 
 fn bare_name(name: Option<&str>) -> &str {
     let Some(name) = name else { return "" };
-    if name.starts_with('.') {
-        return name;
-    }
-    name.split_once('.').map_or(name, |(bare, _)| bare)
+    let offset = usize::from(name.starts_with('.'));
+    name[offset..]
+        .find('.')
+        .map_or(name, |dot| &name[..offset + dot])
 }
 
 pub(crate) fn slice<T>(
