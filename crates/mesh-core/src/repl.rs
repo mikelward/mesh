@@ -383,6 +383,7 @@ fn clone_piece(piece: &Piece) -> Piece {
             name: v.name.clone(),
             member: v.member.clone(),
             access: v.access.clone(),
+            quoted: v.quoted,
         }),
     }
 }
@@ -398,6 +399,7 @@ fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
     if let [Word(pieces)] = rhs.as_slice()
         && let [Piece::Var(vref)] = pieces.as_slice()
         && vref.member.is_none()
+        && !vref.quoted
     {
         let value = assignment_value(vref, vars)?;
         vars.set_value(name, value);
@@ -451,7 +453,7 @@ fn append_assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), Stri
         Value::List(expand::expand(items, vars).map_err(|e| e.to_string())?)
     } else if let [Word(pieces)] = rhs.as_slice() {
         if let [Piece::Var(vref)] = pieces.as_slice() {
-            if vref.member.is_none() {
+            if vref.member.is_none() && !vref.quoted {
                 assignment_value(vref, vars)?
             } else {
                 scalar_value(rhs, vars, name)?
