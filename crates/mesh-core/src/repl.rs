@@ -48,8 +48,8 @@ enum Step {
 
 /// Tokenize and run one line of input against the variable store. A line is a
 /// sequence of commands joined by `;` / `&&` / `||`; each connector decides
-/// whether its command runs from the previous command's status. Empty lines (and
-/// empty segments, e.g. a trailing `;`) are a no-op that keeps the last status.
+/// whether its command runs from the previous command's status. Empty lines are
+/// a no-op that keeps the last status.
 fn run_line(text: &str, last: u8, vars: &mut Vars, jobs: &mut exec::JobTable) -> Step {
     let segments = match lexer::split_line(text) {
         Ok(segments) => segments,
@@ -66,8 +66,8 @@ fn run_line(text: &str, last: u8, vars: &mut Vars, jobs: &mut exec::JobTable) ->
             Sep::Or => status != 0,  // run after failure
         };
         if !run_it || segment.stages.is_empty() {
-            // Short-circuited, or an empty segment (blank line, `;;`, a trailing
-            // `;`): a no-op that leaves the status unchanged.
+            // Short-circuited commands leave the status unchanged. The empty
+            // check is defensive; the lexer no longer emits empty segments.
             continue;
         }
         match run_pipeline(segment.stages, segment.background, status, vars, jobs) {

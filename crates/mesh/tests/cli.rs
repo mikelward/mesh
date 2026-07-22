@@ -145,6 +145,32 @@ fn and_or_short_circuit_on_status() {
 }
 
 #[test]
+fn empty_command_positions_are_syntax_errors() {
+    for script in [
+        "; puts no\n",
+        "puts no ;; puts no\n",
+        "true &&\n",
+        "false ||\n",
+    ] {
+        let out = run_with_input(script);
+        assert_eq!(out.status.code(), Some(2), "{script:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("syntax error: empty command"),
+            "{script:?}"
+        );
+        assert!(out.stdout.is_empty(), "{script:?}");
+    }
+}
+
+#[test]
+fn one_trailing_semicolon_is_allowed() {
+    let out = run_with_input("puts yes;\n");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "yes\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn a_sequence_reports_the_last_commands_status() {
     // `true && false` short-circuits to false's status (1); a following `;`
     // still runs. The whole line's status is the last command actually run.
