@@ -1218,22 +1218,22 @@ fn starts_list(word: &Word) -> bool {
 }
 
 fn bracket_delta(word: &Word) -> i32 {
-    word.0
-        .iter()
-        .filter_map(|piece| match piece {
-            Piece::Text {
-                text,
-                expandable: true,
-            } => Some(text),
-            _ => None,
-        })
-        .flat_map(|text| text.chars())
-        .map(|ch| match ch {
-            '[' => 1,
-            ']' => -1,
-            _ => 0,
-        })
-        .sum()
+    // Interior brackets belong to scalar text (often a glob), not list syntax.
+    let opens = match word.0.first() {
+        Some(Piece::Text {
+            text,
+            expandable: true,
+        }) => text.chars().take_while(|ch| *ch == '[').count(),
+        _ => 0,
+    };
+    let closes = match word.0.last() {
+        Some(Piece::Text {
+            text,
+            expandable: true,
+        }) => text.chars().rev().take_while(|ch| *ch == ']').count(),
+        _ => 0,
+    };
+    opens as i32 - closes as i32
 }
 
 /// Interactive loop: reedline line editing with an in-memory history. Ctrl-D on
