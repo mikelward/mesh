@@ -395,6 +395,14 @@ fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
     if name == "env" {
         return Err(format!("{name}: cannot assign to the reserved name"));
     }
+    if let [Word(pieces)] = rhs.as_slice()
+        && let [Piece::Var(vref)] = pieces.as_slice()
+        && vref.member.is_none()
+    {
+        let value = assignment_value(vref, vars)?;
+        vars.set_value(name, value);
+        return Ok(());
+    }
     if let Some(items) = list_literal(rhs.as_slice()) {
         let values = expand::expand(items, vars).map_err(|e| e.to_string())?;
         vars.set_list(name, values);
@@ -408,6 +416,28 @@ fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
         }
         0 => Err(format!("{name}: assignment needs a value")),
         _ => Err(format!("{name}: list assignment not supported yet")),
+    }
+}
+
+/// Preserve list values in an exact variable-to-variable assignment. Command
+/// expansion still requires `...`; assignment is a value context instead.
+fn assignment_value(vref: &crate::lexer::VarRef, vars: &Vars) -> Result<Value, String> {
+    let value = vars
+        .get(&vref.name)
+        .ok_or_else(|| format!("{}: unbound variable", vref.name))?;
+    match (&vref.access, value) {
+        (None, value) => Ok(value.clone()),
+        (
+            Some(crate::lexer::Access::Slice {
+                start,
+                end,
+                inclusive,
+            }),
+            Value::List(values),
+        ) => Ok(Value::List(
+            expand::slice(values, *start, *end, *inclusive).to_vec(),
+        )),
+        _ => scalar_value(vec![Word(vec![Piece::Var(vref.clone())])], vars, &vref.name),
     }
 }
 

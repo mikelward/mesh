@@ -199,7 +199,12 @@ fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
     }
 }
 
-fn slice<T>(values: &[T], start: Option<i64>, end: Option<i64>, inclusive: bool) -> &[T] {
+pub(crate) fn slice<T>(
+    values: &[T],
+    start: Option<i64>,
+    end: Option<i64>,
+    inclusive: bool,
+) -> &[T] {
     let len = values.len() as i128;
     let clamp = |bound: i64, inclusive| -> usize {
         let bound = bound as i128;

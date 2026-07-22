@@ -34,6 +34,11 @@ impl Vars {
         self.map.insert(name.to_string(), Value::List(value));
     }
 
+    /// Bind an already typed value without converting lists to strings.
+    pub fn set_value(&mut self, name: &str, value: Value) {
+        self.map.insert(name.to_string(), value);
+    }
+
     /// Read `name`. Returns `None` if unbound — the caller turns that into a
     /// loud error, per the no-null / fail-loud rule.
     pub fn get(&self, name: &str) -> Option<&Value> {
