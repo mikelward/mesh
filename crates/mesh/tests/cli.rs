@@ -485,11 +485,11 @@ fn list_indexing_is_zero_based_and_supports_negative_indices() {
 #[test]
 fn list_slices_are_clamped_and_require_spread() {
     let out = run_with_input(
-        "xs = [a b c d]\nputs ...$xs[1..3]\nputs ...$xs[..=1]\nputs ...$xs[-2..]\nputs before ...$xs[9..] after\nputs before ...$xs[..=-5] after\nputs before ...$xs[..=-4] after\nputs $xs[1..2]\ns = text\nputs $s[1..]\nputs $missing[1..]\nputs recovered\n",
+        "xs = [a b c d]\nputs ...$xs[1..3]\nputs ...$xs[..=1]\nputs ...$xs[-2..]\nputs ...$xs[..=-1]\nputs ...$xs[..=9223372036854775807]\nputs before ...$xs[9..] after\nputs before ...$xs[..=-5] after\nputs before ...$xs[..=-4] after\nputs $xs[1..2]\ns = text\nputs $s[1..]\nputs $missing[1..]\nputs recovered\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "b c\na b\nc d\nbefore after\nbefore after\nbefore a after\nrecovered\n"
+        "b c\na b\nc d\na b c d\na b c d\nbefore after\nbefore after\nbefore a after\nrecovered\n"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("list value needs `...`"));

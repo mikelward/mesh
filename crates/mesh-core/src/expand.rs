@@ -201,14 +201,13 @@ fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
 
 fn slice<T>(values: &[T], start: Option<i64>, end: Option<i64>, inclusive: bool) -> &[T] {
     let len = values.len() as i128;
-    let clamp = |bound: i128| -> usize {
-        let offset = if bound < 0 { len + bound } else { bound };
+    let clamp = |bound: i64, inclusive| -> usize {
+        let bound = bound as i128;
+        let offset = if bound < 0 { len + bound } else { bound } + i128::from(inclusive);
         offset.clamp(0, len) as usize
     };
-    let start = start.map_or(0, |bound| clamp(bound as i128));
-    let end = end.map_or(values.len(), |bound| {
-        clamp(bound as i128 + i128::from(inclusive))
-    });
+    let start = start.map_or(0, |bound| clamp(bound, false));
+    let end = end.map_or(values.len(), |bound| clamp(bound, inclusive));
     if start >= end {
         &values[0..0]
     } else {
