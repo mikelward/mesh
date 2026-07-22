@@ -752,9 +752,18 @@ fn open_controlling_pty(master: &mut libc::c_int, slave: &mut libc::c_int) -> bo
             std::ptr::null_mut::<libc::winsize>(),
         )
     } == 0;
-    opened
-        && unsafe { libc::setsid() } >= 0
-        && unsafe { libc::ioctl(*slave, libc::TIOCSCTTY as libc::c_ulong, 0) } >= 0
+    if !opened || unsafe { libc::setsid() } < 0 {
+        return false;
+    }
+
+    // Darwin exposes TIOCSCTTY as c_uint although ioctl takes c_ulong. Other
+    // targets already expose the request with the type their ioctl expects;
+    // notably, musl's ioctl request is c_int.
+    #[cfg(target_os = "macos")]
+    let request = libc::c_ulong::from(libc::TIOCSCTTY);
+    #[cfg(not(target_os = "macos"))]
+    let request = libc::TIOCSCTTY;
+    (unsafe { libc::ioctl(*slave, request, 0) }) >= 0
 }
 
 fn sigcont_harness() -> i32 {
