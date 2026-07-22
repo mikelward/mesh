@@ -118,12 +118,19 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
             // stages join it, so terminal signals address the entire pipeline.
             command.process_group(process_group.unwrap_or(0));
         }
-        // The interactive shell ignores terminal-generated signals while it
-        // owns the prompt. Children must restore the ordinary dispositions so
-        // Ctrl-C/Ctrl-Z/Ctrl-\\ affect the foreground job instead of being
-        // inherited as ignored across exec.
-        unsafe {
-            command.pre_exec(restore_job_signals);
+        if interactive {
+            // The interactive shell ignores terminal-generated signals while
+            // it owns the prompt. Restore them only in children of that mode;
+            // a non-interactive invocation must preserve its caller's choices.
+            // Hand off the terminal before exec so a newly started program
+            // cannot race ahead and receive SIGTTIN.
+            unsafe {
+                command.pre_exec(|| {
+                    restore_job_signals()?;
+                    set_foreground_group(libc::getpgrp());
+                    Ok(())
+                });
+            }
         }
 
         // stdin: an input redirection wins over the incoming pipe/EOF/terminal.
@@ -180,12 +187,6 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
     let foreground = process_group;
     if let Some(pgid) = foreground {
         set_foreground_group(pgid);
-        // A child that reached a read before the handoff may have been stopped
-        // by SIGTTIN. Resume the group only after it owns the terminal.
-        // SAFETY: a negative PID addresses the process group created above.
-        unsafe {
-            libc::kill(-pgid, libc::SIGCONT);
-        }
     }
 
     // pipefail: the last stage to fail wins. A SIGPIPE is ignored only for a
