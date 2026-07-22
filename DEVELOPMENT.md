@@ -9,10 +9,10 @@ The clean-break M3 parser target and precedence rules live in
 the subset accepted by the current implementation.
 
 > **Status:** the implementation is a read/tokenize/exec loop that launches
-> external commands plus the `cd`, `pwd`, `puts`, `exit`, `jobs`, `fg`, and `bg`
-> builtins. Interactive
+> external commands plus the `cd`, `pwd`, `puts`, `exit`, `jobs`, `fg`, `bg`,
+> `prompt`, and `prompt-hook` builtins. Interactive
 > input uses `reedline` line editing (history, Ctrl-C/Ctrl-D) behind a two-glyph
-> prompt; piped input uses a std-only reader. None of the mesh *language* is
+> prompt that can be customized with lifecycle hooks; piped input uses a std-only reader. None of the mesh *language* is
 > implemented yet. Treat the current code as a seed, not a foundation to build
 > features on before the real lexer/parser land.
 

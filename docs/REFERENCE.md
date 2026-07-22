@@ -26,16 +26,57 @@ An unknown command prints `command not found` and sets a failing status.
 | `pwd` | Print the working directory. |
 | `exit [n]` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). |
 | `prompt [text]` | Set the interactive prompt to `text`. With no arguments, print the current prompt; `--reset` restores the status-sensitive default. |
-| `prompt-hook name function` | Register a zero-argument function to run before every primary interactive prompt. Reusing `name` replaces that hook without changing its order; `prompt-hook --remove name` removes it. |
+| `prompt-hook [event] name function` | Register a named function for a prompt lifecycle event. The default event is `preprompt`. Reusing `name` within an event replaces that hook without changing its order. |
 
-Prompt hooks are session-local, run in registration order, and do not run for
-continuation prompts. Define the function before registering it:
+### Custom prompts and hooks
+
+The smallest static prompt is:
 
 ```mesh
-func refresh() { puts "checking status…" }
-prompt-hook status refresh
 prompt "project> "
 ```
+
+For a dynamic prompt, register a `preprompt` function and have it update the
+prompt. This example includes the current directory:
+
+```mesh
+func refresh-prompt() {
+  prompt "$(pwd)> "
+}
+prompt-hook cwd refresh-prompt
+```
+
+An external renderer works the same way:
+
+```mesh
+func refresh-prompt() { prompt "$(starship prompt)" }
+prompt-hook renderer refresh-prompt
+```
+
+Hooks are session-local and run in registration order. Re-registering the same
+event/name pair replaces it in place, making configuration safe to reload.
+Remove one with `prompt-hook --remove [event] name`. `preprompt` hooks run only
+for primary prompts, not multiline continuation prompts.
+
+| Event | Function parameters | When it runs |
+| --- | --- | --- |
+| `preprompt` | none | Before each primary prompt is rendered. This is the default event when omitted. |
+| `preexec` | `command` | Immediately before an interactive command runs. |
+| `postexec` | `command, status, elapsed` | After an interactive command; `elapsed` is integer milliseconds. |
+| `exit` | `status` | Before an interactive shell exits normally. |
+
+```mesh
+func command-started(cmd) { puts "running $cmd" }
+func command-finished(cmd, status, elapsed) {
+  puts "$cmd exited $status after ${elapsed}ms"
+}
+prompt-hook preexec log command-started
+prompt-hook postexec log command-finished
+```
+
+This is the currently implemented prompt API. The structured `$sh.prompt` map,
+styled segments, `fill`/`rule`, and the `precd`/`postcd` events described as the
+eventual prompt design in `DESIGN.md` are not implemented yet.
 
 ## Exit status
 
