@@ -953,7 +953,10 @@ fn pty_read_until_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
         if prompt.windows(4).any(|part| part == b"\x1b[6n") {
             unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
         }
-        if prompt.windows(5).any(|part| part == b"mesh$") {
+        if prompt
+            .windows(5)
+            .any(|part| part == b"mesh$" || part == b"mesh!")
+        {
             break;
         }
     }

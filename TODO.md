@@ -53,14 +53,16 @@ file as tasks land.
       Ctrl-C interrupts it with status 130 while mesh survives, and idle
       Ctrl-Z/Ctrl-\\ do not suspend or terminate mesh. Stopped-job tracking and
       resumption land with the job table below.
-- [ ] Job table plus `fg` / `bg` builtins.
+- [x] Job table plus `jobs`, `fg`, and `bg` builtins for stopped foreground jobs.
+      `N` and `%N` select a job; no operand selects the newest job. Background
+      launch with `&` remains a separate lexer/parser task.
 - [x] Hand the terminal to full-screen programs and restore the shell's terminal
       modes cleanly when they exit or stop.
 
 ## Known limitations
 
-- Ctrl-Z stops a foreground job, but mesh cannot register, report, or resume it
-  until the M2 job table and `fg` / `bg` task lands.
+- Jobs enter the table through Ctrl-Z; `&` background-launch syntax is not
+  implemented yet.
 
 ## Decisions made
 

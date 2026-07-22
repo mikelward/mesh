@@ -202,6 +202,14 @@ redirect** (`2>`, `&>`, and their `>>` forms) is also deferred and **rejected as
 a syntax error** rather than silently reinterpreted. Also deferred: here-strings
 and a redirection with no command (`> f`).
 
+## M2 job builtins
+
+Ctrl-Z registers a stopped foreground pipeline in the interactive job table.
+`jobs` lists registered jobs; `fg [N|%N]` foregrounds one, and `bg [N|%N]`
+continues one in the background. With no reference, `fg` and `bg` select the
+newest job. These are command forms rather than new grammar productions. The
+`&` background-launch operator is not parsed yet.
+
 ### Not yet parsed
 `{ }` blocks, `func`, `:` modifiers, heredocs. Each arrives with the task that
 needs it, and this file grows to match.

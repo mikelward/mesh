@@ -5,7 +5,8 @@ the language design, see [`DESIGN.md`](DESIGN.md); for the milestone plan, see
 [`ROADMAP.md`](ROADMAP.md).
 
 > **Status:** the implementation is a read/tokenize/exec loop that launches
-> external commands plus the `cd`, `pwd`, `puts`, and `exit` builtins. Interactive
+> external commands plus the `cd`, `pwd`, `puts`, `exit`, `jobs`, `fg`, and `bg`
+> builtins. Interactive
 > input uses `reedline` line editing (history, Ctrl-C/Ctrl-D) behind a two-glyph
 > prompt; piped input uses a std-only reader. None of the mesh *language* is
 > implemented yet. Treat the current code as a seed, not a foundation to build
@@ -139,7 +140,7 @@ mesh/
 │           ├── lexer.rs    # quotes + escapes + $interpolation → words of pieces
 │           ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
 │           ├── vars.rs     # session-global variable store
-│           ├── builtins.rs # cd, pwd, puts, exit
+│           ├── builtins.rs # cd, pwd, puts, exit + job-builtin recognition
 │           └── exec.rs     # launch external commands + pipelines/redirection
 ├── DESIGN.md               # vision + language design (the "why/what")
 ├── DEVELOPMENT.md          # this file (the "how to build")
@@ -157,8 +158,8 @@ command segments joined by `;` / `&&` / `||`, each a list of words of pieces →
 run the segments left to right, each connector deciding from the previous status
 whether its command runs → per command, classify as an assignment or a command →
 for a command, `expand::expand` (resolve `$` interpolation against `vars`, then
-tilde/globs) → `builtins::dispatch` (handles `cd`/`pwd`/`puts`/`exit`, returns
-`None` otherwise) → else `exec::run` launches the external command. A
+tilde/globs) → job-table dispatch (`jobs`/`fg`/`bg`) or `builtins::dispatch`
+(`cd`/`pwd`/`puts`/`exit`) → else `exec::run` launches the external command. A
 session-global `vars` store persists across lines; the loop tracks the last exit
 status and returns it as the process exit code at EOF.
 

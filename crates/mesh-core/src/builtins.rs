@@ -21,7 +21,7 @@ pub enum Builtin {
 /// redirection, which are not supported yet (both need the builtin to write to a
 /// non-stdout target / a forked child).
 pub fn is_builtin(name: &str) -> bool {
-    matches!(name, "cd" | "pwd" | "puts" | "exit")
+    matches!(name, "cd" | "pwd" | "puts" | "exit" | "fg" | "bg" | "jobs")
 }
 
 /// If `words[0]` names a builtin, run it and return its outcome; otherwise
@@ -174,7 +174,7 @@ fn exit(args: &[String], last: u8) -> Builtin {
 
 #[cfg(test)]
 mod tests {
-    use super::path_line;
+    use super::{is_builtin, path_line};
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -182,5 +182,12 @@ mod tests {
     fn path_line_preserves_non_utf8_bytes() {
         // A 0xff byte must survive verbatim, not become U+FFFD.
         assert_eq!(path_line(OsStr::from_bytes(b"/x\xffy")), b"/x\xffy\n");
+    }
+
+    #[test]
+    fn recognizes_job_builtins() {
+        assert!(is_builtin("jobs"));
+        assert!(is_builtin("fg"));
+        assert!(is_builtin("bg"));
     }
 }
