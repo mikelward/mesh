@@ -1644,7 +1644,11 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
                 return Step::Continue(1);
             }
         };
-        return call_func(&name, args, shell);
+        if auto_help_requested(&args) {
+            let help = shell.funcs.get(&name).unwrap().help(&name);
+            return Step::Continue(builtins::print_generated_help(&name, &help));
+        }
+        return call_func(&name, remove_option_terminator(args), shell);
     }
     let words = match expand::expand(tokens, &shell.vars) {
         Ok(words) => words,
@@ -1662,6 +1666,9 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
     // level; `run_line` decides which by `in_function`).
     if words[0] == "return" {
         return make_return(&words[1..], last);
+    }
+    if builtins::is_builtin(&words[0]) && auto_help_requested_strings(&words[1..]) {
+        return Step::Continue(builtins::print_help(&words[0]));
     }
     match words[0].as_str() {
         "prompt" => return configure_prompt(&words[1..], shell),
@@ -1684,6 +1691,28 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         Some(Builtin::Status(code)) => Step::Continue(code),
         None => Step::Continue(exec::run(&words, &mut shell.jobs)),
     }
+}
+
+fn auto_help_requested(args: &[Value]) -> bool {
+    args.iter()
+        .take_while(|arg| !matches!(arg, Value::String(value) if value == "--"))
+        .any(|arg| matches!(arg, Value::String(value) if value == "--help"))
+}
+
+fn auto_help_requested_strings(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--help")
+}
+
+fn remove_option_terminator(mut args: Vec<Value>) -> Vec<Value> {
+    if let Some(index) = args
+        .iter()
+        .position(|arg| matches!(arg, Value::String(value) if value == "--"))
+    {
+        args.remove(index);
+    }
+    args
 }
 
 fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
