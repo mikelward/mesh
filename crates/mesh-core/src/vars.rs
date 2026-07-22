@@ -17,6 +17,29 @@ pub enum Value {
     Boolean(bool),
     List(Vec<Value>),
     Map(Vec<(String, Value)>),
+    Regex(RegexValue),
+    Glob(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RegexValue {
+    pub pattern: String,
+    pub case_insensitive: bool,
+    pub multi_line: bool,
+    pub dot_matches_new_line: bool,
+    pub ignore_whitespace: bool,
+}
+
+impl RegexValue {
+    pub fn new(pattern: String) -> Self {
+        Self {
+            pattern,
+            case_insensitive: false,
+            multi_line: false,
+            dot_matches_new_line: false,
+            ignore_whitespace: false,
+        }
+    }
 }
 
 type Scope = HashMap<String, Value>;
@@ -150,6 +173,8 @@ impl Vars {
             }
             (Value::Boolean(_), _) => return Err(format!("{name}: cannot append to a boolean")),
             (Value::Map(_), _) => return Err(format!("{name}: can only merge a map into a map")),
+            (Value::Regex(_), _) => return Err(format!("{name}: cannot append to a regex")),
+            (Value::Glob(_), _) => return Err(format!("{name}: cannot append to a glob")),
         }
         Ok(())
     }

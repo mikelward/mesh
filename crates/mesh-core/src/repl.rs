@@ -17,7 +17,7 @@ use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 use crate::builtins::{self, Builtin};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
-use crate::vars::{Value, Vars};
+use crate::vars::{RegexValue, Value, Vars};
 use crate::{exec, expand, parser};
 
 /// The mutable shell session threaded through the run loop: variable scopes,
@@ -727,6 +727,12 @@ fn eval_expr(
                     Value::List(v)
                 }
             }),
+        E::Regex(pattern) => {
+            let value = RegexValue::new(pattern.clone());
+            compile_regex(&value).map_err(runtime_message)?;
+            Ok(Value::Regex(value))
+        }
+        E::Glob(pattern) => Ok(Value::Glob(pattern.clone())),
         E::Variable(name) => {
             let reference = expansion_variable(&name.value, parser::QuoteMode::Bare);
             expand::resolve_value(&reference, &shell.vars).map_err(|error| {
@@ -859,9 +865,11 @@ fn eval_expr(
                     Value::List(values) => Ok(Value::List(
                         expand::slice(&values, bound(start)?, bound(end)?, *inclusive).to_vec(),
                     )),
-                    Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
-                        runtime_error("cannot slice a scalar value")
-                    }
+                    Value::String(_)
+                    | Value::Integer(_)
+                    | Value::Boolean(_)
+                    | Value::Regex(_)
+                    | Value::Glob(_) => runtime_error("cannot slice a scalar value"),
                     Value::Map(_) => runtime_error("cannot slice a map value"),
                 };
             }
@@ -883,9 +891,11 @@ fn eval_expr(
                             Step::Continue(1)
                         })
                 }
-                Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
-                    runtime_error("cannot index a scalar value")
-                }
+                Value::String(_)
+                | Value::Integer(_)
+                | Value::Boolean(_)
+                | Value::Regex(_)
+                | Value::Glob(_) => runtime_error("cannot index a scalar value"),
                 Value::Map(entries) => {
                     let key = match index_value {
                         Value::String(key) => key,
@@ -907,10 +917,23 @@ fn eval_expr(
                     "modifier :{name} arguments are not implemented yet"
                 ));
             }
+            let mut value = eval_expr(value, last, in_function, shell)?;
+            if let Value::Regex(regex) = &mut value {
+                match name.as_str() {
+                    "i" | "ignorecase" => regex.case_insensitive = true,
+                    "m" | "multiline" => regex.multi_line = true,
+                    "s" | "dotall" => regex.dot_matches_new_line = true,
+                    "x" | "extended" => regex.ignore_whitespace = true,
+                    _ => {
+                        return runtime_error(format!("modifier :{name} is not valid for a regex"));
+                    }
+                }
+                compile_regex(regex).map_err(runtime_message)?;
+                return Ok(value);
+            }
             let Some(modifier) = expand::Modifier::from_name(name) else {
                 return runtime_error(format!("modifier :{name} is not implemented yet"));
             };
-            let value = eval_expr(value, last, in_function, shell)?;
             expand::apply_modifier(value, modifier)
                 .map_err(|error| runtime_message(error.to_string()))
         }
@@ -944,7 +967,7 @@ fn eval_expr(
             };
             Ok(Value::List((start..stop).map(Value::Integer).collect()))
         }
-        E::Call { .. } => runtime_error("call expressions are not implemented yet"),
+        E::Call { callee, arguments } => eval_call(callee, arguments, last, in_function, shell),
         E::Lambda { .. } => runtime_error("lambda expressions are not implemented yet"),
     }
 }
@@ -963,6 +986,63 @@ fn range_endpoint(
         Value::Integer(value) => Ok(value),
         _ => runtime_error("range endpoints must be integers"),
     }
+}
+
+fn eval_call(
+    callee: &parser::Expr,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let parser::Expr::Scalar(word) = callee else {
+        return runtime_error("call target is not callable");
+    };
+    if word.value.text() != "re" {
+        return runtime_error(format!(
+            "call `{}` is not implemented yet",
+            word.value.text()
+        ));
+    }
+    let mut pattern = None;
+    let mut literal = false;
+    let mut case_insensitive = false;
+    for argument in arguments {
+        match argument {
+            parser::Argument::Positional(expression) if pattern.is_none() => {
+                match eval_expr(expression, last, in_function, shell)? {
+                    Value::String(value) => pattern = Some(value),
+                    _ => return runtime_error("re() pattern must be a string"),
+                }
+            }
+            parser::Argument::Named(name, expression)
+                if matches!(name.as_str(), "literal" | "ignore-case") =>
+            {
+                let Value::Boolean(value) = eval_expr(expression, last, in_function, shell)? else {
+                    return runtime_error(format!("re() `{name}` must be a boolean"));
+                };
+                if name == "literal" {
+                    literal = value;
+                } else {
+                    case_insensitive = value;
+                }
+            }
+            parser::Argument::Spread(_) => {
+                return runtime_error("re() does not accept spread arguments");
+            }
+            _ => return runtime_error("invalid re() argument"),
+        }
+    }
+    let Some(mut pattern) = pattern else {
+        return runtime_error("re() requires one pattern string");
+    };
+    if literal {
+        pattern = regex::escape(&pattern);
+    }
+    let mut value = RegexValue::new(pattern);
+    value.case_insensitive = case_insensitive;
+    compile_regex(&value).map_err(runtime_message)?;
+    Ok(Value::Regex(value))
 }
 
 fn runtime_message(message: impl std::fmt::Display) -> Step {
@@ -1191,6 +1271,7 @@ fn truthy(value: &Value) -> bool {
         Value::Boolean(value) => *value,
         Value::List(v) => !v.is_empty(),
         Value::Map(v) => !v.is_empty(),
+        Value::Regex(_) | Value::Glob(_) => true,
     }
 }
 
@@ -1217,6 +1298,17 @@ fn checked_div(left: i64, right: i64) -> Result<i64, String> {
     left.checked_div(right)
         .ok_or_else(|| "numeric overflow".into())
 }
+
+fn compile_regex(value: &RegexValue) -> Result<regex::Regex, String> {
+    regex::RegexBuilder::new(&value.pattern)
+        .case_insensitive(value.case_insensitive)
+        .multi_line(value.multi_line)
+        .dot_matches_new_line(value.dot_matches_new_line)
+        .ignore_whitespace(value.ignore_whitespace)
+        .build()
+        .map_err(|error| format!("invalid regex: {error}"))
+}
+
 fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value, String> {
     use parser::BinaryOp::*;
     Ok(match op {
@@ -1274,15 +1366,25 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
                 Value::String(needle) => bool_value(text.contains(&needle)),
                 _ => return Err("left operand of `in` must be a string".into()),
             },
-            Value::Integer(_) | Value::Boolean(_) => {
+            Value::Integer(_) | Value::Boolean(_) | Value::Regex(_) | Value::Glob(_) => {
                 return Err("right operand of `in` must be a collection or string".into());
             }
         },
         Match | NotMatch => {
-            return Err(format!(
-                "operator `{}` is not implemented yet",
-                if op == Match { "=~" } else { "!~" }
-            ));
+            let Value::String(text) = left else {
+                return Err("left operand of `~` must be a string".into());
+            };
+            let matched = match right {
+                Value::Regex(regex) => compile_regex(&regex)?.is_match(&text),
+                Value::Glob(pattern) => glob::Pattern::new(&pattern)
+                    .map_err(|error| format!("invalid glob pattern: {error}"))?
+                    .matches(&text),
+                Value::String(_) => return Err(
+                    "right operand of `~` must be a regex or bare glob; use re(...) for a string pattern".into(),
+                ),
+                _ => return Err("right operand of `~` must be a regex or bare glob".into()),
+            };
+            bool_value(if op == Match { matched } else { !matched })
         }
     })
 }

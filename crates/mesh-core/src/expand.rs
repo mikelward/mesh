@@ -164,10 +164,9 @@ fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> 
         Value::Map(_) => Err(ExpandError::Unsupported(
             "a map cannot be spread here".into(),
         )),
-        Value::Integer(_) | Value::Boolean(_) => Err(ExpandError::Unsupported(format!(
-            "...${}: value is not a list",
-            vref.name
-        ))),
+        Value::Integer(_) | Value::Boolean(_) | Value::Regex(_) | Value::Glob(_) => Err(
+            ExpandError::Unsupported(format!("...${}: value is not a list", vref.name)),
+        ),
     }
 }
 
@@ -184,10 +183,9 @@ fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError
         Value::Map(_) => Err(ExpandError::Unsupported(
             "a map cannot be spread into argv".into(),
         )),
-        Value::Integer(_) | Value::Boolean(_) => Err(ExpandError::Unsupported(format!(
-            "...${}: value is not a list",
-            vref.name
-        ))),
+        Value::Integer(_) | Value::Boolean(_) | Value::Regex(_) | Value::Glob(_) => Err(
+            ExpandError::Unsupported(format!("...${}: value is not a list", vref.name)),
+        ),
     }
 }
 
@@ -203,6 +201,9 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
             ))),
             Value::Map(_) => Err(ExpandError::Unsupported(format!(
                 "...${name}: map element cannot be a command argument"
+            ))),
+            Value::Regex(_) | Value::Glob(_) => Err(ExpandError::Unsupported(format!(
+                "...${name}: pattern element cannot be a command argument"
             ))),
         })
         .collect()
@@ -345,7 +346,9 @@ fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
         Value::String(value) => Ok(value),
         Value::Integer(value) => Ok(value.to_string()),
         Value::Boolean(value) => Ok(value.to_string()),
-        Value::List(_) | Value::Map(_) => Err(ExpandError::ListNeedsSpread(vref.name.clone())),
+        Value::List(_) | Value::Map(_) | Value::Regex(_) | Value::Glob(_) => {
+            Err(ExpandError::ListNeedsSpread(vref.name.clone()))
+        }
     }
 }
 
@@ -387,7 +390,11 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                                 })?
                         }
                         Value::Map(_) => map_value_access(value, &key, &vref.name)?,
-                        Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
+                        Value::String(_)
+                        | Value::Integer(_)
+                        | Value::Boolean(_)
+                        | Value::Regex(_)
+                        | Value::Glob(_) => {
                             return Err(ExpandError::NotAList(vref.name.clone()));
                         }
                     }
@@ -480,10 +487,12 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             Value::String(value) => Ok(Value::Integer(value.chars().count() as i64)),
             Value::List(values) => Ok(Value::Integer(values.len() as i64)),
             Value::Map(values) => Ok(Value::Integer(values.len() as i64)),
-            Value::Integer(_) | Value::Boolean(_) => Err(ExpandError::Modifier {
-                name: name.into(),
-                message: "requires a string or collection".into(),
-            }),
+            Value::Integer(_) | Value::Boolean(_) | Value::Regex(_) | Value::Glob(_) => {
+                Err(ExpandError::Modifier {
+                    name: name.into(),
+                    message: "requires a string or collection".into(),
+                })
+            }
         },
         Keys => match value {
             Value::Map(values) => Ok(Value::List(
@@ -511,12 +520,14 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                     name: name.into(),
                     message: "empty list has no element".into(),
                 }),
-            Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
-                Err(ExpandError::Modifier {
-                    name: name.into(),
-                    message: "requires a list".into(),
-                })
-            }
+            Value::String(_)
+            | Value::Integer(_)
+            | Value::Boolean(_)
+            | Value::Regex(_)
+            | Value::Glob(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a list".into(),
+            }),
             Value::Map(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
@@ -531,12 +542,14 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 };
                 Ok(Value::List(values[range].to_vec()))
             }
-            Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
-                Err(ExpandError::Modifier {
-                    name: name.into(),
-                    message: "requires a list".into(),
-                })
-            }
+            Value::String(_)
+            | Value::Integer(_)
+            | Value::Boolean(_)
+            | Value::Regex(_)
+            | Value::Glob(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a list".into(),
+            }),
             Value::Map(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
@@ -552,12 +565,14 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                         .collect(),
                 ))
             }
-            Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
-                Err(ExpandError::Modifier {
-                    name: name.into(),
-                    message: "requires a list".into(),
-                })
-            }
+            Value::String(_)
+            | Value::Integer(_)
+            | Value::Boolean(_)
+            | Value::Regex(_)
+            | Value::Glob(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a list".into(),
+            }),
             Value::Map(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
@@ -588,6 +603,10 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             Value::Map(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "cannot map over a map".into(),
+            }),
+            Value::Regex(_) | Value::Glob(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "cannot apply string modifier to this value".into(),
             }),
             Value::Integer(_) | Value::Boolean(_) => Err(ExpandError::Modifier {
                 name: name.into(),
