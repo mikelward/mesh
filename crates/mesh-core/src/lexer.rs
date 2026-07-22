@@ -240,7 +240,7 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
             // reinterpreted: an fd number or `&` attached *before* the operator
             // (`2>`, `&>`), or a `&` attached *after* it (`>&2`, `<&0`, the
             // fd-duplication form) which would otherwise become the target file.
-            if is_descriptor_prefix(&current, &chars, i) || chars.get(i + len) == Some(&'&') {
+            if is_descriptor_prefix(&current) || chars.get(i + len) == Some(&'&') {
                 return Err(LexError::UnsupportedRedirect);
             }
             finish_word(&mut current, &mut words, &mut redirs, &mut pending_redir);
@@ -391,10 +391,7 @@ fn separator_at(chars: &[char], at: usize) -> Option<(Sep, usize)> {
 /// digits (`2>`) or ends in a bare `&` (`&>`, `hello&>`). So a plain argument
 /// `2 > f`, a non-fd word `file2>f`, an escaped `\&>`/`\2>` (a literal), and an
 /// empty-quote form (`""2>`) are all excluded.
-fn is_descriptor_prefix(current: &Option<Vec<Piece>>, chars: &[char], at: usize) -> bool {
-    if at == 0 || chars[at - 1].is_whitespace() {
-        return false;
-    }
+fn is_descriptor_prefix(current: &Option<Vec<Piece>>) -> bool {
     // `&>` / `&>>`: a bare (unescaped) `&` immediately before the operator,
     // whatever precedes it — `echo hello&>f` is still the deferred both-streams
     // form. An escaped `\&` is a literal piece, so it is excluded.
@@ -407,18 +404,17 @@ fn is_descriptor_prefix(current: &Option<Vec<Piece>>, chars: &[char], at: usize)
             return true;
         }
     }
-    // `N>` / `N>>` / `N<`: the word abutting the operator is a bare run of ASCII
-    // digits (an fd number). Scan the raw chars back to the previous space, so an
-    // empty quote (`""2>`), an escape (`\2>`), or a non-fd word (`file2>`) — each
-    // of which puts a non-digit char in the run — is excluded.
-    let mut j = at;
-    while j > 0 && !chars[j - 1].is_whitespace() {
-        if !chars[j - 1].is_ascii_digit() {
-            return false;
-        }
-        j -= 1;
-    }
-    j < at // at least one digit abutted the operator
+    // `N>` / `N>>` / `N<`: the pending word must consist of one bare text piece
+    // containing only digits. Inspecting the word rather than scanning back to
+    // whitespace also makes a preceding operator a boundary, while still
+    // excluding empty quotes, escapes, and non-fd words.
+    matches!(
+        current.as_deref(),
+        Some([Piece::Text {
+            text,
+            expandable: true,
+        }]) if !text.is_empty() && text.chars().all(|ch| ch.is_ascii_digit())
+    )
 }
 
 /// If a bare redirection operator starts at `at`, return it and its length:
@@ -899,6 +895,17 @@ mod tests {
             split_line("cat > | wc"),
             Err(LexError::MissingRedirectTarget)
         );
+    }
+
+    #[test]
+    fn descriptor_prefix_stops_at_an_operator() {
+        for line in ["true;2>f", "true&&2>f", "false||2>f", "echo x|2>f"] {
+            assert_eq!(
+                split_line(line),
+                Err(LexError::UnsupportedRedirect),
+                "{line:?}"
+            );
+        }
     }
 
     #[test]
