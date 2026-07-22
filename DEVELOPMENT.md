@@ -11,6 +11,11 @@ the language design, see [`DESIGN.md`](DESIGN.md); for the milestone plan, see
 > implemented yet. Treat the current code as a seed, not a foundation to build
 > features on before the real lexer/parser land.
 
+Interactive startup follows Unix job-control rules: a mesh launched as a
+background job stops before reading its terminal and can be resumed with `fg`.
+Foreground commands receive the terminal, and mesh restores both terminal
+ownership and its saved terminal modes when they finish or stop.
+
 ## Prerequisites
 
 - A stable Rust toolchain. [`rust-toolchain.toml`](rust-toolchain.toml) pins

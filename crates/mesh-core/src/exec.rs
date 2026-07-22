@@ -78,6 +78,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
     let mut outcomes: Vec<Outcome> = Vec::new();
     let mut next_stdin = NextIn::Inherit;
     let mut process_group = None;
+    let shell_modes = interactive.then(terminal_modes).flatten();
 
     // Open each stage's redirections concurrently — each stage still opens its
     // own in source order, but different stages open at the same time, so a FIFO
@@ -208,8 +209,26 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
         // SAFETY: getpgrp takes no arguments and cannot fail.
         let shell_group = unsafe { libc::getpgrp() };
         set_foreground_group(shell_group);
+        if let Some(modes) = shell_modes {
+            restore_terminal_modes(&modes);
+        }
     }
     status
+}
+
+fn terminal_modes() -> Option<libc::termios> {
+    let mut modes = std::mem::MaybeUninit::uninit();
+    // SAFETY: tcgetattr initializes `modes` on success.
+    (unsafe { libc::tcgetattr(libc::STDIN_FILENO, modes.as_mut_ptr()) } == 0)
+        .then(|| unsafe { modes.assume_init() })
+}
+
+fn restore_terminal_modes(modes: &libc::termios) {
+    // SAFETY: `modes` came from tcgetattr for this terminal. Errors are best
+    // effort here: command status must remain the foreground job's status.
+    unsafe {
+        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSADRAIN, modes);
+    }
 }
 
 /// Wait for a child to exit, be signaled, or stop. `Child::wait` only reports
@@ -326,7 +345,7 @@ fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::restore_job_signals;
+    use super::{restore_job_signals, restore_terminal_modes, terminal_modes};
 
     #[test]
     fn child_restores_sigint_to_default() {
@@ -349,5 +368,53 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFSIGNALED(status));
         assert_eq!(libc::WTERMSIG(status), libc::SIGINT);
+    }
+
+    #[test]
+    fn saved_terminal_modes_can_be_restored() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid != 0 {
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            return;
+        }
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::dup2(slave, libc::STDIN_FILENO) },
+            libc::STDIN_FILENO
+        );
+
+        let saved = terminal_modes().expect("PTY has terminal modes");
+        let mut changed = saved;
+        changed.c_lflag ^= libc::ECHO;
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave, libc::TCSANOW, &changed) },
+            0
+        );
+        restore_terminal_modes(&saved);
+        let restored = terminal_modes().expect("PTY still has terminal modes");
+        assert_eq!(restored.c_lflag & libc::ECHO, saved.c_lflag & libc::ECHO);
+
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+            libc::_exit(0);
+        }
     }
 }

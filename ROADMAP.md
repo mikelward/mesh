@@ -80,7 +80,8 @@ makes a shell a shell.
   tracking and `fg` / `bg` remain.
 - **Ctrl-C returns to the prompt** with status `130` (child gets SIGINT, shell
   survives) ✅ landed.
-- Hand the terminal to full-screen programs (`vim`) and get it back cleanly.
+- Hand the terminal to full-screen programs (`vim`) and get it back cleanly ✅
+  landed, including restoration of the shell's saved terminal modes.
 
 **Acceptance:** `ls | grep foo > out.txt` works; `Ctrl-Z` a `vim`, `bg`/`fg` it,
 run a pipeline alongside.

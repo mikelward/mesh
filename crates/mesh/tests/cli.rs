@@ -592,6 +592,140 @@ fn child_reads_remaining_stdin() {
 }
 
 #[test]
+fn background_interactive_startup_stops_until_foregrounded() {
+    // Run the PTY choreography in an isolated session so this test cannot
+    // change the test runner's controlling terminal or process group.
+    let harness = unsafe { libc::fork() };
+    assert!(
+        harness >= 0,
+        "fork failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if harness == 0 {
+        unsafe { libc::_exit(background_startup_harness()) };
+    }
+
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+fn background_startup_harness() -> i32 {
+    use std::ffi::CString;
+    use std::os::fd::RawFd;
+
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } != 0
+        || unsafe { libc::setsid() } < 0
+        || unsafe { libc::ioctl(slave, libc::TIOCSCTTY, 0) } < 0
+    {
+        return 10;
+    }
+    // Closing the last PTY descriptor can hang up this isolated session while
+    // the harness is reporting success; that is unrelated to mesh's behavior.
+    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    let harness_group = unsafe { libc::getpgrp() };
+    if unsafe { libc::tcsetpgrp(slave, harness_group) } < 0 {
+        return 11;
+    }
+
+    let mesh = unsafe { libc::fork() };
+    if mesh < 0 {
+        return 12;
+    }
+    if mesh == 0 {
+        unsafe {
+            libc::setpgid(0, 0);
+            libc::dup2(slave, libc::STDIN_FILENO);
+            libc::dup2(slave, libc::STDOUT_FILENO);
+            libc::dup2(slave, libc::STDERR_FILENO);
+            libc::close(master);
+            libc::close(slave);
+        }
+        let path = CString::new(env!("CARGO_BIN_EXE_mesh")).unwrap();
+        let arg0 = CString::new("mesh").unwrap();
+        unsafe {
+            libc::execl(
+                path.as_ptr(),
+                arg0.as_ptr(),
+                std::ptr::null::<libc::c_char>(),
+            );
+            libc::_exit(127);
+        }
+    }
+    unsafe { libc::close(slave) };
+
+    let mut status = 0;
+    if unsafe { libc::waitpid(mesh, &mut status, libc::WUNTRACED) } != mesh
+        || !libc::WIFSTOPPED(status)
+        || libc::WSTOPSIG(status) != libc::SIGTTIN
+    {
+        return 13;
+    }
+    if unsafe { libc::tcsetpgrp(master, mesh) } < 0
+        || unsafe { libc::kill(mesh, libc::SIGCONT) } < 0
+    {
+        return 14;
+    }
+    // Wait until reedline has initialized (which may flush pending input).
+    if !pty_wait_for_prompt(master) {
+        return 17;
+    }
+    if unsafe { libc::write(master, b"\x04".as_ptr().cast(), 1) } != 1 {
+        return 14;
+    }
+    if unsafe { libc::waitpid(mesh, &mut status, 0) } != mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 15;
+    }
+    unsafe { libc::close(master) };
+    0
+}
+
+/// Act as the small piece of terminal-emulator behavior reedline needs while
+/// waiting for its prompt.
+fn pty_wait_for_prompt(master: std::os::fd::RawFd) -> bool {
+    let mut ready = libc::pollfd {
+        fd: master,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut prompt = Vec::new();
+    for _ in 0..8 {
+        if unsafe { libc::poll(&mut ready, 1, 2_000) } <= 0 {
+            return false;
+        }
+        let mut chunk = [0_u8; 256];
+        let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if count <= 0 {
+            return false;
+        }
+        prompt.extend_from_slice(&chunk[..count as usize]);
+        if prompt.windows(4).any(|part| part == b"\x1b[6n") {
+            unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
+        }
+        if prompt.windows(5).any(|part| part == b"mesh$") {
+            break;
+        }
+    }
+    prompt.windows(5).any(|part| part == b"mesh$")
+}
+
+#[test]
 fn a_pipe_connects_two_commands() {
     let out = run_with_input("printf 'a\\nb\\nc\\n' | grep b\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "b\n");
