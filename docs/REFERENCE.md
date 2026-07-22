@@ -155,7 +155,8 @@ is literal text, so `$host:$port` is not mistaken for a modifier chain.
 | `:stem` | string or list | Basename without the last extension. |
 | `:bare` | string or list | Basename without any extensions. |
 | `:upper` / `:lower` | string or list | Change case; maps over list elements. |
-| `:len` | string, list, or map | Character, element, or entry count as a decimal string. |
+| `:int` | string | Parse an integer, failing loudly on invalid input. |
+| `:len` | string, list, or map | Character, element, or entry count as an integer. |
 | `:first` / `:last` | list | First or last element; an empty list is an error. |
 | `:rest` / `:init` | list | All but the first or last element; empty and one-element lists yield `[]` where appropriate. |
 | `:dedup` | list | Remove later duplicates, preserving first occurrence order. |
@@ -166,6 +167,14 @@ Path and case modifiers map over lists. Collection modifiers consume a list or
 map as a whole. List results retain their type: use `...$xs:rest` in command position,
 or bind them directly with `ys = $xs:rest`. Modifier arguments—including
 `:join(SEP)`, `:split(SEP)`, and `:get(KEY, DEFAULT)`—are not implemented yet.
+
+Bare decimal literals and `true` / `false` produce typed integer and boolean
+values. Arithmetic requires integers, comparisons return booleans, and strings
+are never implicitly parsed as numbers. Integers and booleans have canonical
+command/interpolation renderings (`42`, `true`, and `false`). Lists and maps keep
+requiring an explicit spread, access, or modifier at the byte-oriented command
+boundary. A whole typed value, including a list or map, passes unchanged as one
+positional argument to an in-shell function.
 
 ## Conditionals
 

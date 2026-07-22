@@ -1,11 +1,11 @@
 //! The variable store.
 //!
-//! A session-global scope of string and list variables, plus a stack of
+//! A session-global scope of typed scalar and collection variables, plus a stack of
 //! **function-local** scopes pushed for the duration of a `func` call. Reads
 //! resolve the innermost local scope, then the global scope — a callee never
 //! sees its caller's locals (lexical, not dynamic). Writes land in the innermost
-//! scope (a function-local when one is active, else the global). Maps, `export`,
-//! and the `$sh.*` surface are deferred to later tasks — see `DESIGN.md`
+//! scope (a function-local when one is active, else the global). `export` and
+//! the `$sh.*` surface are deferred to later tasks — see `DESIGN.md`
 //! §"Variables and assignment".
 
 use std::collections::HashMap;
@@ -13,6 +13,8 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     String(String),
+    Integer(i64),
+    Boolean(bool),
     List(Vec<Value>),
     Map(Vec<(String, Value)>),
 }
@@ -106,6 +108,11 @@ impl Vars {
         let current = self.active_mut().get_mut(name).expect("seeded above");
         match (current, value) {
             (Value::String(left), Value::String(right)) => left.push_str(&right),
+            (Value::Integer(left), Value::Integer(right)) => {
+                *left = left
+                    .checked_add(right)
+                    .ok_or_else(|| format!("{name}: numeric overflow"))?;
+            }
             (Value::List(left), Value::List(mut right)) => left.append(&mut right),
             (Value::List(left), right) => left.push(right),
             (Value::Map(left), Value::Map(right)) => {
@@ -120,6 +127,13 @@ impl Vars {
             (Value::String(_), Value::List(_) | Value::Map(_)) => {
                 return Err(format!("{name}: cannot append a list to a string"));
             }
+            (Value::String(_), _) => {
+                return Err(format!("{name}: can only append a string to a string"));
+            }
+            (Value::Integer(_), _) => {
+                return Err(format!("{name}: can only add an integer to an integer"));
+            }
+            (Value::Boolean(_), _) => return Err(format!("{name}: cannot append to a boolean")),
             (Value::Map(_), _) => return Err(format!("{name}: can only merge a map into a map")),
         }
         Ok(())

@@ -249,7 +249,7 @@ fn run_executable(
                         .map(|v| eval_expr(v, last, in_function, shell))
                         .transpose();
                     match code {
-                        Ok(Some(Value::String(s))) => make_return(&[s], last),
+                        Ok(Some(Value::Integer(code))) => Step::Return(code.rem_euclid(256) as u8),
                         Ok(None) => Step::Return(last),
                         Ok(Some(_)) => {
                             eprintln!("mesh: return: numeric argument required");
@@ -575,8 +575,13 @@ fn eval_expr(
             for item in items {
                 match item {
                     MapItem::Pair(key, value) => {
-                        let Value::String(key) = eval_expr(key, last, in_function, shell)? else {
-                            return runtime_error("map key must be a string");
+                        let key = match eval_expr(key, last, in_function, shell)? {
+                            Value::String(key) => key,
+                            // Numeric-looking and boolean barewords in key position
+                            // are key bytes, not typed map keys.
+                            Value::Integer(key) => key.to_string(),
+                            Value::Boolean(key) => key.to_string(),
+                            _ => return runtime_error("map key must be a string"),
                         };
                         let value = eval_expr(value, last, in_function, shell)?;
                         if let Some((_, old)) = out.iter_mut().find(|(old, _)| old == &key) {
@@ -617,7 +622,7 @@ fn eval_expr(
             expression,
         } => number(&eval_expr(expression, last, in_function, shell)?)
             .and_then(|n| n.checked_neg().ok_or_else(|| "numeric overflow".into()))
-            .map(|n| Value::String(n.to_string()))
+            .map(Value::Integer)
             .map_err(|m| {
                 eprintln!("mesh: {m}");
                 Step::Continue(1)
@@ -677,7 +682,9 @@ fn eval_expr(
                     Value::List(values) => Ok(Value::List(
                         expand::slice(&values, bound(start)?, bound(end)?, *inclusive).to_vec(),
                     )),
-                    Value::String(_) => runtime_error("cannot index a string value"),
+                    Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
+                        runtime_error("cannot slice a scalar value")
+                    }
                     Value::Map(_) => runtime_error("cannot slice a map value"),
                 };
             }
@@ -699,10 +706,15 @@ fn eval_expr(
                             Step::Continue(1)
                         })
                 }
-                Value::String(_) => runtime_error("cannot index a string value"),
+                Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
+                    runtime_error("cannot index a scalar value")
+                }
                 Value::Map(entries) => {
-                    let Value::String(key) = index_value else {
-                        return runtime_error("map key must be a string");
+                    let key = match index_value {
+                        Value::String(key) => key,
+                        Value::Integer(key) => key.to_string(),
+                        Value::Boolean(key) => key.to_string(),
+                        _ => return runtime_error("map key must be a string"),
                     };
                     map_lookup(&entries, &key)
                 }
@@ -732,7 +744,7 @@ fn eval_expr(
             body,
         } => eval_for_expr(binding, iterable, body, last, in_function, shell),
         E::BackgroundJob(pipeline) => match run_ast_pipeline(pipeline, true, last, shell) {
-            Step::Continue(code) => Ok(Value::String(code.to_string())),
+            Step::Continue(code) => Ok(Value::Integer(i64::from(code))),
             step => Err(step),
         },
         E::Capture(source) => capture_source(source, last, in_function, shell),
@@ -913,6 +925,8 @@ fn eval_body(
 fn truthy(value: &Value) -> bool {
     match value {
         Value::String(s) => !s.is_empty() && s != "false" && s != "0",
+        Value::Integer(value) => *value == 0,
+        Value::Boolean(value) => *value,
         Value::List(v) => !v.is_empty(),
         Value::Map(v) => !v.is_empty(),
     }
@@ -926,12 +940,12 @@ fn map_lookup(entries: &[(String, Value)], key: &str) -> Result<Value, Step> {
         .ok_or_else(|| runtime_message(format!("map key `{key}` not found")))
 }
 fn bool_value(value: bool) -> Value {
-    Value::String(value.to_string())
+    Value::Boolean(value)
 }
 fn number(value: &Value) -> Result<i64, String> {
     match value {
-        Value::String(s) => s.parse().map_err(|_| format!("{s}: expected number")),
-        _ => Err("expected number".into()),
+        Value::Integer(value) => Ok(*value),
+        _ => Err("expected integer".into()),
     }
 }
 fn checked_div(left: i64, right: i64) -> Result<i64, String> {
@@ -946,41 +960,44 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
     Ok(match op {
         Equal => bool_value(left == right),
         NotEqual => bool_value(left != right),
-        Add => Value::String(
+        Add => Value::Integer(
             number(&left)?
                 .checked_add(number(&right)?)
-                .ok_or("numeric overflow")?
-                .to_string(),
+                .ok_or("numeric overflow")?,
         ),
-        Subtract => Value::String(
+        Subtract => Value::Integer(
             number(&left)?
                 .checked_sub(number(&right)?)
-                .ok_or("numeric overflow")?
-                .to_string(),
+                .ok_or("numeric overflow")?,
         ),
-        Multiply => Value::String(
+        Multiply => Value::Integer(
             number(&left)?
                 .checked_mul(number(&right)?)
-                .ok_or("numeric overflow")?
-                .to_string(),
+                .ok_or("numeric overflow")?,
         ),
-        Divide => Value::String(checked_div(number(&left)?, number(&right)?)?.to_string()),
+        Divide => Value::Integer(checked_div(number(&left)?, number(&right)?)?),
         Remainder => {
             let left = number(&left)?;
             let right = number(&right)?;
             if right == 0 {
                 return Err("division by zero".into());
             }
-            Value::String(
-                left.checked_rem(right)
-                    .ok_or("numeric overflow")?
-                    .to_string(),
-            )
+            Value::Integer(left.checked_rem(right).ok_or("numeric overflow")?)
         }
-        Less => bool_value(number(&left)? < number(&right)?),
-        LessEqual => bool_value(number(&left)? <= number(&right)?),
-        Greater => bool_value(number(&left)? > number(&right)?),
-        GreaterEqual => bool_value(number(&left)? >= number(&right)?),
+        Less | LessEqual | Greater | GreaterEqual => {
+            let ordering = match (&left, &right) {
+                (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
+                (Value::String(left), Value::String(right)) => left.cmp(right),
+                _ => return Err("comparison requires two integers or two strings".into()),
+            };
+            bool_value(match op {
+                Less => ordering.is_lt(),
+                LessEqual => !ordering.is_gt(),
+                Greater => ordering.is_gt(),
+                GreaterEqual => !ordering.is_lt(),
+                _ => unreachable!(),
+            })
+        }
         And => bool_value(truthy(&left) && truthy(&right)),
         Or => bool_value(truthy(&left) || truthy(&right)),
         In => match right {
@@ -995,6 +1012,9 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
                 Value::String(needle) => bool_value(text.contains(&needle)),
                 _ => return Err("left operand of `in` must be a string".into()),
             },
+            Value::Integer(_) | Value::Boolean(_) => {
+                return Err("right operand of `in` must be a collection or string".into());
+            }
         },
         Match | NotMatch => {
             return Err(format!(
@@ -1628,7 +1648,7 @@ mod tests {
     fn unspaced_assignment() {
         let mut shell = Shell::new();
         assert_eq!(run_line("n=42", 0, false, &mut shell), Step::Continue(0));
-        assert_eq!(shell.vars.get("n"), Some(&Value::String("42".to_string())));
+        assert_eq!(shell.vars.get("n"), Some(&Value::Integer(42)));
     }
 
     #[test]
@@ -1656,13 +1676,13 @@ mod tests {
         };
 
         assert_eq!(run_source(&source, 0, false, &mut shell), Step::Continue(0));
-        assert_eq!(shell.vars.get("answer"), Some(&Value::String("42".into())));
+        assert_eq!(shell.vars.get("answer"), Some(&Value::Integer(42)));
         assert_eq!(
             shell.vars.get("values"),
             Some(&Value::List(vec![
-                Value::String("2".into()),
-                Value::String("3".into()),
-                Value::String("4".into()),
+                Value::Integer(2),
+                Value::Integer(3),
+                Value::Integer(4),
             ]))
         );
     }
@@ -1695,7 +1715,11 @@ mod tests {
             ("member = 2 in [1 2]", "member", "true"),
         ] {
             assert_eq!(run_line(source, 0, false, &mut shell), Step::Continue(0));
-            assert_eq!(shell.vars.get(name), Some(&Value::String(expected.into())));
+            let expected = match expected {
+                "true" => Value::Boolean(true),
+                value => Value::Integer(value.parse().unwrap()),
+            };
+            assert_eq!(shell.vars.get(name), Some(&expected));
         }
     }
 
@@ -1729,17 +1753,17 @@ mod tests {
     fn checked_division_distinguishes_zero_from_overflow() {
         assert_eq!(
             eval_binary(
-                Value::String(i64::MIN.to_string()),
+                Value::Integer(i64::MIN),
                 parser::BinaryOp::Divide,
-                Value::String("-1".into()),
+                Value::Integer(-1),
             ),
             Err("numeric overflow".into())
         );
         assert_eq!(
             eval_binary(
-                Value::String("1".into()),
+                Value::Integer(1),
                 parser::BinaryOp::Divide,
-                Value::String("0".into()),
+                Value::Integer(0),
             ),
             Err("division by zero".into())
         );

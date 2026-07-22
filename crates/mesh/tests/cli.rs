@@ -1927,6 +1927,47 @@ fn a_list_slice_reaches_a_function_as_a_list() {
 }
 
 #[test]
+fn a_bare_map_reaches_an_in_shell_function_intact() {
+    let out = run_with_input("func show(x) { puts $x.a }\nm = [a: ok]\nshow $m\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn integer_and_boolean_values_remain_typed() {
+    let out = run_with_input(
+        "n = 40 + 2\n\
+         found = $n == 42\n\
+         n += 1\n\
+         puts $n $found\n\
+         puts \"$n:$found\"\n\
+         text = \"42\"\n\
+         parsed = $text:int + 1\n\
+         puts $parsed\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "43 true\n43:true\n43\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn arithmetic_does_not_coerce_strings() {
+    let out = run_with_input("n = \"1\" + 2\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("expected integer"));
+}
+
+#[test]
 fn a_bare_list_to_an_external_command_is_still_an_error() {
     // The external-argv rule is unchanged: a bare list must be spread or joined.
     let out = run_with_input("xs = [a b]\necho $xs\n");
@@ -2038,7 +2079,7 @@ fn tilde_expansion_ignores_adjacent_empty_quotes() {
 
 #[test]
 fn captures_command_output_as_an_expression_value() {
-    let out = run_with_input("answer = $(printf 20) + 22\nputs $answer\n");
+    let out = run_with_input("answer = $(printf 20):int + 22\nputs $answer\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
     assert!(
         out.status.success(),

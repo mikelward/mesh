@@ -113,7 +113,7 @@ file as tasks land.
 - [x] Ordered, string-keyed maps: literals (including `[:]`), duplicate-key
       replacement, map spread, strict dot/bracket access, `+=` merge, and
       `:keys` / `:values` / `:len` collection modifiers.
-- [ ] Remaining scalar types.
+- [x] Remaining scalar types (integers and booleans).
 - [x] Initial argument-free `:` modifiers: path/string transforms and list
       collection operations, including typed list results and chaining.
 - [x] `func` — user-defined functions: `func name(params) { body }` with required

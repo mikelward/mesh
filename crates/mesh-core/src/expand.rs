@@ -41,6 +41,7 @@ pub enum Modifier {
     Values,
     Upper,
     Lower,
+    Int,
 }
 
 impl Modifier {
@@ -62,6 +63,7 @@ impl Modifier {
             "values" => Self::Values,
             "upper" => Self::Upper,
             "lower" => Self::Lower,
+            "int" => Self::Int,
             _ => return None,
         })
     }
@@ -130,19 +132,19 @@ pub fn expand(words: Vec<Word>, vars: &Vars) -> Result<Vec<String>, ExpandError>
 }
 
 /// Expand words into typed argument values for an **in-shell function call**,
-/// preserving list values rather than applying the external-argv rule
-/// (`DESIGN.md` §"Arguments do not word-split": a bare list arrives at an in-shell
-/// function as one value). `...$xs` spreads into one value per element; a bare,
-/// unquoted `$name` (or `$name[slice]`) holding a list arrives as a single
-/// `Value::List`; every other word yields `Value::String` argument(s) via ordinary
-/// expansion (so a glob still expands to its matches, an index to one element).
+/// preserving typed values rather than applying the external-argv rule.
+/// `...$xs` spreads into one value per element; an otherwise whole bare variable
+/// reference arrives as one value. Bare integer and boolean literals are typed;
+/// every other word yields string argument(s) via ordinary expansion.
 pub fn expand_values(words: Vec<Word>, vars: &Vars) -> Result<Vec<Value>, ExpandError> {
     let mut out = Vec::new();
     for word in words {
         if let Some(vref) = spread_var(&word) {
             out.extend(spread_values(vref, vars)?);
-        } else if let Some(list) = whole_list_value(&word, vars) {
-            out.push(Value::List(list));
+        } else if let Some(value) = whole_value(&word, vars) {
+            out.push(value?);
+        } else if let Some(value) = scalar_literal(&word) {
+            out.push(value);
         } else {
             let mut strings = Vec::new();
             expand_word(word, vars, &mut strings)?;
@@ -162,6 +164,10 @@ fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> 
         Value::Map(_) => Err(ExpandError::Unsupported(
             "a map cannot be spread here".into(),
         )),
+        Value::Integer(_) | Value::Boolean(_) => Err(ExpandError::Unsupported(format!(
+            "...${}: value is not a list",
+            vref.name
+        ))),
     }
 }
 
@@ -178,6 +184,10 @@ fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError
         Value::Map(_) => Err(ExpandError::Unsupported(
             "a map cannot be spread into argv".into(),
         )),
+        Value::Integer(_) | Value::Boolean(_) => Err(ExpandError::Unsupported(format!(
+            "...${}: value is not a list",
+            vref.name
+        ))),
     }
 }
 
@@ -186,6 +196,8 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
         .into_iter()
         .map(|value| match value {
             Value::String(value) => Ok(value),
+            Value::Integer(value) => Ok(value.to_string()),
+            Value::Boolean(value) => Ok(value.to_string()),
             Value::List(_) => Err(ExpandError::Unsupported(format!(
                 "...${name}: nested list element cannot be a command argument"
             ))),
@@ -196,20 +208,31 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
         .collect()
 }
 
-/// If `word` is exactly a bare, unquoted variable reference that resolves to a
-/// list, return that list (to bind as one typed function argument). A string, a
-/// member access, a quoted reference, or an unbound name returns `None`, so
-/// ordinary expansion handles it (and reports any error).
-fn whole_list_value(word: &Word, vars: &Vars) -> Option<Vec<Value>> {
+/// Preserve a whole bare variable reference at an in-shell value boundary.
+fn whole_value(word: &Word, vars: &Vars) -> Option<Result<Value, ExpandError>> {
     let [Piece::Var(vref)] = word.0.as_slice() else {
         return None;
     };
     if vref.quoted {
         return None;
     }
-    match resolve_value(vref, vars) {
-        Ok(Value::List(values)) => Some(values),
-        _ => None,
+    Some(resolve_value(vref, vars))
+}
+
+fn scalar_literal(word: &Word) -> Option<Value> {
+    let [
+        Piece::Text {
+            text,
+            expandable: true,
+        },
+    ] = word.0.as_slice()
+    else {
+        return None;
+    };
+    match text.as_str() {
+        "true" => Some(Value::Boolean(true)),
+        "false" => Some(Value::Boolean(false)),
+        _ => text.parse().ok().map(Value::Integer),
     }
 }
 
@@ -320,6 +343,8 @@ fn glob_pattern(pieces: &Pieces) -> String {
 fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
     match resolve_value(vref, vars)? {
         Value::String(value) => Ok(value),
+        Value::Integer(value) => Ok(value.to_string()),
+        Value::Boolean(value) => Ok(value.to_string()),
         Value::List(_) | Value::Map(_) => Err(ExpandError::ListNeedsSpread(vref.name.clone())),
     }
 }
@@ -362,7 +387,9 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                             })?
                     }
                     Value::Map(_) => map_value_access(value, &key, &vref.name)?,
-                    Value::String(_) => return Err(ExpandError::NotAList(vref.name.clone())),
+                    Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
+                        return Err(ExpandError::NotAList(vref.name.clone()));
+                    }
                 }
             }
             Access::Slice {
@@ -448,9 +475,13 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
     let name = modifier_name(modifier);
     match modifier {
         Len => match value {
-            Value::String(value) => Ok(Value::String(value.chars().count().to_string())),
-            Value::List(values) => Ok(Value::String(values.len().to_string())),
-            Value::Map(values) => Ok(Value::String(values.len().to_string())),
+            Value::String(value) => Ok(Value::Integer(value.chars().count() as i64)),
+            Value::List(values) => Ok(Value::Integer(values.len() as i64)),
+            Value::Map(values) => Ok(Value::Integer(values.len() as i64)),
+            Value::Integer(_) | Value::Boolean(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a string or collection".into(),
+            }),
         },
         Keys => match value {
             Value::Map(values) => Ok(Value::List(
@@ -478,10 +509,12 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                     name: name.into(),
                     message: "empty list has no element".into(),
                 }),
-            Value::String(_) => Err(ExpandError::Modifier {
-                name: name.into(),
-                message: "requires a list".into(),
-            }),
+            Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
+                Err(ExpandError::Modifier {
+                    name: name.into(),
+                    message: "requires a list".into(),
+                })
+            }
             Value::Map(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
@@ -496,10 +529,12 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 };
                 Ok(Value::List(values[range].to_vec()))
             }
-            Value::String(_) => Err(ExpandError::Modifier {
-                name: name.into(),
-                message: "requires a list".into(),
-            }),
+            Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
+                Err(ExpandError::Modifier {
+                    name: name.into(),
+                    message: "requires a list".into(),
+                })
+            }
             Value::Map(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
@@ -515,13 +550,30 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                         .collect(),
                 ))
             }
-            Value::String(_) => Err(ExpandError::Modifier {
-                name: name.into(),
-                message: "requires a list".into(),
-            }),
+            Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
+                Err(ExpandError::Modifier {
+                    name: name.into(),
+                    message: "requires a list".into(),
+                })
+            }
             Value::Map(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
+            }),
+        },
+        Modifier::Int => match value {
+            Value::String(value) => {
+                value
+                    .parse()
+                    .map(Value::Integer)
+                    .map_err(|_| ExpandError::Modifier {
+                        name: name.into(),
+                        message: format!("cannot parse `{value}` as an integer"),
+                    })
+            }
+            _ => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a string".into(),
             }),
         },
         _ => match value {
@@ -534,6 +586,10 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             Value::Map(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "cannot map over a map".into(),
+            }),
+            Value::Integer(_) | Value::Boolean(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a string".into(),
             }),
         },
     }
@@ -557,6 +613,7 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::Values => "values",
         Modifier::Upper => "upper",
         Modifier::Lower => "lower",
+        Modifier::Int => "int",
     }
 }
 
@@ -588,7 +645,15 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         Modifier::Bare => bare_name(path.file_name().and_then(|p| p.to_str())).to_string(),
         Modifier::Upper => value.to_uppercase(),
         Modifier::Lower => value.to_lowercase(),
-        _ => unreachable!("collection modifier handled separately"),
+        Modifier::Int
+        | Modifier::Len
+        | Modifier::First
+        | Modifier::Last
+        | Modifier::Rest
+        | Modifier::Init
+        | Modifier::Dedup
+        | Modifier::Keys
+        | Modifier::Values => unreachable!("non-string modifier handled separately"),
     }
 }
 
