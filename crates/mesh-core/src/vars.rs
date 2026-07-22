@@ -54,6 +54,21 @@ impl Vars {
         }
     }
 
+    pub(crate) fn active_snapshot(&self) -> Scope {
+        self.locals
+            .last()
+            .cloned()
+            .unwrap_or_else(|| self.global.clone())
+    }
+
+    pub(crate) fn restore_active(&mut self, snapshot: Scope) {
+        if let Some(scope) = self.locals.last_mut() {
+            *scope = snapshot;
+        } else {
+            self.global = snapshot;
+        }
+    }
+
     /// Does the active scope already hold `name`? (Only the innermost local when
     /// one is active, else the global — never an outer scope.)
     fn active_has(&self, name: &str) -> bool {

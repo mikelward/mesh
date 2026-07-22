@@ -171,33 +171,29 @@ fn run_executable(
     match node {
         Pipeline(pipeline) => run_ast_pipeline(pipeline, background, last, shell),
         Assignment {
-            name,
+            pattern,
             append,
             value,
-        } => {
-            if name == "env" {
-                eprintln!("mesh: env: cannot assign to the reserved name");
-                return Step::Continue(1);
-            }
-            match eval_expr(value, last, in_function, shell) {
-                Ok(value) => {
-                    let result = if *append {
-                        shell.vars.append(name, value)
-                    } else {
-                        shell.vars.set_value(name, value);
-                        Ok(())
+        } => match eval_expr(value, last, in_function, shell) {
+            Ok(value) => {
+                let result = if *append {
+                    let parser::BindingPattern::Name(name) = pattern else {
+                        unreachable!("the parser restricts += to names")
                     };
-                    result.map_or_else(
-                        |error| {
-                            eprintln!("mesh: {error}");
-                            Step::Continue(1)
-                        },
-                        |_| Step::Continue(0),
-                    )
-                }
-                Err(step) => step,
+                    shell.vars.append(name, value)
+                } else {
+                    bind_pattern(pattern, &value, &mut shell.vars)
+                };
+                result.map_or_else(
+                    |error| {
+                        eprintln!("mesh: {error}");
+                        Step::Continue(1)
+                    },
+                    |_| Step::Continue(0),
+                )
             }
-        }
+            Err(step) => step,
+        },
         Function {
             name,
             parameters,
@@ -227,6 +223,7 @@ fn run_executable(
             Step::Continue(0)
         }
         If(expression) => run_ast_if(expression, last, in_function, shell),
+        Match(expression) => run_ast_match(expression, last, in_function, shell),
         For {
             bindings,
             iterable,
@@ -339,12 +336,57 @@ fn run_ast_if(node: &parser::IfExpr, last: u8, in_function: bool, shell: &mut Sh
     }
 }
 
+fn run_ast_match(node: &parser::MatchExpr, last: u8, in_function: bool, shell: &mut Shell) -> Step {
+    let subject = match eval_expr(&node.value, last, in_function, shell) {
+        Ok(value) => value,
+        Err(step) => return step,
+    };
+    for arm in &node.arms {
+        let bindings = match match_bindings(&arm.pattern, &subject, last, in_function, shell) {
+            Ok(Some(bindings)) => bindings,
+            Ok(None) => continue,
+            Err(step) => return step,
+        };
+        let snapshot = shell.vars.active_snapshot();
+        commit_bindings(bindings, &mut shell.vars);
+        if let Some(guard) = &arm.guard {
+            match eval_expr(guard, last, in_function, shell) {
+                Ok(value) if truthy(&value) => {}
+                Ok(_) => {
+                    shell.vars.restore_active(snapshot);
+                    continue;
+                }
+                Err(step) => return step,
+            }
+        }
+        return run_source(&arm.body, 0, in_function, shell);
+    }
+    Step::Continue(0)
+}
+
 fn condition_status(
     condition: &parser::Executable,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<u8, Step> {
+    if let parser::Executable::Assignment {
+        pattern,
+        append: false,
+        value,
+    } = condition
+        && matches!(pattern, parser::BindingPattern::List(_))
+    {
+        let value = eval_expr(value, last, in_function, shell)?;
+        return match pattern_bindings(pattern, &value) {
+            Ok(Some(bindings)) => {
+                commit_bindings(bindings, &mut shell.vars);
+                Ok(0)
+            }
+            Ok(None) => Ok(1),
+            Err(message) => Err(runtime_message(message)),
+        };
+    }
     if let parser::Executable::Expression {
         expression,
         guard: None,
@@ -360,19 +402,15 @@ fn condition_status(
 }
 
 fn run_ast_for(
-    bindings: &[String],
+    bindings: &[parser::BindingPattern],
     iterable: &parser::Expr,
     body: &parser::Source,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
 ) -> Step {
-    if bindings.len() == 2 && bindings[0] == bindings[1] {
-        eprintln!("mesh: for: duplicate binding `{}`", bindings[0]);
-        return Step::Continue(2);
-    }
-    if bindings.iter().any(|binding| binding == "env") {
-        eprintln!("mesh: for: `env` is a reserved name and cannot be a binding");
+    if let Err(message) = validate_patterns(bindings) {
+        eprintln!("mesh: for: {message}");
         return Step::Continue(2);
     }
     let value = match eval_expr(iterable, last, in_function, shell) {
@@ -386,7 +424,10 @@ fn run_ast_for(
     let mut status = 0;
     shell.loop_depth += 1;
     for values in values {
-        bind_iteration(bindings, values, shell);
+        if let Err(message) = bind_iteration(bindings, values, shell) {
+            shell.loop_depth -= 1;
+            return runtime_message(message);
+        }
         match run_source(body, 0, in_function, shell) {
             Step::Continue(code) => status = code,
             flow => {
@@ -419,9 +460,121 @@ fn iteration_values(value: Value, binding_count: usize) -> Result<Vec<Vec<Value>
     }
 }
 
-fn bind_iteration(bindings: &[String], values: Vec<Value>, shell: &mut Shell) {
-    for (binding, value) in bindings.iter().zip(values) {
-        shell.vars.set_value(binding, value);
+fn bind_iteration(
+    bindings: &[parser::BindingPattern],
+    values: Vec<Value>,
+    shell: &mut Shell,
+) -> Result<(), String> {
+    let mut pending = Vec::new();
+    for (pattern, value) in bindings.iter().zip(&values) {
+        let Some(mut found) = pattern_bindings(pattern, value)? else {
+            return Err("loop value does not match its binding pattern".into());
+        };
+        pending.append(&mut found);
+    }
+    validate_bindings(&pending)?;
+    commit_bindings(pending, &mut shell.vars);
+    Ok(())
+}
+
+fn bind_pattern(
+    pattern: &parser::BindingPattern,
+    value: &Value,
+    vars: &mut Vars,
+) -> Result<(), String> {
+    let bindings = pattern_bindings(pattern, value)?
+        .ok_or_else(|| "value does not match binding pattern".to_string())?;
+    validate_bindings(&bindings)?;
+    commit_bindings(bindings, vars);
+    Ok(())
+}
+
+fn validate_patterns(patterns: &[parser::BindingPattern]) -> Result<(), String> {
+    fn names(pattern: &parser::BindingPattern, out: &mut Vec<(String, Value)>) {
+        match pattern {
+            parser::BindingPattern::Name(name) | parser::BindingPattern::Rest(name) => {
+                out.push((name.clone(), Value::String(String::new())));
+            }
+            parser::BindingPattern::List(patterns) => {
+                for pattern in patterns {
+                    names(pattern, out);
+                }
+            }
+            parser::BindingPattern::Ignore => {}
+        }
+    }
+    let mut bindings = Vec::new();
+    for pattern in patterns {
+        names(pattern, &mut bindings);
+    }
+    validate_bindings(&bindings)
+}
+
+fn pattern_bindings(
+    pattern: &parser::BindingPattern,
+    value: &Value,
+) -> Result<Option<Vec<(String, Value)>>, String> {
+    use parser::BindingPattern::*;
+    match pattern {
+        Name(name) => Ok(Some(vec![(name.clone(), value.clone())])),
+        Ignore => Ok(Some(Vec::new())),
+        Rest(_) => Err("`...rest` is only valid inside a list pattern".into()),
+        List(patterns) => {
+            let Value::List(values) = value else {
+                return Ok(None);
+            };
+            let rest = patterns
+                .iter()
+                .position(|pattern| matches!(pattern, Rest(_)));
+            let fixed = patterns.len() - usize::from(rest.is_some());
+            if rest.map_or(values.len() != fixed, |_| values.len() < fixed) {
+                return Ok(None);
+            }
+            let mut bindings = Vec::new();
+            for (index, pattern) in patterns.iter().enumerate() {
+                match pattern {
+                    Rest(name) => {
+                        let tail_fixed = patterns.len() - index - 1;
+                        bindings.push((
+                            name.clone(),
+                            Value::List(values[index..values.len() - tail_fixed].to_vec()),
+                        ));
+                    }
+                    _ => {
+                        let value_index = if rest.is_some_and(|rest| index > rest) {
+                            values.len() - (patterns.len() - index)
+                        } else {
+                            index
+                        };
+                        let Some(mut found) = pattern_bindings(pattern, &values[value_index])?
+                        else {
+                            return Ok(None);
+                        };
+                        bindings.append(&mut found);
+                    }
+                }
+            }
+            validate_bindings(&bindings)?;
+            Ok(Some(bindings))
+        }
+    }
+}
+
+fn validate_bindings(bindings: &[(String, Value)]) -> Result<(), String> {
+    for (index, (name, _)) in bindings.iter().enumerate() {
+        if name == "env" {
+            return Err("`env` is a reserved name and cannot be a binding".into());
+        }
+        if bindings[..index].iter().any(|(old, _)| old == name) {
+            return Err(format!("duplicate binding `{name}`"));
+        }
+    }
+    Ok(())
+}
+
+fn commit_bindings(bindings: Vec<(String, Value)>, vars: &mut Vars) {
+    for (name, value) in bindings {
+        vars.set_value(&name, value);
     }
 }
 
@@ -762,6 +915,7 @@ fn eval_expr(
                 .map_err(|error| runtime_message(error.to_string()))
         }
         E::If(node) => eval_if_expr(node, last, in_function, shell),
+        E::Match(node) => eval_match_expr(node, last, in_function, shell),
         E::For {
             bindings,
             iterable,
@@ -883,6 +1037,52 @@ fn eval_if_expr(
     }
 }
 
+fn eval_match_expr(
+    node: &parser::MatchExpr,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let subject = eval_expr(&node.value, last, in_function, shell)?;
+    for arm in &node.arms {
+        let bindings = match_bindings(&arm.pattern, &subject, last, in_function, shell)?;
+        let Some(bindings) = bindings else { continue };
+        let snapshot = shell.vars.active_snapshot();
+        validate_bindings(&bindings).map_err(runtime_message)?;
+        commit_bindings(bindings, &mut shell.vars);
+        if let Some(guard) = &arm.guard
+            && !truthy(&eval_expr(guard, last, in_function, shell)?)
+        {
+            shell.vars.restore_active(snapshot);
+            continue;
+        }
+        return eval_value_body(&arm.body, 0, in_function, shell);
+    }
+    Ok(Value::String(String::new()))
+}
+
+fn match_bindings(
+    pattern: &parser::MatchPattern,
+    subject: &Value,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Option<Vec<(String, Value)>>, Step> {
+    let bindings = match pattern {
+        parser::MatchPattern::Wildcard => Some(Vec::new()),
+        parser::MatchPattern::Binding(pattern) => {
+            pattern_bindings(pattern, subject).map_err(runtime_message)?
+        }
+        parser::MatchPattern::Value(pattern) => {
+            (eval_expr(pattern, last, in_function, shell)? == *subject).then(Vec::new)
+        }
+    };
+    if let Some(bindings) = &bindings {
+        validate_bindings(bindings).map_err(runtime_message)?;
+    }
+    Ok(bindings)
+}
+
 fn eval_value_body(
     body: &parser::Source,
     last: u8,
@@ -896,6 +1096,7 @@ fn eval_value_body(
                 statement.and_or.first,
                 parser::Executable::Expression { .. }
                     | parser::Executable::If(_)
+                    | parser::Executable::Match(_)
                     | parser::Executable::For { .. }
             )
     });
@@ -907,25 +1108,23 @@ fn eval_value_body(
 }
 
 fn eval_for_expr(
-    bindings: &[String],
+    bindings: &[parser::BindingPattern],
     iterable: &parser::Expr,
     body: &parser::Source,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    if bindings.len() == 2 && bindings[0] == bindings[1] {
-        return runtime_error(format!("for: duplicate binding `{}`", bindings[0]));
-    }
-    if bindings.iter().any(|binding| binding == "env") {
-        return runtime_error("for: `env` is a reserved name and cannot be a binding");
-    }
+    validate_patterns(bindings).map_err(runtime_message)?;
     let iterable = eval_expr(iterable, last, in_function, shell)?;
     let values = iteration_values(iterable, bindings.len()).map_err(runtime_message)?;
     let mut results = Vec::new();
     shell.loop_depth += 1;
     for values in values {
-        bind_iteration(bindings, values, shell);
+        if let Err(message) = bind_iteration(bindings, values, shell) {
+            shell.loop_depth -= 1;
+            return runtime_error(message);
+        }
         let result = match eval_body(body, 0, in_function, shell) {
             Ok(value) => value,
             Err(step) => {
@@ -960,6 +1159,9 @@ fn eval_body(
                 } => return eval_expr(expression, last, in_function, shell),
                 parser::Executable::If(node) => {
                     return eval_if_expr(node, last, in_function, shell);
+                }
+                parser::Executable::Match(node) => {
+                    return eval_match_expr(node, last, in_function, shell);
                 }
                 parser::Executable::For {
                     bindings,

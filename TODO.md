@@ -125,12 +125,22 @@ file as tasks land.
       `else` / `else if`, multiline bodies, and assignment-position string/list
       results. Deferred with the general expression parser: boolean/comparison
       conditions and conditional destructuring.
-- [ ] `for` / `match`.
+- [ ] Finish `for` / `match`, in dependency order:
   - [x] First `for` slice over string lists and expanded word expressions, with
         brace-delimited multiline bodies and current-scope bindings.
   - [x] Ordered map iteration with `key, value` binders, bounded integer range
         iteration, `break`, and `continue`.
-  - [ ] General list-pattern destructuring.
+  - [x] Introduce reusable list-pattern binding for names, `_`, and `...rest`,
+        then use it for assignment, conditional binding, loops, and match arms.
+  - [ ] Implement `match` parsing and evaluation, including ordered first-match
+        arms, literal/glob/regex/range/`_` patterns, alternation, list patterns,
+        guards, statement position, and expression results.
+  - [ ] Add loop-control regression coverage for nested loops and for `break` /
+        `continue` reached through nested `if` and function calls.
+  - [ ] Audit the M3 acceptance examples in [`DESIGN.md`](DESIGN.md) and
+        [`docs/INTRO.md`](docs/INTRO.md): add end-to-end coverage for examples
+        that are in scope, inventory dependencies that remain, and update the
+        milestone documentation without silently weakening its acceptance bar.
 
 ## Decisions made
 

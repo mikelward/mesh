@@ -180,7 +180,7 @@ pub enum AndOrOp {
 pub enum Executable {
     Pipeline(Pipeline),
     Assignment {
-        name: String,
+        pattern: BindingPattern,
         append: bool,
         value: Expr,
     },
@@ -190,8 +190,9 @@ pub enum Executable {
         body: Source,
     },
     If(IfExpr),
+    Match(MatchExpr),
     For {
-        bindings: Vec<String>,
+        bindings: Vec<BindingPattern>,
         iterable: Expr,
         body: Source,
     },
@@ -204,6 +205,16 @@ pub enum Executable {
         expression: Expr,
         guard: Option<Guard>,
     },
+}
+
+/// A binding pattern shared by assignments, conditional bindings, loops, and
+/// list-shaped match arms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingPattern {
+    Name(String),
+    Ignore,
+    Rest(String),
+    List(Vec<BindingPattern>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +274,26 @@ pub enum ElseBranch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchExpr {
+    pub value: Box<Expr>,
+    pub arms: Vec<MatchArm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchArm {
+    pub pattern: MatchPattern,
+    pub guard: Option<Expr>,
+    pub body: Source,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchPattern {
+    Binding(BindingPattern),
+    Wildcard,
+    Value(Expr),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
     Scalar(Spanned<Word>),
     Variable(Spanned<String>),
@@ -303,8 +334,9 @@ pub enum Expr {
     BackgroundJob(Pipeline),
     Capture(Source),
     If(Box<IfExpr>),
+    Match(Box<MatchExpr>),
     For {
-        bindings: Vec<String>,
+        bindings: Vec<BindingPattern>,
         iterable: Box<Expr>,
         body: Source,
     },
@@ -1143,22 +1175,29 @@ impl Parser {
         if self.word("if") {
             return Ok(Executable::If(self.if_expr()?));
         }
+        if self.word("match") {
+            return Ok(Executable::Match(self.match_expr()?));
+        }
         if self.word("for") {
             return self.for_expr();
         }
         if self.word("return") || self.word("break") || self.word("continue") {
             return self.control();
         }
-        if let (Some(name), Some(op)) = (
-            self.word_text_at(0),
-            self.tokens.get(self.position + 1).map(|t| &t.value),
-        ) {
-            if matches!(op, TokenKind::Equal | TokenKind::PlusEqual) {
-                let name = name.to_owned();
-                self.position += 1;
+        let assignment_start = self.position;
+        if self.word_text_at(0).is_some() || self.same(&TokenKind::LBracket) {
+            if let Ok(pattern) = self.binding_pattern()
+                && matches!(
+                    self.peek().map(|token| &token.value),
+                    Some(TokenKind::Equal | TokenKind::PlusEqual)
+                )
+            {
                 let append = self.eat(&TokenKind::PlusEqual).is_some();
                 if !append {
                     self.expect(&TokenKind::Equal, "`=`")?;
+                }
+                if append && !matches!(pattern, BindingPattern::Name(_)) {
+                    return Err(self.error(ParseErrorKind::Expected("a name before `+=`")));
                 }
                 let value = if !append && !self.value_start() && self.amp_before_terminator() {
                     let pipeline = self.pipeline()?;
@@ -1168,11 +1207,12 @@ impl Parser {
                     self.expression()?
                 };
                 return Ok(Executable::Assignment {
-                    name,
+                    pattern,
                     append,
                     value,
                 });
             }
+            self.position = assignment_start;
         }
         if self.value_start() {
             let expression = self.expression()?;
@@ -1405,13 +1445,86 @@ impl Parser {
         })
     }
 
-    fn for_bindings(&mut self) -> Result<Vec<String>, ParseError> {
-        let first = self.name()?;
+    fn match_expr(&mut self) -> Result<MatchExpr, ParseError> {
+        self.take_word("match");
+        let value = Box::new(self.expression()?);
+        self.newlines();
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        self.newlines();
+        let mut arms = Vec::new();
+        while !self.same(&TokenKind::RBrace) {
+            let pattern = if self.same(&TokenKind::LBracket) {
+                MatchPattern::Binding(self.binding_pattern()?)
+            } else if self.word("_") {
+                self.position += 1;
+                MatchPattern::Wildcard
+            } else {
+                MatchPattern::Value(self.expression()?)
+            };
+            let guard = if self.take_word("if") {
+                Some(self.expression()?)
+            } else {
+                None
+            };
+            self.newlines();
+            let body = self.block()?;
+            arms.push(MatchArm {
+                pattern,
+                guard,
+                body,
+            });
+            self.newlines();
+            if self.at_end() {
+                return Err(self.eof(ParseErrorKind::Unterminated('{')));
+            }
+        }
+        self.position += 1;
+        Ok(MatchExpr { value, arms })
+    }
+
+    fn for_bindings(&mut self) -> Result<Vec<BindingPattern>, ParseError> {
+        let first = self.binding_pattern()?;
         let mut bindings = vec![first];
         if self.eat(&TokenKind::Comma).is_some() {
-            bindings.push(self.name()?);
+            bindings.push(self.binding_pattern()?);
         }
         Ok(bindings)
+    }
+
+    fn binding_pattern(&mut self) -> Result<BindingPattern, ParseError> {
+        if self.eat(&TokenKind::LBracket).is_some() {
+            self.newlines();
+            let mut elements = Vec::new();
+            let mut rest_seen = false;
+            while !self.same(&TokenKind::RBracket) {
+                let element = if self.eat(&TokenKind::Spread).is_some() {
+                    if rest_seen {
+                        return Err(
+                            self.error(ParseErrorKind::Expected("only one `...rest` binding"))
+                        );
+                    }
+                    rest_seen = true;
+                    BindingPattern::Rest(self.name()?)
+                } else if self.take_word("_") {
+                    BindingPattern::Ignore
+                } else {
+                    BindingPattern::Name(self.name()?)
+                };
+                elements.push(element);
+                self.eat(&TokenKind::Comma);
+                self.newlines();
+                if self.at_end() {
+                    return Err(self.eof(ParseErrorKind::Unterminated('[')));
+                }
+            }
+            self.position += 1;
+            return Ok(BindingPattern::List(elements));
+        }
+        if self.take_word("_") {
+            Ok(BindingPattern::Ignore)
+        } else {
+            Ok(BindingPattern::Name(self.name()?))
+        }
     }
 
     fn control(&mut self) -> Result<Executable, ParseError> {
@@ -1478,19 +1591,18 @@ impl Parser {
     }
 
     fn condition(&mut self) -> Result<Executable, ParseError> {
-        if self.word_text_at(0).is_some()
-            && self
-                .tokens
-                .get(self.position + 1)
-                .is_some_and(|token| matches!(token.value, TokenKind::Equal))
-        {
-            let name = self.name()?;
-            self.position += 1;
-            return Ok(Executable::Assignment {
-                name,
-                append: false,
-                value: self.expression()?,
-            });
+        let start = self.position;
+        if self.word_text_at(0).is_some() || self.same(&TokenKind::LBracket) {
+            if let Ok(pattern) = self.binding_pattern()
+                && self.eat(&TokenKind::Equal).is_some()
+            {
+                return Ok(Executable::Assignment {
+                    pattern,
+                    append: false,
+                    value: self.expression()?,
+                });
+            }
+            self.position = start;
         }
         if self.value_start() {
             return Ok(Executable::Expression {
@@ -1621,6 +1733,9 @@ impl Parser {
         }
         if self.word("if") {
             return Ok(Expr::If(Box::new(self.if_expr()?)));
+        }
+        if self.word("match") {
+            return Ok(Expr::Match(Box::new(self.match_expr()?)));
         }
         if self.word("for") {
             self.take_word("for");
@@ -2617,14 +2732,26 @@ mod tests {
     #[test]
     fn accepts_kebab_case_names_and_variables() {
         let tree = complete("last-cmd-time = $last-cmd-time\nfunc auto-fetch() { return }");
-        let Executable::Assignment { name, value, .. } = &tree.statements[0].and_or.first else {
+        let Executable::Assignment { pattern, value, .. } = &tree.statements[0].and_or.first else {
             panic!()
         };
-        assert_eq!(name, "last-cmd-time");
+        assert_eq!(pattern, &BindingPattern::Name("last-cmd-time".into()));
         assert!(matches!(value, Expr::Variable(variable) if variable.value == "$last-cmd-time"));
         assert!(matches!(
             &tree.statements[1].and_or.first,
             Executable::Function { name, .. } if name == "auto-fetch"
+        ));
+    }
+
+    #[test]
+    fn parses_list_binding_patterns() {
+        let tree = complete("[first ...middle last] = [a b c d]");
+        assert!(matches!(
+            &tree.statements[0].and_or.first,
+            Executable::Assignment {
+                pattern: BindingPattern::List(patterns),
+                ..
+            } if patterns.len() == 3
         ));
     }
 

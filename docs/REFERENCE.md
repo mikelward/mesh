@@ -194,7 +194,33 @@ In assignment position, the selected body's final physical line supplies the
 value. The current value forms are one string, a list or map literal, a whole
 variable value, or a nested `if`; earlier lines in that body run for effect. A
 false conditional with no `else` yields `""`. General boolean/comparison
-expressions and conditional destructuring are not implemented yet.
+expressions are not implemented yet. A list-pattern condition binds only when
+the value has the requested shape; a mismatch selects `else` without changing
+any bindings:
+
+```mesh
+if [head ...tail] = $items { puts $head ...$tail }
+```
+
+## List patterns
+
+List patterns are shared by assignment, conditional binding, loops, and list
+arms in `match`. Names bind positions, `_` discards one, and `...rest` binds the
+variable-length middle (including an empty list). Fixed names after the rest
+remain pinned to the end:
+
+```mesh
+[first ...middle last] = $items
+for [key value] in $pairs { puts $key $value }
+result = match $items {
+  [head ...tail] { [$head ...$tail] }
+  _ { [] }
+}
+```
+
+An unconditional mismatch is a loud error and binds nothing. Conditional and
+`match` mismatches simply try the other branch or arm. Duplicate and reserved
+bindings are rejected before any value is committed.
 
 ## For loops
 
@@ -213,6 +239,13 @@ for key, value in $settings { puts "$key=$value" }
 ```
 
 `break` exits the nearest loop and `continue` skips to its next iteration.
+
+## Match
+
+`match value { pattern { body } ... }` evaluates arms from top to bottom and
+uses the first match. The implemented slice supports exact value patterns,
+list patterns, `_`, and guards; an unmatched expression yields `""`. Its
+literal/glob/regex/range pattern surface and alternation remain to be completed.
 
 ## Functions
 
