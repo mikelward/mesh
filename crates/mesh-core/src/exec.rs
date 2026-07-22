@@ -1,11 +1,14 @@
 //! External command execution.
 //!
 //! Launches external commands, optionally connected by pipes and with `<` / `>`
-//! / `>>` redirections, and maps results to exit statuses. `std::process::Command`
-//! resolves names against the inherited `PATH`. No job control yet.
+//! / `>>` redirections, and maps results to exit statuses. Every command or
+//! pipeline runs in its own process group, which owns the terminal while it is
+//! in the foreground.
 
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
+use std::io::IsTerminal;
+use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 
 use crate::lexer::RedirKind;
@@ -28,10 +31,10 @@ const SIGPIPE_CODE: u8 = 128 + 13;
 /// that could not be executed, and `128 + signal` when the child is killed by a
 /// signal. These line up with the result/status model in `DESIGN.md`.
 pub fn run(words: &[String]) -> u8 {
-    match Command::new(&words[0]).args(&words[1..]).status() {
-        Ok(status) => status_to_code(status),
-        Err(err) => spawn_error_code(&words[0], &err),
-    }
+    run_pipeline(vec![Cmd {
+        words: words.to_vec(),
+        redirs: Vec::new(),
+    }])
 }
 
 /// How the next stage receives its stdin.
@@ -70,6 +73,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
     let n = cmds.len();
     let mut outcomes: Vec<Outcome> = Vec::new();
     let mut next_stdin = NextIn::Inherit;
+    let mut process_group = None;
 
     // Open each stage's redirections concurrently — each stage still opens its
     // own in source order, but different stages open at the same time, so a FIFO
@@ -104,6 +108,9 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
 
         let mut command = Command::new(&cmd.words[0]);
         command.args(&cmd.words[1..]);
+        // A zero process group makes the first child a group leader. Later
+        // stages join it, so terminal signals address the entire pipeline.
+        command.process_group(process_group.unwrap_or(0));
 
         // stdin: an input redirection wins over the incoming pipe/EOF/terminal.
         if let Some(file) = in_file {
@@ -132,6 +139,15 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
 
         match command.spawn() {
             Ok(mut child) => {
+                let pgid = process_group.unwrap_or_else(|| child.id() as i32);
+                process_group = Some(pgid);
+                // Repeat setpgid in the parent to close the race between spawn
+                // and exec; EACCES only means the child won that race.
+                // SAFETY: setpgid has no pointer arguments and these PIDs came
+                // directly from successful child creation.
+                unsafe {
+                    libc::setpgid(child.id() as libc::pid_t, pgid);
+                }
                 if piped_out {
                     if let Some(out) = child.stdout.take() {
                         next_stdin = NextIn::Pipe(out);
@@ -143,6 +159,11 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
                 outcomes.push(Outcome::Failed(spawn_error_code(&cmd.words[0], &err)));
             }
         }
+    }
+
+    let foreground = process_group.filter(|_| std::io::stdin().is_terminal());
+    if let Some(pgid) = foreground {
+        set_foreground_group(pgid);
     }
 
     // pipefail: the last stage to fail wins. A SIGPIPE is ignored only for a
@@ -160,7 +181,30 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
             status = code;
         }
     }
+    if foreground.is_some() {
+        // getpgrp, rather than getpid, also handles a mesh process launched in
+        // a process group established by its parent shell.
+        // SAFETY: getpgrp takes no arguments and cannot fail.
+        let shell_group = unsafe { libc::getpgrp() };
+        set_foreground_group(shell_group);
+    }
     status
+}
+
+/// Give fd 0's controlling terminal to `pgid`. SIGTTOU must be blocked while a
+/// background shell performs the handoff, or the kernel can suspend the shell.
+fn set_foreground_group(pgid: libc::pid_t) {
+    // SAFETY: all calls use scalar values. The old signal mask is initialized
+    // by the first pthread_sigmask call before it is used by the second.
+    unsafe {
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        libc::sigaddset(&mut block, libc::SIGTTOU);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+        libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+    }
 }
 
 /// Open every redirection in source order so each file's create/truncate side

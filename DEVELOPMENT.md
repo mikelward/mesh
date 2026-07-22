@@ -53,7 +53,7 @@ integration tests need no terminal. The rest of the interactive stack named in
 | --- | --- | --- | --- |
 | `reedline` | interactive line editing, history, Ctrl-C/D | MIT | **in use** |
 | `glob` | filesystem glob expansion | MIT/Apache-2.0 | **in use** |
-| `nix` | `fork`/`exec`, `setpgid`, `tcsetpgrp`, signals | MIT | planned (job control) |
+| `libc` | process groups and foreground-terminal handoff | MIT/Apache-2.0 | **in use** |
 | `crossterm` | terminal control (pulled in by `reedline`) | MIT | transitive |
 | `nucleo` | fuzzy completion | MPL-2.0 | planned |
 
