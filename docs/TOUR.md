@@ -160,6 +160,39 @@ mesh$ <strong>puts still here</strong>
 still here
 </pre>
 
+## Functions
+
+Give a sequence of commands a name with `func`. Parameters are named — you write
+`$name` in the body, not `$1`:
+
+<pre>
+mesh$ <strong>func greet(name) {</strong>
+...   <strong>puts "hi, $name"</strong>
+... <strong>}</strong>
+mesh$ <strong>greet world</strong>
+hi, world
+</pre>
+
+A body can be one line too: `func sq(x) { puts $x $x }`. Each call runs in its own
+scope, so a variable you set inside a function stays inside it:
+
+<pre>
+mesh$ <strong>func work() { tmp = scratch; puts $tmp }</strong>
+mesh$ <strong>work</strong>
+scratch
+mesh$ <strong>puts $tmp</strong>
+mesh: tmp: unbound variable
+</pre>
+
+`return` leaves a function early; `return N` also sets its status, so a function
+reads as true/false in `&&` / `||`:
+
+<pre>
+mesh$ <strong>func check(x) { test -e $x && return 0; return 1 }</strong>
+mesh$ <strong>check /etc && puts present</strong>
+present
+</pre>
+
 ---
 
 That's everything mesh does today. New features land one at a time, and this tour

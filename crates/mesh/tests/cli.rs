@@ -1469,3 +1469,192 @@ fn a_failed_background_redirect_reports_mesh_status_one() {
     assert!(!stderr.contains("mesh-redir"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Functions (`func name(params) { body }`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn defines_and_calls_a_function_with_a_positional() {
+    let out = run_with_input("func greet(name) {\n  puts \"hi, $name\"\n}\ngreet world\n");
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi, world\n");
+}
+
+#[test]
+fn a_single_line_function_definition_works() {
+    let out = run_with_input("func sq(x) { puts $x $x }\nsq 3\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3 3\n");
+}
+
+#[test]
+fn a_function_takes_multiple_positionals() {
+    // Comma- and space-separated parameter lists both bind left to right.
+    let out = run_with_input("func pair(a, b) { puts $a $b }\npair x y\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x y\n");
+}
+
+#[test]
+fn a_functions_status_is_its_last_command() {
+    let out = run_with_input("func f() { true; false }\nf || puts caught\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "caught\n");
+}
+
+#[test]
+fn return_sets_the_status_and_stops_the_body() {
+    let out = run_with_input("func f() { puts one; return 3; puts two }\nf || puts nonzero\n");
+    // `two` never prints (return stops the body); the status is 3, so `||` fires.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one\nnonzero\n");
+}
+
+#[test]
+fn an_empty_body_yields_status_zero() {
+    let out = run_with_input("func nop() { }\nnop && puts ok\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+#[test]
+fn a_return_value_is_masked_to_eight_bits() {
+    // `return 256` is status 0, matching `exit` and `DESIGN.md`.
+    let out = run_with_input("func f() { return 256 }\nf && puts zero\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "zero\n");
+}
+
+#[test]
+fn a_function_local_does_not_leak_to_the_caller() {
+    // `x` bound inside the function is gone after it returns.
+    let out = run_with_input("func setx() { x = inside }\nsetx\nputs \"$x\"\n");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unbound variable"));
+}
+
+#[test]
+fn scope_is_lexical_not_dynamic() {
+    // `inner` cannot see `outer`'s local `x` — it sees only its own scope and the
+    // global scope (a callee never sees its caller's locals).
+    let out = run_with_input(
+        "func inner() { puts \"got $x\" }\nfunc outer() { x = local; inner }\nouter\n",
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("x: unbound variable"));
+}
+
+#[test]
+fn a_function_reads_a_global_variable() {
+    let out = run_with_input("g = shared\nfunc show() { puts $g }\nshow\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "shared\n");
+}
+
+#[test]
+fn a_function_can_call_another_function() {
+    let out = run_with_input("func a() { puts from-a }\nfunc b() { a; puts from-b }\nb\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "from-a\nfrom-b\n");
+}
+
+#[test]
+fn a_redefinition_replaces_the_earlier_body() {
+    let out = run_with_input("func f() { puts one }\nfunc f() { puts two }\nf\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "two\n");
+}
+
+#[test]
+fn a_nested_multi_line_definition_is_stored_whole() {
+    // The nested `func inner` spans lines; only storing its first line would run
+    // the rest as loose commands. `inner` is defined for later top-level calls.
+    let out =
+        run_with_input("func outer() {\n  func inner() {\n    puts nested\n  }\n}\nouter\ninner\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nested\n");
+}
+
+#[test]
+fn an_arity_mismatch_is_a_recoverable_error() {
+    let out = run_with_input("func f(a, b) { puts $a }\nf 1\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("expected 2 argument(s), got 1"), "{stderr}");
+    // The shell recovers and keeps going.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_bare_return_at_top_level_is_reported_and_recoverable() {
+    let out = run_with_input("return\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("return: not inside a function"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_reserved_name_cannot_be_a_function() {
+    for name in ["cd", "exit", "func", "return", "jobs"] {
+        let out = run_with_input(&format!("func {name}() {{ puts x }}\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("reserved name"), "{name}: {stderr}");
+    }
+}
+
+#[test]
+fn unsupported_signature_forms_are_rejected_clearly() {
+    let cases = [
+        ("func f(...xs) { puts hi }\n", "rest parameters"),
+        ("func f(--flag) { puts hi }\n", "flag parameters"),
+        ("func f(x = 1) { puts hi }\n", "optional/default"),
+        ("func f(a, a) { puts hi }\n", "duplicate parameter"),
+        ("func f(a,) { puts hi }\n", "after `,`"),
+    ];
+    for (input, needle) in cases {
+        let out = run_with_input(input);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{input:?} → {stderr}");
+    }
+}
+
+#[test]
+fn a_function_in_a_pipeline_is_rejected() {
+    let out = run_with_input("func f() { puts hi }\nf | cat\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not supported in a pipeline"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_redirected_function_is_rejected() {
+    let dir = fresh_dir("func_redirect");
+    let target = dir.join("out");
+    let out = run_with_input(&format!(
+        "func f() {{ puts hi }}\nf > {}\n",
+        target.display()
+    ));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("redirection or backgrounding of a function"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!target.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_malformed_header_does_not_leak_later_body_lines() {
+    // The P1 quarantine case: `func f(x {` opens a body with no signature `)`.
+    // Buffering runs to the matching `}`, so `puts LEAKED` is inside the (rejected)
+    // definition and must not run at the top level.
+    let out = run_with_input("func f(x {\nputs )\nputs LEAKED\n}\nputs after\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("LEAKED"), "leaked: {stdout}");
+    assert_eq!(stdout, "after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("missing `)`"));
+}
+
+#[test]
+fn an_unterminated_definition_at_eof_is_reported() {
+    let out = run_with_input("func f() {\n  puts hi\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("missing closing `}`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

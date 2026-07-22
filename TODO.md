@@ -79,7 +79,12 @@ file as tasks land.
         `ys = $xs[1..]`).
   - [x] List-preserving append from a slice (`xs += $ys[1..]`).
 - [ ] Maps, scalar types, and `:` modifiers.
-- [ ] `if` / `for` / `match` and `func`.
+- [x] `func` — user-defined functions: `func name(params) { body }` with required
+      named positionals, multi-line bodies, function-local (lexical) scope, and
+      `return`. Resolution is builtins → functions → external. Deferred:
+      flags/optionals/rest parameters, functions in pipelines/redirections, and
+      calling for a value (`f(arg)`) vs running (`f arg`).
+- [ ] `if` / `for` / `match`.
 
 ## Decisions made
 
