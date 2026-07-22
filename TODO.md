@@ -238,12 +238,13 @@ file as tasks land.
 
 ## Review Comments
 
-Review threads swept from the project's PRs (open and merged) that still need
-attention. Each entry is the full reviewer comment plus a link to the PR and the
-specific thread. Threads the maintainer already replied to as fixed — or
-declined outright — are excluded; a couple where the maintainer agreed the issue
-is real but the fix is still pending are kept and marked as such. PRs 1–18 were
-not swept in this pass.
+Open review threads swept from the project's PRs that still need attention. In
+the latest pass (2026-07-22) every unreplied thread on PRs updated in the last
+24 hours was verified against `main` (@ d0485f4): threads whose fix is already
+present on `main` were replied to on GitHub and are **omitted here**, and only
+findings that still reproduce on `main` are kept below, each with a one-line note.
+Entries for PRs #24–#58 are carried over from the earlier sweep and were not
+re-verified in this pass. PRs 1–18 were not swept.
 
 ### PR #24 — Design: settle regex-as-value/re(), :int, exec, per-stream tty tests ([#24](https://github.com/mikelward/mesh/pull/24))
 
@@ -261,6 +262,7 @@ not swept in this pass.
   colliding `/…/` syntax — so rather than patch the lexer rule a fourth time,
   I'm raising the disambiguation as a design decision with the maintainer
   instead of guessing. Will update here once it's resolved.
+
 ### PR #30 — Add the real lexer: quoting, escapes, and expansion suppression ([#30](https://github.com/mikelward/mesh/pull/30))
 
 - `crates/mesh/src/expand.rs:64` — [thread](https://github.com/mikelward/mesh/pull/30#discussion_r3616268047)
@@ -285,27 +287,6 @@ not swept in this pass.
   error. Fresh evidence after the earlier descriptor fixes is that the scan stops
   only at whitespace, even though `finish_segment`/the pipe handler has already
   started a new word after `;`, `&&`, `||`, or `|`. *(no maintainer reply)*
-
-### PR #40 — Split core into `crates/mesh-core` and add stderr redirection ([#40](https://github.com/mikelward/mesh/pull/40))
-
-- `crates/mesh-core/src/exec.rs:125` — [thread](https://github.com/mikelward/mesh/pull/40#discussion_r3617863908)
-  **[P2] Redirect spawn diagnostics through the requested stderr file** — When
-  the executable cannot be spawned, such as `optional-tool 2>/dev/null`, this
-  configures only the prospective child's stderr; `spawn_error_code` later prints
-  the command-not-found or permission diagnostic from the parent, so the redirect
-  file remains empty and the message leaks to the shell's stderr. Since `2>` is
-  documented as redirecting the command's stderr and redirection is otherwise
-  bash-like, the spawn-failure diagnostic must also use the opened stderr
-  destination. *(no maintainer reply)*
-- `crates/mesh-core/src/lexer.rs:342` — [thread](https://github.com/mikelward/mesh/pull/40#discussion_r3617863911)
-  **[P2] Accept stderr redirects after an unspaced operator** — The
-  whitespace-only boundary check misclassifies a valid `2>` when the stage begins
-  immediately after another operator. For example, `true;2>err sh -c 'echo x >&2'`
-  or `producer|2>err consumer` treats `2` as the command/argument and `>` as
-  stdout redirection instead of recognizing stderr redirection. Separators and
-  redirection operators are explicitly allowed without surrounding spaces, so
-  operator boundaries such as `;`, `&&`, `||`, and `|` must also qualify as the
-  start of the descriptor prefix. *(no maintainer reply)*
 
 ### PR #42 — Add functions with named positionals and local scope ([#42](https://github.com/mikelward/mesh/pull/42))
 
@@ -370,6 +351,16 @@ not swept in this pass.
   handoff before allowing exec, or continue only a group confirmed to have
   stopped, with PTY regression coverage. *(no maintainer reply)*
 
+### PR #65 — Normalize TIOCSCTTY for BSD ioctl ABI ([#65](https://github.com/mikelward/mesh/pull/65))
+
+- `crates/mesh-platform/src/lib.rs` — [thread](https://github.com/mikelward/mesh/pull/65#discussion_r3626885654)
+  **[P2] Keep the ioctl request type target-specific for musl** — `mesh-platform`
+  only cfg-splits macOS vs. not, forcing `TIOCSCTTY: libc::c_ulong` for every
+  other target. On `*-linux-musl`, `libc::ioctl`'s request parameter is `c_int`,
+  so the `c_ulong` constant fails to type-check and `cargo test` no longer builds
+  on musl. Add a `target_env = "musl"` arm (or otherwise narrow the widening) so
+  the constant matches each target's `ioctl` ABI. *(still open on main)*
+
 ### PR #66 — Add stopped-job tracking and job-control builtins (jobs, fg, bg) ([#66](https://github.com/mikelward/mesh/pull/66))
 
 - `crates/mesh-core/src/exec.rs:61` — [thread](https://github.com/mikelward/mesh/pull/66#discussion_r3626898554)
@@ -392,14 +383,6 @@ not swept in this pass.
   earlier polls. Persist completed outcomes and their codes instead of re-waiting
   for reaped children, with a stopped multi-stage PTY regression. *(no maintainer
   reply)*
-- `crates/mesh/tests/cli.rs:857` — [thread](https://github.com/mikelward/mesh/pull/66#discussion_r3626898563)
-  **[P2] Return failed prompts after recognizing them** — When a PTY command
-  leaves a nonzero status — particularly after Ctrl-Z, which produces `mesh!` —
-  this new condition stops reading at that prompt, but the final predicate still
-  returns `Some` only for `mesh$`. The helper therefore reports a timeout/failure
-  after successfully finding `mesh!`, preventing it from covering the newly added
-  stopped-job flow; accept both prompt forms in the return predicate as well.
-  *(no maintainer reply)*
 - `crates/mesh-core/src/exec.rs:25` — [thread](https://github.com/mikelward/mesh/pull/66#discussion_r3626928169)
   **[P1] Hang up retained jobs when the shell exits** — When a user stops a
   long-running command, resumes it with `bg`, and then runs `exit` or loses the
@@ -413,52 +396,16 @@ not swept in this pass.
   to stopped groups, plus a PTY regression covering `bg` followed by shell exit.
   *(no maintainer reply)*
 
-### PR #67 — Add background command launch (bare `&`) ([#67](https://github.com/mikelward/mesh/pull/67))
+### PR #74 / #75 — Require braces for quoted list indexing ([#74](https://github.com/mikelward/mesh/pull/74), [#75](https://github.com/mikelward/mesh/pull/75))
 
-- `crates/mesh-core/src/exec.rs:225` — [thread](https://github.com/mikelward/mesh/pull/67#discussion_r3627015317)
-  **[P1] Keep terminal stdin usable after `fg`** — In an interactive session,
-  assigning `/dev/null` to every background job's stdin is permanent, so `cat &`
-  followed by `fg` immediately receives EOF even after the job owns the terminal.
-  Terminal job control already prevents a background process group from consuming
-  prompt input via `SIGTTIN`; use `/dev/null` only where that protection is
-  unavailable, otherwise foregrounding input-driven jobs is unusable. *(no
-  maintainer reply)*
-- `crates/mesh-core/src/exec.rs:360` — [thread](https://github.com/mikelward/mesh/pull/67#discussion_r3627015322)
-  **[P1] Retain statuses reaped on earlier prompts** — When stages of a
-  registered background pipeline finish between different prompt iterations,
-  `poll_outcomes` reaps each stage but never stores its status in `Outcome`; its
-  local `status` is discarded whenever another stage remains running. For
-  example, `sh -c 'exit 7' | sleep 1 &` can be reported as `Done (0)` after an
-  intervening prompt, and foregrounding a partially reaped pipeline can similarly
-  return a spurious status, violating the documented pipefail result. *(no
-  maintainer reply)*
-- `crates/mesh-core/src/exec.rs:352` — [thread](https://github.com/mikelward/mesh/pull/67#discussion_r3627015323)
-  **[P2] Defer blocking redirects for background jobs** — This background branch
-  is reached only after all `open_redirs` threads have been joined, so a command
-  such as `cat < fifo & puts ready` blocks the shell while opening the FIFO and
-  never launches `puts ready` until an external writer appears. A background
-  launch must return control before potentially blocking redirection setup, or
-  otherwise perform those opens in the child. *(no maintainer reply)*
-
-### PR #70 — Preserve background job input and outcomes ([#70](https://github.com/mikelward/mesh/pull/70))
-
-- `crates/mesh-core/src/exec.rs:507` — [thread](https://github.com/mikelward/mesh/pull/70#discussion_r3627151268)
-  **[P2] Avoid requiring PATH-resolved sh for redirects** — When `PATH` does not
-  contain `sh`, every background command with a redirection now fails before
-  running, even if the requested executable uses an absolute path. For example,
-  with `PATH=/definitely-missing`, `/bin/echo ok > out &` reports the original
-  command as not found and never creates `out`; foreground redirection still
-  works. Resolve the wrapper independently of the user's command-search path or
-  avoid introducing this extra executable dependency. *(no maintainer reply)*
-- `crates/mesh-core/src/exec.rs:503` — [thread](https://github.com/mikelward/mesh/pull/70#discussion_r3627151270)
-  **[P2] Preserve Mesh's redirection-failure status** — When a background
-  redirect cannot be opened, delegating the operation to `sh` changes the result
-  from Mesh's established status 1 to a shell-dependent value. On this workspace,
-  `/bin/echo ok > missing/dir/out &` is later reported as `Done (2)`, while the
-  same foreground command exits 1; the diagnostic also leaks `mesh-redir` instead
-  of using Mesh's normal error format. Normalize wrapper-side open failures so
-  foreground and background execution retain the same status semantics. *(no
-  maintainer reply)*
+- `crates/mesh-core/src/lexer.rs` — [thread #75](https://github.com/mikelward/mesh/pull/75#discussion_r3627383581),
+  [thread #74](https://github.com/mikelward/mesh/pull/74#discussion_r3627329099)
+  **[P2] Keep an unbraced bracket suffix literal inside double quotes** — Per
+  `DESIGN.md`, `"$x[0]"` means the value of `$x` followed by literal `[0]`, and
+  indexing requires `"${x[0]}"`. On main, `x = text; puts "$x[0]"` instead errors
+  `mesh: $x: cannot index a string value`. Gate unbraced index parsing inside
+  strings the same way as member access while keeping indexing in the braced
+  parser. *(still reproduces on main; two threads, same root cause)*
 
 ### PR #76 — Preserve empty strings in list literals ([#76](https://github.com/mikelward/mesh/pull/76))
 
@@ -486,93 +433,202 @@ not swept in this pass.
   dispatch added specifically to `crates/mesh/src/main.rs`. *(no maintainer
   reply)*
 
-### PR #78 — Support member access in quoted interpolation ([#78](https://github.com/mikelward/mesh/pull/78))
+### PR #92 — Document grammar simplification opportunities ([#92](https://github.com/mikelward/mesh/pull/92))
 
-- `DESIGN.md:654` — [thread](https://github.com/mikelward/mesh/pull/78#discussion_r3627423330)
-  **[P2] Update all docs for the new interpolation rule** — This newly documented
-  rule conflicts with two remaining authoritative descriptions:
-  `DESIGN.md:1043-1046` still says `"$file.txt"` appends a literal suffix, and
-  `docs/REFERENCE.md:96-99` gives users the same now-invalid behavior. With this
-  commit, that expression instead attempts member access and fails for a string
-  variable, so users following either passage will get runtime errors; update
-  those sections to require `"${file}.txt"` and describe unbraced member access.
-  *(no maintainer reply)*
+- `GRAMMAR.md:20` — [thread](https://github.com/mikelward/mesh/pull/92#discussion_r3627954324)
+  **[P2] Treat trailing connectors as incomplete input** — `GRAMMAR.md` flatly
+  calls a trailing `&&` / `||` a syntax error, but the line-editor contract
+  requires the interactive parser to report incompleteness and read a
+  continuation line. Reserve the syntax error for EOF without a right-hand
+  operand and preserve the incomplete result during editing. *(GRAMMAR.md still
+  calls them syntax errors)*
 
-### PR #79 — Align quoted interpolation documentation and coverage ([#79](https://github.com/mikelward/mesh/pull/79))
+### PR #96 — Track structured string interpolation decision ([#96](https://github.com/mikelward/mesh/pull/96))
 
-- `GRAMMAR.md:115` — [thread](https://github.com/mikelward/mesh/pull/79#discussion_r3627447406)
-  **[P2] Add braced access forms to the grammar** — The new production documents
-  only unbraced `$xs[N]`, even though this commit's lexer test and prose
-  explicitly support `${xs[N]}` and `${name.member}`. Because `GRAMMAR.md`
-  defines the grammar currently parsed, consumers following this EBNF would
-  reject valid forms such as `"${items[-1]}"`; add braced member and index
-  alternatives, or factor the optional access suffix into both braced and
-  unbraced forms. *(no maintainer reply)*
+- `TODO.md` (this file, "Decisions needed") — [thread](https://github.com/mikelward/mesh/pull/96#discussion_r3628103538)
+  **[P2] Remove the already-settled interpolation decision** — `DESIGN.md`
+  already specifies that lists/maps have no canonical byte representation and that
+  interpolating them is a loud error requiring explicit rendering (`:join`).
+  Leaving "Double-quoted interpolation of structured values" under "Decisions
+  needed" above contradicts the settled design. Resolve/remove that item.
+  *(self-referential; the entry is still present in this file)*
 
-### PR #81 — Add clamped list slicing and spread support ([#81](https://github.com/mikelward/mesh/pull/81))
+### PR #97 — Keep quoted glob hyphens literal ([#97](https://github.com/mikelward/mesh/pull/97))
 
-- `crates/mesh-core/src/expand.rs:215` — [thread](https://github.com/mikelward/mesh/pull/81#discussion_r3627480804)
-  **[P2] Apply inclusivity before clamping the end bound** — For inclusive slices
-  whose negative end lies before the list (for example, `...$xs[..=-5]` on
-  `[a b c d]`), clamping first changes the end to index 0 and then increments it,
-  incorrectly returning `a`; every end below `-len` therefore behaves like
-  exactly `-len` instead of producing the empty intersection required by clamped
-  slicing. Resolve the inclusive end to an exclusive position by adding one
-  before clamping (using the existing wider integer representation to avoid
-  overflow). *(no maintainer reply; the inclusive-slice clamping order is the
-  subject of PRs #83/#85 — verify and resolve)*
+- `crates/mesh-core/src/expand.rs:165` — [thread](https://github.com/mikelward/mesh/pull/97#discussion_r3628143486)
+  **[P2] Keep multiple quoted hyphens out of range positions** — A class with two
+  quoted hyphens still lets the first act as a range operator: with files `-`,
+  `a`, `z`, `puts [a'--'z]` expands to only `a`. Place deferred hyphens where they
+  cannot become the middle of a range and add coverage for multiple quoted
+  hyphens. *(still reproduces on main)*
 
-### PR #82 — Add append assignment (`+=`) for strings and lists ([#82](https://github.com/mikelward/mesh/pull/82))
+### PR #102 — Add string-list for loops ([#102](https://github.com/mikelward/mesh/pull/102))
 
-- `crates/mesh-core/src/repl.rs:429` — [thread](https://github.com/mikelward/mesh/pull/82#discussion_r3627499447)
-  **[P2] Support list slices as append operands** — When the RHS is a list slice
-  such as `xs += $more[1..]`, the `access.is_none()` condition sends it through
-  `scalar_value`, where expansion rejects the slice with "list value needs `...`"
-  and leaves `xs` unchanged. `GRAMMAR.md:241-247` defines a slice as a list value
-  and says list-to-list `+=` extends the target, so this path should materialize
-  the selected slice as `Value::List` just as a whole-list variable does. *(no
-  maintainer reply; addressed by PR #84 "Support sliced RHS for `+=`" — verify
-  and resolve)*
+- `crates/mesh-core/src/repl.rs:520` — [thread](https://github.com/mikelward/mesh/pull/102#discussion_r3630644981)
+  **[P2] Reject `env` as a loop binding** — `for env in [a b] { ... }` is accepted
+  at parse time, but every `$env` read inside the body fails with
+  `$env: not supported yet` because `env` is the reserved environment namespace.
+  Assignments and function parameters already reject `env`; loops should reject it
+  at parse time too. *(still accepted on main)*
 
-### PR #83 — Apply inclusive slice ends before clamping ([#83](https://github.com/mikelward/mesh/pull/83))
+### PR #104 — Add argument-free postfix modifiers ([#104](https://github.com/mikelward/mesh/pull/104))
 
-- `crates/mesh-core/src/expand.rs:210` — [thread](https://github.com/mikelward/mesh/pull/83#discussion_r3627504423)
-  **[P1] Preserve the relative meaning of an inclusive -1 end** — For any
-  non-empty list, an inclusive end of `-1` should include the final element, but
-  adding the inclusive offset before resolving negative indices changes `-1` to
-  absolute `0`; consequently, `$xs[..=-1]` now produces an empty slice instead of
-  the entire list. Resolve the original signed endpoint relative to `len` in
-  `i128`, then add one and clamp, and add a `..=-1` regression case. *(no
-  maintainer reply; addressed by PR #85 "Resolve negative inclusive slice ends
-  correctly" — verify and resolve)*
+- `crates/mesh-core/src/expand.rs:420` — [thread](https://github.com/mikelward/mesh/pull/104#discussion_r3630783302)
+  **[P2] Preserve a directory value for paths without a parent** — `$file:dir`
+  returns `""` for a bare filename (`report.txt`) and for `/`, conflicting with
+  the `dirname` semantics (a dirname is always truthy). Normalize to `.` for a
+  relative leaf and `/` for the root. *(still returns empty on main)*
+- `crates/mesh-core/src/expand.rs:442` — [thread](https://github.com/mikelward/mesh/pull/104#discussion_r3630783308)
+  **[P2] Keep extensions after a dotfile's leading dot** — For `.config.toml`,
+  `:exts` is empty and `:bare` returns `.config.toml`, even though `:ext` returns
+  `toml` and `:stem` returns `.config`. Only the initial dot should be excluded
+  when searching for extension delimiters, so `:base` decomposes into both
+  `:stem`+`:ext` and `:bare`+`:exts`. *(still reproduces on main)*
 
-### PR #84 — Support sliced RHS for `+=` and preserve inclusive `..=-1` semantics ([#84](https://github.com/mikelward/mesh/pull/84))
+### PR #106 — Add clean-break parser contract and nested list values ([#106](https://github.com/mikelward/mesh/pull/106))
 
-- `GRAMMAR.md:248` — [thread](https://github.com/mikelward/mesh/pull/84#discussion_r3627546056)
-  **[P1] Support a spread immediately before `]`** — When a spread is the last or
-  only list item (for example, `ys = [first ...$xs]` or `ys = [...$xs]`),
-  `list_literal` removes `]` but leaves an empty trailing `Piece::Text`;
-  `expand::spread_var` then rejects the word because it requires exactly the
-  `"..."` and variable pieces, so the assignment fails with `list value needs
-  ...`. This makes the newly documented whole-word spread incomplete and breaks
-  the canonical concatenation forms in `DESIGN.md`; discard empty edge pieces
-  after removing the brackets and add a final-position regression test. *(no
-  maintainer reply; addressed by PR #86 "Support spreads before list closing
-  brackets" — verify and resolve)*
+- `crates/mesh-core/src/expand.rs:376` — [thread](https://github.com/mikelward/mesh/pull/106#discussion_r3631193878)
+  **[P2] Recurse value modifiers through nested lists** — A nested list passed to
+  a value modifier fails instead of mapping over each value: `x = [[a b] c]; y = $x:upper`
+  reports `:upper: cannot map over a nested list`. Value modifiers are defined to
+  map automatically over lists (unlike `:join`, whose nested-value error is
+  explicit); apply the modifier recursively and add coverage. *(still reproduces
+  on main; the three PARSER.md findings on #106 — `unless` guards, guards on
+  ordinary commands, and `if lhs = rhs` conditional assignment — are now resolved
+  in the contract.)*
 
-### PR #88 — Preserve lists in variable assignments ([#88](https://github.com/mikelward/mesh/pull/88))
+### PR #107 — Define M3 parser contract, add PARSER.md ([#107](https://github.com/mikelward/mesh/pull/107))
 
-- `crates/mesh-core/src/repl.rs:400` — [thread](https://github.com/mikelward/mesh/pull/88#discussion_r3627794224)
-  **[P2] Preserve quote context before copying list values** — When the RHS is
-  solely a double-quoted interpolation, such as `ys = "$xs"` or
-  `ys = "${xs[1..]}"`, the lexer produces the same single-`Piece::Var` shape as a
-  bare reference, so this fast path silently binds a list. That contradicts the
-  double-quoted string behavior in `DESIGN.md:755-764` and is inconsistent with
-  `ys = "x$xs"`, which correctly rejects rendering the list as text. Retain
-  whether the reference was quoted or restrict this path to bare references, and
-  cover the quoted whole-list and slice cases with a regression test. *(addressed
-  by e2ad505 "Preserve quote context for list assignments" — verify and resolve)*
+- `PARSER.md:101` — [thread](https://github.com/mikelward/mesh/pull/107#discussion_r3631390301)
+  **[P2] Use the decided brace syntax for match arms** — `match-arm` is still
+  `pattern "=>" (value-expression | block)`, but the settled Matching section in
+  `DESIGN.md` defines arms as `pattern { ... }`, with literal/glob/regex/range
+  patterns. Reserve the documented arm syntax even if evaluation stays deferred.
+- `PARSER.md:74` — [thread](https://github.com/mikelward/mesh/pull/107#discussion_r3631390309)
+  **[P2] Preserve the separator after a background assignment** — `background-job`
+  consumes the `&`, but `statement-list` still requires a `list-sep` before the
+  next `and-or`, so `j = make -j8 & puts ready` cannot parse even though `&` is
+  declared to be both the background marker and a list separator. Model the marker
+  so it terminates the assignment RHS and separates the following item.
+- `PARSER.md:165` — [thread](https://github.com/mikelward/mesh/pull/107#discussion_r3631390313)
+  **[P2] Require an endpoint for inclusive ranges** — `range-expression` makes the
+  right `additive` optional for both `..` and `..=`, so `..=` and `1..=` are
+  accepted as complete. Split the half-open and inclusive productions so `..=`
+  always has a right operand.
+- `PARSER.md:22` — [thread](https://github.com/mikelward/mesh/pull/107#discussion_r3631390318)
+  **[P2] Reserve the here-string redirect token** — For `cmd <<< "text"`, the
+  longest-match set reserves `<<` but not `<<<`, and there is no here-string
+  redirect production. Add a distinct `<<<` token and operand shape.
 
-### PRs with no unresolved review threads
+### PR #108 — Add span-carrying M3 tokenizer and syntax parser ([#108](https://github.com/mikelward/mesh/pull/108))
 
-37, 39, 41, 45, 47–56, 59, 62, 63, 68, 69, 71, 72, 80, 85, 86, 87, 89, 90.
+- `crates/mesh-core/src/parser.rs:1356` — [thread](https://github.com/mikelward/mesh/pull/108#discussion_r3631613772)
+  **[P1] Represent command substitutions as capture expressions** — `x = $(echo hi)`
+  is not captured: `echo` writes straight to stdout and `x` receives the exit
+  status (`0`). Add a capture AST node that runs the contents as a statement list
+  and captures output. *(same root cause as #114's capture finding below; still
+  reproduces on main)*
+- `crates/mesh-core/src/parser.rs:1346` — [thread](https://github.com/mikelward/mesh/pull/108#discussion_r3631613777)
+  **[P1] Capture a command-running branch's value in value position** — A value
+  form whose selected branch runs a command, such as
+  `greeting = if $french { echo bonjour } else { hi }`, runs the command directly
+  and leaves `greeting` empty. (Literal-value branches like `if true { "x" }`
+  already work; capturing a branch that produces its value via a command does
+  not.) *(still reproduces on main)*
+
+### PR #109 — Use parser to decide compound-input completeness ([#109](https://github.com/mikelward/mesh/pull/109))
+
+- `crates/mesh-core/src/repl.rs:512` — [thread](https://github.com/mikelward/mesh/pull/109#discussion_r3631789889)
+  **[P1] Keep malformed function bodies quarantined** — A body line such as
+  `puts xr'\' }` exposes a lexer disagreement: the M3 parser reads the mid-word
+  `r'…'` as raw and reports `Complete`, while `lexer::scan_braces` treats the
+  quote as escaped and still considers the body open. The buffer is dispatched,
+  `define_func` reports a missing `}`, and a following `puts LEAKED` runs at top
+  level. Preserve the incomplete result whenever the executor's scanner still
+  considers the body open. *(still leaks on main)*
+
+### PR #111 — Route expression errors through the parser ([#111](https://github.com/mikelward/mesh/pull/111))
+
+- `crates/mesh-core/src/repl.rs:91` — [thread](https://github.com/mikelward/mesh/pull/111#discussion_r3632004520)
+  **[P2] Keep comparison errors out of command redirections** — When a command
+  word is interpolated/quoted, the parser classifies multiple redirections such as
+  `cmd=cat; $cmd < first < second` as a `ChainedComparison` and returns status 2
+  before the compatibility lexer can run the command. Only honor the comparison
+  error after establishing that the input is actually in expression position.
+  *(still reproduces on main)*
+
+### PR #113 — Replace compatibility command lexer with parser-driven AST execution ([#113](https://github.com/mikelward/mesh/pull/113))
+
+- `crates/mesh-core/src/repl.rs:83` — [thread](https://github.com/mikelward/mesh/pull/113#discussion_r3632167181)
+  **[P1] Keep background conditional lists in one job** — A backgrounded `and-or`
+  is launched per-executable, so `&` binds tighter than `&&`. `false && touch marker &`
+  still creates `marker` because `false`'s status-0 background launch is observed
+  before short-circuiting. The whole chain must background as one unit (or be
+  rejected until supported).
+- `crates/mesh-core/src/repl.rs:192` — [thread](https://github.com/mikelward/mesh/pull/113#discussion_r3632167202)
+  **[P1] Surface errors raised while evaluating guards** — `puts BAD if $missing`
+  prints the unbound-variable diagnostic but still exits 0 and silently skips the
+  command (`guard_allows` converts `Err(_)` to `false`). Guard evaluation must
+  return an error-bearing result so callers report the failure. *(same root cause
+  as #120's guard finding.)*
+- `crates/mesh-core/src/repl.rs:247` — [thread](https://github.com/mikelward/mesh/pull/113#discussion_r3632167206)
+  **[P2] Honor stderr-pipe edges in parsed pipelines** — `sh -c 'echo error >&2' |& cat`
+  leaves the error on mesh's stderr with `cat` empty (exit 0); `|&` executes as a
+  plain `|`. Propagate the `pipe_stderr` edge into the executor or reject `|&`.
+  *(same root cause as #120's `|&` finding.)*
+- `crates/mesh-core/src/repl.rs:199` — [thread](https://github.com/mikelward/mesh/pull/113#discussion_r3632196451)
+  **[P1] Propagate errors from `if` conditions** — `if $missing { puts wrong } else { puts ELSE }`
+  reports the unbound variable but still runs the `else` branch and can finish
+  successfully. A fail-loud condition error must abort the conditional, not select
+  `else`.
+- `crates/mesh-core/src/repl.rs:664` — [thread](https://github.com/mikelward/mesh/pull/113#discussion_r3632196468)
+  **[P1] Reprocess input after an incomplete header is invalidated** — Piped
+  `func f()` then `puts after` reports the header error but discards `puts after`
+  with `std::mem::take`, so the valid second command never runs. Report the header
+  error and reprocess the new line as its own input unit.
+- `crates/mesh-core/src/repl.rs:169` — [thread](https://github.com/mikelward/mesh/pull/113#discussion_r3632196473)
+  **[P2] Reject `break` and continue outside loops** — A top-level `break` is
+  reported, but inside a function `func f() { break; puts unreachable }; f` prints
+  `unreachable` — the control step escapes the body without aborting it. Track
+  loop context and abort/report when no loop is active.
+
+### PR #114 — Execute parsed syntax trees recursively ([#114](https://github.com/mikelward/mesh/pull/114))
+
+- `crates/mesh-core/src/repl.rs:588` — [thread](https://github.com/mikelward/mesh/pull/114#discussion_r3632264055)
+  **[P1] Capture command output instead of returning its status** — In an
+  AST-evaluated expression, `E::Capture` runs the source with inherited stdout and
+  substitutes the exit-status string: `answer = $(printf 20) + 22; puts $answer`
+  leaks `20` to stdout and prints `2022` instead of `42`. *(same root cause as
+  #108's capture finding; still reproduces on main)*
+
+### PR #116 — Evaluate parsed expressions as typed runtime values ([#116](https://github.com/mikelward/mesh/pull/116))
+
+- `crates/mesh-core/src/repl.rs:868` — [thread](https://github.com/mikelward/mesh/pull/116#discussion_r3632440491)
+  **[P2] Distinguish remainder overflow from division by zero** — `i64::MIN % -1`
+  makes `checked_rem` return `None` (overflow), but the branch reports
+  `division by zero`. Check the divisor first and report numeric overflow for the
+  remaining `None`, mirroring `checked_div`. *(still mislabeled on main)*
+
+### PR #118 — Use parser completeness for compound input ([#118](https://github.com/mikelward/mesh/pull/118))
+
+- `crates/mesh-core/src/repl.rs:1216` — [thread](https://github.com/mikelward/mesh/pull/118#discussion_r3632636867)
+  **[P1] Quarantine malformed compound bodies through their closing brace** — A
+  malformed header that has already opened a body, `func f(x {\nputs LEAKED\n}`,
+  parses the first line to an error rather than `Incomplete`, so the reader runs
+  the subsequent body lines at top level and `puts LEAKED` executes. Preserve the
+  unit through its closing delimiter. *(still leaks on main; the sibling
+  "incomplete compound after earlier executables" finding is now fixed.)*
+
+### PR #120 — Execute REPL from parser AST and remove lexer::split_line ([#120](https://github.com/mikelward/mesh/pull/120))
+
+- `crates/mesh-core/src/repl.rs:80` — [thread](https://github.com/mikelward/mesh/pull/120#discussion_r3632755710)
+  **[P1] Propagate postfix-guard evaluation failures** — `guard_allows` converts
+  `Err(_)` to `false` and returns the previous status, so
+  `puts skipped if $missing && puts ran` reports the unbound variable but still
+  runs `puts ran` and exits 0. Preserve the evaluation error's `Step` so `&&` does
+  not continue. *(same root cause as #113's guard finding.)*
+- `crates/mesh-core/src/repl.rs:80` — [thread](https://github.com/mikelward/mesh/pull/120#discussion_r3632755717)
+  **[P1] Preserve stderr piping for `|&`** — `run_ast_pipeline` ignores
+  `Pipeline::pipe_stderr`, so `sh -c 'echo err >&2' |& cat` writes `err` to mesh's
+  stderr and leaves `cat` empty. Carry the per-connector stderr flag into
+  execution. *(same root cause as #113's `|&` finding.)*
