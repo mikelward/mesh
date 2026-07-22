@@ -1816,3 +1816,42 @@ fn a_multi_line_signature_still_buffers_and_defines() {
     let out = run_with_input("func add(a,\nb) {\n  puts $a $b\n}\nadd 1 2\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1 2\n");
 }
+
+#[test]
+fn a_bare_list_reaches_an_in_shell_function_intact() {
+    // Per DESIGN.md, an unspread list passes to an in-shell function as one list
+    // value — so the parameter holds the whole list and can be spread inside.
+    let out = run_with_input("xs = [a b]\nfunc f(x) { puts ...$x }\nf $xs\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a b\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_list_argument_counts_as_one_positional() {
+    // `f $xs tail` binds the whole list to the first positional and `tail` to the
+    // second — a list is one argument, not its elements.
+    let out = run_with_input("xs = [a b c]\nfunc f(x, y) { puts ...$x; puts $y }\nf $xs tail\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a b c\ntail\n");
+}
+
+#[test]
+fn a_list_slice_reaches_a_function_as_a_list() {
+    let out = run_with_input("xs = [a b c d]\nfunc f(x) { puts ...$x }\nf $xs[1..3]\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "b c\n");
+}
+
+#[test]
+fn a_bare_list_to_an_external_command_is_still_an_error() {
+    // The external-argv rule is unchanged: a bare list must be spread or joined.
+    let out = run_with_input("xs = [a b]\necho $xs\n");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("list value needs"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

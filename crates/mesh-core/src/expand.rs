@@ -42,39 +42,91 @@ impl std::fmt::Display for ExpandError {
     }
 }
 
-/// Expand each word into zero or more argument strings.
+/// Expand each word into zero or more argument strings (the external-argv rule:
+/// a bare list value is an error — spread or join it).
 pub fn expand(words: Vec<Word>, vars: &Vars) -> Result<Vec<String>, ExpandError> {
     let mut out = Vec::new();
     for word in words {
         if let Some(vref) = spread_var(&word) {
-            match vars.get(&vref.name) {
-                Some(Value::List(values)) => match &vref.access {
-                    None => out.extend(values.iter().cloned()),
-                    Some(Access::Slice {
-                        start,
-                        end,
-                        inclusive,
-                    }) => out.extend(slice(values, *start, *end, *inclusive).iter().cloned()),
-                    Some(Access::Index(_)) => {
-                        return Err(ExpandError::Unsupported(format!(
-                            "...${}: cannot spread a single list element",
-                            vref.name
-                        )));
-                    }
-                },
-                Some(Value::String(_)) => {
-                    return Err(ExpandError::Unsupported(format!(
-                        "...${} on a string",
-                        vref.name
-                    )));
-                }
-                None => return Err(ExpandError::UnboundVar(vref.name.clone())),
-            }
+            out.extend(spread_strings(vref, vars)?);
             continue;
         }
         expand_word(word, vars, &mut out)?;
     }
     Ok(out)
+}
+
+/// Expand words into typed argument values for an **in-shell function call**,
+/// preserving list values rather than applying the external-argv rule
+/// (`DESIGN.md` §"Arguments do not word-split": a bare list arrives at an in-shell
+/// function as one value). `...$xs` spreads into one value per element; a bare,
+/// unquoted `$name` (or `$name[slice]`) holding a list arrives as a single
+/// `Value::List`; every other word yields `Value::String` argument(s) via ordinary
+/// expansion (so a glob still expands to its matches, an index to one element).
+pub fn expand_values(words: Vec<Word>, vars: &Vars) -> Result<Vec<Value>, ExpandError> {
+    let mut out = Vec::new();
+    for word in words {
+        if let Some(vref) = spread_var(&word) {
+            out.extend(spread_strings(vref, vars)?.into_iter().map(Value::String));
+        } else if let Some(list) = whole_list_value(&word, vars) {
+            out.push(Value::List(list));
+        } else {
+            let mut strings = Vec::new();
+            expand_word(word, vars, &mut strings)?;
+            out.extend(strings.into_iter().map(Value::String));
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve a `...$name` spread to its element strings (a whole list or a slice).
+/// Spreading a single element (`...$xs[0]`), a string, or an unbound name is an
+/// error, matching the command-position spread rules.
+fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError> {
+    match vars.get(&vref.name) {
+        Some(Value::List(values)) => match &vref.access {
+            None => Ok(values.clone()),
+            Some(Access::Slice {
+                start,
+                end,
+                inclusive,
+            }) => Ok(slice(values, *start, *end, *inclusive).to_vec()),
+            Some(Access::Index(_)) => Err(ExpandError::Unsupported(format!(
+                "...${}: cannot spread a single list element",
+                vref.name
+            ))),
+        },
+        Some(Value::String(_)) => Err(ExpandError::Unsupported(format!(
+            "...${} on a string",
+            vref.name
+        ))),
+        None => Err(ExpandError::UnboundVar(vref.name.clone())),
+    }
+}
+
+/// If `word` is exactly a bare, unquoted `$name` (or `$name[slice]`) that resolves
+/// to a list, return that list (to bind as one typed function argument). A string,
+/// an index access, a member access, a quoted reference, or an unbound name
+/// returns `None`, so ordinary expansion handles it (and reports any error).
+fn whole_list_value(word: &Word, vars: &Vars) -> Option<Vec<String>> {
+    let [Piece::Var(vref)] = word.0.as_slice() else {
+        return None;
+    };
+    if vref.member.is_some() || vref.quoted {
+        return None;
+    }
+    match (vars.get(&vref.name), &vref.access) {
+        (Some(Value::List(values)), None) => Some(values.clone()),
+        (
+            Some(Value::List(values)),
+            Some(Access::Slice {
+                start,
+                end,
+                inclusive,
+            }),
+        ) => Some(slice(values, *start, *end, *inclusive).to_vec()),
+        _ => None,
+    }
 }
 
 /// Recognize the deliberately narrow first spread form: `...$name` as a whole

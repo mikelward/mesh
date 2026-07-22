@@ -134,6 +134,9 @@ greet world          # -> hi, world
 - **Resolution.** A name in command position resolves as **builtin → function →
   external**. The argument count must match the parameters (a mismatch is a loud,
   recoverable error).
+- **Arguments.** A function preserves typed values: a bare list (`f $xs`) arrives
+  intact as one list-valued positional, whereas an external command still needs it
+  spread (`...$xs`) or joined. A spread contributes one argument per element.
 - **Result.** A function's status is its last command's status, or `0` for an
   empty body. `return N` exits early with status `N` (masked to 0–255, like
   `exit`); a bare `return` uses the status so far. Both stop the rest of the body.
