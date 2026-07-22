@@ -1754,6 +1754,14 @@ fn a_malformed_header_does_not_leak_later_body_lines() {
 }
 
 #[test]
+fn a_disputed_quote_keeps_function_body_lines_quarantined() {
+    let out = run_with_input("func f() {\nputs xr'\\' }\nputs LEAKED\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("LEAKED"), "body leaked: {stdout}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("missing closing `}`"));
+}
+
+#[test]
 fn an_unterminated_definition_at_eof_is_reported() {
     let out = run_with_input("func f() {\n  puts hi\n");
     assert!(

@@ -509,7 +509,10 @@ fn needs_more_compound_input(text: &str) -> bool {
     };
 
     match parser::parse(text) {
-        Ok(parser::ParseOutcome::Complete(_)) => false,
+        // The executor's brace scanner is authoritative while it still sees an
+        // open function body. Lexer disagreements must not release buffered
+        // body lines to top-level execution.
+        Ok(parser::ParseOutcome::Complete(_)) => legacy_incomplete,
         Ok(parser::ParseOutcome::Incomplete) | Err(_) => legacy_incomplete,
     }
 }
@@ -1533,6 +1536,11 @@ mod tests {
     fn compound_input_completeness_comes_from_the_parser() {
         assert!(needs_more_compound_input("func f() {\nputs hi\n"));
         assert!(!needs_more_compound_input("func f() {\nputs hi\n}\n"));
+    }
+
+    #[test]
+    fn executor_scanner_keeps_disputed_function_body_open() {
+        assert!(needs_more_compound_input("func f() {\nputs xr'\\' }\n"));
     }
 
     #[test]
