@@ -9,6 +9,7 @@ mod exec;
 mod expand;
 mod funcs;
 pub mod lexer;
+pub mod parser;
 mod repl;
 mod vars;
 
