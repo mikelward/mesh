@@ -188,12 +188,12 @@ file as tasks land.
 
 ## Review Comments
 
-Unresolved review threads swept from the PRs (open and merged). Each entry is
-the full reviewer comment plus a link to the PR and the specific thread. Many
-of these already carry a maintainer reply describing a fix but were never
-marked "resolved" on GitHub; the ones with no reply (or an explicit
-"declining"/"raising with maintainer") are the genuinely open items. PRs 1–18
-were not swept in this pass.
+Review threads swept from the project's PRs (open and merged) that still need
+attention. Each entry is the full reviewer comment plus a link to the PR and the
+specific thread. Threads the maintainer already replied to as fixed — or
+declined outright — are excluded; a couple where the maintainer agreed the issue
+is real but the fix is still pending are kept and marked as such. PRs 1–18 were
+not swept in this pass.
 
 ### PR #20 — Design: modifier grammar cleanup + decisions & TODOs ([#20](https://github.com/mikelward/mesh/pull/20))
 
@@ -288,42 +288,6 @@ were not swept in this pass.
   `r = re("x"); s = "pattern=${r}"` and `s = "${sh.stdin}"` consequently have no
   specified rendering; make interpolation a loud error for no-byte-form values,
   matching the existing explicit rule for `Instant`. *(no maintainer reply)*
-
-### PR #25 — Start the M0 build track: a shell that runs external commands ([#25](https://github.com/mikelward/mesh/pull/25))
-
-- `crates/mesh/src/exec.rs:18` — [thread](https://github.com/mikelward/mesh/pull/25#discussion_r3615390637)
-  **[P1] Keep the interactive shell alive on Ctrl-C** — When stdin is a TTY and
-  a foreground command is running, mesh and the child remain in the same
-  foreground process group with the default SIGINT disposition, so pressing
-  Ctrl-C kills the shell along with the child. For example, running `sleep 10`
-  and pressing Ctrl-C exits mesh with signal 2 instead of returning to a prompt
-  with status 130, contradicting the interactive signal behavior in `DESIGN.md`;
-  the parent must survive SIGINT while ensuring the foreground child still
-  receives its default signal handling.
-  _Maintainer reply:_ Real and correct, but **deferred by decision** to the
-  dedicated job-control task, not fixed in this PR. A proper fix is job control —
-  give the foreground child its own process group and hand it the terminal with
-  `tcsetpgrp`. Tracked as a known limitation in `ROADMAP.md`/`TODO.md`. Leaving
-  this thread open until the job-control task lands. *(now addressed by the M2
-  job-control work — verify and resolve)*
-
-### PR #28 — Add tilde and glob expansion ([#28](https://github.com/mikelward/mesh/pull/28))
-
-- `crates/mesh/src/expand.rs:90` — [thread](https://github.com/mikelward/mesh/pull/28#discussion_r3616000820)
-  **[P2] Preserve the HOME prefix when formatting glob matches** — When `$HOME`
-  ends in `/` and the user-typed suffix contains glob syntax (for example,
-  `HOME=/tmp/home/` with `puts ~/*`), this path goes through `glob_with`, whose
-  returned `PathBuf` matches normalize the doubled separator, so the result
-  becomes `/tmp/home/file` rather than the documented verbatim substitution
-  `/tmp/home//file`. With `HOME=/`, this similarly changes `//file` to `/file`,
-  which can name a different pathname on POSIX systems. Reconstruct each match
-  with the original `$HOME` prefix spelling.
-  _Maintainer reply:_ Declining this one as a known, near-zero-impact limitation
-  rather than fixing it now (redundant slashes collapse to the same file on
-  POSIX; the `//` leading-slash corner is implementation-defined and Linux/macOS
-  both treat as `/`). Sits in the same bucket as the documented String-model
-  limitation; the whole expansion path gets revisited with the `OsString` rework.
-  *(declined — tracked limitation)*
 
 ### PR #29 — Design: regex literal, absolute-path rule, and string quoting (Model B) ([#29](https://github.com/mikelward/mesh/pull/29))
 
