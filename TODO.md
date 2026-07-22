@@ -155,7 +155,7 @@ file as tasks land.
 
 ## Icebox / decide later
 
-- [ ] **`return` with no argument — use the last status.** `exit` already does
+- [x] **`return` with no argument — use the last status.** `exit` already does
       this (a bare `exit` leaves the last command's status). Apply the same rule
       to `return` when it lands with function bodies.
 - [ ] **Reserve only bare `_` as discard, allow `_name`.** Today a name must
@@ -529,8 +529,8 @@ not swept in this pass.
   double-quoted string behavior in `DESIGN.md:755-764` and is inconsistent with
   `ys = "x$xs"`, which correctly rejects rendering the list as text. Retain
   whether the reference was quoted or restrict this path to bare references, and
-  cover the quoted whole-list and slice cases with a regression test. *(no
-  maintainer reply)*
+  cover the quoted whole-list and slice cases with a regression test. *(addressed
+  by e2ad505 "Preserve quote context for list assignments" — verify and resolve)*
 
 ### PRs with no unresolved review threads
 
