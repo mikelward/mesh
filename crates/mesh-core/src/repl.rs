@@ -16,7 +16,7 @@ use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 
 use crate::builtins::{self, Builtin};
 use crate::lexer::{Piece, Redir, RedirKind, Sep, Stage, Word};
-use crate::vars::Vars;
+use crate::vars::{Value, Vars};
 use crate::{exec, expand, lexer};
 
 /// Run the shell until end-of-input or `exit`, returning the last status as the
@@ -228,7 +228,11 @@ fn run_command_or_assign(
     jobs: &mut exec::JobTable,
 ) -> Step {
     match classify(tokens) {
-        Line::Assign { name, rhs } => match assign(&name, rhs, vars) {
+        Line::Assign { name, rhs, append } => match if append {
+            append_assign(&name, rhs, vars)
+        } else {
+            assign(&name, rhs, vars)
+        } {
             Ok(()) => Step::Continue(0),
             Err(msg) => {
                 eprintln!("mesh: {msg}");
@@ -268,31 +272,37 @@ fn run_command_or_assign(
 
 /// A classified line: a variable binding or a command.
 enum Line {
-    Assign { name: String, rhs: Vec<Word> },
+    Assign {
+        name: String,
+        rhs: Vec<Word>,
+        append: bool,
+    },
     Command(Vec<Word>),
 }
 
-/// Classify a non-empty token list. An assignment is a leading `name = value`
-/// (spaced) or `name=value` (unspaced, the whole statement); position separates
-/// it from a `k=v` argument after a command word (`git commit --author=me`).
+/// Classify a non-empty token list. An assignment uses `=` or `+=`, either
+/// spaced or unspaced as the whole statement; position separates it from a
+/// `k=v` argument after a command word (`git commit --author=me`).
 ///
 /// Deferred: prefix env (`FOO=1 cmd` — use `env FOO=1 cmd`), and `name=value`
 /// followed by more words.
 fn classify(mut tokens: Vec<Word>) -> Line {
-    // Spaced: `name` `=` value…
-    if tokens.len() >= 2 && is_equals(&tokens[1]) {
+    // Spaced: `name` (`=` | `+=`) value…
+    if tokens.len() >= 2 && assignment_operator(&tokens[1]).is_some() {
         if let Some(name) = bare_ident(&tokens[0]) {
             let name = name.to_string();
+            let append = assignment_operator(&tokens[1]) == Some(true);
             let rhs = tokens.split_off(2);
-            return Line::Assign { name, rhs };
+            return Line::Assign { name, rhs, append };
         }
     }
-    // Unspaced: a single word `name=value`.
+    // Unspaced: a single word `name=value` or `name+=value`.
     if tokens.len() == 1 {
-        if let Some((name, rhs)) = split_unspaced_assignment(&tokens[0]) {
+        if let Some((name, rhs, append)) = split_unspaced_assignment(&tokens[0]) {
             return Line::Assign {
                 name,
                 rhs: vec![rhs],
+                append,
             };
         }
     }
@@ -312,15 +322,29 @@ fn bare_ident(word: &Word) -> Option<&str> {
     }
 }
 
-/// Is `word` exactly the bare token `=`?
-fn is_equals(word: &Word) -> bool {
-    matches!(word.0.as_slice(), [Piece::Text { text, expandable: true }] if text == "=")
+/// Recognize a bare `=` or `+=` assignment operator.
+fn assignment_operator(word: &Word) -> Option<bool> {
+    match word.0.as_slice() {
+        [
+            Piece::Text {
+                text,
+                expandable: true,
+            },
+        ] if text == "=" => Some(false),
+        [
+            Piece::Text {
+                text,
+                expandable: true,
+            },
+        ] if text == "+=" => Some(true),
+        _ => None,
+    }
 }
 
 /// Split a single word `name=value…` into the name and a word for the value, if
 /// the leading unquoted text is `ident=…`. `value` keeps any later pieces (so
 /// `x=$y` binds `x` to the value of `$y`).
-fn split_unspaced_assignment(word: &Word) -> Option<(String, Word)> {
+fn split_unspaced_assignment(word: &Word) -> Option<(String, Word, bool)> {
     let [
         Piece::Text {
             text,
@@ -331,7 +355,10 @@ fn split_unspaced_assignment(word: &Word) -> Option<(String, Word)> {
     else {
         return None;
     };
-    let (name, after) = text.split_once('=')?;
+    let (before, after) = text.split_once('=')?;
+    let (name, append) = before
+        .strip_suffix('+')
+        .map_or((before, false), |name| (name, true));
     if !lexer::is_ident(name) {
         return None;
     }
@@ -343,7 +370,7 @@ fn split_unspaced_assignment(word: &Word) -> Option<(String, Word)> {
         });
     }
     value.extend(rest.iter().map(clone_piece));
-    Some((name.to_string(), Word(value)))
+    Some((name.to_string(), Word(value), append))
 }
 
 fn clone_piece(piece: &Piece) -> Piece {
@@ -381,6 +408,41 @@ fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
         }
         0 => Err(format!("{name}: assignment needs a value")),
         _ => Err(format!("{name}: list assignment not supported yet")),
+    }
+}
+
+/// Apply `+=` without coercion: strings concatenate, while lists append a
+/// scalar or extend with another list.
+fn append_assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
+    if name == "env" {
+        return Err(format!("{name}: cannot assign to the reserved name"));
+    }
+    let value = if let Some(items) = list_literal(rhs.as_slice()) {
+        Value::List(expand::expand(items, vars).map_err(|e| e.to_string())?)
+    } else if let [Word(pieces)] = rhs.as_slice() {
+        if let [Piece::Var(vref)] = pieces.as_slice() {
+            if vref.member.is_none() && vref.access.is_none() {
+                vars.get(&vref.name)
+                    .cloned()
+                    .ok_or_else(|| format!("{}: unbound variable", vref.name))?
+            } else {
+                scalar_value(rhs, vars, name)?
+            }
+        } else {
+            scalar_value(rhs, vars, name)?
+        }
+    } else {
+        scalar_value(rhs, vars, name)?
+    };
+    vars.append(name, value)
+}
+
+fn scalar_value(rhs: Vec<Word>, vars: &Vars, name: &str) -> Result<Value, String> {
+    let mut args = expand::expand(rhs, vars).map_err(|e| e.to_string())?;
+    match args.len() {
+        1 => Ok(Value::String(args.pop().unwrap())),
+        0 => Err(format!("{name}: assignment needs a value")),
+        _ => Err(format!("{name}: append needs one value")),
     }
 }
 

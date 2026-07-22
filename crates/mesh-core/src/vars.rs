@@ -39,4 +39,21 @@ impl Vars {
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.map.get(name)
     }
+
+    /// Append `value` according to the current string/list value rules.
+    pub fn append(&mut self, name: &str, value: Value) -> Result<(), String> {
+        let current = self
+            .map
+            .get_mut(name)
+            .ok_or_else(|| format!("{name}: unbound variable"))?;
+        match (current, value) {
+            (Value::String(left), Value::String(right)) => left.push_str(&right),
+            (Value::List(left), Value::List(mut right)) => left.append(&mut right),
+            (Value::List(left), Value::String(right)) => left.push(right),
+            (Value::String(_), Value::List(_)) => {
+                return Err(format!("{name}: cannot append a list to a string"));
+            }
+        }
+        Ok(())
+    }
 }

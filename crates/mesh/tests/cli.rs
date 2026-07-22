@@ -444,6 +444,32 @@ fn list_literal_preserves_quoted_empty_elements() {
 }
 
 #[test]
+fn append_assignment_concatenates_strings_and_grows_lists() {
+    let out = run_with_input(
+        "greeting = hi\ngreeting += ' there'\nputs $greeting\nxs = [a b]\nxs += c\nxs += [d e]\nmore = [f g]\nxs += $more\nputs ...$xs\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi there\na b c d e f g\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn unspaced_append_assignment_and_type_errors_recover() {
+    let out = run_with_input(
+        "x=one\nx+=two\nputs $x\nxs=[a]\nxs+=b\nputs ...$xs\nx += [bad]\nmissing += value\nputs recovered\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "onetwo\na b\nrecovered\n"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot append a list to a string"));
+    assert!(stderr.contains("missing: unbound variable"));
+}
+
+#[test]
 fn list_requires_explicit_spread_in_command_arguments() {
     let out = run_with_input("xs = [a b]\nputs $xs\nputs recovered\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("list value needs `...`"));
