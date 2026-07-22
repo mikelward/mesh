@@ -146,7 +146,8 @@ mesh/
 │   │   └── src/
 │   │       ├── lib.rs      # public run entry point and lexer module
 │   │       ├── repl.rs     # read / tokenize / dispatch loop
-│   │       ├── lexer.rs    # quotes + escapes + $interpolation → words of pieces
+│   │       ├── lexer.rs    # compatibility lexer used by the current evaluator
+│   │       ├── parser.rs   # span-carrying M3 tokens and command/value AST
 │   │       ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
 │   │       ├── vars.rs     # variable store: global scope + function-local scopes
 │   │       ├── funcs.rs    # user-defined function store (name → params + body)

@@ -70,8 +70,8 @@ file as tasks land.
       block parser.
   - [x] Fix the parser grammar, precedence, attachment, and completeness contract
         in [`PARSER.md`](PARSER.md).
-  - [ ] Emit a span-carrying token stream without performing structural parsing.
-  - [ ] Parse tokens into command, expression, and block AST nodes.
+  - [x] Emit a span-carrying token stream without performing structural parsing.
+  - [x] Parse tokens into command, expression, and block AST nodes.
   - [ ] Evaluate the AST through the existing expansion and execution layers,
         then remove the raw-text compound-form recognizers.
 - [x] General list expressions: nested values, indexing/slicing, `+=`, and
