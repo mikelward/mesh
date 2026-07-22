@@ -36,9 +36,11 @@ Cargo, as a **workspace** rooted at [`Cargo.toml`](Cargo.toml).
 
 - **Edition:** 2024. **MSRV:** 1.85 (recorded as `rust-version`; bumps are
   deliberate, not incidental).
-- **Two members today** — `crates/mesh`, the thin shell executable, and
-  `crates/mesh-core`, the reusable lexer, expansion, and runtime library. The
-  workspace leaves room for satellite crates without restructuring.
+- **Three members today** — `crates/mesh`, the thin shell executable;
+  `crates/mesh-core`, the reusable lexer, expansion, and runtime library; and
+  `crates/mesh-platform`, a small crate holding the `libc` constants and types
+  whose definitions differ across platforms. The workspace leaves room for more
+  satellite crates without restructuring.
 - **Lints are centralized** in `[workspace.lints]` and inherited by each crate
   (`[lints] workspace = true`). CI denies warnings, so keep the tree clean rather
   than scattering `#[allow]`.
@@ -135,16 +137,19 @@ mesh/
 │   │   ├── Cargo.toml
 │   │   ├── src/main.rs     # calls mesh_core::run
 │   │   └── tests/cli.rs    # end-to-end tests driving the built binary
-│   └── mesh-core/          # reusable shell implementation
+│   ├── mesh-core/          # reusable shell implementation
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs      # public run entry point and lexer module
+│   │       ├── repl.rs     # read / tokenize / dispatch loop
+│   │       ├── lexer.rs    # quotes + escapes + $interpolation → words of pieces
+│   │       ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
+│   │       ├── vars.rs     # session-global variable store
+│   │       ├── builtins.rs # cd, pwd, puts, exit + job-builtin recognition
+│   │       └── exec.rs     # launch external commands + pipelines/redirection
+│   └── mesh-platform/      # libc constants/types that differ across platforms
 │       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs      # public run entry point and lexer module
-│           ├── repl.rs     # read / tokenize / dispatch loop
-│           ├── lexer.rs    # quotes + escapes + $interpolation → words of pieces
-│           ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
-│           ├── vars.rs     # session-global variable store
-│           ├── builtins.rs # cd, pwd, puts, exit + job-builtin recognition
-│           └── exec.rs     # launch external commands + pipelines/redirection
+│       └── src/lib.rs      # e.g. TIOCSCTTY, typed for libc::ioctl per platform
 ├── DESIGN.md               # vision + language design (the "why/what")
 ├── DEVELOPMENT.md          # this file (the "how to build")
 ├── GRAMMAR.md              # the grammar actually implemented so far (grows per task)
