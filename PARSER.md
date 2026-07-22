@@ -99,9 +99,9 @@ conditional-assignment
                 = binding "=" value-expression ;
 for-expression  = "for" pattern "in" value-expression block ;
 match-expression
-                = "match" value-expression "{" match-arm* "}" ;  # later
+                = "match" value-expression "{" match-arm* "}" ;
 match-arm       = pattern block terminator* ;
-pattern         = name | "_" ;                             # destructuring: later
+pattern         = name | "_" | list-pattern ;
 ```
 
 `command-word` is the lexer's adjacency-preserving word token, including
@@ -257,6 +257,6 @@ surrounding scope.
 
 The first parser must preserve all valid forms documented in `GRAMMAR.md` unless
 this contract explicitly rejects one. It may initially build placeholder AST
-nodes for reserved *later* forms and diagnose them as unsupported. The executor,
+nodes for reserved future forms and diagnose them as unsupported. The executor,
 job-control implementation, value store, and expansion rules are consumers of
 the AST rather than part of this replacement.

@@ -26,8 +26,9 @@ regex and glob matching with `~`, collection iteration and destructuring,
 functions, `if`/`match` expressions, and postfix value modifiers.
 For a hands-on walk through what runs today, see
 [`docs/TOUR.md`](docs/TOUR.md); for a terse lookup,
-[`docs/REFERENCE.md`](docs/REFERENCE.md). The full language is still landing task
-by task — see [`ROADMAP.md`](ROADMAP.md).
+[`docs/REFERENCE.md`](docs/REFERENCE.md). This is the completed M3 language
+surface; later design work remains tracked in
+[`ROADMAP.md`](ROADMAP.md) and [`TODO.md`](TODO.md).
 
 ## Name
 
@@ -38,7 +39,7 @@ overloaded in infra (service mesh, mesh networking) and sits one letter from
 ## Status
 
 Language design remains in draft. Implementation has completed the M2 shell
-runtime (pipelines, redirection, and job control) and begun **M3** with typed
-values, explicit `...$list` argument spread, functions, conditionals, collection
-loops and matching. See
+runtime (pipelines, redirection, and job control) and completed **M3** with typed
+values, the clean-break parser, explicit `...$list` argument spread, functions,
+conditionals, collection loops, destructuring, and matching. See
 [`ROADMAP.md`](ROADMAP.md).

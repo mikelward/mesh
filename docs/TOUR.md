@@ -365,8 +365,9 @@ list element, for example `for [key value] in $pairs { ... }`.
 
 ## Selecting a value with `match`
 
-`match` tries arms from top to bottom. The implemented surface supports exact
-values, list patterns, `_`, and `if` guards:
+`match` tries arms from top to bottom. It supports exact values, globs, regular
+expressions, integer ranges, `|` alternatives, list patterns, `_`, and `if`
+guards:
 
 <pre>
 mesh$ <strong>command = [start server verbose]</strong>
@@ -378,8 +379,7 @@ mesh$ <strong>puts ...$result</strong>
 start server verbose
 </pre>
 
-Glob, regex, range, and alternate `match` arms are still ahead; use the `~`
-operator for a one-line glob or regex test today.
+Use `~` when a one-line glob or regex boolean test is clearer than a `match`.
 
 ## Functions
 

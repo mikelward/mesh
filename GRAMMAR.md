@@ -1,42 +1,16 @@
-# Grammar (implemented subset)
+# Legacy incremental grammar notes
 
-The grammar mesh **currently parses**, grown one task at a time — deliberately a
-*subset* of the full language in [`DESIGN.md`](DESIGN.md), just enough for the
-features built so far. Where this doc and `DESIGN.md` differ, `DESIGN.md` is the
-eventual target and this file is the current reality. Decisions made ahead of the
-full design are noted inline and are open to revision.
+This file records the task-by-task grammar that preceded M3. It remains useful
+for the public compatibility lexer and the history of M0–M2 behavior, but it is
+**not** the current execution grammar: M3 replaced that path with the
+span-carrying clean-break parser described in [`PARSER.md`](PARSER.md). The
+implemented user-facing surface is summarized in
+[`docs/REFERENCE.md`](docs/REFERENCE.md), while [`DESIGN.md`](DESIGN.md) remains
+the eventual language target.
 
-Notation is EBNF-ish: `*` = zero or more, `?` = optional, `|` = alternative,
-`"x"` = literal.
-
-## Complexity audit
-
-The implemented grammar is still small, but a few rules make the lexer more
-context-sensitive than the notation above suggests. Before adding general
-expressions, the following simplifications would reduce special cases and make
-future parsing errors more predictable:
-
-1. **Empty command positions are errors (completed).** Leading and repeated
-   separators are rejected. Trailing `&&` and `||` are incomplete while input
-   is being edited and become errors only at EOF. A single trailing `;` is
-   permitted as a statement terminator. Every conditional operator thus
-   has two operands, without status-preservation edge cases.
-2. **Tokenize first, validate structure second.** `split_line` currently finds
-   words, separators, pipes, redirections, and unsupported descriptor redirects
-   in one pass. Descriptor detection consequently needs to inspect both built
-   pieces and the original character stream. A small token stream (`Word`,
-   `Separator`, `Pipe`, `Redirect`, `Background`) followed by a structural
-   parser would centralize longest-match rules and make later operators easier
-   to add without changing quote handling.
-3. **Keep access syntax in one parser.** Braced and unbraced interpolation share
-   names, member access, indices, and slices, but differ in how malformed access
-   is reported. General expressions should reuse one variable-reference parser
-   with an explicit strict/lenient terminator policy rather than adding another
-   copy for each context.
-
-The highest-value behavior change is item 1 because it removes surprising
-accepted input. Items 2–3 are implementation constraints to settle before the
-expression grammar grows; they do not require changing today’s valid programs.
+The sections below are historical snapshots, so statements such as “deferred”
+or “still ahead” describe the point at which that slice landed, not current M3
+status.
 
 ## Task 1 — external commands + `exit`
 

@@ -60,7 +60,7 @@ file as tasks land.
 - [x] Hand the terminal to full-screen programs and restore the shell's terminal
       modes cleanly when they exit or stop.
 
-## M3 — The mesh language (in progress)
+## M3 — The mesh language ✅ (done)
 
 - [x] First typed value: bracketed list literals in assignment
       (`xs = [a "b c"]`), including the distinct empty list (`xs = []`).
@@ -121,11 +121,10 @@ file as tasks land.
       `return`. Resolution is builtins → functions → external. Deferred:
       flags/optionals/rest parameters, functions in pipelines/redirections, and
       calling for a value (`f(arg)`) vs running (`f arg`).
-- [x] First `if` expression slice — command-status conditions, brace-delimited
-      `else` / `else if`, multiline bodies, and assignment-position string/list
-      results. Deferred with the general expression parser: boolean/comparison
-      conditions and conditional destructuring.
-- [ ] Finish `for` / `match`, in dependency order:
+- [x] First `if` expression slice — command-status and value conditions, brace-delimited
+      `else` / `else if`, multiline bodies, typed assignment-position results,
+      and conditional list-pattern binding.
+- [x] Finish `for` / `match`, in dependency order:
   - [x] First `for` slice over string lists and expanded word expressions, with
         brace-delimited multiline bodies and current-scope bindings.
   - [x] Ordered map iteration with `key, value` binders, bounded integer range
@@ -135,9 +134,9 @@ file as tasks land.
   - [x] Implement `match` parsing and evaluation, including ordered first-match
         arms, literal/glob/regex/range/`_` patterns, alternation, list patterns,
         guards, statement position, and expression results.
-  - [ ] Add loop-control regression coverage for nested loops and for `break` /
+  - [x] Add loop-control regression coverage for nested loops and for `break` /
         `continue` reached through nested `if` and function calls.
-  - [ ] Audit the M3 acceptance examples in [`DESIGN.md`](DESIGN.md) and
+  - [x] Audit the M3 acceptance examples in [`DESIGN.md`](DESIGN.md) and
         [`docs/INTRO.md`](docs/INTRO.md): add end-to-end coverage for examples
         that are in scope, inventory dependencies that remain, and update the
         milestone documentation without silently weakening its acceptance bar.
