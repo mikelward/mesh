@@ -16,13 +16,10 @@ context-sensitive than the notation above suggests. Before adding general
 expressions, the following simplifications would reduce special cases and make
 future parsing errors more predictable:
 
-1. **Make empty command positions errors.** Empty segments are currently no-ops
-   around `;`, `&&`, and `||`, while an empty pipeline stage or background
-   command is an error. Rejecting leading, repeated, and trailing separators
-   (except a single trailing `;`, if desired) would give every operator the same
-   "two operands" shape and remove status-preservation edge cases. In
-   particular, `a &&` and `a ||` should be syntax errors rather than commands
-   whose missing right-hand side is silently skipped.
+1. **Empty command positions are errors (completed).** Leading and repeated
+   separators are rejected, as are trailing `&&` and `||`. A single trailing
+   `;` is permitted as a statement terminator. Every conditional operator thus
+   has two operands, without status-preservation edge cases.
 2. **Give raw strings an unambiguous token spelling.** The `r'…'` / `r"…"`
    prefix is recognized only at a word boundary or after a bare `=` so that the
    `r` in `ptr'x'` remains ordinary text. That makes tokenization depend on the
@@ -181,9 +178,9 @@ function-local scope, the `$sh.*` surface, and `$env:get(K, default)`.
 A line is now a sequence of commands joined by separators, run left to right:
 
 ```
-line    = segment (sep segment)*
+line    = segment (sep segment)* ";"?
 sep     = ";" | "&&" | "||"
-segment = words?                      # may be empty (a no-op)
+segment = words
 ```
 
 - **`;`** runs the next command unconditionally; **`&&`** runs it only if the
@@ -191,13 +188,10 @@ segment = words?                      # may be empty (a no-op)
   (nonzero). Equal precedence, left-associative — `a && b || c` is `(a && b) || c`.
 - A separator is recognized only **bare**: a quoted (`'a;b'`) or backslash-escaped
   (`a\;b`) operator is a literal character.
-- Short-circuited and **empty** segments (a blank line, a leading/trailing `;`,
-  `;;`) are no-ops that leave the status unchanged. The line's status is the last
-  command actually run — so `exit` in a later segment sees it (`false; exit` → 1).
-
-Deferred: `&` (background) is **not** an operator yet — a lone `&` stays a
-literal character (it arrives with job control). A dangling trailing operator
-(`a &&`) is currently a lenient no-op, not an error.
+- A blank line is a no-op. Leading or repeated separators and trailing `&&` or
+  `||` are syntax errors; one trailing `;` is allowed. The line's status is the
+  last command actually run — so `exit` in a later segment sees it
+  (`false; exit` → 1).
 
 ## Task 8 — pipes and redirection
 
@@ -205,7 +199,7 @@ Each command is now a **pipeline** of `|`-joined stages, and every stage may car
 `<` / `>` / `>>` redirections:
 
 ```
-segment = pipeline?                   # may be empty (a no-op)
+segment = pipeline
 pipeline = stage ("|" stage)*
 stage    = (word | redir)+            # words and redirections interleave
 redir    = ("<" | ">" | ">>") word    # the following word is the target file

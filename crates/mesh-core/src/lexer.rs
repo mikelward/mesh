@@ -67,6 +67,7 @@ pub enum LexError {
     EmptyPipelineStage,
     UnsupportedRedirect,
     EmptyBackgroundCommand,
+    EmptyCommand,
 }
 
 impl std::fmt::Display for LexError {
@@ -94,6 +95,7 @@ impl std::fmt::Display for LexError {
             LexError::EmptyBackgroundCommand => {
                 write!(f, "syntax error: background operator needs a command")
             }
+            LexError::EmptyCommand => write!(f, "syntax error: empty command between separators"),
         }
     }
 }
@@ -156,6 +158,7 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
     let mut pending_redir: Option<RedirKind> = None;
     let mut sep_before = Sep::Seq;
     let mut current: Option<Vec<Piece>> = None;
+    let mut trailing_separator = None;
     let mut i = 0;
 
     while i < chars.len() {
@@ -180,6 +183,9 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
             if pending_redir.is_some() {
                 return Err(LexError::MissingRedirectTarget);
             }
+            if stages.is_empty() && words.is_empty() && redirs.is_empty() {
+                return Err(LexError::EmptyCommand);
+            }
             finish_segment(
                 &mut segments,
                 sep_before,
@@ -189,6 +195,7 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
                 false,
             )?;
             sep_before = sep;
+            trailing_separator = Some(sep);
             i += len;
             continue;
         }
@@ -209,6 +216,7 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
                 true,
             )?;
             sep_before = Sep::Seq;
+            trailing_separator = None;
             i += 1;
             continue;
         }
@@ -244,6 +252,7 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
             continue;
         }
         let at_word_start = current.is_none();
+        trailing_separator = None;
         let word = current.get_or_insert_with(Vec::new);
         // A raw string is recognized where a string piece can begin: at a word
         // start, and right after an unescaped `=`. A bare `'…'`/`"…"` already
@@ -293,14 +302,23 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
     if pending_redir.is_some() {
         return Err(LexError::MissingRedirectTarget);
     }
-    finish_segment(
-        &mut segments,
-        sep_before,
-        &mut stages,
-        &mut words,
-        &mut redirs,
-        false,
-    )?;
+    let command_empty = stages.is_empty() && words.is_empty() && redirs.is_empty();
+    if command_empty {
+        match trailing_separator {
+            Some(Sep::Seq) => {} // A single trailing `;` is permitted.
+            Some(Sep::And | Sep::Or) => return Err(LexError::EmptyCommand),
+            None => {} // Blank line, or a pipeline terminated by `&`.
+        }
+    } else {
+        finish_segment(
+            &mut segments,
+            sep_before,
+            &mut stages,
+            &mut words,
+            &mut redirs,
+            false,
+        )?;
+    }
     Ok(segments)
 }
 
@@ -322,9 +340,9 @@ fn finish_word(
 }
 
 /// Close off the pipeline accumulated so far and push it as a segment. The final
-/// stage is completed from `words`/`redirs`; an empty final stage is a no-op for
-/// a single-stage segment (a blank line, `;;`) but an error inside a pipeline
-/// (a trailing `|`).
+/// stage is completed from `words`/`redirs`; an empty final stage is an error
+/// inside a pipeline (a trailing `|`). Callers filter blank lines and a permitted
+/// trailing semicolon before reaching this helper.
 fn finish_segment(
     segments: &mut Vec<Segment>,
     sep_before: Sep,
@@ -891,12 +909,17 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_segment_is_kept() {
-        // A trailing `;` leaves an empty final segment (no stages); the runner
-        // treats it as a no-op. Structurally it is still present.
+    fn a_single_trailing_semicolon_is_permitted() {
         let segs = split_line("a ;").unwrap();
-        assert_eq!(segs.len(), 2);
-        assert!(segs[1].stages.is_empty());
+        assert_eq!(segs, [seg(Sep::Seq, &["a"])]);
+    }
+
+    #[test]
+    fn empty_command_positions_are_errors() {
+        for line in ["; a", "&& a", "|| a", "a ;; b", "a ; && b", "a &&", "a ||"] {
+            assert_eq!(split_line(line), Err(LexError::EmptyCommand), "{line:?}");
+        }
+        assert!(split_line("").unwrap().is_empty());
     }
 
     #[test]
