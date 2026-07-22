@@ -1083,29 +1083,10 @@ fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
     }
 }
 
-/// Preserve list values in an exact variable-to-variable assignment. Command
+/// Preserve typed values in an exact variable-reference assignment. Command
 /// expansion still requires `...`; assignment is a value context instead.
 fn assignment_value(vref: &crate::lexer::VarRef, vars: &Vars) -> Result<Value, String> {
-    if !vref.modifiers.is_empty() {
-        return expand::resolve_value(vref, vars).map_err(|error| error.to_string());
-    }
-    let value = vars
-        .get(&vref.name)
-        .ok_or_else(|| format!("{}: unbound variable", vref.name))?;
-    match (&vref.access, value) {
-        (None, value) => Ok(value.clone()),
-        (
-            Some(crate::lexer::Access::Slice {
-                start,
-                end,
-                inclusive,
-            }),
-            Value::List(values),
-        ) => Ok(Value::List(
-            expand::slice(values, *start, *end, *inclusive).to_vec(),
-        )),
-        _ => scalar_value(vec![Word(vec![Piece::Var(vref.clone())])], vars, &vref.name),
-    }
+    expand::resolve_value(vref, vars).map_err(|error| error.to_string())
 }
 
 /// Apply `+=` without coercion: strings concatenate, while lists append a

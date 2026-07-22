@@ -116,10 +116,10 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
         .collect()
 }
 
-/// If `word` is exactly a bare, unquoted `$name` (or `$name[slice]`) that resolves
-/// to a list, return that list (to bind as one typed function argument). A string,
-/// an index access, a member access, a quoted reference, or an unbound name
-/// returns `None`, so ordinary expansion handles it (and reports any error).
+/// If `word` is exactly a bare, unquoted variable reference that resolves to a
+/// list, return that list (to bind as one typed function argument). A string, a
+/// member access, a quoted reference, or an unbound name returns `None`, so
+/// ordinary expansion handles it (and reports any error).
 fn whole_list_value(word: &Word, vars: &Vars) -> Option<Vec<Value>> {
     let [Piece::Var(vref)] = word.0.as_slice() else {
         return None;
@@ -127,22 +127,8 @@ fn whole_list_value(word: &Word, vars: &Vars) -> Option<Vec<Value>> {
     if vref.member.is_some() || vref.quoted {
         return None;
     }
-    if !vref.modifiers.is_empty() {
-        return match resolve_value(vref, vars) {
-            Ok(Value::List(values)) => Some(values),
-            _ => None,
-        };
-    }
-    match (vars.get(&vref.name), &vref.access) {
-        (Some(Value::List(values)), None) => Some(values.clone()),
-        (
-            Some(Value::List(values)),
-            Some(Access::Slice {
-                start,
-                end,
-                inclusive,
-            }),
-        ) => Some(slice(values, *start, *end, *inclusive).to_vec()),
+    match resolve_value(vref, vars) {
+        Ok(Value::List(values)) => Some(values),
         _ => None,
     }
 }

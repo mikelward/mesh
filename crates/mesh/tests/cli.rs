@@ -206,6 +206,25 @@ fn general_lists_preserve_nesting_and_spread_one_level() {
 }
 
 #[test]
+fn indexed_nested_lists_remain_typed_in_value_contexts() {
+    let out = run_with_input(
+        "nested = [zero [one two] three]\n\
+         copy = $nested[1]\n\
+         puts ...$copy\n\
+         func show(value) { puts ...$value }\n\
+         show $nested[1]\n\
+         wrapped = [$nested[1]]\n\
+         puts ...$wrapped[0]\n",
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "one two\none two\none two\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn a_nested_list_cannot_cross_the_command_boundary_implicitly() {
     let out = run_with_input("xs = [[one two]]\nputs ...$xs\n");
     assert_eq!(out.status.code(), Some(1));
