@@ -195,6 +195,10 @@ enum Outcome {
         child: Child,
         piped_out: bool,
     },
+    Completed {
+        code: u8,
+        piped_out: bool,
+    },
     Failed(u8),
 }
 
@@ -220,11 +224,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
     let interactive = std::io::stdin().is_terminal();
     let mut outcomes: Vec<Outcome> = Vec::new();
     // A background job must not consume commands from the shell's input.
-    let mut next_stdin = if background {
-        NextIn::Null
-    } else {
-        NextIn::Inherit
-    };
+    let mut next_stdin = initial_stdin(background, interactive);
     let mut process_group = None;
     let shell_modes = interactive.then(terminal_modes).flatten();
 
@@ -232,16 +232,20 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
     // own in source order, but different stages open at the same time, so a FIFO
     // opened by one stage does not block a peer opened by another stage of the
     // same pipeline (`cat < fifo | cmd > fifo`) before the writer is spawned.
-    let opened = std::thread::scope(|scope| {
-        let handles: Vec<_> = cmds
-            .iter()
-            .map(|cmd| scope.spawn(move || open_redirs(&cmd.redirs)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Ok((None, None))))
-            .collect::<Vec<_>>()
-    });
+    let opened = if background {
+        (0..n).map(|_| Ok((None, None))).collect()
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = cmds
+                .iter()
+                .map(|cmd| scope.spawn(move || open_redirs(&cmd.redirs)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Ok((None, None))))
+                .collect::<Vec<_>>()
+        })
+    };
 
     for ((idx, cmd), redir_result) in cmds.into_iter().enumerate().zip(opened) {
         let is_last = idx + 1 == n;
@@ -259,8 +263,13 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
             }
         };
 
-        let mut command = Command::new(&cmd.words[0]);
-        command.args(&cmd.words[1..]);
+        let mut command = if background && !cmd.redirs.is_empty() {
+            background_redirect_command(&cmd)
+        } else {
+            let mut command = Command::new(&cmd.words[0]);
+            command.args(&cmd.words[1..]);
+            command
+        };
         if interactive || background {
             // A zero process group makes the first child a group leader. Later
             // stages join it, so terminal signals address the entire pipeline.
@@ -405,6 +414,14 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
     }
 }
 
+fn initial_stdin(background: bool, interactive: bool) -> NextIn {
+    if background && !interactive {
+        NextIn::Null
+    } else {
+        NextIn::Inherit
+    }
+}
+
 enum WaitResult {
     Complete(u8),
     Stopped(u8),
@@ -413,12 +430,13 @@ enum WaitResult {
 fn wait_outcomes(outcomes: &mut [Outcome]) -> WaitResult {
     let mut status = 0;
     let mut stopped = None;
-    for outcome in outcomes {
+    for outcome in &mut *outcomes {
         let (code, piped_out, did_stop) = match outcome {
             Outcome::Running { child, piped_out } => {
                 let (code, stopped) = wait_for_job(child).unwrap_or((1, false));
                 (code, *piped_out, stopped)
             }
+            Outcome::Completed { code, piped_out } => (*code, *piped_out, false),
             Outcome::Failed(code) => (*code, false, false),
         };
         if did_stop {
@@ -434,10 +452,11 @@ fn wait_outcomes(outcomes: &mut [Outcome]) -> WaitResult {
 fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<WaitResult> {
     let mut any_running = false;
     let mut status = 0;
-    for outcome in outcomes {
+    for outcome in &mut *outcomes {
         let Outcome::Running { child, piped_out } = outcome else {
             continue;
         };
+        let piped_out = *piped_out;
         let mut raw = 0;
         let result = unsafe {
             libc::waitpid(
@@ -452,12 +471,44 @@ fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<WaitResult> {
             return Some(WaitResult::Stopped(128 + libc::WSTOPSIG(raw) as u8));
         } else if result > 0 {
             let code = wait_status(raw);
-            if code != 0 && !(*piped_out && code == SIGPIPE_CODE) {
+            *outcome = Outcome::Completed { code, piped_out };
+            if code != 0 && !(piped_out && code == SIGPIPE_CODE) {
                 status = code;
             }
         }
     }
+    if !any_running {
+        status = outcomes.iter().fold(0, |status, outcome| match outcome {
+            Outcome::Completed { code, piped_out }
+                if *code != 0 && !(*piped_out && *code == SIGPIPE_CODE) =>
+            {
+                *code
+            }
+            Outcome::Failed(code) if *code != 0 => *code,
+            _ => status,
+        });
+    }
     (!any_running).then_some(WaitResult::Complete(status))
+}
+
+/// Start a tiny shell before opening background redirects. `Command::spawn`
+/// returns once that shell execs, leaving potentially blocking FIFO opens in
+/// the job rather than the interactive shell.
+fn background_redirect_command(cmd: &Cmd) -> Command {
+    let mut script = String::new();
+    for (kind, _) in &cmd.redirs {
+        match kind {
+            RedirKind::In => script.push_str("exec 0<\"$1\"; shift; "),
+            RedirKind::Out => script.push_str("exec 1>\"$1\"; shift; "),
+            RedirKind::Append => script.push_str("exec 1>>\"$1\"; shift; "),
+        }
+    }
+    script.push_str("exec \"$@\"");
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script).arg("mesh-redir");
+    command.args(cmd.redirs.iter().map(|(_, path)| path));
+    command.args(&cmd.words);
+    command
 }
 
 fn signal_group(pgid: libc::pid_t, signal: libc::c_int, label: &str) -> Result<(), ()> {
@@ -616,7 +667,16 @@ fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobTable, restore_job_signals, restore_terminal_modes, run, terminal_modes};
+    use super::{
+        JobTable, NextIn, initial_stdin, restore_job_signals, restore_terminal_modes, run,
+        terminal_modes,
+    };
+
+    #[test]
+    fn interactive_background_jobs_keep_terminal_stdin() {
+        assert!(matches!(initial_stdin(true, true), NextIn::Inherit));
+        assert!(matches!(initial_stdin(true, false), NextIn::Null));
+    }
 
     #[test]
     fn job_builtins_fail_cleanly_with_an_empty_table() {
