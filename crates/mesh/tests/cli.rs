@@ -225,6 +225,19 @@ fn indexed_nested_lists_remain_typed_in_value_contexts() {
 }
 
 #[test]
+fn scalar_glob_brackets_do_not_delimit_nested_lists() {
+    let out = run_with_input(
+        "outer = [[a[b c]]\n\
+         puts ...$outer[0]\n\
+         outer = [[a]b c]]\n\
+         puts ...$outer[0]\n",
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a[b c\na]b c\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn a_nested_list_cannot_cross_the_command_boundary_implicitly() {
     let out = run_with_input("xs = [[one two]]\nputs ...$xs\n");
     assert_eq!(out.status.code(), Some(1));
