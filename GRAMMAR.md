@@ -109,10 +109,9 @@ and `\`-newline continuation across multiple input lines. Words are still
 ```
 assign  = name "=" value              # unspaced, whole statement
         | name "=" ws value…          # spaced form (for compound values)
-var     = "$" name                    # $x
-        | "$" "{" name "}"            # ${x}
-        | "$" "env" "." key          # $env.KEY  (member access)
-        | "$" name "[" integer "]"    # $xs[0]    (exact list indexing)
+var     = "$" name access             # $x, $name.member, $xs[-1]
+        | "$" "{" name access "}"       # ${x}, ${name.member}, ${xs[-1]}
+access  = ("." name)? ("[" signed-integer "]")?
 name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
 ```
 
@@ -120,10 +119,11 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
   whole statement; `name = value` (spaced) is the compound-value form. Position
   separates assignment from a `k=v` *argument*: `git commit --author=me` and
   `env FOO=1 cmd` are commands, not bindings.
-- **`$name` / `${name}`** read a variable; **`$env.KEY`** reads the environment
-  (strict), and **`$xs[N]`** reads an exact list element. These forms have the
-  same meaning in bare words and `"…"`; braces delimit a reference when literal
-  text follows. Interpolation does **not** happen in `'…'` or `r'…'`.
+- **`$name` / `${name}`** read a variable; **`$env.KEY` / `${env.KEY}`** read the
+  environment (strict), and **`$xs[N]` / `${xs[N]}`** read an exact list element.
+  These forms have the same meaning in bare words and `"…"`; braces delimit a
+  reference when literal text follows. Interpolation does **not** happen in
+  `'…'` or `r'…'`.
 - **Reads fail loud**: an **unbound** variable is an error (no null / always-on
   `set -u`), and the shell recovers to the next line. Assignment always creates.
   A **malformed `${…}`** (missing `}`, or an invalid name inside) is a syntax
