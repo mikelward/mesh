@@ -1900,3 +1900,13 @@ fn an_invalid_quoted_parameter_quarantines_the_body() {
     assert_eq!(stdout, "after\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("func:"));
 }
+
+#[test]
+fn a_following_command_with_a_quoted_brace_is_not_the_body() {
+    // `func f()` awaits its body; the next line is a separate command that merely
+    // contains a quoted `{`. That brace is not the body opener, so the header is
+    // rejected and both following commands still run.
+    let out = run_with_input("func f()\nputs '{'\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "{\nafter\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("missing body"));
+}
