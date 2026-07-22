@@ -695,7 +695,7 @@ impl<'a> Lexer<'a> {
                 let before = self.source[..self.position].chars().next_back();
                 let after = rest[s.len()..].chars().next();
                 let boundary = |value: Option<char>| {
-                    value.is_none_or(|c| c.is_whitespace() || ",()[]{};".contains(c))
+                    value.is_none_or(|c| c.is_whitespace() || ",()[]{};=:".contains(c))
                 };
                 // A prefix minus belongs to the expression grammar even when it
                 // is attached to its operand (`-$n`). Binary operators retain
@@ -789,14 +789,14 @@ fn variable_end(source: &str, start: usize) -> Result<usize, ParseError> {
 }
 
 fn valid_variable_access(value: &str) -> bool {
-    let name_end = value.find(['.', '[']).unwrap_or(value.len());
+    let name_end = value.find(['.', '[', ':']).unwrap_or(value.len());
     if !valid_name(&value[..name_end]) {
         return false;
     }
     let mut rest = &value[name_end..];
     while !rest.is_empty() {
         if let Some(member) = rest.strip_prefix('.') {
-            let end = member.find(['.', '[']).unwrap_or(member.len());
+            let end = member.find(['.', '[', ':']).unwrap_or(member.len());
             if !valid_name(&member[..end]) {
                 return false;
             }
@@ -805,17 +805,35 @@ fn valid_variable_access(value: &str) -> bool {
             let Some(close) = index.find(']') else {
                 return false;
             };
-            let contents = &index[..close];
-            let digits = contents.strip_prefix('-').unwrap_or(contents);
-            if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+            if !valid_variable_subscript(&index[..close]) {
                 return false;
             }
             rest = &index[close + 1..];
+        } else if let Some(modifier) = rest.strip_prefix(':') {
+            let end = modifier.find(':').unwrap_or(modifier.len());
+            if !modifier_name(&modifier[..end]) {
+                return false;
+            }
+            rest = &modifier[end..];
         } else {
             return false;
         }
     }
     true
+}
+
+fn valid_variable_subscript(value: &str) -> bool {
+    let signed_integer = |text: &str| {
+        let digits = text.strip_prefix('-').unwrap_or(text);
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+    };
+    if let Some((start, end)) = value.split_once("..=") {
+        (start.is_empty() || signed_integer(start)) && signed_integer(end)
+    } else if let Some((start, end)) = value.split_once("..") {
+        (start.is_empty() || signed_integer(start)) && (end.is_empty() || signed_integer(end))
+    } else {
+        signed_integer(value)
+    }
 }
 
 fn decode_unicode_escape(source: &str, start: usize) -> Option<(char, usize)> {
@@ -1632,7 +1650,7 @@ impl Parser {
                 )
             )
     }
-    fn value_start(&self) -> bool {
+    fn value_start(&mut self) -> bool {
         match self.peek().map(|token| &token.value) {
             Some(
                 TokenKind::CaptureStart
@@ -1658,10 +1676,24 @@ impl Parser {
                     .tokens
                     .get(self.position + 1)
                     .is_some_and(|next| value_operator(&next.value));
-                variable || quoted || attached_call || followed_by_operator
+                variable
+                    || (quoted
+                        && !matches!(
+                            self.tokens.get(self.position + 1).map(|token| &token.value),
+                            Some(TokenKind::Less | TokenKind::Greater | TokenKind::Append)
+                        )
+                        && self.viable_expression())
+                    || attached_call
+                    || followed_by_operator
             }
             _ => false,
         }
+    }
+    fn viable_expression(&mut self) -> bool {
+        let saved = self.position;
+        let viable = self.expression().is_ok() && self.at_command_end();
+        self.position = saved;
+        viable
     }
     fn amp_before_terminator(&self) -> bool {
         for token in &self.tokens[self.position..] {
@@ -2117,18 +2149,42 @@ mod tests {
     }
 
     #[test]
+    fn keeps_quoted_executables_in_command_position() {
+        for source in [r#""my tool" arg"#, r#"'echo' > out"#] {
+            let tree = complete(source);
+            assert!(matches!(
+                tree.statements[0].and_or.first,
+                Executable::Pipeline(_)
+            ));
+        }
+    }
+
+    #[test]
     fn tokenizes_attached_negation_as_an_operator() {
-        let tree = complete("x = -$n");
-        assert!(matches!(
-            tree.statements[0].and_or.first,
-            Executable::Assignment {
-                value: Expr::Unary {
+        for source in ["x = -$n", "x=-$n", "x = f(value:-$n)"] {
+            let tree = complete(source);
+            let Executable::Assignment { value, .. } = &tree.statements[0].and_or.first else {
+                panic!()
+            };
+            let negated = match value {
+                Expr::Unary {
                     op: UnaryOp::Negate,
                     ..
-                },
-                ..
-            }
-        ));
+                } => true,
+                Expr::Call { arguments, .. } => matches!(
+                    arguments.as_slice(),
+                    [Argument::Named(
+                        _,
+                        Expr::Unary {
+                            op: UnaryOp::Negate,
+                            ..
+                        }
+                    )]
+                ),
+                _ => false,
+            };
+            assert!(negated, "negation was not parsed in {source}");
+        }
     }
 
     #[test]
@@ -2170,6 +2226,8 @@ mod tests {
     fn validates_braced_variable_access() {
         assert!(tokenize("${user.name}").is_ok());
         assert!(tokenize("${items[0]}").is_ok());
+        assert!(tokenize("${items[1..]}").is_ok());
+        assert!(tokenize("${items[-1]:stem}").is_ok());
         assert!(matches!(
             tokenize("${bad name}"),
             Err(ParseError {
