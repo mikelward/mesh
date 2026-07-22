@@ -50,7 +50,7 @@ background      = "&" terminator* ;
 and-or          = executable (("&&" | "||") executable)* ;
 executable      = pipeline | compound-statement ;
 pipeline        = pipe-stage (("|" | "|&") pipe-stage)* ;
-pipe-stage      = simple-command | value-call ;
+pipe-stage      = simple-command postfix-guard? | value-call ;
 
 simple-command  = command-item+ ;
 command-item    = command-word | redirection ;
@@ -71,10 +71,9 @@ binding         = name | pattern ;                          # pattern: later
 control-statement
                 = ("return" | "break" | "continue") value-expression?
                   postfix-guard? ;
-postfix-guard   = "if" value-expression ;
+postfix-guard   = ("if" | "unless") value-expression ;
 expression-statement
-                = call-expression postfix-guard? ;
-call-expression = value-call postfix-part* ;
+                = value-expression postfix-guard? ;
 
 block           = "{" terminator* statement-list? terminator* "}" ;
 function-definition
@@ -83,7 +82,9 @@ parameter-list  = "(" (parameter (","? parameter)*)? ")" ;
 parameter       = name ;                                    # richer forms: later
 if-expression   = "if" condition block
                   ("else" (if-expression | block))? ;
-condition       = value-expression | pipeline ;
+condition       = conditional-assignment | value-expression | pipeline ;
+conditional-assignment
+                = binding "=" value-expression ;
 for-expression  = "for" pattern "in" value-expression block ;
 match-expression
                 = "match" value-expression "{" match-arm* "}" ;  # later
@@ -94,12 +95,22 @@ pattern         = name | "_" ;                             # destructuring: late
 `command-word` is the lexer's adjacency-preserving word token, including
 interpolations and expression atoms allowed in command position. Keywords are
 recognized only where the grammar expects them; an ordinary command may still
-receive `if`, `for`, or `match` as an argument.
+receive `if`, `unless`, `for`, or `match` as an argument. In command position,
+an unquoted `if` or `unless` starts a postfix guard only when the remaining
+tokens form a complete value expression. Quoting the word or leaving no viable
+guard expression keeps it as a command argument.
 
 An assignment, definition, or value expression is not inferred by expanding a
 word. The parser selects it from unquoted syntax. In particular, a bare word on
 an assignment RHS remains a string (`x = greet`), while attached parentheses
 select a value call (`x = greet()`).
+
+A syntactically recognizable value expression is valid as a statement, not
+only a value call. This lets a block return a scalar, variable, collection,
+capture, or operator expression as its final value. A command-shaped bare word
+remains a command, preserving the shell-oriented default. In a condition,
+`binding = value-expression` is a distinct test-and-bind node rather than an
+ordinary assignment statement.
 
 ## Value-expression grammar
 
@@ -113,7 +124,7 @@ not appear in this table.
 | 1 | `or` | left |
 | 2 | `and` | left |
 | 3 | `not` | prefix |
-| 4 | `==`, `!=`, `<`, `<=`, `>`, `>=`, `~`, `in` | none |
+| 4 | `==`, `!=`, `<`, `<=`, `>`, `>=`, `~`, `!~`, `in` | none |
 | 5 | `..`, `..=` | none |
 | 6 | `+`, `-` | left, later |
 | 7 | `*`, `/`, `%` | left, later |
@@ -127,7 +138,7 @@ or-expression    = and-expression ("or" and-expression)* ;
 and-expression   = not-expression ("and" not-expression)* ;
 not-expression   = "not" not-expression | comparison ;
 comparison       = range-expression (compare-op range-expression)? ;
-compare-op       = "==" | "!=" | "<" | "<=" | ">" | ">=" | "~" | "in" ;
+compare-op       = "==" | "!=" | "<" | "<=" | ">" | ">=" | "~" | "!~" | "in" ;
 range-expression = additive (range-op additive?)?
                  | range-op additive? ;
 range-op         = ".." | "..=" ;
@@ -185,10 +196,10 @@ These decisions remove ambiguities before AST implementation:
   redirect belongs to `b`; in `a >out | b`, it belongs to `a`. Redirections may
   interleave with command words and the last redirect for a descriptor wins at
   evaluation time.
-- **A postfix guard attaches to one control or expression statement**, before
-  any `;`, newline, `&`, pipeline, or conditional-list operator. It is not a
-  suffix on an entire pipeline. The initial parser may restrict it to `return`,
-  `break`, and `continue` until general expression statements execute.
+- **A postfix guard attaches to one simple command, control statement, or value
+  expression**, before any `;`, newline, `&`, pipeline, or conditional-list
+  operator. It is not a suffix on an entire pipeline. Both `if` and `unless`
+  use this attachment; `unless` negates the guard condition.
 - **A newline terminates at the shallow statement level.** Delimiter nesting or
   a trailing `|`, `|&`, `&&`, `||`, comma, or binary value operator makes it
   trivia instead. A newline after a complete operand terminates; continuing such
