@@ -489,9 +489,9 @@ fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
             let end = value.find(['.', '[', ':']).unwrap_or(value.len());
             accesses.push(expand::Access::Member(value[..end].to_string()));
             rest = &value[end..];
-        } else if let Some(value) = rest.strip_prefix('[') {
-            let close = value.find(']').expect("parser validated variable access");
-            let index = &value[..close];
+        } else if rest.starts_with('[') {
+            let close = parser::subscript_end(rest).expect("parser validated variable access");
+            let index = &rest[1..close - 1];
             accesses.push(if let Some((start, end)) = index.split_once("..=") {
                 expand::Access::Slice {
                     start: parse_bound(start),
@@ -507,7 +507,7 @@ fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
             } else {
                 expand::Access::Subscript(index.to_string())
             });
-            rest = &value[close + 1..];
+            rest = &rest[close..];
         } else if let Some(value) = rest.strip_prefix(':') {
             let end = value.find(':').unwrap_or(value.len());
             if let Some(modifier) = expand::Modifier::from_name(&value[..end]) {
@@ -1307,7 +1307,16 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
 
 /// Return whether the parser needs another physical line to complete the input.
 fn needs_more_input(text: &str) -> bool {
-    matches!(parser::parse(text), Ok(parser::ParseOutcome::Incomplete))
+    let trimmed = text.trim_start();
+    let func_header = trimmed.strip_prefix("func").is_some_and(|rest| {
+        rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
+    });
+    match parser::parse(text) {
+        Ok(parser::ParseOutcome::Incomplete) if func_header => crate::lexer::needs_more_input(text),
+        Ok(parser::ParseOutcome::Incomplete) => true,
+        Err(_) if func_header => crate::lexer::needs_more_input(text),
+        Ok(parser::ParseOutcome::Complete(_)) | Err(_) => false,
+    }
 }
 
 fn run_interactive() -> ExitCode {
@@ -1554,7 +1563,10 @@ impl Prompt for MeshPrompt {
 
 #[cfg(test)]
 mod tests {
-    use super::{Shell, Step, eval_binary, handle_signal, needs_more_input, run_line, run_source};
+    use super::{
+        Shell, Step, eval_binary, expansion_word, handle_signal, needs_more_input, run_line,
+        run_source,
+    };
     use crate::parser;
     use crate::vars::Value;
     use reedline::Signal;
@@ -1581,6 +1593,37 @@ mod tests {
         assert!(!needs_more_input("puts *"));
         assert!(needs_more_input("puts value |"));
         assert!(!needs_more_input("puts 'unterminated"));
+    }
+
+    #[test]
+    fn malformed_function_bodies_are_buffered_without_swallowing_trailing_braces() {
+        assert!(needs_more_input("func f(') {\nputs LEAKED\n"));
+        assert!(!needs_more_input("func f(') {\nputs LEAKED\n}\n"));
+        assert!(!needs_more_input("func f() {} {\n"));
+    }
+
+    #[test]
+    fn command_interpolation_accepts_closing_brackets_in_quoted_map_keys() {
+        let parser::ParseOutcome::Complete(source) = parser::parse("puts $m[\"a]b\"]").unwrap()
+        else {
+            panic!("source should be complete");
+        };
+        let parser::Executable::Pipeline(pipeline) = &source.statements[0].and_or.first else {
+            panic!("source should contain a pipeline");
+        };
+        let parser::CommandItem::Word(word) = &pipeline.stages[0].items[1] else {
+            panic!("second command item should be a word");
+        };
+        let mut shell = Shell::new();
+        shell.vars.set_value(
+            "m",
+            Value::Map(vec![("a]b".into(), Value::String("ok".into()))]),
+        );
+
+        assert_eq!(
+            crate::expand::expand_values(vec![expansion_word(&word.value)], &shell.vars),
+            Ok(vec![Value::String("ok".into())])
+        );
     }
 
     #[test]
