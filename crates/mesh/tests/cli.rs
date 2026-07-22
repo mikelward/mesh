@@ -510,6 +510,18 @@ fn list_slices_are_clamped_and_require_spread() {
 }
 
 #[test]
+fn assignment_copies_whole_lists_and_list_slices() {
+    let out = run_with_input(
+        "xs = [a b c d]\nys = $xs\nzs=$xs[1..=2]\nxs += e\nputs ...$ys\nputs ...$zs\nputs ...$xs\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a b c d\nb c\na b c d e\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn invalid_list_index_fails_loudly_and_recovers() {
     let out = run_with_input(
         "xs = [a b]\nputs $xs[2]\nputs $xs[-3]\nx = text\nputs $x[0]\nputs recovered\n",

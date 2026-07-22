@@ -102,7 +102,8 @@ The first vertical slice has landed: assignments accept string-list literals
 arguments, and exact integer indexing reads an element. A bare `$xs` in
 argument position fails loudly, preserving the design's
 explicit-spread/no-word-splitting rule. Nested values, slicing, and general
-expression parsing remain ahead.
+expression parsing remain ahead. List-valued assignment also preserves a whole
+list or slice instead of coercing it to command words.
 
 **Acceptance:** the `DESIGN.md`/`docs/INTRO.md` examples run as written.
 
