@@ -547,7 +547,8 @@ fn eval_expr(
             op: U::Negate,
             expression,
         } => number(&eval_expr(expression, last, in_function, shell)?)
-            .map(|n| Value::String((-n).to_string()))
+            .and_then(|n| n.checked_neg().ok_or_else(|| "numeric overflow".into()))
+            .map(|n| Value::String(n.to_string()))
             .map_err(|m| {
                 eprintln!("mesh: {m}");
                 Step::Continue(1)
@@ -570,18 +571,88 @@ fn eval_expr(
                 Step::Continue(1)
             })
         }
-        E::If(node) => match run_ast_if(node, last, in_function, shell) {
-            Step::Continue(code) => Ok(Value::String(code.to_string())),
-            step => Err(step),
-        },
+        E::Member { value, name } => {
+            if let E::Variable(variable) = value.as_ref()
+                && variable.value.trim_start_matches('$') == "env"
+            {
+                return std::env::var(name).map(Value::String).map_err(|_| {
+                    eprintln!("mesh: $env.{name}: not set");
+                    Step::Continue(1)
+                });
+            }
+            runtime_error(format!("member access .{name} is not implemented yet"))
+        }
+        E::Index { value, index } => {
+            let value = eval_expr(value, last, in_function, shell)?;
+            let index_value = eval_expr(index, last, in_function, shell)?;
+            let index = number(&index_value).map_err(runtime_message)?;
+            match value {
+                Value::List(values) => {
+                    let offset = if index < 0 {
+                        values.len() as i128 + index as i128
+                    } else {
+                        index as i128
+                    };
+                    usize::try_from(offset)
+                        .ok()
+                        .and_then(|i| values.get(i))
+                        .cloned()
+                        .ok_or_else(|| {
+                            eprintln!("mesh: list index {index} out of range");
+                            Step::Continue(1)
+                        })
+                }
+                Value::String(_) => runtime_error("cannot index a string value"),
+            }
+        }
+        E::Modifier {
+            value,
+            name,
+            arguments,
+        } => {
+            if arguments.is_some() {
+                return runtime_error(format!(
+                    "modifier :{name} arguments are not implemented yet"
+                ));
+            }
+            let Some(modifier) = crate::lexer::Modifier::from_name(name) else {
+                return runtime_error(format!("modifier :{name} is not implemented yet"));
+            };
+            let value = eval_expr(value, last, in_function, shell)?;
+            expand::apply_modifier(value, modifier)
+                .map_err(|error| runtime_message(error.to_string()))
+        }
+        E::If(node) => eval_if_expr(node, last, in_function, shell),
         E::For {
             binding,
             iterable,
             body,
-        } => match run_ast_for(binding, iterable, body, last, in_function, shell) {
-            Step::Continue(code) => Ok(Value::String(code.to_string())),
-            step => Err(step),
-        },
+        } => {
+            let iterable = eval_expr(iterable, last, in_function, shell)?;
+            let values = match iterable {
+                Value::List(values) => values,
+                value => vec![value],
+            };
+            let mut results = Vec::new();
+            shell.loop_depth += 1;
+            for value in values {
+                shell.vars.set_value(binding, value);
+                match eval_body(body, 0, in_function, shell) {
+                    Ok(value) => results.push(value),
+                    Err(step) => {
+                        shell.loop_depth -= 1;
+                        return Err(step);
+                    }
+                }
+                match shell.control.take() {
+                    Some(parser::ControlKind::Break) => break,
+                    Some(parser::ControlKind::Continue) | None => {}
+                    Some(parser::ControlKind::Return) => unreachable!(),
+                }
+            }
+            shell.loop_depth -= 1;
+            Ok(Value::List(results))
+        }
         E::BackgroundJob(pipeline) => match run_ast_pipeline(pipeline, true, last, shell) {
             Step::Continue(code) => Ok(Value::String(code.to_string())),
             step => Err(step),
@@ -590,11 +661,67 @@ fn eval_expr(
             Step::Continue(code) => Ok(Value::String(code.to_string())),
             step => Err(step),
         },
-        _ => {
-            eprintln!("mesh: expression is not executable yet");
-            Err(Step::Continue(1))
+        E::Map(_) => runtime_error("map expressions are not implemented yet"),
+        E::Range { .. } => runtime_error("range expressions are not implemented yet"),
+        E::Call { .. } => runtime_error("call expressions are not implemented yet"),
+        E::Lambda { .. } => runtime_error("lambda expressions are not implemented yet"),
+    }
+}
+
+fn runtime_message(message: impl std::fmt::Display) -> Step {
+    eprintln!("mesh: {message}");
+    Step::Continue(1)
+}
+
+fn runtime_error<T>(message: impl std::fmt::Display) -> Result<T, Step> {
+    Err(runtime_message(message))
+}
+
+fn eval_if_expr(
+    node: &parser::IfExpr,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let condition = run_executable(&node.condition, false, last, in_function, shell);
+    let Step::Continue(code) = condition else {
+        return Err(condition);
+    };
+    if code == 0 {
+        eval_body(&node.then_body, 0, in_function, shell)
+    } else {
+        match &node.else_branch {
+            Some(parser::ElseBranch::If(next)) => eval_if_expr(next, code, in_function, shell),
+            Some(parser::ElseBranch::Block(body)) => eval_body(body, 0, in_function, shell),
+            None => Ok(Value::String(String::new())),
         }
     }
+}
+
+fn eval_body(
+    body: &parser::Source,
+    mut last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    for (index, statement) in body.statements.iter().enumerate() {
+        let final_statement = index + 1 == body.statements.len();
+        if final_statement
+            && !statement.background
+            && statement.and_or.rest.is_empty()
+            && let parser::Executable::Expression {
+                expression,
+                guard: None,
+            } = &statement.and_or.first
+        {
+            return eval_expr(expression, last, in_function, shell);
+        }
+        match run_statement(statement, last, in_function, shell) {
+            Step::Continue(code) => last = code,
+            flow => return Err(flow),
+        }
+    }
+    Ok(Value::String(String::new()))
 }
 
 fn truthy(value: &Value) -> bool {
@@ -617,18 +744,55 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
     Ok(match op {
         Equal => bool_value(left == right),
         NotEqual => bool_value(left != right),
-        Add => Value::String((number(&left)? + number(&right)?).to_string()),
-        Subtract => Value::String((number(&left)? - number(&right)?).to_string()),
-        Multiply => Value::String((number(&left)? * number(&right)?).to_string()),
-        Divide => Value::String((number(&left)? / number(&right)?).to_string()),
-        Remainder => Value::String((number(&left)? % number(&right)?).to_string()),
+        Add => Value::String(
+            number(&left)?
+                .checked_add(number(&right)?)
+                .ok_or("numeric overflow")?
+                .to_string(),
+        ),
+        Subtract => Value::String(
+            number(&left)?
+                .checked_sub(number(&right)?)
+                .ok_or("numeric overflow")?
+                .to_string(),
+        ),
+        Multiply => Value::String(
+            number(&left)?
+                .checked_mul(number(&right)?)
+                .ok_or("numeric overflow")?
+                .to_string(),
+        ),
+        Divide => Value::String(
+            number(&left)?
+                .checked_div(number(&right)?)
+                .ok_or("division by zero")?
+                .to_string(),
+        ),
+        Remainder => Value::String(
+            number(&left)?
+                .checked_rem(number(&right)?)
+                .ok_or("division by zero")?
+                .to_string(),
+        ),
         Less => bool_value(number(&left)? < number(&right)?),
         LessEqual => bool_value(number(&left)? <= number(&right)?),
         Greater => bool_value(number(&left)? > number(&right)?),
         GreaterEqual => bool_value(number(&left)? >= number(&right)?),
         And => bool_value(truthy(&left) && truthy(&right)),
         Or => bool_value(truthy(&left) || truthy(&right)),
-        _ => return Err("operator is not executable yet".into()),
+        In => match right {
+            Value::List(values) => bool_value(values.contains(&left)),
+            Value::String(text) => match left {
+                Value::String(needle) => bool_value(text.contains(&needle)),
+                _ => return Err("left operand of `in` must be a string".into()),
+            },
+        },
+        Match | NotMatch => {
+            return Err(format!(
+                "operator `{}` is not implemented yet",
+                if op == Match { "=~" } else { "!~" }
+            ));
+        }
     })
 }
 
@@ -2063,7 +2227,8 @@ impl Prompt for MeshPrompt {
 
 #[cfg(test)]
 mod tests {
-    use super::{Shell, Step, handle_signal, needs_more_compound_input, run_line};
+    use super::{Shell, Step, handle_signal, needs_more_compound_input, run_line, run_source};
+    use crate::parser;
     use crate::vars::Value;
     use reedline::Signal;
 
@@ -2144,6 +2309,53 @@ mod tests {
         let mut shell = Shell::new();
         assert_eq!(run_line("n=42", 0, false, &mut shell), Step::Continue(0));
         assert_eq!(shell.vars.get("n"), Some(&Value::String("42".to_string())));
+    }
+
+    #[test]
+    fn parsed_expressions_preserve_typed_values_through_access_and_modifiers() {
+        let mut shell = Shell::new();
+        let parser::ParseOutcome::Complete(source) =
+            parser::parse("tail = [one two]; xs = [$tail ...$tail]; result = $xs[0]:last").unwrap()
+        else {
+            panic!("source should be complete");
+        };
+
+        assert_eq!(run_source(&source, 0, false, &mut shell), Step::Continue(0));
+        assert_eq!(shell.vars.get("result"), Some(&Value::String("two".into())));
+    }
+
+    #[test]
+    fn parsed_operators_and_recursive_value_bodies_evaluate() {
+        let mut shell = Shell::new();
+        let parser::ParseOutcome::Complete(source) = parser::parse(
+            "answer = if true { 6 * 7 } else { 0 }; values = for x in [1 2 3] { $x + 1 }",
+        )
+        .unwrap() else {
+            panic!("source should be complete");
+        };
+
+        assert_eq!(run_source(&source, 0, false, &mut shell), Step::Continue(0));
+        assert_eq!(shell.vars.get("answer"), Some(&Value::String("42".into())));
+        assert_eq!(
+            shell.vars.get("values"),
+            Some(&Value::List(vec![
+                Value::String("2".into()),
+                Value::String("3".into()),
+                Value::String("4".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn parsed_but_unimplemented_expressions_return_runtime_errors() {
+        let mut shell = Shell::new();
+        let parser::ParseOutcome::Complete(source) = parser::parse("value = [key: value]").unwrap()
+        else {
+            panic!("source should be complete");
+        };
+
+        assert_eq!(run_source(&source, 0, false, &mut shell), Step::Continue(1));
+        assert_eq!(shell.vars.get("value"), None);
     }
 
     #[test]

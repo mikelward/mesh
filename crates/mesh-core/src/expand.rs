@@ -313,7 +313,7 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
     Ok(value)
 }
 
-fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, ExpandError> {
+pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, ExpandError> {
     use Modifier::{Dedup, First, Init, Last, Len, Rest};
     let name = modifier_name(modifier);
     match modifier {

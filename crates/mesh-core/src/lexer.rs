@@ -51,7 +51,7 @@ pub enum Modifier {
 }
 
 impl Modifier {
-    fn from_name(name: &str) -> Option<Self> {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "dir" => Self::Dir,
             "base" => Self::Base,
