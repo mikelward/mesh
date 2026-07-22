@@ -543,7 +543,11 @@ fn parse_var(
             j = k;
         }
     }
-    let (index, j) = parse_index(chars, j).unwrap_or((None, j));
+    let (index, j) = if member_after_name {
+        parse_index(chars, j).unwrap_or((None, j))
+    } else {
+        (None, j)
+    };
     Ok(Some((
         VarRef {
             name,
@@ -891,6 +895,19 @@ mod tests {
     fn double_quotes_interpolate_single_quotes_do_not() {
         assert_eq!(words(r#""a$x""#), [Word(vec![lit("a"), var("x")])]);
         assert_eq!(words(r"'a$x'"), [Word(vec![lit("a$x")])]);
+    }
+
+    #[test]
+    fn indexing_in_double_quotes_requires_braces() {
+        assert_eq!(words(r#""$xs[0]""#), [Word(vec![var("xs"), lit("[0]")])]);
+        assert_eq!(
+            words(r#""${xs[0]}""#),
+            [Word(vec![Piece::Var(VarRef {
+                name: "xs".into(),
+                member: None,
+                index: Some(0),
+            })])]
+        );
     }
 
     #[test]
