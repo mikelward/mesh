@@ -5,6 +5,7 @@
 //! use the shell implementation without depending on an executable crate.
 
 mod builtins;
+mod completion;
 mod exec;
 mod expand;
 mod funcs;

@@ -141,6 +141,18 @@ file as tasks land.
         that are in scope, inventory dependencies that remain, and update the
         milestone documentation without silently weakening its acceptance bar.
 
+## Beyond M3 — Interactive completion
+
+- [x] Lazily derive typed flag and subcommand candidates from bounded external
+      `--help` probes.
+- [x] Cache generated completion specs in memory and under
+      `$XDG_CACHE_HOME/mesh/completions/`, keyed by executable path, modification
+      time, and subcommand arguments; regenerate stale or corrupt entries.
+- [ ] Add typed file, directory, and enum values to completion specs.
+- [ ] Add fuzzy and case-insensitive candidate ranking with `nucleo`.
+- [ ] Load curated completion specs, then add man-page-derived specs.
+- [ ] Expose static and dynamic completion overrides through `$sh.complete`.
+
 ## Decisions made
 
 - **Merge method:** rebase. **Toolchain:** floating `stable`. **Loop autonomy:**

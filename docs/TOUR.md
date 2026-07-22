@@ -61,9 +61,12 @@ mesh$ <strong>puts $site.tls.enabled</strong>
 true
 </pre>
 
-Completion currently matches prefixes exactly and case-sensitively. Rich
-per-command flag and argument completion, fuzzy matching, and case-insensitive
-matching are later work.
+For external commands, mesh lazily reads bounded `--help` output to complete
+subcommands and flags, then caches the resulting completion spec by executable
+path and modification time. Files and directories remain available as the
+fallback. Completion currently matches prefixes exactly and case-sensitively;
+typed argument values, fuzzy matching, and case-insensitive matching are later
+work.
 
 ## Printing with `puts`
 
