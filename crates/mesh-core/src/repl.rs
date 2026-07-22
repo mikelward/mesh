@@ -367,8 +367,7 @@ fn run_executable(
                 name.clone(),
                 FuncDef {
                     params: parameters.clone(),
-                    body: String::new(),
-                    ast: Some(body.clone()),
+                    body: body.clone(),
                 },
             );
             Step::Continue(0)
@@ -1167,8 +1166,8 @@ fn make_return(args: &[String], last: u8) -> Step {
 /// list argument counts as **one** positional (it arrives intact as a list
 /// value); an arity mismatch is a recoverable error.
 fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
-    let (params, body, ast) = match shell.funcs.get(name) {
-        Some(def) => (def.params.clone(), def.body.clone(), def.ast.clone()),
+    let (params, body) = match shell.funcs.get(name) {
+        Some(def) => (def.params.clone(), def.body.clone()),
         None => return Step::Continue(exec::run(&[name.to_string()], &mut shell.jobs)),
     };
     if args.len() != params.len() {
@@ -1184,10 +1183,7 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
     for (param, arg) in params.iter().zip(args) {
         shell.vars.set_value(param, arg);
     }
-    let executed = match &ast {
-        Some(source) => run_source(source, 0, true, shell),
-        None => run_body(&body, true, shell),
-    };
+    let executed = run_source(&body, 0, true, shell);
     let result = match executed {
         Step::Return(code) => Step::Continue(code),
         other => other,
@@ -1712,14 +1708,14 @@ fn parse_func_def(text: &str) -> Result<(String, FuncDef), String> {
     if !after_body.trim().is_empty() {
         return Err("func: unexpected text after the closing `}`".to_string());
     }
-    Ok((
-        name.to_string(),
-        FuncDef {
-            params,
-            body: body.to_string(),
-            ast: None,
-        },
-    ))
+    let body = match parser::parse(body) {
+        Ok(parser::ParseOutcome::Complete(source)) => source,
+        Ok(parser::ParseOutcome::Incomplete) => {
+            return Err("func: incomplete function body".to_string());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    Ok((name.to_string(), FuncDef { params, body }))
 }
 
 /// Given the text right after a body's opening `{`, split off the body (up to

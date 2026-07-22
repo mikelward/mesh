@@ -1625,6 +1625,14 @@ fn a_single_line_function_definition_works() {
 }
 
 #[test]
+fn a_function_body_is_parsed_when_defined() {
+    let out = run_with_input("func bad() { value = 1 < 2 < 3 }\nbad\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("comparisons cannot be chained"));
+    assert!(stderr.contains("command not found: bad"));
+}
+
+#[test]
 fn a_function_takes_multiple_positionals() {
     // Comma- and space-separated parameter lists both bind left to right.
     let out = run_with_input("func pair(a, b) { puts $a $b }\npair x y\n");
