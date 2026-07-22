@@ -40,7 +40,7 @@ file as tasks land.
 - [x] Globs + `~` expansion (glob no-match → **empty**). `~user` and expansion
       suppression (quoting) still to come; non-UTF-8 lossy under String words.
 
-## M2 — Next up
+## M2 — Pipes, redirection, and job control ✅ (done)
 
 - [x] Pipelines (`a | b | c`) with pipefail status, ignoring an upstream
       `SIGPIPE` caused by a downstream stage closing the pipe.
@@ -59,6 +59,19 @@ file as tasks land.
       table; background stdin defaults to `/dev/null`.
 - [x] Hand the terminal to full-screen programs and restore the shell's terminal
       modes cleanly when they exit or stop.
+
+## M3 — The mesh language (in progress)
+
+- [x] First typed value: bracketed string-list literals in assignment
+      (`xs = [a "b c"]`), including the distinct empty list (`xs = []`).
+- [x] Explicit list spread into command arguments (`puts ...$xs`); using a list
+      without `...` is a loud error rather than implicit word splitting.
+- [ ] Replace the incremental command lexer with the clean-break expression and
+      block parser.
+- [ ] General list expressions: nested values, indexing/slicing, `+=`, and
+      expression-position spread.
+- [ ] Maps, scalar types, and `:` modifiers.
+- [ ] `if` / `for` / `match` and `func`.
 
 ## Decisions made
 

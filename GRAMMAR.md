@@ -215,9 +215,31 @@ Ctrl-Z also registers a stopped foreground pipeline in the same job table.
 continues one in the background. With no reference, `fg` and `bg` select the
 newest job. These builtins are command forms rather than new grammar productions.
 
+## M3 list-value slice
+
+The first non-string value is a list of strings. In assignment position,
+bracketed, space-separated words form a list; `[]` remains distinct from an
+empty string:
+
+```
+list-assign = name "=" ws? "[" (word (ws word)*)? "]"
+spread      = "...$" name                  # whole command word, for now
+```
+
+Each literal element uses the existing word expansion rules. A glob can
+therefore contribute zero or more elements. `...$name` contributes every list
+element as a separate command argument and contributes no arguments for `[]`.
+A list used as bare `$name` in command arguments is an error: mesh never
+implicitly word-splits or flattens a typed value. Spreading a string is also an
+error.
+
+This is deliberately a vertical slice rather than the final expression
+grammar. Lists currently contain strings only; nesting, indexing, slicing,
+`+=`, and spread inside expressions remain unparsed.
+
 ### Not yet parsed
-`{ }` blocks, `func`, `:` modifiers, heredocs. Each arrives with the task that
-needs it, and this file grows to match.
+Nested/general list expressions, maps, `{ }` blocks, `func`, `:` modifiers, and
+heredocs. Each arrives with the task that needs it, and this file grows to match.
 
 **Design target (still ahead of the lexer above).** The **Model B strings**
 direction from `DESIGN.md` is now implemented (see task 5 above). What the lexer

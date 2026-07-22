@@ -359,14 +359,18 @@ fn clone_piece(piece: &Piece) -> Piece {
     }
 }
 
-/// Bind `name` to the expansion of `rhs`. Only single-value assignments are
-/// supported for now; a list (glob/multiple words) or empty result is an error.
+/// Bind `name` to a scalar expansion or a bracketed list literal.
 fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
     // `env` is the environment namespace (`$env.KEY`); a plain `env` binding
     // would be shadowed by that read and so could never be read back. Reject it
     // rather than store an unreachable value.
     if name == "env" {
         return Err(format!("{name}: cannot assign to the reserved name"));
+    }
+    if let Some(items) = list_literal(rhs.as_slice()) {
+        let values = expand::expand(items, vars).map_err(|e| e.to_string())?;
+        vars.set_list(name, values);
+        return Ok(());
     }
     let mut args = expand::expand(rhs, vars).map_err(|e| e.to_string())?;
     match args.len() {
@@ -377,6 +381,47 @@ fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
         0 => Err(format!("{name}: assignment needs a value")),
         _ => Err(format!("{name}: list assignment not supported yet")),
     }
+}
+
+/// Remove bare outer brackets from an assignment RHS. Brackets embedded in a
+/// quoted piece remain ordinary text; nested values wait for the M3 parser.
+fn list_literal(rhs: &[Word]) -> Option<Vec<Word>> {
+    let mut items: Vec<Word> = rhs
+        .iter()
+        .map(|word| Word(word.0.iter().map(clone_piece).collect()))
+        .collect();
+    let first = items.first_mut()?;
+    let Piece::Text {
+        text: first_text,
+        expandable: true,
+    } = first.0.first_mut()?
+    else {
+        return None;
+    };
+    if !first_text.starts_with('[') {
+        return None;
+    }
+    first_text.remove(0);
+
+    let last = items.last_mut()?;
+    let Piece::Text {
+        text: last_text,
+        expandable: true,
+    } = last.0.last_mut()?
+    else {
+        return None;
+    };
+    if !last_text.ends_with(']') {
+        return None;
+    }
+    last_text.pop();
+    items.retain(|word| {
+        !word
+            .0
+            .iter()
+            .all(|piece| matches!(piece, Piece::Text { text, .. } if text.is_empty()))
+    });
+    Some(items)
 }
 
 /// Interactive loop: reedline line editing with an in-memory history. Ctrl-D on
@@ -567,7 +612,7 @@ impl Prompt for MeshPrompt {
 mod tests {
     use super::{Step, handle_signal, run_line};
     use crate::exec::JobTable;
-    use crate::vars::Vars;
+    use crate::vars::{Value, Vars};
     use reedline::Signal;
 
     #[test]
@@ -616,7 +661,7 @@ mod tests {
             run_line("x = hello", 0, &mut vars, &mut jobs),
             Step::Continue(0)
         );
-        assert_eq!(vars.get("x"), Some("hello"));
+        assert_eq!(vars.get("x"), Some(&Value::String("hello".to_string())));
     }
 
     #[test]
@@ -624,6 +669,6 @@ mod tests {
         let mut vars = Vars::new();
         let mut jobs = JobTable::new();
         assert_eq!(run_line("n=42", 0, &mut vars, &mut jobs), Step::Continue(0));
-        assert_eq!(vars.get("n"), Some("42"));
+        assert_eq!(vars.get("n"), Some(&Value::String("42".to_string())));
     }
 }

@@ -424,6 +424,25 @@ fn assignment_and_interpolation() {
 }
 
 #[test]
+fn list_literal_preserves_arity_and_spreads_into_arguments() {
+    let out = run_with_input("xs = [a 'b c' d]\nputs ...$xs\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a b c d\n");
+}
+
+#[test]
+fn empty_list_spreads_to_no_arguments() {
+    let out = run_with_input("xs = []\nputs before ...$xs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "before after\n");
+}
+
+#[test]
+fn list_requires_explicit_spread_in_command_arguments() {
+    let out = run_with_input("xs = [a b]\nputs $xs\nputs recovered\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("list value needs `...`"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "recovered\n");
+}
+
+#[test]
 fn interpolation_only_in_double_quotes() {
     let out = run_with_input("x = world\nputs \"hi $x\"\nputs 'hi $x'\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hi world\nhi $x\n");

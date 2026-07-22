@@ -34,6 +34,7 @@ overloaded in infra (service mesh, mesh networking) and sits one letter from
 
 ## Status
 
-Language design in draft. Implementation in milestone **M1**: external commands
-and builtins, `reedline` editing, Model B quoting, tilde/glob expansion, and
-variables with interpolation. See [`ROADMAP.md`](ROADMAP.md).
+Language design remains in draft. Implementation has completed the M2 shell
+runtime (pipelines, redirection, and job control) and begun **M3** with typed
+string-list literals and explicit `...$list` argument spread. See
+[`ROADMAP.md`](ROADMAP.md).
