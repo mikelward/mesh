@@ -98,12 +98,31 @@ flat += [five six]       # extends by two elements
 Lists do not flatten implicitly. A nested list must be indexed or otherwise
 selected before its string elements can be spread into command arguments.
 
+Maps use comma-separated `key: value` pairs. Keys are strings and entries retain
+insertion order. A later duplicate replaces the value without moving the key;
+spreads and `+=` use the same right-side-wins rule. `[:]` is the empty map.
+
+```mesh
+ports = [http: 80, https: 443]
+overrides = [http: 8080]
+ports += $overrides
+copy = [...$ports, ssh: 22]
+puts $copy.http             # 8080
+```
+
+A map cannot cross the command boundary as a single argument because it has no
+canonical string representation. Select a value, or explicitly spread its
+`:keys` or `:values` list instead.
+
 | Read | Meaning |
 | --- | --- |
 | `$name` | The value of `name`. |
 | `${name}` | Same, when the following character would run into the name. |
 | `$env.KEY` | The environment variable `KEY`. |
 | `$xs[N]` | List element `N`; negative indexes count from the end. |
+| `$map.key` | Map value for the identifier key; a missing key is an error. |
+| `$map[key]` | Map value for a literal string key. |
+| `${map[$key]}` | Map value for a key read from a string variable. |
 | `...$xs[A..B]` | Spread a clamped, end-exclusive list slice. |
 | `...$xs[A..=B]` | Spread a clamped, end-inclusive list slice. |
 
@@ -112,7 +131,7 @@ recovers and continues. An interpolated value is a single literal value — it i
 never split on spaces or matched against filenames. Interpolation happens in bare
 words and `"…"`, never in `'…'` or `r'…'`.
 
-Member access and integer indexing have the same meaning inside `"…"` as they do
+Member access and list/map indexing have the same meaning inside `"…"` as they do
 outside it. A slice remains a list and needs `...` in command position; omitted
 bounds and negative bounds are supported. Use braces to delimit a reference
 before literal text: `${x}.txt`.
@@ -136,13 +155,15 @@ is literal text, so `$host:$port` is not mistaken for a modifier chain.
 | `:stem` | string or list | Basename without the last extension. |
 | `:bare` | string or list | Basename without any extensions. |
 | `:upper` / `:lower` | string or list | Change case; maps over list elements. |
-| `:len` | string or list | Character or element count as a decimal string. |
+| `:len` | string, list, or map | Character, element, or entry count as a decimal string. |
 | `:first` / `:last` | list | First or last element; an empty list is an error. |
 | `:rest` / `:init` | list | All but the first or last element; empty and one-element lists yield `[]` where appropriate. |
 | `:dedup` | list | Remove later duplicates, preserving first occurrence order. |
+| `:keys` | map | Keys as an insertion-ordered list. |
+| `:values` | map | Values as an insertion-ordered list. |
 
-Path and case modifiers map over lists. Collection modifiers consume a list as
-a whole. List results retain their type: use `...$xs:rest` in command position,
+Path and case modifiers map over lists. Collection modifiers consume a list or
+map as a whole. List results retain their type: use `...$xs:rest` in command position,
 or bind them directly with `ys = $xs:rest`. Modifier arguments—including
 `:join(SEP)`, `:split(SEP)`, and `:get(KEY, DEFAULT)`—are not implemented yet.
 
@@ -161,7 +182,7 @@ may span lines, and `return` or `exit` in a selected body keeps its normal
 control-flow effect.
 
 In assignment position, the selected body's final physical line supplies the
-value. The current value forms are one string, a list literal, a whole
+value. The current value forms are one string, a list or map literal, a whole
 variable value, or a nested `if`; earlier lines in that body run for effect. A
 false conditional with no `else` yields `""`. General boolean/comparison
 expressions and conditional destructuring are not implemented yet.
@@ -221,7 +242,7 @@ background), and calling for a value (`f(arg)`) as opposed to running it.
 
 ## Not yet implemented
 
-Map values, general boolean/comparison expressions, conditional destructuring,
+General boolean/comparison expressions, conditional destructuring,
 `match`, modifier arguments, regex literals, and heredocs. Function
 flags/optional/rest parameters and functions in pipelines are also still ahead. See
 [`ROADMAP.md`](../ROADMAP.md).

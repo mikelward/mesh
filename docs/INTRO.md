@@ -26,6 +26,21 @@ A value is always exactly one value. The space in `$photo` can't split it into t
 arguments, and an unquoted `$photo` is never re-matched against filenames — so
 there's no quoting to remember and nothing splits behind your back.
 
+Maps are ordered, string-keyed values rather than flattened command words. The
+same literal supports defaults followed by overrides, with later values winning
+without disturbing key order:
+
+<pre>
+<strong>defaults = [host: localhost, port: 8080]</strong>
+<strong>config = [...$defaults, port: 9090]</strong>
+<strong>puts $config.host $config.port</strong>
+localhost 9090
+</pre>
+
+Use `$config.key` for identifier keys and `${config[$name]}` for a computed key.
+`:keys`, `:values`, and `:len` inspect a map without inventing a lossy string
+representation for the whole value.
+
 `$PATH` is a **list**, not a colon-string, so the `IFS=:` juggling disappears.
 To **prepend** (bash's `PATH="/opt/bin:$PATH"` — new dir wins), build the list with
 it first; `:dedup` drops any later duplicate, keeping the first:

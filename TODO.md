@@ -110,7 +110,10 @@ file as tasks land.
   - [x] List-preserving append from a slice (`xs += $ys[1..]`).
   - [x] Nested values and one-level expression spread (`[$xs]` versus
         `[...$xs]`), including spreading an indexed nested list.
-- [ ] Maps and remaining scalar types.
+- [x] Ordered, string-keyed maps: literals (including `[:]`), duplicate-key
+      replacement, map spread, strict dot/bracket access, `+=` merge, and
+      `:keys` / `:values` / `:len` collection modifiers.
+- [ ] Remaining scalar types.
 - [x] Initial argument-free `:` modifiers: path/string transforms and list
       collection operations, including typed list results and chaining.
 - [x] `func` — user-defined functions: `func name(params) { body }` with required
