@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
 use std::process::ExitCode;
@@ -53,6 +53,10 @@ impl Shell {
 /// even when stdout is redirected would need reedline to write to `/dev/tty`;
 /// that refinement is deferred.)
 pub fn run() -> ExitCode {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--mesh-background-redirect") {
+        return exec::run_background_redirect(args.collect());
+    }
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
         run_interactive()
     } else {
@@ -76,7 +80,7 @@ enum Step {
 /// running a function body: there a `return` unwinds; at top level it is a
 /// recoverable error.
 fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
-    match parser::parse(text) {
+    let step = match parser::parse(text) {
         Ok(parser::ParseOutcome::Complete(source)) => run_source(&source, last, in_function, shell),
         Ok(parser::ParseOutcome::Incomplete) => {
             eprintln!("mesh: syntax error: unexpected end of input");
@@ -86,7 +90,11 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
             eprintln!("mesh: {error}");
             Step::Continue(2)
         }
+    };
+    if !in_function && shell.loop_depth == 0 {
+        shell.control = None;
     }
+    step
 }
 
 /// Execute the syntax tree recursively.  Keeping execution on the tree (rather
@@ -132,6 +140,10 @@ fn run_and_or(
     in_function: bool,
     shell: &mut Shell,
 ) -> Step {
+    if background && !node.rest.is_empty() {
+        eprintln!("mesh: background conditional lists are not supported yet");
+        return Step::Continue(2);
+    }
     let mut step = run_executable(&node.first, background, last, in_function, shell);
     for (op, executable) in &node.rest {
         let Step::Continue(status) = step else {
@@ -256,6 +268,7 @@ fn run_executable(
                                 "continue"
                             }
                         );
+                        shell.control = Some(*kind);
                         Step::Continue(1)
                     } else {
                         shell.control = Some(*kind);
@@ -269,6 +282,25 @@ fn run_executable(
                 Ok(true) => {}
                 Ok(false) => return Step::Continue(last),
                 Err(step) => return step,
+            }
+            if let parser::Expr::Scalar(word) = expression
+                && word.value.pieces.iter().any(|piece| match piece {
+                    parser::WordPiece::Text { quote, .. }
+                    | parser::WordPiece::Variable { quote, .. } => {
+                        !matches!(quote, parser::QuoteMode::Bare)
+                    }
+                })
+            {
+                return run_pipeline(
+                    vec![Stage {
+                        words: vec![expansion_word(&word.value)],
+                        redirs: Vec::new(),
+                        pipe_stderr: false,
+                    }],
+                    false,
+                    last,
+                    shell,
+                );
             }
             match eval_expr(expression, last, in_function, shell) {
                 Ok(_) => Step::Continue(0),
@@ -292,9 +324,9 @@ fn guard_allows(
 }
 
 fn run_ast_if(node: &parser::IfExpr, last: u8, in_function: bool, shell: &mut Shell) -> Step {
-    let condition = run_executable(&node.condition, false, last, in_function, shell);
-    let Step::Continue(code) = condition else {
-        return condition;
+    let code = match condition_status(&node.condition, last, in_function, shell) {
+        Ok(code) => code,
+        Err(step) => return step,
     };
     if code == 0 {
         run_source(&node.then_body, 0, in_function, shell)
@@ -304,6 +336,26 @@ fn run_ast_if(node: &parser::IfExpr, last: u8, in_function: bool, shell: &mut Sh
             Some(parser::ElseBranch::Block(body)) => run_source(body, 0, in_function, shell),
             None => Step::Continue(0),
         }
+    }
+}
+
+fn condition_status(
+    condition: &parser::Executable,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<u8, Step> {
+    if let parser::Executable::Expression {
+        expression,
+        guard: None,
+    } = condition
+    {
+        return eval_expr(expression, last, in_function, shell)
+            .map(|value| if truthy(&value) { 0 } else { 1 });
+    }
+    match run_executable(condition, false, last, in_function, shell) {
+        Step::Continue(code) => Ok(code),
+        step => Err(step),
     }
 }
 
@@ -352,6 +404,7 @@ fn run_ast_for(
 struct Stage {
     words: Vec<Word>,
     redirs: Vec<Redir>,
+    pipe_stderr: bool,
 }
 
 struct Redir {
@@ -366,7 +419,7 @@ fn run_ast_pipeline(
     shell: &mut Shell,
 ) -> Step {
     let mut stages = Vec::with_capacity(node.stages.len());
-    for command in &node.stages {
+    for (index, command) in node.stages.iter().enumerate() {
         match guard_allows(command.guard.as_ref(), last, false, shell) {
             Ok(true) => {}
             Ok(false) => return Step::Continue(last),
@@ -391,7 +444,11 @@ fn run_ast_pipeline(
                 }),
             }
         }
-        stages.push(Stage { words, redirs });
+        stages.push(Stage {
+            words,
+            redirs,
+            pipe_stderr: node.pipe_stderr.get(index).copied().unwrap_or(false),
+        });
     }
     run_pipeline(stages, background, last, shell)
 }
@@ -638,10 +695,7 @@ fn eval_expr(
             Step::Continue(code) => Ok(Value::String(code.to_string())),
             step => Err(step),
         },
-        E::Capture(source) => match run_source(source, last, in_function, shell) {
-            Step::Continue(code) => Ok(Value::String(code.to_string())),
-            step => Err(step),
-        },
+        E::Capture(source) => capture_source(source, last, in_function, shell),
         E::Map(_) => runtime_error("map expressions are not implemented yet"),
         E::Range { .. } => runtime_error("range expressions are not implemented yet"),
         E::Call { .. } => runtime_error("call expressions are not implemented yet"),
@@ -658,24 +712,89 @@ fn runtime_error<T>(message: impl std::fmt::Display) -> Result<T, Step> {
     Err(runtime_message(message))
 }
 
+fn capture_source(
+    source: &parser::Source,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return runtime_error(io::Error::last_os_error());
+    }
+    let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    if saved < 0 || unsafe { libc::dup2(fds[1], libc::STDOUT_FILENO) } < 0 {
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return runtime_error(io::Error::last_os_error());
+    }
+    unsafe { libc::close(fds[1]) };
+    let mut reader = unsafe { File::from_raw_fd(fds[0]) };
+    let (step, read_result) = std::thread::scope(|scope| {
+        let read = scope.spawn(|| {
+            let mut output = String::new();
+            reader.read_to_string(&mut output).map(|_| output)
+        });
+        let step = run_source(source, last, in_function, shell);
+        let _ = io::stdout().flush();
+        unsafe {
+            libc::dup2(saved, libc::STDOUT_FILENO);
+            libc::close(saved);
+        }
+        (step, read.join())
+    });
+    let output = match read_result {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => return runtime_error(error),
+        Err(_) => return runtime_error("capture reader panicked"),
+    };
+    match step {
+        Step::Continue(0) => Ok(Value::String(output.trim_end_matches('\n').to_string())),
+        Step::Continue(code) => Err(Step::Continue(code)),
+        step => Err(step),
+    }
+}
+
 fn eval_if_expr(
     node: &parser::IfExpr,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    let condition = run_executable(&node.condition, false, last, in_function, shell);
-    let Step::Continue(code) = condition else {
-        return Err(condition);
-    };
+    let code = condition_status(&node.condition, last, in_function, shell)?;
     if code == 0 {
-        eval_body(&node.then_body, 0, in_function, shell)
+        eval_value_body(&node.then_body, 0, in_function, shell)
     } else {
         match &node.else_branch {
             Some(parser::ElseBranch::If(next)) => eval_if_expr(next, code, in_function, shell),
-            Some(parser::ElseBranch::Block(body)) => eval_body(body, 0, in_function, shell),
+            Some(parser::ElseBranch::Block(body)) => eval_value_body(body, 0, in_function, shell),
             None => Ok(Value::String(String::new())),
         }
+    }
+}
+
+fn eval_value_body(
+    body: &parser::Source,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let value_final = body.statements.last().is_some_and(|statement| {
+        !statement.background
+            && statement.and_or.rest.is_empty()
+            && matches!(
+                statement.and_or.first,
+                parser::Executable::Expression { .. }
+                    | parser::Executable::If(_)
+                    | parser::Executable::For { .. }
+            )
+    });
+    if value_final {
+        eval_body(body, last, in_function, shell)
+    } else {
+        capture_source(body, last, in_function, shell)
     }
 }
 
@@ -848,7 +967,11 @@ fn run_pipeline(mut stages: Vec<Stage>, background: bool, last: u8, shell: &mut 
 /// redirections it is an external command only (a redirected builtin or function
 /// is not supported yet).
 fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> Step {
-    let Stage { words, redirs } = stage;
+    let Stage {
+        words,
+        redirs,
+        pipe_stderr: _,
+    } = stage;
     if redirs.is_empty() && !background {
         return run_command(words, last, shell);
     }
@@ -896,6 +1019,7 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
             vec![exec::Cmd {
                 words: argv,
                 redirs,
+                pipe_stderr: false,
             }],
             &mut shell.jobs,
             background,
@@ -912,7 +1036,11 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
 fn run_multi(stages: Vec<Stage>, background: bool, shell: &mut Shell) -> Step {
     let mut cmds = Vec::with_capacity(stages.len());
     for stage in stages {
-        let Stage { words, redirs } = stage;
+        let Stage {
+            words,
+            redirs,
+            pipe_stderr,
+        } = stage;
         let argv = match expand::expand(words, &shell.vars) {
             Ok(argv) => argv,
             Err(err) => {
@@ -947,6 +1075,7 @@ fn run_multi(stages: Vec<Stage>, background: bool, shell: &mut Shell) -> Step {
         cmds.push(exec::Cmd {
             words: argv,
             redirs,
+            pipe_stderr,
         });
     }
     Step::Continue(exec::run_pipeline(cmds, &mut shell.jobs, background))
@@ -1085,7 +1214,15 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
     for (param, arg) in params.iter().zip(args) {
         shell.vars.set_value(param, arg);
     }
+    let caller_loop_depth = std::mem::replace(&mut shell.loop_depth, 0);
     let executed = run_source(&body, 0, true, shell);
+    shell.loop_depth = caller_loop_depth;
+    if matches!(
+        shell.control,
+        Some(parser::ControlKind::Break | parser::ControlKind::Continue)
+    ) {
+        shell.control = None;
+    }
     let result = match executed {
         Step::Return(code) => Step::Continue(code),
         other => other,
@@ -1096,7 +1233,12 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
 
 /// Return whether the parser needs another physical line to complete the input.
 fn needs_more_input(text: &str) -> bool {
-    matches!(parser::parse(text), Ok(parser::ParseOutcome::Incomplete))
+    let parser_incomplete = matches!(parser::parse(text), Ok(parser::ParseOutcome::Incomplete));
+    let trimmed = text.trim_start();
+    let compound = ["func ", "if ", "for "]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix));
+    parser_incomplete || (compound && text.contains('{') && crate::lexer::needs_more_input(text))
 }
 
 fn run_interactive() -> ExitCode {

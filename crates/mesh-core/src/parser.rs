@@ -1870,7 +1870,11 @@ impl Parser {
                         value_operator(&operator.value) && operator.span.end < right.span.start
                     });
                 let numeric = word.text().parse::<i64>().is_ok();
-                variable
+                (variable
+                    && !matches!(
+                        self.tokens.get(self.position + 1).map(|token| &token.value),
+                        Some(TokenKind::Less | TokenKind::Greater | TokenKind::Append)
+                    ))
                     || (quoted
                         && !matches!(
                             self.tokens.get(self.position + 1).map(|token| &token.value),

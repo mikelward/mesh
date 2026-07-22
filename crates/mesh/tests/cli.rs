@@ -2009,6 +2009,125 @@ fn remainder_overflow_is_not_reported_as_division_by_zero() {
 }
 
 #[test]
+fn quoted_path_with_spaces_runs_in_command_position() {
+    let dir = fresh_dir("quoted command");
+    let command = dir.join("say hello");
+    std::fs::write(&command, "#!/bin/sh\nprintf 'ran\\n'\n").unwrap();
+    let mut permissions = std::fs::metadata(&command).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&command, permissions).unwrap();
+    let out = run_with_input(&format!("\"{}\"\n", command.display()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn tilde_expansion_ignores_adjacent_empty_quotes() {
+    let home = fresh_dir("tilde_empty_quote");
+    let out = run_with_home("puts ~\"\" ~\"\"/child\n", &home);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{} {}/child\n", home.display(), home.display())
+    );
+}
+
+#[test]
+fn captures_command_output_as_an_expression_value() {
+    let out = run_with_input("answer = $(printf 20) + 22\nputs $answer\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn expression_condition_errors_do_not_select_else() {
+    let out = run_with_input("if $missing { puts BAD } else { puts ALSO_BAD }\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(!out.status.success());
+}
+
+#[test]
+fn stderr_pipe_connects_to_the_next_stage() {
+    let out = run_with_input("sh -c 'echo out; echo err >&2' |& cat\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "out\nerr\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}
+
+#[test]
+fn background_conditional_lists_are_rejected_as_one_unit() {
+    let dir = fresh_dir("background_and_or");
+    let marker = dir.join("marker");
+    let out = run_with_input(&format!("false && touch {} &\n", marker.display()));
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!marker.exists());
+}
+
+#[test]
+fn break_inside_a_function_does_not_continue_its_body() {
+    let out = run_with_input("func f() { break; puts BAD }\nf\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(!out.status.success());
+}
+
+#[test]
+fn multiple_quoted_glob_hyphens_stay_literal() {
+    let dir = fresh_dir("multiple_quoted_hyphens");
+    for name in ["-", "a", "z"] {
+        std::fs::write(dir.join(name), "").unwrap();
+    }
+    let out = run_with_input(&format!("cd {}\nputs [a'--'z]\n", dir.display()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "- a z\n");
+}
+
+#[test]
+fn command_branch_output_becomes_the_if_expression_value() {
+    let out = run_with_input(
+        "french = true\ngreeting = if $french { printf bonjour } else { hi }\nputs $greeting\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bonjour\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn malformed_function_bodies_remain_quarantined() {
+    for input in [
+        "func f(x {\nputs LEAKED\n}\n",
+        "func f(x {\nputs )\nputs LEAKED\n}\n",
+    ] {
+        let out = run_with_input(input);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("syntax error"));
+    }
+}
+
+#[test]
+fn interpolated_command_allows_multiple_input_redirects() {
+    let dir = fresh_dir("multiple_input_redirects");
+    let first = dir.join("first");
+    let second = dir.join("second");
+    std::fs::write(&first, "first\n").unwrap();
+    std::fs::write(&second, "second\n").unwrap();
+    let out = run_with_input(&format!(
+        "cmd = cat\n$cmd < {} < {}\n",
+        first.display(),
+        second.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "second\n");
+}
+
+#[test]
 fn collection_modifiers_preserve_typed_list_results() {
     let out = run_with_input(
         "xs = [a b b c]\nputs $xs:len $xs:first $xs:last\nputs ...$xs:rest:init:dedup\nys = $xs:rest:init\nputs ...$ys\n",
