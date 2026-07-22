@@ -21,6 +21,8 @@ pub enum ExpandError {
     UnsetEnv(String),
     Unsupported(String),
     ListNeedsSpread(String),
+    NotAList(String),
+    IndexOutOfRange { name: String, index: i64 },
 }
 
 impl std::fmt::Display for ExpandError {
@@ -31,6 +33,10 @@ impl std::fmt::Display for ExpandError {
             ExpandError::Unsupported(s) => write!(f, "{s}: not supported yet"),
             ExpandError::ListNeedsSpread(n) => {
                 write!(f, "${n}: list value needs `...` in command arguments")
+            }
+            ExpandError::NotAList(n) => write!(f, "${n}: cannot index a string value"),
+            ExpandError::IndexOutOfRange { name, index } => {
+                write!(f, "${name}[{index}]: list index out of range")
             }
         }
     }
@@ -64,7 +70,11 @@ fn spread_var(word: &Word) -> Option<&str> {
                 text,
                 expandable: true,
             },
-            Piece::Var(VarRef { name, member: None }),
+            Piece::Var(VarRef {
+                name,
+                member: None,
+                index: None,
+            }),
         ] if text == "..." => Some(name),
         _ => None,
     }
@@ -129,19 +139,44 @@ fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), Exp
 /// `$name` reads the variable store (unbound is an error). Member access on any
 /// namespace other than `env`, and a bare `$env`, are not supported yet.
 fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
-    match (vref.name.as_str(), &vref.member) {
-        ("env", Some(key)) => env::var_os(key)
+    match (vref.name.as_str(), &vref.member, vref.index) {
+        ("env", Some(key), None) => env::var_os(key)
             .map(|v| v.to_string_lossy().into_owned())
             .ok_or_else(|| ExpandError::UnsetEnv(key.clone())),
-        ("env", None) => Err(ExpandError::Unsupported("$env".to_string())),
-        (name, None) => vars
+        ("env", None, None) => Err(ExpandError::Unsupported("$env".to_string())),
+        (name, None, Some(index)) => vars
+            .get(name)
+            .ok_or_else(|| ExpandError::UnboundVar(name.to_string()))
+            .and_then(|value| match value {
+                Value::String(_) => Err(ExpandError::NotAList(name.to_string())),
+                Value::List(values) => {
+                    let offset = if index < 0 {
+                        values.len() as i128 + index as i128
+                    } else {
+                        index as i128
+                    };
+                    usize::try_from(offset)
+                        .ok()
+                        .and_then(|offset| values.get(offset))
+                        .cloned()
+                        .ok_or_else(|| ExpandError::IndexOutOfRange {
+                            name: name.to_string(),
+                            index,
+                        })
+                }
+            }),
+        (name, None, None) => vars
             .get(name)
             .ok_or_else(|| ExpandError::UnboundVar(name.to_string()))
             .and_then(|value| match value {
                 Value::String(value) => Ok(value.clone()),
                 Value::List(_) => Err(ExpandError::ListNeedsSpread(name.to_string())),
             }),
-        (name, Some(member)) => Err(ExpandError::Unsupported(format!("${name}.{member}"))),
+        (name, Some(member), None) => Err(ExpandError::Unsupported(format!("${name}.{member}"))),
+        (name, member, Some(index)) => Err(ExpandError::Unsupported(format!(
+            "${name}{}[{index}]",
+            member.as_ref().map(|m| format!(".{m}")).unwrap_or_default()
+        ))),
     }
 }
 

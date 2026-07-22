@@ -70,6 +70,8 @@ file as tasks land.
       block parser.
 - [ ] General list expressions: nested values, indexing/slicing, `+=`, and
       expression-position spread.
+  - [x] Exact integer indexing (`$xs[0]`, including negative indices) for the
+        current string-list slice.
 - [ ] Maps, scalar types, and `:` modifiers.
 - [ ] `if` / `for` / `match` and `func`.
 
