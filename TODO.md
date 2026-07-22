@@ -396,17 +396,6 @@ re-verified in this pass. PRs 1–18 were not swept.
   to stopped groups, plus a PTY regression covering `bg` followed by shell exit.
   *(no maintainer reply)*
 
-### PR #74 / #75 — Require braces for quoted list indexing ([#74](https://github.com/mikelward/mesh/pull/74), [#75](https://github.com/mikelward/mesh/pull/75))
-
-- `crates/mesh-core/src/lexer.rs` — [thread #75](https://github.com/mikelward/mesh/pull/75#discussion_r3627383581),
-  [thread #74](https://github.com/mikelward/mesh/pull/74#discussion_r3627329099)
-  **[P2] Keep an unbraced bracket suffix literal inside double quotes** — Per
-  `DESIGN.md`, `"$x[0]"` means the value of `$x` followed by literal `[0]`, and
-  indexing requires `"${x[0]}"`. On main, `x = text; puts "$x[0]"` instead errors
-  `mesh: $x: cannot index a string value`. Gate unbraced index parsing inside
-  strings the same way as member access while keeping indexing in the braced
-  parser. *(still reproduces on main; two threads, same root cause)*
-
 ### PR #76 — Preserve empty strings in list literals ([#76](https://github.com/mikelward/mesh/pull/76))
 
 - `crates/mesh-core/src/lexer.rs:480` — [thread](https://github.com/mikelward/mesh/pull/76#discussion_r3627370806)
