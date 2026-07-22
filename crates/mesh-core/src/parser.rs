@@ -842,7 +842,7 @@ fn variable_suffix_end(source: &str, start: usize, mut end: usize) -> usize {
     end
 }
 
-fn subscript_end(rest: &str) -> Option<usize> {
+pub(crate) fn subscript_end(rest: &str) -> Option<usize> {
     let mut quote = None;
     let mut escaped = false;
     for (offset, ch) in rest.char_indices().skip(1) {
@@ -874,14 +874,14 @@ fn valid_variable_access(value: &str) -> bool {
                 return false;
             }
             rest = &member[end..];
-        } else if let Some(index) = rest.strip_prefix('[') {
-            let Some(close) = index.find(']') else {
+        } else if rest.starts_with('[') {
+            let Some(close) = subscript_end(rest) else {
                 return false;
             };
-            if !valid_variable_subscript(&index[..close]) {
+            if !valid_variable_subscript(&rest[1..close - 1]) {
                 return false;
             }
-            rest = &index[close + 1..];
+            rest = &rest[close..];
         } else if let Some(modifier) = rest.strip_prefix(':') {
             let end = modifier.find(':').unwrap_or(modifier.len());
             if !modifier_name(&modifier[..end]) {
@@ -1001,14 +1001,14 @@ fn variable_access_prefix(text: &str) -> usize {
                 break;
             }
             consumed += length + 1;
-        } else if let Some(value) = rest.strip_prefix('[') {
-            let Some(close) = value.find(']') else {
+        } else if rest.starts_with('[') {
+            let Some(close) = subscript_end(rest) else {
                 break;
             };
-            if !valid_variable_subscript(&value[..close]) {
+            if !valid_variable_subscript(&rest[1..close - 1]) {
                 break;
             }
-            consumed += close + 2;
+            consumed += close;
         } else if let Some(value) = rest.strip_prefix(':') {
             let length = value
                 .find(['.', '[', ':', '!', '/', ' '])

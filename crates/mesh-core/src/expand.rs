@@ -350,60 +350,62 @@ fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
 }
 
 pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandError> {
-    if vref.name == "env" {
+    let mut value = if vref.name == "env" {
         let [Access::Member(key)] = vref.accesses.as_slice() else {
             return Err(ExpandError::Unsupported("$env".to_string()));
         };
-        return env::var_os(key)
+        env::var_os(key)
             .map(|v| Value::String(v.to_string_lossy().into_owned()))
-            .ok_or_else(|| ExpandError::UnsetEnv(key.clone()));
-    }
-    let mut value = vars
-        .get(&vref.name)
-        .ok_or_else(|| ExpandError::UnboundVar(vref.name.clone()))?
-        .clone();
-    for access in &vref.accesses {
-        value = match access {
-            Access::Member(key) => map_value_access(value, key, &vref.name)?,
-            Access::Subscript(subscript) => {
-                let key = subscript_key(subscript, vars)?;
-                match value {
+            .ok_or_else(|| ExpandError::UnsetEnv(key.clone()))?
+    } else {
+        let mut value = vars
+            .get(&vref.name)
+            .ok_or_else(|| ExpandError::UnboundVar(vref.name.clone()))?
+            .clone();
+        for access in &vref.accesses {
+            value = match access {
+                Access::Member(key) => map_value_access(value, key, &vref.name)?,
+                Access::Subscript(subscript) => {
+                    let key = subscript_key(subscript, vars)?;
+                    match value {
+                        Value::List(values) => {
+                            let index = key.parse::<i64>().map_err(|_| {
+                                ExpandError::Unsupported("list index must be an integer".into())
+                            })?;
+                            let offset = if index < 0 {
+                                values.len() as i128 + index as i128
+                            } else {
+                                index as i128
+                            };
+                            usize::try_from(offset)
+                                .ok()
+                                .and_then(|offset| values.get(offset))
+                                .cloned()
+                                .ok_or_else(|| ExpandError::IndexOutOfRange {
+                                    name: vref.name.clone(),
+                                    index,
+                                })?
+                        }
+                        Value::Map(_) => map_value_access(value, &key, &vref.name)?,
+                        Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
+                            return Err(ExpandError::NotAList(vref.name.clone()));
+                        }
+                    }
+                }
+                Access::Slice {
+                    start,
+                    end,
+                    inclusive,
+                } => match value {
                     Value::List(values) => {
-                        let index = key.parse::<i64>().map_err(|_| {
-                            ExpandError::Unsupported("list index must be an integer".into())
-                        })?;
-                        let offset = if index < 0 {
-                            values.len() as i128 + index as i128
-                        } else {
-                            index as i128
-                        };
-                        usize::try_from(offset)
-                            .ok()
-                            .and_then(|offset| values.get(offset))
-                            .cloned()
-                            .ok_or_else(|| ExpandError::IndexOutOfRange {
-                                name: vref.name.clone(),
-                                index,
-                            })?
+                        Value::List(slice(&values, *start, *end, *inclusive).to_vec())
                     }
-                    Value::Map(_) => map_value_access(value, &key, &vref.name)?,
-                    Value::String(_) | Value::Integer(_) | Value::Boolean(_) => {
-                        return Err(ExpandError::NotAList(vref.name.clone()));
-                    }
-                }
-            }
-            Access::Slice {
-                start,
-                end,
-                inclusive,
-            } => match value {
-                Value::List(values) => {
-                    Value::List(slice(&values, *start, *end, *inclusive).to_vec())
-                }
-                _ => return Err(ExpandError::NotAList(vref.name.clone())),
-            },
-        };
-    }
+                    _ => return Err(ExpandError::NotAList(vref.name.clone())),
+                },
+            };
+        }
+        value
+    };
     for modifier in &vref.modifiers {
         value = apply_modifier(value, *modifier)?;
     }
@@ -730,7 +732,8 @@ fn has_glob_meta(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_tilde, has_glob_meta};
+    use super::{Access, Modifier, VarRef, apply_tilde, has_glob_meta, resolve_value};
+    use crate::vars::{Value, Vars};
 
     #[test]
     fn detects_glob_metacharacters() {
@@ -743,5 +746,25 @@ mod tests {
         let mut pieces = vec![("~".to_string(), false)];
         apply_tilde(&mut pieces);
         assert_eq!(pieces, vec![("~".to_string(), false)]);
+    }
+
+    #[test]
+    fn environment_values_receive_command_word_modifiers() {
+        let key = "MESH_TEST_ENV_MODIFIER";
+        // SAFETY: this test uses a process-specific key that no other test reads.
+        unsafe { std::env::set_var(key, "abcd") };
+        let reference = VarRef {
+            name: "env".into(),
+            accesses: vec![Access::Member(key.into())],
+            modifiers: vec![Modifier::Len],
+            quoted: false,
+        };
+
+        assert_eq!(
+            resolve_value(&reference, &Vars::new()),
+            Ok(Value::Integer(4))
+        );
+        // SAFETY: the test owns this process-specific key.
+        unsafe { std::env::remove_var(key) };
     }
 }
