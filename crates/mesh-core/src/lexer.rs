@@ -996,8 +996,12 @@ pub fn scan_braces(text: &str, start_depth: i32) -> BraceScan {
             '$' if chars.get(k + 1).map(|&(_, c)| c) == Some('{') => {
                 k = skip_interpolation(&chars, k + 2);
             }
+            // A bare `{`/`}` is a block delimiter and a word boundary: the body's
+            // first word begins right after the opening `{` (so a `func f(){r'…'}`
+            // raw prefix is raw), and a fresh word follows the closing `}`.
             '{' => {
                 depth += 1;
+                word_start = true;
                 k += 1;
             }
             '}' => {
@@ -1005,6 +1009,7 @@ pub fn scan_braces(text: &str, start_depth: i32) -> BraceScan {
                 if depth == 0 && close.is_none() {
                     close = Some(byte);
                 }
+                word_start = true;
                 k += 1;
             }
             // Operators the lexer starts a fresh word after (so a following
@@ -1521,6 +1526,17 @@ mod tests {
         // reports the trailing-text error rather than swallowing later commands.
         assert!(!needs_more_input("func f() {} {\n"));
         assert!(!needs_more_input("func f() { puts hi } extra {\n"));
+    }
+
+    #[test]
+    fn scan_braces_treats_a_body_brace_as_a_word_boundary() {
+        // The body's first word begins right after `{`, so a raw prefix there is
+        // raw and its trailing backslash does not escape the quote and swallow `}`.
+        assert_eq!(scan_braces(r"func f(){r'\'}", 0).depth, 0);
+        assert_eq!(
+            scan_braces(r"func f(){r'\'}", 0).close,
+            Some(r"func f(){r'\'".len())
+        );
     }
 
     #[test]

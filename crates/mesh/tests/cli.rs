@@ -1874,3 +1874,17 @@ fn an_impossible_parameter_head_does_not_enter_continuation() {
         );
     }
 }
+
+#[test]
+fn a_raw_string_body_immediately_after_the_brace_defines() {
+    // `func f(){r'\'}` — a raw string as the first body word with no space after
+    // `{`; the body's `}` is still found and the definition is accepted.
+    let out = run_with_input("func f(){r'\\'}\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("missing closing")
+            && !String::from_utf8_lossy(&out.stderr).contains("unexpected text"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
