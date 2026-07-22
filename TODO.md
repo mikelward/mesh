@@ -86,7 +86,7 @@ file as tasks land.
         index access, modifiers, lists and spread, unary and binary operators,
         and recursive `if` / `for` bodies; return explicit runtime errors for
         parsed expression forms that are not implemented yet.
-  - [ ] Store parsed function bodies as `parser::Source` and execute them
+  - [x] Store parsed function bodies as `parser::Source` and execute them
         recursively instead of retaining and reparsing raw body text.
   - [ ] Remove the raw-text function, `if`, and `for` recognizers and their brace
         scanners; use only `ParseOutcome::Incomplete` to buffer compound input.

@@ -1192,15 +1192,16 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
     result
 }
 
-/// Run a function body, buffering a nested multi-line `func` definition until its
-/// braces balance — exactly as the top-level reader does — so a nested definition
-/// is stored rather than having only its first line reach `run_line`.
+/// Run a compatibility-parser compound body, buffering a nested multi-line
+/// `func` definition until its braces balance — exactly as the top-level reader
+/// does — so a nested definition is stored rather than having only its first
+/// line reach `run_line`.
 ///
 /// A function starts fresh, not inheriting the caller's `$?`: an empty body (or a
 /// bare `return` before any command) yields status 0 (`DESIGN.md` — "no
 /// expression to yield … status 0"), and the first line likewise sees `$?` = 0.
 /// `return` ends the body early with its status; `exit` propagates out.
-fn run_body(body: &str, in_function: bool, shell: &mut Shell) -> Step {
+fn run_legacy_body(body: &str, in_function: bool, shell: &mut Shell) -> Step {
     let mut status = 0;
     let mut pending = String::new();
     for line in body.lines() {
@@ -1398,7 +1399,7 @@ fn run_for(text: &str, in_function: bool, shell: &mut Shell) -> Step {
             return Step::Continue(1);
         };
         shell.vars.set(name, item);
-        match run_body(body, in_function, shell) {
+        match run_legacy_body(body, in_function, shell) {
             Step::Continue(code) => status = code,
             Step::Return(code) if in_function => {
                 shell.loop_depth -= 1;
@@ -1497,12 +1498,12 @@ fn run_if(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
         return condition_step;
     }
     if take_then {
-        run_body(then_body, in_function, shell)
+        run_legacy_body(then_body, in_function, shell)
     } else if let Some(body) = else_body {
         if is_if_start(body) {
             run_if(body, last, in_function, shell)
         } else {
-            run_body(body, in_function, shell)
+            run_legacy_body(body, in_function, shell)
         }
     } else {
         Step::Continue(0)
@@ -1550,7 +1551,7 @@ fn eval_block_value(
     let step = if prefix.trim().is_empty() {
         Step::Continue(0)
     } else {
-        run_body(prefix, in_function, shell)
+        run_legacy_body(prefix, in_function, shell)
     };
     if !matches!(step, Step::Continue(_)) {
         return Ok((Value::String(String::new()), step));
