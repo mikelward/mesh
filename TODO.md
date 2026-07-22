@@ -66,6 +66,9 @@ file as tasks land.
       (`xs = [a "b c"]`), including the distinct empty list (`xs = []`).
 - [x] Explicit list spread into command arguments (`puts ...$xs`); using a list
       without `...` is a loud error rather than implicit word splitting.
+  **Status:** the first execution-path cutover was reverted after integration
+  regressions. The checked parser-front-end items below remain landed; the
+  unchecked runtime migration items are still outstanding and are authoritative.
 - [x] Replace the incremental command lexer with the clean-break expression and
       block parser.
   - [x] Fix the parser grammar, precedence, attachment, and completeness contract
