@@ -14,9 +14,52 @@ pub struct Spanned<T> {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteMode {
+    Bare,
+    Double,
+    Single,
+    Raw,
+    Escaped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WordPiece {
+    Text { text: String, quote: QuoteMode },
+    Variable { name: String, quote: QuoteMode },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Word {
+    pub pieces: Vec<WordPiece>,
+}
+
+impl Word {
+    pub fn text(&self) -> String {
+        self.pieces
+            .iter()
+            .map(|piece| match piece {
+                WordPiece::Text { text, .. } => text.as_str(),
+                WordPiece::Variable { name, .. } => name.as_str(),
+            })
+            .collect()
+    }
+
+    fn is_bare_text(&self, expected: &str) -> bool {
+        matches!(self.pieces.as_slice(), [WordPiece::Text { text, quote: QuoteMode::Bare }] if text == expected)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeredocBody {
+    pub text: String,
+    pub raw: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
-    Word { text: String, quoted: bool },
+    Word(Word),
+    HeredocBody(HeredocBody),
     Newline,
     Semi,
     Amp,
@@ -166,10 +209,11 @@ pub struct Command {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandItem {
-    Word(Spanned<String>),
+    Word(Spanned<Word>),
     Redirect {
         kind: RedirectKind,
-        target: Spanned<String>,
+        target: Spanned<Word>,
+        body: Option<Spanned<HeredocBody>>,
     },
 }
 
@@ -196,7 +240,7 @@ pub enum ElseBranch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
-    Scalar(Spanned<String>),
+    Scalar(Spanned<Word>),
     Variable(Spanned<String>),
     List(Vec<ListItem>),
     Map(Vec<MapItem>),
@@ -232,6 +276,7 @@ pub enum Expr {
         arguments: Option<Vec<Argument>>,
     },
     Group(Box<Expr>),
+    BackgroundJob(Pipeline),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +374,7 @@ impl<'a> Lexer<'a> {
 
     fn run(mut self) -> Result<Vec<Token>, ParseError> {
         let mut tokens = Vec::new();
+        let mut line_start = 0;
         while self.position < self.source.len() {
             let start = self.position;
             let c = self.char_at(self.position).expect("position is in bounds");
@@ -349,10 +395,12 @@ impl<'a> Lexer<'a> {
             }
             if c == '\n' {
                 self.position += 1;
+                self.consume_heredocs(&mut tokens, line_start, start)?;
                 tokens.push(Spanned {
                     value: TokenKind::Newline,
-                    span: start..self.position,
+                    span: start..start + 1,
                 });
+                line_start = tokens.len();
                 continue;
             }
             if let Some((text, kind)) = self.punctuation() {
@@ -363,25 +411,23 @@ impl<'a> Lexer<'a> {
                 });
                 continue;
             }
-            let mut text = String::new();
-            let mut quoted = false;
+            let mut pieces = Vec::new();
             while self.position < self.source.len() {
                 let here = self.char_at(self.position).unwrap();
                 if here.is_whitespace()
                     || self.punctuation().is_some()
-                    || (here == '#' && text.is_empty())
+                    || (here == '#' && pieces.is_empty())
                 {
                     break;
                 }
                 if here == '\\' {
                     self.position += 1;
                     let Some(next) = self.char_at(self.position) else {
-                        text.push('\\');
+                        push_text(&mut pieces, "\\", QuoteMode::Escaped);
                         break;
                     };
-                    text.push(next);
+                    push_text(&mut pieces, &next.to_string(), QuoteMode::Escaped);
                     self.position += next.len_utf8();
-                    quoted = true;
                     continue;
                 }
                 let raw =
@@ -394,23 +440,40 @@ impl<'a> Lexer<'a> {
                         here
                     };
                     self.position += 1;
-                    quoted = true;
+                    let mode = if raw {
+                        QuoteMode::Raw
+                    } else if quote == '\'' {
+                        QuoteMode::Single
+                    } else {
+                        QuoteMode::Double
+                    };
                     let mut closed = false;
+                    let piece_count = pieces.len();
                     while self.position < self.source.len() {
                         let inner = self.char_at(self.position).unwrap();
-                        self.position += inner.len_utf8();
                         if inner == quote {
+                            self.position += inner.len_utf8();
                             closed = true;
                             break;
                         }
                         if inner == '\\' && !raw {
+                            self.position += 1;
                             let Some(escaped) = self.char_at(self.position) else {
                                 break;
                             };
                             self.position += escaped.len_utf8();
-                            text.push(escaped);
+                            push_text(&mut pieces, &escaped.to_string(), QuoteMode::Escaped);
+                        } else if inner == '$' && mode == QuoteMode::Double {
+                            let end = variable_end(self.source, self.position);
+                            push_variable(
+                                &mut pieces,
+                                &self.source[self.position..end],
+                                QuoteMode::Double,
+                            );
+                            self.position = end;
                         } else {
-                            text.push(inner);
+                            push_text(&mut pieces, &inner.to_string(), mode);
+                            self.position += inner.len_utf8();
                         }
                     }
                     if !closed {
@@ -419,23 +482,111 @@ impl<'a> Lexer<'a> {
                             span: start..self.source.len(),
                         });
                     }
+                    if pieces.len() == piece_count {
+                        push_text(&mut pieces, "", mode);
+                    }
                     continue;
                 }
-                text.push(here);
-                self.position += here.len_utf8();
+                if here == '$' {
+                    let end = variable_end(self.source, self.position);
+                    push_variable(
+                        &mut pieces,
+                        &self.source[self.position..end],
+                        QuoteMode::Bare,
+                    );
+                    self.position = end;
+                } else {
+                    push_text(&mut pieces, &here.to_string(), QuoteMode::Bare);
+                    self.position += here.len_utf8();
+                }
             }
-            if text.is_empty() && !quoted {
+            if pieces.is_empty() {
                 return Err(ParseError {
                     kind: ParseErrorKind::UnexpectedToken,
                     span: start..start + c.len_utf8(),
                 });
             }
             tokens.push(Spanned {
-                value: TokenKind::Word { text, quoted },
+                value: TokenKind::Word(Word { pieces }),
                 span: start..self.position,
             });
         }
         Ok(tokens)
+    }
+
+    fn consume_heredocs(
+        &mut self,
+        tokens: &mut Vec<Token>,
+        line_start: usize,
+        command_newline: usize,
+    ) -> Result<(), ParseError> {
+        let mut requests = Vec::new();
+        for index in line_start..tokens.len() {
+            if matches!(tokens[index].value, TokenKind::Heredoc) {
+                let Some(Token {
+                    value: TokenKind::Word(word),
+                    ..
+                }) = tokens.get(index + 1)
+                else {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::Expected("a heredoc delimiter"),
+                        span: tokens[index].span.clone(),
+                    });
+                };
+                requests.push((index + 1, word.text(), word_is_quoted(word)));
+            }
+        }
+        if requests.is_empty() {
+            return Ok(());
+        }
+
+        let mut scan = command_newline + 1;
+        for (inserted, (delimiter_index, delimiter, raw)) in requests.into_iter().enumerate() {
+            let body_start = scan;
+            let mut closing = None;
+            while scan <= self.source.len() {
+                let line_end = self.source[scan..]
+                    .find('\n')
+                    .map_or(self.source.len(), |offset| scan + offset);
+                let line = self.source[scan..line_end]
+                    .strip_suffix('\r')
+                    .unwrap_or(&self.source[scan..line_end]);
+                if line == delimiter {
+                    closing = Some((
+                        scan,
+                        if line_end < self.source.len() {
+                            line_end + 1
+                        } else {
+                            line_end
+                        },
+                    ));
+                    break;
+                }
+                if line_end == self.source.len() {
+                    break;
+                }
+                scan = line_end + 1;
+            }
+            let Some((closing_start, closing_end)) = closing else {
+                return Err(ParseError {
+                    kind: ParseErrorKind::Unterminated('<'),
+                    span: body_start..self.source.len(),
+                });
+            };
+            tokens.insert(
+                delimiter_index + 1 + inserted,
+                Spanned {
+                    value: TokenKind::HeredocBody(HeredocBody {
+                        text: self.source[body_start..closing_start].to_owned(),
+                        raw,
+                    }),
+                    span: body_start..closing_start,
+                },
+            );
+            scan = closing_end;
+        }
+        self.position = scan;
+        Ok(())
     }
 
     fn char_at(&self, byte: usize) -> Option<char> {
@@ -507,6 +658,79 @@ impl<'a> Lexer<'a> {
         };
         Some((spelling, kind))
     }
+}
+
+fn push_text(pieces: &mut Vec<WordPiece>, text: &str, quote: QuoteMode) {
+    if let Some(WordPiece::Text {
+        text: previous,
+        quote: previous_quote,
+    }) = pieces.last_mut()
+        && *previous_quote == quote
+    {
+        previous.push_str(text);
+    } else {
+        pieces.push(WordPiece::Text {
+            text: text.to_owned(),
+            quote,
+        });
+    }
+}
+
+fn push_variable(pieces: &mut Vec<WordPiece>, variable: &str, quote: QuoteMode) {
+    pieces.push(WordPiece::Variable {
+        name: variable.to_owned(),
+        quote,
+    });
+}
+
+fn variable_end(source: &str, start: usize) -> usize {
+    let rest = &source[start..];
+    if let Some(braced) = rest.strip_prefix("${") {
+        return braced.find('}').map_or(start + 1, |end| start + 3 + end);
+    }
+    let mut end = start + 1;
+    for c in source[end..].chars() {
+        if c == '_' || c.is_alphanumeric() {
+            end += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+fn word_is_quoted(word: &Word) -> bool {
+    word.pieces.iter().any(|piece| match piece {
+        WordPiece::Text { quote, .. } | WordPiece::Variable { quote, .. } => {
+            *quote != QuoteMode::Bare
+        }
+    })
+}
+
+fn token_word_pieces(kind: &TokenKind) -> Option<Vec<WordPiece>> {
+    if let TokenKind::Word(word) = kind {
+        return Some(word.pieces.clone());
+    }
+    let spelling = match kind {
+        TokenKind::Dot => ".",
+        TokenKind::Colon => ":",
+        TokenKind::LBracket => "[",
+        TokenKind::RBracket => "]",
+        TokenKind::LParen => "(",
+        TokenKind::RParen => ")",
+        TokenKind::Comma => ",",
+        TokenKind::Spread => "...",
+        TokenKind::Range => "..",
+        TokenKind::RangeInclusive => "..=",
+        TokenKind::Equal => "=",
+        TokenKind::PlusEqual => "+=",
+        TokenKind::Operator(operator) => operator,
+        _ => return None,
+    };
+    Some(vec![WordPiece::Text {
+        text: spelling.to_owned(),
+        quote: QuoteMode::Bare,
+    }])
 }
 
 struct Parser {
@@ -600,12 +824,24 @@ impl Parser {
                 if !append {
                     self.expect(&TokenKind::Equal, "`=`")?;
                 }
+                let value = if !append && !self.value_start() && self.amp_before_terminator() {
+                    let pipeline = self.pipeline()?;
+                    self.expect(&TokenKind::Amp, "`&`")?;
+                    Expr::BackgroundJob(pipeline)
+                } else {
+                    self.expression()?
+                };
                 return Ok(Executable::Assignment {
                     name,
                     append,
-                    value: self.expression()?,
+                    value,
                 });
             }
+        }
+        if self.value_start() {
+            let expression = self.expression()?;
+            let guard = self.guard()?;
+            return Ok(Executable::Expression { expression, guard });
         }
         self.pipeline().map(Executable::Pipeline)
     }
@@ -637,7 +873,8 @@ impl Parser {
     fn command(&mut self) -> Result<Command, ParseError> {
         let mut items = Vec::new();
         while !self.at_command_end() {
-            if (self.word("if") || self.word("unless")) && !items.is_empty() {
+            if (self.word("if") || self.word("unless")) && !items.is_empty() && self.viable_guard()
+            {
                 break;
             }
             let kind = if self.eat(&TokenKind::Less).is_some() {
@@ -653,7 +890,26 @@ impl Parser {
             };
             if let Some(kind) = kind {
                 let target = self.command_word()?;
-                items.push(CommandItem::Redirect { kind, target });
+                let body = if kind == RedirectKind::Heredoc {
+                    let token = self
+                        .next()
+                        .ok_or_else(|| self.eof(ParseErrorKind::UnexpectedEnd))?;
+                    match token.value {
+                        TokenKind::HeredocBody(body) => Some(Spanned {
+                            value: body,
+                            span: token.span,
+                        }),
+                        _ => {
+                            return Err(ParseError {
+                                kind: ParseErrorKind::Expected("a heredoc body"),
+                                span: token.span,
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
+                items.push(CommandItem::Redirect { kind, target, body });
             } else {
                 items.push(CommandItem::Word(self.command_word()?));
             }
@@ -665,20 +921,31 @@ impl Parser {
         Ok(Command { items, guard })
     }
 
-    fn command_word(&mut self) -> Result<Spanned<String>, ParseError> {
-        let token = self
+    fn command_word(&mut self) -> Result<Spanned<Word>, ParseError> {
+        let first = self
             .next()
             .ok_or_else(|| self.eof(ParseErrorKind::UnexpectedEnd))?;
-        match token.value {
-            TokenKind::Word { text, .. } => Ok(Spanned {
-                value: text,
-                span: token.span,
-            }),
-            _ => Err(ParseError {
-                kind: ParseErrorKind::Expected("a command word"),
-                span: token.span,
-            }),
+        let start = first.span.start;
+        let mut end = first.span.end;
+        let mut pieces = token_word_pieces(&first.value).ok_or_else(|| ParseError {
+            kind: ParseErrorKind::Expected("a command word"),
+            span: first.span.clone(),
+        })?;
+        while self.peek().is_some_and(|token| token.span.start == end) {
+            let Some(next_pieces) = self
+                .peek()
+                .and_then(|token| token_word_pieces(&token.value))
+            else {
+                break;
+            };
+            end = self.peek().unwrap().span.end;
+            self.position += 1;
+            pieces.extend(next_pieces);
         }
+        Ok(Spanned {
+            value: Word { pieces },
+            span: start..end,
+        })
     }
 
     fn guard(&mut self) -> Result<Option<Guard>, ParseError> {
@@ -721,9 +988,10 @@ impl Parser {
 
     fn if_expr(&mut self) -> Result<IfExpr, ParseError> {
         self.take_word("if");
-        let condition = Box::new(self.pipeline().map(Executable::Pipeline)?);
+        let condition = Box::new(self.condition()?);
         self.newlines();
         let then_body = self.block()?;
+        let before_else_trivia = self.position;
         self.newlines();
         let else_branch = if self.take_word("else") {
             self.newlines();
@@ -733,6 +1001,7 @@ impl Parser {
                 ElseBranch::Block(self.block()?)
             })
         } else {
+            self.position = before_else_trivia;
             None
         };
         Ok(IfExpr {
@@ -783,6 +1052,30 @@ impl Parser {
 
     fn expression(&mut self) -> Result<Expr, ParseError> {
         self.binary(1)
+    }
+
+    fn condition(&mut self) -> Result<Executable, ParseError> {
+        if self.word_text_at(0).is_some()
+            && self
+                .tokens
+                .get(self.position + 1)
+                .is_some_and(|token| matches!(token.value, TokenKind::Equal))
+        {
+            let name = self.name()?;
+            self.position += 1;
+            return Ok(Executable::Assignment {
+                name,
+                append: false,
+                value: self.expression()?,
+            });
+        }
+        if self.value_start() {
+            return Ok(Executable::Expression {
+                expression: self.expression()?,
+                guard: None,
+            });
+        }
+        self.pipeline().map(Executable::Pipeline)
     }
 
     fn binary(&mut self, minimum: u8) -> Result<Expr, ParseError> {
@@ -858,6 +1151,7 @@ impl Parser {
         let mut value = self.primary()?;
         loop {
             if self.eat(&TokenKind::LParen).is_some() {
+                self.newlines();
                 value = Expr::Call {
                     callee: Box::new(value),
                     arguments: self.arguments()?,
@@ -868,7 +1162,9 @@ impl Parser {
                     name: self.name()?,
                 };
             } else if self.eat(&TokenKind::LBracket).is_some() {
+                self.newlines();
                 let index = self.expression()?;
+                self.newlines();
                 self.expect(&TokenKind::RBracket, "`]`")?;
                 value = Expr::Index {
                     value: Box::new(value),
@@ -898,25 +1194,39 @@ impl Parser {
 
     fn primary(&mut self) -> Result<Expr, ParseError> {
         if self.eat(&TokenKind::LParen).is_some() {
+            self.newlines();
             let value = self.expression()?;
+            self.newlines();
             self.expect(&TokenKind::RParen, "`)`")?;
             return Ok(Expr::Group(Box::new(value)));
         }
         if self.eat(&TokenKind::LBracket).is_some() {
+            self.newlines();
             return self.collection();
         }
         let token = self
             .next()
             .ok_or_else(|| self.eof(ParseErrorKind::UnexpectedEnd))?;
         match token.value {
-            TokenKind::Word { text, .. } if text.starts_with('$') => Ok(Expr::Variable(Spanned {
-                value: text,
-                span: token.span,
-            })),
-            TokenKind::Word { text, .. } => Ok(Expr::Scalar(Spanned {
-                value: text,
-                span: token.span,
-            })),
+            TokenKind::Word(word) => {
+                if let [
+                    WordPiece::Variable {
+                        name,
+                        quote: QuoteMode::Bare,
+                    },
+                ] = word.pieces.as_slice()
+                {
+                    Ok(Expr::Variable(Spanned {
+                        value: name.clone(),
+                        span: token.span,
+                    }))
+                } else {
+                    Ok(Expr::Scalar(Spanned {
+                        value: word,
+                        span: token.span,
+                    }))
+                }
+            }
             TokenKind::Range | TokenKind::RangeInclusive => {
                 self.position -= 1;
                 self.range(None)
@@ -974,15 +1284,17 @@ impl Parser {
             }
         }
         if is_map {
+            let mut prefix = Vec::new();
             for value in values {
                 match value {
-                    ListItem::Spread(v) => pairs.insert(0, MapItem::Spread(v)),
+                    ListItem::Spread(v) => prefix.push(MapItem::Spread(v)),
                     ListItem::Value(_) => {
                         return Err(self.error(ParseErrorKind::Expected("consistent map entries")));
                     }
                 }
             }
-            Ok(Expr::Map(pairs))
+            prefix.extend(pairs);
+            Ok(Expr::Map(prefix))
         } else {
             Ok(Expr::List(values))
         }
@@ -990,6 +1302,7 @@ impl Parser {
 
     fn arguments(&mut self) -> Result<Vec<Argument>, ParseError> {
         let mut result = Vec::new();
+        self.newlines();
         if self.eat(&TokenKind::RParen).is_some() {
             return Ok(result);
         }
@@ -1008,10 +1321,12 @@ impl Parser {
             } else {
                 result.push(Argument::Positional(self.expression()?));
             }
+            self.newlines();
             if self.eat(&TokenKind::RParen).is_some() {
                 break;
             }
             self.expect(&TokenKind::Comma, "`,`")?;
+            self.newlines();
             if self.eat(&TokenKind::RParen).is_some() {
                 break;
             }
@@ -1042,18 +1357,9 @@ impl Parser {
             return None;
         }
         let (op, p, comparison) = match token {
-            TokenKind::Word {
-                text,
-                quoted: false,
-            } if text == "or" => (BinaryOp::Or, 1, false),
-            TokenKind::Word {
-                text,
-                quoted: false,
-            } if text == "and" => (BinaryOp::And, 2, false),
-            TokenKind::Word {
-                text,
-                quoted: false,
-            } if text == "in" => (BinaryOp::In, 4, true),
+            TokenKind::Word(word) if word.is_bare_text("or") => (BinaryOp::Or, 1, false),
+            TokenKind::Word(word) if word.is_bare_text("and") => (BinaryOp::And, 2, false),
+            TokenKind::Word(word) if word.is_bare_text("in") => (BinaryOp::In, 4, true),
             TokenKind::Operator(text) => match text.as_str() {
                 "==" => (BinaryOp::Equal, 4, true),
                 "!=" => (BinaryOp::NotEqual, 4, true),
@@ -1082,10 +1388,9 @@ impl Parser {
             .next()
             .ok_or_else(|| self.eof(ParseErrorKind::UnexpectedEnd))?;
         match token.value {
-            TokenKind::Word {
-                text,
-                quoted: false,
-            } if valid_name(&text) => Ok(text),
+            TokenKind::Word(word) if valid_name(&word.text()) && !word_is_quoted(&word) => {
+                Ok(word.text())
+            }
             _ => Err(ParseError {
                 kind: ParseErrorKind::Expected("a name"),
                 span: token.span,
@@ -1122,6 +1427,46 @@ impl Parser {
                 )
             )
     }
+    fn value_start(&self) -> bool {
+        match self.peek().map(|token| &token.value) {
+            Some(
+                TokenKind::LParen
+                | TokenKind::LBracket
+                | TokenKind::Range
+                | TokenKind::RangeInclusive,
+            ) => true,
+            Some(TokenKind::Word(word)) => {
+                matches!(
+                    word.pieces.as_slice(),
+                    [WordPiece::Variable {
+                        quote: QuoteMode::Bare,
+                        ..
+                    }]
+                ) || self.tokens.get(self.position + 1).is_some_and(|next| {
+                    matches!(next.value, TokenKind::LParen)
+                        && next.span.start == self.peek().unwrap().span.end
+                })
+            }
+            _ => false,
+        }
+    }
+    fn amp_before_terminator(&self) -> bool {
+        for token in &self.tokens[self.position..] {
+            match token.value {
+                TokenKind::Amp => return true,
+                TokenKind::Newline | TokenKind::Semi | TokenKind::RBrace => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+    fn viable_guard(&mut self) -> bool {
+        let saved = self.position;
+        self.position += 1;
+        let viable = self.expression().is_ok() && self.at_command_end();
+        self.position = saved;
+        viable
+    }
     fn terminators(&mut self) -> usize {
         let start = self.position;
         while matches!(
@@ -1136,7 +1481,7 @@ impl Parser {
         while self.eat(&TokenKind::Newline).is_some() {}
     }
     fn word(&self, expected: &str) -> bool {
-        matches!(self.peek().map(|t| &t.value), Some(TokenKind::Word { text, quoted: false }) if text == expected)
+        matches!(self.peek().map(|t| &t.value), Some(TokenKind::Word(word)) if word.is_bare_text(expected))
     }
     fn take_word(&mut self, expected: &str) -> bool {
         if self.word(expected) {
@@ -1148,10 +1493,17 @@ impl Parser {
     }
     fn word_text_at(&self, offset: usize) -> Option<&str> {
         match &self.tokens.get(self.position + offset)?.value {
-            TokenKind::Word {
-                text,
-                quoted: false,
-            } if valid_name(text) => Some(text),
+            TokenKind::Word(word) if valid_name(&word.text()) && !word_is_quoted(word) => {
+                match word.pieces.as_slice() {
+                    [
+                        WordPiece::Text {
+                            text,
+                            quote: QuoteMode::Bare,
+                        },
+                    ] => Some(text),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -1262,10 +1614,12 @@ mod tests {
         assert_eq!(
             tokens[1],
             Spanned {
-                value: TokenKind::Word {
-                    text: "a b".into(),
-                    quoted: true
-                },
+                value: TokenKind::Word(Word {
+                    pieces: vec![WordPiece::Text {
+                        text: "a b".into(),
+                        quote: QuoteMode::Double,
+                    }],
+                }),
                 span: 5..10
             }
         );
@@ -1356,5 +1710,137 @@ mod tests {
             panic!()
         };
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn retains_quote_boundaries_and_interpolation_modes() {
+        let tokens = tokenize("\"pre\"$x'$y'").unwrap();
+        let TokenKind::Word(word) = &tokens[0].value else {
+            panic!()
+        };
+        assert_eq!(
+            word.pieces,
+            vec![
+                WordPiece::Text {
+                    text: "pre".into(),
+                    quote: QuoteMode::Double
+                },
+                WordPiece::Variable {
+                    name: "$x".into(),
+                    quote: QuoteMode::Bare
+                },
+                WordPiece::Text {
+                    text: "$y".into(),
+                    quote: QuoteMode::Single
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn assembles_adjacent_punctuation_into_command_words() {
+        let tree = complete("echo file.txt ./tool key:value xs[0]");
+        let Executable::Pipeline(pipeline) = &tree.statements[0].and_or.first else {
+            panic!()
+        };
+        let words: Vec<_> = pipeline.stages[0]
+            .items
+            .iter()
+            .map(|item| match item {
+                CommandItem::Word(word) => word.value.text(),
+                CommandItem::Redirect { .. } => panic!(),
+            })
+            .collect();
+        assert_eq!(words, ["echo", "file.txt", "./tool", "key:value", "xs[0]"]);
+    }
+
+    #[test]
+    fn consumes_heredoc_body_without_parsing_it_as_statements() {
+        let tree = complete("cat <<EOF\nhello $name\nEOF\n");
+        assert_eq!(tree.statements.len(), 1);
+        let Executable::Pipeline(pipeline) = &tree.statements[0].and_or.first else {
+            panic!()
+        };
+        let CommandItem::Redirect {
+            body: Some(body), ..
+        } = &pipeline.stages[0].items[1]
+        else {
+            panic!()
+        };
+        assert_eq!(body.value.text, "hello $name\n");
+        assert!(!body.value.raw);
+    }
+
+    #[test]
+    fn parses_value_conditions_and_value_shaped_statements() {
+        let tree = complete("if $x == 1 { puts yes }\n$x\nfoo()\n[one two]");
+        let Executable::If(condition) = &tree.statements[0].and_or.first else {
+            panic!()
+        };
+        assert!(matches!(
+            condition.condition.as_ref(),
+            Executable::Expression { .. }
+        ));
+        assert!(
+            tree.statements[1..]
+                .iter()
+                .all(|statement| matches!(statement.and_or.first, Executable::Expression { .. }))
+        );
+    }
+
+    #[test]
+    fn keeps_background_pipeline_inside_assignment() {
+        let tree = complete("j = make -j8 &");
+        let Executable::Assignment {
+            value: Expr::BackgroundJob(pipeline),
+            ..
+        } = &tree.statements[0].and_or.first
+        else {
+            panic!()
+        };
+        assert_eq!(pipeline.stages[0].items.len(), 2);
+        assert!(!tree.statements[0].background);
+    }
+
+    #[test]
+    fn leaves_non_viable_guard_keywords_as_arguments() {
+        let tree = complete("echo if\necho unless");
+        for statement in tree.statements {
+            let Executable::Pipeline(pipeline) = statement.and_or.first else {
+                panic!()
+            };
+            assert_eq!(pipeline.stages[0].items.len(), 2);
+            assert!(pipeline.stages[0].guard.is_none());
+        }
+    }
+
+    #[test]
+    fn skips_newlines_inside_expression_delimiters() {
+        let tree = complete("x = (\n1 +\n2\n)");
+        assert!(matches!(
+            tree.statements[0].and_or.first,
+            Executable::Assignment { .. }
+        ));
+    }
+
+    #[test]
+    fn preserves_map_spread_source_order() {
+        let tree = complete("x = [...$a, ...$b, key: value]");
+        let Executable::Assignment {
+            value: Expr::Map(items),
+            ..
+        } = &tree.statements[0].and_or.first
+        else {
+            panic!()
+        };
+        let names: Vec<_> = items
+            .iter()
+            .take(2)
+            .map(|item| match item {
+                MapItem::Spread(Expr::Variable(name)) => name.value.as_str(),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(names, ["$a", "$b"]);
     }
 }
