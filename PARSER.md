@@ -19,7 +19,7 @@ bodies are lexical input, not grammar punctuation.
 ## Lexical contract
 
 The lexer emits tokens with byte spans. Longest match wins for punctuation:
-`...`, `..=`, `..`, `>>`, `&&`, and `||` are each one token. Redirections are
+`...`, `..=`, `..`, `<<`, `>>`, `&&`, and `||` are each one token. Redirections are
 tokens even without surrounding whitespace. Value operators require surrounding
 whitespace when the design calls for it; word operators such as `and`, `or`, and
 `in` also require word boundaries. The token stream retains whitespace boundaries
@@ -54,8 +54,12 @@ pipe-stage      = simple-command postfix-guard? | value-call ;
 
 simple-command  = command-item+ ;
 command-item    = command-word | redirection ;
-redirection     = redirect-op command-word ;
+redirection     = redirect-op command-word | heredoc-redirect ;
 redirect-op     = "<" | ">" | ">>" | fd-redirect ;       # fd forms: later
+heredoc-redirect
+                = "<<" heredoc-delimiter HEREDOC_BODY ;
+heredoc-delimiter
+                = command-word ;
 
 compound-statement
                 = assignment
@@ -66,7 +70,11 @@ compound-statement
                 | control-statement
                 | expression-statement ;
 
-assignment      = binding ("=" | "+=") value-expression ;
+assignment      = binding "+=" value-expression
+                | binding "=" assignment-value ;
+assignment-value
+                = value-expression | background-job ;
+background-job  = pipeline "&" ;
 binding         = name | pattern ;                          # pattern: later
 control-statement
                 = ("return" | "break" | "continue") value-expression?
@@ -78,6 +86,8 @@ expression-statement
 block           = "{" terminator* statement-list? terminator* "}" ;
 function-definition
                 = "func" name parameter-list block ;
+lambda-expression
+                = "func" parameter-list block ;
 parameter-list  = "(" (parameter (","? parameter)*)? ")" ;
 parameter       = name ;                                    # richer forms: later
 if-expression   = "if" condition block
@@ -100,6 +110,12 @@ an unquoted `if` or `unless` starts a postfix guard only when the remaining
 tokens form a complete value expression. Quoting the word or leaving no viable
 guard expression keeps it as a command argument.
 
+`HEREDOC_BODY` is an opaque, span-carrying lexical token containing the lines
+after the command-line newline through the matching delimiter. The lexer queues
+each `<<` delimiter on the command line, reads queued bodies in source order,
+and associates each body token with its `heredoc-redirect`; a quoted delimiter
+also records that the body is raw. The parser does not interpret body contents.
+
 An assignment, definition, or value expression is not inferred by expanding a
 word. The parser selects it from unquoted syntax. In particular, a bare word on
 an assignment RHS remains a string (`x = greet`), while attached parentheses
@@ -111,6 +127,11 @@ capture, or operator expression as its final value. A command-shaped bare word
 remains a command, preserving the shell-oriented default. In a condition,
 `binding = value-expression` is a distinct test-and-bind node rather than an
 ordinary assignment statement.
+
+An `=` assignment may take a trailing-`&` command pipeline as its RHS. In
+`j = make -j8 &`, the ampersand belongs to `background-job`, so evaluation
+launches the pipeline and binds its job handle to `j`; it does not background an
+assignment node. `+=` remains a value-only operation.
 
 ## Value-expression grammar
 
@@ -152,9 +173,11 @@ member-access    = "." name ;
 index-access     = "[" (value-expression | range-expression) "]" ;
 modifier         = ":" name call-arguments? ;
 
-primary          = scalar | variable | list | map | value-call | "(" value-expression ")"
+primary          = scalar | variable | list | map | capture | lambda-expression
+                 | value-call | "(" value-expression ")"
                  | if-expression | for-expression | match-expression ;
 value-call       = name call-arguments ;
+capture          = "$(" terminator* statement-list? terminator* ")" ;
 list             = "[" list-items? "]" ;
 list-items       = list-item (list-separator? list-item)* ;
 list-item        = value-expression | "..." value-expression ;
@@ -168,6 +191,12 @@ argument         = value-expression
                  | name ":" value-expression
                  | "..." value-expression ;
 ```
+
+`capture` runs its nested statement list in command-substitution mode and
+produces captured output for the following postfix chain, so `$(cmd):raw` is a
+modifier applied to the capture node. `lambda-expression` is the named
+definition form without a name and produces a callable value; it reuses the
+same parameter and block grammar as `function-definition`.
 
 `[...]` is a map if it contains a `key: value` pair or uses the empty-map form
 `[:]`; otherwise it is a list. Once pair syntax selects a map, every entry must
