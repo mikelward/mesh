@@ -1,8 +1,8 @@
 //! Builtins.
 //!
 //! The commands that must run inside the shell process because they read or
-//! mutate its own state: `cd` (working directory), `pwd` (reports it), `puts`
-//! (output), and `exit` (ends the loop). Everything else mesh runs is external.
+//! mutate its own state. Session-aware builtins such as `prompt` are dispatched
+//! by the REPL; the stateless builtins live here. Everything else is external.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -21,7 +21,10 @@ pub enum Builtin {
 /// redirection, which are not supported yet (both need the builtin to write to a
 /// non-stdout target / a forked child).
 pub fn is_builtin(name: &str) -> bool {
-    matches!(name, "cd" | "pwd" | "puts" | "exit" | "fg" | "bg" | "jobs")
+    matches!(
+        name,
+        "cd" | "pwd" | "puts" | "exit" | "fg" | "bg" | "jobs" | "prompt" | "prompt-hook"
+    )
 }
 
 /// If `words[0]` names a builtin, run it and return its outcome; otherwise

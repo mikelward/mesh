@@ -25,6 +25,17 @@ An unknown command prints `command not found` and sets a failing status.
 | `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`. |
 | `pwd` | Print the working directory. |
 | `exit [n]` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). |
+| `prompt [text]` | Set the interactive prompt to `text`. With no arguments, print the current prompt; `--reset` restores the status-sensitive default. |
+| `prompt-hook name function` | Register a zero-argument function to run before every primary interactive prompt. Reusing `name` replaces that hook without changing its order; `prompt-hook --remove name` removes it. |
+
+Prompt hooks are session-local, run in registration order, and do not run for
+continuation prompts. Define the function before registering it:
+
+```mesh
+func refresh() { puts "checking status…" }
+prompt-hook status refresh
+prompt "project> "
+```
 
 ## Exit status
 

@@ -28,6 +28,13 @@ struct Shell {
     jobs: exec::JobTable,
     control: Option<parser::ControlKind>,
     loop_depth: usize,
+    prompt: PromptConfig,
+}
+
+#[derive(Default)]
+struct PromptConfig {
+    text: Option<String>,
+    hooks: Vec<(String, String)>,
 }
 
 impl Shell {
@@ -38,6 +45,7 @@ impl Shell {
             jobs: exec::JobTable::new(),
             control: None,
             loop_depth: 0,
+            prompt: PromptConfig::default(),
         }
     }
 }
@@ -1624,6 +1632,11 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
     if words[0] == "return" {
         return make_return(&words[1..], last);
     }
+    match words[0].as_str() {
+        "prompt" => return configure_prompt(&words[1..], shell),
+        "prompt-hook" => return configure_prompt_hook(&words[1..], shell),
+        _ => {}
+    }
     let job_status = match words[0].as_str() {
         "fg" => Some(shell.jobs.foreground(&words[1..])),
         "bg" => Some(shell.jobs.background(&words[1..])),
@@ -1639,6 +1652,59 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         Some(Builtin::Exit(code)) => Step::Exit(code),
         Some(Builtin::Status(code)) => Step::Continue(code),
         None => Step::Continue(exec::run(&words, &mut shell.jobs)),
+    }
+}
+
+fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
+    match args {
+        [] => {
+            println!("{}", shell.prompt.text.as_deref().unwrap_or("mesh$ "));
+            Step::Continue(0)
+        }
+        [flag] if flag == "--reset" => {
+            shell.prompt.text = None;
+            Step::Continue(0)
+        }
+        [text] => {
+            shell.prompt.text = Some(text.clone());
+            Step::Continue(0)
+        }
+        _ => {
+            eprintln!("mesh: prompt: expected one prompt string or --reset");
+            Step::Continue(2)
+        }
+    }
+}
+
+fn configure_prompt_hook(args: &[String], shell: &mut Shell) -> Step {
+    match args {
+        [flag, name] if flag == "--remove" => {
+            shell.prompt.hooks.retain(|(key, _)| key != name);
+            Step::Continue(0)
+        }
+        [name, function] => {
+            if shell.funcs.get(function).is_none() {
+                eprintln!("mesh: prompt-hook: `{function}` is not a function");
+                return Step::Continue(1);
+            }
+            if let Some((_, old)) = shell.prompt.hooks.iter_mut().find(|(key, _)| key == name) {
+                *old = function.clone();
+            } else {
+                shell.prompt.hooks.push((name.clone(), function.clone()));
+            }
+            Step::Continue(0)
+        }
+        _ => {
+            eprintln!("mesh: prompt-hook: expected NAME FUNCTION or --remove NAME");
+            Step::Continue(2)
+        }
+    }
+}
+
+fn run_prompt_hooks(shell: &mut Shell) {
+    let hooks = shell.prompt.hooks.clone();
+    for (_, function) in hooks {
+        let _ = call_func(&function, Vec::new(), shell);
     }
 }
 
@@ -1743,9 +1809,13 @@ fn run_interactive() -> ExitCode {
     let mut pending = String::new();
     loop {
         shell.jobs.reap();
+        if pending.is_empty() {
+            run_prompt_hooks(&mut shell);
+        }
         let prompt = MeshPrompt {
             failed: last != 0,
             continuation: !pending.is_empty(),
+            custom: shell.prompt.text.clone(),
         };
         match editor.read_line(&prompt) {
             Ok(signal) => match handle_signal(signal, last, &mut shell, &mut pending) {
@@ -1941,6 +2011,7 @@ fn read_line(reader: &mut impl Read, out: &mut Vec<u8>) -> io::Result<usize> {
 struct MeshPrompt {
     failed: bool,
     continuation: bool,
+    custom: Option<String>,
 }
 
 impl Prompt for MeshPrompt {
@@ -1953,6 +2024,8 @@ impl Prompt for MeshPrompt {
     fn render_prompt_indicator(&self, _edit_mode: PromptEditMode) -> Cow<'_, str> {
         if self.continuation {
             Cow::Borrowed("... ")
+        } else if let Some(prompt) = &self.custom {
+            Cow::Borrowed(prompt)
         } else if self.failed {
             Cow::Borrowed("mesh! ")
         } else {
@@ -1973,12 +2046,54 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        Shell, Step, eval_binary, expansion_word, handle_signal, needs_more_input, run_line,
-        run_source,
+        MeshPrompt, Shell, Step, eval_binary, expansion_word, handle_signal, needs_more_input,
+        run_line, run_prompt_hooks, run_source,
     };
     use crate::parser;
     use crate::vars::Value;
-    use reedline::Signal;
+    use reedline::{Prompt, PromptEditMode, Signal};
+
+    #[test]
+    fn custom_prompt_replaces_the_status_glyph_and_can_be_reset() {
+        let mut shell = Shell::new();
+        assert_eq!(
+            run_line("prompt 'ready> '", 0, false, &mut shell),
+            Step::Continue(0)
+        );
+        let prompt = MeshPrompt {
+            failed: true,
+            continuation: false,
+            custom: shell.prompt.text.clone(),
+        };
+        assert_eq!(
+            prompt.render_prompt_indicator(PromptEditMode::Default),
+            "ready> "
+        );
+        assert_eq!(
+            run_line("prompt --reset", 0, false, &mut shell),
+            Step::Continue(0)
+        );
+        assert!(shell.prompt.text.is_none());
+    }
+
+    #[test]
+    fn named_prompt_hooks_replace_in_place_and_run_before_the_prompt() {
+        let marker = std::env::temp_dir().join(format!("mesh-prompt-hook-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut shell = Shell::new();
+        let script = format!(
+            "func first() {{ false }}\nfunc second() {{ touch '{}' }}\nprompt-hook refresh first\nprompt-hook refresh second\n",
+            marker.display()
+        );
+        assert_eq!(run_line(&script, 0, false, &mut shell), Step::Continue(0));
+        assert_eq!(
+            shell.prompt.hooks,
+            vec![("refresh".into(), "second".into())]
+        );
+        run_prompt_hooks(&mut shell);
+        assert!(marker.exists());
+        std::fs::remove_file(marker).unwrap();
+    }
 
     #[test]
     fn compound_input_completeness_comes_from_the_parser() {
