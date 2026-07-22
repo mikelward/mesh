@@ -2335,6 +2335,53 @@ fn break_controls_a_parsed_loop_body() {
 }
 
 #[test]
+fn nested_loop_control_targets_the_nearest_loop_through_if() {
+    let out = run_with_input(
+        "for outer in [a b] {\n\
+           for inner in [1 2 3] {\n\
+             if $inner == 2 { continue }\n\
+             puts $outer $inner\n\
+             if $inner == 3 { break }\n\
+           }\n\
+           puts done-$outer\n\
+         }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a 1\na 3\ndone-a\nb 1\nb 3\ndone-b\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn loop_control_stops_a_function_body_without_leaking_to_the_callers_loop() {
+    let out = run_with_input(
+        "func stop() { break; puts BAD }\n\
+         func skip() { continue; puts BAD }\n\
+         for item in [a b] {\n\
+           if $item == a { skip }\n\
+           puts seen-$item\n\
+           stop\n\
+           puts after-stop\n\
+         }\n\
+         puts finished\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "seen-a\nafter-stop\nseen-b\nafter-stop\nfinished\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn maps_preserve_order_support_access_spread_and_merge() {
     let out = run_with_input(
         "key = https\n\

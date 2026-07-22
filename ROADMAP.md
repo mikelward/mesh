@@ -43,8 +43,6 @@ and `puts`) subsequently landed in M1.
 - `cargo test --workspace`, `cargo fmt --check`, and `cargo clippy -- -D warnings`
   are all green.
 
-*(Everything below is planned; scope will firm up as each milestone begins.)*
-
 ---
 
 ## M1 — A shell you'd actually sit in
@@ -88,39 +86,31 @@ run a pipeline alongside.
 
 ---
 
-## M3 — The mesh language 🚧
+## M3 — The mesh language ✅
 
-**Goal:** start turning `DESIGN.md` into a running language — the point where the
-build track and the design track converge.
+**Goal:** turn the central `DESIGN.md` language ideas into a running, typed
+language on top of the M2 shell runtime.
 
-**Scope (indicative — driven by `DESIGN.md` as it settles):** parser for the
-clean-break grammar; real values (lists, maps) with no word-splitting;
-`$`-expansion and the `...` spread; `:`-modifiers; `if`/`for`/`match`; `func`.
+**Landed**
+- A clean-break, span-carrying parser for commands, expressions, and blocks,
+  replacing the incremental lexer path for execution.
+- Typed strings, integers, booleans, recursively nested lists, and ordered
+  string-keyed maps, with explicit `...` spread and no implicit word splitting.
+- Variable, member, index, and slice access; arithmetic, comparisons, boolean
+  operators, append/merge assignment, and chainable argument-free modifiers.
+- Named functions with lexical local scope and `return`; typed arguments stay
+  typed across an in-shell call.
+- `if` expressions with command-status or value conditions and conditional
+  list-pattern binding.
+- `for` over lists, ordered maps, and bounded integer ranges, with reusable list
+  patterns plus `break` and `continue` through nested blocks and function calls.
+- Glob and regular-expression `~` tests and ordered `match` expressions with
+  exact, glob, regex, range, alternative, list-pattern, guarded, and `_` arms.
 
-General list support has landed: assignments accept recursively nested literals
-(`xs = [a "b c"]`, including `[]`), `...$xs` spreads one into command
-arguments, and exact integer indexing reads an element. A bare `$xs` in
-argument position fails loudly, preserving the design's explicit-spread and
-no-word-splitting rule. Lists preserve nested values; `$xs` in a literal inserts
-one nested value while `...$xs` flattens exactly one level. Indexing, slicing,
-and `+=` retain those types. General expression parsing remains ahead.
-
-Named functions and the first conditional slice have also landed. `if` executes
-brace-delimited branches from command status, supports `else if`, and can yield a
-string or list value in assignment position (with `""` for a missing
-`else`). General boolean/comparison expressions and conditional destructuring
-remain tied to the general expression parser.
-
-`for` iterates typed lists without word splitting, ordered maps with `key, value`
-binders, and bounded integer ranges. Brace-delimited bodies support `break` and
-`continue`; general list-pattern destructuring remains ahead.
-
-The first postfix modifier slice has landed too: argument-free path and string
-transforms plus list collection operations parse after variable access, chain,
-and preserve typed list results. Modifier calls with arguments and the remaining
-value types are still deferred to the expression parser.
-
-**Acceptance:** the `DESIGN.md`/`docs/INTRO.md` examples run as written.
+**Acceptance:** the implemented M3 subset is covered end to end and documented in
+[`docs/TOUR.md`](docs/TOUR.md) and [`docs/REFERENCE.md`](docs/REFERENCE.md).
+`DESIGN.md` and `docs/INTRO.md` intentionally also preview post-M3 design; examples
+that depend on those later features are not an M3 compatibility promise.
 
 ---
 

@@ -322,7 +322,6 @@ background), and calling for a value (`f(arg)`) as opposed to running it.
 
 ## Not yet implemented
 
-The remaining `match` pattern forms (glob/regex/range and alternation), modifier
-arguments, regex capture modifiers, and heredocs are not yet implemented.
+Modifier arguments, regex capture modifiers, and heredocs are not yet implemented.
 Function flags/optional/rest parameters and functions in pipelines are also still ahead. See
 [`ROADMAP.md`](../ROADMAP.md).
