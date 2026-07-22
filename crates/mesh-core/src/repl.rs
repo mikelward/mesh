@@ -18,7 +18,7 @@ use crate::builtins::{self, Builtin};
 use crate::funcs::{FuncDef, Funcs};
 use crate::lexer::{Piece, Redir, RedirKind, Sep, Stage, Word};
 use crate::vars::{Value, Vars};
-use crate::{exec, expand, lexer};
+use crate::{exec, expand, lexer, parser};
 
 /// The mutable shell session threaded through the run loop: variable scopes,
 /// defined functions, and the job table.
@@ -488,7 +488,7 @@ fn is_compound_input(text: &str) -> bool {
 }
 
 fn needs_more_compound_input(text: &str) -> bool {
-    if is_func_start(text) {
+    let legacy_incomplete = if is_func_start(text) {
         lexer::needs_more_input(text)
     } else if is_if_input(text) {
         let expression = if_assignment(text).map_or(text, |(_, rhs)| rhs);
@@ -506,6 +506,11 @@ fn needs_more_compound_input(text: &str) -> bool {
         }
     } else {
         false
+    };
+
+    match parser::parse(text) {
+        Ok(parser::ParseOutcome::Complete(_)) => false,
+        Ok(parser::ParseOutcome::Incomplete) | Err(_) => legacy_incomplete,
     }
 }
 
@@ -1520,9 +1525,15 @@ impl Prompt for MeshPrompt {
 
 #[cfg(test)]
 mod tests {
-    use super::{Shell, Step, handle_signal, run_line};
+    use super::{Shell, Step, handle_signal, needs_more_compound_input, run_line};
     use crate::vars::Value;
     use reedline::Signal;
+
+    #[test]
+    fn compound_input_completeness_comes_from_the_parser() {
+        assert!(needs_more_compound_input("func f() {\nputs hi\n"));
+        assert!(!needs_more_compound_input("func f() {\nputs hi\n}\n"));
+    }
 
     #[test]
     fn ctrl_d_exits_with_the_last_status() {
