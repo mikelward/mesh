@@ -74,6 +74,7 @@ file as tasks land.
         current string-list slice.
   - [x] Clamped range slicing (`...$xs[1..3]`, `...$xs[..=2]`) for the current
         string-list slice.
+  - [x] Append assignment (`+=`) for strings and the current string-list slice.
 - [ ] Maps, scalar types, and `:` modifiers.
 - [ ] `if` / `for` / `match` and `func`.
 

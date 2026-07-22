@@ -243,8 +243,9 @@ loudly. A slice is a list value and therefore uses spread in command position
 spelling, negative bounds count from the end, and out-of-range bounds clamp.
 
 This is deliberately a vertical slice rather than the final expression
-grammar. Lists currently contain strings only; nesting, `+=`, and
-spread inside expressions remain unparsed.
+grammar. Lists currently contain strings only; `+=` concatenates strings,
+appends a scalar to a list, or extends a list with a list. Nesting and spread
+inside expressions remain unparsed.
 
 ### Not yet parsed
 Nested/general list expressions, maps, `{ }` blocks, `func`, `:` modifiers, and
