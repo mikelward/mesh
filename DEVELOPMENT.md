@@ -102,7 +102,9 @@ cargo clippy --all-targets -- -D warnings        # CI gate
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs fmt, clippy, and the
 test suite on `ubuntu-latest` and `macos-latest` for every push to `main` and
-every pull request.
+every pull request. It also compiles every target, including tests, for
+`x86_64-unknown-freebsd`; this catches Rust and libc API differences, but is not
+a substitute for running the suite on FreeBSD.
 
 ## Supported systems
 
@@ -114,6 +116,8 @@ platform matrix.
 | --- | --- |
 | Linux (x86_64, aarch64) | **Primary** — develop and test here first. |
 | macOS (Apple Silicon, Intel) | **Secondary** — kept green in CI. |
+| FreeBSD (x86_64) | **Experimental** — compile-checked in CI; runtime behavior is not continuously tested. |
+| Other BSDs | **Best effort** — expected to work, but neither compiled nor tested in CI. |
 | Windows | **Not supported.** The POSIX process/terminal model is assumed throughout. |
 
 The floor is any modern Unix with POSIX job control and a stable Rust toolchain.
