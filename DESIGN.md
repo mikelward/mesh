@@ -1040,10 +1040,10 @@ $ports.https              # == $ports[https]
 $config.editor = vim
 ```
 
-Brackets stay for dynamic or non-identifier keys (`$m[$k]`, `$m["a b"]`). The
-dot is an **expression-position** operator only: inside a double-quoted string a
-bare `"$file.txt"` is still interpolate-then-literal (the shell reflex), so reach
-for `$m[key]` or `${m.key}` when you need a map access *inside* a string.
+Brackets stay for dynamic or non-identifier keys (`$m[$k]`, `$m["a b"]`). Dot
+access has the same meaning inside and outside a double-quoted string, so
+`"$m.key"` reads the map member. Use braces when a dot starts literal text:
+`"${file}.txt"`.
 
 | Form | Result | Meaning |
 | --- | --- | --- |

@@ -69,7 +69,7 @@ word   = piece+
 piece  = bare | escape | double | single | raw   # adjacent pieces fuse
 bare   = <unquoted chars, expandable>             # e.g. * ? [ ~ are active here
 escape = "\" <any char>                           # literal next char; \<nl> = continuation
-double = '"' ( <text> | c-escape | "$name" )* '"' # interpolates (deferred) + escapes
+double = '"' ( <text> | c-escape | var )* '"'      # interpolates + escapes
 single = "'" ( <text> | s-escape )* "'"           # escapes, no interpolation; $ literal
 raw    = ("r'" <bytes> "'") | ('r"' <bytes> '"')  # no escapes at all
 ```
@@ -81,8 +81,9 @@ The escape sets (an **unknown escape inside a quote is a syntax error**):
 
 - **Bare words** are expandable; a backslash makes the next char literal
   (`a\ b` is one word; `\*`, `\~` literal).
-- **Double quotes** `"…"` interpolate (deferred to task 6 — a bare `$name` is
-  literal for now) and interpret the C-style escape set.
+- **Double quotes** `"…"` interpolate variables, including member access and
+  integer indexing, and interpret the C-style escape set. Braces delimit a
+  reference before literal text: `"${file}.txt"`.
 - **Single quotes** `'…'` do *not* interpolate but *do* escape (Python `str`):
   `'a\nb'` is two lines, `'$x'` is a literal `$x`, and `'\d'` is an **error**.
 - **Raw strings** `r'…'` / `r"…"` take no escapes — the home for regex source
@@ -111,6 +112,7 @@ assign  = name "=" value              # unspaced, whole statement
 var     = "$" name                    # $x
         | "$" "{" name "}"            # ${x}
         | "$" "env" "." key          # $env.KEY  (member access)
+        | "$" name "[" integer "]"    # $xs[0]    (exact list indexing)
 name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
 ```
 
@@ -119,8 +121,9 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
   separates assignment from a `k=v` *argument*: `git commit --author=me` and
   `env FOO=1 cmd` are commands, not bindings.
 - **`$name` / `${name}`** read a variable; **`$env.KEY`** reads the environment
-  (strict). Interpolation happens in bare words and `"…"`, **not** in `'…'` or
-  `r'…'`.
+  (strict), and **`$xs[N]`** reads an exact list element. These forms have the
+  same meaning in bare words and `"…"`; braces delimit a reference when literal
+  text follows. Interpolation does **not** happen in `'…'` or `r'…'`.
 - **Reads fail loud**: an **unbound** variable is an error (no null / always-on
   `set -u`), and the shell recovers to the next line. Assignment always creates.
   A **malformed `${…}`** (missing `}`, or an invalid name inside) is a syntax

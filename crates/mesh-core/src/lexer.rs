@@ -898,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn braced_and_unbraced_quoted_members_are_equivalent() {
+    fn braced_and_unbraced_quoted_access_are_equivalent() {
         let member = || {
             Piece::Var(VarRef {
                 name: "map".into(),
@@ -908,6 +908,16 @@ mod tests {
         };
         assert_eq!(words(r#""$map.field""#), [Word(vec![member()])]);
         assert_eq!(words(r#""${map.field}""#), [Word(vec![member()])]);
+
+        let index = || {
+            Piece::Var(VarRef {
+                name: "items".into(),
+                member: None,
+                index: Some(-1),
+            })
+        };
+        assert_eq!(words(r#""$items[-1]""#), [Word(vec![index()])]);
+        assert_eq!(words(r#""${items[-1]}""#), [Word(vec![index()])]);
     }
 
     #[test]
