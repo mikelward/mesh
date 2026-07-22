@@ -11,8 +11,7 @@ use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
-use std::os::unix::process::CommandExt;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,6 +21,7 @@ use reedline::{
 };
 
 use crate::builtins::{self, Builtin};
+use crate::completion::{CompletionCache, CompletionSpec};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
 use crate::vars::{RegexValue, Value, Vars};
@@ -1949,7 +1949,8 @@ fn run_interactive() -> ExitCode {
 #[derive(Default)]
 struct CompletionState {
     commands: Vec<String>,
-    help: HashMap<String, String>,
+    help: HashMap<String, CompletionSpec>,
+    cache: CompletionCache,
     variables: Vec<(String, Value)>,
 }
 
@@ -1974,17 +1975,20 @@ impl CompletionState {
         commands.dedup();
         let mut help: HashMap<_, _> = builtins::NAMES
             .iter()
-            .filter_map(|name| builtins::help(name).map(|text| ((*name).into(), text)))
+            .filter_map(|name| {
+                builtins::help(name).map(|text| ((*name).into(), CompletionSpec::from_help(&text)))
+            })
             .collect();
         help.extend(shell.funcs.names().filter_map(|name| {
             shell
                 .funcs
                 .get(name)
-                .map(|def| (name.into(), def.help(name)))
+                .map(|def| (name.into(), CompletionSpec::from_help(&def.help(name))))
         }));
         Self {
             commands,
             help,
+            cache: CompletionCache::default(),
             variables: shell
                 .vars
                 .visible()
@@ -2042,8 +2046,8 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
     } else {
         words
     };
-    let parent_help = help_for(state, parent);
-    let mut parent_values = help_completions(&parent_help, word);
+    let parent_help = completion_for(state, parent);
+    let mut parent_values = parent_help.matching(word);
 
     if word.starts_with('-') {
         return parent_values;
@@ -2070,7 +2074,7 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
     } else {
         parent
     };
-    let mut values = help_completions(&help_for(state, help_words), "");
+    let mut values = completion_for(state, help_words).matching("");
     if completing_word && exact_subcommand {
         values = values
             .into_iter()
@@ -2080,15 +2084,15 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
     values
 }
 
-fn help_for(state: &CompletionState, words: &[String]) -> String {
+fn completion_for(state: &CompletionState, words: &[String]) -> CompletionSpec {
     let Some(command) = words.first() else {
-        return String::new();
+        return CompletionSpec::default();
     };
     state
         .help
         .get(command)
         .cloned()
-        .unwrap_or_else(|| command_help(words))
+        .unwrap_or_else(|| state.cache.spec_for(words))
 }
 
 fn command_segment_words(line: &str) -> Option<Vec<String>> {
@@ -2123,138 +2127,9 @@ fn command_segment_words(line: &str) -> Option<Vec<String>> {
     if words.is_empty() { None } else { Some(words) }
 }
 
-fn command_help(words: &[String]) -> String {
-    let Some((command, args)) = words.split_first() else {
-        return String::new();
-    };
-    let mut process = Command::new(command);
-    process
-        .args(args)
-        .arg("--help")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // SAFETY: this closure only makes async-signal-safe process-group and
-    // `signal` calls between fork and exec. The interactive shell ignores these
-    // signals, but a help child must remain interruptible by terminal input.
-    unsafe {
-        process.pre_exec(|| {
-            if libc::setpgid(0, 0) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            for signal in [
-                libc::SIGINT,
-                libc::SIGQUIT,
-                libc::SIGTSTP,
-                libc::SIGTTOU,
-                libc::SIGTERM,
-            ] {
-                if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
-    let Ok(mut child) = process.spawn() else {
-        return String::new();
-    };
-    let child_group = child.id() as libc::pid_t;
-    // Give the probe the terminal while it runs so Ctrl-C/Ctrl-Z target its
-    // fresh process group rather than the signal-ignoring shell.
-    let shell_group = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
-    if shell_group >= 0 {
-        unsafe {
-            libc::tcsetpgrp(libc::STDIN_FILENO, child_group);
-        }
-    }
-    let stdout = child.stdout.take().map(|mut output| {
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = output.read_to_end(&mut bytes);
-            bytes
-        })
-    });
-    let stderr = child.stderr.take().map(|mut output| {
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = output.read_to_end(&mut bytes);
-            bytes
-        })
-    });
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                // The negative PID targets the whole probe process group,
-                // including wrappers and descendants holding captured pipes.
-                unsafe {
-                    libc::kill(-child_group, libc::SIGKILL);
-                }
-                let _ = child.wait();
-                break;
-            }
-            Err(_) => break,
-        }
-    }
-    // The leader may exit after starting a background descendant. Terminate
-    // anything left in its group before joining the pipe readers.
-    unsafe {
-        libc::kill(-child_group, libc::SIGKILL);
-        if shell_group >= 0 {
-            libc::tcsetpgrp(libc::STDIN_FILENO, shell_group);
-        }
-    }
-    let output = stdout
-        .and_then(|reader| reader.join().ok())
-        .unwrap_or_default();
-    let error = stderr
-        .and_then(|reader| reader.join().ok())
-        .unwrap_or_default();
-    let mut text = String::from_utf8_lossy(&output).into_owned();
-    text.push_str(&String::from_utf8_lossy(&error));
-    text
-}
-
+#[cfg(test)]
 fn help_completions(help: &str, prefix: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    let mut commands = false;
-    for line in help.lines() {
-        let trimmed = line.trim();
-        let heading = trimmed.trim_end_matches(':').to_ascii_lowercase();
-        if matches!(
-            heading.as_str(),
-            "commands" | "subcommands" | "available commands"
-        ) {
-            commands = true;
-            continue;
-        }
-        if trimmed.ends_with(':') || trimmed.is_empty() {
-            commands = false;
-        }
-        for token in trimmed.split_whitespace() {
-            let option = token.trim_end_matches([',', ';']);
-            if option.starts_with('-') && option.len() > 1 {
-                let option = option.split(['=', '[', '<']).next().unwrap_or(option);
-                if option.starts_with(prefix) {
-                    values.push(option.to_owned());
-                }
-            }
-        }
-        if commands
-            && let Some(command) = trimmed.split_whitespace().next()
-            && command.starts_with(prefix)
-            && command
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            values.push(command.to_owned());
-        }
-    }
-    values.sort();
-    values.dedup();
-    values
+    CompletionSpec::from_help(help).matching(prefix)
 }
 
 fn command_position(before: &str) -> bool {
@@ -2592,9 +2467,9 @@ impl Prompt for MeshPrompt {
 mod tests {
     use super::{
         CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell, Step, argument_completions,
-        command_help, command_position, command_segment_words, eval_binary, expansion_word,
-        handle_signal, help_completions, interruptible_task, needs_more_input, run_line,
-        run_prompt_hooks, run_source, variable_completions,
+        command_position, command_segment_words, eval_binary, expansion_word, handle_signal,
+        help_completions, interruptible_task, needs_more_input, run_line, run_prompt_hooks,
+        run_source, variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
@@ -2708,50 +2583,6 @@ mod tests {
             None
         );
         assert!(started.elapsed() < Duration::from_millis(500));
-    }
-
-    #[test]
-    fn command_completion_captures_help_from_stdout_and_stderr() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!("mesh-help-{}", std::process::id()));
-        let command = dir.join("helper");
-        let args = dir.join("args");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            &command,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '  --stdout  output option'\nprintf '%s\\n' '  --stderr  error option' >&2\n",
-                args.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let output = command_help(&[command.to_string_lossy().into_owned(), "subcommand".into()]);
-        assert!(output.contains("--stdout"));
-        assert!(output.contains("--stderr"));
-        assert_eq!(fs::read_to_string(&args).unwrap(), "subcommand\n--help\n");
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn command_completion_times_out_nonterminating_help() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
-
-        let dir = std::env::temp_dir().join(format!("mesh-help-timeout-{}", std::process::id()));
-        let command = dir.join("helper");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(&command, "#!/bin/sh\nsleep 10\n").unwrap();
-        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let started = Instant::now();
-        assert!(command_help(&[command.to_string_lossy().into_owned()]).is_empty());
-        assert!(started.elapsed() < Duration::from_secs(4));
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

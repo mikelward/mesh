@@ -25,12 +25,13 @@ In an interactive shell, Tab completes according to the cursor's current word:
 | --- | --- |
 | First word, or a whitespace-separated word after `;`, `|`, `&&`, `||`, `&`, or `{` | Builtins, defined functions, and executable files found on `PATH` |
 | Command argument | Files and directories; directory suggestions have a trailing `/` |
+| A subcommand or flag described by `command --help` | Lazily generated suggestions, cached under `$XDG_CACHE_HOME/mesh/completions/` (or `~/.cache/mesh/completions/`) |
 | A word beginning with `$` | Visible variable names |
 | After `$map.` | Keys in that map; nested map paths such as `$config.user.` are followed recursively |
 
-Suggestions use case-sensitive prefix matching. Command-specific flags and
-argument types, fuzzy matching, and case-insensitive matching are not yet
-implemented.
+Suggestions use case-sensitive prefix matching. External-command help probes
+have null stdin, a two-second timeout, and a one-MiB output cap. Argument value
+types, fuzzy matching, and case-insensitive matching are not yet implemented.
 
 ## Builtins
 
