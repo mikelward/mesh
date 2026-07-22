@@ -744,14 +744,18 @@ fn ends_with_bare_equals(word: &[Piece]) -> bool {
 /// buffering ([`header_awaits_body`]); an already-malformed header is dispatched
 /// immediately so its parse error is reported without swallowing later commands.
 pub fn needs_more_input(text: &str) -> bool {
-    let scan = scan_braces(text, 0);
-    if scan.close.is_some() {
-        return false; // a body opened and closed → dispatch (complete or trailing junk)
-    }
-    if scan.depth > 0 {
-        return true; // a body is open with no matching `}` yet → keep reading
-    }
-    header_awaits_body(text)
+    // The body opener is the first `{`, located *literally*: the signature grammar
+    // (`func name(params)`) contains no strings, so a `'`/`"` in the header is a
+    // malformed parameter, not a quote — scanning the whole text with body quote
+    // rules would let such a quote swallow the body's `{` and release the buffered
+    // body lines to the top level. Only the body itself (from its `{`) is scanned
+    // with quote/brace rules.
+    let Some(open) = text.find('{') else {
+        return header_awaits_body(text);
+    };
+    // Buffer until the body's first matching `}`; trailing text after it (or a
+    // reopened brace) still dispatches, so the parser reports the error.
+    scan_braces(&text[open..], 0).close.is_none()
 }
 
 /// With no body `{` seen yet, is `text` a valid *incomplete* `func` header still
