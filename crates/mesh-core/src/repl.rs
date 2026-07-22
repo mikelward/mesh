@@ -470,7 +470,7 @@ fn parse_func_def(text: &str) -> Result<(String, FuncDef), String> {
     let close = after_open[..header_end]
         .find(')')
         .ok_or("func: missing `)` before the function body")?;
-    let params = parse_params(&after_open[..close])?;
+    let params = lexer::parse_params(&after_open[..close])?;
     let body_src = after_open[close + 1..]
         .trim_start()
         .strip_prefix('{')
@@ -486,71 +486,6 @@ fn parse_func_def(text: &str) -> Result<(String, FuncDef), String> {
             body: body.to_string(),
         },
     ))
-}
-
-/// Parse a parameter list: names separated by commas and/or whitespace. A comma
-/// is a real separator, not ignorable filler — it must sit between two names, so
-/// a leading, trailing, or doubled comma (`,x`, `x,`, `x,,y`) is a loud error
-/// rather than a silently dropped empty. v1 also rejects the deferred flag /
-/// optional / rest forms with a clear message.
-fn parse_params(list: &str) -> Result<Vec<String>, String> {
-    let chars: Vec<char> = list.chars().collect();
-    let mut params: Vec<String> = Vec::new();
-    // A comma needs a name on each side: it is only valid once at least one name
-    // has been read, and never immediately after another comma.
-    let mut have_name = false;
-    let mut pending_comma = false;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_whitespace() {
-            i += 1;
-            continue;
-        }
-        if c == ',' {
-            if !have_name || pending_comma {
-                return Err("func: missing parameter name before `,`".to_string());
-            }
-            pending_comma = true;
-            i += 1;
-            continue;
-        }
-        // Read a name token: a run up to the next comma or whitespace.
-        let start = i;
-        while i < chars.len() && chars[i] != ',' && !chars[i].is_whitespace() {
-            i += 1;
-        }
-        let tok: String = chars[start..i].iter().collect();
-        if tok.starts_with("...") {
-            return Err("func: rest parameters (`...name`) are not supported yet".to_string());
-        }
-        if tok.starts_with('-') {
-            return Err("func: flag parameters (`--name`) are not supported yet".to_string());
-        }
-        if tok.contains('=') {
-            return Err("func: optional/default parameters are not supported yet".to_string());
-        }
-        if !lexer::is_ident(&tok) {
-            return Err(format!("func: `{tok}` is not a valid parameter name"));
-        }
-        // `env` is the environment namespace (`$env.KEY`), so a parameter named
-        // `env` would bind but never read back — reject it, as assignment does.
-        if tok == "env" {
-            return Err("func: `env` is a reserved name and cannot be a parameter".to_string());
-        }
-        // A repeated name would silently overwrite the earlier positional in the
-        // local scope, making one argument unreachable; diagnose it here.
-        if params.iter().any(|p| p == &tok) {
-            return Err(format!("func: duplicate parameter `{tok}`"));
-        }
-        params.push(tok);
-        have_name = true;
-        pending_comma = false;
-    }
-    if pending_comma {
-        return Err("func: missing parameter name after `,`".to_string());
-    }
-    Ok(params)
 }
 
 /// Given the text right after a body's opening `{`, split off the body (up to
