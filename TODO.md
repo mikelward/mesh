@@ -82,7 +82,7 @@ file as tasks land.
   - [x] Adapt parser-native `Word` / `WordPiece` and redirects directly into the
         existing expansion and process layers without stringifying and reparsing
         the AST through the compatibility lexer.
-  - [ ] Evaluate expressions as typed values, including variables, member and
+  - [x] Evaluate expressions as typed values, including variables, member and
         index access, modifiers, lists and spread, unary and binary operators,
         and recursive `if` / `for` bodies; return explicit runtime errors for
         parsed expression forms that are not implemented yet.

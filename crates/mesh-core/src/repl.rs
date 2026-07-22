@@ -575,10 +575,12 @@ fn eval_expr(
             if let E::Variable(variable) = value.as_ref()
                 && variable.value.trim_start_matches('$') == "env"
             {
-                return std::env::var(name).map(Value::String).map_err(|_| {
-                    eprintln!("mesh: $env.{name}: not set");
-                    Step::Continue(1)
-                });
+                return std::env::var_os(name)
+                    .map(|value| Value::String(value.to_string_lossy().into_owned()))
+                    .ok_or_else(|| {
+                        eprintln!("mesh: $env.{name}: not set");
+                        Step::Continue(1)
+                    });
             }
             runtime_error(format!("member access .{name} is not implemented yet"))
         }
@@ -627,32 +629,7 @@ fn eval_expr(
             binding,
             iterable,
             body,
-        } => {
-            let iterable = eval_expr(iterable, last, in_function, shell)?;
-            let values = match iterable {
-                Value::List(values) => values,
-                value => vec![value],
-            };
-            let mut results = Vec::new();
-            shell.loop_depth += 1;
-            for value in values {
-                shell.vars.set_value(binding, value);
-                match eval_body(body, 0, in_function, shell) {
-                    Ok(value) => results.push(value),
-                    Err(step) => {
-                        shell.loop_depth -= 1;
-                        return Err(step);
-                    }
-                }
-                match shell.control.take() {
-                    Some(parser::ControlKind::Break) => break,
-                    Some(parser::ControlKind::Continue) | None => {}
-                    Some(parser::ControlKind::Return) => unreachable!(),
-                }
-            }
-            shell.loop_depth -= 1;
-            Ok(Value::List(results))
-        }
+        } => eval_for_expr(binding, iterable, body, last, in_function, shell),
         E::BackgroundJob(pipeline) => match run_ast_pipeline(pipeline, true, last, shell) {
             Step::Continue(code) => Ok(Value::String(code.to_string())),
             step => Err(step),
@@ -698,6 +675,40 @@ fn eval_if_expr(
     }
 }
 
+fn eval_for_expr(
+    binding: &str,
+    iterable: &parser::Expr,
+    body: &parser::Source,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let iterable = eval_expr(iterable, last, in_function, shell)?;
+    let values = match iterable {
+        Value::List(values) => values,
+        value => vec![value],
+    };
+    let mut results = Vec::new();
+    shell.loop_depth += 1;
+    for value in values {
+        shell.vars.set_value(binding, value);
+        match eval_body(body, 0, in_function, shell) {
+            Ok(value) => results.push(value),
+            Err(step) => {
+                shell.loop_depth -= 1;
+                return Err(step);
+            }
+        }
+        match shell.control.take() {
+            Some(parser::ControlKind::Break) => break,
+            Some(parser::ControlKind::Continue) | None => {}
+            Some(parser::ControlKind::Return) => unreachable!(),
+        }
+    }
+    shell.loop_depth -= 1;
+    Ok(Value::List(results))
+}
+
 fn eval_body(
     body: &parser::Source,
     mut last: u8,
@@ -706,15 +717,24 @@ fn eval_body(
 ) -> Result<Value, Step> {
     for (index, statement) in body.statements.iter().enumerate() {
         let final_statement = index + 1 == body.statements.len();
-        if final_statement
-            && !statement.background
-            && statement.and_or.rest.is_empty()
-            && let parser::Executable::Expression {
-                expression,
-                guard: None,
-            } = &statement.and_or.first
-        {
-            return eval_expr(expression, last, in_function, shell);
+        if final_statement && !statement.background && statement.and_or.rest.is_empty() {
+            match &statement.and_or.first {
+                parser::Executable::Expression {
+                    expression,
+                    guard: None,
+                } => return eval_expr(expression, last, in_function, shell),
+                parser::Executable::If(node) => {
+                    return eval_if_expr(node, last, in_function, shell);
+                }
+                parser::Executable::For {
+                    binding,
+                    iterable,
+                    body,
+                } => {
+                    return eval_for_expr(binding, iterable, body, last, in_function, shell);
+                }
+                _ => {}
+            }
         }
         match run_statement(statement, last, in_function, shell) {
             Step::Continue(code) => last = code,
@@ -2328,7 +2348,8 @@ mod tests {
     fn parsed_operators_and_recursive_value_bodies_evaluate() {
         let mut shell = Shell::new();
         let parser::ParseOutcome::Complete(source) = parser::parse(
-            "answer = if true { 6 * 7 } else { 0 }; values = for x in [1 2 3] { $x + 1 }",
+            "answer = if true { if false { 0 } else { 6 * 7 } }; \
+             values = for x in [1 2 3] { if true { $x + 1 } }",
         )
         .unwrap() else {
             panic!("source should be complete");
