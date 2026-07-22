@@ -179,6 +179,13 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
                 outcomes.push(Outcome::Running { child, piped_out });
             }
             Err(err) => {
+                // The child hook hands the terminal to the new process group
+                // before exec. If the first stage cannot exec, no successful
+                // child records that group for the normal reclaim path below.
+                if interactive && process_group.is_none() {
+                    // SAFETY: getpgrp takes no arguments and cannot fail.
+                    set_foreground_group(unsafe { libc::getpgrp() });
+                }
                 outcomes.push(Outcome::Failed(spawn_error_code(&cmd.words[0], &err)));
             }
         }

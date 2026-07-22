@@ -656,6 +656,103 @@ fn new_foreground_job_does_not_receive_sigcont() {
     );
 }
 
+#[test]
+fn spawn_failure_returns_terminal_to_interactive_shell() {
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(spawn_failure_harness()) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+fn spawn_failure_harness() -> i32 {
+    use std::ffi::CString;
+
+    let mut master = -1;
+    let mut slave = -1;
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } != 0
+        || unsafe { libc::setsid() } < 0
+        || unsafe { libc::ioctl(slave, libc::TIOCSCTTY, 0) } < 0
+    {
+        return 30;
+    }
+    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    let mesh = unsafe { libc::fork() };
+    if mesh < 0 {
+        return 31;
+    }
+    if mesh == 0 {
+        unsafe {
+            libc::setpgid(0, 0);
+            libc::dup2(slave, libc::STDIN_FILENO);
+            libc::dup2(slave, libc::STDOUT_FILENO);
+            libc::dup2(slave, libc::STDERR_FILENO);
+            libc::close(master);
+            libc::close(slave);
+        }
+        let path = CString::new(env!("CARGO_BIN_EXE_mesh")).unwrap();
+        let arg0 = CString::new("mesh").unwrap();
+        unsafe {
+            libc::execl(
+                path.as_ptr(),
+                arg0.as_ptr(),
+                std::ptr::null::<libc::c_char>(),
+            );
+            libc::_exit(127);
+        }
+    }
+    unsafe { libc::close(slave) };
+    if unsafe { libc::tcsetpgrp(master, mesh) } < 0 || !pty_wait_for_prompt(master) {
+        return 32;
+    }
+    let missing = b"mesh-command-that-does-not-exist\n";
+    if unsafe { libc::write(master, missing.as_ptr().cast(), missing.len()) }
+        != missing.len() as isize
+        || !pty_wait_for_prompt(master)
+    {
+        return 33;
+    }
+    let command = b"puts recovered\n";
+    if unsafe { libc::write(master, command.as_ptr().cast(), command.len()) }
+        != command.len() as isize
+    {
+        return 34;
+    }
+    let output = match pty_read_until_prompt(master) {
+        Some(output) => output,
+        None => return 35,
+    };
+    if !output.windows(11).any(|part| part == b"recovered\r\n") {
+        return 36;
+    }
+    if unsafe { libc::write(master, b"exit\n".as_ptr().cast(), 5) } != 5 {
+        return 37;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(mesh, &mut status, 0) } != mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 38;
+    }
+    unsafe { libc::close(master) };
+    0
+}
+
 fn sigcont_harness() -> i32 {
     use std::ffi::CString;
 
