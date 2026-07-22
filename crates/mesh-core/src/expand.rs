@@ -69,7 +69,7 @@ pub fn expand_values(words: Vec<Word>, vars: &Vars) -> Result<Vec<Value>, Expand
     let mut out = Vec::new();
     for word in words {
         if let Some(vref) = spread_var(&word) {
-            out.extend(spread_strings(vref, vars)?.into_iter().map(Value::String));
+            out.extend(spread_values(vref, vars)?);
         } else if let Some(list) = whole_list_value(&word, vars) {
             out.push(Value::List(list));
         } else {
@@ -81,67 +81,54 @@ pub fn expand_values(words: Vec<Word>, vars: &Vars) -> Result<Vec<Value>, Expand
     Ok(out)
 }
 
-/// Resolve a `...$name` spread to its element strings (a whole list or a slice).
-/// Spreading a single element (`...$xs[0]`), a string, or an unbound name is an
-/// error, matching the command-position spread rules.
-fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError> {
-    if !vref.modifiers.is_empty() {
-        return match resolve_value(vref, vars)? {
-            Value::List(values) => Ok(values),
-            Value::String(_) => Err(ExpandError::Unsupported(format!(
-                "...${}: modifier result is not a list",
-                vref.name
-            ))),
-        };
-    }
-    match vars.get(&vref.name) {
-        Some(Value::List(values)) => match &vref.access {
-            None => Ok(values.clone()),
-            Some(Access::Slice {
-                start,
-                end,
-                inclusive,
-            }) => Ok(slice(values, *start, *end, *inclusive).to_vec()),
-            Some(Access::Index(_)) => Err(ExpandError::Unsupported(format!(
-                "...${}: cannot spread a single list element",
-                vref.name
-            ))),
-        },
-        Some(Value::String(_)) => Err(ExpandError::Unsupported(format!(
-            "...${} on a string",
+fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> {
+    match resolve_value(vref, vars)? {
+        Value::List(values) => Ok(values),
+        Value::String(_) => Err(ExpandError::Unsupported(format!(
+            "...${}: value is not a list",
             vref.name
         ))),
-        None => Err(ExpandError::UnboundVar(vref.name.clone())),
     }
 }
 
-/// If `word` is exactly a bare, unquoted `$name` (or `$name[slice]`) that resolves
-/// to a list, return that list (to bind as one typed function argument). A string,
-/// an index access, a member access, a quoted reference, or an unbound name
-/// returns `None`, so ordinary expansion handles it (and reports any error).
-fn whole_list_value(word: &Word, vars: &Vars) -> Option<Vec<String>> {
+/// Resolve a `...$name` spread to its element strings (a whole list or a slice).
+/// An indexed element can itself be a list. A string, scalar element, or unbound
+/// name is an error, matching the command-position spread rules.
+fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError> {
+    match resolve_value(vref, vars)? {
+        Value::List(values) => strings(values, &vref.name),
+        Value::String(_) => Err(ExpandError::Unsupported(format!(
+            "...${}: value is not a list",
+            vref.name
+        ))),
+    }
+}
+
+fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
+    values
+        .into_iter()
+        .map(|value| match value {
+            Value::String(value) => Ok(value),
+            Value::List(_) => Err(ExpandError::Unsupported(format!(
+                "...${name}: nested list element cannot be a command argument"
+            ))),
+        })
+        .collect()
+}
+
+/// If `word` is exactly a bare, unquoted variable reference that resolves to a
+/// list, return that list (to bind as one typed function argument). A string, a
+/// member access, a quoted reference, or an unbound name returns `None`, so
+/// ordinary expansion handles it (and reports any error).
+fn whole_list_value(word: &Word, vars: &Vars) -> Option<Vec<Value>> {
     let [Piece::Var(vref)] = word.0.as_slice() else {
         return None;
     };
     if vref.member.is_some() || vref.quoted {
         return None;
     }
-    if !vref.modifiers.is_empty() {
-        return match resolve_value(vref, vars) {
-            Ok(Value::List(values)) => Some(values),
-            _ => None,
-        };
-    }
-    match (vars.get(&vref.name), &vref.access) {
-        (Some(Value::List(values)), None) => Some(values.clone()),
-        (
-            Some(Value::List(values)),
-            Some(Access::Slice {
-                start,
-                end,
-                inclusive,
-            }),
-        ) => Some(slice(values, *start, *end, *inclusive).to_vec()),
+    match resolve_value(vref, vars) {
+        Ok(Value::List(values)) => Some(values),
         _ => None,
     }
 }
@@ -277,7 +264,6 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                         .ok()
                         .and_then(|offset| values.get(offset))
                         .cloned()
-                        .map(Value::String)
                         .ok_or_else(|| ExpandError::IndexOutOfRange {
                             name: name.to_string(),
                             index: *index,
@@ -341,7 +327,6 @@ fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, ExpandError
                 .filter(|_| modifier == First)
                 .or_else(|| values.last().filter(|_| modifier == Last))
                 .cloned()
-                .map(Value::String)
                 .ok_or_else(|| ExpandError::Modifier {
                     name: name.into(),
                     message: "empty list has no element".into(),
@@ -382,12 +367,17 @@ fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, ExpandError
         },
         _ => match value {
             Value::String(value) => Ok(Value::String(modify_string(value, modifier))),
-            Value::List(values) => Ok(Value::List(
-                values
-                    .into_iter()
-                    .map(|v| modify_string(v, modifier))
-                    .collect(),
-            )),
+            Value::List(values) => values
+                .into_iter()
+                .map(|value| match value {
+                    Value::String(value) => Ok(Value::String(modify_string(value, modifier))),
+                    Value::List(_) => Err(ExpandError::Modifier {
+                        name: name.into(),
+                        message: "cannot map over a nested list".into(),
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::List),
         },
     }
 }

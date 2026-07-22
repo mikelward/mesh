@@ -4,6 +4,10 @@ How to build, test, and lay out the mesh implementation. For *what* mesh is and
 the language design, see [`DESIGN.md`](DESIGN.md); for the milestone plan, see
 [`ROADMAP.md`](ROADMAP.md).
 
+The clean-break M3 parser target and precedence rules live in
+[`PARSER.md`](PARSER.md). [`GRAMMAR.md`](GRAMMAR.md) continues to describe only
+the subset accepted by the current implementation.
+
 > **Status:** the implementation is a read/tokenize/exec loop that launches
 > external commands plus the `cd`, `pwd`, `puts`, `exit`, `jobs`, `fg`, and `bg`
 > builtins. Interactive

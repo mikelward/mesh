@@ -3217,18 +3217,18 @@ to avoid" rather than promising the latter as done.
   addressable.
 
 **Foundational specification work.** The entries above settle *surface* features;
-these five are the deeper contracts an implementation needs before code, and each
-is currently under-specified. They are called out together because tooling, error
-recovery, and the Rust data representation all depend on them.
+these five are the deeper contracts an implementation needs before code. They
+are called out together because tooling, error recovery, and the Rust data
+representation all depend on them; contracts still marked as needing a decision
+remain under-specified.
 
-- **Grammar and precedence — needs an EBNF.** Publish a real parser grammar (EBNF
-  or equivalent), not just examples, covering adjacency/concatenation, modifier
-  arguments, value calls `f(...)`, ranges `..` / `..=`, redirects, `&`
-  backgrounding, pipelines, `&&` / `||` chains, postfix guards, and newline / `;`
-  termination. Pin the ambiguous cases explicitly: does `a | b && c &` background
-  the whole `&&` list or only `c` (leaning: the whole list, as in bash), and where
-  does a trailing redirect attach (leaning: to the nearest simple command).
-  Examples alone can't make tooling and error recovery agree.
+- **Grammar and precedence — decided.** [`PARSER.md`](PARSER.md) is the parser
+  contract: it covers adjacency/concatenation, modifier arguments, value calls,
+  ranges, redirects, backgrounding, pipelines, conditional chains, postfix
+  guards, and termination. In particular, `a | b && c &` backgrounds the whole
+  `&&` list, while a redirect attaches to the nearest simple command. Keeping the
+  executable subset in [`GRAMMAR.md`](GRAMMAR.md) separate lets implementation
+  progress be recorded without reopening the target grammar.
 - **Status lifetime.** Define exactly when `$sh.status` changes. Provisional: a
   pipeline's status is its **last stage**, every stage retained in
   [`$sh.pipestatus`](#variables-and-assignment); decide whether a **`pipefail`**
