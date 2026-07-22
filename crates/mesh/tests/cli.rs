@@ -1888,3 +1888,15 @@ fn a_raw_string_body_immediately_after_the_brace_defines() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn an_invalid_quoted_parameter_quarantines_the_body() {
+    // A `'` in the parameter list is a malformed parameter, not a string that can
+    // hide the body's `{`. The whole definition (body included) is rejected as one
+    // unit, so its body lines never leak to the top level.
+    let out = run_with_input("func f(') {\nputs LEAKED\n}\nputs after\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("LEAKED"), "body leaked: {stdout}");
+    assert_eq!(stdout, "after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("func:"));
+}
