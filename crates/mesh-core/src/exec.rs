@@ -640,10 +640,6 @@ mod tests {
 
         let mut master = -1;
         let mut slave = -1;
-        #[cfg(target_os = "macos")]
-        let tiocsctty = libc::c_ulong::from(libc::TIOCSCTTY);
-        #[cfg(not(target_os = "macos"))]
-        let tiocsctty = libc::TIOCSCTTY;
         if unsafe {
             libc::openpty(
                 &mut master,
@@ -654,7 +650,7 @@ mod tests {
             )
         } != 0
             || unsafe { libc::setsid() } < 0
-            || unsafe { libc::ioctl(slave, tiocsctty, 0) } < 0
+            || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
             || unsafe { libc::dup2(slave, libc::STDIN_FILENO) } < 0
         {
             unsafe { libc::_exit(1) };

@@ -676,10 +676,6 @@ fn spawn_failure_harness() -> i32 {
 
     let mut master = -1;
     let mut slave = -1;
-    #[cfg(target_os = "macos")]
-    let tiocsctty = libc::c_ulong::from(libc::TIOCSCTTY);
-    #[cfg(not(target_os = "macos"))]
-    let tiocsctty = libc::TIOCSCTTY;
     if unsafe {
         libc::openpty(
             &mut master,
@@ -690,7 +686,7 @@ fn spawn_failure_harness() -> i32 {
         )
     } != 0
         || unsafe { libc::setsid() } < 0
-        || unsafe { libc::ioctl(slave, tiocsctty, 0) } < 0
+        || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
     {
         return 30;
     }
@@ -762,10 +758,6 @@ fn sigcont_harness() -> i32 {
 
     let mut master = -1;
     let mut slave = -1;
-    #[cfg(target_os = "macos")]
-    let tiocsctty = libc::c_ulong::from(libc::TIOCSCTTY);
-    #[cfg(not(target_os = "macos"))]
-    let tiocsctty = libc::TIOCSCTTY;
     if unsafe {
         libc::openpty(
             &mut master,
@@ -776,7 +768,7 @@ fn sigcont_harness() -> i32 {
         )
     } != 0
         || unsafe { libc::setsid() } < 0
-        || unsafe { libc::ioctl(slave, tiocsctty, 0) } < 0
+        || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
     {
         return 20;
     }
@@ -850,10 +842,6 @@ fn background_startup_harness() -> i32 {
 
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
-    #[cfg(target_os = "macos")]
-    let tiocsctty = libc::c_ulong::from(libc::TIOCSCTTY);
-    #[cfg(not(target_os = "macos"))]
-    let tiocsctty = libc::TIOCSCTTY;
     if unsafe {
         libc::openpty(
             &mut master,
@@ -864,7 +852,7 @@ fn background_startup_harness() -> i32 {
         )
     } != 0
         || unsafe { libc::setsid() } < 0
-        || unsafe { libc::ioctl(slave, tiocsctty, 0) } < 0
+        || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
     {
         return 10;
     }

@@ -292,6 +292,7 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "mesh-core",
+ "mesh-platform",
 ]
 
 [[package]]
@@ -300,7 +301,15 @@ version = "0.0.0"
 dependencies = [
  "glob",
  "libc",
+ "mesh-platform",
  "reedline",
+]
+
+[[package]]
+name = "mesh-platform"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
