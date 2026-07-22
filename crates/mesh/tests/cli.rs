@@ -430,6 +430,18 @@ fn list_literal_preserves_arity_and_spreads_into_arguments() {
 }
 
 #[test]
+fn list_literal_accepts_a_spread_immediately_before_the_closing_bracket() {
+    let out = run_with_input(
+        "xs = [second third]\nys = [first ...$xs]\nputs ...$ys\nys = [...$xs]\nputs ...$ys\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first second third\nsecond third\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn empty_list_spreads_to_no_arguments() {
     let out = run_with_input("xs = []\nputs before ...$xs after\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "before after\n");

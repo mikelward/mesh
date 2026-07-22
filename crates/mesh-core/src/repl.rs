@@ -465,6 +465,9 @@ fn list_literal(rhs: &[Word]) -> Option<Vec<Word>> {
         return None;
     }
     first_text.remove(0);
+    if matches!(first.0.first(), Some(Piece::Text { text, expandable: true }) if text.is_empty()) {
+        first.0.remove(0);
+    }
 
     let last = items.last_mut()?;
     let Piece::Text {
@@ -478,11 +481,20 @@ fn list_literal(rhs: &[Word]) -> Option<Vec<Word>> {
         return None;
     }
     last_text.pop();
+    if matches!(last.0.last(), Some(Piece::Text { text, expandable: true }) if text.is_empty()) {
+        last.0.pop();
+    }
     let synthetic = |word: &Word| matches!(word.0.as_slice(), [Piece::Text { text, expandable: true }] if text.is_empty());
-    if items.first().is_some_and(synthetic) {
+    if items
+        .first()
+        .is_some_and(|word| word.0.is_empty() || synthetic(word))
+    {
         items.remove(0);
     }
-    if items.last().is_some_and(synthetic) {
+    if items
+        .last()
+        .is_some_and(|word| word.0.is_empty() || synthetic(word))
+    {
         items.pop();
     }
     Some(items)
