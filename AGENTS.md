@@ -82,6 +82,8 @@ apply throughout.
 - Preserve the existing code style unless there's a correctness issue.
 - Keep comments brief: explain the non-obvious *why*, not the *what*, matching
   the surrounding style.
+- Always add tests for new functionality. When modifying functionality, fix the
+  implementation or tests as appropriate so they remain consistent.
 - Add or update tests with any code change; a change isn't done until it's
   covered. When fixing a bug, add a test that fails before the fix and passes
   after.
