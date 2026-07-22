@@ -814,7 +814,51 @@ fn variable_end(source: &str, start: usize) -> Result<usize, ParseError> {
             break;
         }
     }
-    Ok(end)
+    Ok(variable_suffix_end(source, start, end))
+}
+
+fn variable_suffix_end(source: &str, start: usize, mut end: usize) -> usize {
+    loop {
+        let rest = &source[end..];
+        let candidate = if let Some(member) = rest.strip_prefix('.') {
+            let length = member
+                .char_indices()
+                .take_while(|(_, ch)| *ch == '_' || *ch == '-' || ch.is_alphanumeric())
+                .map(|(offset, ch)| offset + ch.len_utf8())
+                .last()
+                .unwrap_or(0);
+            (length > 0).then_some(end + 1 + length)
+        } else if rest.starts_with('[') {
+            subscript_end(rest).map(|length| end + length)
+        } else {
+            None
+        };
+        let Some(candidate) = candidate else { break };
+        if !valid_variable_access(&source[start + 1..candidate]) {
+            break;
+        }
+        end = candidate;
+    }
+    end
+}
+
+fn subscript_end(rest: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, ch) in rest.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && quote.is_some() {
+            escaped = true;
+        } else if quote == Some(ch) {
+            quote = None;
+        } else if quote.is_none() && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if quote.is_none() && ch == ']' {
+            return Some(offset + 1);
+        }
+    }
+    None
 }
 
 fn valid_variable_access(value: &str) -> bool {
@@ -864,7 +908,31 @@ fn valid_variable_subscript(value: &str) -> bool {
         signed_integer(value)
             || valid_name(value)
             || value.strip_prefix('$').is_some_and(valid_name)
+            || quoted_subscript(value)
     }
+}
+
+fn quoted_subscript(value: &str) -> bool {
+    let Some(quote) = value.chars().next().filter(|ch| matches!(ch, '\'' | '"')) else {
+        return false;
+    };
+    let Some(inner) = value
+        .strip_prefix(quote)
+        .and_then(|v| v.strip_suffix(quote))
+    else {
+        return false;
+    };
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return false;
+        }
+    }
+    !escaped
 }
 
 fn decode_unicode_escape(source: &str, start: usize) -> Option<(char, usize)> {

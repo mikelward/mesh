@@ -11,11 +11,11 @@
 
 use std::env;
 
-/// An exact list index or a clamped range slice.
+/// One access step applied from left to right to a variable value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Access {
-    Index(i64),
-    Key(String),
+    Member(String),
+    Subscript(String),
     Slice {
         start: Option<i64>,
         end: Option<i64>,
@@ -70,8 +70,7 @@ impl Modifier {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarRef {
     pub name: String,
-    pub member: Option<String>,
-    pub access: Option<Access>,
+    pub accesses: Vec<Access>,
     pub modifiers: Vec<Modifier>,
     pub quoted: bool,
 }
@@ -205,7 +204,7 @@ fn whole_list_value(word: &Word, vars: &Vars) -> Option<Vec<Value>> {
     let [Piece::Var(vref)] = word.0.as_slice() else {
         return None;
     };
-    if vref.member.is_some() || vref.quoted {
+    if vref.quoted {
         return None;
     }
     match resolve_value(vref, vars) {
@@ -224,7 +223,7 @@ fn spread_var(word: &Word) -> Option<&VarRef> {
                 expandable: true,
             },
             Piece::Var(vref),
-        ] if text == "..." && vref.member.is_none() => Some(vref),
+        ] if text == "..." => Some(vref),
         _ => None,
     }
 }
@@ -326,100 +325,122 @@ fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
 }
 
 pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandError> {
-    let mut value = match (vref.name.as_str(), &vref.member, &vref.access) {
-        ("env", Some(key), None) => env::var_os(key)
-            .map(|v| v.to_string_lossy().into_owned())
-            .map(Value::String)
-            .ok_or_else(|| ExpandError::UnsetEnv(key.clone())),
-        ("env", None, None) => Err(ExpandError::Unsupported("$env".to_string())),
-        (name, None, Some(Access::Index(index))) => vars
-            .get(name)
-            .ok_or_else(|| ExpandError::UnboundVar(name.to_string()))
-            .and_then(|value| match value {
-                Value::String(_) => Err(ExpandError::NotAList(name.to_string())),
-                Value::List(values) => {
-                    let offset = if *index < 0 {
-                        values.len() as i128 + *index as i128
-                    } else {
-                        *index as i128
-                    };
-                    usize::try_from(offset)
-                        .ok()
-                        .and_then(|offset| values.get(offset))
-                        .cloned()
-                        .ok_or_else(|| ExpandError::IndexOutOfRange {
-                            name: name.to_string(),
-                            index: *index,
-                        })
+    if vref.name == "env" {
+        let [Access::Member(key)] = vref.accesses.as_slice() else {
+            return Err(ExpandError::Unsupported("$env".to_string()));
+        };
+        return env::var_os(key)
+            .map(|v| Value::String(v.to_string_lossy().into_owned()))
+            .ok_or_else(|| ExpandError::UnsetEnv(key.clone()));
+    }
+    let mut value = vars
+        .get(&vref.name)
+        .ok_or_else(|| ExpandError::UnboundVar(vref.name.clone()))?
+        .clone();
+    for access in &vref.accesses {
+        value = match access {
+            Access::Member(key) => map_value_access(value, key, &vref.name)?,
+            Access::Subscript(subscript) => {
+                let key = subscript_key(subscript, vars)?;
+                match value {
+                    Value::List(values) => {
+                        let index = key.parse::<i64>().map_err(|_| {
+                            ExpandError::Unsupported("list index must be an integer".into())
+                        })?;
+                        let offset = if index < 0 {
+                            values.len() as i128 + index as i128
+                        } else {
+                            index as i128
+                        };
+                        usize::try_from(offset)
+                            .ok()
+                            .and_then(|offset| values.get(offset))
+                            .cloned()
+                            .ok_or_else(|| ExpandError::IndexOutOfRange {
+                                name: vref.name.clone(),
+                                index,
+                            })?
+                    }
+                    Value::Map(_) => map_value_access(value, &key, &vref.name)?,
+                    Value::String(_) => return Err(ExpandError::NotAList(vref.name.clone())),
                 }
-                Value::Map(_) => Err(ExpandError::NotAList(name.to_string())),
-            }),
-        (name, None, Some(Access::Key(key))) => map_access(vars, name, key),
-        (name, None, Some(Access::Slice { .. })) => vars
-            .get(name)
-            .ok_or_else(|| ExpandError::UnboundVar(name.to_string()))
-            .and_then(|value| match value {
-                Value::String(_) => Err(ExpandError::NotAList(name.to_string())),
-                Value::List(values) => Ok(Value::List(
-                    slice(
-                        values,
-                        match vref.access {
-                            Some(Access::Slice { start, .. }) => start,
-                            _ => None,
-                        },
-                        match vref.access {
-                            Some(Access::Slice { end, .. }) => end,
-                            _ => None,
-                        },
-                        matches!(
-                            vref.access,
-                            Some(Access::Slice {
-                                inclusive: true,
-                                ..
-                            })
-                        ),
-                    )
-                    .to_vec(),
-                )),
-                Value::Map(_) => Err(ExpandError::NotAList(name.to_string())),
-            }),
-        (name, None, None) => vars
-            .get(name)
-            .ok_or_else(|| ExpandError::UnboundVar(name.to_string()))
-            .cloned(),
-        (name, Some(member), None) => map_access(vars, name, member),
-        (name, member, Some(access)) => Err(ExpandError::Unsupported(format!(
-            "${name}{}[{access:?}]",
-            member.as_ref().map(|m| format!(".{m}")).unwrap_or_default()
-        ))),
-    }?;
+            }
+            Access::Slice {
+                start,
+                end,
+                inclusive,
+            } => match value {
+                Value::List(values) => {
+                    Value::List(slice(&values, *start, *end, *inclusive).to_vec())
+                }
+                _ => return Err(ExpandError::NotAList(vref.name.clone())),
+            },
+        };
+    }
     for modifier in &vref.modifiers {
         value = apply_modifier(value, *modifier)?;
     }
     Ok(value)
 }
 
-fn map_access(vars: &Vars, name: &str, key: &str) -> Result<Value, ExpandError> {
-    let key = if let Some(variable) = key.strip_prefix('$') {
-        match vars.get(variable) {
-            Some(Value::String(value)) => value.as_str(),
-            Some(_) => return Err(ExpandError::Unsupported("map key must be a string".into())),
-            None => return Err(ExpandError::UnboundVar(variable.into())),
-        }
-    } else {
-        key
-    };
-    match vars.get(name) {
-        Some(Value::Map(entries)) => entries
-            .iter()
+fn map_value_access(value: Value, key: &str, name: &str) -> Result<Value, ExpandError> {
+    match value {
+        Value::Map(entries) => entries
+            .into_iter()
             .find(|(candidate, _)| candidate == key)
-            .map(|(_, value)| value.clone())
+            .map(|(_, value)| value)
             .ok_or_else(|| ExpandError::Unsupported(format!("${name}[{key}]: map key not found"))),
-        Some(_) => Err(ExpandError::Unsupported(format!(
+        _ => Err(ExpandError::Unsupported(format!(
             "${name}: value is not a map"
         ))),
-        None => Err(ExpandError::UnboundVar(name.into())),
     }
+}
+
+fn subscript_key(subscript: &str, vars: &Vars) -> Result<String, ExpandError> {
+    if let Some(variable) = subscript.strip_prefix('$') {
+        return match vars.get(variable) {
+            Some(Value::String(value)) => Ok(value.clone()),
+            Some(_) => Err(ExpandError::Unsupported("map key must be a string".into())),
+            None => Err(ExpandError::UnboundVar(variable.into())),
+        };
+    }
+    if let Some(value) = subscript
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+    {
+        return decode_subscript_string(value, '"');
+    }
+    if let Some(value) = subscript
+        .strip_prefix('\'')
+        .and_then(|v| v.strip_suffix('\''))
+    {
+        return decode_subscript_string(value, '\'');
+    }
+    Ok(subscript.to_string())
+}
+
+fn decode_subscript_string(value: &str, quote: char) -> Result<String, ExpandError> {
+    let mut decoded = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        let escaped = chars
+            .next()
+            .ok_or_else(|| ExpandError::Unsupported("unterminated escape in map key".into()))?;
+        decoded.push(match escaped {
+            '\\' => '\\',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            c if c == quote => c,
+            '$' if quote == '"' => '$',
+            _ => return Err(ExpandError::Unsupported("invalid escape in map key".into())),
+        });
+    }
+    Ok(decoded)
 }
 
 pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, ExpandError> {

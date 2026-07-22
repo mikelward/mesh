@@ -2286,3 +2286,36 @@ fn maps_reject_missing_keys_and_non_string_keys() {
     assert_eq!(bad_key.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&bad_key.stderr).contains("map key must be a string"));
 }
+
+#[test]
+fn command_interpolation_dispatches_map_subscripts_by_value_type() {
+    let out = run_with_input(
+        "m = [200: numeric, \"a b\": quoted, x: dynamic]\n\
+         key = x\n\
+         puts $m[200] ${m[\"a b\"]} $m[$key]\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "numeric quoted dynamic\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn command_interpolation_resolves_chained_map_members_in_order() {
+    let out = run_with_input(
+        "inner = [key: value]\n\
+         outer = [inner: $inner]\n\
+         puts $outer.inner.key\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "value\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

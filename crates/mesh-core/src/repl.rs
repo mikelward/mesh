@@ -482,18 +482,17 @@ fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
     let name_end = inner.find(['.', '[', ':']).unwrap_or(inner.len());
     let name = inner[..name_end].to_string();
     let mut rest = &inner[name_end..];
-    let mut member = None;
-    let mut access = None;
+    let mut accesses = Vec::new();
     let mut modifiers = Vec::new();
     while !rest.is_empty() {
         if let Some(value) = rest.strip_prefix('.') {
             let end = value.find(['.', '[', ':']).unwrap_or(value.len());
-            member = Some(value[..end].to_string());
+            accesses.push(expand::Access::Member(value[..end].to_string()));
             rest = &value[end..];
         } else if let Some(value) = rest.strip_prefix('[') {
             let close = value.find(']').expect("parser validated variable access");
             let index = &value[..close];
-            access = Some(if let Some((start, end)) = index.split_once("..=") {
+            accesses.push(if let Some((start, end)) = index.split_once("..=") {
                 expand::Access::Slice {
                     start: parse_bound(start),
                     end: parse_bound(end),
@@ -505,10 +504,8 @@ fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
                     end: parse_bound(end),
                     inclusive: false,
                 }
-            } else if let Ok(index) = index.parse() {
-                expand::Access::Index(index)
             } else {
-                expand::Access::Key(index.to_string())
+                expand::Access::Subscript(index.to_string())
             });
             rest = &value[close + 1..];
         } else if let Some(value) = rest.strip_prefix(':') {
@@ -523,8 +520,7 @@ fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
     }
     VarRef {
         name,
-        member,
-        access,
+        accesses,
         modifiers,
         quoted: !matches!(quote, parser::QuoteMode::Bare),
     }
