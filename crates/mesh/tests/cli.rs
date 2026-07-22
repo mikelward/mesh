@@ -1755,3 +1755,24 @@ fn an_invalid_closed_signature_does_not_swallow_following_commands() {
         );
     }
 }
+
+#[test]
+fn a_line_that_cannot_open_an_awaited_body_is_reprocessed() {
+    // `func f()` awaits its body; the next line is not `{`, so the header is
+    // rejected (missing body) and that line still runs as its own command.
+    let out = run_with_input("func f()\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("missing body"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_delayed_brace_after_a_blank_line_still_defines() {
+    // A blank line between the header and its `{` keeps buffering (it does not
+    // invalidate the awaited body), so the function is still defined.
+    let out = run_with_input("func f()\n\n{\n  puts ok\n}\nf\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
