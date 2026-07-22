@@ -87,18 +87,20 @@ are session-global.
 | `$name` | The value of `name`. |
 | `${name}` | Same, when the following character would run into the name. |
 | `$env.KEY` | The environment variable `KEY`. |
+| `$xs[N]` | List element `N`; negative indexes count from the end. |
 
 Reading an unset variable (or an unset `$env.KEY`) is an error; the shell
 recovers and continues. An interpolated value is a single literal value — it is
 never split on spaces or matched against filenames. Interpolation happens in bare
 words and `"…"`, never in `'…'` or `r'…'`.
 
-Inside `"…"`, a `.` after an unbraced `$name` is literal (`"$x.txt"` is the value
-of `x` followed by `.txt`); use `${…}` for anything more. A malformed `${…}` (no
-closing `}`, or an invalid name inside) is a syntax error. A `$` not followed by
-a name (`$5`) is a literal `$`; a literal `$` in a string is `\$`.
+Member access and integer indexing have the same meaning inside `"…"` as they do
+outside it. Use braces to delimit a reference before literal text: `${x}.txt`.
+A malformed `${…}` (no closing `}`, or an invalid name inside) is a syntax error.
+A `$` not followed by a name (`$5`) is a literal `$`; a literal `$` in a string
+is `\$`.
 
 ## Not yet implemented
 
-List and map values, `:` modifiers, regex literals, functions, and heredocs. See
+Map values, `:` modifiers, regex literals, functions, and heredocs. See
 [`ROADMAP.md`](../ROADMAP.md).

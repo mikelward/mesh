@@ -494,6 +494,12 @@ fn braced_variable_delimits_a_literal_dotted_suffix() {
 }
 
 #[test]
+fn list_indexing_works_inside_double_quotes() {
+    let out = run_with_input("xs = [first last]\nputs \"$xs[0] ${xs[-1]}\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "first last\n");
+}
+
+#[test]
 fn double_hyphen_name_is_not_a_valid_binding() {
     // `a--b` is not a kebab identifier (hyphens are interior, single), so it is
     // not an assignment target — the line is a command, and there is no such
