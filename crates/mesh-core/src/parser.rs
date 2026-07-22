@@ -1132,13 +1132,14 @@ impl Parser {
         self.newlines();
         while !self.same(&TokenKind::RParen) {
             parameters.push(self.name()?);
-            if self.eat(&TokenKind::Comma).is_none()
-                && !self.same(&TokenKind::RParen)
-                && self.peek().is_none()
-            {
+            let comma = self.eat(&TokenKind::Comma).is_some();
+            self.newlines();
+            if comma && self.same(&TokenKind::RParen) {
+                return Err(self.error(ParseErrorKind::Expected("a name")));
+            }
+            if !comma && !self.same(&TokenKind::RParen) && self.peek().is_none() {
                 return Err(self.eof(ParseErrorKind::Unterminated('(')));
             }
-            self.newlines();
         }
         self.position += 1;
         Ok(parameters)
@@ -1986,6 +1987,7 @@ mod tests {
         };
         assert_eq!(parameters, &["x", "y"]);
         assert_eq!(body.statements.len(), 1);
+        assert!(parse("func f(x,) {}").is_err());
     }
 
     #[test]

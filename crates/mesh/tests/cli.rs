@@ -1740,19 +1740,23 @@ fn a_reserved_name_cannot_be_a_function() {
 }
 
 #[test]
-fn unsupported_signature_forms_are_rejected_clearly() {
-    let cases = [
-        ("func f(...xs) { puts hi }\n", "rest parameters"),
-        ("func f(--flag) { puts hi }\n", "flag parameters"),
-        ("func f(x = 1) { puts hi }\n", "optional/default"),
-        ("func f(a, a) { puts hi }\n", "duplicate parameter"),
-        ("func f(a,) { puts hi }\n", "after `,`"),
-    ];
-    for (input, needle) in cases {
+fn unsupported_signature_forms_are_parser_errors() {
+    for input in [
+        "func f(...xs) { puts hi }\n",
+        "func f(--flag) { puts hi }\n",
+        "func f(x = 1) { puts hi }\n",
+        "func f(a,) { puts hi }\n",
+    ] {
         let out = run_with_input(input);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains(needle), "{input:?} → {stderr}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+            "{input:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
+
+    let duplicate = run_with_input("func f(a, a) { puts hi }\n");
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("duplicate parameter"));
 }
 
 #[test]
@@ -1783,33 +1787,50 @@ fn a_redirected_function_is_rejected() {
 }
 
 #[test]
-fn a_malformed_header_does_not_leak_later_body_lines() {
-    // The P1 quarantine case: `func f(x {` opens a body with no signature `)`.
-    // Buffering runs to the matching `}`, so `puts LEAKED` is inside the (rejected)
-    // definition and must not run at the top level.
-    let out = run_with_input("func f(x {\nputs )\nputs LEAKED\n}\nputs after\n");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(!stdout.contains("LEAKED"), "leaked: {stdout}");
-    assert_eq!(stdout, "after\n");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("missing `)`"));
-}
-
-#[test]
-fn a_disputed_quote_keeps_function_body_lines_quarantined() {
-    let out = run_with_input("func f() {\nputs xr'\\' }\nputs LEAKED\n");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(!stdout.contains("LEAKED"), "body leaked: {stdout}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("missing closing `}`"));
-}
-
-#[test]
 fn an_unterminated_definition_at_eof_is_reported() {
     let out = run_with_input("func f() {\n  puts hi\n");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("missing closing `}`"),
+        String::from_utf8_lossy(&out.stderr).contains("unexpected end of input"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn malformed_compound_headers_use_parser_diagnostics() {
+    for input in [
+        "func f)\nputs after\n",
+        "func f() oops\nputs after\n",
+        "func f(,)\nputs after\n",
+        "for 1\nputs after\n",
+    ] {
+        let out = run_with_input(input);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+            "{input:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn parser_incomplete_is_the_only_compound_continuation_signal() {
+    // The reader no longer guesses whether the next physical line was intended
+    // as a body. It buffers while the parser says the whole unit is incomplete,
+    // then reports the parser's error for that unit.
+    for (input, expected) in [
+        ("func f()\nputs after\n", ""),
+        ("func f()\nputs '{'\nputs after\n", "after\n"),
+    ] {
+        let out = run_with_input(input);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{input:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+            "{input:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -1838,19 +1859,6 @@ fn an_escaped_newline_before_a_raw_string_still_closes_the_body() {
 }
 
 #[test]
-fn trailing_text_after_a_body_close_is_reported_not_swallowed() {
-    // `func f() {} {` closes the body at the first `}`; the trailing `{` is a
-    // parse error, and the following command still runs (not buffered away).
-    let out = run_with_input("func f() {} {\nputs after\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("unexpected text after the closing"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
 fn a_body_opening_brace_may_sit_on_the_next_line() {
     // `func f()` then `{` on the following line is a valid layout (the grammar's
     // `")" ws? "{"`), so the reader buffers through to the body's `}` and defines
@@ -1865,101 +1873,11 @@ fn a_body_opening_brace_may_sit_on_the_next_line() {
 }
 
 #[test]
-fn a_malformed_header_does_not_swallow_following_commands() {
-    // Non-whitespace after the signature `)` is a malformed header: it is
-    // reported immediately, and the next command still runs (not buffered away).
-    let out = run_with_input("func f() oops\nputs after\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("missing body"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
-fn a_header_malformed_before_its_paren_does_not_swallow_commands() {
-    // `func f)` has no opening `(` before its `)`, so it can never be a valid
-    // signature: it is reported at once and the following command still runs.
-    let out = run_with_input("func f)\nputs after\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("func:"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
-fn an_invalid_closed_signature_does_not_swallow_following_commands() {
-    // A closed-but-invalid parameter list is provably malformed, so it is
-    // reported at once and the following command still runs (not buffered away).
-    for sig in ["func f(,)", "func f(...xs)", "func f(a,a)"] {
-        let out = run_with_input(&format!("{sig}\nputs after\n"));
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout),
-            "after\n",
-            "signature {sig:?} swallowed the following command"
-        );
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("func:"),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-}
-
-#[test]
-fn a_line_that_cannot_open_an_awaited_body_is_reprocessed() {
-    // `func f()` awaits its body; the next line is not `{`, so the header is
-    // rejected (missing body) and that line still runs as its own command.
-    let out = run_with_input("func f()\nputs after\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("missing body"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
-fn a_header_followed_by_a_complete_definition_is_not_swallowed() {
-    // `func f()` awaits its body; the next line is itself a complete `func g()`
-    // definition, not `f`'s body — so `f` is rejected and `g` is still defined.
-    let out = run_with_input("func f()\nfunc g() { puts g-ran }\ng\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "g-ran\n");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("missing body"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
 fn a_delayed_brace_after_a_blank_line_still_defines() {
     // A blank line between the header and its `{` keeps buffering (it does not
     // invalidate the awaited body), so the function is still defined.
     let out = run_with_input("func f()\n\n{\n  puts ok\n}\nf\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
-}
-
-#[test]
-fn an_invalid_partial_signature_does_not_swallow_following_commands() {
-    // An unclosed but provably-invalid parameter list can never be repaired, so
-    // it is reported at once and the following command still runs.
-    for sig in ["func f(,", "func f(...", "func f(a="] {
-        let out = run_with_input(&format!("{sig}\nputs after\n"));
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout),
-            "after\n",
-            "partial signature {sig:?} swallowed the following command"
-        );
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("func:"),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
 }
 
 #[test]
@@ -2045,25 +1963,6 @@ fn unknown_modifier_names_remain_literal_suffixes() {
 }
 
 #[test]
-fn an_impossible_parameter_head_does_not_enter_continuation() {
-    // A trailing parameter token with a non-letter head can never become a valid
-    // name, so the header is reported at once and the next command still runs.
-    for sig in ["func f(_", "func f(1"] {
-        let out = run_with_input(&format!("{sig}\nputs after\n"));
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout),
-            "after\n",
-            "partial signature {sig:?} swallowed the following command"
-        );
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("func:"),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-}
-
-#[test]
 fn a_raw_string_body_immediately_after_the_brace_defines() {
     // `func f(){r'\'}` — a raw string as the first body word with no space after
     // `{`; the body's `}` is still found and the definition is accepted.
@@ -2075,28 +1974,6 @@ fn a_raw_string_body_immediately_after_the_brace_defines() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-}
-
-#[test]
-fn an_invalid_quoted_parameter_quarantines_the_body() {
-    // A `'` in the parameter list is a malformed parameter, not a string that can
-    // hide the body's `{`. The whole definition (body included) is rejected as one
-    // unit, so its body lines never leak to the top level.
-    let out = run_with_input("func f(') {\nputs LEAKED\n}\nputs after\n");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(!stdout.contains("LEAKED"), "body leaked: {stdout}");
-    assert_eq!(stdout, "after\n");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("func:"));
-}
-
-#[test]
-fn a_following_command_with_a_quoted_brace_is_not_the_body() {
-    // `func f()` awaits its body; the next line is a separate command that merely
-    // contains a quoted `{`. That brace is not the body opener, so the header is
-    // rejected and both following commands still run.
-    let out = run_with_input("func f()\nputs '{'\nputs after\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "{\nafter\n");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("missing body"));
 }
 
 #[test]
@@ -2123,13 +2000,6 @@ fn for_iterates_direct_list_literals_and_skips_an_empty_literal() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-}
-
-#[test]
-fn an_impossible_for_header_does_not_swallow_the_next_command() {
-    let out = run_with_input("for 1\nputs after\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("valid binding name"));
 }
 
 #[test]

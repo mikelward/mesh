@@ -97,7 +97,9 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
                 return run_source(&source, last, in_function, shell);
             }
         }
-        Ok(parser::ParseOutcome::Incomplete) if parser_owned => {
+        Ok(parser::ParseOutcome::Incomplete)
+            if parser_owned || parser_classifies_compound(text) =>
+        {
             eprintln!("mesh: syntax error: unexpected end of input");
             return Step::Continue(2);
         }
@@ -237,6 +239,25 @@ fn starts_with_compound_keyword(text: &str) -> bool {
     )
 }
 
+fn parser_classifies_compound(text: &str) -> bool {
+    let Ok(tokens) = parser::tokenize(text) else {
+        return false;
+    };
+    let bare_keyword = |token: &parser::Token, expected: &[&str]| {
+        matches!(&token.value,
+            parser::TokenKind::Word(word)
+                if matches!(word.pieces.as_slice(),
+                    [parser::WordPiece::Text { text, quote: parser::QuoteMode::Bare }]
+                        if expected.contains(&text.as_str())))
+    };
+    tokens
+        .first()
+        .is_some_and(|token| bare_keyword(token, &["func", "if", "for"]))
+        || matches!(tokens.as_slice(), [_, equal, keyword, ..]
+            if matches!(equal.value, parser::TokenKind::Equal)
+                && bare_keyword(keyword, &["if", "for"]))
+}
+
 fn executable_has_compound(executable: &parser::Executable) -> bool {
     matches!(
         executable,
@@ -368,6 +389,16 @@ fn run_executable(
         } => {
             if name == "func" || name == "return" || builtins::is_builtin(name) {
                 eprintln!("mesh: func: `{name}` is a reserved name and cannot be a function name");
+                return Step::Continue(2);
+            }
+            if let Some(duplicate) = parameters
+                .iter()
+                .enumerate()
+                .find_map(|(index, parameter)| {
+                    parameters[..index].contains(parameter).then_some(parameter)
+                })
+            {
+                eprintln!("mesh: func: duplicate parameter `{duplicate}`");
                 return Step::Continue(2);
             }
             shell.funcs.define(
@@ -1181,7 +1212,8 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
 
 /// Return whether the parser needs another physical line to complete the input.
 fn needs_more_input(text: &str) -> bool {
-    matches!(parser::parse(text), Ok(parser::ParseOutcome::Incomplete))
+    parser_classifies_compound(text)
+        && matches!(parser::parse(text), Ok(parser::ParseOutcome::Incomplete))
 }
 
 /// A classified line: a variable binding or a command.
@@ -1759,6 +1791,8 @@ mod tests {
         ] {
             assert!(!needs_more_input(input), "expected complete: {input:?}");
         }
+        assert!(!needs_more_input("puts value |"));
+        assert!(!needs_more_input("puts 'unterminated"));
     }
 
     #[test]
