@@ -98,6 +98,8 @@ pub enum ParseErrorKind {
     Unterminated(char),
     ChainedComparison,
     Expected(&'static str),
+    ReservedParameter(String),
+    DuplicateParameter(String),
     UnknownEscape(char),
     BadUnicodeEscape,
 }
@@ -110,7 +112,7 @@ pub struct ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.kind {
+        match &self.kind {
             ParseErrorKind::UnexpectedToken => write!(f, "syntax error: unexpected token"),
             ParseErrorKind::UnexpectedEnd => write!(f, "syntax error: unexpected end of input"),
             ParseErrorKind::Unterminated(c) => write!(f, "syntax error: unclosed `{c}`"),
@@ -118,6 +120,15 @@ impl std::fmt::Display for ParseError {
                 write!(f, "syntax error: comparisons cannot be chained")
             }
             ParseErrorKind::Expected(expected) => write!(f, "syntax error: expected {expected}"),
+            ParseErrorKind::ReservedParameter(name) => {
+                write!(
+                    f,
+                    "syntax error: `{name}` is reserved and cannot be a parameter"
+                )
+            }
+            ParseErrorKind::DuplicateParameter(name) => {
+                write!(f, "syntax error: duplicate parameter `{name}`")
+            }
             ParseErrorKind::UnknownEscape(c) => write!(f, "syntax error: invalid escape \\{c}"),
             ParseErrorKind::BadUnicodeEscape => {
                 write!(f, "syntax error: invalid \\u{{…}} escape")
@@ -1131,14 +1142,24 @@ impl Parser {
         let mut parameters = Vec::new();
         self.newlines();
         while !self.same(&TokenKind::RParen) {
-            parameters.push(self.name()?);
+            let parameter = self.name()?;
+            if parameter == "env" {
+                return Err(self.error(ParseErrorKind::ReservedParameter(parameter)));
+            }
+            if parameters.contains(&parameter) {
+                return Err(self.error(ParseErrorKind::DuplicateParameter(parameter)));
+            }
+            parameters.push(parameter);
             let comma = self.eat(&TokenKind::Comma).is_some();
             self.newlines();
             if comma && self.same(&TokenKind::RParen) {
                 return Err(self.error(ParseErrorKind::Expected("a name")));
             }
-            if !comma && !self.same(&TokenKind::RParen) && self.peek().is_none() {
-                return Err(self.eof(ParseErrorKind::Unterminated('(')));
+            if !comma && !self.same(&TokenKind::RParen) {
+                if self.peek().is_none() {
+                    return Err(self.eof(ParseErrorKind::Unterminated('(')));
+                }
+                return Err(self.error(ParseErrorKind::Expected("`,` or `)`")));
             }
         }
         self.position += 1;
@@ -1987,7 +2008,14 @@ mod tests {
         };
         assert_eq!(parameters, &["x", "y"]);
         assert_eq!(body.statements.len(), 1);
-        assert!(parse("func f(x,) {}").is_err());
+        for invalid in [
+            "func f(x,) {}",
+            "func f(x y) {}",
+            "func f(x, x) {}",
+            "func f(env) {}",
+        ] {
+            assert!(parse(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]

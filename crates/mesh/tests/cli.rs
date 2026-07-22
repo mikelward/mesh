@@ -1634,7 +1634,7 @@ fn a_function_body_is_parsed_when_defined() {
 
 #[test]
 fn a_function_takes_multiple_positionals() {
-    // Comma- and space-separated parameter lists both bind left to right.
+    // Comma-separated parameter lists bind left to right.
     let out = run_with_input("func pair(a, b) { puts $a $b }\npair x y\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "x y\n");
 }
@@ -1745,7 +1745,10 @@ fn unsupported_signature_forms_are_parser_errors() {
         "func f(...xs) { puts hi }\n",
         "func f(--flag) { puts hi }\n",
         "func f(x = 1) { puts hi }\n",
+        "func f(a b) { puts hi }\n",
         "func f(a,) { puts hi }\n",
+        "func f(a, a) { puts hi }\n",
+        "func f(env) { puts hi }\n",
     ] {
         let out = run_with_input(input);
         assert!(
@@ -1754,9 +1757,6 @@ fn unsupported_signature_forms_are_parser_errors() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-
-    let duplicate = run_with_input("func f(a, a) { puts hi }\n");
-    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("duplicate parameter"));
 }
 
 #[test]
