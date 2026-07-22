@@ -744,18 +744,54 @@ fn ends_with_bare_equals(word: &[Piece]) -> bool {
 /// buffering ([`header_awaits_body`]); an already-malformed header is dispatched
 /// immediately so its parse error is reported without swallowing later commands.
 pub fn needs_more_input(text: &str) -> bool {
-    // The body opener is the first `{`, located *literally*: the signature grammar
-    // (`func name(params)`) contains no strings, so a `'`/`"` in the header is a
-    // malformed parameter, not a quote — scanning the whole text with body quote
-    // rules would let such a quote swallow the body's `{` and release the buffered
-    // body lines to the top level. Only the body itself (from its `{`) is scanned
-    // with quote/brace rules.
-    let Some(open) = text.find('{') else {
-        return header_awaits_body(text);
-    };
-    // Buffer until the body's first matching `}`; trailing text after it (or a
-    // reopened brace) still dispatches, so the parser reports the error.
-    scan_braces(&text[open..], 0).close.is_none()
+    match body_open_offset(text) {
+        // A body has opened: buffer until its first matching `}`. Only the body
+        // (from its `{`) is scanned with quote/brace rules; trailing text after the
+        // close (or a reopened brace) still dispatches so the parser reports it.
+        Some(open) => scan_braces(&text[open..], 0).close.is_none(),
+        // No body has opened yet — the header is still forming, or is malformed.
+        None => header_awaits_body(text),
+    }
+}
+
+/// Byte offset of the body's opening `{`, located via the **signature grammar**
+/// rather than a literal brace search, so a `{` that belongs elsewhere — inside a
+/// following command (`func f()`⏎`puts '{'`) or hidden by a malformed quoted
+/// parameter — is not mistaken for the body opener. The body opens only where a
+/// `{` sits right after the signature `func name(params)` (whitespace between `)`
+/// and `{`), or — for a malformed header whose `(` never closed (`func f(x {`) —
+/// at the first `{` in the parameter region, so that definition still buffers
+/// through to its matching `}` and stays quarantined. Returns `None` when no body
+/// has opened, i.e. the header is still forming or is malformed without a brace.
+fn body_open_offset(text: &str) -> Option<usize> {
+    let brace = text.find('{')?;
+    match text.find('(') {
+        // `(` before the `{`: this is the signature. Find its closing `)`.
+        Some(open) if open < brace => match text[open + 1..brace].find(')') {
+            // Signature closed before the `{`: the body opens at `{` only if just
+            // whitespace sits between `)` and `{` (a real body opener); otherwise
+            // the `{` is separate content and no body opens from this header.
+            Some(rel) => {
+                let close = open + 1 + rel;
+                text[close + 1..brace].trim().is_empty().then_some(brace)
+            }
+            // The signature `(` never closed before the `{`: the `{` is in the
+            // parameter region of a malformed header — treat it as the body opener
+            // so the definition buffers to its matching `}` and stays quarantined.
+            None => Some(brace),
+        },
+        // `{` before any `(` (or no `(` at all): a body opener only if the header
+        // text before it is a valid name prefix (`func f {`); otherwise the `{`
+        // belongs to following content (`func`⏎`puts '{'`), not this header.
+        _ => {
+            let head = text[..brace]
+                .trim_start()
+                .strip_prefix("func")
+                .unwrap_or("")
+                .trim();
+            (head.is_empty() || is_ident_prefix(head)).then_some(brace)
+        }
+    }
 }
 
 /// With no body `{` seen yet, is `text` a valid *incomplete* `func` header still
@@ -1521,6 +1557,21 @@ mod tests {
         assert!(needs_more_input("func my-\n"));
         assert!(!needs_more_input("func _f\n"));
         assert!(!needs_more_input("func 1f\n"));
+    }
+
+    #[test]
+    fn needs_more_input_uses_the_signature_to_find_the_body_opener() {
+        // A `{` inside a following command (or hidden by a malformed quoted param)
+        // is not the body opener, so a completed header awaiting its body is not
+        // kept pending by such a brace.
+        assert!(!needs_more_input("func f()\nputs '{'\n"));
+        assert!(!needs_more_input("func f()\nputs '{'\nputs after\n"));
+        // A real body opener right after the signature still buffers.
+        assert!(needs_more_input("func f() {\n"));
+        assert!(needs_more_input("func f()\n{\n"));
+        // A malformed header with a brace in the parameter region still quarantines.
+        assert!(needs_more_input("func f(x {\nputs LEAK\n"));
+        assert!(needs_more_input("func f(') {\nputs LEAKED\n"));
     }
 
     #[test]
