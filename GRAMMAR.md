@@ -244,8 +244,8 @@ spelling, negative bounds count from the end, and out-of-range bounds clamp.
 
 This is deliberately a vertical slice rather than the final expression
 grammar. Lists currently contain strings only; `+=` concatenates strings,
-appends a scalar to a list, or extends a list with a list. Nesting and spread
-inside expressions remain unparsed.
+appends a scalar to a list, or extends a list with a whole list or slice.
+Nesting and general expression parsing remain ahead.
 
 ### Not yet parsed
 Nested/general list expressions, maps, `{ }` blocks, `func`, `:` modifiers, and

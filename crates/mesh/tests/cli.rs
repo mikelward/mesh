@@ -468,6 +468,16 @@ fn append_assignment_concatenates_strings_and_grows_lists() {
 }
 
 #[test]
+fn append_assignment_preserves_list_slices() {
+    let out = run_with_input(
+        "xs = [a b]\nmore = [c d e]\nxs += $more[1..]\nputs ...$xs\nxs += $more[9..]\nputs ...$xs\n",
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a b d e\na b d e\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn unspaced_append_assignment_and_type_errors_recover() {
     let out = run_with_input(
         "x=one\nx+=two\nputs $x\nxs=[a]\nxs+=b\nputs ...$xs\nx += [bad]\nmissing += value\nputs recovered\n",
