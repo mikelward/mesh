@@ -11,9 +11,12 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
 use std::process::ExitCode;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
+use reedline::{
+    Completer, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal, Span, Suggestion,
+};
 
 use crate::builtins::{self, Builtin};
 use crate::expand::{Piece, VarRef, Word};
@@ -1868,7 +1871,10 @@ fn run_interactive() -> ExitCode {
         eprintln!("mesh: could not configure interactive signals: {err}");
         return ExitCode::from(1);
     }
-    let mut editor = Reedline::create();
+    let completion = Arc::new(RwLock::new(CompletionState::default()));
+    let mut editor = Reedline::create().with_completer(Box::new(MeshCompleter {
+        state: Arc::clone(&completion),
+    }));
     let mut last: u8 = 0;
     let mut shell = Shell::new();
     let mut pending = String::new();
@@ -1877,6 +1883,8 @@ fn run_interactive() -> ExitCode {
         if pending.is_empty() {
             run_prompt_hooks(PromptEvent::PrePrompt, Vec::new(), &mut shell);
         }
+        *completion.write().expect("completion state poisoned") =
+            CompletionState::from_shell(&shell);
         let prompt = MeshPrompt {
             failed: last != 0,
             continuation: !pending.is_empty(),
@@ -1904,6 +1912,158 @@ fn run_interactive() -> ExitCode {
             }
         }
     }
+}
+
+#[derive(Default)]
+struct CompletionState {
+    commands: Vec<String>,
+    variables: Vec<(String, Value)>,
+}
+
+impl CompletionState {
+    fn from_shell(shell: &Shell) -> Self {
+        let mut commands: Vec<String> = builtins::NAMES.iter().map(|name| (*name).into()).collect();
+        commands.extend(shell.funcs.names().map(str::to_owned));
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    continue;
+                };
+                commands.extend(entries.flatten().filter_map(|entry| {
+                    use std::os::unix::fs::PermissionsExt;
+                    let metadata = entry.metadata().ok()?;
+                    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                        .then(|| entry.file_name().to_string_lossy().into_owned())
+                }));
+            }
+        }
+        commands.sort();
+        commands.dedup();
+        Self {
+            commands,
+            variables: shell
+                .vars
+                .visible()
+                .map(|(n, v)| (n.into(), v.clone()))
+                .collect(),
+        }
+    }
+}
+
+struct MeshCompleter {
+    state: Arc<RwLock<CompletionState>>,
+}
+
+impl Completer for MeshCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        let line = &line[..pos];
+        let start = line.rfind(char::is_whitespace).map_or(0, |at| at + 1);
+        let word = &line[start..];
+        let state = self.state.read().expect("completion state poisoned");
+        let values = if word.starts_with('$') {
+            variable_completions(word, &state.variables)
+        } else if command_position(&line[..start]) {
+            state
+                .commands
+                .iter()
+                .filter(|name| name.starts_with(word))
+                .cloned()
+                .collect()
+        } else {
+            path_completions(word)
+        };
+        values
+            .into_iter()
+            .map(|value| Suggestion {
+                value,
+                span: Span::new(start, pos),
+                append_whitespace: false,
+                ..Suggestion::default()
+            })
+            .collect()
+    }
+}
+
+fn command_position(before: &str) -> bool {
+    let before = before.trim_end();
+    before.is_empty() || before.ends_with([';', '|', '&', '{'])
+}
+
+fn variable_completions(word: &str, variables: &[(String, Value)]) -> Vec<String> {
+    let path = &word[1..];
+    let mut parts = path.split('.');
+    let root = parts.next().unwrap_or_default();
+    let tail: Vec<_> = parts.collect();
+    if tail.is_empty() {
+        return variables
+            .iter()
+            .filter(|(name, _)| name.starts_with(root))
+            .map(|(name, _)| format!("${name}"))
+            .collect();
+    }
+    let Some((_, root_value)) = variables.iter().find(|(name, _)| name == root) else {
+        return Vec::new();
+    };
+    let mut value = root_value;
+    for key in &tail[..tail.len() - 1] {
+        let Value::Map(entries) = value else {
+            return Vec::new();
+        };
+        let Some((_, next)) = entries.iter().find(|(name, _)| name == key) else {
+            return Vec::new();
+        };
+        value = next;
+    }
+    let prefix = tail.last().unwrap();
+    let Value::Map(entries) = value else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|(key, _)| key.starts_with(prefix))
+        .map(|(key, _)| {
+            format!(
+                "${root}.{}{}",
+                tail[..tail.len() - 1]
+                    .iter()
+                    .map(|p| format!("{p}."))
+                    .collect::<String>(),
+                key
+            )
+        })
+        .collect()
+}
+
+fn path_completions(word: &str) -> Vec<String> {
+    let path = std::path::Path::new(word);
+    let (dir, prefix) = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            (parent, name.to_string_lossy())
+        }
+        _ => (std::path::Path::new("."), std::borrow::Cow::Borrowed(word)),
+    };
+    let display_dir = if dir == std::path::Path::new(".") {
+        "".into()
+    } else {
+        format!("{}/", dir.display())
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with(prefix.as_ref()).then(|| {
+                format!(
+                    "{display_dir}{name}{}",
+                    if entry.path().is_dir() { "/" } else { "" }
+                )
+            })
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// Let the parent job-control shell stop and later foreground mesh before the
@@ -2139,12 +2299,40 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        MeshPrompt, PromptEvent, PromptHook, Shell, Step, eval_binary, expansion_word,
-        handle_signal, needs_more_input, run_line, run_prompt_hooks, run_source,
+        MeshPrompt, PromptEvent, PromptHook, Shell, Step, command_position, eval_binary,
+        expansion_word, handle_signal, needs_more_input, run_line, run_prompt_hooks, run_source,
+        variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
     use reedline::{Prompt, PromptEditMode, Signal};
+
+    #[test]
+    fn completion_recognizes_command_positions() {
+        assert!(command_position(""));
+        assert!(command_position("puts x | "));
+        assert!(command_position("false && "));
+        assert!(!command_position("puts "));
+    }
+
+    #[test]
+    fn completion_offers_variables_and_nested_map_keys() {
+        let variables = vec![
+            ("name".into(), Value::String("mesh".into())),
+            (
+                "config".into(),
+                Value::Map(vec![(
+                    "user".into(),
+                    Value::Map(vec![("name".into(), Value::String("Ada".into()))]),
+                )]),
+            ),
+        ];
+        assert_eq!(variable_completions("$na", &variables), ["$name"]);
+        assert_eq!(
+            variable_completions("$config.user.n", &variables),
+            ["$config.user.name"]
+        );
+    }
 
     #[test]
     fn custom_prompt_replaces_the_status_glyph_and_can_be_reset() {

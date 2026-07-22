@@ -53,6 +53,9 @@ the placeholder tokenizer with the first real slice of the mesh lexer.
 **Scope**
 - `reedline` line editing ✅ landed — interactive TTY input with in-memory
   history and Ctrl-C/Ctrl-D handling; the std byte reader stays for piped input.
+- Prefix completion ✅ landed — commands and builtins in command position,
+  filesystem paths in argument position, and visible variables including nested
+  map keys after `$map.`.
 - Lexer v1: quoting (`'…'`, `"…"`) and escaping, so arguments with spaces work.
 - Promote the shell internals into a `crates/mesh-core` library ✅ landed; the
   binary is a thin `main` (enables direct unit tests of the lexer).

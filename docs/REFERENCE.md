@@ -17,6 +17,21 @@ command arg1 arg2 …
 
 An unknown command prints `command not found` and sets a failing status.
 
+### Tab completion
+
+In an interactive shell, Tab completes according to the cursor's current word:
+
+| Position | Suggestions |
+| --- | --- |
+| First word, or a whitespace-separated word after `;`, `|`, `&&`, `||`, `&`, or `{` | Builtins, defined functions, and executable files found on `PATH` |
+| Command argument | Files and directories; directory suggestions have a trailing `/` |
+| A word beginning with `$` | Visible variable names |
+| After `$map.` | Keys in that map; nested map paths such as `$config.user.` are followed recursively |
+
+Suggestions use case-sensitive prefix matching. Command-specific flags and
+argument types, fuzzy matching, and case-insensitive matching are not yet
+implemented.
+
 ## Builtins
 
 | Builtin | Effect |

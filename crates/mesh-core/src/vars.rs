@@ -126,6 +126,19 @@ impl Vars {
         self.global.get(name)
     }
 
+    /// Iterate over bindings visible in the current scope, with locals taking
+    /// precedence over globals of the same name.
+    pub(crate) fn visible(&self) -> impl Iterator<Item = (&str, &Value)> {
+        let local = self.locals.last();
+        local
+            .into_iter()
+            .flat_map(|scope| scope.iter().map(|(name, value)| (name.as_str(), value)))
+            .chain(self.global.iter().filter_map(move |(name, value)| {
+                (!local.is_some_and(|scope| scope.contains_key(name)))
+                    .then_some((name.as_str(), value))
+            }))
+    }
+
     /// Append `value` according to the current string/list value rules.
     ///
     /// Append is an assignment, and assignment is **local-by-default**: inside a

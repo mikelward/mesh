@@ -20,8 +20,9 @@ cargo test --workspace # run the tests
 ```
 
 The shell launches external commands and includes prompt configuration alongside
-the `cd`, `pwd`, `puts`, and `exit` builtins. A growing slice of the language is
-in place: quoting and escapes, `~`
+the `cd`, `pwd`, `puts`, and `exit` builtins. Interactive Tab completion covers
+builtins, defined functions, commands on `PATH`, filesystem paths, variables,
+and map keys. A growing slice of the language is in place: quoting and escapes, `~`
 and filename globs, typed scalar/list/map values, arithmetic and comparisons,
 regex and glob matching with `~`, collection iteration and destructuring,
 functions, `if`/`match` expressions, and postfix value modifiers.

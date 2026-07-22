@@ -29,6 +29,42 @@ mesh: command not found: nonesuch
 
 Leave with `exit`, or press Ctrl-D on an empty line.
 
+## Completing what you type
+
+Press Tab while typing the first word of a command to complete builtins,
+functions you have defined, and executable commands on `PATH`:
+
+<pre>
+mesh$ <strong>pw&lt;Tab&gt;</strong>
+mesh$ <strong>pwd</strong>
+</pre>
+
+After the command, Tab completes files and directories in the current or named
+directory. Directory suggestions end in `/`, so you can keep completing the
+next path component:
+
+<pre>
+mesh$ <strong>puts docs/TO&lt;Tab&gt;</strong>
+mesh$ <strong>puts docs/TOUR.md</strong>
+</pre>
+
+Tab also completes variables after `$`. If the variable contains a map, it
+completes map keys after the dot, including keys in nested maps:
+
+<pre>
+mesh$ <strong>site = [host: example.com, tls: [enabled: true]]</strong>
+mesh$ <strong>puts $site.ho&lt;Tab&gt;</strong>
+mesh$ <strong>puts $site.host</strong>
+example.com
+mesh$ <strong>puts $site.tls.en&lt;Tab&gt;</strong>
+mesh$ <strong>puts $site.tls.enabled</strong>
+true
+</pre>
+
+Completion currently matches prefixes exactly and case-sensitively. Rich
+per-command flag and argument completion, fuzzy matching, and case-insensitive
+matching are later work.
+
 ## Printing with `puts`
 
 `puts` writes its arguments, separated by a single space, and a newline:
