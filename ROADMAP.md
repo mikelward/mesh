@@ -115,6 +115,11 @@ The first `for` slice iterates string lists and expanded word expressions with
 brace-delimited bodies. Map/range iteration, destructured binders, `break`, and
 `continue` remain ahead.
 
+The first postfix modifier slice has landed too: argument-free path and string
+transforms plus list collection operations parse after variable access, chain,
+and preserve typed list results. Modifier calls with arguments and the remaining
+value types are still deferred to the expression parser.
+
 **Acceptance:** the `DESIGN.md`/`docs/INTRO.md` examples run as written.
 
 ---

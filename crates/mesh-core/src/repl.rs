@@ -414,7 +414,7 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
     for (param, arg) in params.iter().zip(args) {
         shell.vars.set_value(param, arg);
     }
-    let result = match run_func_body(&body, shell) {
+    let result = match run_body(&body, true, shell) {
         Step::Return(code) => Step::Continue(code),
         other => other,
     };
@@ -430,7 +430,7 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
 /// bare `return` before any command) yields status 0 (`DESIGN.md` — "no
 /// expression to yield … status 0"), and the first line likewise sees `$?` = 0.
 /// `return` ends the body early with its status; `exit` propagates out.
-fn run_func_body(body: &str, shell: &mut Shell) -> Step {
+fn run_body(body: &str, in_function: bool, shell: &mut Shell) -> Step {
     let mut status = 0;
     let mut pending = String::new();
     for line in body.lines() {
@@ -438,7 +438,7 @@ fn run_func_body(body: &str, shell: &mut Shell) -> Step {
             // A nested header awaiting its body, invalidated by this line: flush
             // the header (its missing-body error), then reprocess the line below.
             let header = std::mem::take(&mut pending);
-            match run_line(&header, status, true, shell) {
+            match run_line(&header, status, in_function, shell) {
                 Step::Continue(code) => status = code,
                 Step::Return(code) => return Step::Return(code),
                 Step::Exit(code) => return Step::Exit(code),
@@ -450,7 +450,7 @@ fn run_func_body(body: &str, shell: &mut Shell) -> Step {
             continue;
         }
         let full = std::mem::take(&mut pending);
-        match run_line(&full, status, true, shell) {
+        match run_line(&full, status, in_function, shell) {
             Step::Continue(code) => status = code,
             Step::Return(code) => return Step::Return(code),
             Step::Exit(code) => return Step::Exit(code),
@@ -459,7 +459,7 @@ fn run_func_body(body: &str, shell: &mut Shell) -> Step {
     // A truncated nested definition still buffered at the end of the body: run it
     // so its "missing }" error is reported rather than silently swallowed.
     if !pending.trim().is_empty() {
-        return run_line(&pending, status, true, shell);
+        return run_line(&pending, status, in_function, shell);
     }
     Step::Continue(status)
 }
@@ -497,6 +497,9 @@ fn needs_more_compound_input(text: &str) -> bool {
             Err(msg) => msg.contains("missing body") || msg.contains("missing closing"),
         }
     } else if is_for_start(text) {
+        if validate_for_header(text).is_err() {
+            return false;
+        }
         match parse_for(text) {
             Ok(_) => false,
             Err(msg) => msg.contains("missing body") || msg.contains("missing closing"),
@@ -512,6 +515,7 @@ fn parse_for(text: &str) -> Result<(&str, &str, &str), String> {
         .strip_prefix("for")
         .ok_or("for: expected `for`")?
         .trim_start();
+    validate_for_header(text)?;
     let open = first_bare_open(rest).ok_or("for: missing body `{ ... }`")?;
     let header = rest[..open].trim();
     let mut parts = header.splitn(2, char::is_whitespace);
@@ -534,6 +538,31 @@ fn parse_for(text: &str) -> Result<(&str, &str, &str), String> {
         return Err("for: unexpected text after the closing `}`".into());
     }
     Ok((name, source, body))
+}
+
+/// Reject header fragments that no later body opener can make valid. Missing
+/// pieces remain repairable so a body may still begin on a following line.
+fn validate_for_header(text: &str) -> Result<(), String> {
+    let rest = text
+        .trim()
+        .strip_prefix("for")
+        .ok_or("for: expected `for`")?
+        .trim_start();
+    let header = first_bare_open(rest).map_or(rest, |open| &rest[..open]);
+    let mut parts = header.split_whitespace();
+    let Some(name) = parts.next() else {
+        return Ok(());
+    };
+    if !lexer::is_ident(name) {
+        return Err(format!("for: `{name}` is not a valid binding name"));
+    }
+    let Some(keyword) = parts.next() else {
+        return Ok(());
+    };
+    if keyword != "in" {
+        return Err("for: expected `in` after the binding name".into());
+    }
+    Ok(())
 }
 
 fn run_for(text: &str, in_function: bool, shell: &mut Shell) -> Step {
@@ -559,14 +588,16 @@ fn run_for(text: &str, in_function: bool, shell: &mut Shell) -> Step {
         eprintln!("mesh: for: iterable must be one expression");
         return Step::Continue(2);
     }
-    let values = match expand::expand_values(
-        segment.stages[0]
-            .words
-            .iter()
-            .map(|word| Word(word.0.iter().map(clone_piece).collect()))
-            .collect(),
-        &shell.vars,
-    ) {
+    let words: Vec<Word> = segment.stages[0]
+        .words
+        .iter()
+        .map(|word| Word(word.0.iter().map(clone_piece).collect()))
+        .collect();
+    let expanded = match list_literal(&words) {
+        Some(items) => expand::expand(items, &shell.vars).map(|items| vec![Value::List(items)]),
+        None => expand::expand_values(words, &shell.vars),
+    };
+    let values = match expanded {
         Ok(values) => values,
         Err(err) => {
             eprintln!("mesh: {err}");
@@ -580,7 +611,7 @@ fn run_for(text: &str, in_function: bool, shell: &mut Shell) -> Step {
     let mut status = 0;
     for item in items {
         shell.vars.set(name, item);
-        match run_func_body(body, shell) {
+        match run_body(body, in_function, shell) {
             Step::Continue(code) => status = code,
             Step::Return(code) if in_function => return Step::Return(code),
             Step::Return(_) => {
@@ -666,12 +697,12 @@ fn run_if(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
         return condition_step;
     }
     if take_then {
-        run_func_body(then_body, shell)
+        run_body(then_body, in_function, shell)
     } else if let Some(body) = else_body {
         if is_if_start(body) {
             run_if(body, last, in_function, shell)
         } else {
-            run_func_body(body, shell)
+            run_body(body, in_function, shell)
         }
     } else {
         Step::Continue(0)
@@ -690,12 +721,12 @@ fn eval_if_value(
         return Ok((Value::String(String::new()), step));
     }
     if take_then {
-        eval_block_value(then_body, shell)
+        eval_block_value(then_body, in_function, shell)
     } else if let Some(body) = else_body {
         if is_if_start(body) {
             eval_if_value(body, last, in_function, shell)
         } else {
-            eval_block_value(body, shell)
+            eval_block_value(body, in_function, shell)
         }
     } else {
         Ok((Value::String(String::new()), Step::Continue(0)))
@@ -703,25 +734,29 @@ fn eval_if_value(
 }
 
 /// Evaluate the final physical line as a value; preceding lines run for effect.
-fn eval_block_value(body: &str, shell: &mut Shell) -> Result<(Value, Step), String> {
+fn eval_block_value(
+    body: &str,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<(Value, Step), String> {
     let body = body.trim();
     if body.is_empty() {
         return Ok((Value::String(String::new()), Step::Continue(0)));
     }
     if is_if_start(body) {
-        return eval_if_value(body, 0, true, shell);
+        return eval_if_value(body, 0, in_function, shell);
     }
     let (prefix, expression) = body.rsplit_once('\n').unwrap_or(("", body));
     let step = if prefix.trim().is_empty() {
         Step::Continue(0)
     } else {
-        run_func_body(prefix, shell)
+        run_body(prefix, in_function, shell)
     };
     if !matches!(step, Step::Continue(_)) {
         return Ok((Value::String(String::new()), step));
     }
     if is_if_start(expression.trim()) {
-        return eval_if_value(expression.trim(), 0, true, shell);
+        return eval_if_value(expression.trim(), 0, in_function, shell);
     }
     let words = lexer::split_line(expression).map_err(|e| e.to_string())?;
     let [segment] = words.as_slice() else {
@@ -1009,6 +1044,7 @@ fn clone_piece(piece: &Piece) -> Piece {
             name: v.name.clone(),
             member: v.member.clone(),
             access: v.access.clone(),
+            modifiers: v.modifiers.clone(),
             quoted: v.quoted,
         }),
     }
@@ -1050,6 +1086,9 @@ fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
 /// Preserve list values in an exact variable-to-variable assignment. Command
 /// expansion still requires `...`; assignment is a value context instead.
 fn assignment_value(vref: &crate::lexer::VarRef, vars: &Vars) -> Result<Value, String> {
+    if !vref.modifiers.is_empty() {
+        return expand::resolve_value(vref, vars).map_err(|error| error.to_string());
+    }
     let value = vars
         .get(&vref.name)
         .ok_or_else(|| format!("{}: unbound variable", vref.name))?;

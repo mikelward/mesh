@@ -11,7 +11,7 @@
 
 use std::env;
 
-use crate::lexer::{Access, Piece, VarRef, Word};
+use crate::lexer::{Access, Modifier, Piece, VarRef, Word};
 use crate::vars::{Value, Vars};
 
 /// An expansion error — an unbound read fails loud (no null), per `DESIGN.md`.
@@ -23,6 +23,7 @@ pub enum ExpandError {
     ListNeedsSpread(String),
     NotAList(String),
     IndexOutOfRange { name: String, index: i64 },
+    Modifier { name: String, message: String },
 }
 
 impl std::fmt::Display for ExpandError {
@@ -38,6 +39,7 @@ impl std::fmt::Display for ExpandError {
             ExpandError::IndexOutOfRange { name, index } => {
                 write!(f, "${name}[{index}]: list index out of range")
             }
+            ExpandError::Modifier { name, message } => write!(f, ":{name}: {message}"),
         }
     }
 }
@@ -83,6 +85,15 @@ pub fn expand_values(words: Vec<Word>, vars: &Vars) -> Result<Vec<Value>, Expand
 /// Spreading a single element (`...$xs[0]`), a string, or an unbound name is an
 /// error, matching the command-position spread rules.
 fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError> {
+    if !vref.modifiers.is_empty() {
+        return match resolve_value(vref, vars)? {
+            Value::List(values) => Ok(values),
+            Value::String(_) => Err(ExpandError::Unsupported(format!(
+                "...${}: modifier result is not a list",
+                vref.name
+            ))),
+        };
+    }
     match vars.get(&vref.name) {
         Some(Value::List(values)) => match &vref.access {
             None => Ok(values.clone()),
@@ -114,6 +125,12 @@ fn whole_list_value(word: &Word, vars: &Vars) -> Option<Vec<String>> {
     };
     if vref.member.is_some() || vref.quoted {
         return None;
+    }
+    if !vref.modifiers.is_empty() {
+        return match resolve_value(vref, vars) {
+            Ok(Value::List(values)) => Some(values),
+            _ => None,
+        };
     }
     match (vars.get(&vref.name), &vref.access) {
         (Some(Value::List(values)), None) => Some(values.clone()),
@@ -232,9 +249,17 @@ fn glob_pattern(pieces: &Pieces) -> String {
 /// `$name` reads the variable store (unbound is an error). Member access on any
 /// namespace other than `env`, and a bare `$env`, are not supported yet.
 fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
-    match (vref.name.as_str(), &vref.member, &vref.access) {
+    match resolve_value(vref, vars)? {
+        Value::String(value) => Ok(value),
+        Value::List(_) => Err(ExpandError::ListNeedsSpread(vref.name.clone())),
+    }
+}
+
+pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandError> {
+    let mut value = match (vref.name.as_str(), &vref.member, &vref.access) {
         ("env", Some(key), None) => env::var_os(key)
             .map(|v| v.to_string_lossy().into_owned())
+            .map(Value::String)
             .ok_or_else(|| ExpandError::UnsetEnv(key.clone())),
         ("env", None, None) => Err(ExpandError::Unsupported("$env".to_string())),
         (name, None, Some(Access::Index(index))) => vars
@@ -252,6 +277,7 @@ fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
                         .ok()
                         .and_then(|offset| values.get(offset))
                         .cloned()
+                        .map(Value::String)
                         .ok_or_else(|| ExpandError::IndexOutOfRange {
                             name: name.to_string(),
                             index: *index,
@@ -263,21 +289,167 @@ fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
             .ok_or_else(|| ExpandError::UnboundVar(name.to_string()))
             .and_then(|value| match value {
                 Value::String(_) => Err(ExpandError::NotAList(name.to_string())),
-                Value::List(_) => Err(ExpandError::ListNeedsSpread(name.to_string())),
+                Value::List(values) => Ok(Value::List(
+                    slice(
+                        values,
+                        match vref.access {
+                            Some(Access::Slice { start, .. }) => start,
+                            _ => None,
+                        },
+                        match vref.access {
+                            Some(Access::Slice { end, .. }) => end,
+                            _ => None,
+                        },
+                        matches!(
+                            vref.access,
+                            Some(Access::Slice {
+                                inclusive: true,
+                                ..
+                            })
+                        ),
+                    )
+                    .to_vec(),
+                )),
             }),
         (name, None, None) => vars
             .get(name)
             .ok_or_else(|| ExpandError::UnboundVar(name.to_string()))
-            .and_then(|value| match value {
-                Value::String(value) => Ok(value.clone()),
-                Value::List(_) => Err(ExpandError::ListNeedsSpread(name.to_string())),
-            }),
+            .cloned(),
         (name, Some(member), None) => Err(ExpandError::Unsupported(format!("${name}.{member}"))),
         (name, member, Some(access)) => Err(ExpandError::Unsupported(format!(
             "${name}{}[{access:?}]",
             member.as_ref().map(|m| format!(".{m}")).unwrap_or_default()
         ))),
+    }?;
+    for modifier in &vref.modifiers {
+        value = apply_modifier(value, *modifier)?;
     }
+    Ok(value)
+}
+
+fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, ExpandError> {
+    use Modifier::{Dedup, First, Init, Last, Len, Rest};
+    let name = modifier_name(modifier);
+    match modifier {
+        Len => match value {
+            Value::String(value) => Ok(Value::String(value.chars().count().to_string())),
+            Value::List(values) => Ok(Value::String(values.len().to_string())),
+        },
+        First | Last => match value {
+            Value::List(values) => values
+                .first()
+                .filter(|_| modifier == First)
+                .or_else(|| values.last().filter(|_| modifier == Last))
+                .cloned()
+                .map(Value::String)
+                .ok_or_else(|| ExpandError::Modifier {
+                    name: name.into(),
+                    message: "empty list has no element".into(),
+                }),
+            Value::String(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a list".into(),
+            }),
+        },
+        Rest | Init => match value {
+            Value::List(values) => {
+                let range = if modifier == Rest {
+                    1.min(values.len())..values.len()
+                } else {
+                    0..values.len().saturating_sub(1)
+                };
+                Ok(Value::List(values[range].to_vec()))
+            }
+            Value::String(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a list".into(),
+            }),
+        },
+        Dedup => match value {
+            Value::List(values) => {
+                let mut seen = std::collections::HashSet::new();
+                Ok(Value::List(
+                    values
+                        .into_iter()
+                        .filter(|v| seen.insert(v.clone()))
+                        .collect(),
+                ))
+            }
+            Value::String(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a list".into(),
+            }),
+        },
+        _ => match value {
+            Value::String(value) => Ok(Value::String(modify_string(value, modifier))),
+            Value::List(values) => Ok(Value::List(
+                values
+                    .into_iter()
+                    .map(|v| modify_string(v, modifier))
+                    .collect(),
+            )),
+        },
+    }
+}
+
+fn modifier_name(modifier: Modifier) -> &'static str {
+    match modifier {
+        Modifier::Dir => "dir",
+        Modifier::Base => "base",
+        Modifier::Ext => "ext",
+        Modifier::Exts => "exts",
+        Modifier::Stem => "stem",
+        Modifier::Bare => "bare",
+        Modifier::Len => "len",
+        Modifier::First => "first",
+        Modifier::Last => "last",
+        Modifier::Rest => "rest",
+        Modifier::Init => "init",
+        Modifier::Dedup => "dedup",
+        Modifier::Upper => "upper",
+        Modifier::Lower => "lower",
+    }
+}
+
+fn modify_string(value: String, modifier: Modifier) -> String {
+    use std::path::Path;
+    let path = Path::new(&value);
+    match modifier {
+        Modifier::Dir => path
+            .parent()
+            .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
+        Modifier::Base => path
+            .file_name()
+            .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
+        Modifier::Ext => path
+            .extension()
+            .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
+        Modifier::Stem => path
+            .file_stem()
+            .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
+        Modifier::Exts => extensions(path.file_name().and_then(|p| p.to_str())).to_string(),
+        Modifier::Bare => bare_name(path.file_name().and_then(|p| p.to_str())).to_string(),
+        Modifier::Upper => value.to_uppercase(),
+        Modifier::Lower => value.to_lowercase(),
+        _ => unreachable!("collection modifier handled separately"),
+    }
+}
+
+fn extensions(name: Option<&str>) -> &str {
+    let Some(name) = name else { return "" };
+    if name.starts_with('.') {
+        return "";
+    }
+    name.split_once('.')
+        .map_or("", |(_, extensions)| extensions)
+}
+
+fn bare_name(name: Option<&str>) -> &str {
+    let Some(name) = name else { return "" };
+    if name.starts_with('.') {
+        return name;
+    }
+    name.split_once('.').map_or(name, |(bare, _)| bare)
 }
 
 pub(crate) fn slice<T>(
