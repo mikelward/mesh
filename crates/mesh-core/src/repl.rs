@@ -1791,6 +1791,8 @@ mod tests {
         ] {
             assert!(!needs_more_input(input), "expected complete: {input:?}");
         }
+        assert!(!needs_more_input("cd /"));
+        assert!(!needs_more_input("puts *"));
         assert!(!needs_more_input("puts value |"));
         assert!(!needs_more_input("puts 'unterminated"));
     }
