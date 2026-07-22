@@ -9,6 +9,44 @@ full design are noted inline and are open to revision.
 Notation is EBNF-ish: `*` = zero or more, `?` = optional, `|` = alternative,
 `"x"` = literal.
 
+## Complexity audit
+
+The implemented grammar is still small, but a few rules make the lexer more
+context-sensitive than the notation above suggests. Before adding general
+expressions, the following simplifications would reduce special cases and make
+future parsing errors more predictable:
+
+1. **Make empty command positions errors.** Empty segments are currently no-ops
+   around `;`, `&&`, and `||`, while an empty pipeline stage or background
+   command is an error. Rejecting leading, repeated, and trailing separators
+   (except a single trailing `;`, if desired) would give every operator the same
+   "two operands" shape and remove status-preservation edge cases. In
+   particular, `a &&` and `a ||` should be syntax errors rather than commands
+   whose missing right-hand side is silently skipped.
+2. **Give raw strings an unambiguous token spelling.** The `r'…'` / `r"…"`
+   prefix is recognized only at a word boundary or after a bare `=` so that the
+   `r` in `ptr'x'` remains ordinary text. That makes tokenization depend on the
+   preceding piece. A delimiter that cannot be part of a bare word, or limiting
+   raw strings to whole words and assignment values, would eliminate this
+   look-behind rule. Until that decision is made, new raw-string recognition
+   contexts should not be added ad hoc.
+3. **Tokenize first, validate structure second.** `split_line` currently finds
+   words, separators, pipes, redirections, and unsupported descriptor redirects
+   in one pass. Descriptor detection consequently needs to inspect both built
+   pieces and the original character stream. A small token stream (`Word`,
+   `Separator`, `Pipe`, `Redirect`, `Background`) followed by a structural
+   parser would centralize longest-match rules and make later operators easier
+   to add without changing quote handling.
+4. **Keep access syntax in one parser.** Braced and unbraced interpolation share
+   names, member access, indices, and slices, but differ in how malformed access
+   is reported. General expressions should reuse one variable-reference parser
+   with an explicit strict/lenient terminator policy rather than adding another
+   copy for each context.
+
+The highest-value behavior change is item 1 because it removes surprising
+accepted input. Items 2–4 are implementation constraints to settle before the
+expression grammar grows; they do not require changing today’s valid programs.
+
 ## Task 1 — external commands + `exit`
 
 ```
