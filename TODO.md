@@ -108,6 +108,10 @@ file as tasks land.
 
 ## Decisions needed
 
+- [ ] **Double-quoted interpolation of structured values.** Decide how lists,
+      maps, and other non-scalar values interpolate inside `"…"`: whether they
+      remain a loud error, use a canonical rendering, or require an explicit
+      conversion such as `:join` or serialization.
 - [ ] **Regex literal + absolute-path rule** *(direction chosen — see the block in
       [`DESIGN.md`](DESIGN.md) "Quoting and escaping")*. **Keep `/…/`** as the regex
       literal; in a match slot a leading-slash word is a regex only when it is a clean
