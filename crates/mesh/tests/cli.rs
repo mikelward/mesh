@@ -715,6 +715,10 @@ fn spawn_failure_harness() -> i32 {
             libc::_exit(127);
         }
     }
+    // Set the group from both sides of fork so tcsetpgrp cannot race the child.
+    if unsafe { libc::setpgid(mesh, mesh) } < 0 && unsafe { libc::getpgid(mesh) } != mesh {
+        return 39;
+    }
     unsafe { libc::close(slave) };
     if unsafe { libc::tcsetpgrp(master, mesh) } < 0 || !pty_wait_for_prompt(master) {
         return 32;
@@ -796,6 +800,10 @@ fn sigcont_harness() -> i32 {
             );
             libc::_exit(127);
         }
+    }
+    // Set the group from both sides of fork so tcsetpgrp cannot race the child.
+    if unsafe { libc::setpgid(mesh, mesh) } < 0 && unsafe { libc::getpgid(mesh) } != mesh {
+        return 28;
     }
     unsafe { libc::close(slave) };
     if unsafe { libc::tcsetpgrp(master, mesh) } < 0 || !pty_wait_for_prompt(master) {
