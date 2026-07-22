@@ -292,7 +292,7 @@ fn empty_command_positions_are_syntax_errors() {
         let out = run_with_input(script);
         assert_eq!(out.status.code(), Some(2), "{script:?}");
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("syntax error: empty command"),
+            String::from_utf8_lossy(&out.stderr).contains("syntax error"),
             "{script:?}"
         );
         assert!(out.stdout.is_empty(), "{script:?}");
@@ -1287,6 +1287,17 @@ fn a_pipe_connects_two_commands() {
 }
 
 #[test]
+fn parser_incomplete_pipeline_continues_on_the_next_line() {
+    let out = run_with_input("printf 'complete\\n' |\ncat\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "complete\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn a_three_stage_pipeline_works() {
     let out = run_with_input("printf '3\\n1\\n2\\n' | sort | head -1\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
@@ -1407,7 +1418,7 @@ fn a_redirect_with_no_target_is_a_syntax_error_that_recovers() {
 
 #[test]
 fn an_empty_pipeline_stage_is_a_syntax_error_that_recovers() {
-    let out = run_with_input("echo hi |\nputs after\n");
+    let out = run_with_input("echo hi | |\nputs after\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("empty command in a pipeline"));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 }

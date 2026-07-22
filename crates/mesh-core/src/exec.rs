@@ -11,7 +11,12 @@ use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, Stdio};
 
-use crate::lexer::RedirKind;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirKind {
+    In,
+    Out,
+    Append,
+}
 
 /// A pipeline stage: an expanded argv and its redirections (in source order;
 /// for a given direction the last one wins, as in POSIX shells).

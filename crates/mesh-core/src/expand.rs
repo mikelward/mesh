@@ -11,7 +11,74 @@
 
 use std::env;
 
-use crate::lexer::{Access, Modifier, Piece, VarRef, Word};
+/// An exact list index or a clamped range slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Access {
+    Index(i64),
+    Slice {
+        start: Option<i64>,
+        end: Option<i64>,
+        inclusive: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modifier {
+    Dir,
+    Base,
+    Ext,
+    Exts,
+    Stem,
+    Bare,
+    Len,
+    First,
+    Last,
+    Rest,
+    Init,
+    Dedup,
+    Upper,
+    Lower,
+}
+
+impl Modifier {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "dir" => Self::Dir,
+            "base" => Self::Base,
+            "ext" => Self::Ext,
+            "exts" => Self::Exts,
+            "stem" => Self::Stem,
+            "bare" => Self::Bare,
+            "len" => Self::Len,
+            "first" => Self::First,
+            "last" => Self::Last,
+            "rest" => Self::Rest,
+            "init" => Self::Init,
+            "dedup" => Self::Dedup,
+            "upper" => Self::Upper,
+            "lower" => Self::Lower,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VarRef {
+    pub name: String,
+    pub member: Option<String>,
+    pub access: Option<Access>,
+    pub modifiers: Vec<Modifier>,
+    pub quoted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Piece {
+    Text { text: String, expandable: bool },
+    Var(VarRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Word(pub Vec<Piece>);
 use crate::vars::{Value, Vars};
 
 /// An expansion error — an unbound read fails loud (no null), per `DESIGN.md`.
