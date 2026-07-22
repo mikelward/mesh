@@ -104,6 +104,26 @@ A malformed `${…}` (no closing `}`, or an invalid name inside) is a syntax err
 A `$` not followed by a name (`$5`) is a literal `$`; a literal `$` in a string
 is `\$`.
 
+## Conditionals
+
+```
+if command { body }
+if command { body } else { body }
+if command { body } else if command { body }
+name = if command { value } else { value }
+```
+
+An `if` runs its condition as a command. Status `0` selects the first body; a
+nonzero status selects `else`, if present. Only the selected body runs. Bodies
+may span lines, and `return` or `exit` in a selected body keeps its normal
+control-flow effect.
+
+In assignment position, the selected body's final physical line supplies the
+value. The current value forms are one string, a string-list literal, a whole
+variable value, or a nested `if`; earlier lines in that body run for effect. A
+false conditional with no `else` yields `""`. General boolean/comparison
+expressions and conditional destructuring are not implemented yet.
+
 ## Functions
 
 ```
@@ -147,6 +167,7 @@ background), and calling for a value (`f(arg)`) as opposed to running it.
 
 ## Not yet implemented
 
-Map values, `:` modifiers, regex literals, and heredocs. Function flags/optional/
-rest parameters and functions in pipelines are also still ahead. See
+Map values, general boolean/comparison expressions, conditional destructuring,
+`for`, `match`, `:` modifiers, regex literals, and heredocs. Function
+flags/optional/rest parameters and functions in pipelines are also still ahead. See
 [`ROADMAP.md`](../ROADMAP.md).

@@ -145,6 +145,49 @@ fn and_or_short_circuit_on_status() {
 }
 
 #[test]
+fn if_runs_the_branch_selected_by_command_status() {
+    let out = run_with_input(
+        "if true {\n  puts then\n} else {\n  puts wrong\n}\n\
+         if false { puts wrong } else { puts else }\n",
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "then\nelse\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn if_chains_else_if_and_propagates_control_flow() {
+    let out = run_with_input(
+        "if false { puts wrong } else if true { puts nested }\n\
+         func choose() {\n\
+           if true { return 7 }\n\
+           puts wrong\n\
+         }\n\
+         choose\n",
+    );
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nested\n");
+}
+
+#[test]
+fn if_expression_assigns_the_selected_typed_value() {
+    let out = run_with_input(
+        "word = if true { \"chosen value\" } else { wrong }\n\
+         items = if false { [wrong] } else { [one \"two three\"] }\n\
+         missing = if false { wrong }\n\
+         puts $word\n\
+         puts ...$items\n\
+         puts \"<$missing>\"\n",
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "chosen value\none two three\n<>\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn empty_command_positions_are_syntax_errors() {
     for script in [
         "; puts no\n",

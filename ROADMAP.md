@@ -105,6 +105,12 @@ explicit-spread/no-word-splitting rule. Nested values, slicing, and general
 expression parsing remain ahead. List-valued assignment also preserves a whole
 list or slice instead of coercing it to command words.
 
+Named functions and the first conditional slice have also landed. `if` executes
+brace-delimited branches from command status, supports `else if`, and can yield a
+string or string-list value in assignment position (with `""` for a missing
+`else`). General boolean/comparison expressions and conditional destructuring
+remain tied to the general expression parser.
+
 **Acceptance:** the `DESIGN.md`/`docs/INTRO.md` examples run as written.
 
 ---
