@@ -1669,3 +1669,30 @@ fn append_in_a_function_does_not_leak_to_the_global() {
         "beforeafter\nbefore\n"
     );
 }
+
+#[test]
+fn an_escaped_newline_before_a_raw_string_still_closes_the_body() {
+    // A `\`-newline inside a body is a line boundary, so the raw string on the
+    // next line is raw and the body's closing `}` is still found — the definition
+    // is accepted and later top-level commands are not swallowed.
+    let out = run_with_input("func f() { true \\\nr'\\' }\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("missing closing"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn trailing_text_after_a_body_close_is_reported_not_swallowed() {
+    // `func f() {} {` closes the body at the first `}`; the trailing `{` is a
+    // parse error, and the following command still runs (not buffered away).
+    let out = run_with_input("func f() {} {\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected text after the closing"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
