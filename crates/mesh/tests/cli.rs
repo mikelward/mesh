@@ -436,6 +436,14 @@ fn empty_list_spreads_to_no_arguments() {
 }
 
 #[test]
+fn list_literal_preserves_quoted_empty_elements() {
+    let out = run_with_input(
+        "xs = [\"\" a]\nprintf '<%s>\\n' ...$xs\nxs = [\"\"]\nprintf '<%s>\\n' ...$xs\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "<>\n<a>\n<>\n");
+}
+
+#[test]
 fn list_requires_explicit_spread_in_command_arguments() {
     let out = run_with_input("xs = [a b]\nputs $xs\nputs recovered\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("list value needs `...`"));
