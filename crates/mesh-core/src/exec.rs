@@ -342,9 +342,12 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable) -> u8 {
     // pipefail: the last stage to fail wins. A SIGPIPE is ignored only for a
     // stage whose stdout fed a pipe (a downstream stage could have closed it).
     let result = wait_outcomes(&mut outcomes);
-    if foreground.is_some() {
+    if interactive {
         // getpgrp, rather than getpid, also handles a mesh process launched in
-        // a process group established by its parent shell.
+        // a process group established by its parent shell. Reclaim even when
+        // spawn failed: the child pre-exec hook may already have handed the
+        // terminal to its short-lived process group before exec reported the
+        // failure to the parent.
         // SAFETY: getpgrp takes no arguments and cannot fail.
         let shell_group = unsafe { libc::getpgrp() };
         set_foreground_group(shell_group);
@@ -584,7 +587,7 @@ fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobTable, restore_job_signals, restore_terminal_modes, terminal_modes};
+    use super::{JobTable, restore_job_signals, restore_terminal_modes, run, terminal_modes};
 
     #[test]
     fn job_builtins_fail_cleanly_with_an_empty_table() {
@@ -592,6 +595,56 @@ mod tests {
         assert_eq!(jobs.foreground(&[]), 1);
         assert_eq!(jobs.background(&[]), 1);
         assert_eq!(jobs.list(&[]), 0);
+    }
+
+    #[test]
+    fn spawn_failure_reclaims_the_terminal() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid != 0 {
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            return;
+        }
+
+        let mut master = -1;
+        let mut slave = -1;
+        #[cfg(target_os = "macos")]
+        let tiocsctty = libc::c_ulong::from(libc::TIOCSCTTY);
+        #[cfg(not(target_os = "macos"))]
+        let tiocsctty = libc::TIOCSCTTY;
+        if unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        } != 0
+            || unsafe { libc::setsid() } < 0
+            || unsafe { libc::ioctl(slave, tiocsctty, 0) } < 0
+            || unsafe { libc::dup2(slave, libc::STDIN_FILENO) } < 0
+        {
+            unsafe { libc::_exit(1) };
+        }
+        let shell_group = unsafe { libc::getpgrp() };
+        if unsafe { libc::tcsetpgrp(slave, shell_group) } < 0 {
+            unsafe { libc::_exit(2) };
+        }
+
+        let mut jobs = JobTable::new();
+        let status = run(&["mesh_command_that_does_not_exist_42".into()], &mut jobs);
+        let foreground = unsafe { libc::tcgetpgrp(slave) };
+        unsafe {
+            libc::_exit(if status == 127 && foreground == shell_group {
+                0
+            } else {
+                3
+            });
+        }
     }
 
     #[test]
