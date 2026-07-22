@@ -272,9 +272,57 @@ grammar. Lists currently contain strings only; `+=` concatenates strings,
 appends a scalar to a list, or extends a list with a whole list or slice.
 Nesting and general expression parsing remain ahead.
 
+## Task 9 — functions (`func`)
+
+A `func` definition binds a named callable. v1 covers **required named
+positionals** only:
+
+```
+func-def = "func" ws name ws? "(" params? ")" ws? "{" body "}"
+params   = param ((ws | ",") param)*        # names, comma- and/or space-separated
+param    = name                             # required positional only, for now
+call     = name (ws word)*                  # a defined name in command position
+return   = "return" (ws signed-integer)?    # early exit, inside a body only
+```
+
+- **Definition.** `func greet(name) { … }` — parameters are named, referenced as
+  `$name` in the body (never `$1`). Bodies may span **multiple input lines**: the
+  reader buffers input until the body's `{ … }` braces balance (a brace inside a
+  quote/`r'…'`/escape or a `${…}` interpolation does not count), then defines the
+  function. A single-line `func f(x) { … }` and a nested multi-line definition
+  inside a body are buffered the same way. A definition is a **standalone
+  statement**: it does not yet compose with `;` / `&&` / `||` / `|` (text after
+  the closing `}` is an error).
+- **Signature.** Parameters are required named positionals, separated by commas
+  and/or whitespace; a comma must sit between two names (a leading, trailing, or
+  doubled comma is an error). Names must be distinct and cannot be the reserved
+  `env`. The deferred forms — optional/default (`x = v`), flags (`--flag`), and
+  rest (`...xs`) — are rejected with a clear "not supported yet" message.
+- **Name.** A function name cannot be a reserved word (`func` / `return`) or a
+  builtin (`cd` / `pwd` / `puts` / `exit` / `jobs` / `fg` / `bg`), since those
+  resolve first and the definition could never be reached.
+- **Call.** A defined name in command position runs the function. Resolution is
+  **builtins → functions → external**; the argument count must match the
+  positionals (an arity mismatch is a loud, recoverable error). Arguments bind
+  left to right.
+- **Scope.** Each call runs in a fresh **function-local** scope: `x = 5` in a
+  body binds a local (gone on return). Reads resolve the innermost local scope,
+  then the global scope only — a callee never sees its caller's locals (lexical,
+  not dynamic).
+- **`return`.** `return N` sets the status (masked to 0–255, like `exit`); a bare
+  `return` uses the status so far. Either stops the rest of the body. A function's
+  result is its last command's status, or **0** for an empty body or a bare
+  `return` before anything ran (`DESIGN.md`). At top level `return` is a
+  recoverable error that does **not** abort a `;` sequence.
+- **Deferred:** a function in a multi-stage pipeline or with a redirection (or in
+  the background) is rejected (needs the fork-based executor); flags/optionals/
+  rest parameters; `func` composing with separators; and calling for a value
+  (`f(arg)`) vs. running (`f arg`) — only the run form exists today.
+
 ### Not yet parsed
-Nested/general list expressions, maps, `{ }` blocks, `func`, `:` modifiers, and
-heredocs. Each arrives with the task that needs it, and this file grows to match.
+Nested/general list expressions, maps, bare `{ }` blocks, `if` / `for` / `match`,
+`:` modifiers, and heredocs. Each arrives with the task that needs it, and this
+file grows to match.
 
 **Design target (still ahead of the lexer above).** The **Model B strings**
 direction from `DESIGN.md` is now implemented (see task 5 above). What the lexer

@@ -104,7 +104,46 @@ A malformed `${…}` (no closing `}`, or an invalid name inside) is a syntax err
 A `$` not followed by a name (`$5`) is a literal `$`; a literal `$` in a string
 is `\$`.
 
+## Functions
+
+```
+func name(params) { body }    # define a named function
+name arg ...                  # call it; args bind to the positionals
+return [ N ]                  # exit the body early (inside a function only)
+```
+
+Define a callable with `func`. Parameters are **named** — reference them as
+`$name` in the body, never `$1`:
+
+```
+func greet(name) {
+  puts "hi, $name"
+}
+greet world          # -> hi, world
+```
+
+- **Signature.** v1 accepts **required named positionals** only, separated by
+  commas and/or spaces (`func pair(a, b)` or `func pair(a b)`). Names must be
+  distinct and cannot be `env`. Optional/default (`x = v`), flags (`--flag`), and
+  rest (`...xs`) parameters are not supported yet.
+- **Body.** May span multiple lines; the shell keeps reading until the `{ … }`
+  braces balance. Interactively, the continuation prompt is `...`.
+- **Scope.** Each call gets a fresh **function-local** scope: `x = 5` in a body
+  binds a local that is gone on return. Reads see the innermost local scope, then
+  the global scope — a function never sees its caller's locals.
+- **Resolution.** A name in command position resolves as **builtin → function →
+  external**. The argument count must match the parameters (a mismatch is a loud,
+  recoverable error).
+- **Result.** A function's status is its last command's status, or `0` for an
+  empty body. `return N` exits early with status `N` (masked to 0–255, like
+  `exit`); a bare `return` uses the status so far. Both stop the rest of the body.
+  At top level `return` is a recoverable error.
+
+Not yet supported: a function in a pipeline or with a redirection (or in the
+background), and calling for a value (`f(arg)`) as opposed to running it.
+
 ## Not yet implemented
 
-Map values, `:` modifiers, regex literals, functions, and heredocs. See
+Map values, `:` modifiers, regex literals, and heredocs. Function flags/optional/
+rest parameters and functions in pipelines are also still ahead. See
 [`ROADMAP.md`](../ROADMAP.md).

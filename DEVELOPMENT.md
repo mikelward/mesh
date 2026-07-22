@@ -144,7 +144,8 @@ mesh/
 │   │       ├── repl.rs     # read / tokenize / dispatch loop
 │   │       ├── lexer.rs    # quotes + escapes + $interpolation → words of pieces
 │   │       ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
-│   │       ├── vars.rs     # session-global variable store
+│   │       ├── vars.rs     # variable store: global scope + function-local scopes
+│   │       ├── funcs.rs    # user-defined function store (name → params + body)
 │   │       ├── builtins.rs # cd, pwd, puts, exit + job-builtin recognition
 │   │       └── exec.rs     # launch external commands + pipelines/redirection
 │   └── mesh-platform/      # libc constants/types that differ across platforms
@@ -167,9 +168,14 @@ run the segments left to right, each connector deciding from the previous status
 whether its command runs → per command, classify as an assignment or a command →
 for a command, `expand::expand` (resolve `$` interpolation against `vars`, then
 tilde/globs) → job-table dispatch (`jobs`/`fg`/`bg`) or `builtins::dispatch`
-(`cd`/`pwd`/`puts`/`exit`) → else `exec::run` launches the external command. A
-session-global `vars` store persists across lines; the loop tracks the last exit
-status and returns it as the process exit code at EOF.
+(`cd`/`pwd`/`puts`/`exit`) → a user function from the `funcs` store → else
+`exec::run` launches the external command. A `func name(params) { … }` definition
+is recognized from raw text before `split_line` (its body spans lines the per-line
+lexer would flatten); the reader buffers input until the body braces balance. A
+function call runs the body in a fresh function-local `vars` scope. A session
+`vars` store (global scope plus a stack of function-local scopes) and the `funcs`
+store persist across lines; the loop tracks the last exit status and returns it as
+the process exit code at EOF.
 
 The shell internals live in the `crates/mesh-core` library; `crates/mesh` is a
 thin executable that calls its public `run` entry point. This keeps lexer and
