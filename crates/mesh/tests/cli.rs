@@ -661,17 +661,21 @@ fn sigcont_harness() -> i32 {
 
     let mut master = -1;
     let mut slave = -1;
+    #[cfg(target_os = "macos")]
+    let tiocsctty = libc::c_ulong::from(libc::TIOCSCTTY);
+    #[cfg(not(target_os = "macos"))]
+    let tiocsctty = libc::TIOCSCTTY;
     if unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     } != 0
         || unsafe { libc::setsid() } < 0
-        || unsafe { libc::ioctl(slave, libc::TIOCSCTTY, 0) } < 0
+        || unsafe { libc::ioctl(slave, tiocsctty, 0) } < 0
     {
         return 20;
     }
