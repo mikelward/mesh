@@ -649,16 +649,11 @@ hyphen between — the third payoff of that one spacing rule.
   a name-baked sigil would lie the moment a var is reassigned a different shape —
   and Perl's context-varying sigil (where `$foo[0]` indexes the array `@foo`) is
   a notorious footgun. `$name` means one thing everywhere: "read this variable."
-- **String interpolation.** Inside `"…"`, a bare `$name` interpolates just the
-  **variable** — the following `.`/`[` is *literal text*, so `"$file.txt"` is
-  `$file` then `.txt` and `"$m.key"` is `$m` then `.key` (the shell reflex). Any
-  **member access, indexing, or expression** in a string uses the braced
-  **`${…}`** form, which also delimits where it ends: `"${m.key}"`, `"${xs[0]}"`,
-  `"${dir}s"`. One rule — unbraced `$name` is the variable, `${…}` is everything
-  more — so the two never parse ambiguously. (Outside strings there is no
-  ambiguity: `$m.key` / `$xs[0]` are ordinary access.) *(open — whether to extend
-  bare `$name.key` access into strings too, flipping which case pays the ceremony;
-  see [Open questions](#open-questions).)*
+- **String interpolation.** Inside `"…"`, unbraced member access and integer
+  indexing work exactly as they do outside strings: `"$m.key"` and `"$xs[0]"`.
+  Braces remain available for the same references and delimit them when literal
+  text could otherwise be consumed as access: `"${m.key}"`, `"${xs[0]}"`,
+  `"${file}.txt"`, `"${dir}s"`. General expressions also use `${…}`.
 - **No null.** mesh has **no `nil`/`null`/`none`** value — the billion-dollar
   mistake is left out. The consequence is a consistent rule wherever a value
   might be absent: **exact** access fails loud (`$xs[99]`, `$m[absent]` are
@@ -3118,20 +3113,9 @@ to avoid" rather than promising the latter as done.
   **not** a `:s/old/new/` form (`:s` is the `:dotall` flag; arguments stay
   parenthesized) — see [Modifiers](#modifiers). Remaining: backref spelling and
   whether a first-only `:replace` is ever needed.
-- **Member access inside string interpolation** — currently *(decided)* a bare
-  `$name` inside `"…"` interpolates just the variable, so a following `.`/`[` is
-  literal (`"$file.txt"` appends `.txt`; `"$m.key"` is `$m` then `.key`), and any
-  access inside a string takes the braced `${…}` form
-  ([Variables and assignment](#variables-and-assignment)). Outside strings, `$m.key` / `$xs[0]`
-  are already ordinary access — so the fork is only *inside* strings: keep the
-  current rule, or extend bare `$name.key` access into strings too. The trade is
-  **consistency** (one meaning for `$x.y` everywhere, member access always free)
-  **vs. keeping literal-append free** (the common `"$file.txt"` / `"$host.$domain"`
-  needs no ceremony). If flipped, literal-append needs an explicit terminator —
-  leading candidate **`${file}.bak`** (the brace closes the reference cleanly), over
-  `"$file".bak`, which reintroduces a "what does `.` after a closing quote mean"
-  ambiguity once `.` binds access to expressions. Interactive path-building leans to
-  the current rule; data-heavy scripting leans to the flip.
+- **Member access inside string interpolation — decided:** `$map.field` has the
+  same meaning inside and outside `"…"`. Use `${file}.bak` when a dot begins a
+  literal suffix rather than member access ([Variables and assignment](#variables-and-assignment)).
 - **Predicate qualifier syntax** — confirm `size >` / `age <` / `mtime <` forms.
 - **History expansion — decided** ([History expansion](#history-expansion)):
   interactive-only, quote-safe `!!` / `!string` / `!$` (with `!*` / `!n` deferred);

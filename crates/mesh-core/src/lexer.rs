@@ -249,7 +249,7 @@ pub fn split_line(line: &str) -> Result<Vec<Segment>, LexError> {
                     i += 1;
                 }
             },
-            '$' => match parse_var(&chars, i + 1, true)? {
+            '$' => match parse_var(&chars, i + 1)? {
                 Some((vref, next)) => {
                     word.push(Piece::Var(vref));
                     i = next;
@@ -434,9 +434,7 @@ fn lex_escaped(
             break;
         }
         if double && c == '$' {
-            // Inside a string an unbraced `$name.member` is `$name` + literal
-            // `.member`; only `${…}` parses member access here.
-            if let Some((vref, next)) = parse_var(chars, i + 1, false)? {
+            if let Some((vref, next)) = parse_var(chars, i + 1)? {
                 push_text(word, &buf, false);
                 buf.clear();
                 word.push(Piece::Var(vref));
@@ -522,16 +520,8 @@ fn lex_raw(
 /// intent, so a missing `}` or a malformed name inside it is a loud `Err` rather
 /// than a silent literal — a literal `$` in a string is spelled `\$`.
 ///
-/// `member_after_name` controls whether a `.member` after an unbraced `$name` is
-/// consumed as member access. It is **true** outside strings (`$m.key` is access)
-/// and **false** inside `"…"`, where an unbraced `$name.member` is `$name` plus
-/// the literal `.member` (per `DESIGN.md` — use `${…}` for access in a string).
-/// The braced `${…}` form always parses member access.
-fn parse_var(
-    chars: &[char],
-    at: usize,
-    member_after_name: bool,
-) -> Result<Option<(VarRef, usize)>, LexError> {
+/// Both braced and unbraced forms parse member access and integer indexing.
+fn parse_var(chars: &[char], at: usize) -> Result<Option<(VarRef, usize)>, LexError> {
     if chars.get(at) == Some(&'{') {
         let start = at + 1;
         let mut j = start;
@@ -551,7 +541,7 @@ fn parse_var(
         return Ok(None); // `$` not followed by a name → literal `$`
     };
     let mut member = None;
-    if member_after_name && chars.get(j) == Some(&'.') {
+    if chars.get(j) == Some(&'.') {
         if let Some((m, k)) = read_name(chars, j + 1) {
             member = Some(m);
             j = k;
@@ -905,6 +895,19 @@ mod tests {
     fn double_quotes_interpolate_single_quotes_do_not() {
         assert_eq!(words(r#""a$x""#), [Word(vec![lit("a"), var("x")])]);
         assert_eq!(words(r"'a$x'"), [Word(vec![lit("a$x")])]);
+    }
+
+    #[test]
+    fn braced_and_unbraced_quoted_members_are_equivalent() {
+        let member = || {
+            Piece::Var(VarRef {
+                name: "map".into(),
+                member: Some("field".into()),
+                index: None,
+            })
+        };
+        assert_eq!(words(r#""$map.field""#), [Word(vec![member()])]);
+        assert_eq!(words(r#""${map.field}""#), [Word(vec![member()])]);
     }
 
     #[test]

@@ -476,24 +476,21 @@ fn interpolation_only_in_double_quotes() {
 #[test]
 fn env_interpolation_reads_the_environment() {
     let home = fresh_dir("env_read");
-    let out = run_with_home("puts $env.HOME\n", &home);
+    let out = run_with_home(
+        "puts $env.HOME\nputs \"$env.HOME\"\nputs \"${env.HOME}\"\n",
+        &home,
+    );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        format!("{}\n", home.display())
+        format!("{0}\n{0}\n{0}\n", home.display())
     );
     let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
-fn dotted_suffix_in_a_string_is_literal_not_member_access() {
-    // Inside `"…"`, an unbraced `$x.txt` is `$x` + the literal `.txt` — member
-    // access needs braces (`${x}` is fine too). `$env.HOME` access uses `${…}`
-    // form when a literal dot must follow.
-    let out = run_with_input("x = report\nputs \"$x.txt\"\nputs \"${x}.txt\"\n");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "report.txt\nreport.txt\n"
-    );
+fn braced_variable_delimits_a_literal_dotted_suffix() {
+    let out = run_with_input("x = report\nputs \"${x}.txt\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "report.txt\n");
 }
 
 #[test]
