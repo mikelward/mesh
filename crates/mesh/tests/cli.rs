@@ -65,6 +65,39 @@ fn runs_an_external_command() {
 }
 
 #[test]
+fn expression_parse_errors_recover_before_the_next_command() {
+    let out = run_with_input("result = 1 < 2 < 3\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("comparisons cannot be chained"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn assignment_parse_errors_are_authoritative() {
+    let out = run_with_input("result = 1 + )\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn incomplete_assignment_at_eof_is_a_syntax_error() {
+    let out = run_with_input("result = 1 +");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("syntax error: unexpected end of input"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn non_interactive_command_stays_in_mesh_process_group() {
     let out = run_with_input(
         "sh -c 'test \"$(ps -o pgid= -p $$ | xargs)\" = \"$(ps -o pgid= -p $PPID | xargs)\"'\n",
