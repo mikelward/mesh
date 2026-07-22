@@ -776,8 +776,10 @@ fn header_awaits_body(text: &str) -> bool {
     }
     let after_open = &rest[paren + 1..];
     match after_open.find(')') {
-        // Params still forming (their validity is checked at parse time).
-        None => true,
+        // Params still forming: keep reading only while the partial list could
+        // still be completed into a valid one (`func f(,`, `func f(...`, `func
+        // f(a=` can never be repaired, so they dispatch immediately).
+        None => params_prefix_ok(after_open),
         // Signature closed: the parameter list must actually parse, and only
         // whitespace may sit between `)` and the `{`. Reusing `parse_params` means
         // any signature the parser will reject (`(,)`, `(...xs)`, `(a,a)`) is
@@ -786,6 +788,57 @@ fn header_awaits_body(text: &str) -> bool {
             parse_params(&after_open[..close]).is_ok() && after_open[close + 1..].trim().is_empty()
         }
     }
+}
+
+/// Could the partial (still-unclosed) parameter list `list` still be completed
+/// into a valid one by appending more input? Applies the same structural rules as
+/// [`parse_params`], but treats the final token as an in-progress prefix (a bare
+/// name may still be growing), so only *provably* unrepairable content fails: a
+/// leading or doubled comma, a rest/flag/default token (`...`, `-…`, `…=…`), or a
+/// finalized name that is invalid, `env`, or a duplicate. A trailing comma is
+/// repairable (a name may follow).
+fn params_prefix_ok(list: &str) -> bool {
+    let chars: Vec<char> = list.chars().collect();
+    let mut names: Vec<String> = Vec::new();
+    let mut have_name = false;
+    let mut pending_comma = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == ',' {
+            if !have_name || pending_comma {
+                return false; // a comma with no name before it can never be valid
+            }
+            pending_comma = true;
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && chars[i] != ',' && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        let tok: String = chars[start..i].iter().collect();
+        // Forms that can never be a valid positional, even as a prefix.
+        if tok.starts_with("...") || tok.starts_with('-') || tok.contains('=') {
+            return false;
+        }
+        // A delimiter after the token finalizes it; the trailing token may still be
+        // growing, so its name-level validity is deferred to when the list closes.
+        let finalized = i < chars.len();
+        if finalized && (!is_ident(&tok) || tok == "env" || names.iter().any(|n| n == &tok)) {
+            return false;
+        }
+        if finalized {
+            names.push(tok);
+        }
+        have_name = true;
+        pending_comma = false;
+    }
+    true
 }
 
 /// Parse a parameter list: names separated by commas and/or whitespace. A comma
@@ -1424,6 +1477,15 @@ mod tests {
         assert!(!needs_more_input("func f(,)\n"));
         assert!(!needs_more_input("func f(...xs)\n"));
         assert!(!needs_more_input("func f(a,a)\n"));
+        // An unclosed but provably-invalid parameter list is dispatched too, while
+        // a valid partial list (a name still forming) keeps buffering.
+        assert!(!needs_more_input("func f(,\n"));
+        assert!(!needs_more_input("func f(...\n"));
+        assert!(!needs_more_input("func f(a=\n"));
+        assert!(!needs_more_input("func f(a,a,\n"));
+        assert!(needs_more_input("func f(a\n"));
+        assert!(needs_more_input("func f(a, b\n"));
+        assert!(needs_more_input("func f(a,\n"));
     }
 
     #[test]

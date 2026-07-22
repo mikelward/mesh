@@ -1789,3 +1789,30 @@ fn a_delayed_brace_after_a_blank_line_still_defines() {
     let out = run_with_input("func f()\n\n{\n  puts ok\n}\nf\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
+
+#[test]
+fn an_invalid_partial_signature_does_not_swallow_following_commands() {
+    // An unclosed but provably-invalid parameter list can never be repaired, so
+    // it is reported at once and the following command still runs.
+    for sig in ["func f(,", "func f(...", "func f(a="] {
+        let out = run_with_input(&format!("{sig}\nputs after\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "after\n",
+            "partial signature {sig:?} swallowed the following command"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("func:"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn a_multi_line_signature_still_buffers_and_defines() {
+    // A valid parameter list split across lines keeps buffering until the `)` and
+    // body arrive, then defines normally.
+    let out = run_with_input("func add(a,\nb) {\n  puts $a $b\n}\nadd 1 2\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1 2\n");
+}
