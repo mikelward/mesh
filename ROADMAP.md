@@ -111,6 +111,10 @@ string or string-list value in assignment position (with `""` for a missing
 `else`). General boolean/comparison expressions and conditional destructuring
 remain tied to the general expression parser.
 
+The first `for` slice iterates string lists and expanded word expressions with
+brace-delimited bodies. Map/range iteration, destructured binders, `break`, and
+`continue` remain ahead.
+
 **Acceptance:** the `DESIGN.md`/`docs/INTRO.md` examples run as written.
 
 ---

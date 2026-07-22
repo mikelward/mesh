@@ -1953,3 +1953,30 @@ fn a_following_command_with_a_quoted_brace_is_not_the_body() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "{\nafter\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("missing body"));
 }
+
+#[test]
+fn for_iterates_lists_without_word_splitting() {
+    let out = run_with_input("xs = [one \"two words\" three]\nfor x in $xs { puts \"<$x>\" }\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "<one>\n<two words>\n<three>\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn for_supports_multiline_bodies_and_empty_lists() {
+    let out = run_with_input(
+        "xs = [a b]\nseen = \"\"\nfor x in $xs {\n  puts $x\n  seen += $x\n}\nempty = []\nfor x in $empty { puts never }\nputs $seen\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\nab\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
