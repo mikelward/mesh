@@ -132,7 +132,7 @@ file as tasks land.
         iteration, `break`, and `continue`.
   - [x] Introduce reusable list-pattern binding for names, `_`, and `...rest`,
         then use it for assignment, conditional binding, loops, and match arms.
-  - [ ] Implement `match` parsing and evaluation, including ordered first-match
+  - [x] Implement `match` parsing and evaluation, including ordered first-match
         arms, literal/glob/regex/range/`_` patterns, alternation, list patterns,
         guards, statement position, and expression results.
   - [ ] Add loop-control regression coverage for nested loops and for `break` /

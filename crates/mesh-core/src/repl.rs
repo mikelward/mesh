@@ -1154,7 +1154,37 @@ fn match_bindings(
             pattern_bindings(pattern, subject).map_err(runtime_message)?
         }
         parser::MatchPattern::Value(pattern) => {
-            (eval_expr(pattern, last, in_function, shell)? == *subject).then(Vec::new)
+            let pattern_value = eval_expr(pattern, last, in_function, shell)?;
+            let matched = match pattern_value {
+                Value::Regex(regex) => match subject {
+                    Value::String(text) => compile_regex(&regex)
+                        .map_err(runtime_message)?
+                        .is_match(text),
+                    _ => false,
+                },
+                Value::Glob(pattern) => match subject {
+                    Value::String(text) => glob::Pattern::new(&pattern)
+                        .map_err(|error| runtime_message(format!("invalid glob pattern: {error}")))?
+                        .matches(text),
+                    _ => false,
+                },
+                Value::List(values) if matches!(pattern, parser::Expr::Range { .. }) => {
+                    values.contains(subject)
+                }
+                value => value == *subject,
+            };
+            matched.then(Vec::new)
+        }
+        parser::MatchPattern::Alternation(patterns) => {
+            let mut matched = None;
+            for pattern in patterns {
+                if let Some(bindings) = match_bindings(pattern, subject, last, in_function, shell)?
+                {
+                    matched = Some(bindings);
+                    break;
+                }
+            }
+            matched
         }
     };
     if let Some(bindings) = &bindings {
@@ -1169,6 +1199,21 @@ fn eval_value_body(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
+    if let [statement] = body.statements.as_slice()
+        && !statement.background
+        && statement.and_or.rest.is_empty()
+        && let parser::Executable::Pipeline(parser::Pipeline { stages, .. }) =
+            &statement.and_or.first
+        && let [parser::Command { items, guard: None }] = stages.as_slice()
+        && let [parser::CommandItem::Word(word)] = items.as_slice()
+    {
+        return eval_expr(
+            &parser::Expr::Scalar(word.clone()),
+            last,
+            in_function,
+            shell,
+        );
+    }
     let value_final = body.statements.last().is_some_and(|statement| {
         !statement.background
             && statement.and_or.rest.is_empty()

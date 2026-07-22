@@ -243,9 +243,9 @@ for key, value in $settings { puts "$key=$value" }
 ## Match
 
 `match value { pattern { body } ... }` evaluates arms from top to bottom and
-uses the first match. The implemented slice supports exact value patterns,
-list patterns, `_`, and guards; an unmatched expression yields `""`. Its
-literal/glob/regex/range pattern surface and alternation remain to be completed.
+uses the first match. Patterns may be exact values, globs, regular expressions,
+integer ranges, alternatives separated by `|`, list binding patterns, or `_`.
+Arms may have `if` guards, and an unmatched expression yields `""`.
 
 ## Functions
 
