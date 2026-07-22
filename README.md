@@ -19,8 +19,9 @@ cargo run -p mesh      # start the shell
 cargo test --workspace # run the tests
 ```
 
-The shell launches external commands and the builtins `cd`, `pwd`, `puts`, and
-`exit`, with a growing slice of the language in place: quoting and escapes, `~`
+The shell launches external commands and includes prompt configuration alongside
+the `cd`, `pwd`, `puts`, and `exit` builtins. A growing slice of the language is
+in place: quoting and escapes, `~`
 and filename globs, typed scalar/list/map values, arithmetic and comparisons,
 regex and glob matching with `~`, collection iteration and destructuring,
 functions, `if`/`match` expressions, and postfix value modifiers.

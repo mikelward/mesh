@@ -11,6 +11,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 
@@ -34,7 +35,34 @@ struct Shell {
 #[derive(Default)]
 struct PromptConfig {
     text: Option<String>,
-    hooks: Vec<(String, String)>,
+    hooks: Vec<PromptHook>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptEvent {
+    PrePrompt,
+    PreExec,
+    PostExec,
+    Exit,
+}
+
+impl PromptEvent {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "preprompt" => Some(Self::PrePrompt),
+            "preexec" => Some(Self::PreExec),
+            "postexec" => Some(Self::PostExec),
+            "exit" => Some(Self::Exit),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PromptHook {
+    event: PromptEvent,
+    name: String,
+    function: String,
 }
 
 impl Shell {
@@ -1677,34 +1705,71 @@ fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
 }
 
 fn configure_prompt_hook(args: &[String], shell: &mut Shell) -> Step {
+    let invalid = || {
+        eprintln!("mesh: prompt-hook: expected [EVENT] NAME FUNCTION or --remove [EVENT] NAME");
+        Step::Continue(2)
+    };
     match args {
         [flag, name] if flag == "--remove" => {
-            shell.prompt.hooks.retain(|(key, _)| key != name);
+            shell
+                .prompt
+                .hooks
+                .retain(|hook| hook.event != PromptEvent::PrePrompt || hook.name != *name);
             Step::Continue(0)
         }
-        [name, function] => {
-            if shell.funcs.get(function).is_none() {
-                eprintln!("mesh: prompt-hook: `{function}` is not a function");
-                return Step::Continue(1);
-            }
-            if let Some((_, old)) = shell.prompt.hooks.iter_mut().find(|(key, _)| key == name) {
-                *old = function.clone();
-            } else {
-                shell.prompt.hooks.push((name.clone(), function.clone()));
-            }
+        [flag, event, name] if flag == "--remove" => {
+            let Some(event) = PromptEvent::parse(event) else {
+                return invalid();
+            };
+            shell
+                .prompt
+                .hooks
+                .retain(|hook| hook.event != event || hook.name != *name);
             Step::Continue(0)
         }
-        _ => {
-            eprintln!("mesh: prompt-hook: expected NAME FUNCTION or --remove NAME");
-            Step::Continue(2)
+        [name, function] => register_prompt_hook(PromptEvent::PrePrompt, name, function, shell),
+        [event, name, function] => {
+            let Some(event) = PromptEvent::parse(event) else {
+                return invalid();
+            };
+            register_prompt_hook(event, name, function, shell)
         }
+        _ => invalid(),
     }
 }
 
-fn run_prompt_hooks(shell: &mut Shell) {
-    let hooks = shell.prompt.hooks.clone();
-    for (_, function) in hooks {
-        let _ = call_func(&function, Vec::new(), shell);
+fn register_prompt_hook(event: PromptEvent, name: &str, function: &str, shell: &mut Shell) -> Step {
+    if shell.funcs.get(function).is_none() {
+        eprintln!("mesh: prompt-hook: `{function}` is not a function");
+        return Step::Continue(1);
+    }
+    if let Some(hook) = shell
+        .prompt
+        .hooks
+        .iter_mut()
+        .find(|hook| hook.event == event && hook.name == name)
+    {
+        hook.function = function.to_string();
+    } else {
+        shell.prompt.hooks.push(PromptHook {
+            event,
+            name: name.to_string(),
+            function: function.to_string(),
+        });
+    }
+    Step::Continue(0)
+}
+
+fn run_prompt_hooks(event: PromptEvent, args: Vec<Value>, shell: &mut Shell) {
+    let hooks: Vec<String> = shell
+        .prompt
+        .hooks
+        .iter()
+        .filter(|hook| hook.event == event)
+        .map(|hook| hook.function.clone())
+        .collect();
+    for function in hooks {
+        let _ = call_func(&function, args.clone(), shell);
     }
 }
 
@@ -1810,7 +1875,7 @@ fn run_interactive() -> ExitCode {
     loop {
         shell.jobs.reap();
         if pending.is_empty() {
-            run_prompt_hooks(&mut shell);
+            run_prompt_hooks(PromptEvent::PrePrompt, Vec::new(), &mut shell);
         }
         let prompt = MeshPrompt {
             failed: last != 0,
@@ -1820,7 +1885,14 @@ fn run_interactive() -> ExitCode {
         match editor.read_line(&prompt) {
             Ok(signal) => match handle_signal(signal, last, &mut shell, &mut pending) {
                 None => continue, // an unfinished `func` body: read the next line
-                Some(Step::Exit(code)) => return ExitCode::from(code),
+                Some(Step::Exit(code)) => {
+                    run_prompt_hooks(
+                        PromptEvent::Exit,
+                        vec![Value::Integer(i64::from(code))],
+                        &mut shell,
+                    );
+                    return ExitCode::from(code);
+                }
                 Some(Step::Continue(code)) => last = code,
                 // Top-level `run_line` reports a stray `return` itself, so one
                 // never reaches here.
@@ -1902,7 +1974,28 @@ fn handle_signal(
                 return None;
             }
             let text = std::mem::take(pending);
-            Some(run_line(&text, last, false, shell))
+            let command = text.trim_end_matches('\n').to_string();
+            run_prompt_hooks(
+                PromptEvent::PreExec,
+                vec![Value::String(command.clone())],
+                shell,
+            );
+            let start = Instant::now();
+            let step = run_line(&text, last, false, shell);
+            let status = match step {
+                Step::Continue(code) | Step::Exit(code) | Step::Return(code) => code,
+            };
+            let elapsed = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+            run_prompt_hooks(
+                PromptEvent::PostExec,
+                vec![
+                    Value::String(command),
+                    Value::Integer(i64::from(status)),
+                    Value::Integer(elapsed),
+                ],
+                shell,
+            );
+            Some(step)
         }
         // Ctrl-D (EOF) exits with the last status, abandoning any in-progress
         // `func` — the buffered lines are dropped as the shell leaves. reedline
@@ -2046,8 +2139,8 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        MeshPrompt, Shell, Step, eval_binary, expansion_word, handle_signal, needs_more_input,
-        run_line, run_prompt_hooks, run_source,
+        MeshPrompt, PromptEvent, PromptHook, Shell, Step, eval_binary, expansion_word,
+        handle_signal, needs_more_input, run_line, run_prompt_hooks, run_source,
     };
     use crate::parser;
     use crate::vars::Value;
@@ -2088,11 +2181,35 @@ mod tests {
         assert_eq!(run_line(&script, 0, false, &mut shell), Step::Continue(0));
         assert_eq!(
             shell.prompt.hooks,
-            vec![("refresh".into(), "second".into())]
+            vec![PromptHook {
+                event: PromptEvent::PrePrompt,
+                name: "refresh".into(),
+                function: "second".into(),
+            }]
         );
-        run_prompt_hooks(&mut shell);
+        run_prompt_hooks(PromptEvent::PrePrompt, Vec::new(), &mut shell);
         assert!(marker.exists());
         std::fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn command_hooks_receive_command_status_and_elapsed_arguments() {
+        let mut shell = Shell::new();
+        assert_eq!(
+            run_line(
+                "func before(cmd) { puts $cmd }\nfunc after(cmd, status, elapsed) { puts $cmd $status $elapsed }\nprompt-hook preexec log before\nprompt-hook postexec log after",
+                0,
+                false,
+                &mut shell,
+            ),
+            Step::Continue(0)
+        );
+        let mut pending = String::new();
+        assert_eq!(
+            handle_signal(Signal::Success("true".into()), 0, &mut shell, &mut pending,),
+            Some(Step::Continue(0))
+        );
+        assert_eq!(shell.prompt.hooks.len(), 2);
     }
 
     #[test]
