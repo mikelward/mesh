@@ -2401,3 +2401,58 @@ fn command_interpolation_resolves_chained_map_members_in_order() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn list_patterns_bind_names_discards_and_a_middle_rest_atomically() {
+    let out = run_with_input(
+        "[first ...middle last] = [a b c d]\n\
+         [_ kept] = [ignored yes]\n\
+         puts $first ...$middle $last $kept\n\
+         first = unchanged\n\
+         [first missing] = [only]\n\
+         puts $first\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a b c d yes\nunchanged\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not match binding pattern"));
+}
+
+#[test]
+fn conditional_list_binding_skips_mismatches_without_partial_updates() {
+    let out = run_with_input(
+        "a = old\n\
+         if [a b] = [one] { puts wrong } else { puts $a }\n\
+         if [head ...tail] = [one two three] { puts $head ...$tail }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "old\none two three\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn loops_and_match_arms_share_list_pattern_binding() {
+    let out = run_with_input(
+        "rows = [[a b] [c d]]\n\
+         for [left right] in $rows { puts $left $right }\n\
+         result = match [start x y] {\n\
+           [verb ...args] if $verb == start { [$verb ...$args] }\n\
+           _ { [wrong] }\n\
+         }\n\
+         puts ...$result\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a b\nc d\nstart x y\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
