@@ -1855,3 +1855,22 @@ fn a_bare_list_to_an_external_command_is_still_an_error() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn an_impossible_parameter_head_does_not_enter_continuation() {
+    // A trailing parameter token with a non-letter head can never become a valid
+    // name, so the header is reported at once and the next command still runs.
+    for sig in ["func f(_", "func f(1"] {
+        let out = run_with_input(&format!("{sig}\nputs after\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "after\n",
+            "partial signature {sig:?} swallowed the following command"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("func:"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
