@@ -332,6 +332,10 @@ fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
 /// an empty line exits (reedline's default — a non-empty line is unaffected);
 /// Ctrl-C cancels the current line and returns to the prompt without exiting.
 fn run_interactive() -> ExitCode {
+    if let Err(err) = ignore_interactive_signals() {
+        eprintln!("mesh: could not configure interactive signals: {err}");
+        return ExitCode::from(1);
+    }
     let mut editor = Reedline::create();
     let mut last: u8 = 0;
     let mut vars = Vars::new();
@@ -348,6 +352,27 @@ fn run_interactive() -> ExitCode {
             }
         }
     }
+}
+
+/// Keep terminal-generated signals from stopping or ending mesh itself.
+/// Foreground children restore their default dispositions before `exec` and
+/// receive these signals after the executor hands them the terminal.
+fn ignore_interactive_signals() -> io::Result<()> {
+    for signal in [
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTSTP,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+        libc::SIGTERM,
+    ] {
+        // SAFETY: signal is one of the valid constants above, and SIG_IGN is a
+        // valid disposition. The interactive loop is single-threaded here.
+        if unsafe { libc::signal(signal, libc::SIG_IGN) } == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Map a reedline signal to the next [`Step`]. Extracted from the read loop so
