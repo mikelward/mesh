@@ -296,6 +296,10 @@ pub enum MatchPattern {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
     Scalar(Spanned<Word>),
+    /// A context-sensitive `/.../` literal in a match operand.
+    Regex(String),
+    /// A bare whole-string glob in a match operand.
+    Glob(String),
     Variable(Spanned<String>),
     List(Vec<ListItem>),
     Map(Vec<MapItem>),
@@ -1056,6 +1060,81 @@ fn variable_access_prefix(text: &str) -> usize {
     consumed
 }
 
+fn match_operand(expression: Expr) -> Expr {
+    match expression {
+        Expr::Modifier {
+            value,
+            name,
+            arguments,
+        } => Expr::Modifier {
+            value: Box::new(match_operand(*value)),
+            name,
+            arguments,
+        },
+        Expr::Scalar(word)
+            if word.value.pieces.iter().all(|piece| {
+                matches!(
+                    piece,
+                    WordPiece::Text {
+                        quote: QuoteMode::Bare | QuoteMode::Escaped,
+                        ..
+                    }
+                )
+            }) =>
+        {
+            let pieces = &word.value.pieces;
+            let text = word.value.text();
+            let clean_regex = text.starts_with('/')
+                && text.ends_with('/')
+                && text.len() >= 2
+                && pieces
+                    .iter()
+                    .enumerate()
+                    .all(|(piece_index, piece)| match piece {
+                        WordPiece::Text {
+                            text,
+                            quote: QuoteMode::Bare,
+                        } => text.char_indices().all(|(byte, c)| {
+                            c != '/'
+                                || (piece_index == 0 && byte == 0)
+                                || (piece_index + 1 == pieces.len() && byte + 1 == text.len())
+                        }),
+                        WordPiece::Text {
+                            quote: QuoteMode::Escaped,
+                            ..
+                        } => true,
+                        _ => false,
+                    });
+            if clean_regex {
+                let mut source = String::new();
+                for piece in pieces {
+                    let WordPiece::Text { text, quote } = piece else {
+                        unreachable!()
+                    };
+                    if *quote == QuoteMode::Escaped && text != "/" {
+                        source.push('\\');
+                    }
+                    source.push_str(text);
+                }
+                Expr::Regex(source[1..source.len() - 1].to_owned())
+            } else if pieces.iter().all(|piece| {
+                matches!(
+                    piece,
+                    WordPiece::Text {
+                        quote: QuoteMode::Bare,
+                        ..
+                    }
+                )
+            }) {
+                Expr::Glob(text)
+            } else {
+                Expr::Scalar(word)
+            }
+        }
+        other => other,
+    }
+}
+
 fn token_word_pieces(kind: &TokenKind) -> Option<Vec<WordPiece>> {
     if let TokenKind::Word(word) = kind {
         return Some(word.pieces.clone());
@@ -1648,7 +1727,10 @@ impl Parser {
             }
             self.position += 1;
             self.newlines();
-            let right = self.binary(precedence + 1)?;
+            let mut right = self.binary(precedence + 1)?;
+            if matches!(op, BinaryOp::Match | BinaryOp::NotMatch) {
+                right = match_operand(right);
+            }
             left = Expr::Binary {
                 left: Box::new(left),
                 op,

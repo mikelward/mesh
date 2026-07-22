@@ -2456,3 +2456,53 @@ fn loops_and_match_arms_share_list_pattern_binding() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn tilde_matches_regexes_and_globs() {
+    let out = run_with_input(
+        "digits = item42 ~ /\\d+$/\n\
+         slash = a/b ~ /a\\/b/\n\
+         file = src/main.rs ~ src/*.rs\n\
+         insensitive = ERROR ~ /error/:i\n\
+         negative = notes.txt !~ *.rs\n\
+         puts $digits $slash $file $insensitive $negative\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true true true true true\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn re_constructs_reusable_and_literal_patterns() {
+    let out = run_with_input(
+        "pattern = re(r'^a.c$')\n\
+         dynamic = abc ~ $pattern\n\
+         exact = a.c ~ re('a.c', literal: true)\n\
+         puts $dynamic $exact\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true true\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn tilde_rejects_quoted_and_invalid_regex_patterns() {
+    let out = run_with_input(
+        "bad = abc ~ 'a.c'\n\
+         broken = abc ~ /\\k/\n\
+         puts after\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("right operand of `~` must be a regex or bare glob"));
+    assert!(stderr.contains("invalid regex"));
+}
