@@ -444,6 +444,15 @@ fn list_literal_preserves_quoted_empty_elements() {
 }
 
 #[test]
+fn list_literal_spread_flattens_one_level() {
+    let out = run_with_input(
+        "left = [a 'b c']\nright = [d e]\nall = [...$left middle ...$right]\nputs ...$all\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a b c middle d e\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn append_assignment_concatenates_strings_and_grows_lists() {
     let out = run_with_input(
         "greeting = hi\ngreeting += ' there'\nputs $greeting\nxs = [a b]\nxs += c\nxs += [d e]\nmore = [f g]\nxs += $more\nputs ...$xs\n",

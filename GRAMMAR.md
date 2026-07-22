@@ -225,7 +225,8 @@ bracketed, space-separated words form a list; `[]` remains distinct from an
 empty string:
 
 ```
-list-assign = name "=" ws? "[" (word (ws word)*)? "]"
+list-assign = name "=" ws? "[" (list-item (ws list-item)*)? "]"
+list-item   = word | spread
 spread      = "...$" name                  # whole command word, for now
 index       = "$" name "[" signed-integer "]"
 slice       = "$" name "[" signed-integer? (".." signed-integer? | "..=" signed-integer) "]"
@@ -234,6 +235,8 @@ slice       = "$" name "[" signed-integer? (".." signed-integer? | "..=" signed-
 Each literal element uses the existing word expansion rules. A glob can
 therefore contribute zero or more elements. `...$name` contributes every list
 element as a separate command argument and contributes no arguments for `[]`.
+A spread is also accepted as a list-literal item (`ys = [...$xs tail]`), where
+it flattens the referenced string list by one level into the new list.
 A list used as bare `$name` in command arguments is an error: mesh never
 implicitly word-splits or flattens a typed value. Spreading a string is also an
 error. Exact indexing is zero-based, accepts negative indices from the end, and
@@ -244,8 +247,9 @@ spelling, negative bounds count from the end, and out-of-range bounds clamp.
 
 This is deliberately a vertical slice rather than the final expression
 grammar. Lists currently contain strings only; `+=` concatenates strings,
-appends a scalar to a list, or extends a list with a list. Nesting and spread
-inside expressions remain unparsed.
+appends a scalar to a list, or extends a list with a list. Nesting and general
+expression parsing remain ahead; list-literal spread is the only
+expression-position spread supported so far.
 
 ### Not yet parsed
 Nested/general list expressions, maps, `{ }` blocks, `func`, `:` modifiers, and
