@@ -13,7 +13,7 @@ use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -2059,6 +2059,9 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
     if !paths.is_empty() {
         return paths;
     }
+    if completing_word && !exact_subcommand {
+        return Vec::new();
+    }
 
     // Once the current word is a complete subcommand, include it in the help
     // request so `git reset<Tab>` asks `git reset --help` for the next word.
@@ -2130,11 +2133,14 @@ fn command_help(words: &[String]) -> String {
         .arg("--help")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // SAFETY: this closure only makes async-signal-safe `signal` calls between
-    // fork and exec. The interactive shell ignores these signals, but a help
-    // child must remain interruptible by terminal-generated signals.
+    // SAFETY: this closure only makes async-signal-safe process-group and
+    // `signal` calls between fork and exec. The interactive shell ignores these
+    // signals, but a help child must remain interruptible by terminal input.
     unsafe {
         process.pre_exec(|| {
+            if libc::setpgid(0, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
             for signal in [
                 libc::SIGINT,
                 libc::SIGQUIT,
@@ -2152,6 +2158,15 @@ fn command_help(words: &[String]) -> String {
     let Ok(mut child) = process.spawn() else {
         return String::new();
     };
+    let child_group = child.id() as libc::pid_t;
+    // Give the probe the terminal while it runs so Ctrl-C/Ctrl-Z target its
+    // fresh process group rather than the signal-ignoring shell.
+    let shell_group = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+    if shell_group >= 0 {
+        unsafe {
+            libc::tcsetpgrp(libc::STDIN_FILENO, child_group);
+        }
+    }
     let stdout = child.stdout.take().map(|mut output| {
         thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -2172,11 +2187,23 @@ fn command_help(words: &[String]) -> String {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             Ok(None) => {
-                let _ = child.kill();
+                // The negative PID targets the whole probe process group,
+                // including wrappers and descendants holding captured pipes.
+                unsafe {
+                    libc::kill(-child_group, libc::SIGKILL);
+                }
                 let _ = child.wait();
                 break;
             }
             Err(_) => break,
+        }
+    }
+    // The leader may exit after starting a background descendant. Terminate
+    // anything left in its group before joining the pipe readers.
+    unsafe {
+        libc::kill(-child_group, libc::SIGKILL);
+        if shell_group >= 0 {
+            libc::tcsetpgrp(libc::STDIN_FILENO, shell_group);
         }
     }
     let output = stdout
@@ -2281,6 +2308,25 @@ fn variable_completions(word: &str, variables: &[(String, Value)]) -> Vec<String
 }
 
 fn path_completions(word: &str) -> Vec<String> {
+    let word = word.to_owned();
+    interruptible_task(Duration::from_millis(200), move || {
+        path_completions_sync(&word)
+    })
+    .unwrap_or_default()
+}
+
+fn interruptible_task<T: Send + 'static>(
+    timeout: Duration,
+    task: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(task());
+    });
+    receiver.recv_timeout(timeout).ok()
+}
+
+fn path_completions_sync(word: &str) -> Vec<String> {
     let path = std::path::Path::new(word);
     let (dir, prefix) = match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
@@ -2547,8 +2593,8 @@ mod tests {
     use super::{
         CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell, Step, argument_completions,
         command_help, command_position, command_segment_words, eval_binary, expansion_word,
-        handle_signal, help_completions, needs_more_input, run_line, run_prompt_hooks, run_source,
-        variable_completions,
+        handle_signal, help_completions, interruptible_task, needs_more_input, run_line,
+        run_prompt_hooks, run_source, variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
@@ -2618,6 +2664,14 @@ mod tests {
             argument_completions(&state, &["cargo".into(), "bu".into()], "bu"),
             ["build"]
         );
+        assert!(
+            argument_completions(
+                &state,
+                &["cargo".into(), "definitely-missing".into()],
+                "definitely-missing"
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -2638,6 +2692,22 @@ mod tests {
             [format!("{}/", child.display())]
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filesystem_completion_work_is_time_bounded() {
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        assert_eq!(
+            interruptible_task(Duration::from_millis(10), || {
+                thread::sleep(Duration::from_secs(1));
+                1
+            }),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]
@@ -2675,7 +2745,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mesh-help-timeout-{}", std::process::id()));
         let command = dir.join("helper");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(&command, "#!/bin/sh\nexec sleep 10\n").unwrap();
+        fs::write(&command, "#!/bin/sh\nsleep 10\n").unwrap();
         fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
 
         let started = Instant::now();
