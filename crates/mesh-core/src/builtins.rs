@@ -10,6 +10,18 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+pub(crate) const NAMES: &[&str] = &[
+    "cd",
+    "pwd",
+    "puts",
+    "exit",
+    "fg",
+    "bg",
+    "jobs",
+    "prompt",
+    "prompt-hook",
+];
+
 /// Outcome of a builtin. `Status` reports an exit status and continues the loop;
 /// `Exit` ends the shell with the given status.
 pub enum Builtin {
@@ -21,10 +33,7 @@ pub enum Builtin {
 /// redirection, which are not supported yet (both need the builtin to write to a
 /// non-stdout target / a forked child).
 pub fn is_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "cd" | "pwd" | "puts" | "exit" | "fg" | "bg" | "jobs" | "prompt" | "prompt-hook"
-    )
+    NAMES.contains(&name)
 }
 
 /// If `words[0]` names a builtin, run it and return its outcome; otherwise

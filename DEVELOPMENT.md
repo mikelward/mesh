@@ -11,7 +11,8 @@ the subset accepted by the current implementation.
 > **Status:** the implementation is a read/tokenize/exec loop that launches
 > external commands plus the `cd`, `pwd`, `puts`, `exit`, `jobs`, `fg`, `bg`,
 > `prompt`, and `prompt-hook` builtins. Interactive
-> input uses `reedline` line editing (history, Ctrl-C/Ctrl-D) behind a two-glyph
+> input uses `reedline` line editing (history, Ctrl-C/Ctrl-D, and session-aware
+> Tab completion) behind a two-glyph
 > prompt that can be customized with lifecycle hooks; piped input uses a std-only reader. None of the mesh *language* is
 > implemented yet. Treat the current code as a seed, not a foundation to build
 > features on before the real lexer/parser land.
@@ -66,7 +67,7 @@ integration tests need no terminal. The rest of the interactive stack named in
 
 | Crate | Purpose | License | Status |
 | --- | --- | --- | --- |
-| `reedline` | interactive line editing, history, Ctrl-C/D | MIT | **in use** |
+| `reedline` | interactive line editing, history, Ctrl-C/D, completion | MIT | **in use** |
 | `glob` | filesystem glob expansion | MIT/Apache-2.0 | **in use** |
 | `libc` | process groups and foreground-terminal handoff | MIT/Apache-2.0 | **in use** |
 | `crossterm` | terminal control (pulled in by `reedline`) | MIT | transitive |

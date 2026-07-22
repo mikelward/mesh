@@ -35,4 +35,8 @@ impl Funcs {
     pub fn get(&self, name: &str) -> Option<&FuncDef> {
         self.map.get(name)
     }
+
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.map.keys().map(String::as_str)
+    }
 }
