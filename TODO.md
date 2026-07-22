@@ -68,6 +68,12 @@ file as tasks land.
       without `...` is a loud error rather than implicit word splitting.
 - [ ] Replace the incremental command lexer with the clean-break expression and
       block parser.
+  - [x] Fix the parser grammar, precedence, attachment, and completeness contract
+        in [`PARSER.md`](PARSER.md).
+  - [ ] Emit a span-carrying token stream without performing structural parsing.
+  - [ ] Parse tokens into command, expression, and block AST nodes.
+  - [ ] Evaluate the AST through the existing expansion and execution layers,
+        then remove the raw-text compound-form recognizers.
 - [x] General list expressions: nested values, indexing/slicing, `+=`, and
       expression-position spread.
   - [x] Exact integer indexing (`$xs[0]`, including negative indices) for the
