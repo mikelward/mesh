@@ -206,15 +206,11 @@ pub(crate) fn slice<T>(
     inclusive: bool,
 ) -> &[T] {
     let len = values.len() as i128;
-    let clamp = |bound: i64| -> usize {
-        let offset = if bound < 0 {
-            len + bound as i128
-        } else {
-            bound as i128
-        };
+    let clamp = |bound: i128| -> usize {
+        let offset = if bound < 0 { len + bound } else { bound };
         offset.clamp(0, len) as usize
     };
-    let start = start.map_or(0, clamp);
+    let start = start.map_or(0, |bound| clamp(bound as i128));
     let end = end.map_or(values.len(), |bound| {
         let offset = if bound < 0 {
             len + bound as i128
