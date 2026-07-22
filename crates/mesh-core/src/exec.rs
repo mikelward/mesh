@@ -20,6 +20,141 @@ pub struct Cmd {
     pub redirs: Vec<(RedirKind, String)>,
 }
 
+/// Foreground jobs suspended with Ctrl-Z. Background launch syntax arrives
+/// later; for now every entry starts as a stopped foreground pipeline.
+pub struct JobTable {
+    jobs: Vec<Job>,
+    next_id: usize,
+}
+
+struct Job {
+    id: usize,
+    pgid: libc::pid_t,
+    command: String,
+    outcomes: Vec<Outcome>,
+    shell_modes: Option<libc::termios>,
+    state: JobState,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum JobState {
+    Running,
+    Stopped,
+}
+
+impl JobTable {
+    pub fn new() -> Self {
+        Self {
+            jobs: Vec::new(),
+            next_id: 1,
+        }
+    }
+
+    /// Resume a job in the foreground. With no operand, use the most recently
+    /// registered job; explicit references accept `N` and `%N`.
+    pub fn foreground(&mut self, args: &[String]) -> u8 {
+        let Some(index) = self.resolve(args, "fg") else {
+            return 1;
+        };
+        let mut job = self.jobs.remove(index);
+        set_foreground_group(job.pgid);
+        if signal_group(job.pgid, libc::SIGCONT, "fg").is_err() {
+            reclaim_terminal(job.shell_modes.as_ref());
+            return 1;
+        }
+        job.state = JobState::Running;
+        let result = wait_outcomes(&mut job.outcomes);
+        reclaim_terminal(job.shell_modes.as_ref());
+        match result {
+            WaitResult::Complete(status) => status,
+            WaitResult::Stopped(status) => {
+                job.state = JobState::Stopped;
+                eprintln!("[{}] Stopped {}", job.id, job.command);
+                self.jobs.push(job);
+                status
+            }
+        }
+    }
+
+    /// Continue a stopped job without giving it the terminal.
+    pub fn background(&mut self, args: &[String]) -> u8 {
+        let Some(index) = self.resolve(args, "bg") else {
+            return 1;
+        };
+        let job = &mut self.jobs[index];
+        if signal_group(job.pgid, libc::SIGCONT, "bg").is_err() {
+            return 1;
+        }
+        job.state = JobState::Running;
+        eprintln!("[{}] Running {}", job.id, job.command);
+        0
+    }
+
+    pub fn list(&mut self, args: &[String]) -> u8 {
+        if !args.is_empty() {
+            eprintln!("mesh: jobs: too many arguments");
+            return 1;
+        }
+        self.reap();
+        for job in &self.jobs {
+            let state = if job.state == JobState::Stopped {
+                "Stopped"
+            } else {
+                "Running"
+            };
+            println!("[{}] {state} {}", job.id, job.command);
+        }
+        0
+    }
+
+    /// Report jobs which completed since the preceding prompt and remove them.
+    pub fn reap(&mut self) {
+        let mut index = 0;
+        while index < self.jobs.len() {
+            if self.jobs[index].state == JobState::Running {
+                match poll_outcomes(&mut self.jobs[index].outcomes) {
+                    Some(WaitResult::Complete(status)) => {
+                        let job = self.jobs.remove(index);
+                        eprintln!("[{}] Done ({status}) {}", job.id, job.command);
+                        continue;
+                    }
+                    Some(WaitResult::Stopped(_)) => self.jobs[index].state = JobState::Stopped,
+                    None => {}
+                }
+            }
+            index += 1;
+        }
+    }
+
+    fn resolve(&self, args: &[String], name: &str) -> Option<usize> {
+        if args.len() > 1 {
+            eprintln!("mesh: {name}: too many arguments");
+            return None;
+        }
+        if self.jobs.is_empty() {
+            eprintln!("mesh: {name}: no current job");
+            return None;
+        }
+        let Some(reference) = args.first() else {
+            return Some(self.jobs.len() - 1);
+        };
+        let id = reference
+            .strip_prefix('%')
+            .unwrap_or(reference)
+            .parse::<usize>();
+        match id
+            .ok()
+            .and_then(|id| self.jobs.iter().position(|job| job.id == id))
+        {
+            Some(index) => Some(index),
+            None => {
+                eprintln!("mesh: {name}: {reference}: no such job");
+                None
+            }
+        }
+    }
+}
+
 /// `128 + SIGPIPE(13)` — an upstream stage killed because a later stage closed
 /// the pipe early. Under our pipefail rule this does not count as a failure.
 const SIGPIPE_CODE: u8 = 128 + 13;
@@ -30,11 +165,14 @@ const SIGPIPE_CODE: u8 = 128 + 13;
 /// POSIX shells: `127` for a command that could not be found, `126` for one
 /// that could not be executed, and `128 + signal` when the child is killed by a
 /// signal. These line up with the result/status model in `DESIGN.md`.
-pub fn run(words: &[String]) -> u8 {
-    run_pipeline(vec![Cmd {
-        words: words.to_vec(),
-        redirs: Vec::new(),
-    }])
+pub fn run(words: &[String], jobs: &mut JobTable) -> u8 {
+    run_pipeline(
+        vec![Cmd {
+            words: words.to_vec(),
+            redirs: Vec::new(),
+        }],
+        jobs,
+    )
 }
 
 /// How the next stage receives its stdin.
@@ -72,7 +210,12 @@ enum Outcome {
 /// Interactive pipelines get a foreground process group; non-interactive ones
 /// stay in mesh's process group so signals sent to the invoking group reach all
 /// stages.
-pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
+pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable) -> u8 {
+    let command_text = cmds
+        .iter()
+        .map(|cmd| cmd.words.join(" "))
+        .collect::<Vec<_>>()
+        .join(" | ");
     let n = cmds.len();
     let interactive = std::io::stdin().is_terminal();
     let mut outcomes: Vec<Outcome> = Vec::new();
@@ -191,19 +334,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
 
     // pipefail: the last stage to fail wins. A SIGPIPE is ignored only for a
     // stage whose stdout fed a pipe (a downstream stage could have closed it).
-    let mut status = 0;
-    for outcome in outcomes {
-        let (code, piped_out) = match outcome {
-            Outcome::Running {
-                mut child,
-                piped_out,
-            } => (wait_for_job(&mut child).unwrap_or(1), piped_out),
-            Outcome::Failed(code) => (code, false),
-        };
-        if code != 0 && !(piped_out && code == SIGPIPE_CODE) {
-            status = code;
-        }
-    }
+    let result = wait_outcomes(&mut outcomes);
     if foreground.is_some() {
         // getpgrp, rather than getpid, also handles a mesh process launched in
         // a process group established by its parent shell.
@@ -214,7 +345,97 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
             restore_terminal_modes(&modes);
         }
     }
-    status
+    match result {
+        WaitResult::Complete(status) => status,
+        WaitResult::Stopped(status) => {
+            if let Some(pgid) = foreground {
+                let id = jobs.next_id;
+                jobs.next_id += 1;
+                eprintln!("[{id}] Stopped {command_text}");
+                jobs.jobs.push(Job {
+                    id,
+                    pgid,
+                    command: command_text,
+                    outcomes,
+                    shell_modes,
+                    state: JobState::Stopped,
+                });
+            }
+            status
+        }
+    }
+}
+
+enum WaitResult {
+    Complete(u8),
+    Stopped(u8),
+}
+
+fn wait_outcomes(outcomes: &mut [Outcome]) -> WaitResult {
+    let mut status = 0;
+    let mut stopped = None;
+    for outcome in outcomes {
+        let (code, piped_out, did_stop) = match outcome {
+            Outcome::Running { child, piped_out } => {
+                let (code, stopped) = wait_for_job(child).unwrap_or((1, false));
+                (code, *piped_out, stopped)
+            }
+            Outcome::Failed(code) => (*code, false, false),
+        };
+        if did_stop {
+            stopped = Some(code);
+        }
+        if code != 0 && !(piped_out && code == SIGPIPE_CODE) {
+            status = code;
+        }
+    }
+    stopped.map_or(WaitResult::Complete(status), WaitResult::Stopped)
+}
+
+fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<WaitResult> {
+    let mut any_running = false;
+    let mut status = 0;
+    for outcome in outcomes {
+        let Outcome::Running { child, piped_out } = outcome else {
+            continue;
+        };
+        let mut raw = 0;
+        let result = unsafe {
+            libc::waitpid(
+                child.id() as libc::pid_t,
+                &mut raw,
+                libc::WNOHANG | libc::WUNTRACED,
+            )
+        };
+        if result == 0 {
+            any_running = true;
+        } else if result > 0 && libc::WIFSTOPPED(raw) {
+            return Some(WaitResult::Stopped(128 + libc::WSTOPSIG(raw) as u8));
+        } else if result > 0 {
+            let code = wait_status(raw);
+            if code != 0 && !(*piped_out && code == SIGPIPE_CODE) {
+                status = code;
+            }
+        }
+    }
+    (!any_running).then_some(WaitResult::Complete(status))
+}
+
+fn signal_group(pgid: libc::pid_t, signal: libc::c_int, label: &str) -> Result<(), ()> {
+    if unsafe { libc::kill(-pgid, signal) } < 0 {
+        eprintln!("mesh: {label}: {}", std::io::Error::last_os_error());
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+fn reclaim_terminal(modes: Option<&libc::termios>) {
+    let shell_group = unsafe { libc::getpgrp() };
+    set_foreground_group(shell_group);
+    if let Some(modes) = modes {
+        restore_terminal_modes(modes);
+    }
 }
 
 fn terminal_modes() -> Option<libc::termios> {
@@ -236,7 +457,7 @@ fn restore_terminal_modes(modes: &libc::termios) {
 /// termination, which would leave mesh blocked after Ctrl-Z. Reporting a stop
 /// now lets the shell reclaim the terminal; the job-table task will retain the
 /// process and make it available to `fg` / `bg`.
-fn wait_for_job(child: &mut Child) -> std::io::Result<u8> {
+fn wait_for_job(child: &mut Child) -> std::io::Result<(u8, bool)> {
     loop {
         let mut status = 0;
         // SAFETY: child.id() is a live child PID and status points to writable
@@ -251,14 +472,24 @@ fn wait_for_job(child: &mut Child) -> std::io::Result<u8> {
             return Err(err);
         }
         if libc::WIFEXITED(status) {
-            return Ok(libc::WEXITSTATUS(status) as u8);
+            return Ok((libc::WEXITSTATUS(status) as u8, false));
         }
         if libc::WIFSIGNALED(status) {
-            return Ok(128u8.wrapping_add(libc::WTERMSIG(status) as u8));
+            return Ok((128u8.wrapping_add(libc::WTERMSIG(status) as u8), false));
         }
         if libc::WIFSTOPPED(status) {
-            return Ok(128u8.wrapping_add(libc::WSTOPSIG(status) as u8));
+            return Ok((128u8.wrapping_add(libc::WSTOPSIG(status) as u8), true));
         }
+    }
+}
+
+fn wait_status(status: libc::c_int) -> u8 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status) as u8
+    } else if libc::WIFSIGNALED(status) {
+        128u8.wrapping_add(libc::WTERMSIG(status) as u8)
+    } else {
+        1
     }
 }
 
@@ -346,7 +577,15 @@ fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{restore_job_signals, restore_terminal_modes, terminal_modes};
+    use super::{JobTable, restore_job_signals, restore_terminal_modes, terminal_modes};
+
+    #[test]
+    fn job_builtins_fail_cleanly_with_an_empty_table() {
+        let mut jobs = JobTable::new();
+        assert_eq!(jobs.foreground(&[]), 1);
+        assert_eq!(jobs.background(&[]), 1);
+        assert_eq!(jobs.list(&[]), 0);
+    }
 
     #[test]
     fn child_restores_sigint_to_default() {

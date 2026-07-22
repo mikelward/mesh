@@ -50,7 +50,7 @@ enum Step {
 /// sequence of commands joined by `;` / `&&` / `||`; each connector decides
 /// whether its command runs from the previous command's status. Empty lines (and
 /// empty segments, e.g. a trailing `;`) are a no-op that keeps the last status.
-fn run_line(text: &str, last: u8, vars: &mut Vars) -> Step {
+fn run_line(text: &str, last: u8, vars: &mut Vars, jobs: &mut exec::JobTable) -> Step {
     let segments = match lexer::split_line(text) {
         Ok(segments) => segments,
         Err(err) => {
@@ -70,7 +70,7 @@ fn run_line(text: &str, last: u8, vars: &mut Vars) -> Step {
             // `;`): a no-op that leaves the status unchanged.
             continue;
         }
-        match run_pipeline(segment.stages, status, vars) {
+        match run_pipeline(segment.stages, status, vars, jobs) {
             Step::Exit(code) => return Step::Exit(code),
             Step::Continue(code) => status = code,
         }
@@ -80,21 +80,26 @@ fn run_line(text: &str, last: u8, vars: &mut Vars) -> Step {
 
 /// Run one pipeline. A single stage keeps the full command surface (assignments,
 /// builtins). A multi-stage pipeline (`|`) is external commands only for now.
-fn run_pipeline(mut stages: Vec<Stage>, last: u8, vars: &mut Vars) -> Step {
+fn run_pipeline(
+    mut stages: Vec<Stage>,
+    last: u8,
+    vars: &mut Vars,
+    jobs: &mut exec::JobTable,
+) -> Step {
     if stages.len() == 1 {
-        run_single(stages.pop().unwrap(), last, vars)
+        run_single(stages.pop().unwrap(), last, vars, jobs)
     } else {
-        run_multi(stages, vars)
+        run_multi(stages, vars, jobs)
     }
 }
 
 /// Run a one-stage pipeline. Without redirections this is the full command
 /// surface: an assignment or a builtin/external command. With redirections it is
 /// a command only (external for now — a redirected builtin is not supported yet).
-fn run_single(stage: Stage, last: u8, vars: &mut Vars) -> Step {
+fn run_single(stage: Stage, last: u8, vars: &mut Vars, jobs: &mut exec::JobTable) -> Step {
     let Stage { words, redirs } = stage;
     if redirs.is_empty() {
-        return run_command_or_assign(words, last, vars);
+        return run_command_or_assign(words, last, vars, jobs);
     }
     let argv = match expand::expand(words, vars) {
         Ok(argv) => argv,
@@ -115,10 +120,13 @@ fn run_single(stage: Stage, last: u8, vars: &mut Vars) -> Step {
         return Step::Continue(1);
     }
     match expand_redirs(redirs, vars) {
-        Ok(redirs) => Step::Continue(exec::run_pipeline(vec![exec::Cmd {
-            words: argv,
-            redirs,
-        }])),
+        Ok(redirs) => Step::Continue(exec::run_pipeline(
+            vec![exec::Cmd {
+                words: argv,
+                redirs,
+            }],
+            jobs,
+        )),
         Err(err) => {
             eprintln!("mesh: {err}");
             Step::Continue(1)
@@ -128,7 +136,7 @@ fn run_single(stage: Stage, last: u8, vars: &mut Vars) -> Step {
 
 /// Run a multi-stage pipeline (`a | b | c`). Every stage must be an external
 /// command; a builtin in a pipeline is not supported yet.
-fn run_multi(stages: Vec<Stage>, vars: &mut Vars) -> Step {
+fn run_multi(stages: Vec<Stage>, vars: &mut Vars, jobs: &mut exec::JobTable) -> Step {
     let mut cmds = Vec::with_capacity(stages.len());
     for stage in stages {
         let Stage { words, redirs } = stage;
@@ -162,7 +170,7 @@ fn run_multi(stages: Vec<Stage>, vars: &mut Vars) -> Step {
             redirs,
         });
     }
-    Step::Continue(exec::run_pipeline(cmds))
+    Step::Continue(exec::run_pipeline(cmds, jobs))
 }
 
 /// Expand each redirection target to exactly one path. Zero or several words is
@@ -184,7 +192,12 @@ fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<(RedirKind, Stri
 
 /// Run one command with no redirections: classify it as an assignment or a
 /// command and act. `last` is the previous status (the default for a bare `exit`).
-fn run_command_or_assign(tokens: Vec<Word>, last: u8, vars: &mut Vars) -> Step {
+fn run_command_or_assign(
+    tokens: Vec<Word>,
+    last: u8,
+    vars: &mut Vars,
+    jobs: &mut exec::JobTable,
+) -> Step {
     match classify(tokens) {
         Line::Assign { name, rhs } => match assign(&name, rhs, vars) {
             Ok(()) => Step::Continue(0),
@@ -206,10 +219,19 @@ fn run_command_or_assign(tokens: Vec<Word>, last: u8, vars: &mut Vars) -> Step {
                 // matches) is an empty-list result — status 0 per `DESIGN.md`.
                 return Step::Continue(0);
             }
+            let job_status = match words[0].as_str() {
+                "fg" => Some(jobs.foreground(&words[1..])),
+                "bg" => Some(jobs.background(&words[1..])),
+                "jobs" => Some(jobs.list(&words[1..])),
+                _ => None,
+            };
+            if let Some(code) = job_status {
+                return Step::Continue(code);
+            }
             match builtins::dispatch(&words, last) {
                 Some(Builtin::Exit(code)) => Step::Exit(code),
                 Some(Builtin::Status(code)) => Step::Continue(code),
-                None => Step::Continue(exec::run(&words)),
+                None => Step::Continue(exec::run(&words, jobs)),
             }
         }
     }
@@ -343,10 +365,12 @@ fn run_interactive() -> ExitCode {
     let mut editor = Reedline::create();
     let mut last: u8 = 0;
     let mut vars = Vars::new();
+    let mut jobs = exec::JobTable::new();
     loop {
+        jobs.reap();
         let prompt = MeshPrompt { failed: last != 0 };
         match editor.read_line(&prompt) {
-            Ok(signal) => match handle_signal(signal, last, &mut vars) {
+            Ok(signal) => match handle_signal(signal, last, &mut vars, &mut jobs) {
                 Step::Exit(code) => return ExitCode::from(code),
                 Step::Continue(code) => last = code,
             },
@@ -412,9 +436,9 @@ fn ignore_interactive_signals() -> io::Result<()> {
 /// `Ctrl-D` exits (reedline only emits it on an empty line, so this is the
 /// exit-on-empty behavior); `Ctrl-C` — and any future signal — cancels the
 /// current line and re-prompts, keeping the last status.
-fn handle_signal(signal: Signal, last: u8, vars: &mut Vars) -> Step {
+fn handle_signal(signal: Signal, last: u8, vars: &mut Vars, jobs: &mut exec::JobTable) -> Step {
     match signal {
-        Signal::Success(line) => run_line(&line, last, vars),
+        Signal::Success(line) => run_line(&line, last, vars, jobs),
         Signal::CtrlD => Step::Exit(last),
         _ => Step::Continue(last),
     }
@@ -428,6 +452,7 @@ fn run_piped() -> ExitCode {
     let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
     let mut last: u8 = 0;
     let mut vars = Vars::new();
+    let mut jobs = exec::JobTable::new();
     let mut line = Vec::new();
 
     loop {
@@ -449,7 +474,7 @@ fn run_piped() -> ExitCode {
                 continue;
             }
         };
-        match run_line(text, last, &mut vars) {
+        match run_line(text, last, &mut vars, &mut jobs) {
             Step::Exit(code) => return ExitCode::from(code),
             Step::Continue(code) => last = code,
         }
@@ -512,20 +537,26 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{Step, handle_signal, run_line};
+    use crate::exec::JobTable;
     use crate::vars::Vars;
     use reedline::Signal;
 
     #[test]
     fn ctrl_d_exits_with_the_last_status() {
         let mut vars = Vars::new();
-        assert_eq!(handle_signal(Signal::CtrlD, 7, &mut vars), Step::Exit(7));
+        let mut jobs = JobTable::new();
+        assert_eq!(
+            handle_signal(Signal::CtrlD, 7, &mut vars, &mut jobs),
+            Step::Exit(7)
+        );
     }
 
     #[test]
     fn ctrl_c_re_prompts_keeping_status() {
         let mut vars = Vars::new();
+        let mut jobs = JobTable::new();
         assert_eq!(
-            handle_signal(Signal::CtrlC, 7, &mut vars),
+            handle_signal(Signal::CtrlC, 7, &mut vars, &mut jobs),
             Step::Continue(7)
         );
     }
@@ -533,27 +564,37 @@ mod tests {
     #[test]
     fn a_submitted_exit_line_exits() {
         let mut vars = Vars::new();
+        let mut jobs = JobTable::new();
         let signal = Signal::Success("exit 5".to_string());
-        assert_eq!(handle_signal(signal, 0, &mut vars), Step::Exit(5));
+        assert_eq!(
+            handle_signal(signal, 0, &mut vars, &mut jobs),
+            Step::Exit(5)
+        );
     }
 
     #[test]
     fn a_submitted_blank_line_keeps_the_status() {
         let mut vars = Vars::new();
-        assert_eq!(run_line("   ", 3, &mut vars), Step::Continue(3));
+        let mut jobs = JobTable::new();
+        assert_eq!(run_line("   ", 3, &mut vars, &mut jobs), Step::Continue(3));
     }
 
     #[test]
     fn assignment_then_read() {
         let mut vars = Vars::new();
-        assert_eq!(run_line("x = hello", 0, &mut vars), Step::Continue(0));
+        let mut jobs = JobTable::new();
+        assert_eq!(
+            run_line("x = hello", 0, &mut vars, &mut jobs),
+            Step::Continue(0)
+        );
         assert_eq!(vars.get("x"), Some("hello"));
     }
 
     #[test]
     fn unspaced_assignment() {
         let mut vars = Vars::new();
-        assert_eq!(run_line("n=42", 0, &mut vars), Step::Continue(0));
+        let mut jobs = JobTable::new();
+        assert_eq!(run_line("n=42", 0, &mut vars, &mut jobs), Step::Continue(0));
         assert_eq!(vars.get("n"), Some("42"));
     }
 }
