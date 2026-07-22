@@ -31,6 +31,11 @@ impl Vars {
         Self::default()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set(&mut self, name: &str, value: String) {
+        self.set_value(name, Value::String(value));
+    }
+
     /// Enter a fresh function-local scope; balanced by [`pop_scope`].
     pub fn push_scope(&mut self) {
         self.locals.push(Scope::new());
@@ -59,12 +64,6 @@ impl Vars {
         } else {
             self.global.contains_key(name)
         }
-    }
-
-    /// Bind `name` to `value`, creating or replacing it in the active scope.
-    pub fn set(&mut self, name: &str, value: String) {
-        self.active_mut()
-            .insert(name.to_string(), Value::String(value));
     }
 
     /// Bind an already typed value without converting lists to strings.

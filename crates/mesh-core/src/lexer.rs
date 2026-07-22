@@ -663,6 +663,19 @@ fn parse_var_ref(inner: &str) -> Option<VarRef> {
     })
 }
 
+/// Convert the parser's lossless `$...` spelling into the compatibility value
+/// reference used by expansion. Structural parsing has already happened; this
+/// only decodes the reference payload while expansion is migrated separately.
+pub(crate) fn parser_var_ref(spelling: &str, quoted: bool) -> Option<VarRef> {
+    let inner = spelling
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| spelling.strip_prefix('$'))?;
+    let mut reference = parse_var_ref(inner)?;
+    reference.quoted = quoted;
+    Some(reference)
+}
+
 fn parse_modifiers(chars: &[char], at: &mut usize) -> Vec<Modifier> {
     let mut modifiers = Vec::new();
     loop {

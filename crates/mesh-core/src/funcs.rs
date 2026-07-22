@@ -3,14 +3,17 @@
 //! A `func name(params) { body }` definition binds a named callable. v1 supports
 //! **required named positionals** only; optional defaults, `--flags`, and
 //! `...rest` are deferred (see `DESIGN.md` §"Functions"). The body is kept as raw
-//! source and re-run on each call — a compiled body arrives with a real parser.
+//! syntax tree and executed directly on each call.
 
 use std::collections::HashMap;
 
-/// A defined function: its positional parameter names and its raw body source.
+use crate::parser::Source;
+
+/// A defined function: its positional parameter names and parsed body.
+#[derive(Clone)]
 pub struct FuncDef {
     pub params: Vec<String>,
-    pub body: String,
+    pub body: Source,
 }
 
 /// The session's defined functions (name → definition).
