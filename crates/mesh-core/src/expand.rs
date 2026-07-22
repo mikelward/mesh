@@ -11,7 +11,7 @@
 
 use std::env;
 
-use crate::lexer::{Piece, VarRef, Word};
+use crate::lexer::{Access, Piece, VarRef, Word};
 use crate::vars::{Value, Vars};
 
 /// An expansion error — an unbound read fails loud (no null), per `DESIGN.md`.
@@ -46,13 +46,29 @@ impl std::fmt::Display for ExpandError {
 pub fn expand(words: Vec<Word>, vars: &Vars) -> Result<Vec<String>, ExpandError> {
     let mut out = Vec::new();
     for word in words {
-        if let Some(name) = spread_var(&word) {
-            match vars.get(name) {
-                Some(Value::List(values)) => out.extend(values.iter().cloned()),
+        if let Some(vref) = spread_var(&word) {
+            match vars.get(&vref.name) {
+                Some(Value::List(values)) => match &vref.access {
+                    None => out.extend(values.iter().cloned()),
+                    Some(Access::Slice {
+                        start,
+                        end,
+                        inclusive,
+                    }) => out.extend(slice(values, *start, *end, *inclusive).iter().cloned()),
+                    Some(Access::Index(_)) => {
+                        return Err(ExpandError::Unsupported(format!(
+                            "...${}: cannot spread a single list element",
+                            vref.name
+                        )));
+                    }
+                },
                 Some(Value::String(_)) => {
-                    return Err(ExpandError::Unsupported(format!("...${name} on a string")));
+                    return Err(ExpandError::Unsupported(format!(
+                        "...${} on a string",
+                        vref.name
+                    )));
                 }
-                None => return Err(ExpandError::UnboundVar(name.to_string())),
+                None => return Err(ExpandError::UnboundVar(vref.name.clone())),
             }
             continue;
         }
@@ -63,19 +79,15 @@ pub fn expand(words: Vec<Word>, vars: &Vars) -> Result<Vec<String>, ExpandError>
 
 /// Recognize the deliberately narrow first spread form: `...$name` as a whole
 /// word. General expression spreading arrives with the parser.
-fn spread_var(word: &Word) -> Option<&str> {
+fn spread_var(word: &Word) -> Option<&VarRef> {
     match word.0.as_slice() {
         [
             Piece::Text {
                 text,
                 expandable: true,
             },
-            Piece::Var(VarRef {
-                name,
-                member: None,
-                index: None,
-            }),
-        ] if text == "..." => Some(name),
+            Piece::Var(vref),
+        ] if text == "..." && vref.member.is_none() => Some(vref),
         _ => None,
     }
 }
@@ -139,21 +151,21 @@ fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), Exp
 /// `$name` reads the variable store (unbound is an error). Member access on any
 /// namespace other than `env`, and a bare `$env`, are not supported yet.
 fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
-    match (vref.name.as_str(), &vref.member, vref.index) {
+    match (vref.name.as_str(), &vref.member, &vref.access) {
         ("env", Some(key), None) => env::var_os(key)
             .map(|v| v.to_string_lossy().into_owned())
             .ok_or_else(|| ExpandError::UnsetEnv(key.clone())),
         ("env", None, None) => Err(ExpandError::Unsupported("$env".to_string())),
-        (name, None, Some(index)) => vars
+        (name, None, Some(Access::Index(index))) => vars
             .get(name)
             .ok_or_else(|| ExpandError::UnboundVar(name.to_string()))
             .and_then(|value| match value {
                 Value::String(_) => Err(ExpandError::NotAList(name.to_string())),
                 Value::List(values) => {
-                    let offset = if index < 0 {
-                        values.len() as i128 + index as i128
+                    let offset = if *index < 0 {
+                        values.len() as i128 + *index as i128
                     } else {
-                        index as i128
+                        *index as i128
                     };
                     usize::try_from(offset)
                         .ok()
@@ -161,9 +173,16 @@ fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
                         .cloned()
                         .ok_or_else(|| ExpandError::IndexOutOfRange {
                             name: name.to_string(),
-                            index,
+                            index: *index,
                         })
                 }
+            }),
+        (name, None, Some(Access::Slice { .. })) => vars
+            .get(name)
+            .ok_or_else(|| ExpandError::UnboundVar(name.to_string()))
+            .and_then(|value| match value {
+                Value::String(_) => Err(ExpandError::NotAList(name.to_string())),
+                Value::List(_) => Err(ExpandError::ListNeedsSpread(name.to_string())),
             }),
         (name, None, None) => vars
             .get(name)
@@ -173,10 +192,32 @@ fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
                 Value::List(_) => Err(ExpandError::ListNeedsSpread(name.to_string())),
             }),
         (name, Some(member), None) => Err(ExpandError::Unsupported(format!("${name}.{member}"))),
-        (name, member, Some(index)) => Err(ExpandError::Unsupported(format!(
-            "${name}{}[{index}]",
+        (name, member, Some(access)) => Err(ExpandError::Unsupported(format!(
+            "${name}{}[{access:?}]",
             member.as_ref().map(|m| format!(".{m}")).unwrap_or_default()
         ))),
+    }
+}
+
+fn slice<T>(values: &[T], start: Option<i64>, end: Option<i64>, inclusive: bool) -> &[T] {
+    let len = values.len() as i128;
+    let clamp = |bound: i64| -> usize {
+        let offset = if bound < 0 {
+            len + bound as i128
+        } else {
+            bound as i128
+        };
+        offset.clamp(0, len) as usize
+    };
+    let start = start.map_or(0, clamp);
+    let mut end = end.map_or(values.len(), clamp);
+    if inclusive && end < values.len() {
+        end += 1;
+    }
+    if start >= end {
+        &values[0..0]
+    } else {
+        &values[start..end]
     }
 }
 

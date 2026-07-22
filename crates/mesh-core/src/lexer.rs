@@ -19,13 +19,23 @@
 //! `\`-newline continuation across input lines.
 
 /// A variable reference: `$name`, `${name}`, or `$env.member`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarRef {
     pub name: String,
     /// A single `.member` access, e.g. `$env.PATH` → name `env`, member `PATH`.
     pub member: Option<String>,
-    /// An exact integer index, e.g. `$xs[-1]`.
-    pub index: Option<i64>,
+    pub access: Option<Access>,
+}
+
+/// An exact list index or a clamped range slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Access {
+    Index(i64),
+    Slice {
+        start: Option<i64>,
+        end: Option<i64>,
+        inclusive: bool,
+    },
 }
 
 /// One piece of a word.
@@ -547,12 +557,12 @@ fn parse_var(chars: &[char], at: usize) -> Result<Option<(VarRef, usize)>, LexEr
             j = k;
         }
     }
-    let (index, j) = parse_index(chars, j).unwrap_or((None, j));
+    let (access, j) = parse_access(chars, j).unwrap_or((None, j));
     Ok(Some((
         VarRef {
             name,
             member,
-            index,
+            access,
         },
         j,
     )))
@@ -575,7 +585,7 @@ fn parse_var_ref(inner: &str) -> Option<VarRef> {
         member = Some(m);
         j = k;
     }
-    let (index, next) = parse_index(&chars, j)?;
+    let (access, next) = parse_access(&chars, j)?;
     j = next;
     if j != chars.len() {
         return None; // trailing junk
@@ -583,17 +593,40 @@ fn parse_var_ref(inner: &str) -> Option<VarRef> {
     Some(VarRef {
         name,
         member,
-        index,
+        access,
     })
 }
 
-fn parse_index(chars: &[char], start: usize) -> Option<(Option<i64>, usize)> {
+fn parse_access(chars: &[char], start: usize) -> Option<(Option<Access>, usize)> {
     if chars.get(start) != Some(&'[') {
         return Some((None, start));
     }
     let end = chars[start + 1..].iter().position(|c| *c == ']')? + start + 1;
     let text: String = chars[start + 1..end].iter().collect();
-    Some((Some(text.parse().ok()?), end + 1))
+    let access = if let Some((start, end)) = text.split_once("..=") {
+        Access::Slice {
+            start: parse_bound(start)?,
+            end: Some(end.parse().ok()?),
+            inclusive: true,
+        }
+    } else if let Some((start, end)) = text.split_once("..") {
+        Access::Slice {
+            start: parse_bound(start)?,
+            end: parse_bound(end)?,
+            inclusive: false,
+        }
+    } else {
+        Access::Index(text.parse().ok()?)
+    };
+    Some((Some(access), end + 1))
+}
+
+fn parse_bound(text: &str) -> Option<Option<i64>> {
+    if text.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(text.parse().ok()?))
+    }
 }
 
 /// Read a kebab identifier at `start`: an alphabetic head, then alphanumeric/`_`,
@@ -694,7 +727,8 @@ fn push_char(word: &mut Vec<Piece>, c: char, expandable: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        LexError, Piece, Redir, RedirKind, Segment, Sep, Stage, VarRef, Word, split, split_line,
+        Access, LexError, Piece, Redir, RedirKind, Segment, Sep, Stage, VarRef, Word, split,
+        split_line,
     };
 
     fn exp(text: &str) -> Piece {
@@ -713,7 +747,7 @@ mod tests {
         Piece::Var(VarRef {
             name: name.to_string(),
             member: None,
-            index: None,
+            access: None,
         })
     }
 
@@ -878,7 +912,7 @@ mod tests {
             [Word(vec![Piece::Var(VarRef {
                 name: "env".into(),
                 member: Some("PATH".into()),
-                index: None,
+                access: None,
             })])]
         );
     }
@@ -903,7 +937,7 @@ mod tests {
             Piece::Var(VarRef {
                 name: "map".into(),
                 member: Some("field".into()),
-                index: None,
+                access: None,
             })
         };
         assert_eq!(words(r#""$map.field""#), [Word(vec![member()])]);
@@ -913,11 +947,38 @@ mod tests {
             Piece::Var(VarRef {
                 name: "items".into(),
                 member: None,
-                index: Some(-1),
+                access: Some(Access::Index(-1)),
             })
         };
         assert_eq!(words(r#""$items[-1]""#), [Word(vec![index()])]);
         assert_eq!(words(r#""${items[-1]}""#), [Word(vec![index()])]);
+    }
+
+    #[test]
+    fn parses_half_open_and_inclusive_slices() {
+        let slice = |start, end, inclusive| {
+            Piece::Var(VarRef {
+                name: "items".into(),
+                member: None,
+                access: Some(Access::Slice {
+                    start,
+                    end,
+                    inclusive,
+                }),
+            })
+        };
+        assert_eq!(
+            words("$items[1..3]"),
+            [Word(vec![slice(Some(1), Some(3), false)])]
+        );
+        assert_eq!(
+            words("${items[..=2]}"),
+            [Word(vec![slice(None, Some(2), true)])]
+        );
+        assert_eq!(
+            words("$items[-2..]"),
+            [Word(vec![slice(Some(-2), None, false)])]
+        );
     }
 
     #[test]

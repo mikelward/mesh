@@ -228,6 +228,7 @@ empty string:
 list-assign = name "=" ws? "[" (word (ws word)*)? "]"
 spread      = "...$" name                  # whole command word, for now
 index       = "$" name "[" signed-integer "]"
+slice       = "$" name "[" signed-integer? (".." signed-integer? | "..=" signed-integer) "]"
 ```
 
 Each literal element uses the existing word expansion rules. A glob can
@@ -237,10 +238,12 @@ A list used as bare `$name` in command arguments is an error: mesh never
 implicitly word-splits or flattens a typed value. Spreading a string is also an
 error. Exact indexing is zero-based, accepts negative indices from the end, and
 returns one string element. An out-of-range index or indexing a string fails
-loudly.
+loudly. A slice is a list value and therefore uses spread in command position
+(`...$xs[1..3]`). Half-open (`..`) and inclusive (`..=`) bounds follow Rust's
+spelling, negative bounds count from the end, and out-of-range bounds clamp.
 
 This is deliberately a vertical slice rather than the final expression
-grammar. Lists currently contain strings only; nesting, slicing, `+=`, and
+grammar. Lists currently contain strings only; nesting, `+=`, and
 spread inside expressions remain unparsed.
 
 ### Not yet parsed
