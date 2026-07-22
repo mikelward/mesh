@@ -124,16 +124,7 @@ fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), Exp
         return Ok(());
     }
 
-    let pattern: String = pieces
-        .iter()
-        .map(|(t, e)| {
-            if *e {
-                t.clone()
-            } else {
-                glob::Pattern::escape(t)
-            }
-        })
-        .collect();
+    let pattern = glob_pattern(&pieces);
     let options = glob::MatchOptions {
         require_literal_leading_dot: true,
         ..glob::MatchOptions::new()
@@ -143,6 +134,44 @@ fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), Exp
         Err(_) => out.push(literal(&pieces)),
     }
     Ok(())
+}
+
+/// Escape literal pieces without allowing `-` to become a range operator when
+/// it occurs inside an active character class. `glob` has no escape spelling
+/// for an in-class hyphen, but treats one at the end of the class literally.
+fn glob_pattern(pieces: &Pieces) -> String {
+    let mut pattern = String::new();
+    let mut in_class = false;
+    let mut literal_hyphens = 0;
+
+    for (text, expandable) in pieces {
+        if !*expandable {
+            if in_class {
+                for ch in text.chars() {
+                    if ch == '-' {
+                        literal_hyphens += 1;
+                    } else {
+                        pattern.push_str(&glob::Pattern::escape(&ch.to_string()));
+                    }
+                }
+            } else {
+                pattern.push_str(&glob::Pattern::escape(text));
+            }
+            continue;
+        }
+
+        for ch in text.chars() {
+            if in_class && ch == ']' {
+                pattern.extend(std::iter::repeat_n('-', literal_hyphens));
+                literal_hyphens = 0;
+                in_class = false;
+            } else if !in_class && ch == '[' {
+                in_class = true;
+            }
+            pattern.push(ch);
+        }
+    }
+    pattern
 }
 
 /// Resolve a variable reference to its string value.
