@@ -1,9 +1,9 @@
 //! External command execution.
 //!
 //! Launches external commands, optionally connected by pipes and with `<` / `>`
-//! / `>>` redirections, and maps results to exit statuses. Every command or
-//! pipeline runs in its own process group, which owns the terminal while it is
-//! in the foreground.
+//! / `>>` redirections, and maps results to exit statuses. Interactive commands
+//! run in a process group that owns the terminal while it is in the foreground;
+//! non-interactive commands remain in mesh's group so signals still reach them.
 
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -69,8 +69,12 @@ enum Outcome {
 ///
 /// `cmds` is non-empty and every stage is an external command (builtins in a
 /// pipeline / with redirection are not supported yet, and are rejected earlier).
+/// Interactive pipelines get a foreground process group; non-interactive ones
+/// stay in mesh's process group so signals sent to the invoking group reach all
+/// stages.
 pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
     let n = cmds.len();
+    let interactive = std::io::stdin().is_terminal();
     let mut outcomes: Vec<Outcome> = Vec::new();
     let mut next_stdin = NextIn::Inherit;
     let mut process_group = None;
@@ -108,9 +112,11 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
 
         let mut command = Command::new(&cmd.words[0]);
         command.args(&cmd.words[1..]);
-        // A zero process group makes the first child a group leader. Later
-        // stages join it, so terminal signals address the entire pipeline.
-        command.process_group(process_group.unwrap_or(0));
+        if interactive {
+            // A zero process group makes the first child a group leader. Later
+            // stages join it, so terminal signals address the entire pipeline.
+            command.process_group(process_group.unwrap_or(0));
+        }
         // The interactive shell ignores terminal-generated signals while it
         // owns the prompt. Children must restore the ordinary dispositions so
         // Ctrl-C/Ctrl-Z/Ctrl-\\ affect the foreground job instead of being
@@ -146,14 +152,16 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
 
         match command.spawn() {
             Ok(mut child) => {
-                let pgid = process_group.unwrap_or_else(|| child.id() as i32);
-                process_group = Some(pgid);
-                // Repeat setpgid in the parent to close the race between spawn
-                // and exec; EACCES only means the child won that race.
-                // SAFETY: setpgid has no pointer arguments and these PIDs came
-                // directly from successful child creation.
-                unsafe {
-                    libc::setpgid(child.id() as libc::pid_t, pgid);
+                if interactive {
+                    let pgid = process_group.unwrap_or_else(|| child.id() as i32);
+                    process_group = Some(pgid);
+                    // Repeat setpgid in the parent to close the race between
+                    // spawn and exec; EACCES means the child won that race.
+                    // SAFETY: setpgid has no pointer arguments and these PIDs
+                    // came directly from successful child creation.
+                    unsafe {
+                        libc::setpgid(child.id() as libc::pid_t, pgid);
+                    }
                 }
                 if piped_out {
                     if let Some(out) = child.stdout.take() {
@@ -168,9 +176,15 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
         }
     }
 
-    let foreground = process_group.filter(|_| std::io::stdin().is_terminal());
+    let foreground = process_group;
     if let Some(pgid) = foreground {
         set_foreground_group(pgid);
+        // A child that reached a read before the handoff may have been stopped
+        // by SIGTTIN. Resume the group only after it owns the terminal.
+        // SAFETY: a negative PID addresses the process group created above.
+        unsafe {
+            libc::kill(-pgid, libc::SIGCONT);
+        }
     }
 
     // pipefail: the last stage to fail wins. A SIGPIPE is ignored only for a
