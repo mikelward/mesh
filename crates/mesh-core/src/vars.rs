@@ -62,6 +62,7 @@ impl Vars {
     }
 
     /// Bind `name` to `value`, creating or replacing it in the active scope.
+    #[cfg(test)]
     pub fn set(&mut self, name: &str, value: String) {
         self.active_mut()
             .insert(name.to_string(), Value::String(value));

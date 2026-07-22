@@ -368,10 +368,7 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
 /// Parse a buffered input unit. An open delimiter or trailing operator returns
 /// [`ParseOutcome::Incomplete`]; malformed complete input returns an error.
 pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
-    let tokens = match tokenize(source) {
-        Ok(tokens) => tokens,
-        Err(error) => return Err(error),
-    };
+    let tokens = tokenize(source)?;
     let mut parser = Parser {
         tokens,
         position: 0,

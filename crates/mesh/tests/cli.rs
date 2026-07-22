@@ -1955,6 +1955,60 @@ fn path_and_string_modifiers_transform_values_and_chain() {
 }
 
 #[test]
+fn path_modifiers_handle_relative_leaves_roots_and_dotfiles() {
+    let out = run_with_input(
+        r#"leaf = report.txt
+root = "/"
+dot = ".config.toml"
+puts $leaf:dir $root:dir
+puts $dot:exts $dot:bare
+"#,
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), ". /\ntoml .config\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn value_modifiers_recurse_through_nested_lists() {
+    let out = run_with_input("xs = [[a b] c]\nys = $xs:upper\nputs ...$ys[0]\nputs $ys[1]\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "A B\nC\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn for_rejects_the_reserved_environment_binding() {
+    let out = run_with_input("for env in [a] { puts BAD }\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reserved name"));
+}
+
+#[test]
+fn guard_errors_fail_the_conditional_list() {
+    let out = run_with_input("puts BAD if $missing && puts ALSO_BAD\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unbound variable"));
+}
+
+#[test]
+fn remainder_overflow_is_not_reported_as_division_by_zero() {
+    let out = run_with_input("x = (-9223372036854775807 - 1) % -1\n");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("numeric overflow"), "{stderr}");
+    assert!(!stderr.contains("division by zero"), "{stderr}");
+}
+
+#[test]
 fn collection_modifiers_preserve_typed_list_results() {
     let out = run_with_input(
         "xs = [a b b c]\nputs $xs:len $xs:first $xs:last\nputs ...$xs:rest:init:dedup\nys = $xs:rest:init\nputs ...$ys\n",

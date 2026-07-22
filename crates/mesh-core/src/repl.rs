@@ -221,8 +221,10 @@ fn run_executable(
             body,
         } => run_ast_for(binding, iterable, body, last, in_function, shell),
         Control { kind, value, guard } => {
-            if !guard_allows(guard.as_ref(), last, in_function, shell) {
-                return Step::Continue(last);
+            match guard_allows(guard.as_ref(), last, in_function, shell) {
+                Ok(true) => {}
+                Ok(false) => return Step::Continue(last),
+                Err(step) => return step,
             }
             match kind {
                 parser::ControlKind::Return => {
@@ -263,8 +265,10 @@ fn run_executable(
             }
         }
         Expression { expression, guard } => {
-            if !guard_allows(guard.as_ref(), last, in_function, shell) {
-                return Step::Continue(last);
+            match guard_allows(guard.as_ref(), last, in_function, shell) {
+                Ok(true) => {}
+                Ok(false) => return Step::Continue(last),
+                Err(step) => return step,
             }
             match eval_expr(expression, last, in_function, shell) {
                 Ok(_) => Step::Continue(0),
@@ -279,13 +283,12 @@ fn guard_allows(
     last: u8,
     in_function: bool,
     shell: &mut Shell,
-) -> bool {
-    guard.is_none_or(
-        |guard| match eval_expr(&guard.condition, last, in_function, shell) {
-            Ok(value) => truthy(&value) != guard.unless,
-            Err(_) => false,
-        },
-    )
+) -> Result<bool, Step> {
+    match guard {
+        None => Ok(true),
+        Some(guard) => eval_expr(&guard.condition, last, in_function, shell)
+            .map(|value| truthy(&value) != guard.unless),
+    }
 }
 
 fn run_ast_if(node: &parser::IfExpr, last: u8, in_function: bool, shell: &mut Shell) -> Step {
@@ -312,6 +315,10 @@ fn run_ast_for(
     in_function: bool,
     shell: &mut Shell,
 ) -> Step {
+    if binding == "env" {
+        eprintln!("mesh: for: `env` is a reserved name and cannot be a binding");
+        return Step::Continue(2);
+    }
     let value = match eval_expr(iterable, last, in_function, shell) {
         Ok(v) => v,
         Err(step) => return step,
@@ -360,8 +367,10 @@ fn run_ast_pipeline(
 ) -> Step {
     let mut stages = Vec::with_capacity(node.stages.len());
     for command in &node.stages {
-        if !guard_allows(command.guard.as_ref(), last, false, shell) {
-            return Step::Continue(last);
+        match guard_allows(command.guard.as_ref(), last, false, shell) {
+            Ok(true) => {}
+            Ok(false) => return Step::Continue(last),
+            Err(step) => return step,
         }
         let mut words = Vec::new();
         let mut redirs = Vec::new();
@@ -789,12 +798,18 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
                 .to_string(),
         ),
         Divide => Value::String(checked_div(number(&left)?, number(&right)?)?.to_string()),
-        Remainder => Value::String(
-            number(&left)?
-                .checked_rem(number(&right)?)
-                .ok_or("division by zero")?
-                .to_string(),
-        ),
+        Remainder => {
+            let left = number(&left)?;
+            let right = number(&right)?;
+            if right == 0 {
+                return Err("division by zero".into());
+            }
+            Value::String(
+                left.checked_rem(right)
+                    .ok_or("numeric overflow")?
+                    .to_string(),
+            )
+        }
         Less => bool_value(number(&left)? < number(&right)?),
         LessEqual => bool_value(number(&left)? <= number(&right)?),
         Greater => bool_value(number(&left)? > number(&right)?),

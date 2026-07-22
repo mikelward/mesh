@@ -19,7 +19,7 @@ bodies are lexical input, not grammar punctuation.
 ## Lexical contract
 
 The lexer emits tokens with byte spans. Longest match wins for punctuation:
-`...`, `..=`, `..`, `<<`, `>>`, `&&`, and `||` are each one token. Redirections are
+`...`, `<<<`, `..=`, `..`, `<<`, `>>`, `&&`, and `||` are each one token. Redirections are
 tokens even without surrounding whitespace. Value operators require surrounding
 whitespace when the design calls for it; word operators such as `and`, `or`, and
 `in` also require word boundaries. The token stream retains whitespace boundaries
@@ -56,6 +56,8 @@ simple-command  = command-item+ ;
 command-item    = command-word | redirection ;
 redirection     = redirect-op command-word | heredoc-redirect ;
 redirect-op     = "<" | ">" | ">>" | fd-redirect ;       # fd forms: later
+here-string-redirect
+                = "<<<" value-expression ;                 # later
 heredoc-redirect
                 = "<<" heredoc-delimiter HEREDOC_BODY ;
 heredoc-delimiter
@@ -98,7 +100,7 @@ conditional-assignment
 for-expression  = "for" pattern "in" value-expression block ;
 match-expression
                 = "match" value-expression "{" match-arm* "}" ;  # later
-match-arm       = pattern "=>" (value-expression | block) terminator* ;
+match-arm       = pattern block terminator* ;
 pattern         = name | "_" ;                             # destructuring: later
 ```
 
@@ -160,9 +162,9 @@ and-expression   = not-expression ("and" not-expression)* ;
 not-expression   = "not" not-expression | comparison ;
 comparison       = range-expression (compare-op range-expression)? ;
 compare-op       = "==" | "!=" | "<" | "<=" | ">" | ">=" | "~" | "!~" | "in" ;
-range-expression = additive (range-op additive?)?
-                 | range-op additive? ;
-range-op         = ".." | "..=" ;
+range-expression = additive (".." additive?)?
+                 | ".." additive?
+                 | additive? "..=" additive ;
 additive         = multiplicative (("+" | "-") multiplicative)* ;
 multiplicative   = prefix (("*" | "/" | "%") prefix)* ;
 prefix           = ("-" | "...") prefix | postfix ;
