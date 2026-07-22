@@ -64,8 +64,10 @@ fn runs_an_external_command() {
 }
 
 #[test]
-fn external_command_leads_its_own_process_group() {
-    let out = run_with_input("sh -c 'test \"$(ps -o pgid= -p $$ | xargs)\" = \"$$\"'\n");
+fn non_interactive_command_stays_in_mesh_process_group() {
+    let out = run_with_input(
+        "sh -c 'test \"$(ps -o pgid= -p $$ | xargs)\" = \"$(ps -o pgid= -p $PPID | xargs)\"'\n",
+    );
     assert_eq!(
         out.status.code(),
         Some(0),
