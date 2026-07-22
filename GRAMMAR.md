@@ -224,6 +224,7 @@ empty string:
 ```
 list-assign = name "=" ws? "[" (word (ws word)*)? "]"
 spread      = "...$" name                  # whole command word, for now
+index       = "$" name "[" signed-integer "]"
 ```
 
 Each literal element uses the existing word expansion rules. A glob can
@@ -231,11 +232,13 @@ therefore contribute zero or more elements. `...$name` contributes every list
 element as a separate command argument and contributes no arguments for `[]`.
 A list used as bare `$name` in command arguments is an error: mesh never
 implicitly word-splits or flattens a typed value. Spreading a string is also an
-error.
+error. Exact indexing is zero-based, accepts negative indices from the end, and
+returns one string element. An out-of-range index or indexing a string fails
+loudly.
 
 This is deliberately a vertical slice rather than the final expression
-grammar. Lists currently contain strings only; nesting, indexing, slicing,
-`+=`, and spread inside expressions remain unparsed.
+grammar. Lists currently contain strings only; nesting, slicing, `+=`, and
+spread inside expressions remain unparsed.
 
 ### Not yet parsed
 Nested/general list expressions, maps, `{ }` blocks, `func`, `:` modifiers, and

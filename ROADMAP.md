@@ -98,10 +98,11 @@ clean-break grammar; real values (lists, maps) with no word-splitting;
 `$`-expansion and the `...` spread; `:`-modifiers; `if`/`for`/`match`; `func`.
 
 The first vertical slice has landed: assignments accept string-list literals
-(`xs = [a "b c"]`, including `[]`), and `...$xs` spreads one into command
-arguments. A bare `$xs` in argument position fails loudly, preserving the
-design's explicit-spread/no-word-splitting rule. Nested values, indexing, and
-general expression parsing remain ahead.
+(`xs = [a "b c"]`, including `[]`), `...$xs` spreads one into command
+arguments, and exact integer indexing reads an element. A bare `$xs` in
+argument position fails loudly, preserving the design's
+explicit-spread/no-word-splitting rule. Nested values, slicing, and general
+expression parsing remain ahead.
 
 **Acceptance:** the `DESIGN.md`/`docs/INTRO.md` examples run as written.
 

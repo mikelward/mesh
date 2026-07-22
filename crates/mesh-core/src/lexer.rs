@@ -24,6 +24,8 @@ pub struct VarRef {
     pub name: String,
     /// A single `.member` access, e.g. `$env.PATH` → name `env`, member `PATH`.
     pub member: Option<String>,
+    /// An exact integer index, e.g. `$xs[-1]`.
+    pub index: Option<i64>,
 }
 
 /// One piece of a word.
@@ -541,7 +543,15 @@ fn parse_var(
             j = k;
         }
     }
-    Ok(Some((VarRef { name, member }, j)))
+    let (index, j) = parse_index(chars, j).unwrap_or((None, j));
+    Ok(Some((
+        VarRef {
+            name,
+            member,
+            index,
+        },
+        j,
+    )))
 }
 
 /// Is `s` a valid kebab identifier? Uses the same rule as [`read_name`] (so an
@@ -561,10 +571,25 @@ fn parse_var_ref(inner: &str) -> Option<VarRef> {
         member = Some(m);
         j = k;
     }
+    let (index, next) = parse_index(&chars, j)?;
+    j = next;
     if j != chars.len() {
         return None; // trailing junk
     }
-    Some(VarRef { name, member })
+    Some(VarRef {
+        name,
+        member,
+        index,
+    })
+}
+
+fn parse_index(chars: &[char], start: usize) -> Option<(Option<i64>, usize)> {
+    if chars.get(start) != Some(&'[') {
+        return Some((None, start));
+    }
+    let end = chars[start + 1..].iter().position(|c| *c == ']')? + start + 1;
+    let text: String = chars[start + 1..end].iter().collect();
+    Some((Some(text.parse().ok()?), end + 1))
 }
 
 /// Read a kebab identifier at `start`: an alphabetic head, then alphanumeric/`_`,
@@ -684,6 +709,7 @@ mod tests {
         Piece::Var(VarRef {
             name: name.to_string(),
             member: None,
+            index: None,
         })
     }
 
@@ -847,7 +873,8 @@ mod tests {
             words("$env.PATH"),
             [Word(vec![Piece::Var(VarRef {
                 name: "env".into(),
-                member: Some("PATH".into())
+                member: Some("PATH".into()),
+                index: None,
             })])]
         );
     }

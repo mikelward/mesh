@@ -443,6 +443,23 @@ fn list_requires_explicit_spread_in_command_arguments() {
 }
 
 #[test]
+fn list_indexing_is_zero_based_and_supports_negative_indices() {
+    let out = run_with_input("xs = [a 'b c' d]\nputs $xs[0] $xs[-1] ${xs[1]}!\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a d b c!\n");
+}
+
+#[test]
+fn invalid_list_index_fails_loudly_and_recovers() {
+    let out = run_with_input(
+        "xs = [a b]\nputs $xs[2]\nputs $xs[-3]\nx = text\nputs $x[0]\nputs recovered\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches("list index out of range").count(), 2);
+    assert!(stderr.contains("cannot index a string value"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "recovered\n");
+}
+
+#[test]
 fn interpolation_only_in_double_quotes() {
     let out = run_with_input("x = world\nputs \"hi $x\"\nputs 'hi $x'\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hi world\nhi $x\n");
