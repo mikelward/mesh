@@ -722,7 +722,7 @@ fn spawn_failure_harness() -> i32 {
     let missing = b"mesh-command-that-does-not-exist\n";
     if unsafe { libc::write(master, missing.as_ptr().cast(), missing.len()) }
         != missing.len() as isize
-        || !pty_wait_for_prompt(master)
+        || pty_read_until_any_prompt(master).is_none()
     {
         return 33;
     }
@@ -926,6 +926,14 @@ fn pty_wait_for_prompt(master: std::os::fd::RawFd) -> bool {
 }
 
 fn pty_read_until_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
+    let prompt = pty_read_until_any_prompt(master)?;
+    prompt
+        .windows(5)
+        .any(|part| part == b"mesh$")
+        .then_some(prompt)
+}
+
+fn pty_read_until_any_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
     let mut ready = libc::pollfd {
         fd: master,
         events: libc::POLLIN,
@@ -933,8 +941,12 @@ fn pty_read_until_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
     };
     let mut prompt = Vec::new();
     for _ in 0..8 {
-        if unsafe { libc::poll(&mut ready, 1, 2_000) } <= 0 {
-            return None;
+        let found = prompt
+            .windows(5)
+            .any(|part| part == b"mesh$" || part == b"mesh!");
+        let timeout = if found { 50 } else { 2_000 };
+        if unsafe { libc::poll(&mut ready, 1, timeout) } <= 0 {
+            return found.then_some(prompt);
         }
         let mut chunk = [0_u8; 256];
         let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
@@ -945,16 +957,10 @@ fn pty_read_until_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
         if prompt.windows(4).any(|part| part == b"\x1b[6n") {
             unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
         }
-        if prompt
-            .windows(5)
-            .any(|part| part == b"mesh$" || part == b"mesh!")
-        {
-            break;
-        }
     }
     prompt
         .windows(5)
-        .any(|part| part == b"mesh$")
+        .any(|part| part == b"mesh$" || part == b"mesh!")
         .then_some(prompt)
 }
 
