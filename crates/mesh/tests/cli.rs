@@ -1333,6 +1333,14 @@ fn a_descriptor_redirect_is_rejected_for_now() {
     let out = run_with_input("echo hello 2>err\nputs after\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("descriptor redirection"));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    for command in ["true;2>err", "true&&2>err", "false||2>err", "echo x|2>err"] {
+        let boundary = run_with_input(&format!("{command}\nputs after\n"));
+        assert!(
+            String::from_utf8_lossy(&boundary.stderr).contains("descriptor redirection"),
+            "{command:?} should reject the descriptor redirect"
+        );
+        assert_eq!(String::from_utf8_lossy(&boundary.stdout), "after\n");
+    }
     let amp = run_with_input("echo hello &>f\nputs after\n");
     assert!(String::from_utf8_lossy(&amp.stderr).contains("descriptor redirection"));
     // `&>` attached to a preceding argument (`hello&>f`) is still rejected.
