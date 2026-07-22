@@ -1658,3 +1658,14 @@ fn an_unterminated_definition_at_eof_is_reported() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn append_in_a_function_does_not_leak_to_the_global() {
+    // `g += after` inside a function binds a local (seeded from the visible
+    // global), so the global keeps its value after the call returns.
+    let out = run_with_input("g = before\nfunc f() { g += after; puts $g }\nf\nputs $g\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "beforeafter\nbefore\n"
+    );
+}

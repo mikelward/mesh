@@ -51,6 +51,16 @@ impl Vars {
         }
     }
 
+    /// Does the active scope already hold `name`? (Only the innermost local when
+    /// one is active, else the global — never an outer scope.)
+    fn active_has(&self, name: &str) -> bool {
+        if let Some(scope) = self.locals.last() {
+            scope.contains_key(name)
+        } else {
+            self.global.contains_key(name)
+        }
+    }
+
     /// Bind `name` to `value`, creating or replacing it in the active scope.
     pub fn set(&mut self, name: &str, value: String) {
         self.active_mut()
@@ -80,16 +90,24 @@ impl Vars {
         self.global.get(name)
     }
 
-    /// Append `value` according to the current string/list value rules, mutating
-    /// the binding wherever it lives (innermost local first, else global).
+    /// Append `value` according to the current string/list value rules.
+    ///
+    /// Append is an assignment, and assignment is **local-by-default**: inside a
+    /// function it must create or modify a local, never reach out and mutate an
+    /// outer (global) binding (`DESIGN.md` §"Scope — two levels"). So if the
+    /// active scope does not already hold `name`, the visible value (resolved
+    /// outward: local → global) is copied into the active scope first, then
+    /// appended there — leaving any shadowed global untouched. At top level the
+    /// active scope *is* the global, so this stays an in-place append there.
     pub fn append(&mut self, name: &str, value: Value) -> Result<(), String> {
-        let in_local = self.locals.last().is_some_and(|s| s.contains_key(name));
-        let current = if in_local {
-            self.locals.last_mut().unwrap().get_mut(name)
-        } else {
-            self.global.get_mut(name)
+        if !self.active_has(name) {
+            let seed = self
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("{name}: unbound variable"))?;
+            self.active_mut().insert(name.to_string(), seed);
         }
-        .ok_or_else(|| format!("{name}: unbound variable"))?;
+        let current = self.active_mut().get_mut(name).expect("seeded above");
         match (current, value) {
             (Value::String(left), Value::String(right)) => left.push_str(&right),
             (Value::List(left), Value::List(mut right)) => left.append(&mut right),
@@ -143,5 +161,18 @@ mod tests {
         vars.set("s", "a".into());
         vars.append("s", Value::String("b".into())).unwrap();
         assert_eq!(vars.get("s"), Some(&Value::String("ab".into())));
+    }
+
+    #[test]
+    fn append_in_a_function_shadows_rather_than_clobbers_a_global() {
+        // `+=` on a global-only name inside a function must create a local from
+        // the visible value, not mutate the global (local-by-default assignment).
+        let mut vars = Vars::new();
+        vars.set("g", "before".into());
+        vars.push_scope();
+        vars.append("g", Value::String("after".into())).unwrap();
+        assert_eq!(vars.get("g"), Some(&Value::String("beforeafter".into())));
+        vars.pop_scope();
+        assert_eq!(vars.get("g"), Some(&Value::String("before".into())));
     }
 }
