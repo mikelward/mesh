@@ -195,67 +195,6 @@ declined outright — are excluded; a couple where the maintainer agreed the iss
 is real but the fix is still pending are kept and marked as such. PRs 1–18 were
 not swept in this pass.
 
-### PR #20 — Design: modifier grammar cleanup + decisions & TODOs ([#20](https://github.com/mikelward/mesh/pull/20))
-
-- `DESIGN.md:1479` — [thread](https://github.com/mikelward/mesh/pull/20#discussion_r3612463317)
-  **[P2] Preserve `-nt` behavior when the source is missing** — When `$a` is
-  absent, this replacement does not match Bash: with both files absent,
-  `not $b:exists` makes it true, while with only `$a` absent it evaluates
-  `$a:mtime` and errors; checked Bash's `[[ ]]`, which returns false in both
-  cases and true only when the source exists while the target does not. Fresh
-  evidence beyond the earlier missing-target finding is this newly added
-  fallback expression, which still needs the source-existence side of the
-  operand truth table. *(no maintainer reply)*
-- `DESIGN.md:1489` — [thread](https://github.com/mikelward/mesh/pull/20#discussion_r3612463322)
-  **[P2] Replace the unsupported microsecond literal** — The conversion example
-  is written as executable mesh syntax, but `1900µs` cannot be parsed under the
-  contract immediately below that says literals only reach down to `ms`. This
-  can lead implementers to add an unintended `µs` literal or leave the
-  documented example unusable; demonstrate the remainder using a computed
-  nanosecond-resolution `Duration`, or explicitly add the smaller literal unit.
-  *(no maintainer reply)*
-- `DESIGN.md:1508` — [thread](https://github.com/mikelward/mesh/pull/20#discussion_r3612463326)
-  **[P2] Specify the timezone and precision of `:iso`** — For the same
-  `Instant`, `$t:iso` can validly produce UTC, local time with an offset, or a
-  zone-less ISO-8601 string, with multiple valid fractional-second precisions.
-  That leaves the timezone guess this paragraph says must be made explicit and
-  makes output vary between implementations or hosts; define the exact timezone,
-  offset spelling, and fractional precision for `:iso`, or require the
-  argument-bearing `:format(...)` path instead. *(no maintainer reply)*
-
-### PR #21 — Design: TODOs for runtime-string typing and flag-grammar extensions ([#21](https://github.com/mikelward/mesh/pull/21))
-
-- `DESIGN.md:271` — [thread](https://github.com/mikelward/mesh/pull/21#discussion_r3612535980)
-  **[P2] Narrow the claim that arithmetic and `+=` are int-only** — This
-  contradicts the settled polymorphic `+=` table in `DESIGN.md:684-701`, which
-  also defines list extension, map merging, and string concatenation, as well as
-  the `Duration`/`Instant` arithmetic in `DESIGN.md:1515-1517`. The actual
-  porting gap is that numeric operations do not coerce string operands;
-  describing the operators themselves as int-only could cause those
-  already-specified cases to be omitted from an implementation. *(no maintainer
-  reply)*
-- `DESIGN.md:1123` — [thread](https://github.com/mikelward/mesh/pull/21#discussion_r3612535987)
-  **[P2] Represent the tri-state without an unset value** — When neither
-  spelling is supplied, the proposed `unset` state cannot be read as the third
-  flag value under the settled model: `DESIGN.md:502-510` says mesh has no
-  absent value, and reads of unbound names fail loudly, while ordinary switches
-  are always bound to `false` when omitted (`DESIGN.md:1087-1088`). Define the
-  auto state using an existing value such as an enum string, or explicitly
-  reopen the no-null and parameter-binding rules; otherwise a function body
-  cannot safely observe the advertised tri-state. *(no maintainer reply)*
-
-### PR #23 — Design: stream-tty tests under $sh; drop undefined run reference ([#23](https://github.com/mikelward/mesh/pull/23))
-
-- `DESIGN.md:1805` — [thread](https://github.com/mikelward/mesh/pull/23#discussion_r3612570492)
-  **[P2] Limit the child-process contrast to external commands** — When the
-  invoked command resolves to a mesh function or stateful builtin, ordinary
-  invocation does not run it as a child: the isolation section explicitly says a
-  plain function runs in the current process so `cd` and `export` persist
-  (DESIGN.md:1237-1242). The new blanket statement therefore contradicts the
-  settled execution model and leaves the behavior of `exec` with
-  functions/builtins ambiguous; constrain this comparison to external
-  executables or specify that `exec` only accepts them. *(no maintainer reply)*
-
 ### PR #24 — Design: settle regex-as-value/re(), :int, exec, per-stream tty tests ([#24](https://github.com/mikelward/mesh/pull/24))
 
 - `DESIGN.md` — [thread](https://github.com/mikelward/mesh/pull/24#discussion_r3612864631)
@@ -272,34 +211,6 @@ not swept in this pass.
   colliding `/…/` syntax — so rather than patch the lexer rule a fourth time,
   I'm raising the disambiguation as a design decision with the maintainer
   instead of guessing. Will update here once it's resolved.
-- `DESIGN.md:884` — [thread](https://github.com/mikelward/mesh/pull/24#discussion_r3615024345)
-  **[P2] Define byte rendering for glob values** — The new `glob(STR)`
-  constructor creates a first-class glob value, but this exhaustive
-  argv-rendering table omits that type, and the corresponding `puts` rule
-  likewise omits it. Passing one outside a matcher, such as `echo glob($pattern)`
-  or `puts glob($pattern)`, therefore leaves implementations to choose between
-  emitting the source, expanding filesystem matches, or raising an error; add an
-  explicit glob rule at both byte boundaries. *(no maintainer reply)*
-- `DESIGN.md:884` — [thread](https://github.com/mikelward/mesh/pull/24#discussion_r3615024349)
-  **[P2] Reject no-byte-form values during interpolation** — Classifying regexes
-  and stream handles as having no canonical byte form settles argv and the newly
-  updated `puts`/`print` behavior, but string interpolation still accepts `${…}`
-  without defining what happens for these new values. Expressions such as
-  `r = re("x"); s = "pattern=${r}"` and `s = "${sh.stdin}"` consequently have no
-  specified rendering; make interpolation a loud error for no-byte-form values,
-  matching the existing explicit rule for `Instant`. *(no maintainer reply)*
-
-### PR #29 — Design: regex literal, absolute-path rule, and string quoting (Model B) ([#29](https://github.com/mikelward/mesh/pull/29))
-
-- `DESIGN.md:1151` — [thread](https://github.com/mikelward/mesh/pull/29#discussion_r3616490841)
-  **[P2] Keep the extended-mode literal in one word** — With the newly adopted
-  word-shape rule, the unquoted space terminates this word before its closing
-  `/`, so `/foo # (/:x` cannot be recognized as a clean `/BODY/` literal and
-  never reaches extended-mode compilation. Use a single-word example such as
-  `/foo#(/:x`, where `# (` is ignored only by extended regex parsing, or
-  explicitly define slash-delimited regex tokens as spanning unescaped
-  whitespace. *(no maintainer reply)*
-
 ### PR #30 — Add the real lexer: quoting, escapes, and expansion suppression ([#30](https://github.com/mikelward/mesh/pull/30))
 
 - `crates/mesh/src/expand.rs:64` — [thread](https://github.com/mikelward/mesh/pull/30#discussion_r3616268047)
@@ -358,43 +269,6 @@ not swept in this pass.
   search to the header (before the body `{`) so malformed definitions remain
   quarantined through their matching body close. *(no maintainer reply)*
 
-### PR #44 — Design the glob() function family and string member-access question ([#44](https://github.com/mikelward/mesh/pull/44))
-
-- `DESIGN.md:303` — [thread](https://github.com/mikelward/mesh/pull/44#discussion_r3624114875)
-  **[P2] Bind qualifier comparisons to each candidate path** — When evaluating
-  `glob("*", type: file, size > 1M)`, the comparison now occupies an ordinary
-  value-call argument, but the value-call grammar provides no candidate path or
-  implicit `size` binding. Consequently, an implementation must either evaluate
-  `size > 1M` once before `glob` runs or invent an undocumented
-  deferred-expression context, and the advertised equivalence with
-  `*(size > 1M)` is not implementable consistently. Define the per-match binding
-  or use an explicit predicate representation. *(no maintainer reply)*
-- `DESIGN.md:1567` — [thread](https://github.com/mikelward/mesh/pull/44#discussion_r3624114880)
-  **[P2] Reject named options for external value-mode captures** — When an
-  external is invoked through the newly allowed `cmd(…):capture` form, this rule
-  also permits a direct named option such as `grep(foo, color: never):capture`,
-  but an external has no signature against which `color` can bind and there is no
-  canonical argv encoding for it. Although the resolved map-spread case now
-  rejects external named options for exactly that reason, the fresh direct
-  `key: value` form remains accepted by the blanket value-mode rule; restrict it
-  to signed in-shell callees or define its external encoding. *(no maintainer
-  reply)*
-
-### PR #46 — Settle regex substitution as :replace with a regex OLD ([#46](https://github.com/mikelward/mesh/pull/46))
-
-- `DESIGN.md:303` — [thread](https://github.com/mikelward/mesh/pull/46#discussion_r3624611481)
-  **[P2] Mark the backreference spelling as provisional** — This normative
-  bullet says `${1}` and `${name}` splice captures, but the immediately following
-  open-question paragraph explicitly says the `${1}` versus `$1` spelling remains
-  undecided, and the Open questions section repeats that status. Because
-  `DESIGN.md` serves as the language specification, this gives implementers
-  conflicting guidance about which grammar to accept; either decide the spelling
-  here or label these forms as provisional placeholders.
-  _Maintainer reply:_ Agreed, that's a real contradiction. The intent is
-  "provisional placeholder," not a settled grammar. This PR is already merged, so
-  the wording fix will land in a follow-up (either standalone or folded into
-  whichever change settles the spelling). Tracking it now.
-
 ### PR #57 — Run foreground commands in process groups ([#57](https://github.com/mikelward/mesh/pull/57))
 
 - `crates/mesh-core/src/exec.rs:166` — [thread](https://github.com/mikelward/mesh/pull/57#discussion_r3626714504)
@@ -445,52 +319,6 @@ not swept in this pass.
   never stopped on SIGTTIN should not receive SIGCONT; synchronize the terminal
   handoff before allowing exec, or continue only a group confirmed to have
   stopped, with PTY regression coverage. *(no maintainer reply)*
-
-### PR #60 — Fix macOS PTY null pointer types ([#60](https://github.com/mikelward/mesh/pull/60))
-
-- `crates/mesh-core/src/exec.rs:393` — [thread](https://github.com/mikelward/mesh/pull/60#discussion_r3626808743)
-  **[P1] Update the second macOS openpty call** — On macOS, this corrects only
-  the `mesh-core` unit-test call; `crates/mesh/tests/cli.rs:627-628` still passes
-  `std::ptr::null()` where `libc::openpty` requires mutable `termios` and
-  `winsize` pointers. Because the macOS CI job compiles all targets, the
-  workspace still fails with E0308 before the integration tests run, so apply the
-  same `null_mut()` change to that call. *(no maintainer reply)*
-
-### PR #61 — Preserve signal intent when launching jobs ([#61](https://github.com/mikelward/mesh/pull/61))
-
-- `crates/mesh-core/src/exec.rs:130` — [thread](https://github.com/mikelward/mesh/pull/61#discussion_r3626831916)
-  **[P1] Reclaim the terminal when exec fails** — When an interactive user enters
-  a missing or non-executable command, this pre-exec hook transfers the terminal
-  to the child, but `Command::spawn()` then returns `Err`; consequently
-  `process_group` remains `None` and the later terminal-reclaim path is skipped.
-  The terminal remains assigned to the dead child's process group, so entering
-  another command stops mesh with `SIGTTIN`. Record the child group before the
-  exec result or explicitly restore mesh's group on this error path. *(no
-  maintainer reply; addressed by PR #64 "Reclaim terminal after command spawn
-  failure" — verify and resolve)*
-
-### PR #64 — Reclaim terminal after command spawn failure ([#64](https://github.com/mikelward/mesh/pull/64))
-
-- `crates/mesh/tests/cli.rs:685` — [thread](https://github.com/mikelward/mesh/pull/64#discussion_r3626866033)
-  **[P1] Preserve the macOS-compatible PTY argument handling** — On macOS,
-  `libc::openpty` expects mutable pointers for its `termp` and `winp` arguments,
-  so these `null()` values fail to type-check; this helper also passes the
-  `c_uint` `TIOCSCTTY` directly to an `ioctl` request expecting `c_ulong`.
-  Because `.github/workflows/ci.yml` builds all targets on `macos-latest`, the
-  new test prevents that job from compiling. Mirror the mutable null pointers and
-  target-specific `tiocsctty` normalization already used by
-  `background_startup_harness`. *(no maintainer reply)*
-
-### PR #65 — Normalize TIOCSCTTY for BSD ioctl ABI and add FreeBSD CI ([#65](https://github.com/mikelward/mesh/pull/65))
-
-- `crates/mesh/tests/cli.rs` — [thread](https://github.com/mikelward/mesh/pull/65#discussion_r3626885654)
-  **[P2] Keep the ioctl request type target-specific** — On
-  `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, `libc` declares
-  `ioctl`'s request parameter as `c_int`; forcing `TIOCSCTTY` to `c_ulong`
-  therefore makes both PTY harness calls fail type checking, so `cargo test` no
-  longer builds on these primary Linux configurations. Preserve the inferred
-  `TIOCSCTTY` type for musl while applying the widening only on targets whose
-  `ioctl` ABI requires it. *(no maintainer reply)*
 
 ### PR #66 — Add stopped-job tracking and job-control builtins (jobs, fg, bg) ([#66](https://github.com/mikelward/mesh/pull/66))
 
@@ -581,45 +409,6 @@ not swept in this pass.
   of using Mesh's normal error format. Normalize wrapper-side open failures so
   foreground and background execution retain the same status semantics. *(no
   maintainer reply)*
-
-### PR #73 — Add typed list values and explicit `...$list` argument spread ([#73](https://github.com/mikelward/mesh/pull/73))
-
-- `crates/mesh-core/src/repl.rs:422` — [thread](https://github.com/mikelward/mesh/pull/73#discussion_r3627309850)
-  **[P2] Preserve empty-string elements in list literals** — When a list
-  contains a quoted empty string, such as `xs = ["" a]`, the lexer represents
-  that element as a `Word` with no pieces, so `all(...)` is vacuously true and
-  this predicate silently removes it. Consequently, spreading the list loses
-  positional arguments, and `[""]` becomes indistinguishable from `[]`, violating
-  the new typed-list arity guarantee. Strip only the synthetic words emptied by
-  removing the outer brackets while retaining genuine empty words. *(no
-  maintainer reply; addressed by PR #76 "Preserve empty strings in list
-  literals" — verify and resolve)*
-
-### PR #74 — Add exact list indexing ([#74](https://github.com/mikelward/mesh/pull/74))
-
-- `crates/mesh-core/src/lexer.rs:546` — [thread](https://github.com/mikelward/mesh/pull/74#discussion_r3627329099)
-  **[P2] Keep unbraced bracket suffixes literal inside strings** — When
-  interpolation occurs inside double quotes, this unconditional `parse_index`
-  call also consumes the index even though `member_after_name` is false. This
-  violates `DESIGN.md:652-659`, where `"$x[0]"` means the value of `$x` followed
-  by literal `[0]`, while indexing requires `"${x[0]}"`; for example, with
-  `x = text`, `puts "$x[0]"` now errors with "cannot index a string value"
-  instead of printing `text[0]`. Gate unbraced index parsing the same way as
-  member parsing while retaining indexing in the braced parser. *(no maintainer
-  reply; the `"$x[0]"` interpolation rule is the subject of PRs #75/#78/#79 —
-  verify and resolve)*
-
-### PR #75 — Require braces for quoted list indexing ([#75](https://github.com/mikelward/mesh/pull/75))
-
-- `crates/mesh-core/src/lexer.rs:906` — [thread](https://github.com/mikelward/mesh/pull/75#discussion_r3627383581)
-  **[P2] Enforce the advertised bracing rule** — For double-quoted input such as
-  `"$xs[0]"`, this assertion explicitly preserves unbraced indexing, and the
-  commit makes no production-code change to require braces; it therefore does the
-  opposite of its subject and detailed description, while also reversing the
-  previous `DESIGN.md` requirement. Either make `parse_var` leave the index
-  suffix literal inside quotes and restore the corresponding tests/docs, or
-  rename and rewrite the commit if supporting unbraced indexing is intentional.
-  *(no maintainer reply)*
 
 ### PR #76 — Preserve empty strings in list literals ([#76](https://github.com/mikelward/mesh/pull/76))
 

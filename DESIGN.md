@@ -323,7 +323,8 @@ $line:replaceall(re($pat), $new) # pattern arrives as a string → re()
   precedent (mesh has no per-line notion here for a `/g` toggle to hang off).
 - It is a **value modifier**, so it **maps over a list** element-wise like `:stem`
   — `$paths:replaceall(/\.js$/, .ts)` rewrites each path.
-- **Capture backreferences** in `NEW` for a regex `OLD`: `${1}` / `${name}` splice
+- **Capture backreferences** in `NEW` for a regex `OLD` *(provisional spelling)*:
+  `${1}` / `${name}` currently stand in for syntax that splices
   the numbered / named group of *this match* (a replacement-local scope, not an
   outer variable — bare `$1` stays reserved, mesh having no positional `$1`). For a
   **computed** replacement, `NEW` may be a **lambda** taking the match — `:replaceall(/(\d+)/, func(m) { $m:int + 1 })` — the callback form, consistent with `:map` / `:filter` / `:each`.
@@ -334,8 +335,11 @@ separate `:replace`, mirroring JavaScript's `replace` / `replaceAll` split — d
 until a port needs it.)*
 
 **String→number parse** *(decided — porting `total`, `bisect`)*. Values from argv /
-`gets` / `$(…)` captures are **strings**, and arithmetic / `+=` are int-only (no
-coercion — `n += "x"` fails) with `<` / `>` comparing strings *lexically*. The
+`gets` / `$(…)` captures are **strings**, and numeric operations do not coerce
+string operands (`n += "1"` fails when `n` is an int) with `<` / `>` comparing
+strings *lexically*. This does not narrow the operators themselves: `+=` also
+concatenates strings, extends lists, and merges maps, while `Duration` and
+`Instant` have their arithmetic defined below. The
 **`:int`** modifier parses a string to an integer, **fail-loud** — the inverse of
 the canonical int→decimal rendering, erroring on non-numeric input rather than
 silently yielding `0`. So `$line:words:get(0, "0"):int` sums a column and
@@ -369,6 +373,12 @@ appears.)*
   *(type: file|dir)         # either type
   glob("*", type: file, size > 1M)   # the same options, via the function
   ```
+
+  Qualifier arguments are evaluated once **per candidate path** in a dedicated
+  predicate context. In that context `size`, `age`, `type`, `exec`, and `empty`
+  are properties of the current candidate; they are not ordinary caller-scope
+  names or expressions evaluated before `glob` starts. The literal and function
+  forms use this same binding rule.
 
   There is also a terse **`:`-modifier** shorthand for the common single-type filter,
   usable on a glob *or* a plain list — `*:f` / `*:files` / `$paths:files`, so
@@ -1125,6 +1135,11 @@ error**:
 | Duration | its canonical spelling (`3s`, `1m30s`) | it has a canonical form |
 | **Instant / regex / stream handle** | **error** — no canonical byte form | an Instant needs `:iso`/`:epoch`/`:format`; a regex (it carries flags) and a stream handle have no byte form at all |
 
+String interpolation uses this same rendering table. Interpolating a list, map,
+Instant, regex, stream handle, embedded-NUL string, or any future value without a
+canonical byte form is a loud error; `${…}` is not an alternate serialization
+mechanism.
+
 An embedded NUL (which a `$(cmd):raw` capture can hold) is the one place a
 *string* fails to cross — argv, like the environment, is NUL-terminated, so it
 is a hard error at both boundaries, never a silent truncation.
@@ -1319,7 +1334,7 @@ any regex value; a **parse-affecting** flag like `:x` cannot, because `re()` is
 fail-loud and compiles the *unflagged* pattern first — `re('foo # (')` errors before
 a trailing `:x` could make it valid in extended mode. Parse-affecting flags must
 therefore be known at construction: folded in pre-compile on a `/…/` literal
-(`/foo # (/:x`, compiled once) or passed as a constructor argument
+(`/foo#(/:x`, compiled once; `#(` is ignored only in extended mode) or passed as a constructor argument
 (`re($x, extended: true)`), never as a post-hoc modifier on a finished value.)*
 
 *(decided: **`/…/` does not interpolate** — it is a **raw** regex literal (raw except
@@ -1442,7 +1457,9 @@ Rules:
   - ***Negatable / tri-state flags.*** `setup`'s `--gui`/`--no-gui` auto/yes/no
     pairs have no expression: a switch is binary, false-unless-passed, with no
     `--no-` negation. Allow a switch to auto-derive a `--no-` form (a
-    true/false/unset tri-state), or a first-class three-valued flag.
+    enum-valued `auto`/`yes`/`no` binding), or a first-class three-valued flag.
+    The omitted case must bind `auto`; it cannot be represented by an unbound or
+    unset value because mesh has no absent value and omitted switches are bound.
   The `--`-mid-stream that `shift_options` relies on is already covered by the
   terminator rule below.)*
 - **`--` ends flag parsing** (the universal Unix terminator, kept). Everything
@@ -1678,7 +1695,12 @@ Rules:
   single exception to the value-call error below: a bare `grep(foo)` errors because it
   asks for a return value the command lacks, but `grep(foo):capture` asks for the
   channel record, so it is allowed and comes back the same **minus `.value`** (there
-  is none — accessing it is a loud no-such-field error). Reaching for `:capture` is
+  is none — accessing it is a loud no-such-field error). External captures accept
+  positional arguments only. A direct `key: value`, a
+  dashed option interpreted through a mesh signature, or a map spread is an error
+  because an external has no signature or canonical named-option encoding; pass
+  the intended argv tokens as positionals instead (for example, `"--color=never"`).
+  Reaching for `:capture` is
   the sign a function is doing two jobs at once; a single-channel function needs none
   of it. *(TODO — further fields such as timing and a `pipestatus` list; today it is
   the four above.)*
@@ -1883,7 +1905,7 @@ to a bool):
   ask about the link itself. A raw `$a:mtime > $b:mtime` requires **both** files to
   exist (strict absence errors on a missing operand); `-nt`'s quirk of treating a
   *missing* target as older is the rebuild idiom, written explicitly as
-  `not $b:exists or $a:mtime > $b:mtime`. These ride on the **time model**
+  `$a:exists and (not $b:exists or $a:mtime > $b:mtime)`. These ride on the **time model**
   *(decided, porting `age()`)*: `now()` and the file-time modifiers
   (`:mtime`/`:atime`/`:ctime`) return an **`Instant`**, and `Instant - Instant` is
   a **`Duration`** (`age = now() - $f:mtime`). A `Duration` is written with **suffix
@@ -1893,7 +1915,8 @@ to a bool):
   `Duration ± Duration`, `Duration × n`, `Instant ± Duration → Instant`, and
   `Instant - Instant → Duration` (`Instant + Instant` is an error). Division is
   **not** in the set — for a ratio, drop to an integer first with `:ms` / `:secs`,
-  which **truncate toward zero** (`1900µs:ms` → `1`, `-1900µs:ms` → `-1`); then
+  which **truncate toward zero** (`(now() - $t):ms` drops any sub-millisecond
+  remainder toward zero); then
   `$a:ms / $b:ms` is ordinary integer division, so no float or rational type has to
   be introduced. A `Duration`
   is **signed** — `Instant - Instant` goes negative for a future instant (so a
@@ -1912,7 +1935,8 @@ to a bool):
   An **`Instant` has no canonical text form**: interpolating, `puts`-ing,
   or passing one to argv is a **loud error** — epoch-vs-ISO and the timezone are a
   guess, the same no-guess-at-the-boundary rule as an un-spread list — so render it
-  explicitly with `$t:epoch` (integer seconds), `$t:iso` (ISO-8601), or
+  explicitly with `$t:epoch` (integer seconds), `$t:iso` (UTC ISO-8601 with a
+  literal `Z` suffix and exactly nine fractional-second digits), or
   `$t:format(…)`. A bare
   integer is **not** a
   Duration (the ms-vs-s footgun mesh kills), but the process boundary stays bytes, so
@@ -2185,7 +2209,9 @@ spelling.)*
 `exec CMD …` replaces the current shell process with the command — the standard
 `exec(2)` hand-off — so a dispatcher/wrapper (`autosession` → `exec autotmux …`,
 `logexec` → `exec "$0".distrib`) leaves no parent shell behind: ordinary invocation
-runs a **child**, `exec` *becomes* the command. (`exec` with only redirections and no
+of an **external executable** runs a child, while `exec` *becomes* that external.
+`exec` accepts only external executables; functions and built-ins have no process
+image with which to replace the shell. (`exec` with only redirections and no
 command applies them to the current shell, bash's `exec >log`.)
 
 **Per-stream tty tests** *(decided — porting `confirm`)*. `$sh.interactive` answers
