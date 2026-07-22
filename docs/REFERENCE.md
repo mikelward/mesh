@@ -46,6 +46,32 @@ func refresh-prompt() {
 prompt-hook cwd refresh-prompt
 ```
 
+To print a context line containing the short (unqualified) hostname, working
+directory, and current Git branch before a minimal `> ` input prompt:
+
+```mesh
+func prompt-context() {
+  host = $(hostname -s)
+  dir = $(pwd)
+  branch = $(sh -c 'git branch --show-current 2>/dev/null || true')
+
+  if $branch == "" {
+    puts "$host $dir"
+  } else {
+    puts "$host $dir ($branch)"
+  }
+}
+
+prompt-hook context prompt-context
+prompt "> "
+```
+
+The hook writes the context above the editor; `prompt "> "` controls only the
+input indicator. `hostname -s` requests the short hostname. Use `hostname`
+instead if the platform's default hostname spelling is preferred. The `sh`
+wrapper makes the branch segment empty outside a Git worktree without printing
+Git's diagnostic on every prompt.
+
 An external renderer works the same way:
 
 ```mesh
