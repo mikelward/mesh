@@ -100,6 +100,5 @@ a name (`$5`) is a literal `$`; a literal `$` in a string is `\$`.
 
 ## Not yet implemented
 
-Sequencing (`;`, `&&`, `||`), pipes, redirection, list and map values, `:`
-modifiers, regex literals, functions, and heredocs. See
+List and map values, `:` modifiers, regex literals, functions, and heredocs. See
 [`ROADMAP.md`](../ROADMAP.md).

@@ -204,11 +204,16 @@ and a redirection with no command (`> f`).
 
 ## M2 job builtins
 
-Ctrl-Z registers a stopped foreground pipeline in the interactive job table.
+Bare `&` ends the preceding command or pipeline, launches it in a background
+process group, and acts as a sequence boundary (`sleep 1 & puts ready`). Its
+stdin defaults to `/dev/null`, preventing a background command from consuming
+later shell input. Quoted or escaped `&` remains literal. An empty `&` is a
+syntax error. Assignments and builtins cannot be launched in the background yet.
+
+Ctrl-Z also registers a stopped foreground pipeline in the same job table.
 `jobs` lists registered jobs; `fg [N|%N]` foregrounds one, and `bg [N|%N]`
 continues one in the background. With no reference, `fg` and `bg` select the
-newest job. These are command forms rather than new grammar productions. The
-`&` background-launch operator is not parsed yet.
+newest job. These builtins are command forms rather than new grammar productions.
 
 ### Not yet parsed
 `{ }` blocks, `func`, `:` modifiers, heredocs. Each arrives with the task that

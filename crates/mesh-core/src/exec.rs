@@ -20,8 +20,7 @@ pub struct Cmd {
     pub redirs: Vec<(RedirKind, String)>,
 }
 
-/// Foreground jobs suspended with Ctrl-Z. Background launch syntax arrives
-/// later; for now every entry starts as a stopped foreground pipeline.
+/// Running background jobs and foreground jobs suspended with Ctrl-Z.
 pub struct JobTable {
     jobs: Vec<Job>,
     next_id: usize,
@@ -172,6 +171,7 @@ pub fn run(words: &[String], jobs: &mut JobTable) -> u8 {
             redirs: Vec::new(),
         }],
         jobs,
+        false,
     )
 }
 
@@ -207,10 +207,10 @@ enum Outcome {
 ///
 /// `cmds` is non-empty and every stage is an external command (builtins in a
 /// pipeline / with redirection are not supported yet, and are rejected earlier).
-/// Interactive pipelines get a foreground process group; non-interactive ones
-/// stay in mesh's process group so signals sent to the invoking group reach all
-/// stages.
-pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable) -> u8 {
+/// Interactive foreground pipelines and all background pipelines get their own
+/// process group. Non-interactive foreground pipelines stay in mesh's process
+/// group so signals sent to the invoking group reach all stages.
+pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8 {
     let command_text = cmds
         .iter()
         .map(|cmd| cmd.words.join(" "))
@@ -219,7 +219,12 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable) -> u8 {
     let n = cmds.len();
     let interactive = std::io::stdin().is_terminal();
     let mut outcomes: Vec<Outcome> = Vec::new();
-    let mut next_stdin = NextIn::Inherit;
+    // A background job must not consume commands from the shell's input.
+    let mut next_stdin = if background {
+        NextIn::Null
+    } else {
+        NextIn::Inherit
+    };
     let mut process_group = None;
     let shell_modes = interactive.then(terminal_modes).flatten();
 
@@ -256,7 +261,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable) -> u8 {
 
         let mut command = Command::new(&cmd.words[0]);
         command.args(&cmd.words[1..]);
-        if interactive {
+        if interactive || background {
             // A zero process group makes the first child a group leader. Later
             // stages join it, so terminal signals address the entire pipeline.
             command.process_group(process_group.unwrap_or(0));
@@ -268,11 +273,15 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable) -> u8 {
             // Hand off the terminal before exec so a newly started program
             // cannot race ahead and receive SIGTTIN.
             unsafe {
-                command.pre_exec(|| {
-                    restore_job_signals()?;
-                    set_foreground_group(libc::getpgrp());
-                    Ok(())
-                });
+                if background {
+                    command.pre_exec(restore_job_signals);
+                } else {
+                    command.pre_exec(|| {
+                        restore_job_signals()?;
+                        set_foreground_group(libc::getpgrp());
+                        Ok(())
+                    });
+                }
             }
         }
 
@@ -303,7 +312,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable) -> u8 {
 
         match command.spawn() {
             Ok(mut child) => {
-                if interactive {
+                if interactive || background {
                     let pgid = process_group.unwrap_or_else(|| child.id() as i32);
                     process_group = Some(pgid);
                     // Repeat setpgid in the parent to close the race between
@@ -325,7 +334,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable) -> u8 {
                 // The child hook hands the terminal to the new process group
                 // before exec. If the first stage cannot exec, no successful
                 // child records that group for the normal reclaim path below.
-                if interactive && process_group.is_none() {
+                if interactive && !background && process_group.is_none() {
                     // SAFETY: getpgrp takes no arguments and cannot fail.
                     set_foreground_group(unsafe { libc::getpgrp() });
                 }
@@ -334,9 +343,29 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable) -> u8 {
         }
     }
 
-    let foreground = process_group;
+    let foreground = (!background).then_some(process_group).flatten();
     if let Some(pgid) = foreground {
         set_foreground_group(pgid);
+    }
+
+    if background {
+        if let Some(pgid) = process_group {
+            let id = jobs.next_id;
+            jobs.next_id += 1;
+            eprintln!("[{id}] {pgid}");
+            jobs.jobs.push(Job {
+                id,
+                pgid,
+                command: command_text,
+                outcomes,
+                shell_modes: None,
+                state: JobState::Running,
+            });
+            return 0;
+        }
+        return match wait_outcomes(&mut outcomes) {
+            WaitResult::Complete(status) | WaitResult::Stopped(status) => status,
+        };
     }
 
     // pipefail: the last stage to fail wins. A SIGPIPE is ignored only for a
