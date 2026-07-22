@@ -1770,6 +1770,19 @@ fn a_line_that_cannot_open_an_awaited_body_is_reprocessed() {
 }
 
 #[test]
+fn a_header_followed_by_a_complete_definition_is_not_swallowed() {
+    // `func f()` awaits its body; the next line is itself a complete `func g()`
+    // definition, not `f`'s body — so `f` is rejected and `g` is still defined.
+    let out = run_with_input("func f()\nfunc g() { puts g-ran }\ng\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "g-ran\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("missing body"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn a_delayed_brace_after_a_blank_line_still_defines() {
     // A blank line between the header and its `{` keeps buffering (it does not
     // invalidate the awaited body), so the function is still defined.
