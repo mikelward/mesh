@@ -593,9 +593,9 @@ fn run_for(text: &str, in_function: bool, shell: &mut Shell) -> Step {
         .iter()
         .map(|word| Word(word.0.iter().map(clone_piece).collect()))
         .collect();
-    let expanded = match list_literal(&words) {
-        Some(items) => expand::expand(items, &shell.vars).map(|items| vec![Value::List(items)]),
-        None => expand::expand_values(words, &shell.vars),
+    let expanded = match list_value(&words, &shell.vars) {
+        Some(result) => result.map(|value| vec![value]),
+        None => expand::expand_values(words, &shell.vars).map_err(|error| error.to_string()),
     };
     let values = match expanded {
         Ok(values) => values,
@@ -605,11 +605,15 @@ fn run_for(text: &str, in_function: bool, shell: &mut Shell) -> Step {
         }
     };
     let items = values.into_iter().flat_map(|value| match value {
-        Value::String(value) => vec![value],
+        Value::String(value) => vec![Value::String(value)],
         Value::List(values) => values,
     });
     let mut status = 0;
     for item in items {
+        let Value::String(item) = item else {
+            eprintln!("mesh: for: nested list element is not iterable yet");
+            return Step::Continue(1);
+        };
         shell.vars.set(name, item);
         match run_body(body, in_function, shell) {
             Step::Continue(code) => status = code,
@@ -766,11 +770,8 @@ fn eval_block_value(
         return Err("if: branch value must be one expression".into());
     }
     let rhs = &segment.stages[0].words;
-    if let Some(items) = list_literal(rhs) {
-        return Ok((
-            Value::List(expand::expand(items, &shell.vars).map_err(|e| e.to_string())?),
-            Step::Continue(0),
-        ));
+    if let Some(value) = list_value(rhs, &shell.vars) {
+        return Ok((value?, Step::Continue(0)));
     }
     if let [Word(pieces)] = rhs.as_slice()
         && let [Piece::Var(vref)] = pieces.as_slice()
@@ -1067,9 +1068,8 @@ fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
         vars.set_value(name, value);
         return Ok(());
     }
-    if let Some(items) = list_literal(rhs.as_slice()) {
-        let values = expand::expand(items, vars).map_err(|e| e.to_string())?;
-        vars.set_list(name, values);
+    if let Some(value) = list_value(rhs.as_slice(), vars) {
+        vars.set_value(name, value?);
         return Ok(());
     }
     let mut args = expand::expand(rhs, vars).map_err(|e| e.to_string())?;
@@ -1114,8 +1114,8 @@ fn append_assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), Stri
     if name == "env" {
         return Err(format!("{name}: cannot assign to the reserved name"));
     }
-    let value = if let Some(items) = list_literal(rhs.as_slice()) {
-        Value::List(expand::expand(items, vars).map_err(|e| e.to_string())?)
+    let value = if let Some(value) = list_value(rhs.as_slice(), vars) {
+        value?
     } else if let [Word(pieces)] = rhs.as_slice() {
         if let [Piece::Var(vref)] = pieces.as_slice() {
             if vref.member.is_none() && !vref.quoted {
@@ -1141,8 +1141,8 @@ fn scalar_value(rhs: Vec<Word>, vars: &Vars, name: &str) -> Result<Value, String
     }
 }
 
-/// Remove bare outer brackets from an assignment RHS. Brackets embedded in a
-/// quoted piece remain ordinary text; nested values wait for the M3 parser.
+/// Remove bare outer brackets from a list expression. Brackets embedded in a
+/// quoted piece remain ordinary text.
 fn list_literal(rhs: &[Word]) -> Option<Vec<Word>> {
     let mut items: Vec<Word> = rhs
         .iter()
@@ -1193,6 +1193,66 @@ fn list_literal(rhs: &[Word]) -> Option<Vec<Word>> {
         items.pop();
     }
     Some(items)
+}
+
+/// Evaluate a bracketed list expression, preserving nested lists and flattening
+/// an explicit spread by exactly one level.
+fn list_value(rhs: &[Word], vars: &Vars) -> Option<Result<Value, String>> {
+    let items = list_literal(rhs)?;
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < items.len() {
+        if starts_list(&items[index]) {
+            let start = index;
+            let mut depth = 0_i32;
+            while index < items.len() {
+                depth += bracket_delta(&items[index]);
+                index += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            if depth != 0 {
+                return Some(Err("list: unmatched `[`".into()));
+            }
+            match list_value(&items[start..index], vars) {
+                Some(Ok(value)) => values.push(value),
+                Some(Err(error)) => return Some(Err(error)),
+                None => return Some(Err("list: invalid nested list".into())),
+            }
+        } else {
+            let word = Word(items[index].0.iter().map(clone_piece).collect());
+            match expand::expand_values(vec![word], vars) {
+                Ok(expanded) => values.extend(expanded),
+                Err(error) => return Some(Err(error.to_string())),
+            }
+            index += 1;
+        }
+    }
+    Some(Ok(Value::List(values)))
+}
+
+fn starts_list(word: &Word) -> bool {
+    matches!(word.0.first(), Some(Piece::Text { text, expandable: true }) if text.starts_with('['))
+}
+
+fn bracket_delta(word: &Word) -> i32 {
+    word.0
+        .iter()
+        .filter_map(|piece| match piece {
+            Piece::Text {
+                text,
+                expandable: true,
+            } => Some(text),
+            _ => None,
+        })
+        .flat_map(|text| text.chars())
+        .map(|ch| match ch {
+            '[' => 1,
+            ']' => -1,
+            _ => 0,
+        })
+        .sum()
 }
 
 /// Interactive loop: reedline line editing with an in-memory history. Ctrl-D on

@@ -148,6 +148,27 @@ mesh$ <strong>puts $env.HOME</strong>
 /home/you
 </pre>
 
+## Lists preserve structure
+
+Square brackets build a list. Lists may contain other lists, and mesh never
+guesses whether you meant to flatten one. A plain list reference is one nested
+value; an explicit `...` spread flattens exactly one level:
+
+<pre>
+mesh$ <strong>inner = [two three]</strong>
+mesh$ <strong>nested = [one $inner four]</strong>
+mesh$ <strong>flat = [one ...$inner four]</strong>
+mesh$ <strong>puts ...$nested[1]</strong>
+two three
+mesh$ <strong>puts ...$flat</strong>
+one two three four
+</pre>
+
+Indexes are zero-based (negative indexes count from the end), slices clamp to
+the available range, and `+=` appends a scalar or extends with a list. A nested
+list cannot be passed to a command by accident: select and spread the inner list
+explicitly.
+
 ## Transforming values with modifiers
 
 A postfix `:` modifier transforms a value. Path modifiers provide the common
@@ -220,7 +241,7 @@ yes
 </pre>
 
 An `if` is also a value in an assignment. The selected body's final line is the
-value; it can currently be one string, a string-list literal, a whole variable
+value; it can currently be one string, a list literal, a whole variable
 value, or another `if`:
 
 <pre>

@@ -62,22 +62,24 @@ file as tasks land.
 
 ## M3 — The mesh language (in progress)
 
-- [x] First typed value: bracketed string-list literals in assignment
+- [x] First typed value: bracketed list literals in assignment
       (`xs = [a "b c"]`), including the distinct empty list (`xs = []`).
 - [x] Explicit list spread into command arguments (`puts ...$xs`); using a list
       without `...` is a loud error rather than implicit word splitting.
 - [ ] Replace the incremental command lexer with the clean-break expression and
       block parser.
-- [ ] General list expressions: nested values, indexing/slicing, `+=`, and
+- [x] General list expressions: nested values, indexing/slicing, `+=`, and
       expression-position spread.
   - [x] Exact integer indexing (`$xs[0]`, including negative indices) for the
-        current string-list slice.
+        current list slice.
   - [x] Clamped range slicing (`...$xs[1..3]`, `...$xs[..=2]`) for the current
-        string-list slice.
-  - [x] Append assignment (`+=`) for strings and the current string-list slice.
+        list slice.
+  - [x] Append assignment (`+=`) for strings and the current list slice.
   - [x] List-preserving assignment from a variable or slice (`ys = $xs`,
         `ys = $xs[1..]`).
   - [x] List-preserving append from a slice (`xs += $ys[1..]`).
+  - [x] Nested values and one-level expression spread (`[$xs]` versus
+        `[...$xs]`), including spreading an indexed nested list.
 - [ ] Maps and remaining scalar types.
 - [x] Initial argument-free `:` modifiers: path/string transforms and list
       collection operations, including typed list results and chaining.

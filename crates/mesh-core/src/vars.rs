@@ -10,10 +10,10 @@
 
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     String(String),
-    List(Vec<String>),
+    List(Vec<Value>),
 }
 
 type Scope = HashMap<String, Value>;
@@ -67,12 +67,6 @@ impl Vars {
             .insert(name.to_string(), Value::String(value));
     }
 
-    /// Bind `name` to a list, preserving its arity (including an empty list).
-    pub fn set_list(&mut self, name: &str, value: Vec<String>) {
-        self.active_mut()
-            .insert(name.to_string(), Value::List(value));
-    }
-
     /// Bind an already typed value without converting lists to strings.
     pub fn set_value(&mut self, name: &str, value: Value) {
         self.active_mut().insert(name.to_string(), value);
@@ -111,7 +105,7 @@ impl Vars {
         match (current, value) {
             (Value::String(left), Value::String(right)) => left.push_str(&right),
             (Value::List(left), Value::List(mut right)) => left.append(&mut right),
-            (Value::List(left), Value::String(right)) => left.push(right),
+            (Value::List(left), right) => left.push(right),
             (Value::String(_), Value::List(_)) => {
                 return Err(format!("{name}: cannot append a list to a string"));
             }
