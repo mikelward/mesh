@@ -100,9 +100,23 @@ conditional-assignment
 for-expression  = "for" pattern "in" value-expression block ;
 match-expression
                 = "match" value-expression "{" match-arm* "}" ;
-match-arm       = pattern block terminator* ;
+match-arm       = match-pattern ("|" match-pattern)* match-guard? block
+                  terminator* ;
+match-guard     = "if" value-expression ;
+match-pattern   = "_" | list-pattern | value-pattern ;
+value-pattern   = value-expression | "*" ;
 pattern         = name | "_" | list-pattern ;
+list-pattern    = "[" NL* (list-pattern-item ","? NL*)* "]" ;
+list-pattern-item
+                = name | "_" | "..." name ;
 ```
+
+A `value-pattern` uses the value-expression grammar below, so it includes exact
+values, ranges, bare globs, and regex literals. The standalone `*` spelling is
+listed separately because it is accepted as a catch-all glob even though `*`
+cannot begin an ordinary value expression. In a `list-pattern`, names bind by
+position, `_` discards an element, and at most one `...` rest binding is
+permitted; list-pattern items are not recursively patterns.
 
 `command-word` is the lexer's adjacency-preserving word token, including
 interpolations and expression atoms allowed in command position. Keywords are
