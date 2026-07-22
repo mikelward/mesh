@@ -119,6 +119,12 @@ impl std::fmt::Display for ParseError {
             ParseErrorKind::ChainedComparison => {
                 write!(f, "syntax error: comparisons cannot be chained")
             }
+            ParseErrorKind::Expected(expected) if expected.starts_with("an empty command") => {
+                write!(f, "syntax error: {}", expected.trim_start_matches("an "))
+            }
+            ParseErrorKind::Expected(expected) if expected.starts_with("a redirection") => {
+                write!(f, "syntax error: {}", expected.trim_start_matches("a "))
+            }
             ParseErrorKind::Expected(expected) => write!(f, "syntax error: expected {expected}"),
             ParseErrorKind::ReservedParameter(name) => {
                 write!(
@@ -364,9 +370,6 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
 pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
     let tokens = match tokenize(source) {
         Ok(tokens) => tokens,
-        Err(error) if matches!(error.kind, ParseErrorKind::Unterminated(_)) => {
-            return Ok(ParseOutcome::Incomplete);
-        }
         Err(error) => return Err(error),
     };
     let mut parser = Parser {
@@ -414,6 +417,15 @@ impl<'a> Lexer<'a> {
             if c == '\\' && self.source[self.position..].starts_with("\\\n") {
                 self.position += 2;
                 continue;
+            }
+            if ["&>", ">&", "<&"]
+                .iter()
+                .any(|operator| self.source[self.position..].starts_with(operator))
+            {
+                return Err(ParseError {
+                    kind: ParseErrorKind::Expected("descriptor redirection is not supported yet"),
+                    span: start..start + 2,
+                });
             }
             if c == '#' {
                 while self.position < self.source.len() && self.char_at(self.position) != Some('\n')
@@ -866,6 +878,76 @@ fn word_is_quoted(word: &Word) -> bool {
     })
 }
 
+fn merge_command_variable_access(pieces: Vec<WordPiece>) -> Vec<WordPiece> {
+    let mut coalesced = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        match piece {
+            WordPiece::Text { text, quote } => push_text(&mut coalesced, &text, quote),
+            piece => coalesced.push(piece),
+        }
+    }
+    let mut output = Vec::with_capacity(coalesced.len());
+    for piece in coalesced {
+        if let WordPiece::Text { text, quote } = &piece
+            && let Some(WordPiece::Variable {
+                name,
+                quote: variable_quote,
+            }) = output.last_mut()
+            && *variable_quote == *quote
+            && !name.ends_with('}')
+        {
+            let length = variable_access_prefix(text);
+            if length > 0 {
+                name.push_str(&text[..length]);
+                if length < text.len() {
+                    output.push(WordPiece::Text {
+                        text: text[length..].to_string(),
+                        quote: *quote,
+                    });
+                }
+                continue;
+            }
+        }
+        output.push(piece);
+    }
+    output
+}
+
+fn variable_access_prefix(text: &str) -> usize {
+    let mut consumed = 0;
+    loop {
+        let rest = &text[consumed..];
+        if let Some(value) = rest.strip_prefix('.') {
+            let length = value
+                .find(['.', '[', ':', '!', '/', ' '])
+                .unwrap_or(value.len());
+            if length == 0 || !valid_name(&value[..length]) {
+                break;
+            }
+            consumed += length + 1;
+        } else if let Some(value) = rest.strip_prefix('[') {
+            let Some(close) = value.find(']') else {
+                break;
+            };
+            if !valid_variable_subscript(&value[..close]) {
+                break;
+            }
+            consumed += close + 2;
+        } else if let Some(value) = rest.strip_prefix(':') {
+            let length = value
+                .find(['.', '[', ':', '!', '/', ' '])
+                .unwrap_or(value.len());
+            if length == 0 || !modifier_name(&value[..length]) {
+                break;
+            }
+            consumed += length + 1;
+        } else {
+            break;
+        }
+    }
+    consumed
+}
+
 fn token_word_pieces(kind: &TokenKind) -> Option<Vec<WordPiece>> {
     if let TokenKind::Word(word) = kind {
         return Some(word.pieces.clone());
@@ -899,7 +981,15 @@ struct Parser {
 impl Parser {
     fn source(&mut self, closer: Option<TokenKind>) -> Result<Source, ParseError> {
         let start = self.peek().map_or(self.source_len, |t| t.span.start);
-        self.terminators();
+        self.newlines();
+        if self.same(&TokenKind::Semi) {
+            return Err(self.error(ParseErrorKind::Expected("an empty command")));
+        }
+        if self.same(&TokenKind::Amp) {
+            return Err(self.error(ParseErrorKind::Expected(
+                "a background operator needs a command",
+            )));
+        }
         let mut statements = Vec::new();
         while !self.at_end() && !closer.as_ref().is_some_and(|c| self.same(c)) {
             let statement_start = self.peek().unwrap().span.start;
@@ -914,6 +1004,14 @@ impl Parser {
             if background {
                 self.terminators();
                 continue;
+            }
+            if self.same(&TokenKind::Semi)
+                && self
+                    .tokens
+                    .get(self.position + 1)
+                    .is_some_and(|token| matches!(token.value, TokenKind::Semi))
+            {
+                return Err(self.error(ParseErrorKind::Expected("an empty command")));
             }
             if self.terminators() == 0
                 && !self.at_end()
@@ -1051,6 +1149,26 @@ impl Parser {
                 None
             };
             if let Some(kind) = kind {
+                let operator_start = self.tokens[self.position - 1].span.start;
+                if items.last().is_some_and(|item| {
+                    matches!(
+                        item,
+                        CommandItem::Word(word)
+                            if word.span.end == operator_start
+                                && matches!(word.value.pieces.as_slice(),
+                                    [WordPiece::Text { text, quote: QuoteMode::Bare }]
+                                        if text.chars().all(|c| c.is_ascii_digit()))
+                    )
+                }) {
+                    return Err(self.error(ParseErrorKind::Expected(
+                        "descriptor redirection is not supported yet",
+                    )));
+                }
+                if self.at_command_end() {
+                    return Err(self.error(ParseErrorKind::Expected(
+                        "a redirection needs a target file",
+                    )));
+                }
                 let target = self.command_word()?;
                 let body = if kind == RedirectKind::Heredoc {
                     let token = self
@@ -1077,16 +1195,18 @@ impl Parser {
             }
         }
         if items.is_empty() {
-            return Err(self.error(ParseErrorKind::Expected("a command")));
+            return Err(self.error(ParseErrorKind::Expected("an empty command in a pipeline")));
         }
         let guard = self.guard()?;
         Ok(Command { items, guard })
     }
 
     fn command_word(&mut self) -> Result<Spanned<Word>, ParseError> {
-        let first = self
-            .next()
-            .ok_or_else(|| self.eof(ParseErrorKind::UnexpectedEnd))?;
+        let first = self.next().ok_or_else(|| {
+            self.eof(ParseErrorKind::Expected(
+                "a redirection needs a target file",
+            ))
+        })?;
         let start = first.span.start;
         let mut end = first.span.end;
         let mut pieces = token_word_pieces(&first.value).ok_or_else(|| ParseError {
@@ -1105,7 +1225,9 @@ impl Parser {
             pieces.extend(next_pieces);
         }
         Ok(Spanned {
-            value: Word { pieces },
+            value: Word {
+                pieces: merge_command_variable_access(pieces),
+            },
             span: start..end,
         })
     }
@@ -1371,7 +1493,12 @@ impl Parser {
                     value: Box::new(value),
                     name: self.name()?,
                 };
-            } else if self.eat(&TokenKind::LBracket).is_some() {
+            } else if self.same(&TokenKind::LBracket)
+                && self
+                    .peek()
+                    .is_some_and(|token| token.span.start == self.previous_end())
+            {
+                self.position += 1;
                 self.newlines();
                 let index = self.expression()?;
                 self.newlines();
@@ -1465,9 +1592,53 @@ impl Parser {
                         span: token.span,
                     }))
                 } else {
+                    let start = token.span.start;
+                    let mut end = token.span.end;
+                    let mut pieces = word.pieces;
+                    let mut brackets = 0usize;
+                    while self.peek().is_some_and(|next| next.span.start == end) {
+                        match self.peek().map(|next| &next.value) {
+                            Some(TokenKind::LBracket) => brackets += 1,
+                            Some(TokenKind::RBracket) if brackets > 0 => brackets -= 1,
+                            Some(TokenKind::RBracket)
+                                if self.tokens.get(self.position + 1).is_some_and(|next| {
+                                    next.span.start == self.peek().unwrap().span.end
+                                        && matches!(next.value, TokenKind::Word(_))
+                                }) => {}
+                            Some(
+                                TokenKind::RBracket
+                                | TokenKind::RParen
+                                | TokenKind::RBrace
+                                | TokenKind::Comma
+                                | TokenKind::Colon
+                                | TokenKind::Semi
+                                | TokenKind::Amp
+                                | TokenKind::AndAnd
+                                | TokenKind::OrOr
+                                | TokenKind::Pipe
+                                | TokenKind::PipeBoth
+                                | TokenKind::Less
+                                | TokenKind::Greater
+                                | TokenKind::Append
+                                | TokenKind::Heredoc
+                                | TokenKind::Range
+                                | TokenKind::RangeInclusive
+                                | TokenKind::Operator(_),
+                            ) => break,
+                            _ => {}
+                        }
+                        let Some(next_pieces) =
+                            self.peek().and_then(|next| token_word_pieces(&next.value))
+                        else {
+                            break;
+                        };
+                        end = self.peek().unwrap().span.end;
+                        self.position += 1;
+                        pieces.extend(next_pieces);
+                    }
                     Ok(Expr::Scalar(Spanned {
-                        value: word,
-                        span: token.span,
+                        value: Word { pieces },
+                        span: start..end,
                     }))
                 }
             }
@@ -1697,7 +1868,11 @@ impl Parser {
                 let followed_by_operator = self
                     .tokens
                     .get(self.position + 1)
-                    .is_some_and(|next| value_operator(&next.value));
+                    .zip(self.tokens.get(self.position + 2))
+                    .is_some_and(|(operator, right)| {
+                        value_operator(&operator.value) && operator.span.end < right.span.start
+                    });
+                let numeric = word.text().parse::<i64>().is_ok();
                 variable
                     || (quoted
                         && !matches!(
@@ -1706,7 +1881,7 @@ impl Parser {
                         )
                         && self.viable_expression())
                     || attached_call
-                    || followed_by_operator
+                    || (numeric && followed_by_operator)
             }
             _ => false,
         }

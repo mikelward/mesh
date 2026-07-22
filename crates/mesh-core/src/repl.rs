@@ -15,10 +15,10 @@ use std::process::ExitCode;
 use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 
 use crate::builtins::{self, Builtin};
+use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
-use crate::lexer::{Piece, Redir, RedirKind, Sep, Stage, Word};
 use crate::vars::{Value, Vars};
-use crate::{exec, expand, lexer, parser};
+use crate::{exec, expand, parser};
 
 /// The mutable shell session threaded through the run loop: variable scopes,
 /// defined functions, and the job table.
@@ -76,219 +76,17 @@ enum Step {
 /// running a function body: there a `return` unwinds; at top level it is a
 /// recoverable error.
 fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
-    let parser_owned = parser_owned_assignment(text);
     match parser::parse(text) {
-        Ok(parser::ParseOutcome::Complete(source)) => {
-            let control = text.split_whitespace().any(|word| {
-                matches!(
-                    word.trim_matches(|c: char| !c.is_ascii_alphabetic()),
-                    "break" | "continue"
-                )
-            });
-            let operator_assignment = source.statements.iter().any(|statement| {
-                executable_has_operator_assignment(&statement.and_or.first)
-                    || statement
-                        .and_or
-                        .rest
-                        .iter()
-                        .any(|(_, executable)| executable_has_operator_assignment(executable))
-            });
-            if source_has_compound(&source) || parser_owned || control || operator_assignment {
-                return run_source(&source, last, in_function, shell);
-            }
-        }
-        Ok(parser::ParseOutcome::Incomplete)
-            if parser_owned || parser_classifies_compound(text) =>
-        {
+        Ok(parser::ParseOutcome::Complete(source)) => run_source(&source, last, in_function, shell),
+        Ok(parser::ParseOutcome::Incomplete) => {
             eprintln!("mesh: syntax error: unexpected end of input");
-            return Step::Continue(2);
+            Step::Continue(2)
         }
-        Err(error)
-            if parser_owned
-                || starts_with_compound_keyword(text)
-                || matches!(error.kind, parser::ParseErrorKind::ChainedComparison) =>
-        {
+        Err(error) => {
             eprintln!("mesh: {error}");
-            return Step::Continue(2);
-        }
-        Ok(parser::ParseOutcome::Incomplete) | Err(_) => {}
-    }
-
-    let segments = match lexer::split_line(text) {
-        Ok(segments) => segments,
-        Err(err) => {
-            eprintln!("mesh: {err}");
-            return Step::Continue(2); // syntax error
-        }
-    };
-    let mut status = last;
-    for segment in segments {
-        let run_it = match segment.sep_before {
-            Sep::Seq => true,
-            Sep::And => status == 0, // run after success
-            Sep::Or => status != 0,  // run after failure
-        };
-        if !run_it || segment.stages.is_empty() {
-            // Short-circuited commands leave the status unchanged. The empty
-            // check is defensive; the lexer no longer emits empty segments.
-            continue;
-        }
-        match run_pipeline(segment.stages, segment.background, status, shell) {
-            Step::Exit(code) => return Step::Exit(code),
-            Step::Continue(code) => status = code,
-            Step::Return(code) => {
-                if in_function {
-                    // Inside a function, `return` unwinds — abort the line so the
-                    // caller (`call_func`) can stop the body.
-                    return Step::Return(code);
-                }
-                // At top level `return` is a recoverable error; the `;` sequence
-                // still runs any following command unconditionally.
-                eprintln!("mesh: return: not inside a function");
-                status = 1;
-            }
-        }
-        if shell.control.is_some() {
-            break;
+            Step::Continue(2)
         }
     }
-    Step::Continue(status)
-}
-
-fn executable_has_operator_assignment(executable: &parser::Executable) -> bool {
-    matches!(
-        executable,
-        parser::Executable::Assignment { value, .. } if expression_has_operator(value)
-    )
-}
-
-fn expression_has_operator(expression: &parser::Expr) -> bool {
-    use parser::Expr;
-    match expression {
-        Expr::Unary { .. } | Expr::Binary { .. } => true,
-        Expr::List(items) => items.iter().any(|item| match item {
-            parser::ListItem::Value(value) | parser::ListItem::Spread(value) => {
-                expression_has_operator(value)
-            }
-        }),
-        Expr::Map(items) => items.iter().any(|item| match item {
-            parser::MapItem::Pair(key, value) => {
-                expression_has_operator(key) || expression_has_operator(value)
-            }
-            parser::MapItem::Spread(value) => expression_has_operator(value),
-        }),
-        Expr::Group(value) | Expr::Member { value, .. } => expression_has_operator(value),
-        Expr::Index { value, index } => {
-            expression_has_operator(value) || expression_has_operator(index)
-        }
-        Expr::Modifier {
-            value, arguments, ..
-        } => {
-            expression_has_operator(value)
-                || arguments.as_ref().is_some_and(|arguments| {
-                    arguments.iter().any(|argument| match argument {
-                        parser::Argument::Positional(value)
-                        | parser::Argument::Named(_, value)
-                        | parser::Argument::Spread(value) => expression_has_operator(value),
-                    })
-                })
-        }
-        Expr::Range { start, end, .. } => {
-            start.as_deref().is_some_and(expression_has_operator)
-                || end.as_deref().is_some_and(expression_has_operator)
-        }
-        Expr::Call { callee, arguments } => {
-            expression_has_operator(callee)
-                || arguments.iter().any(|argument| match argument {
-                    parser::Argument::Positional(value)
-                    | parser::Argument::Named(_, value)
-                    | parser::Argument::Spread(value) => expression_has_operator(value),
-                })
-        }
-        Expr::For { iterable, .. } => expression_has_operator(iterable),
-        Expr::Scalar(_)
-        | Expr::Variable(_)
-        | Expr::BackgroundJob(_)
-        | Expr::Capture(_)
-        | Expr::If(_)
-        | Expr::Lambda { .. } => false,
-    }
-}
-
-fn source_has_compound(source: &parser::Source) -> bool {
-    source.statements.iter().any(|statement| {
-        executable_has_compound(&statement.and_or.first)
-            || statement
-                .and_or
-                .rest
-                .iter()
-                .any(|(_, executable)| executable_has_compound(executable))
-    })
-}
-
-fn starts_with_compound_keyword(text: &str) -> bool {
-    let Ok(tokens) = parser::tokenize(text) else {
-        return false;
-    };
-    matches!(
-        tokens.first().map(|token| &token.value),
-        Some(parser::TokenKind::Word(word))
-            if matches!(word.pieces.as_slice(),
-                [parser::WordPiece::Text { text, quote: parser::QuoteMode::Bare }]
-                    if matches!(text.as_str(), "func" | "if" | "for"))
-    )
-}
-
-fn parser_classifies_compound(text: &str) -> bool {
-    let Ok(tokens) = parser::tokenize(text) else {
-        return false;
-    };
-    let bare_keyword = |token: &parser::Token, expected: &[&str]| {
-        matches!(&token.value,
-            parser::TokenKind::Word(word)
-                if matches!(word.pieces.as_slice(),
-                    [parser::WordPiece::Text { text, quote: parser::QuoteMode::Bare }]
-                        if expected.contains(&text.as_str())))
-    };
-    tokens
-        .first()
-        .is_some_and(|token| bare_keyword(token, &["func", "if", "for"]))
-        || matches!(tokens.as_slice(), [_, equal, keyword, ..]
-            if matches!(equal.value, parser::TokenKind::Equal)
-                && bare_keyword(keyword, &["if", "for"]))
-}
-
-fn executable_has_compound(executable: &parser::Executable) -> bool {
-    matches!(
-        executable,
-        parser::Executable::Function { .. }
-            | parser::Executable::If(_)
-            | parser::Executable::For { .. }
-            | parser::Executable::Assignment {
-                value: parser::Expr::If(_) | parser::Expr::For { .. },
-                ..
-            }
-    )
-}
-
-fn parser_owned_assignment(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    let name_len = trimmed
-        .char_indices()
-        .take_while(|(_, c)| c.is_ascii_alphanumeric())
-        .last()
-        .map_or(0, |(index, c)| index + c.len_utf8());
-    let assignment = name_len > 0
-        && trimmed[..name_len]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic())
-        && matches!(
-            trimmed[name_len..].trim_start().as_bytes(),
-            [b'=', ..] | [b'+', b'=', ..]
-        );
-    let rhs = trimmed.split_once('=').map_or("", |(_, rhs)| rhs);
-    assignment && (rhs.contains(" + ") || rhs.trim_end().ends_with(" +"))
 }
 
 /// Execute the syntax tree recursively.  Keeping execution on the tree (rather
@@ -364,24 +162,30 @@ fn run_executable(
             name,
             append,
             value,
-        } => match eval_expr(value, last, in_function, shell) {
-            Ok(value) => {
-                let result = if *append {
-                    shell.vars.append(name, value)
-                } else {
-                    shell.vars.set_value(name, value);
-                    Ok(())
-                };
-                result.map_or_else(
-                    |error| {
-                        eprintln!("mesh: {error}");
-                        Step::Continue(1)
-                    },
-                    |_| Step::Continue(0),
-                )
+        } => {
+            if name == "env" {
+                eprintln!("mesh: env: cannot assign to the reserved name");
+                return Step::Continue(1);
             }
-            Err(step) => step,
-        },
+            match eval_expr(value, last, in_function, shell) {
+                Ok(value) => {
+                    let result = if *append {
+                        shell.vars.append(name, value)
+                    } else {
+                        shell.vars.set_value(name, value);
+                        Ok(())
+                    };
+                    result.map_or_else(
+                        |error| {
+                            eprintln!("mesh: {error}");
+                            Step::Continue(1)
+                        },
+                        |_| Step::Continue(0),
+                    )
+                }
+                Err(step) => step,
+            }
+        }
         Function {
             name,
             parameters,
@@ -538,6 +342,16 @@ fn run_ast_for(
     Step::Continue(status)
 }
 
+struct Stage {
+    words: Vec<Word>,
+    redirs: Vec<Redir>,
+}
+
+struct Redir {
+    kind: exec::RedirKind,
+    target: Word,
+}
+
 fn run_ast_pipeline(
     node: &parser::Pipeline,
     background: bool,
@@ -556,9 +370,9 @@ fn run_ast_pipeline(
                 parser::CommandItem::Word(word) => words.push(expansion_word(&word.value)),
                 parser::CommandItem::Redirect { kind, target, .. } => redirs.push(Redir {
                     kind: match kind {
-                        parser::RedirectKind::Input => RedirKind::In,
-                        parser::RedirectKind::Output => RedirKind::Out,
-                        parser::RedirectKind::Append => RedirKind::Append,
+                        parser::RedirectKind::Input => exec::RedirKind::In,
+                        parser::RedirectKind::Output => exec::RedirKind::Out,
+                        parser::RedirectKind::Append => exec::RedirKind::Append,
                         parser::RedirectKind::Heredoc => {
                             eprintln!("mesh: heredoc execution is not supported yet");
                             return Step::Continue(1);
@@ -585,16 +399,71 @@ fn expansion_word(word: &parser::Word) -> Word {
                     text: text.clone(),
                     expandable: matches!(quote, parser::QuoteMode::Bare),
                 },
-                parser::WordPiece::Variable { name, quote } => Piece::Var(crate::lexer::VarRef {
-                    name: name.strip_prefix('$').unwrap_or(name).to_string(),
-                    member: None,
-                    access: None,
-                    modifiers: Vec::new(),
-                    quoted: !matches!(quote, parser::QuoteMode::Bare),
-                }),
+                parser::WordPiece::Variable { name, quote } => {
+                    Piece::Var(expansion_variable(name, *quote))
+                }
             })
             .collect(),
     )
+}
+
+fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
+    let inner = source
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| source.strip_prefix('$'))
+        .unwrap_or(source);
+    let name_end = inner.find(['.', '[', ':']).unwrap_or(inner.len());
+    let name = inner[..name_end].to_string();
+    let mut rest = &inner[name_end..];
+    let mut member = None;
+    let mut access = None;
+    let mut modifiers = Vec::new();
+    while !rest.is_empty() {
+        if let Some(value) = rest.strip_prefix('.') {
+            let end = value.find(['.', '[', ':']).unwrap_or(value.len());
+            member = Some(value[..end].to_string());
+            rest = &value[end..];
+        } else if let Some(value) = rest.strip_prefix('[') {
+            let close = value.find(']').expect("parser validated variable access");
+            let index = &value[..close];
+            access = Some(if let Some((start, end)) = index.split_once("..=") {
+                expand::Access::Slice {
+                    start: parse_bound(start),
+                    end: parse_bound(end),
+                    inclusive: true,
+                }
+            } else if let Some((start, end)) = index.split_once("..") {
+                expand::Access::Slice {
+                    start: parse_bound(start),
+                    end: parse_bound(end),
+                    inclusive: false,
+                }
+            } else {
+                expand::Access::Index(index.parse().expect("parser validated list index"))
+            });
+            rest = &value[close + 1..];
+        } else if let Some(value) = rest.strip_prefix(':') {
+            let end = value.find(':').unwrap_or(value.len());
+            if let Some(modifier) = expand::Modifier::from_name(&value[..end]) {
+                modifiers.push(modifier);
+            }
+            rest = &value[end..];
+        } else {
+            unreachable!("parser validated variable access")
+        }
+    }
+    VarRef {
+        name,
+        member,
+        access,
+        modifiers,
+        quoted: !matches!(quote, parser::QuoteMode::Bare),
+    }
+}
+
+fn parse_bound(value: &str) -> Option<i64> {
+    (!value.is_empty()).then(|| value.parse().expect("parser validated list bound"))
 }
 
 fn eval_expr(
@@ -617,14 +486,13 @@ fn eval_expr(
                     Value::List(v)
                 }
             }),
-        E::Variable(name) => shell
-            .vars
-            .get(name.value.strip_prefix('$').unwrap_or(&name.value))
-            .cloned()
-            .ok_or_else(|| {
-                eprintln!("mesh: {}: unbound variable", name.value);
+        E::Variable(name) => {
+            let reference = expansion_variable(&name.value, parser::QuoteMode::Bare);
+            expand::resolve_value(&reference, &shell.vars).map_err(|error| {
+                eprintln!("mesh: {error}");
                 Step::Continue(1)
-            }),
+            })
+        }
         E::List(items) => {
             let mut out = Vec::new();
             for item in items {
@@ -691,6 +559,28 @@ fn eval_expr(
         }
         E::Index { value, index } => {
             let value = eval_expr(value, last, in_function, shell)?;
+            if let E::Range {
+                start,
+                end,
+                inclusive,
+            } = index.as_ref()
+            {
+                let mut bound = |expression: &Option<Box<E>>| -> Result<Option<i64>, Step> {
+                    expression
+                        .as_ref()
+                        .map(|expression| {
+                            eval_expr(expression, last, in_function, shell)
+                                .and_then(|value| number(&value).map_err(runtime_message))
+                        })
+                        .transpose()
+                };
+                return match value {
+                    Value::List(values) => Ok(Value::List(
+                        expand::slice(&values, bound(start)?, bound(end)?, *inclusive).to_vec(),
+                    )),
+                    Value::String(_) => runtime_error("cannot index a string value"),
+                };
+            }
             let index_value = eval_expr(index, last, in_function, shell)?;
             let index = number(&index_value).map_err(runtime_message)?;
             match value {
@@ -722,7 +612,7 @@ fn eval_expr(
                     "modifier :{name} arguments are not implemented yet"
                 ));
             }
-            let Some(modifier) = crate::lexer::Modifier::from_name(name) else {
+            let Some(modifier) = expand::Modifier::from_name(name) else {
                 return runtime_error(format!("modifier :{name} is not implemented yet"));
             };
             let value = eval_expr(value, last, in_function, shell)?;
@@ -943,18 +833,9 @@ fn run_pipeline(mut stages: Vec<Stage>, background: bool, last: u8, shell: &mut 
 /// redirections it is an external command only (a redirected builtin or function
 /// is not supported yet).
 fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> Step {
-    let Stage { mut words, redirs } = stage;
-    if redirs.is_empty() {
-        if !background {
-            return run_command_or_assign(words, last, shell);
-        }
-        words = match classify(words) {
-            Line::Command(words) => words,
-            Line::Assign { .. } => {
-                eprintln!("mesh: assignments cannot run in the background");
-                return Step::Continue(1);
-            }
-        };
+    let Stage { words, redirs } = stage;
+    if redirs.is_empty() && !background {
+        return run_command(words, last, shell);
     }
     let argv = match expand::expand(words, &shell.vars) {
         Ok(argv) => argv,
@@ -1058,7 +939,10 @@ fn run_multi(stages: Vec<Stage>, background: bool, shell: &mut Shell) -> Step {
 
 /// Expand each redirection target to exactly one path. Zero or several words is
 /// an ambiguous redirect (a glob/list target is not a single file).
-fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<(RedirKind, String)>, String> {
+fn expand_redirs(
+    redirs: Vec<Redir>,
+    vars: &Vars,
+) -> Result<Vec<(exec::RedirKind, String)>, String> {
     let mut out = Vec::with_capacity(redirs.len());
     for redir in redirs {
         let mut paths = expand::expand(vec![redir.target], vars).map_err(|e| e.to_string())?;
@@ -1076,73 +960,58 @@ fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<(RedirKind, Stri
 /// Run one command with no redirections: classify it as an assignment or a
 /// command and act. `last` is the previous status (the default for a bare `exit`
 /// or `return`).
-fn run_command_or_assign(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
-    match classify(tokens) {
-        Line::Assign { name, rhs, append } => match if append {
-            append_assign(&name, rhs, &mut shell.vars)
-        } else {
-            assign(&name, rhs, &mut shell.vars)
-        } {
-            Ok(()) => Step::Continue(0),
-            Err(msg) => {
-                eprintln!("mesh: {msg}");
-                Step::Continue(1)
+fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
+    // Resolve an in-shell function *before* the external-argv rule turns a
+    // bare list argument into an error, so an unspread list reaches the
+    // function intact as one typed value (`DESIGN.md` §"Arguments do not
+    // word-split"). Functions can never share a name with a builtin or the
+    // `return`/job control words (definition rejects those), so resolving
+    // one here does not reorder the builtins → functions → external chain.
+    if let Some(name) = command_name(&tokens, &shell.vars)
+        && shell.funcs.get(&name).is_some()
+    {
+        let arg_words: Vec<Word> = tokens.into_iter().skip(1).collect();
+        let args = match expand::expand_values(arg_words, &shell.vars) {
+            Ok(args) => args,
+            Err(err) => {
+                eprintln!("mesh: {err}");
+                return Step::Continue(1);
             }
-        },
-        Line::Command(tokens) => {
-            // Resolve an in-shell function *before* the external-argv rule turns a
-            // bare list argument into an error, so an unspread list reaches the
-            // function intact as one typed value (`DESIGN.md` §"Arguments do not
-            // word-split"). Functions can never share a name with a builtin or the
-            // `return`/job control words (definition rejects those), so resolving
-            // one here does not reorder the builtins → functions → external chain.
-            if let Some(name) = command_name(&tokens, &shell.vars)
-                && shell.funcs.get(&name).is_some()
-            {
-                let arg_words: Vec<Word> = tokens.into_iter().skip(1).collect();
-                let args = match expand::expand_values(arg_words, &shell.vars) {
-                    Ok(args) => args,
-                    Err(err) => {
-                        eprintln!("mesh: {err}");
-                        return Step::Continue(1);
-                    }
-                };
-                return call_func(&name, args, shell);
-            }
-            let words = match expand::expand(tokens, &shell.vars) {
-                Ok(words) => words,
-                Err(err) => {
-                    eprintln!("mesh: {err}");
-                    return Step::Continue(1);
-                }
-            };
-            if words.is_empty() {
-                // A command whose words all expanded away (e.g. a glob with no
-                // matches) is an empty-list result — status 0 per `DESIGN.md`.
-                return Step::Continue(0);
-            }
-            // `return` ends the enclosing function (a recoverable error at top
-            // level; `run_line` decides which by `in_function`).
-            if words[0] == "return" {
-                return make_return(&words[1..], last);
-            }
-            let job_status = match words[0].as_str() {
-                "fg" => Some(shell.jobs.foreground(&words[1..])),
-                "bg" => Some(shell.jobs.background(&words[1..])),
-                "jobs" => Some(shell.jobs.list(&words[1..])),
-                _ => None,
-            };
-            if let Some(code) = job_status {
-                return Step::Continue(code);
-            }
-            // Command resolution: builtins, then external (a function was already
-            // resolved above).
-            match builtins::dispatch(&words, last) {
-                Some(Builtin::Exit(code)) => Step::Exit(code),
-                Some(Builtin::Status(code)) => Step::Continue(code),
-                None => Step::Continue(exec::run(&words, &mut shell.jobs)),
-            }
+        };
+        return call_func(&name, args, shell);
+    }
+    let words = match expand::expand(tokens, &shell.vars) {
+        Ok(words) => words,
+        Err(err) => {
+            eprintln!("mesh: {err}");
+            return Step::Continue(1);
         }
+    };
+    if words.is_empty() {
+        // A command whose words all expanded away (e.g. a glob with no
+        // matches) is an empty-list result — status 0 per `DESIGN.md`.
+        return Step::Continue(0);
+    }
+    // `return` ends the enclosing function (a recoverable error at top
+    // level; `run_line` decides which by `in_function`).
+    if words[0] == "return" {
+        return make_return(&words[1..], last);
+    }
+    let job_status = match words[0].as_str() {
+        "fg" => Some(shell.jobs.foreground(&words[1..])),
+        "bg" => Some(shell.jobs.background(&words[1..])),
+        "jobs" => Some(shell.jobs.list(&words[1..])),
+        _ => None,
+    };
+    if let Some(code) = job_status {
+        return Step::Continue(code);
+    }
+    // Command resolution: builtins, then external (a function was already
+    // resolved above).
+    match builtins::dispatch(&words, last) {
+        Some(Builtin::Exit(code)) => Step::Exit(code),
+        Some(Builtin::Status(code)) => Step::Continue(code),
+        None => Step::Continue(exec::run(&words, &mut shell.jobs)),
     }
 }
 
@@ -1153,7 +1022,7 @@ fn run_command_or_assign(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step
 /// path takes over.
 fn command_name(tokens: &[Word], vars: &Vars) -> Option<String> {
     let first = tokens.first()?;
-    let cloned = Word(first.0.iter().map(clone_piece).collect());
+    let cloned = first.clone();
     let mut argv = expand::expand(vec![cloned], vars).ok()?;
     (argv.len() == 1).then(|| argv.pop().unwrap())
 }
@@ -1212,318 +1081,9 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
 
 /// Return whether the parser needs another physical line to complete the input.
 fn needs_more_input(text: &str) -> bool {
-    parser_classifies_compound(text)
-        && matches!(parser::parse(text), Ok(parser::ParseOutcome::Incomplete))
+    matches!(parser::parse(text), Ok(parser::ParseOutcome::Incomplete))
 }
 
-/// A classified line: a variable binding or a command.
-enum Line {
-    Assign {
-        name: String,
-        rhs: Vec<Word>,
-        append: bool,
-    },
-    Command(Vec<Word>),
-}
-
-/// Classify a non-empty token list. An assignment uses `=` or `+=`, either
-/// spaced or unspaced as the whole statement; position separates it from a
-/// `k=v` argument after a command word (`git commit --author=me`).
-///
-/// Deferred: prefix env (`FOO=1 cmd` — use `env FOO=1 cmd`), and `name=value`
-/// followed by more words.
-fn classify(mut tokens: Vec<Word>) -> Line {
-    // Spaced: `name` (`=` | `+=`) value…
-    if tokens.len() >= 2 && assignment_operator(&tokens[1]).is_some() {
-        if let Some(name) = bare_ident(&tokens[0]) {
-            let name = name.to_string();
-            let append = assignment_operator(&tokens[1]) == Some(true);
-            let rhs = tokens.split_off(2);
-            return Line::Assign { name, rhs, append };
-        }
-    }
-    // Unspaced: a single word `name=value` or `name+=value`.
-    if tokens.len() == 1 {
-        if let Some((name, rhs, append)) = split_unspaced_assignment(&tokens[0]) {
-            return Line::Assign {
-                name,
-                rhs: vec![rhs],
-                append,
-            };
-        }
-    }
-    Line::Command(tokens)
-}
-
-/// If `word` is a single unquoted identifier, return it.
-fn bare_ident(word: &Word) -> Option<&str> {
-    match word.0.as_slice() {
-        [
-            Piece::Text {
-                text,
-                expandable: true,
-            },
-        ] if lexer::is_ident(text) => Some(text),
-        _ => None,
-    }
-}
-
-/// Recognize a bare `=` or `+=` assignment operator.
-fn assignment_operator(word: &Word) -> Option<bool> {
-    match word.0.as_slice() {
-        [
-            Piece::Text {
-                text,
-                expandable: true,
-            },
-        ] if text == "=" => Some(false),
-        [
-            Piece::Text {
-                text,
-                expandable: true,
-            },
-        ] if text == "+=" => Some(true),
-        _ => None,
-    }
-}
-
-/// Split a single word `name=value…` into the name and a word for the value, if
-/// the leading unquoted text is `ident=…`. `value` keeps any later pieces (so
-/// `x=$y` binds `x` to the value of `$y`).
-fn split_unspaced_assignment(word: &Word) -> Option<(String, Word, bool)> {
-    let [
-        Piece::Text {
-            text,
-            expandable: true,
-        },
-        rest @ ..,
-    ] = word.0.as_slice()
-    else {
-        return None;
-    };
-    let (before, after) = text.split_once('=')?;
-    let (name, append) = before
-        .strip_suffix('+')
-        .map_or((before, false), |name| (name, true));
-    if !lexer::is_ident(name) {
-        return None;
-    }
-    let mut value: Vec<Piece> = Vec::new();
-    if !after.is_empty() {
-        value.push(Piece::Text {
-            text: after.to_string(),
-            expandable: true,
-        });
-    }
-    value.extend(rest.iter().map(clone_piece));
-    Some((name.to_string(), Word(value), append))
-}
-
-fn clone_piece(piece: &Piece) -> Piece {
-    match piece {
-        Piece::Text { text, expandable } => Piece::Text {
-            text: text.clone(),
-            expandable: *expandable,
-        },
-        Piece::Var(v) => Piece::Var(crate::lexer::VarRef {
-            name: v.name.clone(),
-            member: v.member.clone(),
-            access: v.access.clone(),
-            modifiers: v.modifiers.clone(),
-            quoted: v.quoted,
-        }),
-    }
-}
-
-/// Bind `name` to a scalar expansion or a bracketed list literal.
-fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
-    // `env` is the environment namespace (`$env.KEY`); a plain `env` binding
-    // would be shadowed by that read and so could never be read back. Reject it
-    // rather than store an unreachable value.
-    if name == "env" {
-        return Err(format!("{name}: cannot assign to the reserved name"));
-    }
-    if let [Word(pieces)] = rhs.as_slice()
-        && let [Piece::Var(vref)] = pieces.as_slice()
-        && vref.member.is_none()
-        && !vref.quoted
-    {
-        let value = assignment_value(vref, vars)?;
-        vars.set_value(name, value);
-        return Ok(());
-    }
-    if let Some(value) = list_value(rhs.as_slice(), vars) {
-        vars.set_value(name, value?);
-        return Ok(());
-    }
-    let mut args = expand::expand(rhs, vars).map_err(|e| e.to_string())?;
-    match args.len() {
-        1 => {
-            vars.set(name, args.pop().unwrap());
-            Ok(())
-        }
-        0 => Err(format!("{name}: assignment needs a value")),
-        _ => Err(format!("{name}: list assignment not supported yet")),
-    }
-}
-
-/// Preserve typed values in an exact variable-reference assignment. Command
-/// expansion still requires `...`; assignment is a value context instead.
-fn assignment_value(vref: &crate::lexer::VarRef, vars: &Vars) -> Result<Value, String> {
-    expand::resolve_value(vref, vars).map_err(|error| error.to_string())
-}
-
-/// Apply `+=` without coercion: strings concatenate, while lists append a
-/// scalar or extend with another list.
-fn append_assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
-    if name == "env" {
-        return Err(format!("{name}: cannot assign to the reserved name"));
-    }
-    let value = if let Some(value) = list_value(rhs.as_slice(), vars) {
-        value?
-    } else if let [Word(pieces)] = rhs.as_slice() {
-        if let [Piece::Var(vref)] = pieces.as_slice() {
-            if vref.member.is_none() && !vref.quoted {
-                assignment_value(vref, vars)?
-            } else {
-                scalar_value(rhs, vars, name)?
-            }
-        } else {
-            scalar_value(rhs, vars, name)?
-        }
-    } else {
-        scalar_value(rhs, vars, name)?
-    };
-    vars.append(name, value)
-}
-
-fn scalar_value(rhs: Vec<Word>, vars: &Vars, name: &str) -> Result<Value, String> {
-    let mut args = expand::expand(rhs, vars).map_err(|e| e.to_string())?;
-    match args.len() {
-        1 => Ok(Value::String(args.pop().unwrap())),
-        0 => Err(format!("{name}: assignment needs a value")),
-        _ => Err(format!("{name}: append needs one value")),
-    }
-}
-
-/// Remove bare outer brackets from a list expression. Brackets embedded in a
-/// quoted piece remain ordinary text.
-fn list_literal(rhs: &[Word]) -> Option<Vec<Word>> {
-    let mut items: Vec<Word> = rhs
-        .iter()
-        .map(|word| Word(word.0.iter().map(clone_piece).collect()))
-        .collect();
-    let first = items.first_mut()?;
-    let Piece::Text {
-        text: first_text,
-        expandable: true,
-    } = first.0.first_mut()?
-    else {
-        return None;
-    };
-    if !first_text.starts_with('[') {
-        return None;
-    }
-    first_text.remove(0);
-    if matches!(first.0.first(), Some(Piece::Text { text, expandable: true }) if text.is_empty()) {
-        first.0.remove(0);
-    }
-
-    let last = items.last_mut()?;
-    let Piece::Text {
-        text: last_text,
-        expandable: true,
-    } = last.0.last_mut()?
-    else {
-        return None;
-    };
-    if !last_text.ends_with(']') {
-        return None;
-    }
-    last_text.pop();
-    if matches!(last.0.last(), Some(Piece::Text { text, expandable: true }) if text.is_empty()) {
-        last.0.pop();
-    }
-    let synthetic = |word: &Word| matches!(word.0.as_slice(), [Piece::Text { text, expandable: true }] if text.is_empty());
-    if items
-        .first()
-        .is_some_and(|word| word.0.is_empty() || synthetic(word))
-    {
-        items.remove(0);
-    }
-    if items
-        .last()
-        .is_some_and(|word| word.0.is_empty() || synthetic(word))
-    {
-        items.pop();
-    }
-    Some(items)
-}
-
-/// Evaluate a bracketed list expression, preserving nested lists and flattening
-/// an explicit spread by exactly one level.
-fn list_value(rhs: &[Word], vars: &Vars) -> Option<Result<Value, String>> {
-    let items = list_literal(rhs)?;
-    let mut values = Vec::new();
-    let mut index = 0;
-    while index < items.len() {
-        if starts_list(&items[index]) {
-            let start = index;
-            let mut depth = 0_i32;
-            while index < items.len() {
-                depth += bracket_delta(&items[index]);
-                index += 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            if depth != 0 {
-                return Some(Err("list: unmatched `[`".into()));
-            }
-            match list_value(&items[start..index], vars) {
-                Some(Ok(value)) => values.push(value),
-                Some(Err(error)) => return Some(Err(error)),
-                None => return Some(Err("list: invalid nested list".into())),
-            }
-        } else {
-            let word = Word(items[index].0.iter().map(clone_piece).collect());
-            match expand::expand_values(vec![word], vars) {
-                Ok(expanded) => values.extend(expanded),
-                Err(error) => return Some(Err(error.to_string())),
-            }
-            index += 1;
-        }
-    }
-    Some(Ok(Value::List(values)))
-}
-
-fn starts_list(word: &Word) -> bool {
-    matches!(word.0.first(), Some(Piece::Text { text, expandable: true }) if text.starts_with('['))
-}
-
-fn bracket_delta(word: &Word) -> i32 {
-    // Interior brackets belong to scalar text (often a glob), not list syntax.
-    let opens = match word.0.first() {
-        Some(Piece::Text {
-            text,
-            expandable: true,
-        }) => text.chars().take_while(|ch| *ch == '[').count(),
-        _ => 0,
-    };
-    let closes = match word.0.last() {
-        Some(Piece::Text {
-            text,
-            expandable: true,
-        }) => text.chars().rev().take_while(|ch| *ch == ']').count(),
-        _ => 0,
-    };
-    opens as i32 - closes as i32
-}
-
-/// Interactive loop: reedline line editing with an in-memory history. Ctrl-D on
-/// an empty line exits (reedline's default — a non-empty line is unaffected);
-/// Ctrl-C cancels the current line and returns to the prompt without exiting. A
-/// multi-line `func` body is buffered in `pending` until its braces balance.
 fn run_interactive() -> ExitCode {
     if let Err(err) = wait_until_foreground() {
         eprintln!("mesh: could not acquire terminal foreground: {err}");
@@ -1793,7 +1353,7 @@ mod tests {
         }
         assert!(!needs_more_input("cd /"));
         assert!(!needs_more_input("puts *"));
-        assert!(!needs_more_input("puts value |"));
+        assert!(needs_more_input("puts value |"));
         assert!(!needs_more_input("puts 'unterminated"));
     }
 
