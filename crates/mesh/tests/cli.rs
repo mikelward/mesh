@@ -1900,6 +1900,41 @@ fn a_bare_list_to_an_external_command_is_still_an_error() {
 }
 
 #[test]
+fn path_and_string_modifiers_transform_values_and_chain() {
+    let out = run_with_input(
+        "file = src/archive.tar.gz\nputs $file:dir $file:base $file:ext $file:exts $file:stem $file:bare\nputs $file:base:upper\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "src archive.tar.gz gz tar.gz archive.tar archive\nARCHIVE.TAR.GZ\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn collection_modifiers_preserve_typed_list_results() {
+    let out = run_with_input(
+        "xs = [a b b c]\nputs $xs:len $xs:first $xs:last\nputs ...$xs:rest:init:dedup\nys = $xs:rest:init\nputs ...$ys\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4 a c\nb\nb b\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn unknown_modifier_names_remain_literal_suffixes() {
+    let out = run_with_input("host = example\nputs $host:port\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "example:port\n");
+}
+
+#[test]
 fn an_impossible_parameter_head_does_not_enter_continuation() {
     // A trailing parameter token with a non-letter head can never become a valid
     // name, so the header is reported at once and the next command still runs.
@@ -1965,6 +2000,37 @@ fn for_iterates_lists_without_word_splitting() {
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn for_iterates_direct_list_literals_and_skips_an_empty_literal() {
+    let out =
+        run_with_input("for x in [a \"b c\"] { puts \"<$x>\" }\nfor x in [] { puts never }\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "<a>\n<b c>\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn an_impossible_for_header_does_not_swallow_the_next_command() {
+    let out = run_with_input("for 1\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("valid binding name"));
+}
+
+#[test]
+fn a_top_level_return_in_a_for_body_does_not_skip_the_iteration() {
+    let out = run_with_input("for x in [a b] { return; puts $x }\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr)
+            .matches("return: not inside a function")
+            .count(),
+        2
     );
 }
 

@@ -104,6 +104,32 @@ A malformed `${…}` (no closing `}`, or an invalid name inside) is a syntax err
 A `$` not followed by a name (`$5`) is a literal `$`; a literal `$` in a string
 is `\$`.
 
+## Modifiers
+
+Recognized postfix modifiers apply from left to right after a variable, member,
+or list access. They work in bare and double-quoted interpolation; braced form
+puts the modifier inside the braces (`${file:stem}`). An unrecognized `:name`
+is literal text, so `$host:$port` is not mistaken for a modifier chain.
+
+| Modifier | Input | Result |
+| --- | --- | --- |
+| `:dir` | string or list | Parent-directory portion. |
+| `:base` | string or list | Final path component. |
+| `:ext` | string or list | Last extension, without the dot. |
+| `:exts` | string or list | All extensions, without the first dot. |
+| `:stem` | string or list | Basename without the last extension. |
+| `:bare` | string or list | Basename without any extensions. |
+| `:upper` / `:lower` | string or list | Change case; maps over list elements. |
+| `:len` | string or list | Character or element count as a decimal string. |
+| `:first` / `:last` | list | First or last element; an empty list is an error. |
+| `:rest` / `:init` | list | All but the first or last element; empty and one-element lists yield `[]` where appropriate. |
+| `:dedup` | list | Remove later duplicates, preserving first occurrence order. |
+
+Path and case modifiers map over lists. Collection modifiers consume a list as
+a whole. List results retain their type: use `...$xs:rest` in command position,
+or bind them directly with `ys = $xs:rest`. Modifier arguments—including
+`:join(SEP)`, `:split(SEP)`, and `:get(KEY, DEFAULT)`—are not implemented yet.
+
 ## Conditionals
 
 ```
@@ -180,6 +206,6 @@ background), and calling for a value (`f(arg)`) as opposed to running it.
 ## Not yet implemented
 
 Map values, general boolean/comparison expressions, conditional destructuring,
-`for`, `match`, `:` modifiers, regex literals, and heredocs. Function
+`match`, modifier arguments, regex literals, and heredocs. Function
 flags/optional/rest parameters and functions in pipelines are also still ahead. See
 [`ROADMAP.md`](../ROADMAP.md).

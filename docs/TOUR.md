@@ -148,6 +148,44 @@ mesh$ <strong>puts $env.HOME</strong>
 /home/you
 </pre>
 
+## Transforming values with modifiers
+
+A postfix `:` modifier transforms a value. Path modifiers provide the common
+filename pieces without starting another process:
+
+<pre>
+mesh$ <strong>file=src/archive.tar.gz</strong>
+mesh$ <strong>puts $file:dir $file:base $file:stem $file:ext</strong>
+src archive.tar.gz archive.tar gz
+</pre>
+
+`:exts` returns every extension (`tar.gz` above), while `:bare` removes every
+extension (`archive`). `:upper` and `:lower` change string case. Modifiers chain
+from left to right:
+
+<pre>
+mesh$ <strong>puts $file:base:upper</strong>
+ARCHIVE.TAR.GZ
+</pre>
+
+Lists have collection modifiers. `:len` counts elements; `:first` and `:last`
+select one; `:rest` and `:init` return a list without its first or last element;
+and `:dedup` removes later duplicates while preserving order:
+
+<pre>
+mesh$ <strong>xs = [one two two three]</strong>
+mesh$ <strong>puts $xs:len $xs:first $xs:last</strong>
+4 one three
+mesh$ <strong>puts ...$xs:rest:init:dedup</strong>
+two
+</pre>
+
+A list-returning modifier remains a real list, so spread it with `...` in
+command arguments or assign it intact (`ys = $xs:rest`). Path and case
+modifiers map over a list element by element. An unknown name is not consumed as
+a modifier, which keeps constructions such as `$host:$port` working literally.
+Modifier arguments such as `:join(",")` are not implemented yet.
+
 ## When something is missing
 
 Reading a name you never set is an error, not a silent blank — and the shell
