@@ -354,8 +354,24 @@ value, or a nested `if`. Earlier lines run for effect. A false `if` with no
 conditional destructuring assignments, arrive with the general expression
 parser.
 
+### For loops
+
+The first loop slice iterates string lists and word expressions. The binding is
+updated in the current scope for each element; list elements remain single
+values even when they contain whitespace.
+
+```ebnf
+for-expr = "for" ws name ws "in" ws value… ws? "{" body "}"
+```
+
+```mesh
+for item in $items {
+  puts $item
+}
+```
+
 ### Not yet parsed
-Nested/general list expressions, maps, bare `{ }` blocks, `for` / `match`, `:`
+Nested/general list expressions, maps, bare `{ }` blocks, `match`, `:`
 modifiers, and heredocs. Each arrives with the task that needs it, and this file
 grows to match.
 

@@ -89,6 +89,9 @@ file as tasks land.
       results. Deferred with the general expression parser: boolean/comparison
       conditions and conditional destructuring.
 - [ ] `for` / `match`.
+  - [x] First `for` slice over string lists and expanded word expressions, with
+        brace-delimited multiline bodies and current-scope bindings.
+  - [ ] Map/range iteration, destructured binders, `break`, and `continue`.
 
 ## Decisions made
 

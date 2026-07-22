@@ -124,6 +124,18 @@ variable value, or a nested `if`; earlier lines in that body run for effect. A
 false conditional with no `else` yields `""`. General boolean/comparison
 expressions and conditional destructuring are not implemented yet.
 
+## For loops
+
+`for name in value { body }` runs the body once for each string-list element or
+expanded word. An element containing whitespace remains one value when read
+through `$name`; braces may span lines. Empty lists run the body zero times.
+
+```mesh
+for item in $items {
+  puts $item
+}
+```
+
 ## Functions
 
 ```
