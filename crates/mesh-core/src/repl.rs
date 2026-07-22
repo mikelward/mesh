@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use reedline::{Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 
 use crate::builtins::{self, Builtin};
-use crate::lexer::{Piece, Redir, RedirKind, Sep, Stage, Word};
+use crate::lexer::{Access, Piece, Redir, RedirKind, Sep, Stage, Word};
 use crate::vars::{Value, Vars};
 use crate::{exec, expand, lexer};
 
@@ -425,6 +425,22 @@ fn append_assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), Stri
                 vars.get(&vref.name)
                     .cloned()
                     .ok_or_else(|| format!("{}: unbound variable", vref.name))?
+            } else if vref.member.is_none() && matches!(vref.access, Some(Access::Slice { .. })) {
+                let Some(value) = vars.get(&vref.name) else {
+                    return Err(format!("{}: unbound variable", vref.name));
+                };
+                let Value::List(values) = value else {
+                    return Err(format!("${}: cannot index a string value", vref.name));
+                };
+                let Some(Access::Slice {
+                    start,
+                    end,
+                    inclusive,
+                }) = vref.access
+                else {
+                    unreachable!();
+                };
+                Value::List(expand::slice(values, start, end, inclusive).to_vec())
             } else {
                 scalar_value(rhs, vars, name)?
             }

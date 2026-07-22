@@ -444,13 +444,26 @@ fn list_literal_preserves_quoted_empty_elements() {
 }
 
 #[test]
-fn append_assignment_concatenates_strings_and_grows_lists() {
+fn list_literal_spread_extends_with_list_elements() {
     let out = run_with_input(
-        "greeting = hi\ngreeting += ' there'\nputs $greeting\nxs = [a b]\nxs += c\nxs += [d e]\nmore = [f g]\nxs += $more\nputs ...$xs\n",
+        "middle = [b 'c d']\nxs = [a ...$middle e]\nputs ...$xs\nempty = []\nys = [before ...$empty after]\nputs ...$ys\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "hi there\na b c d e f g\n"
+        "a b c d e\nbefore after\n"
+    );
+    assert!(out.stderr.is_empty());
+    assert!(out.status.success());
+}
+
+#[test]
+fn append_assignment_concatenates_strings_and_grows_lists() {
+    let out = run_with_input(
+        "greeting = hi\ngreeting += ' there'\nputs $greeting\nxs = [a b]\nxs += c\nxs += [d e]\nmore = [f g h]\nxs += $more[1..]\nputs ...$xs\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi there\na b c d e g h\n"
     );
     assert!(out.stderr.is_empty());
 }
@@ -485,11 +498,11 @@ fn list_indexing_is_zero_based_and_supports_negative_indices() {
 #[test]
 fn list_slices_are_clamped_and_require_spread() {
     let out = run_with_input(
-        "xs = [a b c d]\nputs ...$xs[1..3]\nputs ...$xs[..=1]\nputs ...$xs[-2..]\nputs before ...$xs[9..] after\nputs $xs[1..2]\ns = text\nputs $s[1..]\nputs $missing[1..]\nputs recovered\n",
+        "xs = [a b c d]\nputs ...$xs[1..3]\nputs ...$xs[..=1]\nputs ...$xs[-2..]\nputs ...$xs[..=-1]\nputs before ...$xs[9..] after\nputs $xs[1..2]\ns = text\nputs $s[1..]\nputs $missing[1..]\nputs recovered\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "b c\na b\nc d\nbefore after\nrecovered\n"
+        "b c\na b\nc d\na b c d\nbefore after\nrecovered\n"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("list value needs `...`"));

@@ -91,6 +91,10 @@ are session-global.
 | `...$xs[A..B]` | Spread a clamped, end-exclusive list slice. |
 | `...$xs[A..=B]` | Spread a clamped, end-inclusive list slice. |
 
+Lists are assigned with space-separated bracket literals, such as
+`xs = [a "b c"]`. A whole-word spread may extend a literal from another list:
+`ys = [first ...$xs last]`. Spreading an empty list contributes no elements.
+
 Reading an unset variable (or an unset `$env.KEY`) is an error; the shell
 recovers and continues. An interpolated value is a single literal value — it is
 never split on spaces or matched against filenames. Interpolation happens in bare
@@ -106,5 +110,5 @@ is `\$`.
 
 ## Not yet implemented
 
-Map values, `:` modifiers, regex literals, functions, and heredocs. See
+Nested list values, map values, `:` modifiers, regex literals, functions, and heredocs. See
 [`ROADMAP.md`](../ROADMAP.md).
