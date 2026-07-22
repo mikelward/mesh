@@ -88,7 +88,7 @@ file as tasks land.
         parsed expression forms that are not implemented yet.
   - [x] Store parsed function bodies as `parser::Source` and execute them
         recursively instead of retaining and reparsing raw body text.
-  - [ ] Remove the raw-text function, `if`, and `for` recognizers and their brace
+  - [x] Remove the raw-text function, `if`, and `for` recognizers and their brace
         scanners; use only `ParseOutcome::Incomplete` to buffer compound input.
   - [ ] Retire `lexer::split_line` and compatibility lexer types from the REPL
         execution path once commands and expressions run from the AST; retain
