@@ -72,45 +72,10 @@ enum Step {
     Return(u8),
 }
 
-/// Tokenize and run one line of input against the session. A line is a sequence
-/// of commands joined by `;` / `&&` / `||`; each connector decides whether its
-/// command runs from the previous command's status. Empty lines are a no-op that
-/// keeps the last status.
-///
-/// A `func name(params) { … }` definition is parsed from raw text, since its body
-/// spans lines the per-line lexer would otherwise flatten. `in_function` is true
-/// while running a `func` body: there a `return` unwinds; at top level it is a
+/// Parse and run one input unit against the session. `in_function` is true while
+/// running a function body: there a `return` unwinds; at top level it is a
 /// recoverable error.
 fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
-    // Compound forms that predate the AST executor retain their validation and
-    // typed function-call behavior while their bodies recursively re-enter this
-    // function and are executed as parsed sources.
-    if is_func_start(text) {
-        return define_func(text, shell);
-    }
-    if is_if_start(text) {
-        return run_if(text, last, in_function, shell);
-    }
-    if is_for_start(text) {
-        return run_for(text, in_function, shell);
-    }
-    if let Some((name, expression)) = if_assignment(text) {
-        return match eval_if_value(expression, last, in_function, shell) {
-            Ok((value, step)) => match step {
-                Step::Continue(_) => {
-                    shell.vars.set_value(name, value);
-                    Step::Continue(0)
-                }
-                other => other,
-            },
-            Err(msg) => {
-                eprintln!("mesh: {msg}");
-                Step::Continue(2)
-            }
-        };
-    }
-    // Expression assignments already use the clean-break grammar. Commands
-    // still need the compatibility parser until parser words can be expanded.
     let parser_owned = parser_owned_assignment(text);
     match parser::parse(text) {
         Ok(parser::ParseOutcome::Complete(source)) => {
@@ -128,7 +93,7 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
                         .iter()
                         .any(|(_, executable)| executable_has_operator_assignment(executable))
             });
-            if parser_owned || control || operator_assignment {
+            if source_has_compound(&source) || parser_owned || control || operator_assignment {
                 return run_source(&source, last, in_function, shell);
             }
         }
@@ -137,7 +102,9 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
             return Step::Continue(2);
         }
         Err(error)
-            if parser_owned || matches!(error.kind, parser::ParseErrorKind::ChainedComparison) =>
+            if parser_owned
+                || starts_with_compound_keyword(text)
+                || matches!(error.kind, parser::ParseErrorKind::ChainedComparison) =>
         {
             eprintln!("mesh: {error}");
             return Step::Continue(2);
@@ -145,30 +112,6 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
         Ok(parser::ParseOutcome::Incomplete) | Err(_) => {}
     }
 
-    if is_func_start(text) {
-        return define_func(text, shell);
-    }
-    if is_if_start(text) {
-        return run_if(text, last, in_function, shell);
-    }
-    if is_for_start(text) {
-        return run_for(text, in_function, shell);
-    }
-    if let Some((name, expression)) = if_assignment(text) {
-        return match eval_if_value(expression, last, in_function, shell) {
-            Ok((value, step)) => match step {
-                Step::Continue(_) => {
-                    shell.vars.set_value(name, value);
-                    Step::Continue(0)
-                }
-                other => other,
-            },
-            Err(msg) => {
-                eprintln!("mesh: {msg}");
-                Step::Continue(2)
-            }
-        };
-    }
     let segments = match lexer::split_line(text) {
         Ok(segments) => segments,
         Err(err) => {
@@ -270,6 +213,63 @@ fn expression_has_operator(expression: &parser::Expr) -> bool {
     }
 }
 
+fn source_has_compound(source: &parser::Source) -> bool {
+    source.statements.iter().any(|statement| {
+        executable_has_compound(&statement.and_or.first)
+            || statement
+                .and_or
+                .rest
+                .iter()
+                .any(|(_, executable)| executable_has_compound(executable))
+    })
+}
+
+fn starts_with_compound_keyword(text: &str) -> bool {
+    let Ok(tokens) = parser::tokenize(text) else {
+        return false;
+    };
+    matches!(
+        tokens.first().map(|token| &token.value),
+        Some(parser::TokenKind::Word(word))
+            if matches!(word.pieces.as_slice(),
+                [parser::WordPiece::Text { text, quote: parser::QuoteMode::Bare }]
+                    if matches!(text.as_str(), "func" | "if" | "for"))
+    )
+}
+
+fn executable_has_compound(executable: &parser::Executable) -> bool {
+    matches!(
+        executable,
+        parser::Executable::Function { .. }
+            | parser::Executable::If(_)
+            | parser::Executable::For { .. }
+            | parser::Executable::Assignment {
+                value: parser::Expr::If(_) | parser::Expr::For { .. },
+                ..
+            }
+    )
+}
+
+fn parser_owned_assignment(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let name_len = trimmed
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_alphanumeric())
+        .last()
+        .map_or(0, |(index, c)| index + c.len_utf8());
+    let assignment = name_len > 0
+        && trimmed[..name_len]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        && matches!(
+            trimmed[name_len..].trim_start().as_bytes(),
+            [b'=', ..] | [b'+', b'=', ..]
+        );
+    let rhs = trimmed.split_once('=').map_or("", |(_, rhs)| rhs);
+    assignment && (rhs.contains(" + ") || rhs.trim_end().ends_with(" +"))
+}
+
 /// Execute the syntax tree recursively.  Keeping execution on the tree (rather
 /// than splitting the original text again) makes nesting and short-circuiting
 /// obey exactly the same structure the parser accepted.
@@ -283,6 +283,9 @@ fn run_source(
         match run_statement(statement, status, in_function, shell) {
             Step::Continue(code) => status = code,
             flow => return flow,
+        }
+        if shell.control.is_some() {
+            break;
         }
     }
     Step::Continue(status)
@@ -363,6 +366,10 @@ fn run_executable(
             parameters,
             body,
         } => {
+            if name == "func" || name == "return" || builtins::is_builtin(name) {
+                eprintln!("mesh: func: `{name}` is a reserved name and cannot be a function name");
+                return Step::Continue(2);
+            }
             shell.funcs.define(
                 name.clone(),
                 FuncDef {
@@ -889,26 +896,6 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
     })
 }
 
-fn parser_owned_assignment(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    let name_len = trimmed
-        .char_indices()
-        .take_while(|(_, c)| c.is_ascii_alphanumeric())
-        .last()
-        .map_or(0, |(index, c)| index + c.len_utf8());
-    let assignment = name_len > 0
-        && trimmed[..name_len]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic())
-        && matches!(
-            trimmed[name_len..].trim_start().as_bytes(),
-            [b'=', ..] | [b'+', b'=', ..]
-        );
-    let rhs = trimmed.split_once('=').map_or("", |(_, rhs)| rhs);
-    assignment && (rhs.contains(" + ") || rhs.trim_end().ends_with(" +"))
-}
-
 /// Run one pipeline. A single stage keeps the full command surface (assignments,
 /// builtins, functions). A multi-stage pipeline (`|`) is external commands only
 /// for now.
@@ -1192,542 +1179,9 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
     result
 }
 
-/// Run a compatibility-parser compound body, buffering a nested multi-line
-/// `func` definition until its braces balance — exactly as the top-level reader
-/// does — so a nested definition is stored rather than having only its first
-/// line reach `run_line`.
-///
-/// A function starts fresh, not inheriting the caller's `$?`: an empty body (or a
-/// bare `return` before any command) yields status 0 (`DESIGN.md` — "no
-/// expression to yield … status 0"), and the first line likewise sees `$?` = 0.
-/// `return` ends the body early with its status; `exit` propagates out.
-fn run_legacy_body(body: &str, in_function: bool, shell: &mut Shell) -> Step {
-    let mut status = 0;
-    let mut pending = String::new();
-    for line in body.lines() {
-        if line_invalidates_awaited_body(&pending, line) {
-            // A nested header awaiting its body, invalidated by this line: flush
-            // the header (its missing-body error), then reprocess the line below.
-            let header = std::mem::take(&mut pending);
-            match run_line(&header, status, in_function, shell) {
-                Step::Continue(code) => status = code,
-                Step::Return(code) => return Step::Return(code),
-                Step::Exit(code) => return Step::Exit(code),
-            }
-        }
-        pending.push_str(line);
-        pending.push('\n');
-        if is_compound_input(&pending) && needs_more_compound_input(&pending) {
-            continue;
-        }
-        let full = std::mem::take(&mut pending);
-        match run_line(&full, status, in_function, shell) {
-            Step::Continue(code) => status = code,
-            Step::Return(code) => return Step::Return(code),
-            Step::Exit(code) => return Step::Exit(code),
-        }
-        if shell.control.is_some() {
-            return Step::Continue(status);
-        }
-    }
-    // A truncated nested definition still buffered at the end of the body: run it
-    // so its "missing }" error is reported rather than silently swallowed.
-    if !pending.trim().is_empty() {
-        return run_line(&pending, status, in_function, shell);
-    }
-    Step::Continue(status)
-}
-
-/// Does `text` begin with the reserved `if` word?
-fn is_if_start(text: &str) -> bool {
-    match text.trim_start().strip_prefix("if") {
-        Some(rest) => rest.is_empty() || rest.starts_with(char::is_whitespace),
-        None => false,
-    }
-}
-
-fn is_if_input(text: &str) -> bool {
-    is_if_start(text) || if_assignment(text).is_some()
-}
-
-fn is_for_start(text: &str) -> bool {
-    match text.trim_start().strip_prefix("for") {
-        Some(rest) => rest.is_empty() || rest.starts_with(char::is_whitespace),
-        None => false,
-    }
-}
-
-fn is_compound_input(text: &str) -> bool {
-    is_func_start(text) || is_if_input(text) || is_for_start(text)
-}
-
-fn needs_more_compound_input(text: &str) -> bool {
-    let legacy_incomplete = if is_func_start(text) {
-        lexer::needs_more_input(text)
-    } else if is_if_input(text) {
-        let expression = if_assignment(text).map_or(text, |(_, rhs)| rhs);
-        match parse_if(expression) {
-            Ok(_) => false,
-            Err(msg) => msg.contains("missing body") || msg.contains("missing closing"),
-        }
-    } else if is_for_start(text) {
-        if validate_for_header(text).is_err() {
-            return false;
-        }
-        match parse_for(text) {
-            Ok(_) => false,
-            Err(msg) => msg.contains("missing body") || msg.contains("missing closing"),
-        }
-    } else {
-        false
-    };
-
-    match parser::parse(text) {
-        // The executor's brace scanner is authoritative while it still sees an
-        // open function body. Lexer disagreements must not release buffered
-        // body lines to top-level execution.
-        Ok(parser::ParseOutcome::Complete(_)) => legacy_incomplete,
-        Ok(parser::ParseOutcome::Incomplete) | Err(_) => legacy_incomplete,
-    }
-}
-
-fn parse_for(text: &str) -> Result<(&str, &str, &str), String> {
-    let rest = text
-        .trim()
-        .strip_prefix("for")
-        .ok_or("for: expected `for`")?
-        .trim_start();
-    validate_for_header(text)?;
-    let open = first_bare_open(rest).ok_or("for: missing body `{ ... }`")?;
-    let header = rest[..open].trim();
-    let mut parts = header.splitn(2, char::is_whitespace);
-    let name = parts.next().unwrap_or("");
-    if !lexer::is_ident(name) {
-        return Err(format!("for: `{name}` is not a valid binding name"));
-    }
-    let after_name = parts.next().unwrap_or("").trim_start();
-    let source = after_name
-        .strip_prefix("in")
-        .filter(|after| after.starts_with(char::is_whitespace))
-        .ok_or("for: expected `in` after the binding name")?
-        .trim_start();
-    if source.is_empty() {
-        return Err("for: missing iterable expression".into());
-    }
-    let (body, after) =
-        split_braced_body(&rest[open + 1..]).map_err(|_| "for: missing closing `}`".to_string())?;
-    if !after.trim().is_empty() {
-        return Err("for: unexpected text after the closing `}`".into());
-    }
-    Ok((name, source, body))
-}
-
-/// Reject header fragments that no later body opener can make valid. Missing
-/// pieces remain repairable so a body may still begin on a following line.
-fn validate_for_header(text: &str) -> Result<(), String> {
-    let rest = text
-        .trim()
-        .strip_prefix("for")
-        .ok_or("for: expected `for`")?
-        .trim_start();
-    let header = first_bare_open(rest).map_or(rest, |open| &rest[..open]);
-    let mut parts = header.split_whitespace();
-    let Some(name) = parts.next() else {
-        return Ok(());
-    };
-    if !lexer::is_ident(name) {
-        return Err(format!("for: `{name}` is not a valid binding name"));
-    }
-    let Some(keyword) = parts.next() else {
-        return Ok(());
-    };
-    if keyword != "in" {
-        return Err("for: expected `in` after the binding name".into());
-    }
-    Ok(())
-}
-
-fn run_for(text: &str, in_function: bool, shell: &mut Shell) -> Step {
-    let (name, source, body) = match parse_for(text) {
-        Ok(parsed) => parsed,
-        Err(msg) => {
-            eprintln!("mesh: {msg}");
-            return Step::Continue(2);
-        }
-    };
-    let parsed = match lexer::split_line(source) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            eprintln!("mesh: {err}");
-            return Step::Continue(2);
-        }
-    };
-    let [segment] = parsed.as_slice() else {
-        eprintln!("mesh: for: iterable must be one expression");
-        return Step::Continue(2);
-    };
-    if segment.background || segment.stages.len() != 1 || !segment.stages[0].redirs.is_empty() {
-        eprintln!("mesh: for: iterable must be one expression");
-        return Step::Continue(2);
-    }
-    let words: Vec<Word> = segment.stages[0]
-        .words
-        .iter()
-        .map(|word| Word(word.0.iter().map(clone_piece).collect()))
-        .collect();
-    let expanded = match list_value(&words, &shell.vars) {
-        Some(result) => result.map(|value| vec![value]),
-        None => expand::expand_values(words, &shell.vars).map_err(|error| error.to_string()),
-    };
-    let values = match expanded {
-        Ok(values) => values,
-        Err(err) => {
-            eprintln!("mesh: {err}");
-            return Step::Continue(1);
-        }
-    };
-    let items = values.into_iter().flat_map(|value| match value {
-        Value::String(value) => vec![Value::String(value)],
-        Value::List(values) => values,
-    });
-    let mut status = 0;
-    shell.loop_depth += 1;
-    for item in items {
-        let Value::String(item) = item else {
-            eprintln!("mesh: for: nested list element is not iterable yet");
-            shell.loop_depth -= 1;
-            return Step::Continue(1);
-        };
-        shell.vars.set(name, item);
-        match run_legacy_body(body, in_function, shell) {
-            Step::Continue(code) => status = code,
-            Step::Return(code) if in_function => {
-                shell.loop_depth -= 1;
-                return Step::Return(code);
-            }
-            Step::Return(_) => {
-                eprintln!("mesh: return: not inside a function");
-                status = 1;
-            }
-            Step::Exit(code) => {
-                shell.loop_depth -= 1;
-                return Step::Exit(code);
-            }
-        }
-        match shell.control.take() {
-            Some(parser::ControlKind::Break) => break,
-            Some(parser::ControlKind::Continue) => continue,
-            Some(parser::ControlKind::Return) => unreachable!(),
-            None => {}
-        }
-    }
-    shell.loop_depth -= 1;
-    Step::Continue(status)
-}
-
-/// Recognize the current assignment-expression form, `name = if ...`.
-fn if_assignment(text: &str) -> Option<(&str, &str)> {
-    let (name, rhs) = text.trim().split_once('=')?;
-    let name = name.trim();
-    let rhs = rhs.trim_start();
-    (lexer::is_ident(name) && is_if_start(rhs)).then_some((name, rhs))
-}
-
-/// Find the first bare opening brace. The shared scanner supplies all quoting,
-/// escaping, raw-string, and interpolation rules, avoiding a second lexer here.
-fn first_bare_open(text: &str) -> Option<usize> {
-    text.char_indices()
-        .filter(|(_, ch)| *ch == '{')
-        .find_map(|(byte, _)| (lexer::scan_braces(&text[..=byte], 0).depth == 1).then_some(byte))
-}
-
-fn parse_if(text: &str) -> Result<(&str, &str, Option<&str>), String> {
-    let rest = text
-        .trim()
-        .strip_prefix("if")
-        .ok_or("if: expected `if`")?
-        .trim_start();
-    let open = first_bare_open(rest).ok_or("if: missing body `{ ... }`")?;
-    let condition = rest[..open].trim();
-    if condition.is_empty() {
-        return Err("if: missing condition".into());
-    }
-    let (then_body, tail) =
-        split_braced_body(&rest[open + 1..]).map_err(|_| "if: missing closing `}`".to_string())?;
-    let tail = tail.trim();
-    if tail.is_empty() {
-        return Ok((condition, then_body, None));
-    }
-    let else_part = tail
-        .strip_prefix("else")
-        .filter(|after| {
-            after.is_empty() || after.starts_with(char::is_whitespace) || after.starts_with('{')
-        })
-        .ok_or("if: unexpected text after the closing `}`")?
-        .trim_start();
-    if is_if_start(else_part) {
-        return Ok((condition, then_body, Some(else_part)));
-    }
-    let else_open = first_bare_open(else_part).ok_or("if: `else` needs a body `{ ... }`")?;
-    if !else_part[..else_open].trim().is_empty() {
-        return Err("if: unexpected text before the `else` body".into());
-    }
-    let (else_body, after) = split_braced_body(&else_part[else_open + 1..])
-        .map_err(|_| "if: missing closing `}`".to_string())?;
-    if !after.trim().is_empty() {
-        return Err("if: unexpected text after the closing `}`".into());
-    }
-    Ok((condition, then_body, Some(else_body)))
-}
-
-fn test_condition(condition: &str, last: u8, in_function: bool, shell: &mut Shell) -> (bool, Step) {
-    let step = run_line(condition, last, in_function, shell);
-    (matches!(step, Step::Continue(0)), step)
-}
-
-fn run_if(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
-    let (condition, then_body, else_body) = match parse_if(text) {
-        Ok(parsed) => parsed,
-        Err(msg) => {
-            eprintln!("mesh: {msg}");
-            return Step::Continue(2);
-        }
-    };
-    let (take_then, condition_step) = test_condition(condition, last, in_function, shell);
-    if !matches!(condition_step, Step::Continue(_)) {
-        return condition_step;
-    }
-    if take_then {
-        run_legacy_body(then_body, in_function, shell)
-    } else if let Some(body) = else_body {
-        if is_if_start(body) {
-            run_if(body, last, in_function, shell)
-        } else {
-            run_legacy_body(body, in_function, shell)
-        }
-    } else {
-        Step::Continue(0)
-    }
-}
-
-fn eval_if_value(
-    text: &str,
-    last: u8,
-    in_function: bool,
-    shell: &mut Shell,
-) -> Result<(Value, Step), String> {
-    let (condition, then_body, else_body) = parse_if(text)?;
-    let (take_then, step) = test_condition(condition, last, in_function, shell);
-    if !matches!(step, Step::Continue(_)) {
-        return Ok((Value::String(String::new()), step));
-    }
-    if take_then {
-        eval_block_value(then_body, in_function, shell)
-    } else if let Some(body) = else_body {
-        if is_if_start(body) {
-            eval_if_value(body, last, in_function, shell)
-        } else {
-            eval_block_value(body, in_function, shell)
-        }
-    } else {
-        Ok((Value::String(String::new()), Step::Continue(0)))
-    }
-}
-
-/// Evaluate the final physical line as a value; preceding lines run for effect.
-fn eval_block_value(
-    body: &str,
-    in_function: bool,
-    shell: &mut Shell,
-) -> Result<(Value, Step), String> {
-    let body = body.trim();
-    if body.is_empty() {
-        return Ok((Value::String(String::new()), Step::Continue(0)));
-    }
-    if is_if_start(body) {
-        return eval_if_value(body, 0, in_function, shell);
-    }
-    let (prefix, expression) = body.rsplit_once('\n').unwrap_or(("", body));
-    let step = if prefix.trim().is_empty() {
-        Step::Continue(0)
-    } else {
-        run_legacy_body(prefix, in_function, shell)
-    };
-    if !matches!(step, Step::Continue(_)) {
-        return Ok((Value::String(String::new()), step));
-    }
-    if is_if_start(expression.trim()) {
-        return eval_if_value(expression.trim(), 0, in_function, shell);
-    }
-    let words = lexer::split_line(expression).map_err(|e| e.to_string())?;
-    let [segment] = words.as_slice() else {
-        return Err("if: branch value must be one expression".into());
-    };
-    if segment.background || segment.stages.len() != 1 || !segment.stages[0].redirs.is_empty() {
-        return Err("if: branch value must be one expression".into());
-    }
-    let rhs = &segment.stages[0].words;
-    if let Some(value) = list_value(rhs, &shell.vars) {
-        return Ok((value?, Step::Continue(0)));
-    }
-    if let [Word(pieces)] = rhs.as_slice()
-        && let [Piece::Var(vref)] = pieces.as_slice()
-        && vref.member.is_none()
-        && !vref.quoted
-    {
-        return Ok((assignment_value(vref, &shell.vars)?, Step::Continue(0)));
-    }
-    let mut values = expand::expand(
-        rhs.iter()
-            .map(|w| Word(w.0.iter().map(clone_piece).collect()))
-            .collect(),
-        &shell.vars,
-    )
-    .map_err(|e| e.to_string())?;
-    if values.len() != 1 {
-        return Err("if: branch must yield exactly one value".into());
-    }
-    Ok((Value::String(values.pop().unwrap()), Step::Continue(0)))
-}
-
-/// Does `text` begin a `func` definition? (`func` followed by end-of-input,
-/// whitespace, or `(`.)
-fn is_func_start(text: &str) -> bool {
-    match text.trim_start().strip_prefix("func") {
-        Some(rest) => rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == '('),
-        None => false,
-    }
-}
-
-/// When `pending` holds a `func` header still awaiting its body — `func f()` with
-/// the `{` expected on a later line — does the next physical line `next` fail to
-/// open that body? If so the header is invalid on its own and `next` is a
-/// separate command, so the reader flushes the header (reporting its "missing
-/// body" error) and reprocesses `next` fresh rather than swallowing it into the
-/// rejected definition. False once a body brace has opened (then `next` continues
-/// the body) or when `next` still leaves the header validly incomplete.
-fn line_invalidates_awaited_body(pending: &str, next: &str) -> bool {
-    if pending.is_empty() || !is_func_start(pending) {
-        return false;
-    }
-    let before = lexer::scan_braces(pending, 0);
-    if before.close.is_some() || before.depth != 0 {
-        return false; // a body brace is already open or closed — not awaiting one
-    }
-    let mut combined = pending.to_string();
-    combined.push_str(next);
-    if lexer::needs_more_input(&combined) {
-        return false; // still a valid incomplete header (blank line, forming signature)
-    }
-    // The header is resolved by `next`. It is a real definition to dispatch only
-    // if `next` actually opens this header's body — the first non-whitespace after
-    // the signature `)` is `{`. Otherwise `next` is a separate command (even one
-    // that is itself a complete `func … { … }`), so the header must be flushed on
-    // its own and `next` reprocessed rather than swallowed.
-    !body_opens_after_signature(&combined)
-}
-
-/// After a `func name(params)` signature, does the body open — i.e. is the first
-/// non-whitespace character following the signature's `)` a `{`? v1 parameter
-/// lists hold no parentheses, so the first `)` after the first `(` closes the
-/// signature.
-fn body_opens_after_signature(text: &str) -> bool {
-    let rest = text
-        .trim_start()
-        .strip_prefix("func")
-        .unwrap_or("")
-        .trim_start();
-    let Some(paren) = rest.find('(') else {
-        return false;
-    };
-    let after_open = &rest[paren + 1..];
-    let Some(close) = after_open.find(')') else {
-        return false;
-    };
-    after_open[close + 1..].trim_start().starts_with('{')
-}
-
-/// Parse and store a `func name(params) { body }` definition.
-fn define_func(text: &str, shell: &mut Shell) -> Step {
-    match parse_func_def(text) {
-        Ok((name, def)) => {
-            shell.funcs.define(name, def);
-            Step::Continue(0)
-        }
-        Err(msg) => {
-            eprintln!("mesh: {msg}");
-            Step::Continue(2)
-        }
-    }
-}
-
-/// Parse `func name(params) { body }` from raw text into a name and definition.
-/// v1 accepts required named positionals only.
-///
-/// The signature's closing `)` is searched for **only before the body's opening
-/// `{`**, so a malformed header such as `func f(x { … }` cannot borrow a `)` from
-/// a later body line — it is rejected as a missing `)` while the buffered body
-/// (already consumed by the brace-driven reader) stays quarantined.
-fn parse_func_def(text: &str) -> Result<(String, FuncDef), String> {
-    let rest = text
-        .trim()
-        .strip_prefix("func")
-        .ok_or("func: internal error")?
-        .trim_start();
-    let name_end = rest
-        .find(|c: char| c == '(' || c.is_whitespace())
-        .ok_or("func: missing parameter list `(...)`")?;
-    let name = &rest[..name_end];
-    if !lexer::is_ident(name) {
-        return Err(format!("func: `{name}` is not a valid function name"));
-    }
-    // A name resolves as builtin → function → external, and `func`/`return` are
-    // intercepted even earlier (the reader reads `func …` as a definition, and
-    // `return` is control flow). A function named after any of these would be
-    // stored but never reachable, so reject it rather than accept a dead
-    // definition.
-    if name == "func" || name == "return" || builtins::is_builtin(name) {
-        return Err(format!(
-            "func: `{name}` is a reserved name and cannot be a function name"
-        ));
-    }
-    let after_open = rest[name_end..]
-        .trim_start()
-        .strip_prefix('(')
-        .ok_or("func: missing parameter list `(...)`")?;
-    // Bound the `)` search to the header — everything before the body's `{`.
-    let header_end = after_open.find('{').unwrap_or(after_open.len());
-    let close = after_open[..header_end]
-        .find(')')
-        .ok_or("func: missing `)` before the function body")?;
-    let params = lexer::parse_params(&after_open[..close])?;
-    let body_src = after_open[close + 1..]
-        .trim_start()
-        .strip_prefix('{')
-        .ok_or("func: missing body `{ ... }`")?;
-    let (body, after_body) = split_braced_body(body_src)?;
-    if !after_body.trim().is_empty() {
-        return Err("func: unexpected text after the closing `}`".to_string());
-    }
-    let body = match parser::parse(body) {
-        Ok(parser::ParseOutcome::Complete(source)) => source,
-        Ok(parser::ParseOutcome::Incomplete) => {
-            return Err("func: incomplete function body".to_string());
-        }
-        Err(error) => return Err(error.to_string()),
-    };
-    Ok((name.to_string(), FuncDef { params, body }))
-}
-
-/// Given the text right after a body's opening `{`, split off the body (up to
-/// the matching `}`) and whatever follows it. Delegates to the lexer's shared
-/// [`lexer::scan_braces`] so the boundary honors the same quote/raw/escape rules
-/// as execution — the definition scanner and the runtime lexer cannot disagree.
-fn split_braced_body(src: &str) -> Result<(&str, &str), String> {
-    match lexer::scan_braces(src, 1).close {
-        Some(byte) => Ok((&src[..byte], &src[byte + 1..])),
-        None => Err("func: missing closing `}`".to_string()),
-    }
+/// Return whether the parser needs another physical line to complete the input.
+fn needs_more_input(text: &str) -> bool {
+    matches!(parser::parse(text), Ok(parser::ParseOutcome::Incomplete))
 }
 
 /// A classified line: a variable binding or a command.
@@ -2122,35 +1576,23 @@ fn ignore_interactive_signals() -> io::Result<()> {
     Ok(())
 }
 
-/// Handle a reedline signal, buffering the lines of a multi-line `func` body in
-/// `pending`. Returns `None` when more input is needed (a `func` body is still
-/// open), else `Some(step)`. Extracted from the read loop so the interactive
-/// control flow is unit-testable without a terminal.
+/// Handle a reedline signal, buffering input while the parser reports it as
+/// incomplete. Extracted from the read loop so the interactive control flow is
+/// unit-testable without a terminal.
 ///
 /// `Ctrl-D` on an empty line exits (and abandons any in-progress `func`);
 /// `Ctrl-C` cancels the current line/buffer and re-prompts, keeping the status.
 fn handle_signal(
     signal: Signal,
-    mut last: u8,
+    last: u8,
     shell: &mut Shell,
     pending: &mut String,
 ) -> Option<Step> {
     match signal {
         Signal::Success(line) => {
-            if line_invalidates_awaited_body(pending, &line) {
-                // The awaited body never came: flush the header (its missing-body
-                // error) now, then reprocess this line fresh below rather than
-                // swallowing it into the rejected definition.
-                let header = std::mem::take(pending);
-                match run_line(&header, last, false, shell) {
-                    Step::Exit(code) => return Some(Step::Exit(code)),
-                    Step::Continue(code) => last = code,
-                    Step::Return(_) => unreachable!("top-level return handled in run_line"),
-                }
-            }
             pending.push_str(&line);
             pending.push('\n');
-            if is_compound_input(pending) && needs_more_compound_input(pending) {
+            if needs_more_input(pending) {
                 return None;
             }
             let text = std::mem::take(pending);
@@ -2178,9 +1620,8 @@ fn run_piped() -> ExitCode {
     let mut last: u8 = 0;
     let mut shell = Shell::new();
     let mut pending = String::new();
-    // The buffered definition contained invalid UTF-8: keep buffering to its
-    // closing brace (so its body can't leak), then discard it whole rather than
-    // storing/executing the lossy source.
+    // Discard a buffered input unit if any of its physical lines was invalid
+    // UTF-8, while still using the parser to find the unit's end.
     let mut poisoned = false;
     let mut line = Vec::new();
 
@@ -2203,36 +1644,15 @@ fn run_piped() -> ExitCode {
                 eprintln!("mesh: invalid UTF-8 in input");
                 last = 1;
                 lossy = String::from_utf8_lossy(&line).into_owned();
-                // A malformed line that opens or continues a `func` body must be
-                // quarantined: poison it and substitute U+FFFD only so real braces
-                // still count, keep buffering to the matching close, then discard
-                // the whole definition below — never storing or running lossy
-                // source, and never leaking the body to the top level. A standalone
-                // malformed line with no open definition is simply skipped.
-                let opens_definition =
-                    is_compound_input(&lossy) && needs_more_compound_input(&lossy);
-                if pending.is_empty() && !opens_definition {
+                if pending.is_empty() && !needs_more_input(&lossy) {
                     continue;
                 }
                 poisoned = true;
                 &lossy
             }
         };
-        // A buffered header still awaiting its body, followed by a line that
-        // cannot open one: flush the header (its missing-body error) and reprocess
-        // this line fresh rather than swallowing it. Skip while poisoning, whose
-        // discard path owns the buffer.
-        if !poisoned && line_invalidates_awaited_body(&pending, text) {
-            let header = std::mem::take(&mut pending);
-            match run_line(&header, last, false, &mut shell) {
-                Step::Exit(code) => return ExitCode::from(code),
-                Step::Continue(code) => last = code,
-                Step::Return(_) => unreachable!("top-level return handled in run_line"),
-            }
-        }
         pending.push_str(text);
-        // Keep reading the lines of a multi-line `func` body before running it.
-        if is_compound_input(&pending) && needs_more_compound_input(&pending) {
+        if needs_more_input(&pending) {
             continue;
         }
         let full = std::mem::take(&mut pending);
@@ -2247,9 +1667,7 @@ fn run_piped() -> ExitCode {
             Step::Return(_) => unreachable!("top-level return handled in run_line"),
         }
     }
-    // A truncated (or poisoned) `func` definition at EOF: a poisoned one is
-    // discarded (its error was already reported); otherwise run it so the parse
-    // error is reported.
+    // Report an incomplete unit at EOF; a poisoned one was already diagnosed.
     if !poisoned && !pending.trim().is_empty() {
         match run_line(&pending, last, false, &mut shell) {
             Step::Exit(code) => return ExitCode::from(code),
@@ -2282,7 +1700,7 @@ fn read_line(reader: &mut impl Read, out: &mut Vec<u8>) -> io::Result<usize> {
 }
 
 /// The minimal two-glyph prompt: `mesh$` after success, `mesh!` after failure,
-/// `...` while a multi-line `func` body is still open. The full status-dashboard
+/// `...` while a multi-line input unit is incomplete. The full status-dashboard
 /// prompt from `DESIGN.md` is a later milestone.
 struct MeshPrompt {
     failed: bool,
@@ -2318,22 +1736,29 @@ impl Prompt for MeshPrompt {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Shell, Step, eval_binary, handle_signal, needs_more_compound_input, run_line, run_source,
-    };
+    use super::{Shell, Step, eval_binary, handle_signal, needs_more_input, run_line, run_source};
     use crate::parser;
     use crate::vars::Value;
     use reedline::Signal;
 
     #[test]
     fn compound_input_completeness_comes_from_the_parser() {
-        assert!(needs_more_compound_input("func f() {\nputs hi\n"));
-        assert!(!needs_more_compound_input("func f() {\nputs hi\n}\n"));
-    }
-
-    #[test]
-    fn executor_scanner_keeps_disputed_function_body_open() {
-        assert!(needs_more_compound_input("func f() {\nputs xr'\\' }\n"));
+        for input in [
+            "func f() {\nputs hi\n",
+            "if true {\nputs yes\n",
+            "for x in [1 2] {\nputs $x\n",
+            "func f() {\nif true {\nputs hi\n}\n",
+        ] {
+            assert!(needs_more_input(input), "expected incomplete: {input:?}");
+        }
+        for input in [
+            "func f() {\nputs hi\n}\n",
+            "if true {\nputs yes\n}\n",
+            "for x in [1 2] {\nputs $x\n}\n",
+            "func f() {\nif true {\nputs hi\n}\n}\n",
+        ] {
+            assert!(!needs_more_input(input), "expected complete: {input:?}");
+        }
     }
 
     #[test]
@@ -2549,9 +1974,9 @@ mod tests {
     }
 
     #[test]
-    fn a_non_brace_line_after_an_awaited_header_is_reprocessed() {
-        // `func f()` buffers awaiting its body; the next line is not `{`, so the
-        // header is rejected and that line runs as its own command (not swallowed).
+    fn a_non_brace_line_completes_an_invalid_buffered_unit() {
+        // The parser alone decides when the buffered unit is no longer
+        // incomplete; the reader does not reinterpret its physical lines.
         let mut shell = Shell::new();
         let mut pending = String::new();
         assert_eq!(
@@ -2563,14 +1988,13 @@ mod tests {
             ),
             None
         );
-        // The following line invalidates the awaited body: it runs on its own.
         let step = handle_signal(
             Signal::Success("puts after".into()),
             0,
             &mut shell,
             &mut pending,
         );
-        assert_eq!(step, Some(Step::Continue(0)));
+        assert_eq!(step, Some(Step::Continue(2)));
         assert!(pending.is_empty());
         // `f` was never defined.
         assert!(shell.funcs.get("f").is_none());
