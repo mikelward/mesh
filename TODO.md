@@ -84,7 +84,11 @@ file as tasks land.
       `return`. Resolution is builtins → functions → external. Deferred:
       flags/optionals/rest parameters, functions in pipelines/redirections, and
       calling for a value (`f(arg)`) vs running (`f arg`).
-- [ ] `if` / `for` / `match`.
+- [x] First `if` expression slice — command-status conditions, brace-delimited
+      `else` / `else if`, multiline bodies, and assignment-position string/list
+      results. Deferred with the general expression parser: boolean/comparison
+      conditions and conditional destructuring.
+- [ ] `for` / `match`.
 
 ## Decisions made
 

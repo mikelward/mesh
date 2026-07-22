@@ -160,6 +160,45 @@ mesh$ <strong>puts still here</strong>
 still here
 </pre>
 
+## Choosing with `if`
+
+`if` runs a command as its condition. Status `0` selects the first body; any
+other status selects `else` when one is present:
+
+<pre>
+mesh$ <strong>if test -d .git {</strong>
+...   <strong>puts repository</strong>
+... <strong>} else {</strong>
+...   <strong>puts ordinary-directory</strong>
+... <strong>}</strong>
+repository
+</pre>
+
+Chain another test with `else if`:
+
+<pre>
+mesh$ <strong>if false { puts no } else if true { puts yes }</strong>
+yes
+</pre>
+
+An `if` is also a value in an assignment. The selected body's final line is the
+value; it can currently be one string, a string-list literal, a whole variable
+value, or another `if`:
+
+<pre>
+mesh$ <strong>label = if test -d .git { "git tree" } else { directory }</strong>
+mesh$ <strong>puts $label</strong>
+git tree
+mesh$ <strong>names = if true { [Ada "Grace Hopper"] } else { [] }</strong>
+mesh$ <strong>puts ...$names</strong>
+Ada Grace Hopper
+</pre>
+
+When a false value-producing `if` has no `else`, it yields the empty string.
+Only the selected body runs. General boolean/comparison conditions and `if`
+destructuring patterns are still ahead; conditions today are commands and
+functions, including standard commands such as `true` and `false`.
+
 ## Functions
 
 Give a sequence of commands a name with `func`. Parameters are named — you write

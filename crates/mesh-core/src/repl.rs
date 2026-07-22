@@ -81,6 +81,24 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
     if is_func_start(text) {
         return define_func(text, shell);
     }
+    if is_if_start(text) {
+        return run_if(text, last, in_function, shell);
+    }
+    if let Some((name, expression)) = if_assignment(text) {
+        return match eval_if_value(expression, last, in_function, shell) {
+            Ok((value, step)) => match step {
+                Step::Continue(_) => {
+                    shell.vars.set_value(name, value);
+                    Step::Continue(0)
+                }
+                other => other,
+            },
+            Err(msg) => {
+                eprintln!("mesh: {msg}");
+                Step::Continue(2)
+            }
+        };
+    }
     let segments = match lexer::split_line(text) {
         Ok(segments) => segments,
         Err(err) => {
@@ -393,7 +411,10 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
     for (param, arg) in params.iter().zip(args) {
         shell.vars.set_value(param, arg);
     }
-    let result = run_func_body(&body, shell);
+    let result = match run_func_body(&body, shell) {
+        Step::Return(code) => Step::Continue(code),
+        other => other,
+    };
     shell.vars.pop_scope();
     result
 }
@@ -416,31 +437,219 @@ fn run_func_body(body: &str, shell: &mut Shell) -> Step {
             let header = std::mem::take(&mut pending);
             match run_line(&header, status, true, shell) {
                 Step::Continue(code) => status = code,
-                Step::Return(code) => return Step::Continue(code),
+                Step::Return(code) => return Step::Return(code),
                 Step::Exit(code) => return Step::Exit(code),
             }
         }
         pending.push_str(line);
         pending.push('\n');
-        if is_func_start(&pending) && lexer::needs_more_input(&pending) {
+        if (is_func_start(&pending) || is_if_input(&pending)) && needs_more_compound_input(&pending)
+        {
             continue;
         }
         let full = std::mem::take(&mut pending);
         match run_line(&full, status, true, shell) {
             Step::Continue(code) => status = code,
-            Step::Return(code) => return Step::Continue(code),
+            Step::Return(code) => return Step::Return(code),
             Step::Exit(code) => return Step::Exit(code),
         }
     }
     // A truncated nested definition still buffered at the end of the body: run it
     // so its "missing }" error is reported rather than silently swallowed.
     if !pending.trim().is_empty() {
-        return match run_line(&pending, status, true, shell) {
-            Step::Return(code) => Step::Continue(code),
-            other => other,
-        };
+        return run_line(&pending, status, true, shell);
     }
     Step::Continue(status)
+}
+
+/// Does `text` begin with the reserved `if` word?
+fn is_if_start(text: &str) -> bool {
+    match text.trim_start().strip_prefix("if") {
+        Some(rest) => rest.is_empty() || rest.starts_with(char::is_whitespace),
+        None => false,
+    }
+}
+
+fn is_if_input(text: &str) -> bool {
+    is_if_start(text) || if_assignment(text).is_some()
+}
+
+fn needs_more_compound_input(text: &str) -> bool {
+    if is_func_start(text) {
+        lexer::needs_more_input(text)
+    } else if is_if_input(text) {
+        let expression = if_assignment(text).map_or(text, |(_, rhs)| rhs);
+        match parse_if(expression) {
+            Ok(_) => false,
+            Err(msg) => msg.contains("missing body") || msg.contains("missing closing"),
+        }
+    } else {
+        false
+    }
+}
+
+/// Recognize the current assignment-expression form, `name = if ...`.
+fn if_assignment(text: &str) -> Option<(&str, &str)> {
+    let (name, rhs) = text.trim().split_once('=')?;
+    let name = name.trim();
+    let rhs = rhs.trim_start();
+    (lexer::is_ident(name) && is_if_start(rhs)).then_some((name, rhs))
+}
+
+/// Find the first bare opening brace. The shared scanner supplies all quoting,
+/// escaping, raw-string, and interpolation rules, avoiding a second lexer here.
+fn first_bare_open(text: &str) -> Option<usize> {
+    text.char_indices()
+        .filter(|(_, ch)| *ch == '{')
+        .find_map(|(byte, _)| (lexer::scan_braces(&text[..=byte], 0).depth == 1).then_some(byte))
+}
+
+fn parse_if(text: &str) -> Result<(&str, &str, Option<&str>), String> {
+    let rest = text
+        .trim()
+        .strip_prefix("if")
+        .ok_or("if: expected `if`")?
+        .trim_start();
+    let open = first_bare_open(rest).ok_or("if: missing body `{ ... }`")?;
+    let condition = rest[..open].trim();
+    if condition.is_empty() {
+        return Err("if: missing condition".into());
+    }
+    let (then_body, tail) =
+        split_braced_body(&rest[open + 1..]).map_err(|_| "if: missing closing `}`".to_string())?;
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return Ok((condition, then_body, None));
+    }
+    let else_part = tail
+        .strip_prefix("else")
+        .filter(|after| {
+            after.is_empty() || after.starts_with(char::is_whitespace) || after.starts_with('{')
+        })
+        .ok_or("if: unexpected text after the closing `}`")?
+        .trim_start();
+    if is_if_start(else_part) {
+        return Ok((condition, then_body, Some(else_part)));
+    }
+    let else_open = first_bare_open(else_part).ok_or("if: `else` needs a body `{ ... }`")?;
+    if !else_part[..else_open].trim().is_empty() {
+        return Err("if: unexpected text before the `else` body".into());
+    }
+    let (else_body, after) = split_braced_body(&else_part[else_open + 1..])
+        .map_err(|_| "if: missing closing `}`".to_string())?;
+    if !after.trim().is_empty() {
+        return Err("if: unexpected text after the closing `}`".into());
+    }
+    Ok((condition, then_body, Some(else_body)))
+}
+
+fn test_condition(condition: &str, last: u8, in_function: bool, shell: &mut Shell) -> (bool, Step) {
+    let step = run_line(condition, last, in_function, shell);
+    (matches!(step, Step::Continue(0)), step)
+}
+
+fn run_if(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
+    let (condition, then_body, else_body) = match parse_if(text) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            eprintln!("mesh: {msg}");
+            return Step::Continue(2);
+        }
+    };
+    let (take_then, condition_step) = test_condition(condition, last, in_function, shell);
+    if !matches!(condition_step, Step::Continue(_)) {
+        return condition_step;
+    }
+    if take_then {
+        run_func_body(then_body, shell)
+    } else if let Some(body) = else_body {
+        if is_if_start(body) {
+            run_if(body, last, in_function, shell)
+        } else {
+            run_func_body(body, shell)
+        }
+    } else {
+        Step::Continue(0)
+    }
+}
+
+fn eval_if_value(
+    text: &str,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<(Value, Step), String> {
+    let (condition, then_body, else_body) = parse_if(text)?;
+    let (take_then, step) = test_condition(condition, last, in_function, shell);
+    if !matches!(step, Step::Continue(_)) {
+        return Ok((Value::String(String::new()), step));
+    }
+    if take_then {
+        eval_block_value(then_body, shell)
+    } else if let Some(body) = else_body {
+        if is_if_start(body) {
+            eval_if_value(body, last, in_function, shell)
+        } else {
+            eval_block_value(body, shell)
+        }
+    } else {
+        Ok((Value::String(String::new()), Step::Continue(0)))
+    }
+}
+
+/// Evaluate the final physical line as a value; preceding lines run for effect.
+fn eval_block_value(body: &str, shell: &mut Shell) -> Result<(Value, Step), String> {
+    let body = body.trim();
+    if body.is_empty() {
+        return Ok((Value::String(String::new()), Step::Continue(0)));
+    }
+    if is_if_start(body) {
+        return eval_if_value(body, 0, true, shell);
+    }
+    let (prefix, expression) = body.rsplit_once('\n').unwrap_or(("", body));
+    let step = if prefix.trim().is_empty() {
+        Step::Continue(0)
+    } else {
+        run_func_body(prefix, shell)
+    };
+    if !matches!(step, Step::Continue(_)) {
+        return Ok((Value::String(String::new()), step));
+    }
+    if is_if_start(expression.trim()) {
+        return eval_if_value(expression.trim(), 0, true, shell);
+    }
+    let words = lexer::split_line(expression).map_err(|e| e.to_string())?;
+    let [segment] = words.as_slice() else {
+        return Err("if: branch value must be one expression".into());
+    };
+    if segment.background || segment.stages.len() != 1 || !segment.stages[0].redirs.is_empty() {
+        return Err("if: branch value must be one expression".into());
+    }
+    let rhs = &segment.stages[0].words;
+    if let Some(items) = list_literal(rhs) {
+        return Ok((
+            Value::List(expand::expand(items, &shell.vars).map_err(|e| e.to_string())?),
+            Step::Continue(0),
+        ));
+    }
+    if let [Word(pieces)] = rhs.as_slice()
+        && let [Piece::Var(vref)] = pieces.as_slice()
+        && vref.member.is_none()
+        && !vref.quoted
+    {
+        return Ok((assignment_value(vref, &shell.vars)?, Step::Continue(0)));
+    }
+    let mut values = expand::expand(
+        rhs.iter()
+            .map(|w| Word(w.0.iter().map(clone_piece).collect()))
+            .collect(),
+        &shell.vars,
+    )
+    .map_err(|e| e.to_string())?;
+    if values.len() != 1 {
+        return Err("if: branch must yield exactly one value".into());
+    }
+    Ok((Value::String(values.pop().unwrap()), Step::Continue(0)))
 }
 
 /// Does `text` begin a `func` definition? (`func` followed by end-of-input,
@@ -958,7 +1167,9 @@ fn handle_signal(
             }
             pending.push_str(&line);
             pending.push('\n');
-            if is_func_start(pending) && lexer::needs_more_input(pending) {
+            if (is_func_start(pending) || is_if_input(pending))
+                && needs_more_compound_input(pending)
+            {
                 return None;
             }
             let text = std::mem::take(pending);
@@ -1017,7 +1228,8 @@ fn run_piped() -> ExitCode {
                 // the whole definition below — never storing or running lossy
                 // source, and never leaking the body to the top level. A standalone
                 // malformed line with no open definition is simply skipped.
-                let opens_definition = is_func_start(&lossy) && lexer::needs_more_input(&lossy);
+                let opens_definition = (is_func_start(&lossy) || is_if_input(&lossy))
+                    && needs_more_compound_input(&lossy);
                 if pending.is_empty() && !opens_definition {
                     continue;
                 }
@@ -1039,7 +1251,8 @@ fn run_piped() -> ExitCode {
         }
         pending.push_str(text);
         // Keep reading the lines of a multi-line `func` body before running it.
-        if is_func_start(&pending) && lexer::needs_more_input(&pending) {
+        if (is_func_start(&pending) || is_if_input(&pending)) && needs_more_compound_input(&pending)
+        {
             continue;
         }
         let full = std::mem::take(&mut pending);

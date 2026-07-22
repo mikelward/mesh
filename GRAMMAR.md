@@ -325,10 +325,39 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
   rest parameters; `func` composing with separators; and calling for a value
   (`f(arg)`) vs. running (`f arg`) — only the run form exists today.
 
+## Task 10 — `if` expressions
+
+An `if` selects a brace-delimited branch using a command's exit status. Status
+zero takes the first branch; nonzero takes `else`, when present. Branches can
+span lines and `else if` chains without the POSIX `then` / `elif` / `fi` words.
+
+```
+if-expr = "if" ws command ws? "{" body "}"
+          (ws? "else" ws? (if-expr | "{" body "}"))?
+if-assign = name ws? "=" ws? if-expr
+```
+
+For example:
+
+```
+if grep -q needle file { puts found } else { puts absent }
+label = if test -d .git { "git tree" } else { directory }
+items = if true { [one "two three"] } else { [] }
+```
+
+In statement position, the selected body runs normally and the other body is
+not evaluated. `return` and `exit` in a selected body retain their control-flow
+behavior. In assignment position, the selected branch's final physical line is
+a value expression: currently one string value, a list literal, a whole variable
+value, or a nested `if`. Earlier lines run for effect. A false `if` with no
+`else` yields the empty string. General boolean and comparison expressions, and
+conditional destructuring assignments, arrive with the general expression
+parser.
+
 ### Not yet parsed
-Nested/general list expressions, maps, bare `{ }` blocks, `if` / `for` / `match`,
-`:` modifiers, and heredocs. Each arrives with the task that needs it, and this
-file grows to match.
+Nested/general list expressions, maps, bare `{ }` blocks, `for` / `match`, `:`
+modifiers, and heredocs. Each arrives with the task that needs it, and this file
+grows to match.
 
 **Design target (still ahead of the lexer above).** The **Model B strings**
 direction from `DESIGN.md` is now implemented (see task 5 above). What the lexer
