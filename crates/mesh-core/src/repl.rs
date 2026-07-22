@@ -120,7 +120,15 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
                     "break" | "continue"
                 )
             });
-            if parser_owned || control {
+            let operator_assignment = source.statements.iter().any(|statement| {
+                executable_has_operator_assignment(&statement.and_or.first)
+                    || statement
+                        .and_or
+                        .rest
+                        .iter()
+                        .any(|(_, executable)| executable_has_operator_assignment(executable))
+            });
+            if parser_owned || control || operator_assignment {
                 return run_source(&source, last, in_function, shell);
             }
         }
@@ -200,6 +208,66 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
         }
     }
     Step::Continue(status)
+}
+
+fn executable_has_operator_assignment(executable: &parser::Executable) -> bool {
+    matches!(
+        executable,
+        parser::Executable::Assignment { value, .. } if expression_has_operator(value)
+    )
+}
+
+fn expression_has_operator(expression: &parser::Expr) -> bool {
+    use parser::Expr;
+    match expression {
+        Expr::Unary { .. } | Expr::Binary { .. } => true,
+        Expr::List(items) => items.iter().any(|item| match item {
+            parser::ListItem::Value(value) | parser::ListItem::Spread(value) => {
+                expression_has_operator(value)
+            }
+        }),
+        Expr::Map(items) => items.iter().any(|item| match item {
+            parser::MapItem::Pair(key, value) => {
+                expression_has_operator(key) || expression_has_operator(value)
+            }
+            parser::MapItem::Spread(value) => expression_has_operator(value),
+        }),
+        Expr::Group(value) | Expr::Member { value, .. } => expression_has_operator(value),
+        Expr::Index { value, index } => {
+            expression_has_operator(value) || expression_has_operator(index)
+        }
+        Expr::Modifier {
+            value, arguments, ..
+        } => {
+            expression_has_operator(value)
+                || arguments.as_ref().is_some_and(|arguments| {
+                    arguments.iter().any(|argument| match argument {
+                        parser::Argument::Positional(value)
+                        | parser::Argument::Named(_, value)
+                        | parser::Argument::Spread(value) => expression_has_operator(value),
+                    })
+                })
+        }
+        Expr::Range { start, end, .. } => {
+            start.as_deref().is_some_and(expression_has_operator)
+                || end.as_deref().is_some_and(expression_has_operator)
+        }
+        Expr::Call { callee, arguments } => {
+            expression_has_operator(callee)
+                || arguments.iter().any(|argument| match argument {
+                    parser::Argument::Positional(value)
+                    | parser::Argument::Named(_, value)
+                    | parser::Argument::Spread(value) => expression_has_operator(value),
+                })
+        }
+        Expr::For { iterable, .. } => expression_has_operator(iterable),
+        Expr::Scalar(_)
+        | Expr::Variable(_)
+        | Expr::BackgroundJob(_)
+        | Expr::Capture(_)
+        | Expr::If(_)
+        | Expr::Lambda { .. } => false,
+    }
 }
 
 /// Execute the syntax tree recursively.  Keeping execution on the tree (rather
@@ -692,17 +760,18 @@ fn eval_for_expr(
     shell.loop_depth += 1;
     for value in values {
         shell.vars.set_value(binding, value);
-        match eval_body(body, 0, in_function, shell) {
-            Ok(value) => results.push(value),
+        let result = match eval_body(body, 0, in_function, shell) {
+            Ok(value) => value,
             Err(step) => {
                 shell.loop_depth -= 1;
                 return Err(step);
             }
-        }
+        };
         match shell.control.take() {
             Some(parser::ControlKind::Break) => break,
-            Some(parser::ControlKind::Continue) | None => {}
+            Some(parser::ControlKind::Continue) => continue,
             Some(parser::ControlKind::Return) => unreachable!(),
+            None => results.push(result),
         }
     }
     shell.loop_depth -= 1;
@@ -740,6 +809,9 @@ fn eval_body(
             Step::Continue(code) => last = code,
             flow => return Err(flow),
         }
+        if shell.control.is_some() {
+            return Ok(Value::String(String::new()));
+        }
     }
     Ok(Value::String(String::new()))
 }
@@ -758,6 +830,13 @@ fn number(value: &Value) -> Result<i64, String> {
         Value::String(s) => s.parse().map_err(|_| format!("{s}: expected number")),
         _ => Err("expected number".into()),
     }
+}
+fn checked_div(left: i64, right: i64) -> Result<i64, String> {
+    if right == 0 {
+        return Err("division by zero".into());
+    }
+    left.checked_div(right)
+        .ok_or_else(|| "numeric overflow".into())
 }
 fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value, String> {
     use parser::BinaryOp::*;
@@ -782,12 +861,7 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
                 .ok_or("numeric overflow")?
                 .to_string(),
         ),
-        Divide => Value::String(
-            number(&left)?
-                .checked_div(number(&right)?)
-                .ok_or("division by zero")?
-                .to_string(),
-        ),
+        Divide => Value::String(checked_div(number(&left)?, number(&right)?)?.to_string()),
         Remainder => Value::String(
             number(&left)?
                 .checked_rem(number(&right)?)
@@ -2247,7 +2321,9 @@ impl Prompt for MeshPrompt {
 
 #[cfg(test)]
 mod tests {
-    use super::{Shell, Step, handle_signal, needs_more_compound_input, run_line, run_source};
+    use super::{
+        Shell, Step, eval_binary, handle_signal, needs_more_compound_input, run_line, run_source,
+    };
     use crate::parser;
     use crate::vars::Value;
     use reedline::Signal;
@@ -2377,6 +2453,66 @@ mod tests {
 
         assert_eq!(run_source(&source, 0, false, &mut shell), Step::Continue(1));
         assert_eq!(shell.vars.get("value"), None);
+    }
+
+    #[test]
+    fn operator_assignments_use_the_ast_evaluator_from_run_line() {
+        let mut shell = Shell::new();
+        for (source, name, expected) in [
+            ("product = 6 * 7", "product", "42"),
+            ("quotient = 8 / 2", "quotient", "4"),
+            ("equal = 1 == 1", "equal", "true"),
+            ("member = 2 in [1 2]", "member", "true"),
+        ] {
+            assert_eq!(run_line(source, 0, false, &mut shell), Step::Continue(0));
+            assert_eq!(shell.vars.get(name), Some(&Value::String(expected.into())));
+        }
+    }
+
+    #[test]
+    fn for_expression_control_does_not_evaluate_or_collect_the_tail() {
+        let mut shell = Shell::new();
+        assert_eq!(
+            run_line(
+                "stopped = for x in [1 2 3] { break; $x }",
+                0,
+                false,
+                &mut shell
+            ),
+            Step::Continue(0)
+        );
+        assert_eq!(shell.vars.get("stopped"), Some(&Value::List(Vec::new())));
+
+        assert_eq!(
+            run_line(
+                "skipped = for x in [1 2 3] { continue; $x }",
+                0,
+                false,
+                &mut shell,
+            ),
+            Step::Continue(0)
+        );
+        assert_eq!(shell.vars.get("skipped"), Some(&Value::List(Vec::new())));
+    }
+
+    #[test]
+    fn checked_division_distinguishes_zero_from_overflow() {
+        assert_eq!(
+            eval_binary(
+                Value::String(i64::MIN.to_string()),
+                parser::BinaryOp::Divide,
+                Value::String("-1".into()),
+            ),
+            Err("numeric overflow".into())
+        );
+        assert_eq!(
+            eval_binary(
+                Value::String("1".into()),
+                parser::BinaryOp::Divide,
+                Value::String("0".into()),
+            ),
+            Err("division by zero".into())
+        );
     }
 
     #[test]
