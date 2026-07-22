@@ -819,11 +819,18 @@ pub fn scan_braces(text: &str, start_depth: i32) -> BraceScan {
                 word_start = true;
                 k += 1;
             }
-            // `&&` is a separator (fresh word after it); a lone `&` is a literal
-            // character and is *not* a word boundary.
-            '&' if chars.get(k + 1).map(|&(_, c)| c) == Some('&') => {
+            // Both `&&` (a separator) and a lone `&` (the background operator)
+            // start a fresh word after them, exactly as `split_line` does — so a
+            // raw prefix that immediately follows (`true&r'…'`) is recognized as
+            // raw here too, and the scan cannot mis-read it as a plain quote and
+            // swallow the block's closing `}`.
+            '&' => {
                 word_start = true;
-                k += 2;
+                if chars.get(k + 1).map(|&(_, c)| c) == Some('&') {
+                    k += 2;
+                } else {
+                    k += 1;
+                }
             }
             // A bare `=` lets a raw prefix begin the value (`k=r'v'`).
             '=' => {
@@ -1246,6 +1253,15 @@ mod tests {
         assert_eq!(scan_braces(r"puts \{", 0).depth, 0);
         // A real block brace alongside an interpolation still counts.
         assert_eq!(scan_braces("func f() { puts ${x}", 0).depth, 1);
+    }
+
+    #[test]
+    fn scan_braces_treats_a_bare_ampersand_as_a_word_boundary() {
+        // The no-space background form (`true&r'…'`) starts a fresh word after
+        // `&`, so the following raw string is raw here (as in `split_line`) and
+        // its trailing backslash does not escape the quote and swallow the `}`.
+        assert_eq!(scan_braces(r"func f() { true&r'\' }", 0).depth, 0);
+        assert_eq!(scan_braces(r"func f() { true&r'\' }", 0).close, Some(21));
     }
 
     #[test]
