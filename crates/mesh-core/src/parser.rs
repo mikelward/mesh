@@ -1684,7 +1684,7 @@ impl Parser {
                         )
                         && self.viable_expression())
                     || attached_call
-                    || followed_by_operator
+                    || (followed_by_operator && self.viable_expression())
             }
             _ => false,
         }
