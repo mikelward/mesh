@@ -444,8 +444,35 @@ fn line_invalidates_awaited_body(pending: &str, next: &str) -> bool {
     }
     let mut combined = pending.to_string();
     combined.push_str(next);
-    let after = lexer::scan_braces(&combined, 0);
-    after.close.is_none() && after.depth == 0 && !lexer::needs_more_input(&combined)
+    if lexer::needs_more_input(&combined) {
+        return false; // still a valid incomplete header (blank line, forming signature)
+    }
+    // The header is resolved by `next`. It is a real definition to dispatch only
+    // if `next` actually opens this header's body — the first non-whitespace after
+    // the signature `)` is `{`. Otherwise `next` is a separate command (even one
+    // that is itself a complete `func … { … }`), so the header must be flushed on
+    // its own and `next` reprocessed rather than swallowed.
+    !body_opens_after_signature(&combined)
+}
+
+/// After a `func name(params)` signature, does the body open — i.e. is the first
+/// non-whitespace character following the signature's `)` a `{`? v1 parameter
+/// lists hold no parentheses, so the first `)` after the first `(` closes the
+/// signature.
+fn body_opens_after_signature(text: &str) -> bool {
+    let rest = text
+        .trim_start()
+        .strip_prefix("func")
+        .unwrap_or("")
+        .trim_start();
+    let Some(paren) = rest.find('(') else {
+        return false;
+    };
+    let after_open = &rest[paren + 1..];
+    let Some(close) = after_open.find(')') else {
+        return false;
+    };
+    after_open[close + 1..].trim_start().starts_with('{')
 }
 
 /// Parse and store a `func name(params) { body }` definition.
