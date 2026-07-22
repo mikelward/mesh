@@ -371,12 +371,12 @@ fn guard_allows(
     in_function: bool,
     shell: &mut Shell,
 ) -> bool {
-    guard.map_or(true, |guard| {
-        match eval_expr(&guard.condition, last, in_function, shell) {
+    guard.is_none_or(
+        |guard| match eval_expr(&guard.condition, last, in_function, shell) {
             Ok(value) => truthy(&value) != guard.unless,
             Err(_) => false,
-        }
-    })
+        },
+    )
 }
 
 fn run_ast_if(node: &parser::IfExpr, last: u8, in_function: bool, shell: &mut Shell) -> Step {
@@ -448,7 +448,7 @@ fn run_ast_pipeline(
         let mut redirs = Vec::new();
         for item in &command.items {
             match item {
-                parser::CommandItem::Word(word) => words.push(ast_word(&word.value)),
+                parser::CommandItem::Word(word) => words.push(expansion_word(&word.value)),
                 parser::CommandItem::Redirect { kind, target, .. } => redirs.push(Redir {
                     kind: match kind {
                         parser::RedirectKind::Input => RedirKind::In,
@@ -459,7 +459,7 @@ fn run_ast_pipeline(
                             return Step::Continue(1);
                         }
                     },
-                    target: ast_word(&target.value),
+                    target: expansion_word(&target.value),
                 }),
             }
         }
@@ -468,7 +468,10 @@ fn run_ast_pipeline(
     run_pipeline(stages, background, last, shell)
 }
 
-fn ast_word(word: &parser::Word) -> Word {
+/// Adapt a parser word at the expansion boundary without recreating source text.
+/// Quote modes map directly to the expansion layer's literal/expandable bit, so
+/// escaped and quoted pieces can never acquire syntax in a second lexer pass.
+fn expansion_word(word: &parser::Word) -> Word {
     Word(
         word.pieces
             .iter()
@@ -497,16 +500,16 @@ fn eval_expr(
 ) -> Result<Value, Step> {
     use parser::{BinaryOp as B, Expr as E, ListItem, UnaryOp as U};
     match expr {
-        E::Scalar(word) => expand::expand_values(vec![ast_word(&word.value)], &shell.vars)
+        E::Scalar(word) => expand::expand_values(vec![expansion_word(&word.value)], &shell.vars)
             .map_err(|e| {
                 eprintln!("mesh: {e}");
                 Step::Continue(1)
             })
-            .and_then(|mut v| {
+            .map(|mut v| {
                 if v.len() == 1 {
-                    Ok(v.pop().unwrap())
+                    v.pop().unwrap()
                 } else {
-                    Ok(Value::List(v))
+                    Value::List(v)
                 }
             }),
         E::Variable(name) => shell

@@ -79,7 +79,7 @@ file as tasks land.
   - [ ] Add recursive AST execution for `Source`, `Statement`, `AndOr`,
         `Executable`, `Pipeline`, `Command`, and `Expr`; implement sequencing,
         `&&` / `||`, background execution, and control flow from those nodes.
-  - [ ] Adapt parser-native `Word` / `WordPiece` and redirects directly into the
+  - [x] Adapt parser-native `Word` / `WordPiece` and redirects directly into the
         existing expansion and process layers without stringifying and reparsing
         the AST through the compatibility lexer.
   - [ ] Evaluate expressions as typed values, including variables, member and
