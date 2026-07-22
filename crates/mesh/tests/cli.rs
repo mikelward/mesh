@@ -457,6 +457,13 @@ fn list_indexing_is_zero_based_and_supports_negative_indices() {
 }
 
 #[test]
+fn list_indexing_works_in_double_quotes_with_or_without_braces() {
+    let out = run_with_input("xs = ['a b' c]\nputs \"$xs[0]\" \"${xs[1]}\"\n");
+    assert!(out.stderr.is_empty());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a b c\n");
+}
+
+#[test]
 fn invalid_list_index_fails_loudly_and_recovers() {
     let out = run_with_input(
         "xs = [a b]\nputs $xs[2]\nputs $xs[-3]\nx = text\nputs $x[0]\nputs recovered\n",

@@ -908,6 +908,19 @@ mod tests {
     }
 
     #[test]
+    fn indexing_in_double_quotes_accepts_both_forms() {
+        let indexed = || {
+            Word(vec![Piece::Var(VarRef {
+                name: "xs".into(),
+                member: None,
+                index: Some(0),
+            })])
+        };
+        assert_eq!(words(r#""$xs[0]""#), [indexed()]);
+        assert_eq!(words(r#""${xs[0]}""#), [indexed()]);
+    }
+
+    #[test]
     fn single_quotes_escape_but_do_not_interpolate() {
         assert_eq!(words(r"'can\'t'"), [Word(vec![lit("can't")])]);
         assert_eq!(words(r"'a\nb'"), [Word(vec![lit("a\nb")])]);
