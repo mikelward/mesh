@@ -532,6 +532,18 @@ fn assignment_copies_whole_lists_and_list_slices() {
 }
 
 #[test]
+fn quoted_interpolations_do_not_copy_lists_in_assignments() {
+    let out = run_with_input("xs = [a b c d]\nys = \"$xs\"\nzs = \"${xs[1..]}\"\nputs recovered\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "recovered\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr)
+            .matches("list value needs `...`")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn invalid_list_index_fails_loudly_and_recovers() {
     let out = run_with_input(
         "xs = [a b]\nputs $xs[2]\nputs $xs[-3]\nx = text\nputs $x[0]\nputs recovered\n",

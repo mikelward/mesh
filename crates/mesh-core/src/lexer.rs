@@ -25,6 +25,8 @@ pub struct VarRef {
     /// A single `.member` access, e.g. `$env.PATH` → name `env`, member `PATH`.
     pub member: Option<String>,
     pub access: Option<Access>,
+    /// Whether this interpolation appeared inside double quotes.
+    pub quoted: bool,
 }
 
 /// An exact list index or a clamped range slice.
@@ -444,7 +446,8 @@ fn lex_escaped(
             break;
         }
         if double && c == '$' {
-            if let Some((vref, next)) = parse_var(chars, i + 1)? {
+            if let Some((mut vref, next)) = parse_var(chars, i + 1)? {
+                vref.quoted = true;
                 push_text(word, &buf, false);
                 buf.clear();
                 word.push(Piece::Var(vref));
@@ -563,6 +566,7 @@ fn parse_var(chars: &[char], at: usize) -> Result<Option<(VarRef, usize)>, LexEr
             name,
             member,
             access,
+            quoted: false,
         },
         j,
     )))
@@ -594,6 +598,7 @@ fn parse_var_ref(inner: &str) -> Option<VarRef> {
         name,
         member,
         access,
+        quoted: false,
     })
 }
 
@@ -748,6 +753,15 @@ mod tests {
             name: name.to_string(),
             member: None,
             access: None,
+            quoted: false,
+        })
+    }
+    fn quoted_var(name: &str) -> Piece {
+        Piece::Var(VarRef {
+            name: name.to_string(),
+            member: None,
+            access: None,
+            quoted: true,
         })
     }
 
@@ -913,6 +927,7 @@ mod tests {
                 name: "env".into(),
                 member: Some("PATH".into()),
                 access: None,
+                quoted: false,
             })])]
         );
     }
@@ -927,7 +942,7 @@ mod tests {
 
     #[test]
     fn double_quotes_interpolate_single_quotes_do_not() {
-        assert_eq!(words(r#""a$x""#), [Word(vec![lit("a"), var("x")])]);
+        assert_eq!(words(r#""a$x""#), [Word(vec![lit("a"), quoted_var("x")])]);
         assert_eq!(words(r"'a$x'"), [Word(vec![lit("a$x")])]);
     }
 
@@ -938,6 +953,7 @@ mod tests {
                 name: "map".into(),
                 member: Some("field".into()),
                 access: None,
+                quoted: true,
             })
         };
         assert_eq!(words(r#""$map.field""#), [Word(vec![member()])]);
@@ -948,6 +964,7 @@ mod tests {
                 name: "items".into(),
                 member: None,
                 access: Some(Access::Index(-1)),
+                quoted: true,
             })
         };
         assert_eq!(words(r#""$items[-1]""#), [Word(vec![index()])]);
@@ -965,6 +982,7 @@ mod tests {
                     end,
                     inclusive,
                 }),
+                quoted: false,
             })
         };
         assert_eq!(
