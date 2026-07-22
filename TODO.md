@@ -49,16 +49,17 @@ file as tasks land.
       redirection, redirected builtins, and redirection without a command.
 - [x] Fork-based executor and process groups (`fork`/`exec`, `setpgid`,
       `tcsetpgrp`) so mesh can own the terminal and manage foreground jobs.
-- [ ] Signal handling: Ctrl-C interrupts the foreground job and returns to the
-      prompt with status 130; Ctrl-Z suspends it without suspending mesh.
+- [x] Signal handling: terminal signals target the foreground process group;
+      Ctrl-C interrupts it with status 130 while mesh survives, and idle
+      Ctrl-Z/Ctrl-\\ do not suspend or terminate mesh. Stopped-job tracking and
+      resumption land with the job table below.
 - [ ] Job table plus `fg` / `bg` builtins.
 - [ ] Hand the terminal to full-screen programs and restore it cleanly.
 
 ## Known limitations
 
-- Ctrl-C during a foreground command kills the shell instead of returning to the
-  prompt with status `130`. Deferred to the job-control task (M2); see
-  `ROADMAP.md`.
+- Ctrl-Z stops a foreground job, but mesh cannot register, report, or resume it
+  until the M2 job table and `fg` / `bg` task lands.
 
 ## Decisions made
 

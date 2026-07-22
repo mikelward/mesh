@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 use crate::lexer::RedirKind;
 
@@ -111,6 +111,13 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
         // A zero process group makes the first child a group leader. Later
         // stages join it, so terminal signals address the entire pipeline.
         command.process_group(process_group.unwrap_or(0));
+        // The interactive shell ignores terminal-generated signals while it
+        // owns the prompt. Children must restore the ordinary dispositions so
+        // Ctrl-C/Ctrl-Z/Ctrl-\\ affect the foreground job instead of being
+        // inherited as ignored across exec.
+        unsafe {
+            command.pre_exec(restore_job_signals);
+        }
 
         // stdin: an input redirection wins over the incoming pipe/EOF/terminal.
         if let Some(file) = in_file {
@@ -174,7 +181,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
             Outcome::Running {
                 mut child,
                 piped_out,
-            } => (child.wait().map(status_to_code).unwrap_or(1), piped_out),
+            } => (wait_for_job(&mut child).unwrap_or(1), piped_out),
             Outcome::Failed(code) => (code, false),
         };
         if code != 0 && !(piped_out && code == SIGPIPE_CODE) {
@@ -189,6 +196,55 @@ pub fn run_pipeline(cmds: Vec<Cmd>) -> u8 {
         set_foreground_group(shell_group);
     }
     status
+}
+
+/// Wait for a child to exit, be signaled, or stop. `Child::wait` only reports
+/// termination, which would leave mesh blocked after Ctrl-Z. Reporting a stop
+/// now lets the shell reclaim the terminal; the job-table task will retain the
+/// process and make it available to `fg` / `bg`.
+fn wait_for_job(child: &mut Child) -> std::io::Result<u8> {
+    loop {
+        let mut status = 0;
+        // SAFETY: child.id() is a live child PID and status points to writable
+        // storage. WUNTRACED requests the state transition needed for Ctrl-Z.
+        let result =
+            unsafe { libc::waitpid(child.id() as libc::pid_t, &mut status, libc::WUNTRACED) };
+        if result < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if libc::WIFEXITED(status) {
+            return Ok(libc::WEXITSTATUS(status) as u8);
+        }
+        if libc::WIFSIGNALED(status) {
+            return Ok(128u8.wrapping_add(libc::WTERMSIG(status) as u8));
+        }
+        if libc::WIFSTOPPED(status) {
+            return Ok(128u8.wrapping_add(libc::WSTOPSIG(status) as u8));
+        }
+    }
+}
+
+/// Restore signals whose interactive-shell dispositions must not cross exec.
+fn restore_job_signals() -> std::io::Result<()> {
+    for signal in [
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTSTP,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+        libc::SIGTERM,
+    ] {
+        // SAFETY: signal is one of the valid constants above, and SIG_DFL is a
+        // valid disposition. This runs after fork in Command's child hook.
+        if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Give fd 0's controlling terminal to `pgid`. SIGTTOU must be blocked while a
@@ -254,17 +310,30 @@ fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
     }
 }
 
-/// Map an `ExitStatus` to a shell exit code (`128 + signal` when signaled).
-fn status_to_code(status: ExitStatus) -> u8 {
-    if let Some(code) = status.code() {
-        return code as u8;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return 128u8.wrapping_add(signal as u8);
+#[cfg(test)]
+mod tests {
+    use super::restore_job_signals;
+
+    #[test]
+    fn child_restores_sigint_to_default() {
+        // Isolate disposition changes in a fork so this test cannot interfere
+        // with the test harness or concurrently running tests.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::signal(libc::SIGINT, libc::SIG_IGN);
+            }
+            restore_job_signals().unwrap();
+            unsafe {
+                libc::raise(libc::SIGINT);
+                libc::_exit(99);
+            }
         }
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFSIGNALED(status));
+        assert_eq!(libc::WTERMSIG(status), libc::SIGINT);
     }
-    1
 }
