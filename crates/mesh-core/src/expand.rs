@@ -12,7 +12,7 @@
 use std::env;
 
 use crate::lexer::{Piece, VarRef, Word};
-use crate::vars::Vars;
+use crate::vars::{Value, Vars};
 
 /// An expansion error — an unbound read fails loud (no null), per `DESIGN.md`.
 #[derive(Debug, PartialEq, Eq)]
@@ -20,6 +20,7 @@ pub enum ExpandError {
     UnboundVar(String),
     UnsetEnv(String),
     Unsupported(String),
+    ListNeedsSpread(String),
 }
 
 impl std::fmt::Display for ExpandError {
@@ -28,6 +29,9 @@ impl std::fmt::Display for ExpandError {
             ExpandError::UnboundVar(n) => write!(f, "{n}: unbound variable"),
             ExpandError::UnsetEnv(k) => write!(f, "$env.{k}: not set"),
             ExpandError::Unsupported(s) => write!(f, "{s}: not supported yet"),
+            ExpandError::ListNeedsSpread(n) => {
+                write!(f, "${n}: list value needs `...` in command arguments")
+            }
         }
     }
 }
@@ -36,9 +40,34 @@ impl std::fmt::Display for ExpandError {
 pub fn expand(words: Vec<Word>, vars: &Vars) -> Result<Vec<String>, ExpandError> {
     let mut out = Vec::new();
     for word in words {
+        if let Some(name) = spread_var(&word) {
+            match vars.get(name) {
+                Some(Value::List(values)) => out.extend(values.iter().cloned()),
+                Some(Value::String(_)) => {
+                    return Err(ExpandError::Unsupported(format!("...${name} on a string")));
+                }
+                None => return Err(ExpandError::UnboundVar(name.to_string())),
+            }
+            continue;
+        }
         expand_word(word, vars, &mut out)?;
     }
     Ok(out)
+}
+
+/// Recognize the deliberately narrow first spread form: `...$name` as a whole
+/// word. General expression spreading arrives with the parser.
+fn spread_var(word: &Word) -> Option<&str> {
+    match word.0.as_slice() {
+        [
+            Piece::Text {
+                text,
+                expandable: true,
+            },
+            Piece::Var(VarRef { name, member: None }),
+        ] if text == "..." => Some(name),
+        _ => None,
+    }
 }
 
 /// A word reduced to `(text, expandable)` pieces, after interpolation and tilde.
@@ -107,8 +136,11 @@ fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
         ("env", None) => Err(ExpandError::Unsupported("$env".to_string())),
         (name, None) => vars
             .get(name)
-            .map(str::to_string)
-            .ok_or_else(|| ExpandError::UnboundVar(name.to_string())),
+            .ok_or_else(|| ExpandError::UnboundVar(name.to_string()))
+            .and_then(|value| match value {
+                Value::String(value) => Ok(value.clone()),
+                Value::List(_) => Err(ExpandError::ListNeedsSpread(name.to_string())),
+            }),
         (name, Some(member)) => Err(ExpandError::Unsupported(format!("${name}.{member}"))),
     }
 }

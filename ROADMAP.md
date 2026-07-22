@@ -88,7 +88,7 @@ run a pipeline alongside.
 
 ---
 
-## M3 — The mesh language
+## M3 — The mesh language 🚧
 
 **Goal:** start turning `DESIGN.md` into a running language — the point where the
 build track and the design track converge.
@@ -96,6 +96,12 @@ build track and the design track converge.
 **Scope (indicative — driven by `DESIGN.md` as it settles):** parser for the
 clean-break grammar; real values (lists, maps) with no word-splitting;
 `$`-expansion and the `...` spread; `:`-modifiers; `if`/`for`/`match`; `func`.
+
+The first vertical slice has landed: assignments accept string-list literals
+(`xs = [a "b c"]`, including `[]`), and `...$xs` spreads one into command
+arguments. A bare `$xs` in argument position fails loudly, preserving the
+design's explicit-spread/no-word-splitting rule. Nested values, indexing, and
+general expression parsing remain ahead.
 
 **Acceptance:** the `DESIGN.md`/`docs/INTRO.md` examples run as written.
 
