@@ -64,6 +64,17 @@ fn runs_an_external_command() {
 }
 
 #[test]
+fn external_command_leads_its_own_process_group() {
+    let out = run_with_input("sh -c 'test \"$(ps -o pgid= -p $$ | xargs)\" = \"$$\"'\n");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn arguments_are_passed_through() {
     let out = run_with_input("echo one two   three\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "one two three\n");

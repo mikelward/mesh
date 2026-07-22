@@ -47,7 +47,7 @@ file as tasks land.
 - [x] Basic redirection (`>`, `>>`, `<`) on external commands, including
       redirections on individual pipeline stages. Deferred: descriptor/stderr
       redirection, redirected builtins, and redirection without a command.
-- [ ] Fork-based executor and process groups (`fork`/`exec`, `setpgid`,
+- [x] Fork-based executor and process groups (`fork`/`exec`, `setpgid`,
       `tcsetpgrp`) so mesh can own the terminal and manage foreground jobs.
 - [ ] Signal handling: Ctrl-C interrupts the foreground job and returns to the
       prompt with status 130; Ctrl-Z suspends it without suspending mesh.
