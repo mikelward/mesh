@@ -2228,6 +2228,47 @@ fn for_iterates_direct_list_literals_and_skips_an_empty_literal() {
 }
 
 #[test]
+fn for_iterates_integer_ranges_and_ordered_maps() {
+    let out = run_with_input(
+        "for i in 1..4 { puts $i }\n\
+         for i in 2..=4 { puts $i }\n\
+         for i in 4..2 { puts never }\n\
+         ports = [http: 80, https: 443]\n\
+         for protocol, port in $ports { puts \"$protocol=$port\" }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1\n2\n3\n2\n3\n4\nhttp=80\nhttps=443\n"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn for_reports_binder_and_range_type_errors_and_recovers() {
+    let out = run_with_input(
+        "for key in [key: value] { puts never }\n\
+         for left, right in [a b] { puts never }\n\
+         for i in 1..word { puts never }\n\
+         puts recovered\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "recovered\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("map iteration requires"), "{stderr}");
+    assert!(
+        stderr.contains("two loop bindings require a map"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("range endpoints must be integers"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn a_top_level_return_in_a_for_body_does_not_skip_the_iteration() {
     let out = run_with_input("for x in [a b] { return; puts $x }\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\n");

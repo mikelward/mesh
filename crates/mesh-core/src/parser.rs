@@ -191,7 +191,7 @@ pub enum Executable {
     },
     If(IfExpr),
     For {
-        binding: String,
+        bindings: Vec<String>,
         iterable: Expr,
         body: Source,
     },
@@ -304,7 +304,7 @@ pub enum Expr {
     Capture(Source),
     If(Box<IfExpr>),
     For {
-        binding: String,
+        bindings: Vec<String>,
         iterable: Box<Expr>,
         body: Source,
     },
@@ -1391,7 +1391,7 @@ impl Parser {
 
     fn for_expr(&mut self) -> Result<Executable, ParseError> {
         self.take_word("for");
-        let binding = self.name()?;
+        let bindings = self.for_bindings()?;
         if !self.take_word("in") {
             return Err(self.error(ParseErrorKind::Expected("`in`")));
         }
@@ -1399,10 +1399,19 @@ impl Parser {
         self.newlines();
         let body = self.block()?;
         Ok(Executable::For {
-            binding,
+            bindings,
             iterable,
             body,
         })
+    }
+
+    fn for_bindings(&mut self) -> Result<Vec<String>, ParseError> {
+        let first = self.name()?;
+        let mut bindings = vec![first];
+        if self.eat(&TokenKind::Comma).is_some() {
+            bindings.push(self.name()?);
+        }
+        Ok(bindings)
     }
 
     fn control(&mut self) -> Result<Executable, ParseError> {
@@ -1615,7 +1624,7 @@ impl Parser {
         }
         if self.word("for") {
             self.take_word("for");
-            let binding = self.name()?;
+            let bindings = self.for_bindings()?;
             if !self.take_word("in") {
                 return Err(self.error(ParseErrorKind::Expected("`in`")));
             }
@@ -1623,7 +1632,7 @@ impl Parser {
             self.newlines();
             let body = self.block()?;
             return Ok(Expr::For {
-                binding,
+                bindings,
                 iterable: Box::new(iterable),
                 body,
             });

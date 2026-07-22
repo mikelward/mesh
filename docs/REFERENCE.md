@@ -201,12 +201,18 @@ expressions and conditional destructuring are not implemented yet.
 `for name in value { body }` runs the body once for each top-level list element or
 expanded word. An element containing whitespace remains one value when read
 through `$name`; braces may span lines. Empty lists run the body zero times.
+Bounded integer ranges use the same half-open/inclusive spelling as slices, and
+ordered maps use two binders and retain insertion order:
 
 ```mesh
 for item in $items {
   puts $item
 }
+for i in 1..=3 { puts $i }
+for key, value in $settings { puts "$key=$value" }
 ```
+
+`break` exits the nearest loop and `continue` skips to its next iteration.
 
 ## Functions
 

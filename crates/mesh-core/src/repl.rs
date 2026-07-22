@@ -228,10 +228,10 @@ fn run_executable(
         }
         If(expression) => run_ast_if(expression, last, in_function, shell),
         For {
-            binding,
+            bindings,
             iterable,
             body,
-        } => run_ast_for(binding, iterable, body, last, in_function, shell),
+        } => run_ast_for(bindings, iterable, body, last, in_function, shell),
         Control { kind, value, guard } => {
             match guard_allows(guard.as_ref(), last, in_function, shell) {
                 Ok(true) => {}
@@ -360,14 +360,18 @@ fn condition_status(
 }
 
 fn run_ast_for(
-    binding: &str,
+    bindings: &[String],
     iterable: &parser::Expr,
     body: &parser::Source,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
 ) -> Step {
-    if binding == "env" {
+    if bindings.len() == 2 && bindings[0] == bindings[1] {
+        eprintln!("mesh: for: duplicate binding `{}`", bindings[0]);
+        return Step::Continue(2);
+    }
+    if bindings.iter().any(|binding| binding == "env") {
         eprintln!("mesh: for: `env` is a reserved name and cannot be a binding");
         return Step::Continue(2);
     }
@@ -375,14 +379,14 @@ fn run_ast_for(
         Ok(v) => v,
         Err(step) => return step,
     };
-    let values = match value {
-        Value::List(v) => v,
-        value => vec![value],
+    let values = match iteration_values(value, bindings.len()) {
+        Ok(values) => values,
+        Err(message) => return runtime_message(message),
     };
     let mut status = 0;
     shell.loop_depth += 1;
-    for value in values {
-        shell.vars.set_value(binding, value);
+    for values in values {
+        bind_iteration(bindings, values, shell);
         match run_source(body, 0, in_function, shell) {
             Step::Continue(code) => status = code,
             flow => {
@@ -399,6 +403,26 @@ fn run_ast_for(
     }
     shell.loop_depth -= 1;
     Step::Continue(status)
+}
+
+fn iteration_values(value: Value, binding_count: usize) -> Result<Vec<Vec<Value>>, String> {
+    match (value, binding_count) {
+        (Value::Map(entries), 2) => Ok(entries
+            .into_iter()
+            .map(|(key, value)| vec![Value::String(key), value])
+            .collect()),
+        (Value::Map(_), _) => Err("map iteration requires `for key, value in map`".into()),
+        (_, 2) => Err("two loop bindings require a map value".into()),
+        (Value::List(values), 1) => Ok(values.into_iter().map(|value| vec![value]).collect()),
+        (value, 1) => Ok(vec![vec![value]]),
+        (_, _) => Err("a loop requires one binding, or two bindings for a map".into()),
+    }
+}
+
+fn bind_iteration(bindings: &[String], values: Vec<Value>, shell: &mut Shell) {
+    for (binding, value) in bindings.iter().zip(values) {
+        shell.vars.set_value(binding, value);
+    }
 }
 
 struct Stage {
@@ -739,18 +763,51 @@ fn eval_expr(
         }
         E::If(node) => eval_if_expr(node, last, in_function, shell),
         E::For {
-            binding,
+            bindings,
             iterable,
             body,
-        } => eval_for_expr(binding, iterable, body, last, in_function, shell),
+        } => eval_for_expr(bindings, iterable, body, last, in_function, shell),
         E::BackgroundJob(pipeline) => match run_ast_pipeline(pipeline, true, last, shell) {
             Step::Continue(code) => Ok(Value::Integer(i64::from(code))),
             step => Err(step),
         },
         E::Capture(source) => capture_source(source, last, in_function, shell),
-        E::Range { .. } => runtime_error("range expressions are not implemented yet"),
+        E::Range {
+            start,
+            end,
+            inclusive,
+        } => {
+            let start = range_endpoint(start.as_deref(), 0, last, in_function, shell)?;
+            let Some(end) = end.as_deref() else {
+                return runtime_error("an open-ended range cannot be used as a value");
+            };
+            let end = range_endpoint(Some(end), 0, last, in_function, shell)?;
+            let stop = if *inclusive {
+                end.checked_add(1)
+                    .ok_or_else(|| runtime_message("range endpoint overflow"))?
+            } else {
+                end
+            };
+            Ok(Value::List((start..stop).map(Value::Integer).collect()))
+        }
         E::Call { .. } => runtime_error("call expressions are not implemented yet"),
         E::Lambda { .. } => runtime_error("lambda expressions are not implemented yet"),
+    }
+}
+
+fn range_endpoint(
+    expression: Option<&parser::Expr>,
+    default: i64,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<i64, Step> {
+    let Some(expression) = expression else {
+        return Ok(default);
+    };
+    match eval_expr(expression, last, in_function, shell)? {
+        Value::Integer(value) => Ok(value),
+        _ => runtime_error("range endpoints must be integers"),
     }
 }
 
@@ -850,22 +907,25 @@ fn eval_value_body(
 }
 
 fn eval_for_expr(
-    binding: &str,
+    bindings: &[String],
     iterable: &parser::Expr,
     body: &parser::Source,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
+    if bindings.len() == 2 && bindings[0] == bindings[1] {
+        return runtime_error(format!("for: duplicate binding `{}`", bindings[0]));
+    }
+    if bindings.iter().any(|binding| binding == "env") {
+        return runtime_error("for: `env` is a reserved name and cannot be a binding");
+    }
     let iterable = eval_expr(iterable, last, in_function, shell)?;
-    let values = match iterable {
-        Value::List(values) => values,
-        value => vec![value],
-    };
+    let values = iteration_values(iterable, bindings.len()).map_err(runtime_message)?;
     let mut results = Vec::new();
     shell.loop_depth += 1;
-    for value in values {
-        shell.vars.set_value(binding, value);
+    for values in values {
+        bind_iteration(bindings, values, shell);
         let result = match eval_body(body, 0, in_function, shell) {
             Ok(value) => value,
             Err(step) => {
@@ -902,11 +962,11 @@ fn eval_body(
                     return eval_if_expr(node, last, in_function, shell);
                 }
                 parser::Executable::For {
-                    binding,
+                    bindings,
                     iterable,
                     body,
                 } => {
-                    return eval_for_expr(binding, iterable, body, last, in_function, shell);
+                    return eval_for_expr(bindings, iterable, body, last, in_function, shell);
                 }
                 _ => {}
             }
