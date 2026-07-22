@@ -72,6 +72,8 @@ file as tasks land.
       expression-position spread.
   - [x] Exact integer indexing (`$xs[0]`, including negative indices) for the
         current string-list slice.
+  - [x] Clamped range slicing (`...$xs[1..3]`, `...$xs[..=2]`) for the current
+        string-list slice.
 - [ ] Maps, scalar types, and `:` modifiers.
 - [ ] `if` / `for` / `match` and `func`.
 

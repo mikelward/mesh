@@ -457,6 +457,21 @@ fn list_indexing_is_zero_based_and_supports_negative_indices() {
 }
 
 #[test]
+fn list_slices_are_clamped_and_require_spread() {
+    let out = run_with_input(
+        "xs = [a b c d]\nputs ...$xs[1..3]\nputs ...$xs[..=1]\nputs ...$xs[-2..]\nputs before ...$xs[9..] after\nputs $xs[1..2]\ns = text\nputs $s[1..]\nputs $missing[1..]\nputs recovered\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "b c\na b\nc d\nbefore after\nrecovered\n"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("list value needs `...`"));
+    assert!(stderr.contains("cannot index a string value"));
+    assert!(stderr.contains("missing: unbound variable"));
+}
+
+#[test]
 fn invalid_list_index_fails_loudly_and_recovers() {
     let out = run_with_input(
         "xs = [a b]\nputs $xs[2]\nputs $xs[-3]\nx = text\nputs $x[0]\nputs recovered\n",

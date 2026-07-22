@@ -355,7 +355,7 @@ fn clone_piece(piece: &Piece) -> Piece {
         Piece::Var(v) => Piece::Var(crate::lexer::VarRef {
             name: v.name.clone(),
             member: v.member.clone(),
-            index: v.index,
+            access: v.access.clone(),
         }),
     }
 }
