@@ -7,10 +7,13 @@
 
 use std::collections::HashMap;
 
+use crate::parser::Source;
+
 /// A defined function: its positional parameter names and its raw body source.
 pub struct FuncDef {
     pub params: Vec<String>,
     pub body: String,
+    pub ast: Option<Source>,
 }
 
 /// The session's defined functions (name → definition).
