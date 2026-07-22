@@ -698,6 +698,17 @@ fn trailing_line_continuation_adds_no_empty_argument() {
 }
 
 #[test]
+fn quoted_hyphen_stays_literal_inside_a_glob_class() {
+    let dir = fresh_dir("glob_quoted_hyphen");
+    for name in ["-", "a", "m", "z"] {
+        std::fs::write(dir.join(name), "").unwrap();
+    }
+    let out = run_with_input(&format!("cd {}\nputs [a'-'z]\n", dir.display()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "- a z\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn quoted_fragment_cannot_complete_a_glob_class() {
     // `['*'` is a literal `[*`, not the pattern `[[*]` — escaping the quoted `*`
     // must not close the unquoted `[`.
