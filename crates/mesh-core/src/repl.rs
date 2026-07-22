@@ -505,8 +505,10 @@ fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
                     end: parse_bound(end),
                     inclusive: false,
                 }
+            } else if let Ok(index) = index.parse() {
+                expand::Access::Index(index)
             } else {
-                expand::Access::Index(index.parse().expect("parser validated list index"))
+                expand::Access::Key(index.to_string())
             });
             rest = &value[close + 1..];
         } else if let Some(value) = rest.strip_prefix(':') {
@@ -538,7 +540,7 @@ fn eval_expr(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    use parser::{BinaryOp as B, Expr as E, ListItem, UnaryOp as U};
+    use parser::{BinaryOp as B, Expr as E, ListItem, MapItem, UnaryOp as U};
     match expr {
         E::Scalar(word) => expand::expand_values(vec![expansion_word(&word.value)], &shell.vars)
             .map_err(|e| {
@@ -571,6 +573,38 @@ fn eval_expr(
                 }
             }
             Ok(Value::List(out))
+        }
+        E::Map(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                match item {
+                    MapItem::Pair(key, value) => {
+                        let Value::String(key) = eval_expr(key, last, in_function, shell)? else {
+                            return runtime_error("map key must be a string");
+                        };
+                        let value = eval_expr(value, last, in_function, shell)?;
+                        if let Some((_, old)) = out.iter_mut().find(|(old, _)| old == &key) {
+                            *old = value;
+                        } else {
+                            out.push((key, value));
+                        }
+                    }
+                    MapItem::Spread(value) => match eval_expr(value, last, in_function, shell)? {
+                        Value::Map(values) => {
+                            for (key, value) in values {
+                                if let Some((_, old)) = out.iter_mut().find(|(old, _)| old == &key)
+                                {
+                                    *old = value;
+                                } else {
+                                    out.push((key, value));
+                                }
+                            }
+                        }
+                        _ => return runtime_error("only a map can be spread into a map"),
+                    },
+                }
+            }
+            Ok(Value::Map(out))
         }
         E::Group(inner) => eval_expr(inner, last, in_function, shell),
         E::Unary {
@@ -621,7 +655,10 @@ fn eval_expr(
                         Step::Continue(1)
                     });
             }
-            runtime_error(format!("member access .{name} is not implemented yet"))
+            match eval_expr(value, last, in_function, shell)? {
+                Value::Map(entries) => map_lookup(&entries, name),
+                _ => runtime_error(format!("member access .{name} requires a map")),
+            }
         }
         E::Index { value, index } => {
             let value = eval_expr(value, last, in_function, shell)?;
@@ -645,12 +682,13 @@ fn eval_expr(
                         expand::slice(&values, bound(start)?, bound(end)?, *inclusive).to_vec(),
                     )),
                     Value::String(_) => runtime_error("cannot index a string value"),
+                    Value::Map(_) => runtime_error("cannot slice a map value"),
                 };
             }
             let index_value = eval_expr(index, last, in_function, shell)?;
-            let index = number(&index_value).map_err(runtime_message)?;
             match value {
                 Value::List(values) => {
+                    let index = number(&index_value).map_err(runtime_message)?;
                     let offset = if index < 0 {
                         values.len() as i128 + index as i128
                     } else {
@@ -666,6 +704,12 @@ fn eval_expr(
                         })
                 }
                 Value::String(_) => runtime_error("cannot index a string value"),
+                Value::Map(entries) => {
+                    let Value::String(key) = index_value else {
+                        return runtime_error("map key must be a string");
+                    };
+                    map_lookup(&entries, &key)
+                }
             }
         }
         E::Modifier {
@@ -696,7 +740,6 @@ fn eval_expr(
             step => Err(step),
         },
         E::Capture(source) => capture_source(source, last, in_function, shell),
-        E::Map(_) => runtime_error("map expressions are not implemented yet"),
         E::Range { .. } => runtime_error("range expressions are not implemented yet"),
         E::Call { .. } => runtime_error("call expressions are not implemented yet"),
         E::Lambda { .. } => runtime_error("lambda expressions are not implemented yet"),
@@ -875,7 +918,16 @@ fn truthy(value: &Value) -> bool {
     match value {
         Value::String(s) => !s.is_empty() && s != "false" && s != "0",
         Value::List(v) => !v.is_empty(),
+        Value::Map(v) => !v.is_empty(),
     }
+}
+
+fn map_lookup(entries: &[(String, Value)], key: &str) -> Result<Value, Step> {
+    entries
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.clone())
+        .ok_or_else(|| runtime_message(format!("map key `{key}` not found")))
 }
 fn bool_value(value: bool) -> Value {
     Value::String(value.to_string())
@@ -937,6 +989,12 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
         Or => bool_value(truthy(&left) || truthy(&right)),
         In => match right {
             Value::List(values) => bool_value(values.contains(&left)),
+            Value::Map(values) => match left {
+                Value::String(key) => {
+                    bool_value(values.iter().any(|(candidate, _)| candidate == &key))
+                }
+                _ => return Err("map key must be a string".into()),
+            },
             Value::String(text) => match left {
                 Value::String(needle) => bool_value(text.contains(&needle)),
                 _ => return Err("left operand of `in` must be a string".into()),
@@ -1614,15 +1672,21 @@ mod tests {
     }
 
     #[test]
-    fn parsed_but_unimplemented_expressions_return_runtime_errors() {
+    fn map_expressions_preserve_typed_values() {
         let mut shell = Shell::new();
         let parser::ParseOutcome::Complete(source) = parser::parse("value = [key: value]").unwrap()
         else {
             panic!("source should be complete");
         };
 
-        assert_eq!(run_source(&source, 0, false, &mut shell), Step::Continue(1));
-        assert_eq!(shell.vars.get("value"), None);
+        assert_eq!(run_source(&source, 0, false, &mut shell), Step::Continue(0));
+        assert_eq!(
+            shell.vars.get("value"),
+            Some(&Value::Map(vec![(
+                "key".into(),
+                Value::String("value".into())
+            )]))
+        );
     }
 
     #[test]

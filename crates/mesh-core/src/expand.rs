@@ -15,6 +15,7 @@ use std::env;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Access {
     Index(i64),
+    Key(String),
     Slice {
         start: Option<i64>,
         end: Option<i64>,
@@ -36,6 +37,8 @@ pub enum Modifier {
     Rest,
     Init,
     Dedup,
+    Keys,
+    Values,
     Upper,
     Lower,
 }
@@ -55,6 +58,8 @@ impl Modifier {
             "rest" => Self::Rest,
             "init" => Self::Init,
             "dedup" => Self::Dedup,
+            "keys" => Self::Keys,
+            "values" => Self::Values,
             "upper" => Self::Upper,
             "lower" => Self::Lower,
             _ => return None,
@@ -155,6 +160,9 @@ fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> 
             "...${}: value is not a list",
             vref.name
         ))),
+        Value::Map(_) => Err(ExpandError::Unsupported(
+            "a map cannot be spread here".into(),
+        )),
     }
 }
 
@@ -168,6 +176,9 @@ fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError
             "...${}: value is not a list",
             vref.name
         ))),
+        Value::Map(_) => Err(ExpandError::Unsupported(
+            "a map cannot be spread into argv".into(),
+        )),
     }
 }
 
@@ -178,6 +189,9 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
             Value::String(value) => Ok(value),
             Value::List(_) => Err(ExpandError::Unsupported(format!(
                 "...${name}: nested list element cannot be a command argument"
+            ))),
+            Value::Map(_) => Err(ExpandError::Unsupported(format!(
+                "...${name}: map element cannot be a command argument"
             ))),
         })
         .collect()
@@ -307,7 +321,7 @@ fn glob_pattern(pieces: &Pieces) -> String {
 fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
     match resolve_value(vref, vars)? {
         Value::String(value) => Ok(value),
-        Value::List(_) => Err(ExpandError::ListNeedsSpread(vref.name.clone())),
+        Value::List(_) | Value::Map(_) => Err(ExpandError::ListNeedsSpread(vref.name.clone())),
     }
 }
 
@@ -338,7 +352,9 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                             index: *index,
                         })
                 }
+                Value::Map(_) => Err(ExpandError::NotAList(name.to_string())),
             }),
+        (name, None, Some(Access::Key(key))) => map_access(vars, name, key),
         (name, None, Some(Access::Slice { .. })) => vars
             .get(name)
             .ok_or_else(|| ExpandError::UnboundVar(name.to_string()))
@@ -365,12 +381,13 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                     )
                     .to_vec(),
                 )),
+                Value::Map(_) => Err(ExpandError::NotAList(name.to_string())),
             }),
         (name, None, None) => vars
             .get(name)
             .ok_or_else(|| ExpandError::UnboundVar(name.to_string()))
             .cloned(),
-        (name, Some(member), None) => Err(ExpandError::Unsupported(format!("${name}.{member}"))),
+        (name, Some(member), None) => map_access(vars, name, member),
         (name, member, Some(access)) => Err(ExpandError::Unsupported(format!(
             "${name}{}[{access:?}]",
             member.as_ref().map(|m| format!(".{m}")).unwrap_or_default()
@@ -382,13 +399,53 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
     Ok(value)
 }
 
+fn map_access(vars: &Vars, name: &str, key: &str) -> Result<Value, ExpandError> {
+    let key = if let Some(variable) = key.strip_prefix('$') {
+        match vars.get(variable) {
+            Some(Value::String(value)) => value.as_str(),
+            Some(_) => return Err(ExpandError::Unsupported("map key must be a string".into())),
+            None => return Err(ExpandError::UnboundVar(variable.into())),
+        }
+    } else {
+        key
+    };
+    match vars.get(name) {
+        Some(Value::Map(entries)) => entries
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| ExpandError::Unsupported(format!("${name}[{key}]: map key not found"))),
+        Some(_) => Err(ExpandError::Unsupported(format!(
+            "${name}: value is not a map"
+        ))),
+        None => Err(ExpandError::UnboundVar(name.into())),
+    }
+}
+
 pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, ExpandError> {
-    use Modifier::{Dedup, First, Init, Last, Len, Rest};
+    use Modifier::{Dedup, First, Init, Keys, Last, Len, Rest, Values};
     let name = modifier_name(modifier);
     match modifier {
         Len => match value {
             Value::String(value) => Ok(Value::String(value.chars().count().to_string())),
             Value::List(values) => Ok(Value::String(values.len().to_string())),
+            Value::Map(values) => Ok(Value::String(values.len().to_string())),
+        },
+        Keys => match value {
+            Value::Map(values) => Ok(Value::List(
+                values.into_iter().map(|(k, _)| Value::String(k)).collect(),
+            )),
+            _ => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a map".into(),
+            }),
+        },
+        Values => match value {
+            Value::Map(values) => Ok(Value::List(values.into_iter().map(|(_, v)| v).collect())),
+            _ => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a map".into(),
+            }),
         },
         First | Last => match value {
             Value::List(values) => values
@@ -404,6 +461,10 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 name: name.into(),
                 message: "requires a list".into(),
             }),
+            Value::Map(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a list".into(),
+            }),
         },
         Rest | Init => match value {
             Value::List(values) => {
@@ -415,6 +476,10 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 Ok(Value::List(values[range].to_vec()))
             }
             Value::String(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a list".into(),
+            }),
+            Value::Map(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
             }),
@@ -433,6 +498,10 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 name: name.into(),
                 message: "requires a list".into(),
             }),
+            Value::Map(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a list".into(),
+            }),
         },
         _ => match value {
             Value::String(value) => Ok(Value::String(modify_string(value, modifier))),
@@ -441,6 +510,10 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 .map(|value| apply_modifier(value, modifier))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::List),
+            Value::Map(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "cannot map over a map".into(),
+            }),
         },
     }
 }
@@ -459,6 +532,8 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::Rest => "rest",
         Modifier::Init => "init",
         Modifier::Dedup => "dedup",
+        Modifier::Keys => "keys",
+        Modifier::Values => "values",
         Modifier::Upper => "upper",
         Modifier::Lower => "lower",
     }

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 pub enum Value {
     String(String),
     List(Vec<Value>),
+    Map(Vec<(String, Value)>),
 }
 
 type Scope = HashMap<String, Value>;
@@ -107,9 +108,19 @@ impl Vars {
             (Value::String(left), Value::String(right)) => left.push_str(&right),
             (Value::List(left), Value::List(mut right)) => left.append(&mut right),
             (Value::List(left), right) => left.push(right),
-            (Value::String(_), Value::List(_)) => {
+            (Value::Map(left), Value::Map(right)) => {
+                for (key, value) in right {
+                    if let Some((_, old)) = left.iter_mut().find(|(old, _)| old == &key) {
+                        *old = value;
+                    } else {
+                        left.push((key, value));
+                    }
+                }
+            }
+            (Value::String(_), Value::List(_) | Value::Map(_)) => {
                 return Err(format!("{name}: cannot append a list to a string"));
             }
+            (Value::Map(_), _) => return Err(format!("{name}: can only merge a map into a map")),
         }
         Ok(())
     }
