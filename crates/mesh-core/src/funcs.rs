@@ -15,6 +15,26 @@ pub struct FuncDef {
     pub body: Source,
 }
 
+impl FuncDef {
+    /// Produce help in the same conventional shape used by builtin commands.
+    pub fn help(&self, name: &str) -> String {
+        let parameters = self
+            .params
+            .iter()
+            .map(|parameter| format!(" <{}>", parameter.to_uppercase()))
+            .collect::<String>();
+        let mut help = format!("Usage: {name}{parameters}\n");
+        if !self.params.is_empty() {
+            help.push_str("\nArguments:\n");
+            for parameter in &self.params {
+                help.push_str(&format!("  <{}>\n", parameter.to_uppercase()));
+            }
+        }
+        help.push_str("\nOptions:\n  --help  Print help\n");
+        help
+    }
+}
+
 /// The session's defined functions (name → definition).
 #[derive(Default)]
 pub struct Funcs {

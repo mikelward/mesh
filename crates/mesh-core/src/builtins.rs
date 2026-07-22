@@ -36,6 +36,34 @@ pub fn is_builtin(name: &str) -> bool {
     NAMES.contains(&name)
 }
 
+/// Print the canned command-line help for a builtin.
+pub fn print_help(name: &str) -> u8 {
+    let usage = match name {
+        "cd" => "cd [DIR]",
+        "pwd" => "pwd",
+        "puts" => "puts [ARG ...]",
+        "exit" => "exit [N]",
+        "fg" | "bg" => return write_help(name, &format!("{name} [JOB]")),
+        "jobs" => "jobs",
+        "prompt" => "prompt [--reset | TEXT]",
+        "prompt-hook" => "prompt-hook [--remove] [EVENT] NAME [FUNCTION]",
+        _ => return 1,
+    };
+    write_help(name, usage)
+}
+
+/// Write generated help through the builtin-safe stdout path.
+pub fn print_generated_help(name: &str, help: &str) -> u8 {
+    write_stdout(name, help.as_bytes())
+}
+
+fn write_help(name: &str, usage: &str) -> u8 {
+    write_stdout(
+        name,
+        format!("Usage: {usage}\n\nOptions:\n  --help  Print help\n").as_bytes(),
+    )
+}
+
 /// If `words[0]` names a builtin, run it and return its outcome; otherwise
 /// return `None` so the caller falls through to external execution.
 ///

@@ -1630,6 +1630,35 @@ fn defines_and_calls_a_function_with_a_positional() {
 }
 
 #[test]
+fn functions_generate_help_from_their_signatures_without_running() {
+    let out =
+        run_with_input("func greet(first, last) { puts BODY-RAN }\ngreet --help\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Usage: greet <FIRST> <LAST>\n\nArguments:\n  <FIRST>\n  <LAST>\n\nOptions:\n  --help  Print help\nafter\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn builtins_print_standard_command_line_help() {
+    let out = run_with_input("cd --help\nputs --help\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Usage: cd [DIR]\n\nOptions:\n  --help  Print help\nUsage: puts [ARG ...]\n\nOptions:\n  --help  Print help\n"
+    );
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn option_terminator_passes_help_to_a_function_as_data() {
+    let out = run_with_input("func show(value) { puts \"<$value>\" }\nshow -- --help\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "<--help>\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn a_single_line_function_definition_works() {
     let out = run_with_input("func sq(x) { puts $x $x }\nsq 3\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "3 3\n");
