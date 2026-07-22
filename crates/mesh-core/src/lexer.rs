@@ -766,9 +766,10 @@ fn header_awaits_body(text: &str) -> bool {
     let rest = text.trim().strip_prefix("func").unwrap_or("").trim_start();
     let Some(paren) = rest.find('(') else {
         // No `(` yet: still forming the name. Keep reading while what we have is a
-        // valid identifier (or just `func`); anything else can never be a name.
+        // valid identifier *prefix* (or just `func`); an impossible head (`_`, a
+        // digit) or an embedded space can never become a name, so dispatch it.
         let name = rest.trim_end();
-        return name.is_empty() || is_ident(name);
+        return name.is_empty() || is_ident_prefix(name);
     };
     // The name is everything before the `(` and must be a valid identifier.
     if !is_ident(rest[..paren].trim()) {
@@ -790,13 +791,23 @@ fn header_awaits_body(text: &str) -> bool {
     }
 }
 
+/// Is `s` a valid *prefix* of a kebab identifier — an ASCII-letter head followed
+/// by identifier-body characters (alphanumeric, `_`, or `-`)? Used to decide
+/// whether a still-forming name or parameter token could yet become a valid name;
+/// an impossible head (`_`, a digit) or a stray character is rejected at once.
+fn is_ident_prefix(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Could the partial (still-unclosed) parameter list `list` still be completed
 /// into a valid one by appending more input? Applies the same structural rules as
 /// [`parse_params`], but treats the final token as an in-progress prefix (a bare
 /// name may still be growing), so only *provably* unrepairable content fails: a
-/// leading or doubled comma, a rest/flag/default token (`...`, `-…`, `…=…`), or a
-/// finalized name that is invalid, `env`, or a duplicate. A trailing comma is
-/// repairable (a name may follow).
+/// leading or doubled comma, a rest/flag/default token (`...`, `-…`, `…=…`), a
+/// finalized name that is invalid/`env`/duplicate, or a trailing token whose head
+/// already cannot start an identifier. A trailing comma is repairable.
 fn params_prefix_ok(list: &str) -> bool {
     let chars: Vec<char> = list.chars().collect();
     let mut names: Vec<String> = Vec::new();
@@ -827,13 +838,18 @@ fn params_prefix_ok(list: &str) -> bool {
             return false;
         }
         // A delimiter after the token finalizes it; the trailing token may still be
-        // growing, so its name-level validity is deferred to when the list closes.
+        // growing. A finalized token must be a valid, non-`env`, non-duplicate
+        // name; the trailing one need only be a valid identifier *prefix* — an
+        // impossible head (`_`, a digit) can never become a name, so reject it now
+        // rather than entering continuation mode.
         let finalized = i < chars.len();
-        if finalized && (!is_ident(&tok) || tok == "env" || names.iter().any(|n| n == &tok)) {
-            return false;
-        }
         if finalized {
+            if !is_ident(&tok) || tok == "env" || names.iter().any(|n| n == &tok) {
+                return false;
+            }
             names.push(tok);
+        } else if !is_ident_prefix(&tok) {
+            return false;
         }
         have_name = true;
         pending_comma = false;
@@ -1486,6 +1502,16 @@ mod tests {
         assert!(needs_more_input("func f(a\n"));
         assert!(needs_more_input("func f(a, b\n"));
         assert!(needs_more_input("func f(a,\n"));
+        // A trailing parameter token whose head cannot start an identifier is
+        // impossible, so it dispatches instead of entering continuation mode.
+        assert!(!needs_more_input("func f(_\n"));
+        assert!(!needs_more_input("func f(1\n"));
+        assert!(!needs_more_input("func f(a, _\n"));
+        // A still-forming name (before `(`) with a valid letter head keeps reading,
+        // including a partial kebab name; an impossible head dispatches.
+        assert!(needs_more_input("func my-\n"));
+        assert!(!needs_more_input("func _f\n"));
+        assert!(!needs_more_input("func 1f\n"));
     }
 
     #[test]
