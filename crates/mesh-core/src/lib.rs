@@ -11,4 +11,5 @@ pub mod lexer;
 mod repl;
 mod vars;
 
+pub use exec::run_background_redirect;
 pub use repl::run;

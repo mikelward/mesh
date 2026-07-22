@@ -264,7 +264,14 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
         };
 
         let mut command = if background && !cmd.redirs.is_empty() {
-            background_redirect_command(&cmd)
+            match background_redirect_command(&cmd) {
+                Ok(command) => command,
+                Err((path, err)) => {
+                    eprintln!("mesh: {path}: {err}");
+                    outcomes.push(Outcome::Failed(1));
+                    continue;
+                }
+            }
         } else {
             let mut command = Command::new(&cmd.words[0]);
             command.args(&cmd.words[1..]);
@@ -491,24 +498,67 @@ fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<WaitResult> {
     (!any_running).then_some(WaitResult::Complete(status))
 }
 
-/// Start a tiny shell before opening background redirects. `Command::spawn`
-/// returns once that shell execs, leaving potentially blocking FIFO opens in
-/// the job rather than the interactive shell.
-fn background_redirect_command(cmd: &Cmd) -> Command {
-    let mut script = String::new();
-    for (kind, _) in &cmd.redirs {
-        match kind {
-            RedirKind::In => script.push_str("exec 0<\"$1\"; shift; "),
-            RedirKind::Out => script.push_str("exec 1>\"$1\"; shift; "),
-            RedirKind::Append => script.push_str("exec 1>>\"$1\"; shift; "),
-        }
-    }
-    script.push_str("exec \"$@\"");
-    let mut command = Command::new("sh");
-    command.arg("-c").arg(script).arg("mesh-redir");
-    command.args(cmd.redirs.iter().map(|(_, path)| path));
-    command.args(&cmd.words);
+/// Open background redirects in the child, after `spawn` has returned control
+/// to mesh. This keeps FIFO opens non-blocking for the shell without adding a
+/// PATH-resolved wrapper executable.
+fn background_redirect_command(cmd: &Cmd) -> Result<Command, (String, std::io::Error)> {
+    let executable = std::env::current_exe().map_err(|err| (cmd.words[0].clone(), err))?;
+    let mut command = Command::new(executable);
     command
+        .arg("--mesh-background-redirect")
+        .arg(cmd.redirs.len().to_string());
+    for (kind, path) in &cmd.redirs {
+        command.arg(match kind {
+            RedirKind::In => "in",
+            RedirKind::Out => "out",
+            RedirKind::Append => "append",
+        });
+        command.arg(path);
+    }
+    command.args(&cmd.words);
+    Ok(command)
+}
+
+/// Internal executable mode used to defer potentially blocking opens until
+/// after the background child has completed `exec`.
+pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
+    let Some(count) = args.first().and_then(|arg| arg.parse::<usize>().ok()) else {
+        return std::process::ExitCode::from(1);
+    };
+    let Some(words_start) = count.checked_mul(2).and_then(|count| count.checked_add(1)) else {
+        return std::process::ExitCode::from(1);
+    };
+    if words_start >= args.len() {
+        return std::process::ExitCode::from(1);
+    }
+    let mut redirs = Vec::new();
+    for pair in args[1..words_start].chunks_exact(2) {
+        let kind = match pair[0].as_str() {
+            "in" => RedirKind::In,
+            "out" => RedirKind::Out,
+            "append" => RedirKind::Append,
+            _ => return std::process::ExitCode::from(1),
+        };
+        redirs.push((kind, pair[1].clone()));
+    }
+    let (stdin, stdout) = match open_redirs(&redirs) {
+        Ok(files) => files,
+        Err((path, err)) => {
+            eprintln!("mesh: {path}: {err}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let words = &args[words_start..];
+    let mut command = Command::new(&words[0]);
+    command.args(&words[1..]);
+    if let Some(stdin) = stdin {
+        command.stdin(stdin);
+    }
+    if let Some(stdout) = stdout {
+        command.stdout(stdout);
+    }
+    let err = command.exec();
+    std::process::ExitCode::from(spawn_error_code(&words[0], &err))
 }
 
 fn signal_group(pgid: libc::pid_t, signal: libc::c_int, label: &str) -> Result<(), ()> {
