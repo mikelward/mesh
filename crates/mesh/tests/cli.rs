@@ -1296,3 +1296,41 @@ fn a_background_fifo_redirect_does_not_block_the_shell() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ready\npayload\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_background_redirect_does_not_require_sh_on_path() {
+    let dir = fresh_dir("background_redirect_path");
+    let output = dir.join("out");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .env("PATH", "/definitely-missing")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    writeln!(
+        child.stdin.take().expect("stdin"),
+        "/bin/echo ok > {} &\n/bin/sleep 0.05\njobs",
+        output.display()
+    )
+    .expect("write commands");
+    let result = child.wait_with_output().expect("wait for mesh");
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "ok\n");
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("command not found"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_background_redirect_reports_mesh_status_one() {
+    let dir = fresh_dir("background_redirect_failure");
+    let missing = dir.join("missing/out");
+    let out = run_with_input(&format!(
+        "/bin/echo ok > {} &\n/bin/sleep 0.05\njobs\n",
+        missing.display()
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Done (1)"), "{stderr}");
+    assert!(stderr.contains(&format!("mesh: {}:", missing.display())));
+    assert!(!stderr.contains("mesh-redir"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
