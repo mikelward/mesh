@@ -726,20 +726,49 @@ fn ends_with_bare_equals(word: &[Piece]) -> bool {
     )
 }
 
-/// Does the buffered `func` definition in `text` need more input lines? True
-/// while an opening `{` has been seen with **no matching `}` yet** — completion
-/// is based on the **first** brace that returns the depth to zero, not the final
-/// net depth, so trailing text that reopens a brace (`func f() {} {`) does not
-/// keep the definition pending; it is dispatched so the parser reports the
-/// documented "unexpected text after the closing `}`" error.
+/// Does the buffered `func` definition in `text` need more input lines?
 ///
-/// Buffering is **brace-driven only**: it does not reason about the signature's
-/// `(…)`, so a malformed header such as `func f(x {` still buffers through to the
-/// matching `}` and is quarantined rather than releasing later body lines to the
-/// top level.
+/// Completion is based on the **first** brace that returns the depth to zero, not
+/// the final net depth, so trailing text that reopens a brace (`func f() {} {`)
+/// does not keep the definition pending; it is dispatched so the parser reports
+/// the documented "unexpected text after the closing `}`" error. While a body `{`
+/// is open with no matching `}` yet, more input is needed. This stays
+/// **brace-driven** once a body has opened, so a malformed header such as
+/// `func f(x {` still buffers through to the matching `}` and is quarantined
+/// rather than releasing later body lines to the top level.
+///
+/// Before any body `{` appears, the header may still legitimately be incomplete:
+/// the grammar's `")" ws? "{"` lets the opening brace sit on a later line
+/// (`ws` includes a newline). So a header that is a valid *incomplete* prefix —
+/// still forming its signature, or closed with only whitespace after `)` — keeps
+/// buffering ([`header_awaits_body`]); an already-malformed header is dispatched
+/// immediately so its parse error is reported without swallowing later commands.
 pub fn needs_more_input(text: &str) -> bool {
     let scan = scan_braces(text, 0);
-    scan.close.is_none() && scan.depth > 0
+    if scan.close.is_some() {
+        return false; // a body opened and closed → dispatch (complete or trailing junk)
+    }
+    if scan.depth > 0 {
+        return true; // a body is open with no matching `}` yet → keep reading
+    }
+    header_awaits_body(text)
+}
+
+/// With no body `{` seen yet, is `text` a valid *incomplete* `func` header still
+/// awaiting its `{`? True while the signature is still forming (no `)` yet, and
+/// no command punctuation a parameter list can never contain), or once the
+/// signature has closed with only whitespace after the `)`. False otherwise, so a
+/// malformed header is dispatched immediately (its parse error reported) rather
+/// than buffering and swallowing the commands that follow it.
+fn header_awaits_body(text: &str) -> bool {
+    let rest = text.trim().strip_prefix("func").unwrap_or("").trim_start();
+    match rest.find(')') {
+        // Signature closed: only whitespace may sit between `)` and the `{`.
+        Some(close) => rest[close + 1..].trim().is_empty(),
+        // Signature still forming: keep reading unless it already contains command
+        // punctuation (`;`, `|`, `&`, `<`, `>`) that a signature never holds.
+        None => !rest.contains([';', '|', '&', '<', '>']),
+    }
 }
 
 /// The result of a bare-level brace scan (see [`scan_braces`]).
@@ -1287,6 +1316,23 @@ mod tests {
         // so its later body lines cannot leak to the top level (the P1 case).
         assert!(needs_more_input("func f(x {\nputs )\nputs LEAKED\n"));
         assert!(!needs_more_input("func f(x {\nputs )\nputs LEAKED\n}\n"));
+    }
+
+    #[test]
+    fn needs_more_input_buffers_a_delayed_body_opener() {
+        // The grammar's `")" ws? "{"` lets the `{` sit on a later line, so an
+        // otherwise-complete header keeps buffering until the body opens/closes.
+        assert!(needs_more_input("func f()\n"));
+        assert!(needs_more_input("func f()\n{\n  puts hi\n"));
+        assert!(!needs_more_input("func f()\n{\n  puts hi\n}\n"));
+        // A still-forming signature also keeps reading.
+        assert!(needs_more_input("func f(a,\n"));
+        assert!(needs_more_input("func\n"));
+        // A malformed header (non-whitespace after `)`, or command punctuation in
+        // the signature position) is NOT buffered — it dispatches to a parse error
+        // so following commands are not swallowed.
+        assert!(!needs_more_input("func f() oops\n"));
+        assert!(!needs_more_input("func f() ; puts hi\n"));
     }
 
     #[test]
