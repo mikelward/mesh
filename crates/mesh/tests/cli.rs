@@ -449,10 +449,10 @@ fn list_indexing_is_zero_based_and_supports_negative_indices() {
 }
 
 #[test]
-fn list_indexing_in_double_quotes_requires_braces() {
-    let out = run_with_input("xs = [a b]\nputs \"$xs[0]\"\nputs \"${xs[0]}\"\n");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("list value needs `...`"));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\n");
+fn list_indexing_works_in_double_quotes_with_or_without_braces() {
+    let out = run_with_input("xs = ['a b' c]\nputs \"$xs[0]\" \"${xs[1]}\"\n");
+    assert!(out.stderr.is_empty());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a b c\n");
 }
 
 #[test]

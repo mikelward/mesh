@@ -650,13 +650,12 @@ hyphen between — the third payoff of that one spacing rule.
   and Perl's context-varying sigil (where `$foo[0]` indexes the array `@foo`) is
   a notorious footgun. `$name` means one thing everywhere: "read this variable."
 - **String interpolation.** Inside `"…"`, a bare `$name` interpolates just the
-  **variable** — the following `.`/`[` is *literal text*, so `"$file.txt"` is
-  `$file` then `.txt` and `"$m.key"` is `$m` then `.key` (the shell reflex). Any
-  **member access, indexing, or expression** in a string uses the braced
-  **`${…}`** form, which also delimits where it ends: `"${m.key}"`, `"${xs[0]}"`,
-  `"${dir}s"`. One rule — unbraced `$name` is the variable, `${…}` is everything
-  more — so the two never parse ambiguously. (Outside strings there is no
-  ambiguity: `$m.key` / `$xs[0]` are ordinary access.) *(open — whether to extend
+  **variable** before a `.` — `"$file.txt"` is `$file` then `.txt` and `"$m.key"`
+  is `$m` then `.key` (the shell reflex). An integer index is unambiguous and may
+  stay unbraced (`"$xs[0]"`); the braced `"${xs[0]}"` form is equivalent. Other
+  **member access or expressions** in a string use the braced **`${…}`** form,
+  which also delimits where they end: `"${m.key}"`, `"${dir}s"`. (Outside strings
+  there is no ambiguity: `$m.key` / `$xs[0]` are ordinary access.) *(open — whether to extend
   bare `$name.key` access into strings too, flipping which case pays the ceremony;
   see [Open questions](#open-questions).)*
 - **No null.** mesh has **no `nil`/`null`/`none`** value — the billion-dollar
