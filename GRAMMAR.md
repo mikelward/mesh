@@ -306,7 +306,11 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
 - **Call.** A defined name in command position runs the function. Resolution is
   **builtins → functions → external**; the argument count must match the
   positionals (an arity mismatch is a loud, recoverable error). Arguments bind
-  left to right.
+  left to right. Unlike an external command, an in-shell function preserves
+  **typed values**: a bare, unspread list (`f $xs`) arrives intact as one list
+  value — it counts as a single positional — rather than being rejected by the
+  external-argv rule. A spread (`f ...$xs`) still contributes one argument per
+  element, and every other word binds as a string.
 - **Scope.** Each call runs in a fresh **function-local** scope: `x = 5` in a
   body binds a local (gone on return). Reads resolve the innermost local scope,
   then the global scope only — a callee never sees its caller's locals (lexical,

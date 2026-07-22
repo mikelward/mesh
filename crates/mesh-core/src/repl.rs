@@ -282,6 +282,25 @@ fn run_command_or_assign(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step
             }
         },
         Line::Command(tokens) => {
+            // Resolve an in-shell function *before* the external-argv rule turns a
+            // bare list argument into an error, so an unspread list reaches the
+            // function intact as one typed value (`DESIGN.md` §"Arguments do not
+            // word-split"). Functions can never share a name with a builtin or the
+            // `return`/job control words (definition rejects those), so resolving
+            // one here does not reorder the builtins → functions → external chain.
+            if let Some(name) = command_name(&tokens, &shell.vars)
+                && shell.funcs.get(&name).is_some()
+            {
+                let arg_words: Vec<Word> = tokens.into_iter().skip(1).collect();
+                let args = match expand::expand_values(arg_words, &shell.vars) {
+                    Ok(args) => args,
+                    Err(err) => {
+                        eprintln!("mesh: {err}");
+                        return Step::Continue(1);
+                    }
+                };
+                return call_func(&name, args, shell);
+            }
             let words = match expand::expand(tokens, &shell.vars) {
                 Ok(words) => words,
                 Err(err) => {
@@ -308,22 +327,27 @@ fn run_command_or_assign(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step
             if let Some(code) = job_status {
                 return Step::Continue(code);
             }
-            // Command resolution: builtins, then user functions, then external.
+            // Command resolution: builtins, then external (a function was already
+            // resolved above).
             match builtins::dispatch(&words, last) {
                 Some(Builtin::Exit(code)) => Step::Exit(code),
                 Some(Builtin::Status(code)) => Step::Continue(code),
-                None => {
-                    if shell.funcs.get(&words[0]).is_some() {
-                        let name = words[0].clone();
-                        let args = words[1..].to_vec();
-                        call_func(&name, args, shell)
-                    } else {
-                        Step::Continue(exec::run(&words, &mut shell.jobs))
-                    }
-                }
+                None => Step::Continue(exec::run(&words, &mut shell.jobs)),
             }
         }
     }
+}
+
+/// Expand just the command word to its name, if it resolves to a single string —
+/// used to look up an in-shell function before the arguments are expanded. A word
+/// that expands to zero or several words (an empty glob, a multi-match glob, a
+/// bare list) is not a function name, so this returns `None` and the byte-string
+/// path takes over.
+fn command_name(tokens: &[Word], vars: &Vars) -> Option<String> {
+    let first = tokens.first()?;
+    let cloned = Word(first.0.iter().map(clone_piece).collect());
+    let mut argv = expand::expand(vec![cloned], vars).ok()?;
+    (argv.len() == 1).then(|| argv.pop().unwrap())
 }
 
 /// Build the [`Step::Return`] for a `return` command: no argument uses the last
@@ -346,11 +370,12 @@ fn make_return(args: &[String], last: u8) -> Step {
     }
 }
 
-/// Call the function `name` with already-expanded `args`. Binds the positional
-/// parameters in a fresh local scope, runs the body, and returns the function's
-/// status — an explicit `return`, else the last command's status. An arity
-/// mismatch is a recoverable error.
-fn call_func(name: &str, args: Vec<String>, shell: &mut Shell) -> Step {
+/// Call the function `name` with already-expanded typed `args`. Binds the
+/// positional parameters in a fresh local scope, runs the body, and returns the
+/// function's status — an explicit `return`, else the last command's status. A
+/// list argument counts as **one** positional (it arrives intact as a list
+/// value); an arity mismatch is a recoverable error.
+fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
     let (params, body) = match shell.funcs.get(name) {
         Some(def) => (def.params.clone(), def.body.clone()),
         None => return Step::Continue(exec::run(&[name.to_string()], &mut shell.jobs)),
@@ -366,7 +391,7 @@ fn call_func(name: &str, args: Vec<String>, shell: &mut Shell) -> Step {
 
     shell.vars.push_scope();
     for (param, arg) in params.iter().zip(args) {
-        shell.vars.set(param, arg);
+        shell.vars.set_value(param, arg);
     }
     let result = run_func_body(&body, shell);
     shell.vars.pop_scope();
