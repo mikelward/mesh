@@ -6,6 +6,7 @@
 //! stderr, and the exit code.
 
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
@@ -74,6 +75,33 @@ fn non_interactive_command_stays_in_mesh_process_group() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn non_interactive_child_preserves_an_ignored_sigint() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"));
+    child
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        child.pre_exec(|| {
+            if libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = child.spawn().expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"sh -c 'kill -INT $$; echo survived'\n")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait for mesh");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "survived\n");
 }
 
 #[test]
@@ -613,6 +641,104 @@ fn background_interactive_startup_stops_until_foregrounded() {
     );
 }
 
+#[test]
+fn new_foreground_job_does_not_receive_sigcont() {
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(sigcont_harness()) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+fn sigcont_harness() -> i32 {
+    use std::ffi::CString;
+
+    let mut master = -1;
+    let mut slave = -1;
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } != 0
+        || unsafe { libc::setsid() } < 0
+        || unsafe { libc::ioctl(slave, libc::TIOCSCTTY, 0) } < 0
+    {
+        return 20;
+    }
+    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    let mesh = unsafe { libc::fork() };
+    if mesh < 0 {
+        return 21;
+    }
+    if mesh == 0 {
+        unsafe {
+            libc::setpgid(0, 0);
+            libc::dup2(slave, libc::STDIN_FILENO);
+            libc::dup2(slave, libc::STDOUT_FILENO);
+            libc::dup2(slave, libc::STDERR_FILENO);
+            libc::close(master);
+            libc::close(slave);
+        }
+        let path = CString::new(env!("CARGO_BIN_EXE_mesh")).unwrap();
+        let arg0 = CString::new("mesh").unwrap();
+        unsafe {
+            libc::execl(
+                path.as_ptr(),
+                arg0.as_ptr(),
+                std::ptr::null::<libc::c_char>(),
+            );
+            libc::_exit(127);
+        }
+    }
+    unsafe { libc::close(slave) };
+    if unsafe { libc::tcsetpgrp(master, mesh) } < 0 || !pty_wait_for_prompt(master) {
+        return 22;
+    }
+
+    // Extra stages give the first process ample time to install its handler
+    // before mesh finishes launching the group. An unconditional group-wide
+    // SIGCONT after launch therefore makes "unsolicited" observable.
+    let mut command = String::from("sh -c 'trap \"echo unsolicited\" CONT; sleep 0.2; echo done'");
+    for _ in 0..24 {
+        command.push_str(" | cat");
+    }
+    command.push('\n');
+    if unsafe { libc::write(master, command.as_ptr().cast(), command.len()) }
+        != command.len() as isize
+    {
+        return 23;
+    }
+    let output = match pty_read_until_prompt(master) {
+        Some(output) => output,
+        None => return 24,
+    };
+    if output.windows(13).any(|part| part == b"unsolicited\r\n") {
+        return 25;
+    }
+    if unsafe { libc::write(master, b"exit\n".as_ptr().cast(), 5) } != 5 {
+        return 26;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(mesh, &mut status, 0) } != mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 27;
+    }
+    unsafe { libc::close(master) };
+    0
+}
+
 fn background_startup_harness() -> i32 {
     use std::ffi::CString;
     use std::os::fd::RawFd;
@@ -699,6 +825,10 @@ fn background_startup_harness() -> i32 {
 /// Act as the small piece of terminal-emulator behavior reedline needs while
 /// waiting for its prompt.
 fn pty_wait_for_prompt(master: std::os::fd::RawFd) -> bool {
+    pty_read_until_prompt(master).is_some()
+}
+
+fn pty_read_until_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
     let mut ready = libc::pollfd {
         fd: master,
         events: libc::POLLIN,
@@ -707,12 +837,12 @@ fn pty_wait_for_prompt(master: std::os::fd::RawFd) -> bool {
     let mut prompt = Vec::new();
     for _ in 0..8 {
         if unsafe { libc::poll(&mut ready, 1, 2_000) } <= 0 {
-            return false;
+            return None;
         }
         let mut chunk = [0_u8; 256];
         let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
         if count <= 0 {
-            return false;
+            return None;
         }
         prompt.extend_from_slice(&chunk[..count as usize]);
         if prompt.windows(4).any(|part| part == b"\x1b[6n") {
@@ -722,7 +852,10 @@ fn pty_wait_for_prompt(master: std::os::fd::RawFd) -> bool {
             break;
         }
     }
-    prompt.windows(5).any(|part| part == b"mesh$")
+    prompt
+        .windows(5)
+        .any(|part| part == b"mesh$")
+        .then_some(prompt)
 }
 
 #[test]
