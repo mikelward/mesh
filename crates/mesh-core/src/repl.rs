@@ -26,6 +26,8 @@ struct Shell {
     vars: Vars,
     funcs: Funcs,
     jobs: exec::JobTable,
+    control: Option<parser::ControlKind>,
+    loop_depth: usize,
 }
 
 impl Shell {
@@ -34,6 +36,8 @@ impl Shell {
             vars: Vars::new(),
             funcs: Funcs::new(),
             jobs: exec::JobTable::new(),
+            control: None,
+            loop_depth: 0,
         }
     }
 }
@@ -78,11 +82,48 @@ enum Step {
 /// while running a `func` body: there a `return` unwinds; at top level it is a
 /// recoverable error.
 fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
+    // Compound forms that predate the AST executor retain their validation and
+    // typed function-call behavior while their bodies recursively re-enter this
+    // function and are executed as parsed sources.
+    if is_func_start(text) {
+        return define_func(text, shell);
+    }
+    if is_if_start(text) {
+        return run_if(text, last, in_function, shell);
+    }
+    if is_for_start(text) {
+        return run_for(text, in_function, shell);
+    }
+    if let Some((name, expression)) = if_assignment(text) {
+        return match eval_if_value(expression, last, in_function, shell) {
+            Ok((value, step)) => match step {
+                Step::Continue(_) => {
+                    shell.vars.set_value(name, value);
+                    Step::Continue(0)
+                }
+                other => other,
+            },
+            Err(msg) => {
+                eprintln!("mesh: {msg}");
+                Step::Continue(2)
+            }
+        };
+    }
     // Expression assignments already use the clean-break grammar. Commands
     // still need the compatibility parser until parser words can be expanded.
     let parser_owned = parser_owned_assignment(text);
     match parser::parse(text) {
-        Ok(parser::ParseOutcome::Complete(_)) => {}
+        Ok(parser::ParseOutcome::Complete(source)) => {
+            let control = text.split_whitespace().any(|word| {
+                matches!(
+                    word.trim_matches(|c: char| !c.is_ascii_alphabetic()),
+                    "break" | "continue"
+                )
+            });
+            if parser_owned || control {
+                return run_source(&source, last, in_function, shell);
+            }
+        }
         Ok(parser::ParseOutcome::Incomplete) if parser_owned => {
             eprintln!("mesh: syntax error: unexpected end of input");
             return Step::Continue(2);
@@ -154,8 +195,438 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
                 status = 1;
             }
         }
+        if shell.control.is_some() {
+            break;
+        }
     }
     Step::Continue(status)
+}
+
+/// Execute the syntax tree recursively.  Keeping execution on the tree (rather
+/// than splitting the original text again) makes nesting and short-circuiting
+/// obey exactly the same structure the parser accepted.
+fn run_source(
+    source: &parser::Source,
+    mut status: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
+    for statement in &source.statements {
+        match run_statement(statement, status, in_function, shell) {
+            Step::Continue(code) => status = code,
+            flow => return flow,
+        }
+    }
+    Step::Continue(status)
+}
+
+fn run_statement(
+    statement: &parser::Statement,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
+    run_and_or(
+        &statement.and_or,
+        statement.background,
+        last,
+        in_function,
+        shell,
+    )
+}
+
+fn run_and_or(
+    node: &parser::AndOr,
+    background: bool,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
+    let mut step = run_executable(&node.first, background, last, in_function, shell);
+    for (op, executable) in &node.rest {
+        let Step::Continue(status) = step else {
+            return step;
+        };
+        let run = match op {
+            parser::AndOrOp::And => status == 0,
+            parser::AndOrOp::Or => status != 0,
+        };
+        if run {
+            step = run_executable(executable, background, status, in_function, shell);
+        }
+    }
+    step
+}
+
+fn run_executable(
+    node: &parser::Executable,
+    background: bool,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
+    use parser::Executable::*;
+    match node {
+        Pipeline(pipeline) => run_ast_pipeline(pipeline, background, last, shell),
+        Assignment {
+            name,
+            append,
+            value,
+        } => match eval_expr(value, last, in_function, shell) {
+            Ok(value) => {
+                let result = if *append {
+                    shell.vars.append(name, value)
+                } else {
+                    shell.vars.set_value(name, value);
+                    Ok(())
+                };
+                result.map_or_else(
+                    |error| {
+                        eprintln!("mesh: {error}");
+                        Step::Continue(1)
+                    },
+                    |_| Step::Continue(0),
+                )
+            }
+            Err(step) => step,
+        },
+        Function {
+            name,
+            parameters,
+            body,
+        } => {
+            shell.funcs.define(
+                name.clone(),
+                FuncDef {
+                    params: parameters.clone(),
+                    body: String::new(),
+                    ast: Some(body.clone()),
+                },
+            );
+            Step::Continue(0)
+        }
+        If(expression) => run_ast_if(expression, last, in_function, shell),
+        For {
+            binding,
+            iterable,
+            body,
+        } => run_ast_for(binding, iterable, body, last, in_function, shell),
+        Control { kind, value, guard } => {
+            if !guard_allows(guard.as_ref(), last, in_function, shell) {
+                return Step::Continue(last);
+            }
+            match kind {
+                parser::ControlKind::Return => {
+                    if !in_function {
+                        eprintln!("mesh: return: not inside a function");
+                        return Step::Continue(1);
+                    }
+                    let code = value
+                        .as_ref()
+                        .map(|v| eval_expr(v, last, in_function, shell))
+                        .transpose();
+                    match code {
+                        Ok(Some(Value::String(s))) => make_return(&[s], last),
+                        Ok(None) => Step::Return(last),
+                        Ok(Some(_)) => {
+                            eprintln!("mesh: return: numeric argument required");
+                            Step::Continue(2)
+                        }
+                        Err(step) => step,
+                    }
+                }
+                parser::ControlKind::Break | parser::ControlKind::Continue => {
+                    if shell.loop_depth == 0 {
+                        eprintln!(
+                            "mesh: {}: not inside a loop",
+                            if matches!(kind, parser::ControlKind::Break) {
+                                "break"
+                            } else {
+                                "continue"
+                            }
+                        );
+                        Step::Continue(1)
+                    } else {
+                        shell.control = Some(*kind);
+                        Step::Continue(0)
+                    }
+                }
+            }
+        }
+        Expression { expression, guard } => {
+            if !guard_allows(guard.as_ref(), last, in_function, shell) {
+                return Step::Continue(last);
+            }
+            match eval_expr(expression, last, in_function, shell) {
+                Ok(_) => Step::Continue(0),
+                Err(step) => step,
+            }
+        }
+    }
+}
+
+fn guard_allows(
+    guard: Option<&parser::Guard>,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> bool {
+    guard.map_or(true, |guard| {
+        match eval_expr(&guard.condition, last, in_function, shell) {
+            Ok(value) => truthy(&value) != guard.unless,
+            Err(_) => false,
+        }
+    })
+}
+
+fn run_ast_if(node: &parser::IfExpr, last: u8, in_function: bool, shell: &mut Shell) -> Step {
+    let condition = run_executable(&node.condition, false, last, in_function, shell);
+    let Step::Continue(code) = condition else {
+        return condition;
+    };
+    if code == 0 {
+        run_source(&node.then_body, 0, in_function, shell)
+    } else {
+        match &node.else_branch {
+            Some(parser::ElseBranch::If(next)) => run_ast_if(next, code, in_function, shell),
+            Some(parser::ElseBranch::Block(body)) => run_source(body, 0, in_function, shell),
+            None => Step::Continue(0),
+        }
+    }
+}
+
+fn run_ast_for(
+    binding: &str,
+    iterable: &parser::Expr,
+    body: &parser::Source,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
+    let value = match eval_expr(iterable, last, in_function, shell) {
+        Ok(v) => v,
+        Err(step) => return step,
+    };
+    let values = match value {
+        Value::List(v) => v,
+        value => vec![value],
+    };
+    let mut status = 0;
+    shell.loop_depth += 1;
+    for value in values {
+        shell.vars.set_value(binding, value);
+        match run_source(body, 0, in_function, shell) {
+            Step::Continue(code) => status = code,
+            flow => {
+                shell.loop_depth -= 1;
+                return flow;
+            }
+        }
+        match shell.control.take() {
+            Some(parser::ControlKind::Break) => break,
+            Some(parser::ControlKind::Continue) => continue,
+            Some(parser::ControlKind::Return) => unreachable!(),
+            None => {}
+        }
+    }
+    shell.loop_depth -= 1;
+    Step::Continue(status)
+}
+
+fn run_ast_pipeline(
+    node: &parser::Pipeline,
+    background: bool,
+    last: u8,
+    shell: &mut Shell,
+) -> Step {
+    let mut stages = Vec::with_capacity(node.stages.len());
+    for command in &node.stages {
+        if !guard_allows(command.guard.as_ref(), last, false, shell) {
+            return Step::Continue(last);
+        }
+        let mut words = Vec::new();
+        let mut redirs = Vec::new();
+        for item in &command.items {
+            match item {
+                parser::CommandItem::Word(word) => words.push(ast_word(&word.value)),
+                parser::CommandItem::Redirect { kind, target, .. } => redirs.push(Redir {
+                    kind: match kind {
+                        parser::RedirectKind::Input => RedirKind::In,
+                        parser::RedirectKind::Output => RedirKind::Out,
+                        parser::RedirectKind::Append => RedirKind::Append,
+                        parser::RedirectKind::Heredoc => {
+                            eprintln!("mesh: heredoc execution is not supported yet");
+                            return Step::Continue(1);
+                        }
+                    },
+                    target: ast_word(&target.value),
+                }),
+            }
+        }
+        stages.push(Stage { words, redirs });
+    }
+    run_pipeline(stages, background, last, shell)
+}
+
+fn ast_word(word: &parser::Word) -> Word {
+    Word(
+        word.pieces
+            .iter()
+            .map(|piece| match piece {
+                parser::WordPiece::Text { text, quote } => Piece::Text {
+                    text: text.clone(),
+                    expandable: matches!(quote, parser::QuoteMode::Bare),
+                },
+                parser::WordPiece::Variable { name, quote } => Piece::Var(crate::lexer::VarRef {
+                    name: name.strip_prefix('$').unwrap_or(name).to_string(),
+                    member: None,
+                    access: None,
+                    modifiers: Vec::new(),
+                    quoted: !matches!(quote, parser::QuoteMode::Bare),
+                }),
+            })
+            .collect(),
+    )
+}
+
+fn eval_expr(
+    expr: &parser::Expr,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    use parser::{BinaryOp as B, Expr as E, ListItem, UnaryOp as U};
+    match expr {
+        E::Scalar(word) => expand::expand_values(vec![ast_word(&word.value)], &shell.vars)
+            .map_err(|e| {
+                eprintln!("mesh: {e}");
+                Step::Continue(1)
+            })
+            .and_then(|mut v| {
+                if v.len() == 1 {
+                    Ok(v.pop().unwrap())
+                } else {
+                    Ok(Value::List(v))
+                }
+            }),
+        E::Variable(name) => shell
+            .vars
+            .get(name.value.strip_prefix('$').unwrap_or(&name.value))
+            .cloned()
+            .ok_or_else(|| {
+                eprintln!("mesh: {}: unbound variable", name.value);
+                Step::Continue(1)
+            }),
+        E::List(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                match item {
+                    ListItem::Value(v) => out.push(eval_expr(v, last, in_function, shell)?),
+                    ListItem::Spread(v) => match eval_expr(v, last, in_function, shell)? {
+                        Value::List(mut v) => out.append(&mut v),
+                        value => out.push(value),
+                    },
+                }
+            }
+            Ok(Value::List(out))
+        }
+        E::Group(inner) => eval_expr(inner, last, in_function, shell),
+        E::Unary {
+            op: U::Not,
+            expression,
+        } => Ok(bool_value(!truthy(&eval_expr(
+            expression,
+            last,
+            in_function,
+            shell,
+        )?))),
+        E::Unary {
+            op: U::Negate,
+            expression,
+        } => number(&eval_expr(expression, last, in_function, shell)?)
+            .map(|n| Value::String((-n).to_string()))
+            .map_err(|m| {
+                eprintln!("mesh: {m}");
+                Step::Continue(1)
+            }),
+        E::Unary {
+            op: U::Spread,
+            expression,
+        } => eval_expr(expression, last, in_function, shell),
+        E::Binary { left, op, right } => {
+            let l = eval_expr(left, last, in_function, shell)?;
+            if *op == B::And && !truthy(&l) {
+                return Ok(bool_value(false));
+            }
+            if *op == B::Or && truthy(&l) {
+                return Ok(bool_value(true));
+            }
+            let r = eval_expr(right, last, in_function, shell)?;
+            eval_binary(l, *op, r).map_err(|m| {
+                eprintln!("mesh: {m}");
+                Step::Continue(1)
+            })
+        }
+        E::If(node) => match run_ast_if(node, last, in_function, shell) {
+            Step::Continue(code) => Ok(Value::String(code.to_string())),
+            step => Err(step),
+        },
+        E::For {
+            binding,
+            iterable,
+            body,
+        } => match run_ast_for(binding, iterable, body, last, in_function, shell) {
+            Step::Continue(code) => Ok(Value::String(code.to_string())),
+            step => Err(step),
+        },
+        E::BackgroundJob(pipeline) => match run_ast_pipeline(pipeline, true, last, shell) {
+            Step::Continue(code) => Ok(Value::String(code.to_string())),
+            step => Err(step),
+        },
+        E::Capture(source) => match run_source(source, last, in_function, shell) {
+            Step::Continue(code) => Ok(Value::String(code.to_string())),
+            step => Err(step),
+        },
+        _ => {
+            eprintln!("mesh: expression is not executable yet");
+            Err(Step::Continue(1))
+        }
+    }
+}
+
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::String(s) => !s.is_empty() && s != "false" && s != "0",
+        Value::List(v) => !v.is_empty(),
+    }
+}
+fn bool_value(value: bool) -> Value {
+    Value::String(value.to_string())
+}
+fn number(value: &Value) -> Result<i64, String> {
+    match value {
+        Value::String(s) => s.parse().map_err(|_| format!("{s}: expected number")),
+        _ => Err("expected number".into()),
+    }
+}
+fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value, String> {
+    use parser::BinaryOp::*;
+    Ok(match op {
+        Equal => bool_value(left == right),
+        NotEqual => bool_value(left != right),
+        Add => Value::String((number(&left)? + number(&right)?).to_string()),
+        Subtract => Value::String((number(&left)? - number(&right)?).to_string()),
+        Multiply => Value::String((number(&left)? * number(&right)?).to_string()),
+        Divide => Value::String((number(&left)? / number(&right)?).to_string()),
+        Remainder => Value::String((number(&left)? % number(&right)?).to_string()),
+        Less => bool_value(number(&left)? < number(&right)?),
+        LessEqual => bool_value(number(&left)? <= number(&right)?),
+        Greater => bool_value(number(&left)? > number(&right)?),
+        GreaterEqual => bool_value(number(&left)? >= number(&right)?),
+        And => bool_value(truthy(&left) && truthy(&right)),
+        Or => bool_value(truthy(&left) || truthy(&right)),
+        _ => return Err("operator is not executable yet".into()),
+    })
 }
 
 fn parser_owned_assignment(text: &str) -> bool {
@@ -435,8 +906,8 @@ fn make_return(args: &[String], last: u8) -> Step {
 /// list argument counts as **one** positional (it arrives intact as a list
 /// value); an arity mismatch is a recoverable error.
 fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
-    let (params, body) = match shell.funcs.get(name) {
-        Some(def) => (def.params.clone(), def.body.clone()),
+    let (params, body, ast) = match shell.funcs.get(name) {
+        Some(def) => (def.params.clone(), def.body.clone(), def.ast.clone()),
         None => return Step::Continue(exec::run(&[name.to_string()], &mut shell.jobs)),
     };
     if args.len() != params.len() {
@@ -452,7 +923,11 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
     for (param, arg) in params.iter().zip(args) {
         shell.vars.set_value(param, arg);
     }
-    let result = match run_body(&body, true, shell) {
+    let executed = match &ast {
+        Some(source) => run_source(source, 0, true, shell),
+        None => run_body(&body, true, shell),
+    };
+    let result = match executed {
         Step::Return(code) => Step::Continue(code),
         other => other,
     };
@@ -492,6 +967,9 @@ fn run_body(body: &str, in_function: bool, shell: &mut Shell) -> Step {
             Step::Continue(code) => status = code,
             Step::Return(code) => return Step::Return(code),
             Step::Exit(code) => return Step::Exit(code),
+        }
+        if shell.control.is_some() {
+            return Step::Continue(status);
         }
     }
     // A truncated nested definition still buffered at the end of the body: run it
@@ -655,22 +1133,37 @@ fn run_for(text: &str, in_function: bool, shell: &mut Shell) -> Step {
         Value::List(values) => values,
     });
     let mut status = 0;
+    shell.loop_depth += 1;
     for item in items {
         let Value::String(item) = item else {
             eprintln!("mesh: for: nested list element is not iterable yet");
+            shell.loop_depth -= 1;
             return Step::Continue(1);
         };
         shell.vars.set(name, item);
         match run_body(body, in_function, shell) {
             Step::Continue(code) => status = code,
-            Step::Return(code) if in_function => return Step::Return(code),
+            Step::Return(code) if in_function => {
+                shell.loop_depth -= 1;
+                return Step::Return(code);
+            }
             Step::Return(_) => {
                 eprintln!("mesh: return: not inside a function");
                 status = 1;
             }
-            Step::Exit(code) => return Step::Exit(code),
+            Step::Exit(code) => {
+                shell.loop_depth -= 1;
+                return Step::Exit(code);
+            }
+        }
+        match shell.control.take() {
+            Some(parser::ControlKind::Break) => break,
+            Some(parser::ControlKind::Continue) => continue,
+            Some(parser::ControlKind::Return) => unreachable!(),
+            None => {}
         }
     }
+    shell.loop_depth -= 1;
     Step::Continue(status)
 }
 
@@ -963,6 +1456,7 @@ fn parse_func_def(text: &str) -> Result<(String, FuncDef), String> {
         FuncDef {
             params,
             body: body.to_string(),
+            ast: None,
         },
     ))
 }

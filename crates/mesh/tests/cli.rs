@@ -2148,3 +2148,25 @@ fn for_supports_multiline_bodies_and_empty_lists() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn parsed_source_sequences_expression_assignments() {
+    let out = run_with_input("answer = 20 + 22; puts $answer\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn break_controls_a_parsed_loop_body() {
+    let out = run_with_input("for x in [a b c] {\nputs $x\nbreak\nputs never\n}\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
