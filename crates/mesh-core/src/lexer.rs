@@ -36,8 +36,8 @@ pub enum Piece {
     Var(VarRef),
 }
 
-/// A word: adjacent pieces that concatenate into one argument. An empty piece
-/// list is a genuine empty argument (e.g. from `""`).
+/// A word: adjacent pieces that concatenate into one argument. Quoted empty
+/// strings are retained as empty, non-expandable text pieces.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Word(pub Vec<Piece>);
 
@@ -419,6 +419,7 @@ fn lex_escaped(
     quote: char,
     word: &mut Vec<Piece>,
 ) -> Result<usize, LexError> {
+    let piece_start = word.len();
     let double = quote == '"';
     let mut buf = String::new();
     let mut i = start;
@@ -472,6 +473,12 @@ fn lex_escaped(
         i += 1;
     }
     push_text(word, &buf, false);
+    if word.len() == piece_start {
+        word.push(Piece::Text {
+            text: String::new(),
+            expandable: false,
+        });
+    }
     Ok(i)
 }
 
@@ -495,7 +502,14 @@ fn lex_raw(
         buf.push(c);
         i += 1;
     }
-    push_text(word, &buf, false);
+    if buf.is_empty() {
+        word.push(Piece::Text {
+            text: String::new(),
+            expandable: false,
+        });
+    } else {
+        push_text(word, &buf, false);
+    }
     Ok(i)
 }
 
@@ -899,7 +913,10 @@ mod tests {
 
     #[test]
     fn empty_quote_does_not_reset_word_start() {
-        assert_eq!(words(r#"""r'x'"#), [Word(vec![exp("r"), lit("x")])]);
+        assert_eq!(
+            words(r#"""r'x'"#),
+            [Word(vec![lit(""), exp("r"), lit("x")])]
+        );
     }
 
     #[test]

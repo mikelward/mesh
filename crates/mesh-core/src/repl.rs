@@ -415,12 +415,13 @@ fn list_literal(rhs: &[Word]) -> Option<Vec<Word>> {
         return None;
     }
     last_text.pop();
-    items.retain(|word| {
-        !word
-            .0
-            .iter()
-            .all(|piece| matches!(piece, Piece::Text { text, .. } if text.is_empty()))
-    });
+    let synthetic = |word: &Word| matches!(word.0.as_slice(), [Piece::Text { text, expandable: true }] if text.is_empty());
+    if items.first().is_some_and(synthetic) {
+        items.remove(0);
+    }
+    if items.last().is_some_and(synthetic) {
+        items.pop();
+    }
     Some(items)
 }
 
