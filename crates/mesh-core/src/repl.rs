@@ -451,10 +451,8 @@ fn append_assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), Stri
         Value::List(expand::expand(items, vars).map_err(|e| e.to_string())?)
     } else if let [Word(pieces)] = rhs.as_slice() {
         if let [Piece::Var(vref)] = pieces.as_slice() {
-            if vref.member.is_none() && vref.access.is_none() {
-                vars.get(&vref.name)
-                    .cloned()
-                    .ok_or_else(|| format!("{}: unbound variable", vref.name))?
+            if vref.member.is_none() {
+                assignment_value(vref, vars)?
             } else {
                 scalar_value(rhs, vars, name)?
             }

@@ -77,6 +77,7 @@ file as tasks land.
   - [x] Append assignment (`+=`) for strings and the current string-list slice.
   - [x] List-preserving assignment from a variable or slice (`ys = $xs`,
         `ys = $xs[1..]`).
+  - [x] List-preserving append from a slice (`xs += $ys[1..]`).
 - [ ] Maps, scalar types, and `:` modifiers.
 - [ ] `if` / `for` / `match` and `func`.
 
