@@ -862,6 +862,8 @@ fn valid_variable_subscript(value: &str) -> bool {
         (start.is_empty() || signed_integer(start)) && (end.is_empty() || signed_integer(end))
     } else {
         signed_integer(value)
+            || valid_name(value)
+            || value.strip_prefix('$').is_some_and(valid_name)
     }
 }
 

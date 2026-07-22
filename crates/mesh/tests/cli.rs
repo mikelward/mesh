@@ -2251,3 +2251,38 @@ fn break_controls_a_parsed_loop_body() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn maps_preserve_order_support_access_spread_and_merge() {
+    let out = run_with_input(
+        "key = https\n\
+         ports = [http: 80, https: 443, http: 8080]\n\
+         puts $ports.http ${ports[$key]}\n\
+         defaults = [ssh: 22, http: 80]\n\
+         ports += $defaults\n\
+         copy = [...$ports, ssh: 2222]\n\
+         puts ...$copy:keys\n\
+         puts ...$copy:values\n",
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "8080 443\nhttp https ssh\n80 443 2222\n"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn maps_reject_missing_keys_and_non_string_keys() {
+    let missing = run_with_input("m = [present: yes]\nputs $m.absent\n");
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("map key"));
+
+    let bad_key = run_with_input("keys = [bad]\nm = [$keys: value]\n");
+    assert_eq!(bad_key.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bad_key.stderr).contains("map key must be a string"));
+}
