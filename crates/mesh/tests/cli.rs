@@ -2161,6 +2161,25 @@ fn parsed_source_sequences_expression_assignments() {
 }
 
 #[test]
+fn parsed_command_words_and_redirects_keep_quote_structure() {
+    let dir = fresh_dir("parsed_word_redirect");
+    let path = dir.join("result.txt");
+    let input = format!(
+        "target = {}\nfor item in [once] {{ /bin/echo \"*\" > $target }}\n",
+        path.display()
+    );
+
+    let out = run_with_input(&input);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "*\n");
+}
+
+#[test]
 fn break_controls_a_parsed_loop_body() {
     let out = run_with_input("for x in [a b c] {\nputs $x\nbreak\nputs never\n}\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a\n");
