@@ -250,34 +250,38 @@ Ctrl-Z also registers a stopped foreground pipeline in the same job table.
 continues one in the background. With no reference, `fg` and `bg` select the
 newest job. These builtins are command forms rather than new grammar productions.
 
-## M3 list-value slice
+## M3 list values
 
-The first non-string value is a list of strings. In assignment position,
-bracketed, space-separated words form a list; `[]` remains distinct from an
-empty string:
+Lists contain values, including other lists. In assignment position, bracketed,
+space-separated expressions form a list; `[]` remains distinct from an empty
+string:
 
 ```
-list-assign = name "=" ws? "[" (word (ws word)*)? "]"
-spread      = "...$" name                  # whole command word, for now
+list-assign = name "=" ws? list
+list        = "[" (value (ws value)*)? "]"
+value       = word | list
+spread      = "...$" name
 index       = "$" name "[" signed-integer "]"
 slice       = "$" name "[" signed-integer? (".." signed-integer? | "..=" signed-integer) "]"
 ```
 
-Each literal element uses the existing word expansion rules. A glob can
-therefore contribute zero or more elements. `...$name` contributes every list
-element as a separate command argument and contributes no arguments for `[]`.
+Each scalar element uses the existing word expansion rules, so a glob can
+contribute zero or more elements. Inside a list, `$name` inserts its value as one
+element and `...$name` flattens one list level. In command position, spread
+contributes each string element as an argument and contributes none for `[]`; a
+nested list element cannot cross the command boundary.
+
 A list used as bare `$name` in command arguments is an error: mesh never
 implicitly word-splits or flattens a typed value. Spreading a string is also an
 error. Exact indexing is zero-based, accepts negative indices from the end, and
-returns one string element. An out-of-range index or indexing a string fails
-loudly. A slice is a list value and therefore uses spread in command position
+returns one value. An out-of-range index or indexing a string fails loudly. A
+slice is a list value and therefore uses spread in command position
 (`...$xs[1..3]`). Half-open (`..`) and inclusive (`..=`) bounds follow Rust's
 spelling, negative bounds count from the end, and out-of-range bounds clamp.
 
-This is deliberately a vertical slice rather than the final expression
-grammar. Lists currently contain strings only; `+=` concatenates strings,
-appends a scalar to a list, or extends a list with a whole list or slice.
-Nesting and general expression parsing remain ahead.
+`+=` concatenates strings, appends a scalar or nested list to a list, or extends
+a list with a whole list or slice. The clean-break general expression parser
+remains ahead.
 
 ## Task 9 — functions (`func`)
 

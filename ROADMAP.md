@@ -97,17 +97,17 @@ build track and the design track converge.
 clean-break grammar; real values (lists, maps) with no word-splitting;
 `$`-expansion and the `...` spread; `:`-modifiers; `if`/`for`/`match`; `func`.
 
-The first vertical slice has landed: assignments accept string-list literals
+General list support has landed: assignments accept recursively nested literals
 (`xs = [a "b c"]`, including `[]`), `...$xs` spreads one into command
 arguments, and exact integer indexing reads an element. A bare `$xs` in
-argument position fails loudly, preserving the design's
-explicit-spread/no-word-splitting rule. Nested values, slicing, and general
-expression parsing remain ahead. List-valued assignment also preserves a whole
-list or slice instead of coercing it to command words.
+argument position fails loudly, preserving the design's explicit-spread and
+no-word-splitting rule. Lists preserve nested values; `$xs` in a literal inserts
+one nested value while `...$xs` flattens exactly one level. Indexing, slicing,
+and `+=` retain those types. General expression parsing remains ahead.
 
 Named functions and the first conditional slice have also landed. `if` executes
 brace-delimited branches from command status, supports `else if`, and can yield a
-string or string-list value in assignment position (with `""` for a missing
+string or list value in assignment position (with `""` for a missing
 `else`). General boolean/comparison expressions and conditional destructuring
 remain tied to the general expression parser.
 

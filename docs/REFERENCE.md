@@ -82,6 +82,22 @@ A name starts with a letter, then letters, digits, `_`, and interior `-` (a
 hyphen must sit between two name characters). A bare `_` is not a name. Bindings
 are session-global.
 
+Lists are bracketed, space-separated values. They preserve nesting: `$xs` in a
+literal inserts a list as one nested element, while `...$xs` flattens exactly
+one level. The same distinction applies when appending and when an indexed
+element is a list.
+
+```mesh
+inner = [two three]
+nested = [one $inner four]
+flat = [one ...$inner four]
+puts ...$nested[1]       # two three
+flat += [five six]       # extends by two elements
+```
+
+Lists do not flatten implicitly. A nested list must be indexed or otherwise
+selected before its string elements can be spread into command arguments.
+
 | Read | Meaning |
 | --- | --- |
 | `$name` | The value of `name`. |
@@ -145,14 +161,14 @@ may span lines, and `return` or `exit` in a selected body keeps its normal
 control-flow effect.
 
 In assignment position, the selected body's final physical line supplies the
-value. The current value forms are one string, a string-list literal, a whole
+value. The current value forms are one string, a list literal, a whole
 variable value, or a nested `if`; earlier lines in that body run for effect. A
 false conditional with no `else` yields `""`. General boolean/comparison
 expressions and conditional destructuring are not implemented yet.
 
 ## For loops
 
-`for name in value { body }` runs the body once for each string-list element or
+`for name in value { body }` runs the body once for each top-level list element or
 expanded word. An element containing whitespace remains one value when read
 through `$name`; braces may span lines. Empty lists run the body zero times.
 
