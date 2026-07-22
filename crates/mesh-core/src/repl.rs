@@ -84,6 +84,9 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
     if is_if_start(text) {
         return run_if(text, last, in_function, shell);
     }
+    if is_for_start(text) {
+        return run_for(text, in_function, shell);
+    }
     if let Some((name, expression)) = if_assignment(text) {
         return match eval_if_value(expression, last, in_function, shell) {
             Ok((value, step)) => match step {
@@ -443,8 +446,7 @@ fn run_func_body(body: &str, shell: &mut Shell) -> Step {
         }
         pending.push_str(line);
         pending.push('\n');
-        if (is_func_start(&pending) || is_if_input(&pending)) && needs_more_compound_input(&pending)
-        {
+        if is_compound_input(&pending) && needs_more_compound_input(&pending) {
             continue;
         }
         let full = std::mem::take(&mut pending);
@@ -474,6 +476,17 @@ fn is_if_input(text: &str) -> bool {
     is_if_start(text) || if_assignment(text).is_some()
 }
 
+fn is_for_start(text: &str) -> bool {
+    match text.trim_start().strip_prefix("for") {
+        Some(rest) => rest.is_empty() || rest.starts_with(char::is_whitespace),
+        None => false,
+    }
+}
+
+fn is_compound_input(text: &str) -> bool {
+    is_func_start(text) || is_if_input(text) || is_for_start(text)
+}
+
 fn needs_more_compound_input(text: &str) -> bool {
     if is_func_start(text) {
         lexer::needs_more_input(text)
@@ -483,9 +496,101 @@ fn needs_more_compound_input(text: &str) -> bool {
             Ok(_) => false,
             Err(msg) => msg.contains("missing body") || msg.contains("missing closing"),
         }
+    } else if is_for_start(text) {
+        match parse_for(text) {
+            Ok(_) => false,
+            Err(msg) => msg.contains("missing body") || msg.contains("missing closing"),
+        }
     } else {
         false
     }
+}
+
+fn parse_for(text: &str) -> Result<(&str, &str, &str), String> {
+    let rest = text
+        .trim()
+        .strip_prefix("for")
+        .ok_or("for: expected `for`")?
+        .trim_start();
+    let open = first_bare_open(rest).ok_or("for: missing body `{ ... }`")?;
+    let header = rest[..open].trim();
+    let mut parts = header.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("");
+    if !lexer::is_ident(name) {
+        return Err(format!("for: `{name}` is not a valid binding name"));
+    }
+    let after_name = parts.next().unwrap_or("").trim_start();
+    let source = after_name
+        .strip_prefix("in")
+        .filter(|after| after.starts_with(char::is_whitespace))
+        .ok_or("for: expected `in` after the binding name")?
+        .trim_start();
+    if source.is_empty() {
+        return Err("for: missing iterable expression".into());
+    }
+    let (body, after) =
+        split_braced_body(&rest[open + 1..]).map_err(|_| "for: missing closing `}`".to_string())?;
+    if !after.trim().is_empty() {
+        return Err("for: unexpected text after the closing `}`".into());
+    }
+    Ok((name, source, body))
+}
+
+fn run_for(text: &str, in_function: bool, shell: &mut Shell) -> Step {
+    let (name, source, body) = match parse_for(text) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            eprintln!("mesh: {msg}");
+            return Step::Continue(2);
+        }
+    };
+    let parsed = match lexer::split_line(source) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            eprintln!("mesh: {err}");
+            return Step::Continue(2);
+        }
+    };
+    let [segment] = parsed.as_slice() else {
+        eprintln!("mesh: for: iterable must be one expression");
+        return Step::Continue(2);
+    };
+    if segment.background || segment.stages.len() != 1 || !segment.stages[0].redirs.is_empty() {
+        eprintln!("mesh: for: iterable must be one expression");
+        return Step::Continue(2);
+    }
+    let values = match expand::expand_values(
+        segment.stages[0]
+            .words
+            .iter()
+            .map(|word| Word(word.0.iter().map(clone_piece).collect()))
+            .collect(),
+        &shell.vars,
+    ) {
+        Ok(values) => values,
+        Err(err) => {
+            eprintln!("mesh: {err}");
+            return Step::Continue(1);
+        }
+    };
+    let items = values.into_iter().flat_map(|value| match value {
+        Value::String(value) => vec![value],
+        Value::List(values) => values,
+    });
+    let mut status = 0;
+    for item in items {
+        shell.vars.set(name, item);
+        match run_func_body(body, shell) {
+            Step::Continue(code) => status = code,
+            Step::Return(code) if in_function => return Step::Return(code),
+            Step::Return(_) => {
+                eprintln!("mesh: return: not inside a function");
+                status = 1;
+            }
+            Step::Exit(code) => return Step::Exit(code),
+        }
+    }
+    Step::Continue(status)
 }
 
 /// Recognize the current assignment-expression form, `name = if ...`.
@@ -904,6 +1009,7 @@ fn clone_piece(piece: &Piece) -> Piece {
             name: v.name.clone(),
             member: v.member.clone(),
             access: v.access.clone(),
+            modifiers: v.modifiers.clone(),
             quoted: v.quoted,
         }),
     }
@@ -945,6 +1051,9 @@ fn assign(name: &str, rhs: Vec<Word>, vars: &mut Vars) -> Result<(), String> {
 /// Preserve list values in an exact variable-to-variable assignment. Command
 /// expansion still requires `...`; assignment is a value context instead.
 fn assignment_value(vref: &crate::lexer::VarRef, vars: &Vars) -> Result<Value, String> {
+    if !vref.modifiers.is_empty() {
+        return expand::resolve_value(vref, vars).map_err(|error| error.to_string());
+    }
     let value = vars
         .get(&vref.name)
         .ok_or_else(|| format!("{}: unbound variable", vref.name))?;
@@ -1167,9 +1276,7 @@ fn handle_signal(
             }
             pending.push_str(&line);
             pending.push('\n');
-            if (is_func_start(pending) || is_if_input(pending))
-                && needs_more_compound_input(pending)
-            {
+            if is_compound_input(pending) && needs_more_compound_input(pending) {
                 return None;
             }
             let text = std::mem::take(pending);
@@ -1228,8 +1335,8 @@ fn run_piped() -> ExitCode {
                 // the whole definition below — never storing or running lossy
                 // source, and never leaking the body to the top level. A standalone
                 // malformed line with no open definition is simply skipped.
-                let opens_definition = (is_func_start(&lossy) || is_if_input(&lossy))
-                    && needs_more_compound_input(&lossy);
+                let opens_definition =
+                    is_compound_input(&lossy) && needs_more_compound_input(&lossy);
                 if pending.is_empty() && !opens_definition {
                     continue;
                 }
@@ -1251,8 +1358,7 @@ fn run_piped() -> ExitCode {
         }
         pending.push_str(text);
         // Keep reading the lines of a multi-line `func` body before running it.
-        if (is_func_start(&pending) || is_if_input(&pending)) && needs_more_compound_input(&pending)
-        {
+        if is_compound_input(&pending) && needs_more_compound_input(&pending) {
             continue;
         }
         let full = std::mem::take(&mut pending);

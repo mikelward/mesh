@@ -137,9 +137,10 @@ and `\`-newline continuation across multiple input lines. Words are still
 ```
 assign  = name "=" value              # unspaced, whole statement
         | name "=" ws value…          # spaced form (for compound values)
-var     = "$" name access             # $x, $name.member, $xs[-1]
-        | "$" "{" name access "}"       # ${x}, ${name.member}, ${xs[-1]}
+var     = "$" name access modifier*             # $x, $name.member, $xs[-1]:stem
+        | "$" "{" name access modifier* "}"           # ${xs[-1]:stem}
 access  = ("." name)? ("[" signed-integer "]")?
+modifier = ":" modifier-name
 name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
 ```
 
@@ -152,6 +153,13 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
   These forms have the same meaning in bare words and `"…"`; braces delimit a
   reference when literal text follows. Interpolation does **not** happen in
   `'…'` or `r'…'`.
+- Recognized argument-free **postfix modifiers** transform values and chain from
+  left to right. The initial path set is `:dir`, `:base`, `:ext`, `:exts`,
+  `:stem`, and `:bare`; strings also support `:upper` and `:lower`; strings and
+  lists support `:len`; and lists support `:first`, `:last`, `:rest`, `:init`,
+  and `:dedup`. Path and string modifiers map over lists, while collection
+  modifiers consume the list as a whole. An unrecognized name after `:` remains
+  literal text, preserving constructions such as `$host:$port`.
 - **Reads fail loud**: an **unbound** variable is an error (no null / always-on
   `set -u`), and the shell recovers to the next line. Assignment always creates.
   A **malformed `${…}`** (missing `}`, or an invalid name inside) is a syntax
@@ -162,8 +170,7 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
 - **Hyphens** are interior only: `$a-$b` is `$a` + `-` + `$b`, while
   `$auto-fetch` is one name.
 
-Deferred: list/map values (only single-value assignment for now — a glob/list
-RHS is an error), the `:` value modifiers (`$f:stem`), `export`, `global`/`unset`,
+Deferred: maps, modifier arguments such as `:join(SEP)`, `export`, `global`/`unset`,
 function-local scope, the `$sh.*` surface, and `$env:get(K, default)`.
 
 ## Task 7 — sequencing (`;`, `&&`, `||`)
@@ -354,10 +361,26 @@ value, or a nested `if`. Earlier lines run for effect. A false `if` with no
 conditional destructuring assignments, arrive with the general expression
 parser.
 
+### For loops
+
+The first loop slice iterates string lists and word expressions. The binding is
+updated in the current scope for each element; list elements remain single
+values even when they contain whitespace.
+
+```ebnf
+for-expr = "for" ws name ws "in" ws value… ws? "{" body "}"
+```
+
+```mesh
+for item in $items {
+  puts $item
+}
+```
+
 ### Not yet parsed
-Nested/general list expressions, maps, bare `{ }` blocks, `for` / `match`, `:`
-modifiers, and heredocs. Each arrives with the task that needs it, and this file
-grows to match.
+Nested/general list expressions, maps, bare `{ }` blocks, `match`,
+modifier arguments, and heredocs. Each arrives with the task that needs it, and
+this file grows to match.
 
 **Design target (still ahead of the lexer above).** The **Model B strings**
 direction from `DESIGN.md` is now implemented (see task 5 above). What the lexer

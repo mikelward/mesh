@@ -1900,6 +1900,41 @@ fn a_bare_list_to_an_external_command_is_still_an_error() {
 }
 
 #[test]
+fn path_and_string_modifiers_transform_values_and_chain() {
+    let out = run_with_input(
+        "file = src/archive.tar.gz\nputs $file:dir $file:base $file:ext $file:exts $file:stem $file:bare\nputs $file:base:upper\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "src archive.tar.gz gz tar.gz archive.tar archive\nARCHIVE.TAR.GZ\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn collection_modifiers_preserve_typed_list_results() {
+    let out = run_with_input(
+        "xs = [a b b c]\nputs $xs:len $xs:first $xs:last\nputs ...$xs:rest:init:dedup\nys = $xs:rest:init\nputs ...$ys\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4 a c\nb\nb b\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn unknown_modifier_names_remain_literal_suffixes() {
+    let out = run_with_input("host = example\nputs $host:port\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "example:port\n");
+}
+
+#[test]
 fn an_impossible_parameter_head_does_not_enter_continuation() {
     // A trailing parameter token with a non-letter head can never become a valid
     // name, so the header is reported at once and the next command still runs.
@@ -1952,4 +1987,31 @@ fn a_following_command_with_a_quoted_brace_is_not_the_body() {
     let out = run_with_input("func f()\nputs '{'\nputs after\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "{\nafter\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("missing body"));
+}
+
+#[test]
+fn for_iterates_lists_without_word_splitting() {
+    let out = run_with_input("xs = [one \"two words\" three]\nfor x in $xs { puts \"<$x>\" }\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "<one>\n<two words>\n<three>\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn for_supports_multiline_bodies_and_empty_lists() {
+    let out = run_with_input(
+        "xs = [a b]\nseen = \"\"\nfor x in $xs {\n  puts $x\n  seen += $x\n}\nempty = []\nfor x in $empty { puts never }\nputs $seen\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\nab\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

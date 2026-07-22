@@ -15,7 +15,7 @@
 //! (an interpolation resolved later, in [`crate::expand`], against the variable
 //! store). Interpolation and expansion never word-split.
 //!
-//! Deferred: `:` value modifiers, `${…}` beyond a name/`.member`, heredocs, and
+//! Deferred: modifier arguments, `${…}` beyond a name/`.member`, heredocs, and
 //! `\`-newline continuation across input lines.
 
 /// A variable reference: `$name`, `${name}`, or `$env.member`.
@@ -25,8 +25,51 @@ pub struct VarRef {
     /// A single `.member` access, e.g. `$env.PATH` → name `env`, member `PATH`.
     pub member: Option<String>,
     pub access: Option<Access>,
+    /// Recognized postfix value modifiers, in application order.
+    pub modifiers: Vec<Modifier>,
     /// Whether this interpolation appeared inside double quotes.
     pub quoted: bool,
+}
+
+/// The initial, argument-free modifier set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modifier {
+    Dir,
+    Base,
+    Ext,
+    Exts,
+    Stem,
+    Bare,
+    Len,
+    First,
+    Last,
+    Rest,
+    Init,
+    Dedup,
+    Upper,
+    Lower,
+}
+
+impl Modifier {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "dir" => Self::Dir,
+            "base" => Self::Base,
+            "ext" => Self::Ext,
+            "exts" => Self::Exts,
+            "stem" => Self::Stem,
+            "bare" => Self::Bare,
+            "len" => Self::Len,
+            "first" => Self::First,
+            "last" => Self::Last,
+            "rest" => Self::Rest,
+            "init" => Self::Init,
+            "dedup" => Self::Dedup,
+            "upper" => Self::Upper,
+            "lower" => Self::Lower,
+            _ => return None,
+        })
+    }
 }
 
 /// An exact list index or a clamped range slice.
@@ -574,12 +617,14 @@ fn parse_var(chars: &[char], at: usize) -> Result<Option<(VarRef, usize)>, LexEr
             j = k;
         }
     }
-    let (access, j) = parse_access(chars, j).unwrap_or((None, j));
+    let (access, mut j) = parse_access(chars, j).unwrap_or((None, j));
+    let modifiers = parse_modifiers(chars, &mut j);
     Ok(Some((
         VarRef {
             name,
             member,
             access,
+            modifiers,
             quoted: false,
         },
         j,
@@ -605,6 +650,7 @@ fn parse_var_ref(inner: &str) -> Option<VarRef> {
     }
     let (access, next) = parse_access(&chars, j)?;
     j = next;
+    let modifiers = parse_modifiers(&chars, &mut j);
     if j != chars.len() {
         return None; // trailing junk
     }
@@ -612,8 +658,27 @@ fn parse_var_ref(inner: &str) -> Option<VarRef> {
         name,
         member,
         access,
+        modifiers,
         quoted: false,
     })
+}
+
+fn parse_modifiers(chars: &[char], at: &mut usize) -> Vec<Modifier> {
+    let mut modifiers = Vec::new();
+    loop {
+        if chars.get(*at) != Some(&':') {
+            break;
+        }
+        let Some((name, next)) = read_name(chars, *at + 1) else {
+            break;
+        };
+        let Some(modifier) = Modifier::from_name(&name) else {
+            break;
+        };
+        modifiers.push(modifier);
+        *at = next;
+    }
+    modifiers
 }
 
 fn parse_access(chars: &[char], start: usize) -> Option<(Option<Access>, usize)> {
@@ -1165,6 +1230,7 @@ mod tests {
             name: name.to_string(),
             member: None,
             access: None,
+            modifiers: Vec::new(),
             quoted: false,
         })
     }
@@ -1173,6 +1239,7 @@ mod tests {
             name: name.to_string(),
             member: None,
             access: None,
+            modifiers: Vec::new(),
             quoted: true,
         })
     }
@@ -1355,6 +1422,7 @@ mod tests {
                 name: "env".into(),
                 member: Some("PATH".into()),
                 access: None,
+                modifiers: Vec::new(),
                 quoted: false,
             })])]
         );
@@ -1381,6 +1449,7 @@ mod tests {
                 name: "map".into(),
                 member: Some("field".into()),
                 access: None,
+                modifiers: Vec::new(),
                 quoted: true,
             })
         };
@@ -1392,6 +1461,7 @@ mod tests {
                 name: "items".into(),
                 member: None,
                 access: Some(Access::Index(-1)),
+                modifiers: Vec::new(),
                 quoted: true,
             })
         };
@@ -1410,6 +1480,7 @@ mod tests {
                     end,
                     inclusive,
                 }),
+                modifiers: Vec::new(),
                 quoted: false,
             })
         };

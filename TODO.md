@@ -78,7 +78,9 @@ file as tasks land.
   - [x] List-preserving assignment from a variable or slice (`ys = $xs`,
         `ys = $xs[1..]`).
   - [x] List-preserving append from a slice (`xs += $ys[1..]`).
-- [ ] Maps, scalar types, and `:` modifiers.
+- [ ] Maps and remaining scalar types.
+- [x] Initial argument-free `:` modifiers: path/string transforms and list
+      collection operations, including typed list results and chaining.
 - [x] `func` — user-defined functions: `func name(params) { body }` with required
       named positionals, multi-line bodies, function-local (lexical) scope, and
       `return`. Resolution is builtins → functions → external. Deferred:
@@ -89,6 +91,9 @@ file as tasks land.
       results. Deferred with the general expression parser: boolean/comparison
       conditions and conditional destructuring.
 - [ ] `for` / `match`.
+  - [x] First `for` slice over string lists and expanded word expressions, with
+        brace-delimited multiline bodies and current-scope bindings.
+  - [ ] Map/range iteration, destructured binders, `break`, and `continue`.
 
 ## Decisions made
 
