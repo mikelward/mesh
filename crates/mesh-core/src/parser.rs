@@ -60,6 +60,7 @@ pub struct HeredocBody {
 pub enum TokenKind {
     Word(Word),
     HeredocBody(HeredocBody),
+    CaptureStart,
     Newline,
     Semi,
     Amp,
@@ -97,6 +98,8 @@ pub enum ParseErrorKind {
     Unterminated(char),
     ChainedComparison,
     Expected(&'static str),
+    UnknownEscape(char),
+    BadUnicodeEscape,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +118,10 @@ impl std::fmt::Display for ParseError {
                 write!(f, "syntax error: comparisons cannot be chained")
             }
             ParseErrorKind::Expected(expected) => write!(f, "syntax error: expected {expected}"),
+            ParseErrorKind::UnknownEscape(c) => write!(f, "syntax error: invalid escape \\{c}"),
+            ParseErrorKind::BadUnicodeEscape => {
+                write!(f, "syntax error: invalid \\u{{…}} escape")
+            }
         }
     }
 }
@@ -277,6 +284,17 @@ pub enum Expr {
     },
     Group(Box<Expr>),
     BackgroundJob(Pipeline),
+    Capture(Source),
+    If(Box<IfExpr>),
+    For {
+        binding: String,
+        iterable: Box<Expr>,
+        body: Source,
+    },
+    Lambda {
+        parameters: Vec<String>,
+        body: Source,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,12 +475,42 @@ impl<'a> Lexer<'a> {
                             break;
                         }
                         if inner == '\\' && !raw {
+                            let escape_start = self.position;
                             self.position += 1;
                             let Some(escaped) = self.char_at(self.position) else {
                                 break;
                             };
+                            let decoded = match escaped {
+                                'n' => '\n',
+                                't' => '\t',
+                                'r' => '\r',
+                                'e' => '\u{1b}',
+                                '\\' => '\\',
+                                '\'' if quote == '\'' => '\'',
+                                '"' if quote == '"' => '"',
+                                '$' if quote == '"' => '$',
+                                'u' => {
+                                    let (value, end) = decode_unicode_escape(
+                                        self.source,
+                                        self.position + escaped.len_utf8(),
+                                    )
+                                    .ok_or_else(|| ParseError {
+                                        kind: ParseErrorKind::BadUnicodeEscape,
+                                        span: escape_start..self.position + 1,
+                                    })?;
+                                    self.position = end;
+                                    push_text(&mut pieces, &value.to_string(), mode);
+                                    continue;
+                                }
+                                other => {
+                                    return Err(ParseError {
+                                        kind: ParseErrorKind::UnknownEscape(other),
+                                        span: escape_start..self.position + other.len_utf8(),
+                                    });
+                                }
+                            };
                             self.position += escaped.len_utf8();
-                            push_text(&mut pieces, &escaped.to_string(), QuoteMode::Escaped);
+                            push_text(&mut pieces, &decoded.to_string(), mode);
                         } else if inner == '$' && mode == QuoteMode::Double {
                             let end = variable_end(self.source, self.position);
                             push_variable(
@@ -596,6 +644,7 @@ impl<'a> Lexer<'a> {
     fn punctuation(&self) -> Option<(&'static str, TokenKind)> {
         let rest = &self.source[self.position..];
         let choices = [
+            ("$(", TokenKind::CaptureStart),
             ("...", TokenKind::Spread),
             ("..=", TokenKind::RangeInclusive),
             ("|&", TokenKind::PipeBoth),
@@ -689,14 +738,32 @@ fn variable_end(source: &str, start: usize) -> usize {
         return braced.find('}').map_or(start + 1, |end| start + 3 + end);
     }
     let mut end = start + 1;
-    for c in source[end..].chars() {
+    let mut chars = source[end..].char_indices().peekable();
+    while let Some((offset, c)) = chars.next() {
         if c == '_' || c.is_alphanumeric() {
-            end += c.len_utf8();
+            end = start + 1 + offset + c.len_utf8();
+        } else if c == '-'
+            && chars
+                .peek()
+                .is_some_and(|(_, next)| *next == '_' || next.is_alphanumeric())
+        {
+            end = start + 1 + offset + 1;
         } else {
             break;
         }
     }
     end
+}
+
+fn decode_unicode_escape(source: &str, start: usize) -> Option<(char, usize)> {
+    let rest = source.get(start..)?;
+    let hex = rest.strip_prefix('{')?;
+    let close = hex.find('}')?;
+    if close == 0 || close > 6 || !hex[..close].chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = u32::from_str_radix(&hex[..close], 16).ok()?;
+    Some((char::from_u32(value)?, start + close + 2))
 }
 
 fn word_is_quoted(word: &Word) -> bool {
@@ -716,8 +783,6 @@ fn token_word_pieces(kind: &TokenKind) -> Option<Vec<WordPiece>> {
         TokenKind::Colon => ":",
         TokenKind::LBracket => "[",
         TokenKind::RBracket => "]",
-        TokenKind::LParen => "(",
-        TokenKind::RParen => ")",
         TokenKind::Comma => ",",
         TokenKind::Spread => "...",
         TokenKind::Range => "..",
@@ -801,7 +866,12 @@ impl Parser {
     }
 
     fn executable(&mut self) -> Result<Executable, ParseError> {
-        if self.word("func") {
+        if self.word("func")
+            && !self
+                .tokens
+                .get(self.position + 1)
+                .is_some_and(|token| matches!(token.value, TokenKind::LParen))
+        {
             return self.function();
         }
         if self.word("if") {
@@ -965,8 +1035,20 @@ impl Parser {
     fn function(&mut self) -> Result<Executable, ParseError> {
         self.take_word("func");
         let name = self.name()?;
+        let parameters = self.parameters()?;
+        self.newlines();
+        let body = self.block()?;
+        Ok(Executable::Function {
+            name,
+            parameters,
+            body,
+        })
+    }
+
+    fn parameters(&mut self) -> Result<Vec<String>, ParseError> {
         self.expect(&TokenKind::LParen, "`(`")?;
         let mut parameters = Vec::new();
+        self.newlines();
         while !self.same(&TokenKind::RParen) {
             parameters.push(self.name()?);
             if self.eat(&TokenKind::Comma).is_none()
@@ -975,15 +1057,10 @@ impl Parser {
             {
                 return Err(self.eof(ParseErrorKind::Unterminated('(')));
             }
+            self.newlines();
         }
         self.position += 1;
-        self.newlines();
-        let body = self.block()?;
-        Ok(Executable::Function {
-            name,
-            parameters,
-            body,
-        })
+        Ok(parameters)
     }
 
     fn if_expr(&mut self) -> Result<IfExpr, ParseError> {
@@ -1051,7 +1128,43 @@ impl Parser {
     }
 
     fn expression(&mut self) -> Result<Expr, ParseError> {
-        self.binary(1)
+        self.or_expression()
+    }
+
+    fn or_expression(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.and_expression()?;
+        while self.take_word("or") {
+            self.newlines();
+            left = Expr::Binary {
+                left: Box::new(left),
+                op: BinaryOp::Or,
+                right: Box::new(self.and_expression()?),
+            };
+        }
+        Ok(left)
+    }
+
+    fn and_expression(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.not_expression()?;
+        while self.take_word("and") {
+            self.newlines();
+            left = Expr::Binary {
+                left: Box::new(left),
+                op: BinaryOp::And,
+                right: Box::new(self.not_expression()?),
+            };
+        }
+        Ok(left)
+    }
+
+    fn not_expression(&mut self) -> Result<Expr, ParseError> {
+        if self.take_word("not") {
+            return Ok(Expr::Unary {
+                op: UnaryOp::Not,
+                expression: Box::new(self.not_expression()?),
+            });
+        }
+        self.binary(4)
     }
 
     fn condition(&mut self) -> Result<Executable, ParseError> {
@@ -1125,12 +1238,6 @@ impl Parser {
     }
 
     fn prefix(&mut self) -> Result<Expr, ParseError> {
-        if self.take_word("not") {
-            return Ok(Expr::Unary {
-                op: UnaryOp::Not,
-                expression: Box::new(self.prefix()?),
-            });
-        }
         if self.operator("-") {
             self.position += 1;
             return Ok(Expr::Unary {
@@ -1193,6 +1300,40 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr, ParseError> {
+        if self.eat(&TokenKind::CaptureStart).is_some() {
+            self.newlines();
+            return Ok(Expr::Capture(self.source(Some(TokenKind::RParen))?));
+        }
+        if self.word("if") {
+            return Ok(Expr::If(Box::new(self.if_expr()?)));
+        }
+        if self.word("for") {
+            self.take_word("for");
+            let binding = self.name()?;
+            if !self.take_word("in") {
+                return Err(self.error(ParseErrorKind::Expected("`in`")));
+            }
+            let iterable = self.expression()?;
+            self.newlines();
+            let body = self.block()?;
+            return Ok(Expr::For {
+                binding,
+                iterable: Box::new(iterable),
+                body,
+            });
+        }
+        if self.word("func")
+            && self
+                .tokens
+                .get(self.position + 1)
+                .is_some_and(|token| matches!(token.value, TokenKind::LParen))
+        {
+            self.take_word("func");
+            let parameters = self.parameters()?;
+            self.newlines();
+            let body = self.block()?;
+            return Ok(Expr::Lambda { parameters, body });
+        }
         if self.eat(&TokenKind::LParen).is_some() {
             self.newlines();
             let value = self.expression()?;
@@ -1410,6 +1551,7 @@ impl Parser {
                         | TokenKind::Pipe
                         | TokenKind::PipeBoth
                         | TokenKind::LBrace
+                        | TokenKind::RParen
                         | TokenKind::RBrace
                 )
             )
@@ -1430,7 +1572,8 @@ impl Parser {
     fn value_start(&self) -> bool {
         match self.peek().map(|token| &token.value) {
             Some(
-                TokenKind::LParen
+                TokenKind::CaptureStart
+                | TokenKind::LParen
                 | TokenKind::LBracket
                 | TokenKind::Range
                 | TokenKind::RangeInclusive,
@@ -1571,31 +1714,114 @@ impl Parser {
 
 fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
-    chars.next().is_some_and(|c| c == '_' || c.is_alphabetic())
-        && chars.all(|c| c == '_' || c.is_alphanumeric())
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_alphabetic() {
+        return false;
+    }
+    let mut previous_hyphen = false;
+    for c in chars {
+        if c == '-' {
+            if previous_hyphen {
+                return false;
+            }
+            previous_hyphen = true;
+        } else if c == '_' || c.is_alphanumeric() {
+            previous_hyphen = false;
+        } else {
+            return false;
+        }
+    }
+    !previous_hyphen
 }
 
 fn modifier_name(name: &str) -> bool {
-    matches!(
-        name,
-        "dir"
-            | "base"
-            | "ext"
-            | "exts"
-            | "stem"
-            | "bare"
-            | "len"
-            | "first"
-            | "last"
-            | "rest"
-            | "init"
-            | "dedup"
-            | "upper"
-            | "lower"
-            | "get"
-            | "raw"
-    )
+    MODIFIER_NAMES.contains(&name)
 }
+
+const MODIFIER_NAMES: &[&str] = &[
+    "add",
+    "ancestors",
+    "atime",
+    "bare",
+    "base",
+    "capture",
+    "captures",
+    "ctime",
+    "d",
+    "dedup",
+    "dir",
+    "dirs",
+    "dotall",
+    "each",
+    "epoch",
+    "exec",
+    "exists",
+    "ext",
+    "extended",
+    "exts",
+    "f",
+    "files",
+    "filter",
+    "first",
+    "format",
+    "get",
+    "groups",
+    "h",
+    "has",
+    "i",
+    "ignorecase",
+    "init",
+    "int",
+    "iso",
+    "join",
+    "keys",
+    "l",
+    "last",
+    "len",
+    "lines",
+    "links",
+    "lower",
+    "m",
+    "map",
+    "match",
+    "matches",
+    "mod",
+    "ms",
+    "mtime",
+    "multiline",
+    "nulls",
+    "num",
+    "old",
+    "parents",
+    "quotemeta",
+    "raw",
+    "real",
+    "remove",
+    "replace",
+    "replaceall",
+    "replaceend",
+    "replacestart",
+    "rest",
+    "s",
+    "same",
+    "secs",
+    "sort",
+    "split",
+    "stem",
+    "stripend",
+    "stripstart",
+    "tabs",
+    "trimend",
+    "trimstart",
+    "tty",
+    "type",
+    "upper",
+    "values",
+    "words",
+    "x",
+];
 
 #[cfg(test)]
 mod tests {
@@ -1842,5 +2068,117 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["$a", "$b"]);
+    }
+
+    #[test]
+    fn decodes_quoted_escapes_and_rejects_unknown_ones() {
+        let tokens = tokenize(r#""a\nb\u{21}""#).unwrap();
+        let TokenKind::Word(word) = &tokens[0].value else {
+            panic!()
+        };
+        assert_eq!(word.text(), "a\nb!");
+        assert!(matches!(
+            tokenize(r"'\d'"),
+            Err(ParseError {
+                kind: ParseErrorKind::UnknownEscape('d'),
+                ..
+            })
+        ));
+
+        let bare = tokenize(r"a\nb").unwrap();
+        let TokenKind::Word(word) = &bare[0].value else {
+            panic!()
+        };
+        assert_eq!(word.text(), "anb");
+    }
+
+    #[test]
+    fn accepts_kebab_case_names_and_variables() {
+        let tree = complete("last-cmd-time = $last-cmd-time\nfunc auto-fetch() { return }");
+        let Executable::Assignment { name, value, .. } = &tree.statements[0].and_or.first else {
+            panic!()
+        };
+        assert_eq!(name, "last-cmd-time");
+        assert!(matches!(value, Expr::Variable(variable) if variable.value == "$last-cmd-time"));
+        assert!(matches!(
+            &tree.statements[1].and_or.first,
+            Executable::Function { name, .. } if name == "auto-fetch"
+        ));
+    }
+
+    #[test]
+    fn parses_command_substitution_as_a_capture() {
+        let tree = complete("x = $(echo hi):lines");
+        let Executable::Assignment { value, .. } = &tree.statements[0].and_or.first else {
+            panic!()
+        };
+        let Expr::Modifier { value, name, .. } = value else {
+            panic!()
+        };
+        assert_eq!(name, "lines");
+        assert!(matches!(value.as_ref(), Expr::Capture(source) if source.statements.len() == 1));
+    }
+
+    #[test]
+    fn parses_compound_expressions_in_value_position() {
+        let tree = complete(
+            "greeting = if $french { bonjour } else { hi }\nmapper = func(x) { $x }\nitems = for x in $xs { $x }",
+        );
+        assert!(matches!(
+            &tree.statements[0].and_or.first,
+            Executable::Assignment {
+                value: Expr::If(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &tree.statements[1].and_or.first,
+            Executable::Assignment {
+                value: Expr::Lambda { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &tree.statements[2].and_or.first,
+            Executable::Assignment {
+                value: Expr::For { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn not_wraps_the_complete_comparison() {
+        let tree = complete("x = not $a == b");
+        let Executable::Assignment {
+            value:
+                Expr::Unary {
+                    op: UnaryOp::Not,
+                    expression,
+                },
+            ..
+        } = &tree.statements[0].and_or.first
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            expression.as_ref(),
+            Expr::Binary {
+                op: BinaryOp::Equal,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn recognizes_the_documented_modifier_vocabulary() {
+        for modifier in MODIFIER_NAMES {
+            let source = format!("x = $value:{modifier}");
+            let tree = complete(&source);
+            assert!(matches!(
+                &tree.statements[0].and_or.first,
+                Executable::Assignment { value: Expr::Modifier { name, .. }, .. } if name == modifier
+            ));
+        }
     }
 }
