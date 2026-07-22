@@ -2458,6 +2458,50 @@ fn loops_and_match_arms_share_list_pattern_binding() {
 }
 
 #[test]
+fn match_uses_ordered_literal_glob_regex_range_and_alternative_arms() {
+    let out = run_with_input(
+        "kind = match README.md {\n\
+           *.txt { text }\n\
+           *.md | *.markdown { markdown }\n\
+           _ { other }\n\
+         }\n\
+         number = match 7 { 1..=9 { digit } _ { other } }\n\
+         exact = match 42 { 42 { integer } _ { wrong } }\n\
+         regex = match README.md { /^README/ { readme } _ { wrong } }\n\
+         first = match file.txt { * { broad } *.txt { narrow } }\n\
+         puts $kind $number $exact $regex $first\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "markdown digit integer readme broad\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn match_statement_runs_for_effect_and_guards_continue_to_later_arms() {
+    let out = run_with_input(
+        "match [skip payload] {\n\
+           [verb value] if $verb == take { puts wrong }\n\
+           [verb value] if $value == payload { puts $verb $value }\n\
+           _ { puts wrong }\n\
+         }\n\
+         empty = match absent { present { wrong } }\n\
+         puts \"<$empty>\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "skip payload\n<>\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn tilde_matches_regexes_and_globs() {
     let out = run_with_input(
         "digits = item42 ~ /\\d+$/\n\

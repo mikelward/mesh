@@ -291,6 +291,7 @@ pub enum MatchPattern {
     Binding(BindingPattern),
     Wildcard,
     Value(Expr),
+    Alternation(Vec<MatchPattern>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1135,6 +1136,14 @@ fn match_operand(expression: Expr) -> Expr {
     }
 }
 
+fn match_pattern_operand(expression: Expr) -> Expr {
+    let original = expression.clone();
+    match match_operand(expression) {
+        Expr::Glob(pattern) if !pattern.contains(['*', '?', '[', ']', '{', '}']) => original,
+        pattern => pattern,
+    }
+}
+
 fn token_word_pieces(kind: &TokenKind) -> Option<Vec<WordPiece>> {
     if let TokenKind::Word(word) = kind {
         return Some(word.pieces.clone());
@@ -1532,13 +1541,15 @@ impl Parser {
         self.newlines();
         let mut arms = Vec::new();
         while !self.same(&TokenKind::RBrace) {
-            let pattern = if self.same(&TokenKind::LBracket) {
-                MatchPattern::Binding(self.binding_pattern()?)
-            } else if self.word("_") {
-                self.position += 1;
-                MatchPattern::Wildcard
+            let mut patterns = vec![self.match_pattern()?];
+            while self.eat(&TokenKind::Pipe).is_some() {
+                self.newlines();
+                patterns.push(self.match_pattern()?);
+            }
+            let pattern = if patterns.len() == 1 {
+                patterns.pop().unwrap()
             } else {
-                MatchPattern::Value(self.expression()?)
+                MatchPattern::Alternation(patterns)
             };
             let guard = if self.take_word("if") {
                 Some(self.expression()?)
@@ -1559,6 +1570,22 @@ impl Parser {
         }
         self.position += 1;
         Ok(MatchExpr { value, arms })
+    }
+
+    fn match_pattern(&mut self) -> Result<MatchPattern, ParseError> {
+        if self.same(&TokenKind::LBracket) {
+            Ok(MatchPattern::Binding(self.binding_pattern()?))
+        } else if self.word("_") {
+            self.position += 1;
+            Ok(MatchPattern::Wildcard)
+        } else if self.operator("*") {
+            self.position += 1;
+            Ok(MatchPattern::Value(Expr::Glob("*".into())))
+        } else {
+            Ok(MatchPattern::Value(match_pattern_operand(
+                self.expression()?,
+            )))
+        }
     }
 
     fn for_bindings(&mut self) -> Result<Vec<BindingPattern>, ParseError> {
