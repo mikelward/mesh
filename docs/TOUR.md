@@ -40,10 +40,14 @@ mesh$ <strong>pwd</strong>
 </pre>
 
 After the command, Tab completes files and directories in the current or named
-directory. Directory suggestions end in `/`, so you can keep completing the
-next path component:
+directory. Matching is fuzzy and uses smart case: an all-lowercase query ignores
+case, while any uppercase letter makes the whole query case-sensitive. Directory
+entries matching the query's case rank ahead of case-folded matches. Directory
+suggestions end in `/`, so you can keep completing the next path component:
 
 <pre>
+mesh$ <strong>cd pic&lt;Tab&gt;</strong>
+mesh$ <strong>cd Pictures/</strong>
 mesh$ <strong>puts docs/TO&lt;Tab&gt;</strong>
 mesh$ <strong>puts docs/TOUR.md</strong>
 </pre>
@@ -64,9 +68,8 @@ true
 For external commands, mesh lazily reads bounded `--help` output to complete
 subcommands and flags, then caches the resulting completion spec by executable
 path and modification time. Files and directories remain available as the
-fallback. Completion currently matches prefixes exactly and case-sensitively;
-typed argument values, fuzzy matching, and case-insensitive matching are later
-work.
+fallback. Help-derived file, directory, and enumerated argument types narrow
+suggestions to values that fit.
 
 ## Printing with `puts`
 

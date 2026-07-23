@@ -6,7 +6,7 @@
 //! follow its command line and the integration tests need no terminal.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::mem::ManuallyDrop;
@@ -27,7 +27,7 @@ use reedline::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::builtins::{self, Builtin};
-use crate::completion::{CompletionCache, CompletionSpec, ValueHint};
+use crate::completion::{CompletionCache, CompletionSpec, ValueHint, rank_candidates};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
 use crate::vars::{RegexValue, Value, Vars};
@@ -2436,12 +2436,7 @@ impl Completer for MeshCompleter {
         let values = if word.starts_with('$') {
             variable_completions(word, &state.variables)
         } else if command_position(&line[..start]) {
-            state
-                .commands
-                .iter()
-                .filter(|name| name.starts_with(word))
-                .cloned()
-                .collect()
+            rank_candidates(state.commands.clone(), word)
         } else if let Some(words) = command_segment_words(line) {
             argument_completions(&state, &words, word)
         } else {
@@ -2498,9 +2493,8 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
     let exact_subcommand = parent_values.iter().any(|value| value == word);
     parent_values.retain(|value| value != word);
     if !parent_values.is_empty() {
-        parent_values.extend(paths);
-        parent_values.sort();
-        parent_values.dedup();
+        let mut seen: HashSet<_> = parent_values.iter().cloned().collect();
+        parent_values.extend(paths.into_iter().filter(|path| seen.insert(path.clone())));
         return parent_values;
     }
     if !paths.is_empty() {
@@ -2531,11 +2525,7 @@ fn value_completions(hint: &ValueHint, prefix: &str) -> Vec<String> {
     match hint {
         ValueHint::File => path_completions_with(prefix, false),
         ValueHint::Directory => path_completions_with(prefix, true),
-        ValueHint::Enum(values) => values
-            .iter()
-            .filter(|value| value.starts_with(prefix))
-            .cloned()
-            .collect(),
+        ValueHint::Enum(values) => rank_candidates(values.clone(), prefix),
     }
 }
 
@@ -2598,43 +2588,62 @@ fn variable_completions(word: &str, variables: &[(String, Value)]) -> Vec<String
     let root = parts.next().unwrap_or_default();
     let tail: Vec<_> = parts.collect();
     if tail.is_empty() {
-        return variables
-            .iter()
-            .filter(|(name, _)| name.starts_with(root))
-            .map(|(name, _)| format!("${name}"))
-            .collect();
+        return rank_candidates(
+            variables
+                .iter()
+                .map(|(name, _)| format!("${name}"))
+                .collect(),
+            word,
+        );
     }
-    let Some((_, root_value)) = variables.iter().find(|(name, _)| name == root) else {
+    let Some((root_name, root_value)) =
+        variables.iter().find(|(name, _)| name == root).or_else(|| {
+            smart_case_fallback(root)
+                .then(|| {
+                    variables
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(root))
+                })
+                .flatten()
+        })
+    else {
         return Vec::new();
     };
+    let mut resolved = root_name.clone();
     let mut value = root_value;
     for key in &tail[..tail.len() - 1] {
         let Value::Map(entries) = value else {
             return Vec::new();
         };
-        let Some((_, next)) = entries.iter().find(|(name, _)| name == key) else {
+        let Some((name, next)) = entries.iter().find(|(name, _)| name == key).or_else(|| {
+            smart_case_fallback(key)
+                .then(|| {
+                    entries
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+                })
+                .flatten()
+        }) else {
             return Vec::new();
         };
+        resolved.push('.');
+        resolved.push_str(name);
         value = next;
     }
-    let prefix = tail.last().unwrap();
     let Value::Map(entries) = value else {
         return Vec::new();
     };
-    entries
-        .iter()
-        .filter(|(key, _)| key.starts_with(prefix))
-        .map(|(key, _)| {
-            format!(
-                "${root}.{}{}",
-                tail[..tail.len() - 1]
-                    .iter()
-                    .map(|p| format!("{p}."))
-                    .collect::<String>(),
-                key
-            )
-        })
-        .collect()
+    rank_candidates(
+        entries
+            .iter()
+            .map(|(key, _)| format!("${resolved}.{key}"))
+            .collect(),
+        word,
+    )
+}
+
+fn smart_case_fallback(query: &str) -> bool {
+    !query.chars().any(char::is_uppercase)
 }
 
 fn path_completions(word: &str) -> Vec<String> {
@@ -2683,16 +2692,25 @@ fn path_completions_sync(word: &str, directories_only: bool) -> Vec<String> {
                 return None;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            name.starts_with(prefix.as_ref()).then(|| {
+            Some((
+                name.clone(),
                 format!(
                     "{display_dir}{name}{}",
                     if entry.path().is_dir() { "/" } else { "" }
-                )
-            })
+                ),
+            ))
         })
         .collect();
-    out.sort();
-    out
+    out.sort_by(|left, right| left.0.cmp(&right.0));
+    let ranked_names = rank_candidates(
+        out.iter().map(|(name, _)| name.clone()).collect(),
+        prefix.as_ref(),
+    );
+    let mut by_name: std::collections::HashMap<_, _> = out.into_iter().collect();
+    ranked_names
+        .into_iter()
+        .filter_map(|name| by_name.remove(&name))
+        .collect()
 }
 
 /// Let the parent job-control shell stop and later foreground mesh before the
@@ -2941,8 +2959,8 @@ mod tests {
         StartupOptions, Step, TimestampedHistory, argument_completions, command_position,
         command_segment_words, completed_command, eval_binary, expansion_word, handle_signal,
         help_completions, history_path_from, interruptible_task, last_argument, needs_more_input,
-        open_history, persist_logical_history, prepare_history_path, run_line, run_prompt_hooks,
-        run_source, variable_completions,
+        open_history, path_completions_sync, persist_logical_history, prepare_history_path,
+        run_line, run_prompt_hooks, run_source, variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
@@ -3430,6 +3448,45 @@ mod tests {
             variable_completions("$config.user.n", &variables),
             ["$config.user.name"]
         );
+        assert_eq!(variable_completions("$nm", &variables), ["$name"]);
+        assert!(variable_completions("$NM", &variables).is_empty());
+        assert_eq!(
+            variable_completions("$config.user.nm", &variables),
+            ["$config.user.name"]
+        );
+        assert!(variable_completions("$CONFIG.USER.NM", &variables).is_empty());
+    }
+
+    #[test]
+    fn completion_prefers_exact_case_for_variable_and_map_paths() {
+        let variables = vec![
+            (
+                "Config".into(),
+                Value::Map(vec![(
+                    "USER".into(),
+                    Value::Map(vec![("NAME".into(), Value::String("wrong".into()))]),
+                )]),
+            ),
+            (
+                "config".into(),
+                Value::Map(vec![
+                    (
+                        "user".into(),
+                        Value::Map(vec![("nickname".into(), Value::String("lower".into()))]),
+                    ),
+                    (
+                        "USER".into(),
+                        Value::Map(vec![("name".into(), Value::String("upper".into()))]),
+                    ),
+                ]),
+            ),
+        ];
+
+        assert_eq!(
+            variable_completions("$config.USER.n", &variables),
+            ["$config.USER.name"]
+        );
+        assert!(variable_completions("$config.user.N", &variables).is_empty());
     }
 
     #[test]
@@ -3469,6 +3526,25 @@ mod tests {
             argument_completions(&state, &["cargo".into(), "bu".into()], "bu"),
             ["build"]
         );
+        assert_eq!(
+            argument_completions(&state, &["cargo".into(), "bl".into()], "bl"),
+            ["build"]
+        );
+        let state = CompletionState {
+            help: [(
+                "tool".into(),
+                "Commands:\n  commit  record\n  checkout  switch\n\nOptions:\n  --debug  debug\n"
+                    .into(),
+            )]
+            .into(),
+            ..CompletionState::default()
+        };
+        let completions = argument_completions(&state, &["tool".into(), "co".into()], "co");
+        assert_eq!(&completions[..2], ["commit", "checkout"]);
+        assert_eq!(
+            argument_completions(&state, &["tool".into(), "bu".into()], "bu"),
+            Vec::<String>::new()
+        );
         assert!(
             argument_completions(
                 &state,
@@ -3496,6 +3572,30 @@ mod tests {
             argument_completions(&state, &["cat".into(), prefix.clone()], &prefix),
             [format!("{}/", child.display())]
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filesystem_completion_uses_exact_case_then_smart_case() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!("mesh-case-help-{}", std::process::id()));
+        fs::create_dir_all(dir.join("Foo")).unwrap();
+        fs::create_dir_all(dir.join("foo")).unwrap();
+        fs::create_dir_all(dir.join("football")).unwrap();
+
+        let lowercase = format!("{}/foo", dir.display());
+        assert_eq!(
+            path_completions_sync(&lowercase, true),
+            [
+                format!("{}/foo/", dir.display()),
+                format!("{}/football/", dir.display()),
+                format!("{}/Foo/", dir.display())
+            ]
+        );
+        let uppercase = format!("{}/FOO", dir.display());
+        assert!(path_completions_sync(&uppercase, true).is_empty());
+
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3541,6 +3641,23 @@ mod tests {
         assert_eq!(
             argument_completions(&state, &["tool".into(), "--color=a".into()], "--color=a"),
             ["--color=auto", "--color=always"]
+        );
+        assert_eq!(
+            argument_completions(&state, &["tool".into(), "--color=nv".into()], "--color=nv"),
+            ["--color=never"]
+        );
+        assert!(
+            argument_completions(&state, &["tool".into(), "--color=NV".into()], "--color=NV")
+                .is_empty()
+        );
+        let fuzzy_prefix = format!("{}/ft", dir.display());
+        assert_eq!(
+            argument_completions(
+                &state,
+                &["tool".into(), "--file".into(), fuzzy_prefix.clone()],
+                &fuzzy_prefix
+            ),
+            [file.to_string_lossy().into_owned()]
         );
         fs::remove_dir_all(dir).unwrap();
     }

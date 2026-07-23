@@ -1,6 +1,6 @@
 //! Completion specifications generated from command help output.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -11,6 +11,9 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
+
+use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
+use nucleo_matcher::{Config, Matcher};
 
 const CACHE_VERSION: &str = "mesh-completion-v3";
 
@@ -132,11 +135,15 @@ impl CompletionSpec {
     }
 
     pub(crate) fn matching(&self, prefix: &str) -> Vec<String> {
-        self.candidates
+        let candidates = self
+            .candidates
             .iter()
-            .filter(|candidate| candidate.starts_with(prefix))
+            .filter(|candidate| {
+                prefix.is_empty() || prefix.starts_with('-') || !candidate.starts_with('-')
+            })
             .cloned()
-            .collect()
+            .collect();
+        rank_candidates(candidates, prefix)
     }
 
     pub(crate) fn value_hint(&self, option: &str) -> Option<&ValueHint> {
@@ -196,6 +203,49 @@ impl CompletionSpec {
         }
         Some(spec)
     }
+}
+
+pub(crate) fn rank_candidates(candidates: Vec<String>, query: &str) -> Vec<String> {
+    if query.is_empty() {
+        return candidates;
+    }
+    let (mut ranked, remaining): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|candidate| candidate == query);
+    let exact_case = Atom::new(
+        query,
+        CaseMatching::Respect,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+        false,
+    );
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let case_matches = exact_case.match_list(remaining.clone(), &mut matcher);
+    let matched: HashSet<_> = case_matches
+        .iter()
+        .map(|(candidate, _)| candidate.clone())
+        .collect();
+    ranked.extend(case_matches.into_iter().map(|(candidate, _)| candidate));
+
+    let smart_case = Atom::new(
+        query,
+        CaseMatching::Smart,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+        false,
+    );
+    ranked.extend(
+        smart_case
+            .match_list(
+                remaining
+                    .into_iter()
+                    .filter(|candidate| !matched.contains(candidate)),
+                &mut matcher,
+            )
+            .into_iter()
+            .map(|(candidate, _)| candidate),
+    );
+    ranked
 }
 
 fn option_names(tokens: &[&str]) -> Vec<String> {
@@ -538,7 +588,7 @@ fn join_reader(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompletionCache, CompletionSpec, ValueHint, command_help};
+    use super::{CompletionCache, CompletionSpec, ValueHint, command_help, rank_candidates};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -555,7 +605,7 @@ mod tests {
         let spec = CompletionSpec::from_help(
             "Commands:\n  build  compile\n\nOptions:\n  -h, --help  help\n  -o, --output <FILE>  output file\n  --directory <DIR>  working directory\n  --color <WHEN>  color [possible values: auto, always, never]\n  --format=<json|text>  output format\n  --config <KEY=VALUE|PATH>  config override or file\n  --placeholder <LEFT|RIGHT>  metasyntactic union\n",
         );
-        assert_eq!(spec.matching("--h"), ["--help"]);
+        assert_eq!(spec.matching("--h")[0], "--help");
         assert_eq!(spec.matching("b"), ["build"]);
         assert_eq!(spec.value_hint("-o"), Some(&ValueHint::File));
         assert_eq!(spec.value_hint("--output"), Some(&ValueHint::File));
@@ -577,6 +627,36 @@ mod tests {
         assert_eq!(
             CompletionSpec::decode(&spec.encode("test"), "test"),
             Some(spec)
+        );
+    }
+
+    #[test]
+    fn fuzzy_ranking_prefers_exact_then_exact_case_then_folded_case() {
+        assert_eq!(
+            rank_candidates(
+                vec!["Foo".into(), "football".into(), "foo".into(), "FOOD".into()],
+                "foo"
+            ),
+            ["foo", "football", "Foo", "FOOD"]
+        );
+        assert_eq!(
+            rank_candidates(vec!["Pictures".into(), "pictures".into()], "pic"),
+            ["pictures", "Pictures"]
+        );
+    }
+
+    #[test]
+    fn uppercase_fuzzy_queries_are_case_sensitive() {
+        assert_eq!(
+            rank_candidates(vec!["USER".into(), "User".into(), "user".into()], "USER"),
+            ["USER"]
+        );
+        assert_eq!(
+            rank_candidates(
+                vec!["checkout".into(), "cherry-pick".into(), "check".into()],
+                "CP"
+            ),
+            Vec::<String>::new()
         );
     }
 
@@ -660,7 +740,7 @@ mod tests {
         );
         // The unbracketed list is confined to its line: the following option
         // stays a candidate instead of being consumed into the enum.
-        assert_eq!(spec.matching("--o"), ["--output"]);
+        assert_eq!(spec.matching("--o")[0], "--output");
         assert_eq!(spec.value_hint("--output"), Some(&ValueHint::File));
     }
 
