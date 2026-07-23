@@ -2129,15 +2129,16 @@ impl ArgumentRecall {
         else {
             return;
         };
-        let mut pending = String::new();
-        let mut previous_session = None;
-        let mut has_previous_session = false;
+        let mut pending_by_session: Vec<(Option<HistorySessionId>, String)> = Vec::new();
         for entry in entries.into_iter().rev() {
-            if has_previous_session && previous_session != entry.session_id {
-                pending.clear();
-            }
-            previous_session = entry.session_id;
-            has_previous_session = true;
+            let index = pending_by_session
+                .iter()
+                .position(|(session, _)| *session == entry.session_id)
+                .unwrap_or_else(|| {
+                    pending_by_session.push((entry.session_id, String::new()));
+                    pending_by_session.len() - 1
+                });
+            let pending = &mut pending_by_session[index].1;
             pending.push_str(&entry.command_line);
             pending.push('\n');
             if !needs_more_input(&pending) {
@@ -3111,6 +3112,47 @@ mod tests {
 
         assert_eq!(recall.arguments, ["public"]);
 
+        drop(current);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn history_recall_reassembles_interleaved_sessions_independently() {
+        let path = temporary_history_path("history.sqlite3");
+        prepare_history_path(&path).unwrap();
+        let first_session = Reedline::create_history_session_id();
+        let second_session = Reedline::create_history_session_id();
+        let mut saved = TimestampedHistory(
+            SqliteBackedHistory::with_file(
+                path.clone(),
+                first_session,
+                Some(SystemTime::now().into()),
+            )
+            .unwrap(),
+        );
+        for (session, line) in [
+            (first_session, "func f() {"),
+            (second_session, "puts public"),
+            (first_session, "puts secret"),
+            (first_session, "}"),
+        ] {
+            let mut item = HistoryItem::from_command_line(line);
+            item.session_id = session;
+            saved.save(item).unwrap();
+        }
+        drop(saved);
+
+        let current_session = Reedline::create_history_session_id();
+        let current = SqliteBackedHistory::with_file(
+            path.clone(),
+            current_session,
+            Some(SystemTime::now().into()),
+        )
+        .unwrap();
+        let mut recall = ArgumentRecall::default();
+        recall.load(&current, current_session);
+
+        assert_eq!(recall.arguments, ["public"]);
         drop(current);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
