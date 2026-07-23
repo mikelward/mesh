@@ -7,8 +7,9 @@
 
 use std::io::Write;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 
 fn run_with_input(input: &str) -> Output {
     run_with_bytes(input.as_bytes())
@@ -23,9 +24,17 @@ fn fresh_dir(tag: &str) -> PathBuf {
     dir
 }
 
+fn mesh_command() -> Command {
+    static CONFIG_HOME: OnceLock<PathBuf> = OnceLock::new();
+    let config_home = CONFIG_HOME.get_or_init(|| fresh_dir("default_config"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mesh"));
+    command.env("XDG_CONFIG_HOME", config_home);
+    command
+}
+
 /// Run mesh with `HOME` set to `home` (for tilde tests).
-fn run_with_home(input: &str, home: &std::path::Path) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+fn run_with_home(input: &str, home: &Path) -> Output {
+    let mut child = mesh_command()
         .env("HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -41,8 +50,8 @@ fn run_with_home(input: &str, home: &std::path::Path) -> Output {
     child.wait_with_output().expect("wait for mesh")
 }
 
-fn run_with_config(input: &str, config_home: &std::path::Path, args: &[&str]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+fn run_with_config(input: &str, config_home: &Path, args: &[&str]) -> Output {
+    let mut child = mesh_command()
         .args(args)
         .env("XDG_CONFIG_HOME", config_home)
         .stdin(Stdio::piped())
@@ -106,7 +115,7 @@ fn non_interactive_shell_does_not_source_rc_config() {
 }
 
 fn run_with_bytes(input: &[u8]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+    let mut child = mesh_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -176,7 +185,7 @@ fn non_interactive_command_stays_in_mesh_process_group() {
 
 #[test]
 fn non_interactive_child_preserves_an_ignored_sigint() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"));
+    let mut child = mesh_command();
     child
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -528,7 +537,7 @@ fn tilde_preserves_home_bytes_including_trailing_slash() {
     let home = fresh_dir("tilde_slash");
     let mut home_with_slash = home.clone().into_os_string();
     home_with_slash.push("/");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+    let mut child = mesh_command()
         .env("HOME", &home_with_slash)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -944,7 +953,7 @@ fn stdout_write_error_does_not_crash_the_shell() {
         .write(true)
         .open("/dev/full")
         .expect("open /dev/full");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+    let mut child = mesh_command()
         .stdin(Stdio::piped())
         .stdout(dev_full)
         .stderr(Stdio::piped())
@@ -1593,7 +1602,7 @@ fn a_fifo_redirect_in_a_pipeline_does_not_deadlock() {
         let _ = std::fs::remove_dir_all(&dir);
         return; // mkfifo unavailable — skip
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+    let mut child = mesh_command()
         .current_dir(&dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1648,7 +1657,7 @@ fn a_background_fifo_redirect_does_not_block_the_shell() {
 fn a_background_redirect_does_not_require_sh_on_path() {
     let dir = fresh_dir("background_redirect_path");
     let output = dir.join("out");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+    let mut child = mesh_command()
         .env("PATH", "/definitely-missing")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
