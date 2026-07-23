@@ -2129,8 +2129,21 @@ impl ArgumentRecall {
         else {
             return;
         };
+        let mut pending = String::new();
+        let mut previous_session = None;
+        let mut has_previous_session = false;
         for entry in entries.into_iter().rev() {
-            self.remember(&entry.command_line);
+            if has_previous_session && previous_session != entry.session_id {
+                pending.clear();
+            }
+            previous_session = entry.session_id;
+            has_previous_session = true;
+            pending.push_str(&entry.command_line);
+            pending.push('\n');
+            if !needs_more_input(&pending) {
+                self.remember(pending.trim_end_matches('\n'));
+                pending.clear();
+            }
         }
     }
 
@@ -3010,6 +3023,43 @@ mod tests {
 
         drop(current);
         drop(peer);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn history_recall_reassembles_persisted_multiline_commands() {
+        let path = temporary_history_path("history.sqlite3");
+        prepare_history_path(&path).unwrap();
+        let saved_session = Reedline::create_history_session_id();
+        let mut saved = TimestampedHistory(
+            SqliteBackedHistory::with_file(
+                path.clone(),
+                saved_session,
+                Some(SystemTime::now().into()),
+            )
+            .unwrap(),
+        );
+        for line in ["puts public", "func f() {", "puts secret", "}"] {
+            let mut item = HistoryItem::from_command_line(line);
+            item.session_id = saved_session;
+            saved.save(item).unwrap();
+        }
+        drop(saved);
+
+        std::thread::sleep(Duration::from_millis(2));
+        let current_session = Reedline::create_history_session_id();
+        let current = SqliteBackedHistory::with_file(
+            path.clone(),
+            current_session,
+            Some(SystemTime::now().into()),
+        )
+        .unwrap();
+        let mut recall = ArgumentRecall::default();
+        recall.load(&current, current_session);
+
+        assert_eq!(recall.arguments, ["public"]);
+
+        drop(current);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
