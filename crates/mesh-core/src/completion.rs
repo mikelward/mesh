@@ -27,21 +27,54 @@ pub(crate) struct CompletionSpec {
     values: HashMap<String, ValueHint>,
 }
 
+#[derive(Debug)]
+enum PendingValues {
+    Described {
+        options: Vec<String>,
+        values: Vec<String>,
+    },
+    Wrapped {
+        options: Vec<String>,
+        values: Vec<String>,
+    },
+}
+
 impl CompletionSpec {
     pub(crate) fn from_help(help: &str) -> Self {
         let mut candidates = Vec::new();
         let mut values = HashMap::new();
         let mut commands = false;
         let mut current_options = Vec::new();
-        let mut multiline_values: Option<(Vec<String>, Vec<String>)> = None;
+        let mut pending_values = None;
         for line in help.lines() {
             let trimmed = line.trim();
-            if let Some((_, enum_values)) = &mut multiline_values {
-                if let Some(value) = multiline_enum_value(trimmed) {
-                    enum_values.push(value);
-                    continue;
+            let tokens: Vec<_> = trimmed.split_whitespace().collect();
+            let options = option_names(&tokens);
+            if let Some(pending) = &mut pending_values {
+                match pending {
+                    PendingValues::Described { .. } if trimmed.is_empty() => continue,
+                    PendingValues::Described {
+                        values: enum_values,
+                        ..
+                    } => {
+                        if let Some(value) = described_enum_value(trimmed) {
+                            enum_values.push(value);
+                            continue;
+                        }
+                        finish_pending_values(&mut values, pending_values.take());
+                    }
+                    PendingValues::Wrapped {
+                        values: enum_values,
+                        ..
+                    } => {
+                        let (more, complete) = wrapped_enum_values(trimmed);
+                        enum_values.extend(more);
+                        if complete {
+                            finish_pending_values(&mut values, pending_values.take());
+                        }
+                        continue;
+                    }
                 }
-                finish_multiline_values(&mut values, multiline_values.take());
             }
             let heading = trimmed.trim_end_matches(':').to_ascii_lowercase();
             if matches!(
@@ -54,26 +87,31 @@ impl CompletionSpec {
             if trimmed.ends_with(':') || trimmed.is_empty() {
                 commands = false;
             }
-            let tokens: Vec<_> = trimmed.split_whitespace().collect();
-            let mut options = Vec::new();
-            for token in &tokens {
-                let option = token.trim_end_matches([',', ';']);
-                if option.starts_with('-') && option.len() > 1 {
-                    let name = option.split(['=', '[', '<']).next().unwrap_or(option);
-                    candidates.push(name.to_owned());
-                    options.push(name.to_owned());
-                }
-            }
+            candidates.extend(options.iter().cloned());
             if !options.is_empty() {
                 current_options.clone_from(&options);
             }
-            if let Some(hint) = value_hint(trimmed, &tokens) {
+            if let Some((enum_values, complete)) = inline_possible_values(trimmed) {
+                if complete {
+                    for option in &options {
+                        values.insert(option.clone(), ValueHint::Enum(enum_values.clone()));
+                    }
+                } else if !options.is_empty() {
+                    pending_values = Some(PendingValues::Wrapped {
+                        options: options.clone(),
+                        values: enum_values,
+                    });
+                }
+            } else if let Some(hint) = value_hint(&tokens) {
                 for option in &options {
                     values.insert(option.clone(), hint.clone());
                 }
             }
             if starts_multiline_values(trimmed) && !current_options.is_empty() {
-                multiline_values = Some((current_options.clone(), Vec::new()));
+                pending_values = Some(PendingValues::Described {
+                    options: current_options.clone(),
+                    values: Vec::new(),
+                });
             }
             if options.is_empty() && trimmed.is_empty() {
                 current_options.clear();
@@ -87,7 +125,7 @@ impl CompletionSpec {
                 candidates.push(command.to_owned());
             }
         }
-        finish_multiline_values(&mut values, multiline_values);
+        finish_pending_values(&mut values, pending_values);
         candidates.sort();
         candidates.dedup();
         Self { candidates, values }
@@ -160,10 +198,23 @@ impl CompletionSpec {
     }
 }
 
-fn value_hint(line: &str, tokens: &[&str]) -> Option<ValueHint> {
-    if let Some(hint) = inline_possible_values(line) {
-        return Some(hint);
-    }
+fn option_names(tokens: &[&str]) -> Vec<String> {
+    tokens
+        .iter()
+        .filter_map(|token| {
+            let option = token.trim_end_matches([',', ';']);
+            (option.starts_with('-') && option.len() > 1).then(|| {
+                option
+                    .split(['=', '[', '<'])
+                    .next()
+                    .unwrap_or(option)
+                    .to_owned()
+            })
+        })
+        .collect()
+}
+
+fn value_hint(tokens: &[&str]) -> Option<ValueHint> {
     let metavar = tokens.iter().find_map(|token| {
         let token = token.trim_end_matches([',', ';']);
         token
@@ -191,23 +242,28 @@ fn value_hint(line: &str, tokens: &[&str]) -> Option<ValueHint> {
     None
 }
 
-fn inline_possible_values(line: &str) -> Option<ValueHint> {
+fn inline_possible_values(line: &str) -> Option<(Vec<String>, bool)> {
     let lowercase = line.to_ascii_lowercase();
     if let Some(at) = lowercase.find("possible values:") {
-        let values: Vec<_> = line[at + "possible values:".len()..]
-            .trim_matches(|character: char| {
-                character.is_whitespace() || matches!(character, '[' | ']' | '(' | ')')
-            })
-            .split(['|', ','])
-            .map(|value| value.trim().trim_matches(['`', '\'', '"']))
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .collect();
-        if !values.is_empty() {
-            return Some(ValueHint::Enum(values));
-        }
+        let remainder = &line[at + "possible values:".len()..];
+        let (values, complete) = wrapped_enum_values(remainder);
+        return Some((values, complete));
     }
     None
+}
+
+fn wrapped_enum_values(line: &str) -> (Vec<String>, bool) {
+    let complete = line.contains(']');
+    let values = line
+        .trim_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '[' | ']' | '(' | ')')
+        })
+        .split(',')
+        .map(|value| value.trim().trim_matches(['`', '\'', '"']))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (values, complete)
 }
 
 fn starts_multiline_values(line: &str) -> bool {
@@ -216,15 +272,19 @@ fn starts_multiline_values(line: &str) -> bool {
         || line.contains("possible values for this option are:")
 }
 
-fn multiline_enum_value(line: &str) -> Option<String> {
-    (!line.is_empty() && enum_literal(line)).then(|| line.to_owned())
+fn described_enum_value(line: &str) -> Option<String> {
+    let value = line.split_once(':').map_or(line, |(value, _)| value).trim();
+    enum_literal(value).then(|| value.to_owned())
 }
 
-fn finish_multiline_values(
-    hints: &mut HashMap<String, ValueHint>,
-    pending: Option<(Vec<String>, Vec<String>)>,
-) {
-    let Some((options, values)) = pending.filter(|(_, values)| !values.is_empty()) else {
+fn finish_pending_values(hints: &mut HashMap<String, ValueHint>, pending: Option<PendingValues>) {
+    let Some((options, values)) = pending
+        .map(|pending| match pending {
+            PendingValues::Described { options, values }
+            | PendingValues::Wrapped { options, values } => (options, values),
+        })
+        .filter(|(_, values)| !values.is_empty())
+    else {
         return;
     };
     for option in options {
@@ -511,7 +571,7 @@ mod tests {
     #[test]
     fn parses_multiline_possible_value_sections() {
         let spec = CompletionSpec::from_help(
-            "Options:\n  --color=WHEN\n      Controls when colors are used.\n      The possible values for this flag are:\n      never\n      auto\n      always\n      ansi\n\n  --type=TYPE\n      Select a file type.\n      The possible values for this option are:\n      rust\n      python\n",
+            "Options:\n  --color=WHEN\n      Controls when colors are used.\n      The possible values for this flag are:\n\n      never: Colors will never be used.\n      auto: Colors are used when writing to a terminal.\n      always: Colors will always be used.\n      ansi: ANSI color escapes are always used.\n\n  --type=TYPE\n      Select a file type.\n      The possible values for this option are:\n\n      rust: Rust source files.\n      python: Python source files.\n",
         );
 
         assert_eq!(
@@ -526,6 +586,25 @@ mod tests {
         assert_eq!(
             spec.value_hint("--type"),
             Some(&ValueHint::Enum(vec!["rust".into(), "python".into()]))
+        );
+    }
+
+    #[test]
+    fn parses_wrapped_inline_possible_values() {
+        let spec = CompletionSpec::from_help(
+            "Options:\n  --message-format <FMT>  Error format [possible values: human, short, json,\n      json-diagnostic-short, json-diagnostic-rendered-ansi,\n      json-render-diagnostics]\n",
+        );
+
+        assert_eq!(
+            spec.value_hint("--message-format"),
+            Some(&ValueHint::Enum(vec![
+                "human".into(),
+                "short".into(),
+                "json".into(),
+                "json-diagnostic-short".into(),
+                "json-diagnostic-rendered-ansi".into(),
+                "json-render-diagnostics".into()
+            ]))
         );
     }
 
