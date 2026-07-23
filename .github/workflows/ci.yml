@@ -10,12 +10,8 @@ env:
 
 jobs:
   check:
-    name: fmt · clippy · test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -30,3 +26,16 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      - name: Install macOS target
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Install cross compiler
+        uses: mlugg/setup-zig@v2
+
+      # Zig compiles bundled C dependencies; `cargo check` then type-checks all
+      # macOS Rust code without needing an Apple linker or a macOS runner.
+      - name: Check macOS
+        env:
+          CC_x86_64_apple_darwin: zig cc
+        run: cargo check --workspace --all-targets --target x86_64-apple-darwin
