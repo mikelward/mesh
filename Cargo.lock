@@ -379,6 +379,7 @@ dependencies = [
  "reedline",
  "regex",
  "rusqlite",
+ "unicode-segmentation",
 ]
 
 [[package]]
