@@ -24,6 +24,7 @@ use reedline::{
     SearchDirection, SearchQuery, Signal, Span, SqliteBackedHistory, Suggestion,
     default_emacs_keybindings,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::builtins::{self, Builtin};
 use crate::completion::{CompletionCache, CompletionSpec};
@@ -2150,7 +2151,7 @@ impl ArgumentRecall {
                     .is_some_and(|value| value == text)
         });
         let (start, old_len, index) = match repeated {
-            Some((start, text, index)) => (*start, text.len(), index + 1),
+            Some((start, text, index)) => (*start, text.graphemes(true).count(), index + 1),
             None => (cursor, 0, 0),
         };
         let Some(argument) = self.arguments.iter().rev().nth(index).cloned() else {
@@ -2259,9 +2260,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                 argument_recall.insert(&mut editor);
             }
             Ok(signal) => {
-                if let Signal::Success(line) = &signal {
-                    argument_recall.remember(line);
-                }
+                let completed_command = completed_command(&signal, &pending);
                 match handle_signal(signal, last, &mut shell, &mut pending) {
                     None => continue, // an unfinished `func` body: read the next line
                     Some(Step::Exit(code)) => {
@@ -2277,6 +2276,9 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                     // never reaches here.
                     Some(Step::Return(_)) => unreachable!("top-level return handled in run_line"),
                 }
+                if let Some(command) = completed_command {
+                    argument_recall.remember(&command);
+                }
             }
             Err(err) => {
                 eprintln!("mesh: line editor error: {err}");
@@ -2284,6 +2286,17 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             }
         }
     }
+}
+
+fn completed_command(signal: &Signal, pending: &str) -> Option<String> {
+    let Signal::Success(line) = signal else {
+        return None;
+    };
+    let mut command = String::with_capacity(pending.len() + line.len() + 1);
+    command.push_str(pending);
+    command.push_str(line);
+    command.push('\n');
+    (!needs_more_input(&command)).then(|| command.trim_end_matches('\n').to_owned())
 }
 
 #[derive(Default)]
@@ -2817,9 +2830,10 @@ mod tests {
     use super::{
         ArgumentRecall, CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell,
         StartupOptions, Step, TimestampedHistory, argument_completions, command_position,
-        command_segment_words, eval_binary, expansion_word, handle_signal, help_completions,
-        history_path_from, interruptible_task, last_argument, needs_more_input, open_history,
-        prepare_history_path, run_line, run_prompt_hooks, run_source, variable_completions,
+        command_segment_words, completed_command, eval_binary, expansion_word, handle_signal,
+        help_completions, history_path_from, interruptible_task, last_argument, needs_more_input,
+        open_history, prepare_history_path, run_line, run_prompt_hooks, run_source,
+        variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
@@ -2875,6 +2889,42 @@ mod tests {
         editor.run_edit_commands(&[EditCommand::InsertChar('!')]);
         recall.insert(&mut editor);
         assert_eq!(editor.current_buffer_contents(), "puts first!\"two words\"");
+    }
+
+    #[test]
+    fn repeated_argument_recall_preserves_suffix_after_non_ascii_text() {
+        let mut recall = ArgumentRecall::default();
+        recall.remember("puts older");
+        recall.remember("puts é");
+        let mut editor = Reedline::create();
+        editor.run_edit_commands(&[
+            EditCommand::InsertString("puts suffix".to_owned()),
+            EditCommand::MoveToPosition {
+                position: 5,
+                select: false,
+            },
+        ]);
+
+        recall.insert(&mut editor);
+        assert_eq!(editor.current_buffer_contents(), "puts ésuffix");
+        recall.insert(&mut editor);
+        assert_eq!(editor.current_buffer_contents(), "puts oldersuffix");
+    }
+
+    #[test]
+    fn completed_command_assembles_multiline_argument_recall_input() {
+        let first = Signal::Success("puts first |".into());
+        assert_eq!(completed_command(&first, ""), None);
+
+        let second = Signal::Success("puts followed-by-words".into());
+        assert_eq!(
+            completed_command(&second, "puts first |\n").as_deref(),
+            Some("puts first |\nputs followed-by-words")
+        );
+        assert_eq!(
+            last_argument(&completed_command(&second, "puts first |\n").unwrap()).as_deref(),
+            Some("followed-by-words")
+        );
     }
 
     #[test]
