@@ -2141,7 +2141,7 @@ impl ArgumentRecall {
             let pending = &mut pending_by_session[index].1;
             pending.push_str(&entry.command_line);
             pending.push('\n');
-            if !needs_more_input(&pending) {
+            if !needs_more_input(pending) {
                 self.remember(pending.trim_end_matches('\n'));
                 pending.clear();
             }
@@ -2187,6 +2187,7 @@ fn persist_logical_history(
     session: Option<HistorySessionId>,
     signal: &Signal,
     pending: &str,
+    saved_submissions: usize,
 ) -> reedline::Result<()> {
     if pending.is_empty() {
         return Ok(());
@@ -2197,10 +2198,7 @@ fn persist_logical_history(
     }
 
     let entries = history.search(SearchQuery::everything(SearchDirection::Backward, session))?;
-    let mut remaining = pending.lines().count();
-    if matches!(signal, Signal::Success(_)) {
-        remaining += 1;
-    }
+    let mut remaining = saved_submissions;
     for entry in entries
         .into_iter()
         .filter(|entry| entry.session_id == session)
@@ -2299,6 +2297,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         }
     };
     let mut pending = String::new();
+    let mut pending_history_rows = 0;
     loop {
         shell.jobs.reap();
         if pending.is_empty() {
@@ -2316,6 +2315,11 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                 argument_recall.insert(&mut editor);
             }
             Ok(signal) => {
+                if history_session.is_some()
+                    && matches!(&signal, Signal::Success(line) if !line.is_empty())
+                {
+                    pending_history_rows += 1;
+                }
                 let completed_command = completed_command(&signal, &pending);
                 if let Some(session) = history_session
                     && let Err(err) = persist_logical_history(
@@ -2323,6 +2327,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                         Some(session),
                         &signal,
                         &pending,
+                        pending_history_rows,
                     )
                 {
                     eprintln!("mesh: could not update history database: {err}");
@@ -2342,6 +2347,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                     // never reaches here.
                     Some(Step::Return(_)) => unreachable!("top-level return handled in run_line"),
                 }
+                pending_history_rows = 0;
                 if let Some(command) = completed_command {
                     argument_recall.remember(&command);
                 }
@@ -3186,6 +3192,7 @@ mod tests {
             saved_session,
             &Signal::Success("}".into()),
             &pending,
+            3,
         )
         .unwrap();
         drop(saved);
@@ -3221,10 +3228,54 @@ mod tests {
         let mut item = HistoryItem::from_command_line("func f() {");
         item.session_id = saved_session;
         saved.save(item).unwrap();
-        persist_logical_history(&mut saved, saved_session, &Signal::CtrlC, "func f() {\n").unwrap();
+        persist_logical_history(&mut saved, saved_session, &Signal::CtrlC, "func f() {\n", 1)
+            .unwrap();
         let mut item = HistoryItem::from_command_line("puts public");
         item.session_id = saved_session;
         saved.save(item).unwrap();
+        drop(saved);
+
+        let current_session = Reedline::create_history_session_id();
+        let current = SqliteBackedHistory::with_file(
+            path.clone(),
+            current_session,
+            Some(SystemTime::now().into()),
+        )
+        .unwrap();
+        let mut recall = ArgumentRecall::default();
+        recall.load(&current, current_session);
+
+        assert_eq!(recall.arguments, ["public"]);
+        drop(current);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn logical_history_counts_saved_submissions_not_pending_lines() {
+        let path = temporary_history_path("history.sqlite3");
+        prepare_history_path(&path).unwrap();
+        let saved_session = Reedline::create_history_session_id();
+        let mut saved = TimestampedHistory(
+            SqliteBackedHistory::with_file(
+                path.clone(),
+                saved_session,
+                Some(SystemTime::now().into()),
+            )
+            .unwrap(),
+        );
+        for line in ["puts public", "func f() {", "}"] {
+            let mut item = HistoryItem::from_command_line(line);
+            item.session_id = saved_session;
+            saved.save(item).unwrap();
+        }
+        persist_logical_history(
+            &mut saved,
+            saved_session,
+            &Signal::Success("}".into()),
+            "func f() {\n\n",
+            2,
+        )
+        .unwrap();
         drop(saved);
 
         let current_session = Reedline::create_history_session_id();
