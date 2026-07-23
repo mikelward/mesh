@@ -77,6 +77,9 @@ impl CompletionSpec {
                 }
             }
             let heading = trimmed.trim_end_matches(':').to_ascii_lowercase();
+            if line == trimmed && trimmed.ends_with(':') {
+                current_options.clear();
+            }
             if matches!(
                 heading.as_str(),
                 "commands" | "subcommands" | "available commands"
@@ -112,9 +115,6 @@ impl CompletionSpec {
                     options: current_options.clone(),
                     values: Vec::new(),
                 });
-            }
-            if options.is_empty() && trimmed.is_empty() {
-                current_options.clear();
             }
             if commands
                 && let Some(command) = trimmed.split_whitespace().next()
@@ -298,8 +298,9 @@ fn directory_metavar(value: &str) -> bool {
 }
 
 fn file_metavar(value: &str) -> bool {
-    let normalized = value.to_ascii_uppercase();
-    normalized.contains("FILE") || normalized.contains("PATH")
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| word.eq_ignore_ascii_case("FILE") || word.eq_ignore_ascii_case("PATH"))
 }
 
 fn enum_literal(value: &str) -> bool {
@@ -571,7 +572,7 @@ mod tests {
     #[test]
     fn parses_multiline_possible_value_sections() {
         let spec = CompletionSpec::from_help(
-            "Options:\n  --color=WHEN\n      Controls when colors are used.\n      The possible values for this flag are:\n\n      never: Colors will never be used.\n      auto: Colors are used when writing to a terminal.\n      always: Colors will always be used.\n      ansi: ANSI color escapes are always used.\n\n  --type=TYPE\n      Select a file type.\n      The possible values for this option are:\n\n      rust: Rust source files.\n      python: Python source files.\n",
+            "Options:\n  --color=WHEN\n      Controls when colors are used.\n\n      Color output supports several modes.\n\n      The possible values for this flag are:\n\n      never: Colors will never be used.\n      auto: Colors are used when writing to a terminal.\n      always: Colors will always be used.\n      ansi: ANSI color escapes are always used.\n\n  --type=TYPE\n      Select a file type.\n      The possible values for this option are:\n\n      rust: Rust source files.\n      python: Python source files.\n",
         );
 
         assert_eq!(
@@ -587,6 +588,15 @@ mod tests {
             spec.value_hint("--type"),
             Some(&ValueHint::Enum(vec!["rust".into(), "python".into()]))
         );
+    }
+
+    #[test]
+    fn does_not_treat_profile_metavars_as_files() {
+        let spec = CompletionSpec::from_help(
+            "Options:\n  --profile <PROFILE-NAME>  Build artifacts with the specified profile\n",
+        );
+
+        assert_eq!(spec.value_hint("--profile"), None);
     }
 
     #[test]

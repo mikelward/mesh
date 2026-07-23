@@ -2480,8 +2480,6 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
     } else {
         words
     };
-    let parent_help = completion_for(state, parent);
-
     if let Some(option) = parent.last()
         && option.starts_with('-')
     {
@@ -2490,6 +2488,7 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
             return value_completions(hint, word);
         }
     }
+    let parent_help = completion_for(state, parent);
     let paths = path_completions(word);
     let mut parent_values = parent_help.matching(word);
 
@@ -3543,6 +3542,40 @@ mod tests {
             argument_completions(&state, &["tool".into(), "--color=a".into()], "--color=a"),
             ["--color=auto", "--color=always"]
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn separated_typed_completion_probes_the_option_context_first() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("mesh-separated-typed-help-{}", std::process::id()));
+        let command = dir.join("tool");
+        let calls = dir.join("calls");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$*\" = 'build --help' ]; then\n  echo '  --color <auto|always|never>  mode'\nfi\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+        let command = command.to_string_lossy().into_owned();
+        let state = CompletionState::default();
+
+        assert_eq!(
+            argument_completions(
+                &state,
+                &[command, "build".into(), "--color".into(), "a".into()],
+                "a"
+            ),
+            ["auto", "always"]
+        );
+        assert_eq!(fs::read_to_string(calls).unwrap(), "build --help\n");
         fs::remove_dir_all(dir).unwrap();
     }
 
