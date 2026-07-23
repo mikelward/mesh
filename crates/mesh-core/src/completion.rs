@@ -12,16 +12,25 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-const CACHE_VERSION: &str = "mesh-completion-v1";
+const CACHE_VERSION: &str = "mesh-completion-v2";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ValueHint {
+    File,
+    Directory,
+    Enum(Vec<String>),
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CompletionSpec {
     candidates: Vec<String>,
+    values: HashMap<String, ValueHint>,
 }
 
 impl CompletionSpec {
     pub(crate) fn from_help(help: &str) -> Self {
         let mut candidates = Vec::new();
+        let mut values = HashMap::new();
         let mut commands = false;
         for line in help.lines() {
             let trimmed = line.trim();
@@ -36,11 +45,19 @@ impl CompletionSpec {
             if trimmed.ends_with(':') || trimmed.is_empty() {
                 commands = false;
             }
-            for token in trimmed.split_whitespace() {
+            let tokens: Vec<_> = trimmed.split_whitespace().collect();
+            let mut options = Vec::new();
+            for token in &tokens {
                 let option = token.trim_end_matches([',', ';']);
                 if option.starts_with('-') && option.len() > 1 {
-                    let option = option.split(['=', '[', '<']).next().unwrap_or(option);
-                    candidates.push(option.to_owned());
+                    let name = option.split(['=', '[', '<']).next().unwrap_or(option);
+                    candidates.push(name.to_owned());
+                    options.push(name.to_owned());
+                }
+            }
+            if let Some(hint) = value_hint(trimmed, &tokens) {
+                for option in options {
+                    values.insert(option, hint.clone());
                 }
             }
             if commands
@@ -54,7 +71,7 @@ impl CompletionSpec {
         }
         candidates.sort();
         candidates.dedup();
-        Self { candidates }
+        Self { candidates, values }
     }
 
     pub(crate) fn matching(&self, prefix: &str) -> Vec<String> {
@@ -65,23 +82,105 @@ impl CompletionSpec {
             .collect()
     }
 
+    pub(crate) fn value_hint(&self, option: &str) -> Option<&ValueHint> {
+        self.values.get(option)
+    }
+
     fn encode(&self, fingerprint: &str) -> String {
         let mut encoded = format!("{CACHE_VERSION}\n{fingerprint}\n");
         for candidate in &self.candidates {
+            encoded.push_str("candidate\t");
             encoded.push_str(candidate);
             encoded.push('\n');
+        }
+        let mut values: Vec<_> = self.values.iter().collect();
+        values.sort_by_key(|(option, _)| *option);
+        for (option, hint) in values {
+            encoded.push_str("value\t");
+            encoded.push_str(option);
+            match hint {
+                ValueHint::File => encoded.push_str("\tfile\n"),
+                ValueHint::Directory => encoded.push_str("\tdirectory\n"),
+                ValueHint::Enum(values) => {
+                    encoded.push_str("\tenum");
+                    for value in values {
+                        encoded.push('\t');
+                        encoded.push_str(value);
+                    }
+                    encoded.push('\n');
+                }
+            }
         }
         encoded
     }
 
     fn decode(encoded: &str, fingerprint: &str) -> Option<Self> {
         let mut lines = encoded.lines();
-        (lines.next()? == CACHE_VERSION && lines.next()? == fingerprint).then(|| Self {
-            candidates: lines
-                .filter(|line| !line.is_empty() && !line.contains(['\r', '\n']))
-                .map(str::to_owned)
-                .collect(),
-        })
+        if lines.next()? != CACHE_VERSION || lines.next()? != fingerprint {
+            return None;
+        }
+        let mut spec = Self::default();
+        for line in lines {
+            let mut fields = line.split('\t');
+            match fields.next()? {
+                "candidate" => spec.candidates.push(fields.next()?.to_owned()),
+                "value" => {
+                    let option = fields.next()?.to_owned();
+                    let hint = match fields.next()? {
+                        "file" => ValueHint::File,
+                        "directory" => ValueHint::Directory,
+                        "enum" => ValueHint::Enum(fields.map(str::to_owned).collect()),
+                        _ => return None,
+                    };
+                    spec.values.insert(option, hint);
+                }
+                _ => return None,
+            }
+        }
+        Some(spec)
+    }
+}
+
+fn value_hint(line: &str, tokens: &[&str]) -> Option<ValueHint> {
+    let lowercase = line.to_ascii_lowercase();
+    if let Some(at) = lowercase.find("possible values:") {
+        let values: Vec<_> = line[at + "possible values:".len()..]
+            .trim_matches(|character: char| {
+                character.is_whitespace() || matches!(character, '[' | ']' | '(' | ')')
+            })
+            .split(['|', ','])
+            .map(|value| value.trim().trim_matches(['`', '\'', '"']))
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !values.is_empty() {
+            return Some(ValueHint::Enum(values));
+        }
+    }
+    let metavar = tokens.iter().find_map(|token| {
+        let token = token.trim_end_matches([',', ';']);
+        token
+            .split_once('=')
+            .map(|(_, value)| value)
+            .or_else(|| (token.starts_with(['<', '[', '{'])).then_some(token))
+    })?;
+    let metavar = metavar.trim_matches(['<', '>', '[', ']', '{', '}']);
+    let enum_values: Vec<_> = metavar
+        .split(['|', ','])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if enum_values.len() > 1 {
+        return Some(ValueHint::Enum(enum_values));
+    }
+    let normalized = metavar.to_ascii_uppercase();
+    if normalized.contains("DIRECTORY") || normalized == "DIR" {
+        Some(ValueHint::Directory)
+    } else if normalized.contains("FILE") || normalized.contains("PATH") {
+        Some(ValueHint::File)
+    } else {
+        None
     }
 }
 
@@ -299,7 +398,7 @@ fn join_reader(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompletionCache, CompletionSpec, command_help};
+    use super::{CompletionCache, CompletionSpec, ValueHint, command_help};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -314,10 +413,29 @@ mod tests {
     #[test]
     fn parses_typed_specs() {
         let spec = CompletionSpec::from_help(
-            "Commands:\n  build  compile\n\nOptions:\n  -h, --help  help\n",
+            "Commands:\n  build  compile\n\nOptions:\n  -h, --help  help\n  -o, --output <FILE>  output file\n  --directory <DIR>  working directory\n  --color <WHEN>  color [possible values: auto, always, never]\n  --format=<json|text>  output format\n",
         );
-        assert_eq!(spec.matching("--"), ["--help"]);
+        assert_eq!(spec.matching("--h"), ["--help"]);
         assert_eq!(spec.matching("b"), ["build"]);
+        assert_eq!(spec.value_hint("-o"), Some(&ValueHint::File));
+        assert_eq!(spec.value_hint("--output"), Some(&ValueHint::File));
+        assert_eq!(spec.value_hint("--directory"), Some(&ValueHint::Directory));
+        assert_eq!(
+            spec.value_hint("--color"),
+            Some(&ValueHint::Enum(vec![
+                "auto".into(),
+                "always".into(),
+                "never".into()
+            ]))
+        );
+        assert_eq!(
+            spec.value_hint("--format"),
+            Some(&ValueHint::Enum(vec!["json".into(), "text".into()]))
+        );
+        assert_eq!(
+            CompletionSpec::decode(&spec.encode("test"), "test"),
+            Some(spec)
+        );
     }
 
     #[test]

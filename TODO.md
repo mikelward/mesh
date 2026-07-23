@@ -148,7 +148,7 @@ file as tasks land.
 - [x] Cache generated completion specs in memory and under
       `$XDG_CACHE_HOME/mesh/completions/`, keyed by executable path, modification
       time, and subcommand arguments; regenerate stale or corrupt entries.
-- [ ] Add typed file, directory, and enum values to completion specs.
+- [x] Add typed file, directory, and enum values to completion specs.
 - [ ] Add fuzzy and case-insensitive candidate ranking with `nucleo`.
 - [ ] Load curated completion specs, then add man-page-derived specs.
 - [ ] Expose static and dynamic completion overrides through `$sh.complete`.
