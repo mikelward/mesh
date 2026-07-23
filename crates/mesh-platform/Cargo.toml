@@ -1,6 +1,6 @@
 [package]
 name = "mesh-platform"
-version = "0.0.0"
+version.workspace = true
 description = "Platform portability shims over libc for the mesh shell."
 edition.workspace = true
 rust-version.workspace = true

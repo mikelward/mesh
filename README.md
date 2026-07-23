@@ -19,6 +19,20 @@ cargo run -p mesh      # start the shell
 cargo test --workspace # run the tests
 ```
 
+## Releases
+
+Every push to `main` publishes a Linux x86-64 binary. The version is
+`0.0.COMMITS`, where `COMMITS` is the number of commits reachable from that
+revision, and the release is tagged `v0.0.COMMITS`. The workflow calculates the
+version and updates the Cargo metadata used for the build; no manual version
+edit or tag is needed.
+
+Release assets contain the binary and README in
+`mesh-VERSION-x86_64-unknown-linux-gnu.tar.gz`, together with a SHA-256
+checksum. The `0.0.0` workspace version is a source-tree placeholder. Commit
+counts are calculated from a full clone, and rewriting `main` history is avoided
+so release versions remain unique and increasing.
+
 The shell launches external commands and includes prompt configuration alongside
 the `cd`, `pwd`, `puts`, and `exit` builtins. Interactive Tab completion covers
 builtins, defined functions, commands on `PATH`, filesystem paths, variables,

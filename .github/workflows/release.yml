@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  linux-x86-64:
+    name: Linux x86-64 binary
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Set release version
+        run: |
+          version="0.0.$(git rev-list --count HEAD)"
+          python3 - "$version" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          cargo_toml = pathlib.Path("Cargo.toml")
+          text = cargo_toml.read_text()
+          text, count = re.subn(
+              r'(?m)^version = "0\.0\.0"$', f'version = "{version}"', text, count=1
+          )
+          if count != 1:
+              raise SystemExit("workspace placeholder version was not found")
+          cargo_toml.write_text(text)
+
+          lock = pathlib.Path("Cargo.lock")
+          text = lock.read_text()
+          for package in ("mesh", "mesh-core", "mesh-platform"):
+              pattern = rf'(?m)(^name = "{package}"\nversion = ")[^"]+("$)'
+              text, count = re.subn(pattern, rf'\g<1>{version}\2', text, count=1)
+              if count != 1:
+                  raise SystemExit(f"lock entry for {package} was not found")
+          lock.write_text(text)
+          PY
+          printf 'version=%s\n' "$version" >> "$GITHUB_ENV"
+          printf 'tag=v%s\n' "$version" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET" -p mesh
+
+      - name: Package
+        run: |
+          archive="mesh-$version-$TARGET.tar.gz"
+          staging="mesh-$version-$TARGET"
+          mkdir "$staging"
+          cp "target/$TARGET/release/mesh" "$staging/"
+          cp README.md "$staging/"
+          tar -czf "$archive" "$staging"
+          sha256sum "$archive" > "$archive.sha256"
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.tag }}
+          name: mesh ${{ env.version }}
+          generate_release_notes: true
+          files: |
+            ${{ env.archive }}
+            ${{ env.archive }}.sha256

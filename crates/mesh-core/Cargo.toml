@@ -1,6 +1,6 @@
 [package]
 name = "mesh-core"
-version = "0.0.0"
+version.workspace = true
 description = "Core lexer, expansion, and runtime for the mesh shell."
 edition.workspace = true
 rust-version.workspace = true
