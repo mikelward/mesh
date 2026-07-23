@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-const CACHE_VERSION: &str = "mesh-completion-v2";
+const CACHE_VERSION: &str = "mesh-completion-v3";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ValueHint {
@@ -228,11 +228,14 @@ fn value_hint(tokens: &[&str]) -> Option<ValueHint> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .collect();
-    if alternatives.iter().any(|value| directory_metavar(value)) {
-        return Some(ValueHint::Directory);
-    }
+    // A file/path alternative wins over a directory one: `File` completion
+    // already offers directories too, so a mixed `<FILE|DIR>` union stays usable
+    // for either kind. `Directory` is reserved for directory-only metavars.
     if alternatives.iter().any(|value| file_metavar(value)) {
         return Some(ValueHint::File);
+    }
+    if alternatives.iter().any(|value| directory_metavar(value)) {
+        return Some(ValueHint::Directory);
     }
     if alternatives.len() > 1 && alternatives.iter().all(|value| enum_literal(value)) {
         return Some(ValueHint::Enum(
@@ -244,12 +247,15 @@ fn value_hint(tokens: &[&str]) -> Option<ValueHint> {
 
 fn inline_possible_values(line: &str) -> Option<(Vec<String>, bool)> {
     let lowercase = line.to_ascii_lowercase();
-    if let Some(at) = lowercase.find("possible values:") {
-        let remainder = &line[at + "possible values:".len()..];
-        let (values, complete) = wrapped_enum_values(remainder);
-        return Some((values, complete));
-    }
-    None
+    let at = lowercase.find("possible values:")?;
+    let remainder = &line[at + "possible values:".len()..];
+    let (values, complete) = wrapped_enum_values(remainder);
+    // Clap wraps long lists inside `[possible values: …]`, which may spill onto
+    // later lines and closes at the `]`. An unbracketed inline list (no opening
+    // `[` before the marker) is confined to this line, so treat it as complete
+    // rather than swallowing the following options while hunting for a `]`.
+    let bracketed = line[..at].contains('[');
+    Some((values, complete || !bracketed))
 }
 
 fn wrapped_enum_values(line: &str) -> (Vec<String>, bool) {
@@ -293,14 +299,19 @@ fn finish_pending_values(hints: &mut HashMap<String, ValueHint>, pending: Option
 }
 
 fn directory_metavar(value: &str) -> bool {
-    let normalized = value.to_ascii_uppercase();
-    normalized.contains("DIRECTORY") || normalized == "DIR"
+    metavar_words(value)
+        .any(|word| word.eq_ignore_ascii_case("DIRECTORY") || word.eq_ignore_ascii_case("DIR"))
 }
 
 fn file_metavar(value: &str) -> bool {
+    metavar_words(value)
+        .any(|word| word.eq_ignore_ascii_case("FILE") || word.eq_ignore_ascii_case("PATH"))
+}
+
+fn metavar_words(value: &str) -> impl Iterator<Item = &str> {
     value
         .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|word| word.eq_ignore_ascii_case("FILE") || word.eq_ignore_ascii_case("PATH"))
+        .filter(|word| !word.is_empty())
 }
 
 fn enum_literal(value: &str) -> bool {
@@ -616,6 +627,48 @@ mod tests {
                 "json-render-diagnostics".into()
             ]))
         );
+    }
+
+    #[test]
+    fn mixed_file_and_directory_unions_prefer_files() {
+        let spec = CompletionSpec::from_help(
+            "Options:\n  --path <FILE|DIR>  file or directory\n  --dir <DIR>  directory only\n",
+        );
+
+        // `File` completion offers directories too, so a mixed union stays usable
+        // for either kind; a directory-only metavar keeps `Directory`.
+        assert_eq!(spec.value_hint("--path"), Some(&ValueHint::File));
+        assert_eq!(spec.value_hint("--dir"), Some(&ValueHint::Directory));
+    }
+
+    #[test]
+    fn compound_directory_metavars_are_recognized() {
+        let spec = CompletionSpec::from_help("Options:\n  --out <OUTPUT_DIR>  output directory\n");
+
+        assert_eq!(spec.value_hint("--out"), Some(&ValueHint::Directory));
+    }
+
+    #[test]
+    fn unbracketed_possible_values_do_not_swallow_later_options() {
+        let spec = CompletionSpec::from_help(
+            "Options:\n  --format FORMAT  possible values: json, text\n  --output <FILE>  destination\n",
+        );
+
+        assert_eq!(
+            spec.value_hint("--format"),
+            Some(&ValueHint::Enum(vec!["json".into(), "text".into()]))
+        );
+        // The unbracketed list is confined to its line: the following option
+        // stays a candidate instead of being consumed into the enum.
+        assert_eq!(spec.matching("--o"), ["--output"]);
+        assert_eq!(spec.value_hint("--output"), Some(&ValueHint::File));
+    }
+
+    #[test]
+    fn rejects_specs_generated_with_older_parser_semantics() {
+        let encoded = "mesh-completion-v2\ntest\ncandidate\t--profile\nvalue\t--profile\tfile\n";
+
+        assert_eq!(CompletionSpec::decode(encoded, "test"), None);
     }
 
     #[test]
