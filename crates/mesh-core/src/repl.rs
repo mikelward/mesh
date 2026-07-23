@@ -3213,6 +3213,49 @@ mod tests {
     }
 
     #[test]
+    fn history_recall_reloads_multiline_command_arguments() {
+        let path = temporary_history_path("history.sqlite3");
+        prepare_history_path(&path).unwrap();
+        let saved_session = Reedline::create_history_session_id();
+        let mut saved = TimestampedHistory(
+            SqliteBackedHistory::with_file(
+                path.clone(),
+                saved_session,
+                Some(SystemTime::now().into()),
+            )
+            .unwrap(),
+        );
+        for line in ["puts \"first", "followed by last\""] {
+            let mut item = HistoryItem::from_command_line(line);
+            item.session_id = saved_session;
+            saved.save(item).unwrap();
+        }
+        persist_logical_history(
+            &mut saved,
+            saved_session,
+            &Signal::Success("followed by last\"".into()),
+            "puts \"first\n",
+            2,
+        )
+        .unwrap();
+        drop(saved);
+
+        let current_session = Reedline::create_history_session_id();
+        let current = SqliteBackedHistory::with_file(
+            path.clone(),
+            current_session,
+            Some(SystemTime::now().into()),
+        )
+        .unwrap();
+        let mut recall = ArgumentRecall::default();
+        recall.load(&current, current_session);
+
+        assert_eq!(recall.arguments, ["\"first\nfollowed by last\""]);
+        drop(current);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn history_recall_preserves_boundary_after_cancel_and_reload() {
         let path = temporary_history_path("history.sqlite3");
         prepare_history_path(&path).unwrap();
