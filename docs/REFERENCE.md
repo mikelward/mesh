@@ -23,6 +23,11 @@ variables and functions remain available for the session.
 `--rcfile FILE` replaces `rc.mesh`, while `--norc` skips the interactive RC
 file. Neither option skips `env.mesh` or the login files.
 
+Interactive command history is saved in
+`$XDG_STATE_HOME/mesh/history.sqlite3`, falling back to
+`~/.local/state/mesh/history.sqlite3`. Pass `--no-save-history` (or the shorter
+`--no-history` alias) to keep history in memory for that session instead.
+
 ---
 
 ## Commands
