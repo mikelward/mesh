@@ -53,9 +53,13 @@ In an interactive shell, Tab completes according to the cursor's current word:
 | A word beginning with `$` | Visible variable names |
 | After `$map.` | Keys in that map; nested map paths such as `$config.user.` are followed recursively |
 
-Suggestions use case-sensitive prefix matching. External-command help probes
-have null stdin, a two-second timeout, and a one-MiB output cap. Argument value
-types, fuzzy matching, and case-insensitive matching are not yet implemented.
+Suggestions are ranked using fuzzy, smart-case matching: an all-lowercase query
+ignores case, while any uppercase letter makes the whole query case-sensitive.
+Exact-case matches rank ahead of case-folded matches. For example,
+`cd pic<Tab>` can complete to `cd Pictures/`. File, directory, and enumerated
+argument types inferred from help output narrow suggestions to suitable values.
+External-command help probes have null stdin, a two-second timeout, and a
+one-MiB output cap.
 
 ## Builtins
 

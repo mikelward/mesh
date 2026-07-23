@@ -71,7 +71,7 @@ integration tests need no terminal. The rest of the interactive stack named in
 | `glob` | filesystem glob expansion | MIT/Apache-2.0 | **in use** |
 | `libc` | process groups and foreground-terminal handoff | MIT/Apache-2.0 | **in use** |
 | `crossterm` | terminal control (pulled in by `reedline`) | MIT | transitive |
-| `nucleo` | fuzzy completion | MPL-2.0 | planned |
+| `nucleo-matcher` | fuzzy completion | MPL-2.0 | **in use** |
 
 Add a dependency only when a milestone calls for it; prefer a small, focused
 crate over a framework. Note the license column when the repo license is chosen

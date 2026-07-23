@@ -22,12 +22,15 @@ cargo test --workspace # run the tests
 The shell launches external commands and includes prompt configuration alongside
 the `cd`, `pwd`, `puts`, and `exit` builtins. Interactive Tab completion covers
 builtins, defined functions, commands on `PATH`, filesystem paths, variables,
-and map keys. After a command, completion passes the words already entered to
+builtins, defined functions, commands on `PATH`, filesystem paths, variables,
+and map keys, ranked with fuzzy, smart-case matching (all-lowercase ignores case;
+any uppercase makes the query case-sensitive, and exact-case matches rank
+first). After a command, completion passes the words already entered to
 `COMMAND --help` and extracts options and subcommands from both output streams;
 builtins and defined functions use their generated help in the same way. File,
 directory, and enumerated option values narrow argument completion to the
-expected type. A growing slice of the language is in place: quoting and escapes, `~`
-and filename globs, typed scalar/list/map values, arithmetic and comparisons,
+expected type. A growing slice of the language is in place: quoting and escapes,
+`~` and filename globs, typed scalar/list/map values, arithmetic and comparisons,
 regex and glob matching with `~`, collection iteration and destructuring,
 functions, `if`/`match` expressions, and postfix value modifiers.
 For a hands-on walk through what runs today, see
