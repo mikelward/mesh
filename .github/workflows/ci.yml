@@ -42,7 +42,13 @@ jobs:
       # keeps the check pinned to a single source of truth.
       - name: Read MSRV from Cargo.toml
         id: msrv
-        run: echo "version=$(grep '^rust-version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')" >> "$GITHUB_OUTPUT"
+        run: |
+          version="$(grep '^rust-version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          # A two-component MSRV (e.g. 1.95) selects rustup's moving 1.95.x
+          # channel, which would keep passing on 1.95.1 even if the floor
+          # release 1.95.0 stopped compiling. Append .0 to pin the exact floor.
+          case "$version" in *.*.*) ;; *) version="$version.0" ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install MSRV toolchain
         run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
