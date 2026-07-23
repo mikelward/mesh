@@ -7,10 +7,11 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, RwLock, mpsc};
@@ -18,9 +19,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reedline::{
-    Completer, EditCommand, Emacs, History, KeyCode, KeyModifiers, Prompt, PromptEditMode,
-    PromptHistorySearch, Reedline, ReedlineEvent, SearchQuery, Signal, Span, SqliteBackedHistory,
-    Suggestion, default_emacs_keybindings,
+    Completer, EditCommand, Emacs, History, HistorySessionId, KeyCode, KeyModifiers, Prompt,
+    PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, SearchDirection, SearchQuery,
+    Signal, Span, SqliteBackedHistory, Suggestion, default_emacs_keybindings,
 };
 
 use crate::builtins::{self, Builtin};
@@ -185,6 +186,22 @@ fn history_path_from(
                 .map(|home| PathBuf::from(home).join(".local/state"))
         })
         .map(|dir| dir.join("mesh/history.sqlite3"))
+}
+
+fn prepare_history_path(path: &Path) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
 fn startup_files(options: &StartupOptions, interactive: bool) -> Vec<PathBuf> {
@@ -2040,8 +2057,10 @@ struct ArgumentRecall {
 }
 
 impl ArgumentRecall {
-    fn load(&mut self, history: &dyn History) {
-        let Ok(entries) = history.search(SearchQuery::all_that_contain_rev(String::new())) else {
+    fn load(&mut self, history: &dyn History, session: Option<HistorySessionId>) {
+        let Ok(entries) =
+            history.search(SearchQuery::everything(SearchDirection::Backward, session))
+        else {
             return;
         };
         for entry in entries.into_iter().rev() {
@@ -2135,10 +2154,20 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     if options.save_history
         && let Some(path) = history_path()
     {
-        match SqliteBackedHistory::with_file(path, None, None) {
+        let session = Reedline::create_history_session_id();
+        let session_started = Some(std::time::SystemTime::now().into());
+        let history = prepare_history_path(&path)
+            .map_err(|err| err.to_string())
+            .and_then(|()| {
+                SqliteBackedHistory::with_file(path, session, session_started)
+                    .map_err(|err| err.to_string())
+            });
+        match history {
             Ok(history) => {
-                argument_recall.load(&history);
-                editor = editor.with_history(Box::new(history));
+                argument_recall.load(&history, session);
+                editor = editor
+                    .with_history(Box::new(history))
+                    .with_history_session_id(session);
             }
             Err(err) => eprintln!("mesh: could not open history database: {err}"),
         }
@@ -2727,13 +2756,29 @@ mod tests {
         ArgumentRecall, CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell,
         StartupOptions, Step, argument_completions, command_position, command_segment_words,
         eval_binary, expansion_word, handle_signal, help_completions, history_path_from,
-        interruptible_task, last_argument, needs_more_input, run_line, run_prompt_hooks,
-        run_source, variable_completions,
+        interruptible_task, last_argument, needs_more_input, prepare_history_path, run_line,
+        run_prompt_hooks, run_source, variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
-    use reedline::{EditCommand, Prompt, PromptEditMode, Reedline, Signal};
+    use reedline::{
+        EditCommand, History, HistoryItem, Prompt, PromptEditMode, Reedline, Signal,
+        SqliteBackedHistory,
+    };
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn temporary_history_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("mesh-repl-test-{}-{unique}", std::process::id()))
+            .join(name)
+    }
 
     #[test]
     fn last_argument_uses_mesh_word_spans() {
@@ -2803,6 +2848,56 @@ mod tests {
                 "/home/user/.local/state/mesh/history.sqlite3"
             ))
         );
+    }
+
+    #[test]
+    fn history_path_is_owner_only() {
+        let path = temporary_history_path("state/mesh/history.sqlite3");
+        prepare_history_path(&path).unwrap();
+
+        let directory_mode = fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(directory_mode & 0o777, 0o700);
+        assert_eq!(file_mode & 0o777, 0o600);
+
+        fs::remove_dir_all(path.ancestors().nth(3).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn history_recall_excludes_commands_started_by_newer_peer_sessions() {
+        let path = temporary_history_path("history.sqlite3");
+        prepare_history_path(&path).unwrap();
+        let peer_session = Reedline::create_history_session_id();
+        let mut peer = SqliteBackedHistory::with_file(
+            path.clone(),
+            peer_session,
+            Some(SystemTime::now().into()),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        let current_session = Reedline::create_history_session_id();
+        let current = SqliteBackedHistory::with_file(
+            path.clone(),
+            current_session,
+            Some(SystemTime::now().into()),
+        )
+        .unwrap();
+
+        let mut item = HistoryItem::from_command_line("peer secret");
+        item.session_id = peer_session;
+        item.start_timestamp = Some(SystemTime::now().into());
+        peer.save(item).unwrap();
+
+        let mut recall = ArgumentRecall::default();
+        recall.load(&current, current_session);
+        assert!(recall.arguments.is_empty());
+
+        drop(current);
+        drop(peer);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
