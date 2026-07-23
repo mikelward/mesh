@@ -138,8 +138,10 @@ impl CompletionSpec {
         let candidates = self
             .candidates
             .iter()
-            .filter(|candidate| {
-                prefix.is_empty() || prefix.starts_with('-') || !candidate.starts_with('-')
+            .filter(|candidate| match prefix.chars().next() {
+                None => true,
+                Some('-') => candidate.starts_with('-'),
+                Some(_) => !candidate.starts_with('-'),
             })
             .cloned()
             .collect();
@@ -658,6 +660,16 @@ mod tests {
             ),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn fuzzy_matching_keeps_options_and_subcommands_separate() {
+        let spec = CompletionSpec::from_help(
+            "Commands:\n  cherry-pick  apply changes\n\nOptions:\n  --pretty  format output\n",
+        );
+
+        assert_eq!(spec.matching("-p"), ["--pretty"]);
+        assert_eq!(spec.matching("cp"), ["cherry-pick"]);
     }
 
     #[test]
