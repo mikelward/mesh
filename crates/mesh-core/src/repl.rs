@@ -19,9 +19,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reedline::{
-    Completer, EditCommand, Emacs, History, HistorySessionId, KeyCode, KeyModifiers, Prompt,
-    PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, SearchDirection, SearchQuery,
-    Signal, Span, SqliteBackedHistory, Suggestion, default_emacs_keybindings,
+    Completer, EditCommand, Emacs, History, HistoryItem, HistoryItemId, HistorySessionId, KeyCode,
+    KeyModifiers, Prompt, PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent,
+    SearchDirection, SearchQuery, Signal, Span, SqliteBackedHistory, Suggestion,
+    default_emacs_keybindings,
 };
 
 use crate::builtins::{self, Builtin};
@@ -202,6 +203,70 @@ fn prepare_history_path(path: &Path) -> io::Result<()> {
         .mode(0o600)
         .open(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+struct TimestampedHistory<H>(H);
+
+impl<H: History> History for TimestampedHistory<H> {
+    fn save(&mut self, mut item: HistoryItem) -> reedline::Result<HistoryItem> {
+        item.start_timestamp
+            .get_or_insert_with(|| std::time::SystemTime::now().into());
+        self.0.save(item)
+    }
+
+    fn load(&self, id: HistoryItemId) -> reedline::Result<HistoryItem> {
+        self.0.load(id)
+    }
+
+    fn count(&self, query: SearchQuery) -> reedline::Result<i64> {
+        self.0.count(query)
+    }
+
+    fn search(&self, query: SearchQuery) -> reedline::Result<Vec<HistoryItem>> {
+        self.0.search(query)
+    }
+
+    fn update(
+        &mut self,
+        id: HistoryItemId,
+        updater: &dyn Fn(HistoryItem) -> HistoryItem,
+    ) -> reedline::Result<()> {
+        self.0.update(id, updater)
+    }
+
+    fn clear(&mut self) -> reedline::Result<()> {
+        self.0.clear()
+    }
+
+    fn delete(&mut self, id: HistoryItemId) -> reedline::Result<()> {
+        self.0.delete(id)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.0.sync()
+    }
+
+    fn session(&self) -> Option<HistorySessionId> {
+        self.0.session()
+    }
+}
+
+fn open_history(
+    path: PathBuf,
+    session: Option<HistorySessionId>,
+    session_started: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<TimestampedHistory<SqliteBackedHistory>, String> {
+    let history = SqliteBackedHistory::with_file(path.clone(), session, session_started)
+        .map_err(|err| err.to_string())?;
+    rusqlite::Connection::open(path)
+        .and_then(|connection| {
+            connection.execute(
+                "UPDATE history SET start_timestamp = 0 WHERE start_timestamp IS NULL",
+                [],
+            )
+        })
+        .map_err(|err| err.to_string())?;
+    Ok(TimestampedHistory(history))
 }
 
 fn startup_files(options: &StartupOptions, interactive: bool) -> Vec<PathBuf> {
@@ -2158,10 +2223,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         let session_started = Some(std::time::SystemTime::now().into());
         let history = prepare_history_path(&path)
             .map_err(|err| err.to_string())
-            .and_then(|()| {
-                SqliteBackedHistory::with_file(path, session, session_started)
-                    .map_err(|err| err.to_string())
-            });
+            .and_then(|()| open_history(path, session, session_started));
         match history {
             Ok(history) => {
                 argument_recall.load(&history, session);
@@ -2754,10 +2816,10 @@ impl Prompt for MeshPrompt {
 mod tests {
     use super::{
         ArgumentRecall, CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell,
-        StartupOptions, Step, argument_completions, command_position, command_segment_words,
-        eval_binary, expansion_word, handle_signal, help_completions, history_path_from,
-        interruptible_task, last_argument, needs_more_input, prepare_history_path, run_line,
-        run_prompt_hooks, run_source, variable_completions,
+        StartupOptions, Step, TimestampedHistory, argument_completions, command_position,
+        command_segment_words, eval_binary, expansion_word, handle_signal, help_completions,
+        history_path_from, interruptible_task, last_argument, needs_more_input, open_history,
+        prepare_history_path, run_line, run_prompt_hooks, run_source, variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
@@ -2871,12 +2933,14 @@ mod tests {
         let path = temporary_history_path("history.sqlite3");
         prepare_history_path(&path).unwrap();
         let peer_session = Reedline::create_history_session_id();
-        let mut peer = SqliteBackedHistory::with_file(
-            path.clone(),
-            peer_session,
-            Some(SystemTime::now().into()),
-        )
-        .unwrap();
+        let mut peer = TimestampedHistory(
+            SqliteBackedHistory::with_file(
+                path.clone(),
+                peer_session,
+                Some(SystemTime::now().into()),
+            )
+            .unwrap(),
+        );
         std::thread::sleep(Duration::from_millis(2));
         let current_session = Reedline::create_history_session_id();
         let current = SqliteBackedHistory::with_file(
@@ -2888,7 +2952,6 @@ mod tests {
 
         let mut item = HistoryItem::from_command_line("peer secret");
         item.session_id = peer_session;
-        item.start_timestamp = Some(SystemTime::now().into());
         peer.save(item).unwrap();
 
         let mut recall = ArgumentRecall::default();
@@ -2897,6 +2960,30 @@ mod tests {
 
         drop(current);
         drop(peer);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn history_recall_retains_rows_without_timestamps() {
+        let path = temporary_history_path("history.sqlite3");
+        prepare_history_path(&path).unwrap();
+        let mut legacy = SqliteBackedHistory::with_file(path.clone(), None, None).unwrap();
+        legacy
+            .save(HistoryItem::from_command_line("legacy command"))
+            .unwrap();
+        drop(legacy);
+
+        let session = Reedline::create_history_session_id();
+        let history = open_history(path.clone(), session, Some(SystemTime::now().into())).unwrap();
+        let entries = history
+            .search(reedline::SearchQuery::everything(
+                reedline::SearchDirection::Backward,
+                session,
+            ))
+            .unwrap();
+        assert_eq!(entries[0].command_line, "legacy command");
+
+        drop(history);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
