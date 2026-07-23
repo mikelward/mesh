@@ -2623,7 +2623,7 @@ repos. The match/menu UI itself is the [line editor](#line-editing)'s.)*
 This is the history **store and recall**; the history *expansion* syntax
 (`!!` / `^old^new`) is specified in [History expansion](#history-expansion) below.
 
-**The store is SQLite** at `$XDG_STATE_HOME/mesh/history.db` (`$XDG_STATE_HOME`
+**The store is SQLite** at `$XDG_STATE_HOME/mesh/history.sqlite3` (`$XDG_STATE_HOME`
 defaulting to `~/.local/state` — history is per-machine *state*, not cache or
 config). A flat history *file* would force `grep` for everything; a small database
 gives structured columns now and real search later, without committing to a query
@@ -3153,7 +3153,7 @@ to avoid" rather than promising the latter as done.
   as shorthand for `!!:old=new`.
 - **Interactive history (store & recall) — decided**
   ([Interactive history](#interactive-history)): a **SQLite** store at
-  `$XDG_STATE_HOME/mesh/history.db` with rich per-entry columns
+  `$XDG_STATE_HOME/mesh/history.sqlite3` with rich per-entry columns
   (command / cwd / tty / session / start / duration / status) populated by
   `preexec` / `postexec`; recall via up/down and `Ctrl-R`; a `history` built-in
   plus `history | grep` as the MVP search. Remaining: fuzzy search, a

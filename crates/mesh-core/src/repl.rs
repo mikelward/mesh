@@ -18,7 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reedline::{
-    Completer, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal, Span, Suggestion,
+    Completer, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal, Span,
+    SqliteBackedHistory, Suggestion,
 };
 
 use crate::builtins::{self, Builtin};
@@ -114,11 +115,23 @@ pub fn run() -> ExitCode {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct StartupOptions {
     login: bool,
     no_rc: bool,
     rc_file: Option<PathBuf>,
+    save_history: bool,
+}
+
+impl Default for StartupOptions {
+    fn default() -> Self {
+        Self {
+            login: false,
+            no_rc: false,
+            rc_file: None,
+            save_history: true,
+        }
+    }
 }
 
 impl StartupOptions {
@@ -129,6 +142,7 @@ impl StartupOptions {
             match arg.as_str() {
                 "-l" | "--login" => options.login = true,
                 "--norc" => options.no_rc = true,
+                "--no-save-history" | "--no-history" => options.save_history = false,
                 "--rcfile" => {
                     let path = args
                         .next()
@@ -152,6 +166,24 @@ fn config_dir() -> Option<PathBuf> {
                 .map(|home| PathBuf::from(home).join(".config"))
         })
         .map(|dir| dir.join("mesh"))
+}
+
+fn history_path() -> Option<PathBuf> {
+    history_path_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+fn history_path_from(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    xdg_state_home
+        .filter(|path| !path.is_empty() && Path::new(path).is_absolute())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|path| !path.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        })
+        .map(|dir| dir.join("mesh/history.sqlite3"))
 }
 
 fn startup_files(options: &StartupOptions, interactive: bool) -> Vec<PathBuf> {
@@ -2013,6 +2045,14 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     let mut editor = Reedline::create().with_completer(Box::new(MeshCompleter {
         state: Arc::clone(&completion),
     }));
+    if options.save_history
+        && let Some(path) = history_path()
+    {
+        match SqliteBackedHistory::with_file(path, None, None) {
+            Ok(history) => editor = editor.with_history(Box::new(history)),
+            Err(err) => eprintln!("mesh: could not open history database: {err}"),
+        }
+    }
     let mut shell = Shell::new();
     let mut last = match run_startup_files(options, true, 0, &mut shell) {
         Step::Continue(code) => code,
@@ -2588,8 +2628,8 @@ mod tests {
     use super::{
         CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell, StartupOptions, Step,
         argument_completions, command_position, command_segment_words, eval_binary, expansion_word,
-        handle_signal, help_completions, interruptible_task, needs_more_input, run_line,
-        run_prompt_hooks, run_source, variable_completions,
+        handle_signal, help_completions, history_path_from, interruptible_task, needs_more_input,
+        run_line, run_prompt_hooks, run_source, variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
@@ -2606,7 +2646,29 @@ mod tests {
         .unwrap();
         assert!(options.login);
         assert!(!options.no_rc);
+        assert!(options.save_history);
         assert_eq!(options.rc_file, Some(PathBuf::from("/tmp/custom.mesh")));
+    }
+
+    #[test]
+    fn startup_options_can_disable_saved_history() {
+        let options =
+            StartupOptions::parse(["--no-save-history"].into_iter().map(str::to_owned)).unwrap();
+        assert!(!options.save_history);
+    }
+
+    #[test]
+    fn history_uses_xdg_state_home_and_falls_back_for_relative_values() {
+        assert_eq!(
+            history_path_from(Some("/state".into()), Some("/home/user".into())),
+            Some(PathBuf::from("/state/mesh/history.sqlite3"))
+        );
+        assert_eq!(
+            history_path_from(Some("relative".into()), Some("/home/user".into())),
+            Some(PathBuf::from(
+                "/home/user/.local/state/mesh/history.sqlite3"
+            ))
+        );
     }
 
     #[test]
