@@ -2474,7 +2474,6 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
         }
     }
 
-    let paths = path_completions(word);
     let completing_word = !word.is_empty();
     let parent = if completing_word {
         &words[..words.len().saturating_sub(1)]
@@ -2491,6 +2490,7 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
             return value_completions(hint, word);
         }
     }
+    let paths = path_completions(word);
     let mut parent_values = parent_help.matching(word);
 
     if word.starts_with('-') {

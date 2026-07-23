@@ -32,8 +32,17 @@ impl CompletionSpec {
         let mut candidates = Vec::new();
         let mut values = HashMap::new();
         let mut commands = false;
+        let mut current_options = Vec::new();
+        let mut multiline_values: Option<(Vec<String>, Vec<String>)> = None;
         for line in help.lines() {
             let trimmed = line.trim();
+            if let Some((_, enum_values)) = &mut multiline_values {
+                if let Some(value) = multiline_enum_value(trimmed) {
+                    enum_values.push(value);
+                    continue;
+                }
+                finish_multiline_values(&mut values, multiline_values.take());
+            }
             let heading = trimmed.trim_end_matches(':').to_ascii_lowercase();
             if matches!(
                 heading.as_str(),
@@ -55,10 +64,19 @@ impl CompletionSpec {
                     options.push(name.to_owned());
                 }
             }
+            if !options.is_empty() {
+                current_options.clone_from(&options);
+            }
             if let Some(hint) = value_hint(trimmed, &tokens) {
-                for option in options {
-                    values.insert(option, hint.clone());
+                for option in &options {
+                    values.insert(option.clone(), hint.clone());
                 }
+            }
+            if starts_multiline_values(trimmed) && !current_options.is_empty() {
+                multiline_values = Some((current_options.clone(), Vec::new()));
+            }
+            if options.is_empty() && trimmed.is_empty() {
+                current_options.clear();
             }
             if commands
                 && let Some(command) = trimmed.split_whitespace().next()
@@ -69,6 +87,7 @@ impl CompletionSpec {
                 candidates.push(command.to_owned());
             }
         }
+        finish_multiline_values(&mut values, multiline_values);
         candidates.sort();
         candidates.dedup();
         Self { candidates, values }
@@ -142,6 +161,37 @@ impl CompletionSpec {
 }
 
 fn value_hint(line: &str, tokens: &[&str]) -> Option<ValueHint> {
+    if let Some(hint) = inline_possible_values(line) {
+        return Some(hint);
+    }
+    let metavar = tokens.iter().find_map(|token| {
+        let token = token.trim_end_matches([',', ';']);
+        token
+            .split_once('=')
+            .map(|(_, value)| value)
+            .or_else(|| (token.starts_with(['<', '[', '{'])).then_some(token))
+    })?;
+    let metavar = metavar.trim_matches(['<', '>', '[', ']', '{', '}']);
+    let alternatives: Vec<_> = metavar
+        .split(['|', ','])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+    if alternatives.iter().any(|value| directory_metavar(value)) {
+        return Some(ValueHint::Directory);
+    }
+    if alternatives.iter().any(|value| file_metavar(value)) {
+        return Some(ValueHint::File);
+    }
+    if alternatives.len() > 1 && alternatives.iter().all(|value| enum_literal(value)) {
+        return Some(ValueHint::Enum(
+            alternatives.into_iter().map(str::to_owned).collect(),
+        ));
+    }
+    None
+}
+
+fn inline_possible_values(line: &str) -> Option<ValueHint> {
     let lowercase = line.to_ascii_lowercase();
     if let Some(at) = lowercase.find("possible values:") {
         let values: Vec<_> = line[at + "possible values:".len()..]
@@ -157,31 +207,49 @@ fn value_hint(line: &str, tokens: &[&str]) -> Option<ValueHint> {
             return Some(ValueHint::Enum(values));
         }
     }
-    let metavar = tokens.iter().find_map(|token| {
-        let token = token.trim_end_matches([',', ';']);
-        token
-            .split_once('=')
-            .map(|(_, value)| value)
-            .or_else(|| (token.starts_with(['<', '[', '{'])).then_some(token))
-    })?;
-    let metavar = metavar.trim_matches(['<', '>', '[', ']', '{', '}']);
-    let enum_values: Vec<_> = metavar
-        .split(['|', ','])
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .collect();
-    if enum_values.len() > 1 {
-        return Some(ValueHint::Enum(enum_values));
+    None
+}
+
+fn starts_multiline_values(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    line.contains("possible values for this flag are:")
+        || line.contains("possible values for this option are:")
+}
+
+fn multiline_enum_value(line: &str) -> Option<String> {
+    (!line.is_empty() && enum_literal(line)).then(|| line.to_owned())
+}
+
+fn finish_multiline_values(
+    hints: &mut HashMap<String, ValueHint>,
+    pending: Option<(Vec<String>, Vec<String>)>,
+) {
+    let Some((options, values)) = pending.filter(|(_, values)| !values.is_empty()) else {
+        return;
+    };
+    for option in options {
+        hints.insert(option, ValueHint::Enum(values.clone()));
     }
-    let normalized = metavar.to_ascii_uppercase();
-    if normalized.contains("DIRECTORY") || normalized == "DIR" {
-        Some(ValueHint::Directory)
-    } else if normalized.contains("FILE") || normalized.contains("PATH") {
-        Some(ValueHint::File)
-    } else {
-        None
-    }
+}
+
+fn directory_metavar(value: &str) -> bool {
+    let normalized = value.to_ascii_uppercase();
+    normalized.contains("DIRECTORY") || normalized == "DIR"
+}
+
+fn file_metavar(value: &str) -> bool {
+    let normalized = value.to_ascii_uppercase();
+    normalized.contains("FILE") || normalized.contains("PATH")
+}
+
+fn enum_literal(value: &str) -> bool {
+    value.chars().all(|character| {
+        character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '-' | '_')
+    }) && value
+        .chars()
+        .any(|character| character.is_ascii_lowercase())
 }
 
 impl From<&str> for CompletionSpec {
@@ -413,7 +481,7 @@ mod tests {
     #[test]
     fn parses_typed_specs() {
         let spec = CompletionSpec::from_help(
-            "Commands:\n  build  compile\n\nOptions:\n  -h, --help  help\n  -o, --output <FILE>  output file\n  --directory <DIR>  working directory\n  --color <WHEN>  color [possible values: auto, always, never]\n  --format=<json|text>  output format\n",
+            "Commands:\n  build  compile\n\nOptions:\n  -h, --help  help\n  -o, --output <FILE>  output file\n  --directory <DIR>  working directory\n  --color <WHEN>  color [possible values: auto, always, never]\n  --format=<json|text>  output format\n  --config <KEY=VALUE|PATH>  config override or file\n  --placeholder <LEFT|RIGHT>  metasyntactic union\n",
         );
         assert_eq!(spec.matching("--h"), ["--help"]);
         assert_eq!(spec.matching("b"), ["build"]);
@@ -432,9 +500,32 @@ mod tests {
             spec.value_hint("--format"),
             Some(&ValueHint::Enum(vec!["json".into(), "text".into()]))
         );
+        assert_eq!(spec.value_hint("--config"), Some(&ValueHint::File));
+        assert_eq!(spec.value_hint("--placeholder"), None);
         assert_eq!(
             CompletionSpec::decode(&spec.encode("test"), "test"),
             Some(spec)
+        );
+    }
+
+    #[test]
+    fn parses_multiline_possible_value_sections() {
+        let spec = CompletionSpec::from_help(
+            "Options:\n  --color=WHEN\n      Controls when colors are used.\n      The possible values for this flag are:\n      never\n      auto\n      always\n      ansi\n\n  --type=TYPE\n      Select a file type.\n      The possible values for this option are:\n      rust\n      python\n",
+        );
+
+        assert_eq!(
+            spec.value_hint("--color"),
+            Some(&ValueHint::Enum(vec![
+                "never".into(),
+                "auto".into(),
+                "always".into(),
+                "ansi".into()
+            ]))
+        );
+        assert_eq!(
+            spec.value_hint("--type"),
+            Some(&ValueHint::Enum(vec!["rust".into(), "python".into()]))
         );
     }
 
