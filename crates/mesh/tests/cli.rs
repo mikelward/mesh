@@ -6,6 +6,7 @@
 //! stderr, and the exit code.
 
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -24,12 +25,35 @@ fn fresh_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn mesh_command() -> Command {
+fn isolated_config_home() -> &'static Path {
     static CONFIG_HOME: OnceLock<PathBuf> = OnceLock::new();
-    let config_home = CONFIG_HOME.get_or_init(|| fresh_dir("default_config"));
+    CONFIG_HOME.get_or_init(|| fresh_dir("default_config"))
+}
+
+fn mesh_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mesh"));
-    command.env("XDG_CONFIG_HOME", config_home);
+    command.env("XDG_CONFIG_HOME", isolated_config_home());
     command
+}
+
+fn exec_mesh(config_home: &Path) -> i32 {
+    use std::ffi::CString;
+
+    let name = CString::new("XDG_CONFIG_HOME").unwrap();
+    let value = CString::new(config_home.as_os_str().as_bytes()).unwrap();
+    let path = CString::new(env!("CARGO_BIN_EXE_mesh")).unwrap();
+    let arg0 = CString::new("mesh").unwrap();
+    unsafe {
+        if libc::setenv(name.as_ptr(), value.as_ptr(), 1) < 0 {
+            return 126;
+        }
+        libc::execl(
+            path.as_ptr(),
+            arg0.as_ptr(),
+            std::ptr::null::<libc::c_char>(),
+        );
+    }
+    127
 }
 
 /// Run mesh with `HOME` set to `home` (for tilde tests).
@@ -1004,6 +1028,7 @@ fn child_reads_remaining_stdin() {
 fn background_interactive_startup_stops_until_foregrounded() {
     // Run the PTY choreography in an isolated session so this test cannot
     // change the test runner's controlling terminal or process group.
+    let config_home = isolated_config_home();
     let harness = unsafe { libc::fork() };
     assert!(
         harness >= 0,
@@ -1011,7 +1036,7 @@ fn background_interactive_startup_stops_until_foregrounded() {
         std::io::Error::last_os_error()
     );
     if harness == 0 {
-        unsafe { libc::_exit(background_startup_harness()) };
+        unsafe { libc::_exit(background_startup_harness(config_home)) };
     }
 
     let mut status = 0;
@@ -1024,10 +1049,11 @@ fn background_interactive_startup_stops_until_foregrounded() {
 
 #[test]
 fn new_foreground_job_does_not_receive_sigcont() {
+    let config_home = isolated_config_home();
     let harness = unsafe { libc::fork() };
     assert!(harness >= 0);
     if harness == 0 {
-        unsafe { libc::_exit(sigcont_harness()) };
+        unsafe { libc::_exit(sigcont_harness(config_home)) };
     }
     let mut status = 0;
     assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
@@ -1039,10 +1065,11 @@ fn new_foreground_job_does_not_receive_sigcont() {
 
 #[test]
 fn spawn_failure_returns_terminal_to_interactive_shell() {
+    let config_home = isolated_config_home();
     let harness = unsafe { libc::fork() };
     assert!(harness >= 0);
     if harness == 0 {
-        unsafe { libc::_exit(spawn_failure_harness()) };
+        unsafe { libc::_exit(spawn_failure_harness(config_home)) };
     }
     let mut status = 0;
     assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
@@ -1052,9 +1079,7 @@ fn spawn_failure_returns_terminal_to_interactive_shell() {
     );
 }
 
-fn spawn_failure_harness() -> i32 {
-    use std::ffi::CString;
-
+fn spawn_failure_harness(config_home: &Path) -> i32 {
     let mut master = -1;
     let mut slave = -1;
     if unsafe {
@@ -1085,16 +1110,7 @@ fn spawn_failure_harness() -> i32 {
             libc::close(master);
             libc::close(slave);
         }
-        let path = CString::new(env!("CARGO_BIN_EXE_mesh")).unwrap();
-        let arg0 = CString::new("mesh").unwrap();
-        unsafe {
-            libc::execl(
-                path.as_ptr(),
-                arg0.as_ptr(),
-                std::ptr::null::<libc::c_char>(),
-            );
-            libc::_exit(127);
-        }
+        unsafe { libc::_exit(exec_mesh(config_home)) };
     }
     // Set the group from both sides of fork so tcsetpgrp cannot race the child.
     if unsafe { libc::setpgid(mesh, mesh) } < 0 && unsafe { libc::getpgid(mesh) } != mesh {
@@ -1138,9 +1154,7 @@ fn spawn_failure_harness() -> i32 {
     0
 }
 
-fn sigcont_harness() -> i32 {
-    use std::ffi::CString;
-
+fn sigcont_harness(config_home: &Path) -> i32 {
     let mut master = -1;
     let mut slave = -1;
     if unsafe {
@@ -1171,16 +1185,7 @@ fn sigcont_harness() -> i32 {
             libc::close(master);
             libc::close(slave);
         }
-        let path = CString::new(env!("CARGO_BIN_EXE_mesh")).unwrap();
-        let arg0 = CString::new("mesh").unwrap();
-        unsafe {
-            libc::execl(
-                path.as_ptr(),
-                arg0.as_ptr(),
-                std::ptr::null::<libc::c_char>(),
-            );
-            libc::_exit(127);
-        }
+        unsafe { libc::_exit(exec_mesh(config_home)) };
     }
     // Set the group from both sides of fork so tcsetpgrp cannot race the child.
     if unsafe { libc::setpgid(mesh, mesh) } < 0 && unsafe { libc::getpgid(mesh) } != mesh {
@@ -1225,8 +1230,7 @@ fn sigcont_harness() -> i32 {
     0
 }
 
-fn background_startup_harness() -> i32 {
-    use std::ffi::CString;
+fn background_startup_harness(config_home: &Path) -> i32 {
     use std::os::fd::RawFd;
 
     let mut master: RawFd = -1;
@@ -1266,16 +1270,7 @@ fn background_startup_harness() -> i32 {
             libc::close(master);
             libc::close(slave);
         }
-        let path = CString::new(env!("CARGO_BIN_EXE_mesh")).unwrap();
-        let arg0 = CString::new("mesh").unwrap();
-        unsafe {
-            libc::execl(
-                path.as_ptr(),
-                arg0.as_ptr(),
-                std::ptr::null::<libc::c_char>(),
-            );
-            libc::_exit(127);
-        }
+        unsafe { libc::_exit(exec_mesh(config_home)) };
     }
     unsafe { libc::close(slave) };
 
