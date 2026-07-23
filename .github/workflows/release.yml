@@ -1,9 +1,15 @@
 name: Release
 
+# Releases run only on pushes to main. A manual workflow_dispatch trigger is
+# intentionally omitted: dispatch runs the workflow file from the selected ref,
+# so a feature branch could execute an older, unguarded copy of this job and
+# publish a colliding tag or overwrite release assets. The release version and
+# tag are derived from the commit count, so an off-main run can collide with a
+# version already released from main. Keeping the trigger off the default branch
+# disables manual dispatch for every ref.
 on:
   push:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: write
