@@ -278,14 +278,14 @@ fn startup_files(options: &StartupOptions, interactive: bool) -> Vec<PathBuf> {
             files.push(dir.join("login.mesh"));
         }
     }
-    if interactive && !options.no_rc {
-        if let Some(path) = options
+    if interactive
+        && !options.no_rc
+        && let Some(path) = options
             .rc_file
             .clone()
             .or_else(|| config_dir().map(|dir| dir.join("rc.mesh")))
-        {
-            files.push(path);
-        }
+    {
+        files.push(path);
     }
     files
 }

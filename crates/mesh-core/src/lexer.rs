@@ -442,10 +442,9 @@ fn is_descriptor_prefix(current: &Option<Vec<Piece>>) -> bool {
         text,
         expandable: true,
     }) = current.as_deref().and_then(<[Piece]>::last)
+        && text.ends_with('&')
     {
-        if text.ends_with('&') {
-            return true;
-        }
+        return true;
     }
     // `N>` / `N>>` / `N<`: the pending word must consist of one bare text piece
     // containing only digits. Inspecting the word rather than scanning back to
@@ -611,11 +610,11 @@ fn parse_var(chars: &[char], at: usize) -> Result<Option<(VarRef, usize)>, LexEr
         return Ok(None); // `$` not followed by a name → literal `$`
     };
     let mut member = None;
-    if chars.get(j) == Some(&'.') {
-        if let Some((m, k)) = read_name(chars, j + 1) {
-            member = Some(m);
-            j = k;
-        }
+    if chars.get(j) == Some(&'.')
+        && let Some((m, k)) = read_name(chars, j + 1)
+    {
+        member = Some(m);
+        j = k;
     }
     let (access, mut j) = parse_access(chars, j).unwrap_or((None, j));
     let modifiers = parse_modifiers(chars, &mut j);
@@ -768,11 +767,10 @@ fn push_text(word: &mut Vec<Piece>, text: &str, expandable: bool) {
         text: last,
         expandable: e,
     }) = word.last_mut()
+        && *e == expandable
     {
-        if *e == expandable {
-            last.push_str(text);
-            return;
-        }
+        last.push_str(text);
+        return;
     }
     word.push(Piece::Text {
         text: text.to_string(),
@@ -1194,11 +1192,10 @@ fn push_char(word: &mut Vec<Piece>, c: char, expandable: bool) {
         text: last,
         expandable: e,
     }) = word.last_mut()
+        && *e == expandable
     {
-        if *e == expandable {
-            last.push(c);
-            return;
-        }
+        last.push(c);
+        return;
     }
     word.push(Piece::Text {
         text: c.to_string(),
