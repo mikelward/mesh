@@ -11,10 +11,12 @@ publish = false
 workspace = true
 
 [dependencies]
+chrono = "0.4.44"
 glob = "0.3.3"
 libc = "0.2.186"
 reedline = { version = "0.49.0", features = ["sqlite"] }
 regex = "1.11.3"
+rusqlite = "0.40.1"
 
 [dev-dependencies]
 mesh-platform = { path = "../mesh-platform" }
