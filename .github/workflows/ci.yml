@@ -32,6 +32,9 @@ jobs:
 
       - name: Install cross compiler
         uses: mlugg/setup-zig@v2
+        with:
+          # Zig 0.15 rejects the Apple target spelling emitted by cc-rs.
+          version: 0.14.1
 
       # Zig compiles bundled C dependencies; `cargo check` then type-checks all
       # macOS Rust code without needing an Apple linker or a macOS runner.
