@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
@@ -99,11 +100,116 @@ pub fn run() -> ExitCode {
     if args.next().as_deref() == Some("--mesh-background-redirect") {
         return exec::run_background_redirect(args.collect());
     }
+    let options = match StartupOptions::parse(std::env::args().skip(1)) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("mesh: {message}");
+            return ExitCode::from(2);
+        }
+    };
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        run_interactive()
+        run_interactive(&options)
     } else {
-        run_piped()
+        run_piped(&options)
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StartupOptions {
+    login: bool,
+    no_rc: bool,
+    rc_file: Option<PathBuf>,
+}
+
+impl StartupOptions {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut options = Self::default();
+        let mut args = args.peekable();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-l" | "--login" => options.login = true,
+                "--norc" => options.no_rc = true,
+                "--rcfile" => {
+                    let path = args
+                        .next()
+                        .ok_or_else(|| "--rcfile requires a file path".to_owned())?;
+                    options.rc_file = Some(path.into());
+                }
+                _ => return Err(format!("unknown option `{arg}`")),
+            }
+        }
+        Ok(options)
+    }
+}
+
+fn config_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty() && Path::new(path).is_absolute())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .map(|home| PathBuf::from(home).join(".config"))
+        })
+        .map(|dir| dir.join("mesh"))
+}
+
+fn startup_files(options: &StartupOptions, interactive: bool) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Some(dir) = config_dir() {
+        files.push(dir.join("env.mesh"));
+        if options.login {
+            files.push(dir.join("login.mesh"));
+        }
+    }
+    if interactive && !options.no_rc {
+        if let Some(path) = options
+            .rc_file
+            .clone()
+            .or_else(|| config_dir().map(|dir| dir.join("rc.mesh")))
+        {
+            files.push(path);
+        }
+    }
+    files
+}
+
+fn run_config_file(path: &Path, last: u8, shell: &mut Shell) -> Step {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Step::Continue(last),
+        Err(error) => {
+            eprintln!("mesh: {}: {error}", path.display());
+            return Step::Continue(1);
+        }
+    };
+    run_line(&text, last, false, shell)
+}
+
+fn run_startup_files(
+    options: &StartupOptions,
+    interactive: bool,
+    mut last: u8,
+    shell: &mut Shell,
+) -> Step {
+    for path in startup_files(options, interactive) {
+        match run_config_file(&path, last, shell) {
+            Step::Continue(code) => last = code,
+            flow => return flow,
+        }
+    }
+    Step::Continue(last)
+}
+
+fn run_logout(options: &StartupOptions, last: u8, shell: &mut Shell) -> u8 {
+    if !options.login {
+        return last;
+    }
+    let Some(path) = config_dir().map(|dir| dir.join("logout.mesh")) else {
+        return last;
+    };
+    let _ = run_config_file(&path, last, shell);
+    last
 }
 
 /// What to do after handling one input line.
@@ -1894,7 +2000,7 @@ fn needs_more_input(text: &str) -> bool {
     }
 }
 
-fn run_interactive() -> ExitCode {
+fn run_interactive(options: &StartupOptions) -> ExitCode {
     if let Err(err) = wait_until_foreground() {
         eprintln!("mesh: could not acquire terminal foreground: {err}");
         return ExitCode::from(1);
@@ -1907,8 +2013,13 @@ fn run_interactive() -> ExitCode {
     let mut editor = Reedline::create().with_completer(Box::new(MeshCompleter {
         state: Arc::clone(&completion),
     }));
-    let mut last: u8 = 0;
     let mut shell = Shell::new();
+    let mut last = match run_startup_files(options, true, 0, &mut shell) {
+        Step::Continue(code) => code,
+        Step::Exit(code) | Step::Return(code) => {
+            return ExitCode::from(run_logout(options, code, &mut shell));
+        }
+    };
     let mut pending = String::new();
     loop {
         shell.jobs.reap();
@@ -1931,7 +2042,7 @@ fn run_interactive() -> ExitCode {
                         vec![Value::Integer(i64::from(code))],
                         &mut shell,
                     );
-                    return ExitCode::from(code);
+                    return ExitCode::from(run_logout(options, code, &mut shell));
                 }
                 Some(Step::Continue(code)) => last = code,
                 // Top-level `run_line` reports a stray `return` itself, so one
@@ -1940,7 +2051,7 @@ fn run_interactive() -> ExitCode {
             },
             Err(err) => {
                 eprintln!("mesh: line editor error: {err}");
-                return ExitCode::from(1);
+                return ExitCode::from(run_logout(options, 1, &mut shell));
             }
         }
     }
@@ -2340,11 +2451,16 @@ fn handle_signal(
 /// Piped / non-interactive loop: read commands unbuffered from fd 0 so bytes
 /// past a command's newline stay in the pipe/file for a child that inherits
 /// stdin. A malformed (non-UTF-8) line is rejected loudly and skipped.
-fn run_piped() -> ExitCode {
+fn run_piped(options: &StartupOptions) -> ExitCode {
     // `ManuallyDrop` keeps us from closing fd 0 when the shell exits.
     let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
-    let mut last: u8 = 0;
     let mut shell = Shell::new();
+    let mut last = match run_startup_files(options, false, 0, &mut shell) {
+        Step::Continue(code) => code,
+        Step::Exit(code) | Step::Return(code) => {
+            return ExitCode::from(run_logout(options, code, &mut shell));
+        }
+    };
     let mut pending = String::new();
     // Discard a buffered input unit if any of its physical lines was invalid
     // UTF-8, while still using the parser to find the unit's end.
@@ -2358,7 +2474,7 @@ fn run_piped() -> ExitCode {
             Ok(_) => {}
             Err(err) => {
                 eprintln!("mesh: read error: {err}");
-                return ExitCode::from(1);
+                return ExitCode::from(run_logout(options, 1, &mut shell));
             }
         }
 
@@ -2388,7 +2504,9 @@ fn run_piped() -> ExitCode {
             continue;
         }
         match run_line(&full, last, false, &mut shell) {
-            Step::Exit(code) => return ExitCode::from(code),
+            Step::Exit(code) => {
+                return ExitCode::from(run_logout(options, code, &mut shell));
+            }
             Step::Continue(code) => last = code,
             Step::Return(_) => unreachable!("top-level return handled in run_line"),
         }
@@ -2396,12 +2514,14 @@ fn run_piped() -> ExitCode {
     // Report an incomplete unit at EOF; a poisoned one was already diagnosed.
     if !poisoned && !pending.trim().is_empty() {
         match run_line(&pending, last, false, &mut shell) {
-            Step::Exit(code) => return ExitCode::from(code),
+            Step::Exit(code) => {
+                return ExitCode::from(run_logout(options, code, &mut shell));
+            }
             Step::Continue(code) => last = code,
             Step::Return(_) => unreachable!("top-level return handled in run_line"),
         }
     }
-    ExitCode::from(last)
+    ExitCode::from(run_logout(options, last, &mut shell))
 }
 
 /// Read one line (up to and including the newline) into `out`, one byte at a
@@ -2466,14 +2586,36 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell, Step, argument_completions,
-        command_position, command_segment_words, eval_binary, expansion_word, handle_signal,
-        help_completions, interruptible_task, needs_more_input, run_line, run_prompt_hooks,
-        run_source, variable_completions,
+        CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell, StartupOptions, Step,
+        argument_completions, command_position, command_segment_words, eval_binary, expansion_word,
+        handle_signal, help_completions, interruptible_task, needs_more_input, run_line,
+        run_prompt_hooks, run_source, variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
     use reedline::{Prompt, PromptEditMode, Signal};
+    use std::path::PathBuf;
+
+    #[test]
+    fn startup_options_select_login_and_an_alternate_rc_file() {
+        let options = StartupOptions::parse(
+            ["--login", "--rcfile", "/tmp/custom.mesh"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(options.login);
+        assert!(!options.no_rc);
+        assert_eq!(options.rc_file, Some(PathBuf::from("/tmp/custom.mesh")));
+    }
+
+    #[test]
+    fn startup_options_reject_a_missing_rc_file_argument() {
+        assert_eq!(
+            StartupOptions::parse(["--rcfile"].into_iter().map(str::to_owned)),
+            Err("--rcfile requires a file path".to_owned())
+        );
+    }
 
     #[test]
     fn completion_recognizes_command_positions() {

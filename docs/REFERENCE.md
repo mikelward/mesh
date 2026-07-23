@@ -6,6 +6,25 @@ grows as features land.
 
 ---
 
+## Startup files
+
+Mesh reads configuration from `$XDG_CONFIG_HOME/mesh`, falling back to
+`~/.config/mesh` when `XDG_CONFIG_HOME` is unset or is not an absolute path.
+Missing files are ignored. Files are evaluated in the current shell, so their
+variables and functions remain available for the session.
+
+| File | When it runs |
+|---|---|
+| `env.mesh` | Every invocation, including non-interactive input |
+| `login.mesh` | Login shells (`-l` or `--login`), after `env.mesh` |
+| `rc.mesh` | Interactive shells, after the other startup files |
+| `logout.mesh` | When a login shell exits |
+
+`--rcfile FILE` replaces `rc.mesh`, while `--norc` skips the interactive RC
+file. Neither option skips `env.mesh` or the login files.
+
+---
+
 ## Commands
 
 A line is a command: the first word names it, the rest are arguments. Words are
