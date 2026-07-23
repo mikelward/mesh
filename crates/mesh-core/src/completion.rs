@@ -588,7 +588,9 @@ fn join_reader(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompletionCache, CompletionSpec, ValueHint, command_help, rank_candidates};
+    use super::{
+        CompletionCache, CompletionSpec, ValueHint, cache_name, command_help, rank_candidates,
+    };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -812,12 +814,7 @@ mod tests {
         );
         let words = vec![command.to_string_lossy().into_owned()];
         CompletionCache::new(Some(cache_dir.clone())).spec_for(&words);
-        let entry = fs::read_dir(&cache_dir)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+        let entry = cache_dir.join(cache_name(&command, &[]));
         fs::write(entry, "not a completion cache").unwrap();
 
         let spec = CompletionCache::new(Some(cache_dir)).spec_for(&words);
