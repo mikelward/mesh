@@ -18,8 +18,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reedline::{
-    Completer, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal, Span,
-    SqliteBackedHistory, Suggestion,
+    Completer, EditCommand, Emacs, History, KeyCode, KeyModifiers, Prompt, PromptEditMode,
+    PromptHistorySearch, Reedline, ReedlineEvent, SearchQuery, Signal, Span, SqliteBackedHistory,
+    Suggestion, default_emacs_keybindings,
 };
 
 use crate::builtins::{self, Builtin};
@@ -2032,6 +2033,83 @@ fn needs_more_input(text: &str) -> bool {
     }
 }
 
+#[derive(Default)]
+struct ArgumentRecall {
+    arguments: Vec<String>,
+    inserted: Option<(usize, String, usize)>,
+}
+
+impl ArgumentRecall {
+    fn load(&mut self, history: &dyn History) {
+        let Ok(entries) = history.search(SearchQuery::all_that_contain_rev(String::new())) else {
+            return;
+        };
+        for entry in entries.into_iter().rev() {
+            self.remember(&entry.command_line);
+        }
+    }
+
+    fn remember(&mut self, line: &str) {
+        self.inserted = None;
+        if let Some(argument) = last_argument(line) {
+            self.arguments.push(argument);
+        }
+    }
+
+    fn insert(&mut self, editor: &mut Reedline) {
+        let buffer = editor.current_buffer_contents();
+        let cursor = editor.current_insertion_point();
+        let repeated = self.inserted.as_ref().filter(|(start, text, _)| {
+            cursor == *start + text.len()
+                && buffer
+                    .get(*start..cursor)
+                    .is_some_and(|value| value == text)
+        });
+        let (start, old_len, index) = match repeated {
+            Some((start, text, index)) => (*start, text.len(), index + 1),
+            None => (cursor, 0, 0),
+        };
+        let Some(argument) = self.arguments.iter().rev().nth(index).cloned() else {
+            return;
+        };
+        editor.run_edit_commands(&[
+            EditCommand::MoveToPosition {
+                position: start,
+                select: false,
+            },
+            EditCommand::ReplaceChars(old_len, argument.clone()),
+        ]);
+        self.inserted = Some((start, argument, index));
+    }
+}
+
+fn last_argument(line: &str) -> Option<String> {
+    let parser::ParseOutcome::Complete(source) = parser::parse(line).ok()? else {
+        return None;
+    };
+    let statement = source.statements.last()?;
+    let executable = statement
+        .and_or
+        .rest
+        .last()
+        .map_or(&statement.and_or.first, |(_, executable)| executable);
+    let parser::Executable::Pipeline(pipeline) = executable else {
+        return None;
+    };
+    let words: Vec<_> = pipeline
+        .stages
+        .last()?
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            parser::CommandItem::Word(word) => Some(word),
+            parser::CommandItem::Redirect { .. } => None,
+        })
+        .collect();
+    let argument = words.get(1..)?.last()?;
+    line.get(argument.span.clone()).map(str::to_owned)
+}
+
 fn run_interactive(options: &StartupOptions) -> ExitCode {
     if let Err(err) = wait_until_foreground() {
         eprintln!("mesh: could not acquire terminal foreground: {err}");
@@ -2042,14 +2120,26 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         return ExitCode::from(1);
     }
     let completion = Arc::new(RwLock::new(CompletionState::default()));
-    let mut editor = Reedline::create().with_completer(Box::new(MeshCompleter {
-        state: Arc::clone(&completion),
-    }));
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::ALT,
+        KeyCode::Char('.'),
+        ReedlineEvent::ExecuteHostCommand("mesh:recall-last-argument".to_owned()),
+    );
+    let mut editor = Reedline::create()
+        .with_edit_mode(Box::new(Emacs::new(keybindings)))
+        .with_completer(Box::new(MeshCompleter {
+            state: Arc::clone(&completion),
+        }));
+    let mut argument_recall = ArgumentRecall::default();
     if options.save_history
         && let Some(path) = history_path()
     {
         match SqliteBackedHistory::with_file(path, None, None) {
-            Ok(history) => editor = editor.with_history(Box::new(history)),
+            Ok(history) => {
+                argument_recall.load(&history);
+                editor = editor.with_history(Box::new(history));
+            }
             Err(err) => eprintln!("mesh: could not open history database: {err}"),
         }
     }
@@ -2074,21 +2164,29 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             custom: shell.prompt.text.clone(),
         };
         match editor.read_line(&prompt) {
-            Ok(signal) => match handle_signal(signal, last, &mut shell, &mut pending) {
-                None => continue, // an unfinished `func` body: read the next line
-                Some(Step::Exit(code)) => {
-                    run_prompt_hooks(
-                        PromptEvent::Exit,
-                        vec![Value::Integer(i64::from(code))],
-                        &mut shell,
-                    );
-                    return ExitCode::from(run_logout(options, code, &mut shell));
+            Ok(Signal::HostCommand(command)) if command == "mesh:recall-last-argument" => {
+                argument_recall.insert(&mut editor);
+            }
+            Ok(signal) => {
+                if let Signal::Success(line) = &signal {
+                    argument_recall.remember(line);
                 }
-                Some(Step::Continue(code)) => last = code,
-                // Top-level `run_line` reports a stray `return` itself, so one
-                // never reaches here.
-                Some(Step::Return(_)) => unreachable!("top-level return handled in run_line"),
-            },
+                match handle_signal(signal, last, &mut shell, &mut pending) {
+                    None => continue, // an unfinished `func` body: read the next line
+                    Some(Step::Exit(code)) => {
+                        run_prompt_hooks(
+                            PromptEvent::Exit,
+                            vec![Value::Integer(i64::from(code))],
+                            &mut shell,
+                        );
+                        return ExitCode::from(run_logout(options, code, &mut shell));
+                    }
+                    Some(Step::Continue(code)) => last = code,
+                    // Top-level `run_line` reports a stray `return` itself, so one
+                    // never reaches here.
+                    Some(Step::Return(_)) => unreachable!("top-level return handled in run_line"),
+                }
+            }
             Err(err) => {
                 eprintln!("mesh: line editor error: {err}");
                 return ExitCode::from(run_logout(options, 1, &mut shell));
@@ -2626,15 +2724,51 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell, StartupOptions, Step,
-        argument_completions, command_position, command_segment_words, eval_binary, expansion_word,
-        handle_signal, help_completions, history_path_from, interruptible_task, needs_more_input,
-        run_line, run_prompt_hooks, run_source, variable_completions,
+        ArgumentRecall, CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell,
+        StartupOptions, Step, argument_completions, command_position, command_segment_words,
+        eval_binary, expansion_word, handle_signal, help_completions, history_path_from,
+        interruptible_task, last_argument, needs_more_input, run_line, run_prompt_hooks,
+        run_source, variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
-    use reedline::{Prompt, PromptEditMode, Signal};
+    use reedline::{EditCommand, Prompt, PromptEditMode, Reedline, Signal};
     use std::path::PathBuf;
+
+    #[test]
+    fn last_argument_uses_mesh_word_spans() {
+        assert_eq!(
+            last_argument("puts first \"two words\"").as_deref(),
+            Some("\"two words\"")
+        );
+        assert_eq!(
+            last_argument("one ignored | puts '$dir'/'sub dir' >out").as_deref(),
+            Some("'$dir'/'sub dir'")
+        );
+        assert_eq!(
+            last_argument("puts old; puts key:value").as_deref(),
+            Some("key:value")
+        );
+        assert_eq!(last_argument("puts"), None);
+    }
+
+    #[test]
+    fn repeated_argument_recall_walks_back_and_preserves_user_edits() {
+        let mut recall = ArgumentRecall::default();
+        recall.remember("puts first");
+        recall.remember("puts \"two words\"");
+        let mut editor = Reedline::create();
+        editor.run_edit_commands(&[EditCommand::InsertString("puts ".to_owned())]);
+
+        recall.insert(&mut editor);
+        assert_eq!(editor.current_buffer_contents(), "puts \"two words\"");
+        recall.insert(&mut editor);
+        assert_eq!(editor.current_buffer_contents(), "puts first");
+
+        editor.run_edit_commands(&[EditCommand::InsertChar('!')]);
+        recall.insert(&mut editor);
+        assert_eq!(editor.current_buffer_contents(), "puts first!\"two words\"");
+    }
 
     #[test]
     fn startup_options_select_login_and_an_alternate_rc_file() {
