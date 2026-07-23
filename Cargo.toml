@@ -4,7 +4,7 @@ members = ["crates/mesh", "crates/mesh-core", "crates/mesh-platform"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 repository = "https://github.com/mikelward/mesh"
 
 # Lints applied across every workspace crate. Warnings are denied in CI

@@ -1216,14 +1216,14 @@ impl Parser {
                 return Err(self.error(ParseErrorKind::Expected("a statement separator")));
             }
         }
-        if let Some(closer) = closer {
-            if self.eat(&closer).is_none() {
-                return Err(self.eof(ParseErrorKind::Unterminated(match closer {
-                    TokenKind::RBrace => '{',
-                    TokenKind::RParen => '(',
-                    _ => '[',
-                })));
-            }
+        if let Some(closer) = closer
+            && self.eat(&closer).is_none()
+        {
+            return Err(self.eof(ParseErrorKind::Unterminated(match closer {
+                TokenKind::RBrace => '{',
+                TokenKind::RParen => '(',
+                _ => '[',
+            })));
         }
         Ok(Source {
             statements,

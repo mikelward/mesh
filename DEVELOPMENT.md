@@ -39,8 +39,10 @@ Per [`AGENTS.md`](AGENTS.md), install tools via direct binary downloads or
 
 Cargo, as a **workspace** rooted at [`Cargo.toml`](Cargo.toml).
 
-- **Edition:** 2024. **MSRV:** 1.85 (recorded as `rust-version`; bumps are
-  deliberate, not incidental).
+- **Edition:** 2024. **MSRV:** 1.95 (recorded as `rust-version` and verified by
+  the `msrv` CI job; bumps are deliberate, not incidental). The floor is set by
+  `libsqlite3-sys`, whose build script uses the `cfg_select!` macro stabilized
+  in Rust 1.95.
 - **Three members today** — `crates/mesh`, the thin shell executable;
   `crates/mesh-core`, the reusable lexer, expansion, and runtime library; and
   `crates/mesh-platform`, a small crate holding the `libc` constants and types

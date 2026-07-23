@@ -728,16 +728,16 @@ fn apply_tilde(pieces: &mut Pieces) {
     };
     if text == "~" {
         let next = pieces.iter().skip(1).find(|(text, _)| !text.is_empty());
-        if next.is_none() || next.is_some_and(|(text, _)| text.starts_with('/')) {
-            if let Some(home) = home() {
-                pieces[0] = (home, false);
-            }
-        }
-    } else if let Some(rest) = text.strip_prefix("~/") {
-        if let Some(home) = home() {
+        if (next.is_none() || next.is_some_and(|(text, _)| text.starts_with('/')))
+            && let Some(home) = home()
+        {
             pieces[0] = (home, false);
-            pieces.insert(1, (format!("/{rest}"), true));
         }
+    } else if let Some(rest) = text.strip_prefix("~/")
+        && let Some(home) = home()
+    {
+        pieces[0] = (home, false);
+        pieces.insert(1, (format!("/{rest}"), true));
     }
 }
 
