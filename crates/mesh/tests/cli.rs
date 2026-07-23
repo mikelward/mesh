@@ -41,6 +41,70 @@ fn run_with_home(input: &str, home: &std::path::Path) -> Output {
     child.wait_with_output().expect("wait for mesh")
 }
 
+fn run_with_config(input: &str, config_home: &std::path::Path, args: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .args(args)
+        .env("XDG_CONFIG_HOME", config_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for mesh")
+}
+
+#[test]
+fn non_interactive_shell_sources_env_config() {
+    let config = fresh_dir("env_config");
+    let mesh = config.join("mesh");
+    std::fs::create_dir(&mesh).unwrap();
+    std::fs::write(mesh.join("env.mesh"), "greeting = from-env\n").unwrap();
+
+    let out = run_with_config("puts $greeting\n", &config, &[]);
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "from-env\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn login_config_runs_in_order_and_logout_runs_on_exit() {
+    let config = fresh_dir("login_config");
+    let mesh = config.join("mesh");
+    std::fs::create_dir(&mesh).unwrap();
+    std::fs::write(mesh.join("env.mesh"), "value = env\n").unwrap();
+    std::fs::write(mesh.join("login.mesh"), "puts $value\nvalue = login\n").unwrap();
+    std::fs::write(mesh.join("logout.mesh"), "puts logout-$value\n").unwrap();
+
+    let out = run_with_config("puts $value\nexit 7\n", &config, &["--login"]);
+
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "env\nlogin\nlogout-login\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn non_interactive_shell_does_not_source_rc_config() {
+    let config = fresh_dir("noninteractive_rc");
+    let mesh = config.join("mesh");
+    std::fs::create_dir(&mesh).unwrap();
+    std::fs::write(mesh.join("rc.mesh"), "puts wrong\n").unwrap();
+
+    let out = run_with_config("puts right\n", &config, &[]);
+
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "right\n");
+    assert!(out.stderr.is_empty());
+}
+
 fn run_with_bytes(input: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
         .stdin(Stdio::piped())
