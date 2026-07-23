@@ -1,6 +1,6 @@
 [package]
 name = "mesh"
-version = "0.0.0"
+version.workspace = true
 description = "An interactive-first Unix shell (pre-alpha; M0 build track)."
 edition.workspace = true
 rust-version.workspace = true
