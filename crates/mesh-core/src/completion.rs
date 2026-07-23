@@ -591,13 +591,24 @@ mod tests {
     use super::{CompletionCache, CompletionSpec, ValueHint, command_help, rank_candidates};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::thread;
     use std::time::{Duration, Instant};
 
     fn helper(path: &Path, body: &str) {
         fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn fresh_temp_dir(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        if let Err(error) = fs::remove_dir_all(&root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("failed to clean temporary directory: {error}");
+        }
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 
     #[test]
@@ -753,11 +764,10 @@ mod tests {
 
     #[test]
     fn memory_and_disk_cache_avoid_repeated_probes() {
-        let root = std::env::temp_dir().join(format!("mesh-cache-{}", std::process::id()));
+        let root = fresh_temp_dir("mesh-cache");
         let command = root.join("helper");
         let count = root.join("count");
         let cache_dir = root.join("cache");
-        fs::create_dir_all(&root).unwrap();
         helper(
             &command,
             &format!("echo x >> '{}'\necho '  --cached  cached'", count.display()),
@@ -777,9 +787,8 @@ mod tests {
 
     #[test]
     fn modification_time_invalidates_cache() {
-        let root = std::env::temp_dir().join(format!("mesh-invalidate-{}", std::process::id()));
+        let root = fresh_temp_dir("mesh-invalidate");
         let command = root.join("helper");
-        fs::create_dir_all(&root).unwrap();
         helper(&command, "echo '  --first  first'");
         let words = vec![command.to_string_lossy().into_owned()];
         let cache = CompletionCache::new(Some(root.join("cache")));
@@ -793,11 +802,10 @@ mod tests {
 
     #[test]
     fn corrupt_disk_cache_is_replaced_by_a_fresh_probe() {
-        let root = std::env::temp_dir().join(format!("mesh-corrupt-{}", std::process::id()));
+        let root = fresh_temp_dir("mesh-corrupt");
         let command = root.join("helper");
         let count = root.join("count");
         let cache_dir = root.join("cache");
-        fs::create_dir_all(&root).unwrap();
         helper(
             &command,
             &format!("echo x >> '{}'\necho '  --fresh  fresh'", count.display()),
@@ -820,10 +828,9 @@ mod tests {
 
     #[test]
     fn captures_stdout_and_stderr_and_passes_subcommands() {
-        let root = std::env::temp_dir().join(format!("mesh-help-{}", std::process::id()));
+        let root = fresh_temp_dir("mesh-help");
         let command = root.join("helper");
         let args = root.join("args");
-        fs::create_dir_all(&root).unwrap();
         helper(
             &command,
             &format!(
@@ -840,9 +847,8 @@ mod tests {
 
     #[test]
     fn times_out_nonterminating_help() {
-        let root = std::env::temp_dir().join(format!("mesh-timeout-{}", std::process::id()));
+        let root = fresh_temp_dir("mesh-timeout");
         let command = root.join("helper");
-        fs::create_dir_all(&root).unwrap();
         helper(&command, "sleep 10");
         let started = Instant::now();
         assert!(command_help(&[command.to_string_lossy().into_owned()]).is_empty());
