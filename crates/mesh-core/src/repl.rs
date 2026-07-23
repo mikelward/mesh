@@ -27,7 +27,7 @@ use reedline::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::builtins::{self, Builtin};
-use crate::completion::{CompletionCache, CompletionSpec};
+use crate::completion::{CompletionCache, CompletionSpec, ValueHint};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
 use crate::vars::{RegexValue, Value, Vars};
@@ -2464,6 +2464,16 @@ fn suggestions(values: Vec<String>, start: usize, pos: usize) -> Vec<Suggestion>
 }
 
 fn argument_completions(state: &CompletionState, words: &[String], word: &str) -> Vec<String> {
+    if let Some((option, prefix)) = word.split_once('=') {
+        let context = &words[..words.len().saturating_sub(1)];
+        if let Some(hint) = completion_for(state, context).value_hint(option) {
+            return value_completions(hint, prefix)
+                .into_iter()
+                .map(|value| format!("{option}={value}"))
+                .collect();
+        }
+    }
+
     let paths = path_completions(word);
     let completing_word = !word.is_empty();
     let parent = if completing_word {
@@ -2472,6 +2482,15 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
         words
     };
     let parent_help = completion_for(state, parent);
+
+    if let Some(option) = parent.last()
+        && option.starts_with('-')
+    {
+        let context = &parent[..parent.len() - 1];
+        if let Some(hint) = completion_for(state, context).value_hint(option) {
+            return value_completions(hint, word);
+        }
+    }
     let mut parent_values = parent_help.matching(word);
 
     if word.starts_with('-') {
@@ -2507,6 +2526,18 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
             .collect();
     }
     values
+}
+
+fn value_completions(hint: &ValueHint, prefix: &str) -> Vec<String> {
+    match hint {
+        ValueHint::File => path_completions_with(prefix, false),
+        ValueHint::Directory => path_completions_with(prefix, true),
+        ValueHint::Enum(values) => values
+            .iter()
+            .filter(|value| value.starts_with(prefix))
+            .cloned()
+            .collect(),
+    }
 }
 
 fn completion_for(state: &CompletionState, words: &[String]) -> CompletionSpec {
@@ -2608,9 +2639,13 @@ fn variable_completions(word: &str, variables: &[(String, Value)]) -> Vec<String
 }
 
 fn path_completions(word: &str) -> Vec<String> {
+    path_completions_with(word, false)
+}
+
+fn path_completions_with(word: &str, directories_only: bool) -> Vec<String> {
     let word = word.to_owned();
     interruptible_task(Duration::from_millis(200), move || {
-        path_completions_sync(&word)
+        path_completions_sync(&word, directories_only)
     })
     .unwrap_or_default()
 }
@@ -2626,7 +2661,7 @@ fn interruptible_task<T: Send + 'static>(
     receiver.recv_timeout(timeout).ok()
 }
 
-fn path_completions_sync(word: &str) -> Vec<String> {
+fn path_completions_sync(word: &str, directories_only: bool) -> Vec<String> {
     let path = std::path::Path::new(word);
     let (dir, prefix) = match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
@@ -2645,6 +2680,9 @@ fn path_completions_sync(word: &str) -> Vec<String> {
     let mut out: Vec<_> = entries
         .flatten()
         .filter_map(|entry| {
+            if directories_only && !entry.path().is_dir() {
+                return None;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             name.starts_with(prefix.as_ref()).then(|| {
                 format!(
@@ -3458,6 +3496,52 @@ mod tests {
         assert_eq!(
             argument_completions(&state, &["cat".into(), prefix.clone()], &prefix),
             [format!("{}/", child.display())]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn typed_argument_completion_filters_files_directories_and_enums() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!("mesh-typed-help-{}", std::process::id()));
+        let child = dir.join("folder");
+        let file = dir.join("file.txt");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(&file, "").unwrap();
+        let prefix = format!("{}/f", dir.display());
+        let state = CompletionState {
+            help: [(
+                "tool".into(),
+                "Options:\n  --file <FILE> input\n  --directory <DIR> root\n  --color <auto|always|never> mode\n"
+                    .into(),
+            )]
+            .into(),
+            ..CompletionState::default()
+        };
+
+        assert_eq!(
+            argument_completions(
+                &state,
+                &["tool".into(), "--file".into(), prefix.clone()],
+                &prefix
+            ),
+            [
+                file.to_string_lossy().into_owned(),
+                format!("{}/", child.display())
+            ]
+        );
+        assert_eq!(
+            argument_completions(
+                &state,
+                &["tool".into(), "--directory".into(), prefix.clone()],
+                &prefix
+            ),
+            [format!("{}/", child.display())]
+        );
+        assert_eq!(
+            argument_completions(&state, &["tool".into(), "--color=a".into()], "--color=a"),
+            ["--color=auto", "--color=always"]
         );
         fs::remove_dir_all(dir).unwrap();
     }
