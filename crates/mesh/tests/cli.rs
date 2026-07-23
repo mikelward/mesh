@@ -36,22 +36,51 @@ fn mesh_command() -> Command {
     command
 }
 
-fn exec_mesh(config_home: &Path) -> i32 {
-    use std::ffi::CString;
+struct MeshExec {
+    path: std::ffi::CString,
+    _arguments: [std::ffi::CString; 1],
+    argv: [*const libc::c_char; 2],
+    _environment: Vec<std::ffi::CString>,
+    envp: Vec<*const libc::c_char>,
+}
 
-    let name = CString::new("XDG_CONFIG_HOME").unwrap();
-    let value = CString::new(config_home.as_os_str().as_bytes()).unwrap();
-    let path = CString::new(env!("CARGO_BIN_EXE_mesh")).unwrap();
-    let arg0 = CString::new("mesh").unwrap();
-    unsafe {
-        if libc::setenv(name.as_ptr(), value.as_ptr(), 1) < 0 {
-            return 126;
+impl MeshExec {
+    fn new(config_home: &Path) -> Self {
+        use std::ffi::CString;
+
+        let path = CString::new(env!("CARGO_BIN_EXE_mesh")).unwrap();
+        let arguments = [CString::new("mesh").unwrap()];
+        let argv = [arguments[0].as_ptr(), std::ptr::null()];
+
+        let mut environment: Vec<_> = std::env::vars_os()
+            .filter(|(name, _)| name != "XDG_CONFIG_HOME")
+            .map(|(name, value)| {
+                let mut entry = name.into_encoded_bytes();
+                entry.push(b'=');
+                entry.extend(value.into_encoded_bytes());
+                CString::new(entry).unwrap()
+            })
+            .collect();
+        let mut config = b"XDG_CONFIG_HOME=".to_vec();
+        config.extend(config_home.as_os_str().as_bytes());
+        environment.push(CString::new(config).unwrap());
+
+        let mut envp: Vec<_> = environment.iter().map(|entry| entry.as_ptr()).collect();
+        envp.push(std::ptr::null());
+
+        Self {
+            path,
+            _arguments: arguments,
+            argv,
+            _environment: environment,
+            envp,
         }
-        libc::execl(
-            path.as_ptr(),
-            arg0.as_ptr(),
-            std::ptr::null::<libc::c_char>(),
-        );
+    }
+}
+
+fn exec_mesh(exec: &MeshExec) -> i32 {
+    unsafe {
+        libc::execve(exec.path.as_ptr(), exec.argv.as_ptr(), exec.envp.as_ptr());
     }
     127
 }
@@ -1028,7 +1057,7 @@ fn child_reads_remaining_stdin() {
 fn background_interactive_startup_stops_until_foregrounded() {
     // Run the PTY choreography in an isolated session so this test cannot
     // change the test runner's controlling terminal or process group.
-    let config_home = isolated_config_home();
+    let exec = MeshExec::new(isolated_config_home());
     let harness = unsafe { libc::fork() };
     assert!(
         harness >= 0,
@@ -1036,7 +1065,7 @@ fn background_interactive_startup_stops_until_foregrounded() {
         std::io::Error::last_os_error()
     );
     if harness == 0 {
-        unsafe { libc::_exit(background_startup_harness(config_home)) };
+        unsafe { libc::_exit(background_startup_harness(&exec)) };
     }
 
     let mut status = 0;
@@ -1049,11 +1078,11 @@ fn background_interactive_startup_stops_until_foregrounded() {
 
 #[test]
 fn new_foreground_job_does_not_receive_sigcont() {
-    let config_home = isolated_config_home();
+    let exec = MeshExec::new(isolated_config_home());
     let harness = unsafe { libc::fork() };
     assert!(harness >= 0);
     if harness == 0 {
-        unsafe { libc::_exit(sigcont_harness(config_home)) };
+        unsafe { libc::_exit(sigcont_harness(&exec)) };
     }
     let mut status = 0;
     assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
@@ -1065,11 +1094,11 @@ fn new_foreground_job_does_not_receive_sigcont() {
 
 #[test]
 fn spawn_failure_returns_terminal_to_interactive_shell() {
-    let config_home = isolated_config_home();
+    let exec = MeshExec::new(isolated_config_home());
     let harness = unsafe { libc::fork() };
     assert!(harness >= 0);
     if harness == 0 {
-        unsafe { libc::_exit(spawn_failure_harness(config_home)) };
+        unsafe { libc::_exit(spawn_failure_harness(&exec)) };
     }
     let mut status = 0;
     assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
@@ -1079,7 +1108,7 @@ fn spawn_failure_returns_terminal_to_interactive_shell() {
     );
 }
 
-fn spawn_failure_harness(config_home: &Path) -> i32 {
+fn spawn_failure_harness(exec: &MeshExec) -> i32 {
     let mut master = -1;
     let mut slave = -1;
     if unsafe {
@@ -1110,7 +1139,7 @@ fn spawn_failure_harness(config_home: &Path) -> i32 {
             libc::close(master);
             libc::close(slave);
         }
-        unsafe { libc::_exit(exec_mesh(config_home)) };
+        unsafe { libc::_exit(exec_mesh(exec)) };
     }
     // Set the group from both sides of fork so tcsetpgrp cannot race the child.
     if unsafe { libc::setpgid(mesh, mesh) } < 0 && unsafe { libc::getpgid(mesh) } != mesh {
@@ -1154,7 +1183,7 @@ fn spawn_failure_harness(config_home: &Path) -> i32 {
     0
 }
 
-fn sigcont_harness(config_home: &Path) -> i32 {
+fn sigcont_harness(exec: &MeshExec) -> i32 {
     let mut master = -1;
     let mut slave = -1;
     if unsafe {
@@ -1185,7 +1214,7 @@ fn sigcont_harness(config_home: &Path) -> i32 {
             libc::close(master);
             libc::close(slave);
         }
-        unsafe { libc::_exit(exec_mesh(config_home)) };
+        unsafe { libc::_exit(exec_mesh(exec)) };
     }
     // Set the group from both sides of fork so tcsetpgrp cannot race the child.
     if unsafe { libc::setpgid(mesh, mesh) } < 0 && unsafe { libc::getpgid(mesh) } != mesh {
@@ -1230,7 +1259,7 @@ fn sigcont_harness(config_home: &Path) -> i32 {
     0
 }
 
-fn background_startup_harness(config_home: &Path) -> i32 {
+fn background_startup_harness(exec: &MeshExec) -> i32 {
     use std::os::fd::RawFd;
 
     let mut master: RawFd = -1;
@@ -1270,7 +1299,7 @@ fn background_startup_harness(config_home: &Path) -> i32 {
             libc::close(master);
             libc::close(slave);
         }
-        unsafe { libc::_exit(exec_mesh(config_home)) };
+        unsafe { libc::_exit(exec_mesh(exec)) };
     }
     unsafe { libc::close(slave) };
 
