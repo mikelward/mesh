@@ -75,6 +75,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.tag }}
+          target_commitish: ${{ github.sha }}
           name: mesh ${{ env.version }}
           generate_release_notes: true
           files: |
