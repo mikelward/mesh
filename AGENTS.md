@@ -49,11 +49,13 @@ apply throughout.
 
 ## Git workflow
 
-- Before starting any task, run `git fetch origin main`. Use a fresh worktree
-  based on the latest `origin/main` when worktrees are available; otherwise
-  create a fresh branch from it. If continuing an existing branch, rebase it
-  onto the latest `origin/main` before the first new commit, resolving any
-  conflicts rather than working from an older base.
+- Before starting or continuing any task, run `git fetch origin main`. For a new
+  task, create a fresh worktree on a fresh branch based on the latest
+  `origin/main` when worktrees are available, using
+  `git worktree add -b <branch> <path> origin/main`; otherwise create a fresh
+  branch from it. When continuing an existing task branch, rebase it onto the
+  latest `origin/main` before the first new commit, resolving any conflicts
+  rather than abandoning the branch or working from an older base.
 - Clean up the branch history before requesting review and again before merge —
   no `wip` / `fix typo` / `address review` churn shipping to `main`.
 - After rewriting history, push with `git push --force-with-lease`, never a bare
