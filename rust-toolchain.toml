@@ -1,9 +1,12 @@
 # Track current stable so contributors and CI use the same channel and pick up
-# fixes automatically. This floats rather than pins an exact release: mesh is
-# pre-alpha with zero dependencies, so toolchain drift is low-risk and CI (which
-# uses this file) catches any new-compiler/Clippy breakage on every PR. Pin an
-# exact `major.minor.patch` here if reproducibility ever needs to be exact.
-# `rust-version` in Cargo.toml records the supported MSRV floor.
+# fixes automatically. This floats rather than pinning an exact release: CI runs
+# on every PR against both current stable and the MSRV floor, so new-compiler or
+# Clippy breakage surfaces immediately. Pin an exact `major.minor.patch` here if
+# reproducibility ever needs to be exact.
+#
+# `rust-version` in Cargo.toml records the supported MSRV floor (currently 1.95,
+# set by `libsqlite3-sys`, whose build script uses the `cfg_select!` macro
+# stabilized in Rust 1.95). The `msrv` CI job verifies the floor actually builds.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
