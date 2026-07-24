@@ -964,6 +964,14 @@ fn signature_close(after_open: &str) -> Option<usize> {
                 k += 1;
             }
             '\\' => k += 2,
+            // A bare `#` at a word boundary starts a comment through the newline,
+            // exactly as the lexer treats it; a `)`/`{`/`,` inside it is not
+            // structure. The following whitespace/newline resets `word_start`.
+            '#' if raw_eligible => {
+                while k < chars.len() && chars[k].1 != '\n' {
+                    k += 1;
+                }
+            }
             '\'' | '"' => match skip_quote(&chars, k + 1, c, true) {
                 Some(next) => k = next,
                 None => return None, // an unterminated quote: keep buffering
@@ -1106,6 +1114,15 @@ fn split_top_level_commas(list: &str) -> Vec<String> {
             '\\' => {
                 push_range(&mut current, k, (k + 2).min(chars.len()));
                 k += 2;
+            }
+            // A bare `#` at a word boundary is a comment through the newline; drop
+            // it (its `,` is not a separator and its text is not part of the name).
+            '#' if raw_eligible => {
+                let end = chars[k..]
+                    .iter()
+                    .position(|&(_, c)| c == '\n')
+                    .map_or(chars.len(), |offset| k + offset);
+                k = end;
             }
             ',' if depth == 0 => {
                 segments.push(std::mem::take(&mut current));
@@ -2116,6 +2133,20 @@ mod tests {
         assert!(!needs_more_input("func f(x = 1 +)\n"));
         // A well-formed default is still a valid closed signature awaiting its body.
         assert!(needs_more_input("func f(x = 1 + 2)\n"));
+    }
+
+    #[test]
+    fn needs_more_input_skips_comments_when_scanning_a_signature() {
+        // A `#` comment runs to the newline, so a `)`/`{`/`,` inside it is not
+        // signature structure. The definition keeps buffering for the real `)`.
+        assert!(needs_more_input("func f(x = 1 # comment )\n"));
+        assert!(needs_more_input("func f(x = 1 # comment )\n) {\n"));
+        assert!(needs_more_input("func f(x = 1 # brace {\n) {\n"));
+        assert!(needs_more_input("func f(\n  a, # a, comment\n  b\n"));
+        // The whole definition still closes and defines once its body arrives.
+        assert!(!needs_more_input("func f(x = 1 # c )\n) { puts $x }"));
+        // A `#` mid-word is literal, not a comment, so the `)` still closes.
+        assert!(!needs_more_input("func f(x = a#b) oops\n"));
     }
 
     #[test]

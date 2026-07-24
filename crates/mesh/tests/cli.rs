@@ -2106,6 +2106,17 @@ fn a_new_form_signature_buffers_across_lines() {
 }
 
 #[test]
+fn comments_in_a_multiline_signature_are_ignored() {
+    // A `#` comment in a signature runs to the newline, so a `)`/`,` inside it is
+    // not structure; the definition buffers to its real `)` and defines correctly.
+    let out = run_with_input(
+        "func h(\n  a, # first, and note )\n  b\n) {\n  puts \"$a $b\"\n}\nh 1 2\nputs after\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1 2\nafter\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
 fn a_default_expression_with_delimiters_buffers_across_lines() {
     // A default containing `)`, brackets, or a quoted `)`/comma must not be
     // mistaken for the end of the signature when the body brace is on a later line.
