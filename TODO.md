@@ -110,6 +110,10 @@ file as tasks land.
   - [x] List-preserving append from a slice (`xs += $ys[1..]`).
   - [x] Nested values and one-level expression spread (`[$xs]` versus
         `[...$xs]`), including spreading an indexed nested list.
+- [x] Builtins and functions as pipeline stages (`puts $x | grep`, `f | sort`,
+      `a | f | b`). Each runs in a forked child so the stages are concurrent
+      rather than buffered, which is what lets `f | head -3` end early; state a
+      stage changes is confined to it, as in every POSIX shell.
 - [x] Ordered, string-keyed maps: literals (including `[:]`), duplicate-key
       replacement, map spread, strict dot/bracket access, `+=` merge, and
       `:keys` / `:values` / `:len` collection modifiers.
@@ -131,8 +135,8 @@ file as tasks land.
 - [x] Redirecting a function (`f > out`, `f >> log`, `f < in`) — applied to the
       shell's own descriptors around the in-process call, so the body's output
       (including from externals it runs) lands in the target and stdout is
-      restored afterward. Still deferred: redirected builtins, backgrounding an
-      in-shell command, and functions as pipeline stages.
+      restored afterward. Still deferred: redirected builtins and backgrounding
+      an in-shell command.
 - [x] First `if` expression slice — command-status and value conditions, brace-delimited
       `else` / `else if`, multiline bodies, typed assignment-position results,
       and conditional list-pattern binding.
