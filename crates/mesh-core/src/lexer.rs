@@ -829,26 +829,36 @@ pub fn needs_more_input(text: &str) -> bool {
 /// through to its matching `}` and stays quarantined. Returns `None` when no body
 /// has opened, i.e. the header is still forming or is malformed without a brace.
 fn body_open_offset(text: &str) -> Option<usize> {
-    let brace = text.find('{')?;
-    match text.find('(') {
-        // `(` before the `{`: this is the signature. Find its closing `)`.
-        Some(open) if open < brace => match text[open + 1..brace].find(')') {
-            // Signature closed before the `{`: the body opens at `{` only if just
-            // whitespace sits between `)` and `{` (a real body opener); otherwise
-            // the `{` is separate content and no body opens from this header.
-            Some(rel) => {
-                let close = open + 1 + rel;
-                text[close + 1..brace].trim().is_empty().then_some(brace)
+    let paren = text.find('(');
+    let brace = text.find('{');
+    match paren {
+        // `(` present and before any `{`: this is the signature. Find its matching
+        // `)` honoring nested delimiters and quotes, so a `)`/`{` inside a default
+        // expression (`x = (1 + 2)`, `x = {a: 1}`) is not mistaken for the closer.
+        Some(open) if brace.is_none_or(|b| open < b) => {
+            match signature_close(&text[open + 1..]) {
+                // Signature closed: the body opens at the first non-whitespace after
+                // `)` only if that is `{` (a real body opener); otherwise the `{`, if
+                // any, is separate content and no body opens from this header.
+                Some(rel) => {
+                    let close = open + 1 + rel;
+                    let tail = &text[close + 1..];
+                    let trimmed = tail.trim_start();
+                    trimmed
+                        .starts_with('{')
+                        .then(|| close + 1 + (tail.len() - trimmed.len()))
+                }
+                // The signature `(` never closed: a `{` in the parameter region is a
+                // malformed header (`func f(x {`) — treat it as the body opener so
+                // the definition buffers to its matching `}` and stays quarantined.
+                None => text[open + 1..].find('{').map(|rel| open + 1 + rel),
             }
-            // The signature `(` never closed before the `{`: the `{` is in the
-            // parameter region of a malformed header — treat it as the body opener
-            // so the definition buffers to its matching `}` and stays quarantined.
-            None => Some(brace),
-        },
+        }
         // `{` before any `(` (or no `(` at all): a body opener only if the header
         // text before it is a valid name prefix (`func f {`); otherwise the `{`
         // belongs to following content (`func`⏎`puts '{'`), not this header.
         _ => {
+            let brace = brace?;
             let head = text[..brace]
                 .trim_start()
                 .strip_prefix("func")
@@ -881,7 +891,7 @@ fn header_awaits_body(text: &str) -> bool {
         return false;
     }
     let after_open = &rest[paren + 1..];
-    match after_open.find(')') {
+    match signature_close(after_open) {
         // Params still forming: keep reading only while the partial list could
         // still be completed into a valid one (`func f(,` and `func f(a,,` can
         // never be repaired, so they dispatch immediately; `func f(...`, `func
@@ -905,6 +915,62 @@ fn is_ident_prefix(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Byte offset (within `after_open`, the text just past the signature's opening
+/// `(`) of the `)` that closes the signature. Scans with the lexer's own quote,
+/// raw-string, escape, and nesting rules — the same ones [`scan_braces`] uses —
+/// so a `)` inside a default expression's string (`x = ")"`), nested parens
+/// (`x = (1 + 2)`), or brackets/braces (`x = [a, b]`, `x = {k: v}`) is not
+/// mistaken for the closer. Returns `None` while the signature is still open
+/// (including an unterminated quote, which the reader keeps buffering).
+fn signature_close(after_open: &str) -> Option<usize> {
+    let chars: Vec<(usize, char)> = after_open.char_indices().collect();
+    let mut depth = 0i32;
+    let mut word_start = true;
+    let mut after_equals = false;
+    let mut k = 0;
+    while k < chars.len() {
+        let (byte, c) = chars[k];
+        let raw_eligible = word_start || after_equals;
+        word_start = false;
+        after_equals = false;
+        match c {
+            _ if c.is_whitespace() => {
+                word_start = true;
+                k += 1;
+            }
+            '\\' => k += 2,
+            '\'' | '"' => match skip_quote(&chars, k + 1, c, true) {
+                Some(next) => k = next,
+                None => return None, // an unterminated quote: keep buffering
+            },
+            'r' if raw_eligible
+                && matches!(chars.get(k + 1).map(|&(_, c)| c), Some('\'') | Some('"')) =>
+            {
+                match skip_quote(&chars, k + 2, chars[k + 1].1, false) {
+                    Some(next) => k = next,
+                    None => return None,
+                }
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                k += 1;
+            }
+            ')' if depth == 0 => return Some(byte),
+            ')' | ']' | '}' => {
+                depth -= 1;
+                k += 1;
+            }
+            '=' | ',' => {
+                word_start = c == ',';
+                after_equals = c == '=';
+                k += 1;
+            }
+            _ => k += 1,
+        }
+    }
+    None
 }
 
 /// Is the `func` parameter list `list` structurally valid enough to keep
@@ -979,31 +1045,61 @@ fn validate_name(name: &str, names: &mut Vec<String>, forming: bool) -> bool {
 
 /// Split a parameter list on its top-level commas, ignoring commas nested inside
 /// brackets, parentheses, braces, or quotes (which can appear in a default
-/// expression, e.g. `x = [a, b]`). A trailing comma yields a final empty segment.
+/// expression, e.g. `x = [a, b]` or `x = "a,b"`). Quotes are skipped with the
+/// lexer's own escape and raw-string rules, so an escaped quote (`x = "a\",b"`)
+/// does not end the string early. A trailing comma yields a final empty segment.
 fn split_top_level_commas(list: &str) -> Vec<String> {
+    let chars: Vec<(usize, char)> = list.char_indices().collect();
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut depth = 0i32;
-    let mut quote: Option<char> = None;
-    for c in list.chars() {
-        if let Some(active) = quote {
-            current.push(c);
-            if c == active {
-                quote = None;
-            }
-            continue;
-        }
+    let mut word_start = true;
+    let mut after_equals = false;
+    let mut k = 0;
+    let push_range = |current: &mut String, from: usize, to: usize| {
+        current.extend(chars[from..to].iter().map(|&(_, c)| c));
+    };
+    while k < chars.len() {
+        let c = chars[k].1;
+        let raw_eligible = word_start || after_equals;
+        word_start = false;
+        after_equals = false;
         match c {
-            '\'' | '"' => quote = Some(c),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
+            '\'' | '"' => {
+                let end = skip_quote(&chars, k + 1, c, true).unwrap_or(chars.len());
+                push_range(&mut current, k, end);
+                k = end;
+            }
+            'r' if raw_eligible
+                && matches!(chars.get(k + 1).map(|&(_, c)| c), Some('\'') | Some('"')) =>
+            {
+                let end = skip_quote(&chars, k + 2, chars[k + 1].1, false).unwrap_or(chars.len());
+                push_range(&mut current, k, end);
+                k = end;
+            }
+            '\\' => {
+                push_range(&mut current, k, (k + 2).min(chars.len()));
+                k += 2;
+            }
             ',' if depth == 0 => {
                 segments.push(std::mem::take(&mut current));
-                continue;
+                word_start = true;
+                k += 1;
             }
-            _ => {}
+            _ => {
+                if matches!(c, '(' | '[' | '{') {
+                    depth += 1;
+                } else if matches!(c, ')' | ']' | '}') {
+                    depth -= 1;
+                } else if c.is_whitespace() {
+                    word_start = true;
+                } else if c == '=' {
+                    after_equals = true;
+                }
+                current.push(c);
+                k += 1;
+            }
         }
-        current.push(c);
     }
     segments.push(current);
     segments
@@ -1635,6 +1731,25 @@ mod tests {
         // A malformed header with a brace in the parameter region still quarantines.
         assert!(needs_more_input("func f(x {\nputs LEAK\n"));
         assert!(needs_more_input("func f(') {\nputs LEAKED\n"));
+    }
+
+    #[test]
+    fn needs_more_input_finds_the_signature_close_past_a_default_expression() {
+        // A default expression may itself contain `)`, `{`/`}`, `[`/`]`, a comma,
+        // or a quoted `)` — none of which is the signature's closing `)`. The
+        // signature scan honors nesting and the lexer's quote/escape rules, so a
+        // closed header with a delayed body opener still buffers.
+        assert!(needs_more_input("func f(x = (1 + 2))\n"));
+        assert!(needs_more_input("func f(x = (1 + 2))\n{\n"));
+        assert!(needs_more_input("func f(x = [a, b])\n{\n"));
+        assert!(needs_more_input("func f(x = {k: v})\n{\n"));
+        assert!(needs_more_input("func f(x = \")\")\n{\n"));
+        assert!(needs_more_input("func f(x = \"a\\\",b\")\n{\n"));
+        // The body still opens right after the true signature close.
+        assert!(!needs_more_input("func f(x = (1 + 2)) { puts $x }"));
+        // An unterminated quote in a default keeps the signature open (buffering),
+        // not falsely closed at a later `)`.
+        assert!(needs_more_input("func f(x = \"a)\n"));
     }
 
     #[test]

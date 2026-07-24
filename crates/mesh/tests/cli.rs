@@ -2037,6 +2037,19 @@ fn a_new_form_signature_buffers_across_lines() {
 }
 
 #[test]
+fn a_default_expression_with_delimiters_buffers_across_lines() {
+    // A default containing `)`, brackets, or a quoted `)`/comma must not be
+    // mistaken for the end of the signature when the body brace is on a later line.
+    let parens = run_with_input("func f(x = (1 + 2))\n{\n  puts $x\n}\nf\n");
+    assert_eq!(String::from_utf8_lossy(&parens.stdout), "3\n");
+    assert!(parens.stderr.is_empty(), "{:?}", parens.stderr);
+
+    let quoted = run_with_input("func g(x = \"a\\\",b\")\n{\n  puts $x\n}\ng\n");
+    assert_eq!(String::from_utf8_lossy(&quoted.stdout), "a\",b\n");
+    assert!(quoted.stderr.is_empty(), "{:?}", quoted.stderr);
+}
+
+#[test]
 fn a_declared_help_flag_is_kept_and_not_synthesized() {
     // A function that claims `--help` observes the switch in its body instead of
     // triggering the canned help, and its generated help does not duplicate the
