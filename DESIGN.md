@@ -1272,12 +1272,15 @@ Named **`:match`** (not `:matches`), the unanchored scripting-world sense — Ru
 with the [`match`](#matching-match) statement and the `~` test, one regex story
 under one word.
 
-*(TODO: **consolidate `~ /re/` and `:match(/re/)`?** They already overlap — since
-`:match` is falsey on a miss, `if $str:match(/re/)` covers the yes/no case that `~`
-exists for, so `~` is arguably sugar for `:match`'s truthiness. Keep both for now
-(`~` reads better as a bare predicate, `:match` when you want the captures), but
-revisit whether one should be defined in terms of the other, or dropped, before
-first release.)*
+*(**Decided — keep both, split by job** *(resolving the earlier "consolidate?"
+open, settled alongside the [`match`](#matching-match) `~`-alignment law)*. They
+overlap — `:match` is falsey on a miss, so `if $str:match(/re/)` covers `~`'s yes/no
+— but the division is deliberate and worth two spellings: **`~` (and a bare `/re/`
+`match` arm) answer *whether*; `:match` extracts *what*.** `~` reads as a bare
+predicate and binds nothing; `:match` is the single capture path. Defining `~` as
+literal sugar for `:match`-truthiness is a fine mental model and costs nothing, but
+neither is dropped — a predicate that quietly returned a capture list, or a capture
+call you had to read as a bool, would blur the whether/what line this keeps crisp.)*
 
 **Regex is a first-class value** *(decided — porting `fromto`, `filter`, `he`,
 `untar`)*. `/re/` is a **regex literal** evaluating to a regex **value**, and `~`
@@ -1859,9 +1862,15 @@ Rules:
   in statement position the value is discarded and arms run for effect.
 - **Regex captures**: on the *value* side this is **settled** — `str:match(/re/)`
   returns the groups (positional → list, named → map); see
-  [Destructuring](#destructuring). What stays *(open)* is only whether a `/re/`
-  **arm** *auto*-binds its groups into the arm body, or whether you reach for
-  `:match` explicitly there too.
+  [Destructuring](#destructuring). A `/re/` **arm** does **not** *auto*-bind its
+  groups *(decided — resolving the earlier open)*: a bare `/re/` arm is a pure
+  yes/no predicate exactly like the `~` it mirrors (see the alignment note below),
+  and to *capture* you write the explicit `:match` binder as an arm — `[a b] =
+  $x:match(/re/)` on the value, or a list arm over `$x:match(/re/)`. Auto-binding
+  would smuggle invisible, position-fragile names into the arm body (Perl's `$1` /
+  bash's `BASH_REMATCH`), the one implicit-value habit mesh's error model exists to
+  refuse; keeping capture explicit leaves a single obvious rule and a clean split —
+  `~`/`/re/`-arm answer *whether*, `:match` extracts *what*.
 - **List-shape patterns** *(settled — see [Destructuring](#destructuring))*: a
   `match` arm may be a list pattern that **binds by position** — a bare element is
   always a **binder** (never a literal to match), with `_` to discard and `...rest`
@@ -1871,6 +1880,40 @@ Rules:
   (`[verb ...rest] if $verb == "quit"`). Richer element sub-patterns (a literal /
   glob / `/re/` element, or nesting) and **map-shape** patterns (`[k: v]`) stay
   **deferred** until the need is real.
+
+**One pattern grammar: a `match` arm *is* a `~` right-hand side.** This is the load-
+bearing tie between the two constructs, stated as a law rather than left as a
+resemblance:
+
+> `match $x { P { … } }` takes the `P` arm **iff `$x ~ P` is true.**
+
+So the arm vocabulary and the `~` RHS are *the same grammar* — a glob (`*.txt`), a
+`/re/`, `|` alternation, a `1..=9` range, a literal — learned once and read the same
+in both places. `~` is the inline, one-subject **yes/no**; `match` is the multi-arm,
+one-subject **dispatch that yields a value**; and an `if … ~ … else if … ~ …` chain
+is the same `~` composed for a *handful* of heterogeneous branches (mixed `~`,
+comparisons, and command conditions) with **no new syntax**. Three reaches, one
+pattern language, nothing bespoke to any of them. The single deliberate seam is the
+one already noted above: a bare word inside `[ ]` is a **binder**, at the top of an
+arm a **literal**.
+
+**Keyword and operator: alternatives considered.** The exploration weighed six
+spellings against this alignment and mesh's expression identity; `match` +
+`~` wins on every axis, and the rest are recorded here as **declined**:
+
+| Candidate | Verdict | Why |
+| --- | --- | --- |
+| `match $x { P { … } }` | **chosen** | An **expression** that yields the arm's value — the same call mesh made for `if`. The keyword the modern field converged on: Rust, ML/Scala, Python, Elixir, Ruby's `case/in`, and **nushell** (the closest sibling shell) all use `match`/pattern-dispatch as a value form. |
+| `switch $x { … }` / `case $x { … }` | declined | The user's own objection is decisive: `switch`/`case` read as **imperatives that don't yield a value** (bash, fish, Swift, PowerShell are all statement-only). Adopting the keyword either drags in `in … ;; … esac` POSIX ceremony (a clean-break non-goal) or is just `match` wearing a worse-connotation name. Ruby proves `case` *can* be an expression, but only by fighting the word's grain. |
+| `if $x ~~ { … }` | declined | This is **Perl's smartmatch**, which Perl **deprecated and gutted** for exactly the failure mesh's [error model](#error-handling) is built to avoid: one "do-what-I-mean" operator whose meaning shifts with operand context becomes unpredictable. Ruby's `===` survives *only* by hiding behind `when` with each class defining it narrowly — not a free-standing operator. |
+| `if match $x { … }` / `if $x match { … }` | declined | Fuses `if` with `match`, but `match` is **already** an expression — bare `match $x { … }` runs in statement position and `x = match …` binds — so the `if` wrapper adds a keyword and falsely implies a boolean where the construct is multi-way. No surveyed language spells it this way. |
+| `if $x ~ P { … } else if $x ~ Q { … }` | **kept (falls out free)** | Not a rival to `match` but its **small-scale** form — already available as `if` + `~`, no new grammar. Right when branches are few or heterogeneous; `match` is right when many arms dispatch on one subject. |
+
+Net: the two operators mesh already ships — `~`/`!~` for the inline predicate,
+`match` for the value-yielding dispatch — are the whole surface, sharing one pattern
+grammar. The exploration's job was to confirm that against the field and to **retire**
+`~~`, `switch`/`case`, and the `if match` fusions as named-and-declined, so they don't
+resurface.
 
 ### Tests and comparisons
 
