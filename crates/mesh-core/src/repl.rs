@@ -1032,6 +1032,8 @@ struct Stage {
 
 struct Redir {
     kind: exec::RedirKind,
+    /// The descriptor a `N>` prefix named, or `None` for the direction's default.
+    fd: Option<u32>,
     target: Word,
 }
 
@@ -1053,7 +1055,9 @@ fn run_ast_pipeline(
         for item in &command.items {
             match item {
                 parser::CommandItem::Word(word) => words.push(expansion_word(&word.value)),
-                parser::CommandItem::Redirect { kind, target, .. } => redirs.push(Redir {
+                parser::CommandItem::Redirect {
+                    kind, fd, target, ..
+                } => redirs.push(Redir {
                     kind: match kind {
                         parser::RedirectKind::Input => exec::RedirKind::In,
                         parser::RedirectKind::Output => exec::RedirKind::Out,
@@ -1063,6 +1067,7 @@ fn run_ast_pipeline(
                             return Step::Continue(1);
                         }
                     },
+                    fd: *fd,
                     target: expansion_word(&target.value),
                 }),
             }
@@ -2138,10 +2143,7 @@ fn run_stage_in_shell(words: &[String], shell: &mut Shell) -> u8 {
 
 /// Expand each redirection target to exactly one path. Zero or several words is
 /// an ambiguous redirect (a glob/list target is not a single file).
-fn expand_redirs(
-    redirs: Vec<Redir>,
-    vars: &Vars,
-) -> Result<Vec<(exec::RedirKind, String)>, String> {
+fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirection>, String> {
     let mut out = Vec::with_capacity(redirs.len());
     for redir in redirs {
         let mut paths = expand::expand(vec![redir.target], vars).map_err(|e| e.to_string())?;
@@ -2151,7 +2153,13 @@ fn expand_redirs(
                 paths.len()
             ));
         }
-        out.push((redir.kind, paths.pop().unwrap()));
+        out.push(exec::Redirection {
+            fd: redir
+                .fd
+                .map_or_else(|| exec::Redirection::default_fd(redir.kind), |fd| fd as i32),
+            kind: redir.kind,
+            path: paths.pop().unwrap(),
+        });
     }
     Ok(out)
 }

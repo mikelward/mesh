@@ -45,8 +45,13 @@ file as tasks land.
 - [x] Pipelines (`a | b | c`) with pipefail status, ignoring an upstream
       `SIGPIPE` caused by a downstream stage closing the pipe.
 - [x] Basic redirection (`>`, `>>`, `<`) on external commands, including
-      redirections on individual pipeline stages. Deferred: descriptor/stderr
-      redirection, redirected builtins, and redirection without a command.
+      redirections on individual pipeline stages.
+- [x] Descriptor redirection to a file: `2>`, `2>>`, and `1>` alongside the
+      defaults, on external commands, functions, forked pipeline stages, and
+      background commands. The digits must abut the operator, so `echo 2 > f`
+      still writes "2". Deferred: descriptor *duplication* (`2>&1`, `&>`, `>&`,
+      `<&`), descriptors above 2, redirected builtins outside a pipeline, and
+      redirection without a command.
 - [x] Fork-based executor and process groups (`fork`/`exec`, `setpgid`,
       `tcsetpgrp`) so mesh can own the terminal and manage foreground jobs.
 - [x] Signal handling: terminal signals target the foreground process group;
