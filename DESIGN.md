@@ -1960,7 +1960,9 @@ and is on the table as an alternative, **not** a decision:
   **early-exit only**; **status is a view of the result** (int→itself, bool→`0`/`1`,
   any other value→`0`); the caller picks value-vs-stream **by syntax** (`f()` value,
   `$(f)` stdout, bare `f` runs); and a **bare RHS word is a literal string**.
-- The **proposal**: make `puts`/printing the *only* byte producer and require an
+- The **proposal**: make `puts`/printing the only explicit **typed-value→bytes**
+  operation (ordinary command stdout — `ls`, external programs — still streams bytes for
+  pipes and `$(f)` capture, unchanged) and require an
   **explicit keyword** for a typed value, so `{ … }` blocks are pure command-context (a
   bare word always *runs*; quotes mean only "group into one word," removing the
   `"$a""$b"` value-vs-command ambiguity at a block tail). This **reopens** the settled
