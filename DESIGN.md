@@ -1963,8 +1963,8 @@ but leaves `if`/`match`-arm-yield needing a separate mechanism. Either way `retu
 status stays the settled [status view](#functions). *Undecided.*
 
 **Explored, kept the settled model — `0` = success is correct** *(not a change)*. The
-exploration questioned `int → status` (a nonzero int reads as failure, `0` as success/
-truthy) as making a bare int an exit code rather than data. Resolution: **keep it.**
+exploration questioned `int → status` — a bare int read as an exit code rather than data,
+its truthiness following the status view, not the number. Resolution: **keep it.**
 External commands exit `0` for success with no typed value to consult, so for `if X { }`
 to mean "did X succeed" whether `X` is `grep -q …` or a mesh function, a function's
 `0`/success must be truthy too — that interchangeability is the point, and it just works.
