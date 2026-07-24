@@ -1180,13 +1180,11 @@ fn eval_expr(
             name,
             arguments,
         } => {
-            if arguments.is_some() {
-                return runtime_error(format!(
-                    "modifier :{name} arguments are not implemented yet"
-                ));
-            }
             let mut value = eval_expr(value, last, in_function, shell)?;
             if let Value::Regex(regex) = &mut value {
+                if arguments.is_some() {
+                    return runtime_error(format!("modifier :{name} does not take arguments"));
+                }
                 match name.as_str() {
                     "i" | "ignorecase" => regex.case_insensitive = true,
                     "m" | "multiline" => regex.multi_line = true,
@@ -1199,7 +1197,20 @@ fn eval_expr(
                 compile_regex(regex).map_err(runtime_message)?;
                 return Ok(value);
             }
+            if let Some(arguments) = arguments {
+                return eval_modifier_with_arguments(
+                    name,
+                    value,
+                    arguments,
+                    last,
+                    in_function,
+                    shell,
+                );
+            }
             let Some(modifier) = expand::Modifier::from_name(name) else {
+                if modifier_takes_arguments(name) {
+                    return runtime_error(format!("modifier :{name} requires an argument"));
+                }
                 return runtime_error(format!("modifier :{name} is not implemented yet"));
             };
             expand::apply_modifier(value, modifier)
@@ -1311,6 +1322,59 @@ fn eval_call(
     value.case_insensitive = case_insensitive;
     compile_regex(&value).map_err(runtime_message)?;
     Ok(Value::Regex(value))
+}
+
+/// Is `name` a modifier that requires a parenthesized argument list? Used only to
+/// give a clearer error when such a modifier is written bare (`:split` without
+/// arguments) rather than the generic "not implemented yet".
+fn modifier_takes_arguments(name: &str) -> bool {
+    matches!(name, "join" | "split")
+}
+
+/// Evaluate a modifier that carries a parenthesized argument list (`:split(SEP)`,
+/// `:join(SEP)`). The argument-free set is handled by [`expand::apply_modifier`].
+fn eval_modifier_with_arguments(
+    name: &str,
+    value: Value,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    match name {
+        "split" | "join" => {
+            let separator = single_string_argument(name, arguments, last, in_function, shell)?;
+            let result = if name == "split" {
+                expand::split_value(value, &separator)
+            } else {
+                expand::join_value(value, &separator)
+            };
+            result.map_err(runtime_message)
+        }
+        _ if expand::Modifier::from_name(name).is_some() => {
+            runtime_error(format!("modifier :{name} does not take arguments"))
+        }
+        _ => runtime_error(format!(
+            "modifier :{name} arguments are not implemented yet"
+        )),
+    }
+}
+
+/// Evaluate a modifier's single positional argument and require it to be a string.
+fn single_string_argument(
+    name: &str,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<String, Step> {
+    let [parser::Argument::Positional(expression)] = arguments else {
+        return runtime_error(format!("modifier :{name} takes exactly one argument"));
+    };
+    match eval_expr(expression, last, in_function, shell)? {
+        Value::String(value) => Ok(value),
+        _ => runtime_error(format!("modifier :{name} argument must be a string")),
+    }
 }
 
 fn runtime_message(message: impl std::fmt::Display) -> Step {

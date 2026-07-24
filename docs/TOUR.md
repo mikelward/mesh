@@ -276,7 +276,24 @@ A list-returning modifier remains a real list, so spread it with `...` in
 command arguments or assign it intact (`ys = $xs:rest`). Path and case
 modifiers map over a list element by element. An unknown name is not consumed as
 a modifier, which keeps constructions such as `$host:$port` working literally.
-Modifier arguments such as `:join(",")` are not implemented yet.
+
+A modifier that takes an argument spells it in parentheses. `:join(SEP)` folds a
+list back into a string and `:split(SEP)` unfolds a string into a list:
+
+<pre>
+mesh$ <strong>dirs = [/usr/bin /bin]</strong>
+mesh$ <strong>path = $dirs:join(":")</strong>
+mesh$ <strong>puts $path</strong>
+/usr/bin:/bin
+mesh$ <strong>fields = $path:split(":")</strong>
+mesh$ <strong>puts $fields:len</strong>
+2
+</pre>
+
+`:split` treats the separator as a terminator, so a trailing delimiter adds no
+empty element (`"a:b:":split(":")` is `[a b]`). These argument-taking modifiers
+work in an assignment or other value context today; the bare command-word form
+(`puts $dirs:join(":")`) is not wired up yet.
 
 ## Numbers, booleans, and operators
 
