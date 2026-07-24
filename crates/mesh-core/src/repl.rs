@@ -19,10 +19,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reedline::{
-    Completer, EditCommand, Emacs, History, HistoryItem, HistoryItemId, HistorySessionId, KeyCode,
-    KeyModifiers, Prompt, PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent,
-    SearchDirection, SearchQuery, Signal, Span, SqliteBackedHistory, Suggestion,
-    default_emacs_keybindings,
+    Color, Completer, EditCommand, Emacs, History, HistoryItem, HistoryItemId, HistorySessionId,
+    KeyCode, KeyModifiers, Prompt, PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent,
+    SearchDirection, SearchQuery, Signal, SimpleMatchHighlighter, Span, SqliteBackedHistory,
+    Suggestion, default_emacs_keybindings,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -2265,6 +2265,8 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     );
     let mut editor = Reedline::create()
         .with_edit_mode(Box::new(Emacs::new(keybindings)))
+        .with_highlighter(Box::new(input_highlighter()))
+        .with_visual_selection_style(nu_ansi_term::Style::default())
         .with_completer(Box::new(MeshCompleter {
             state: Arc::clone(&completion),
         }));
@@ -2358,6 +2360,10 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             }
         }
     }
+}
+
+fn input_highlighter() -> SimpleMatchHighlighter {
+    SimpleMatchHighlighter::default().with_neutral_style(nu_ansi_term::Style::new().bold())
 }
 
 fn completed_command(signal: &Signal, pending: &str) -> Option<String> {
@@ -2950,6 +2956,18 @@ impl Prompt for MeshPrompt {
     ) -> Cow<'_, str> {
         Cow::Borrowed("search: ")
     }
+    fn get_prompt_color(&self) -> Color {
+        Color::Reset
+    }
+    fn get_prompt_multiline_color(&self) -> nu_ansi_term::Color {
+        nu_ansi_term::Color::Default
+    }
+    fn get_indicator_color(&self) -> Color {
+        Color::Reset
+    }
+    fn get_prompt_right_color(&self) -> Color {
+        Color::Reset
+    }
 }
 
 #[cfg(test)]
@@ -2958,14 +2976,14 @@ mod tests {
         ArgumentRecall, CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell,
         StartupOptions, Step, TimestampedHistory, argument_completions, command_position,
         command_segment_words, completed_command, eval_binary, expansion_word, handle_signal,
-        help_completions, history_path_from, interruptible_task, last_argument, needs_more_input,
-        open_history, path_completions_sync, persist_logical_history, prepare_history_path,
-        run_line, run_prompt_hooks, run_source, variable_completions,
+        help_completions, history_path_from, input_highlighter, interruptible_task, last_argument,
+        needs_more_input, open_history, path_completions_sync, persist_logical_history,
+        prepare_history_path, run_line, run_prompt_hooks, run_source, variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
     use reedline::{
-        EditCommand, History, HistoryItem, Prompt, PromptEditMode, Reedline, Signal,
+        EditCommand, Highlighter, History, HistoryItem, Prompt, PromptEditMode, Reedline, Signal,
         SqliteBackedHistory,
     };
     use std::fs;
@@ -3733,6 +3751,32 @@ mod tests {
             Step::Continue(0)
         );
         assert!(shell.prompt.text.is_none());
+    }
+
+    #[test]
+    fn prompt_uses_terminal_default_colors() {
+        let prompt = MeshPrompt {
+            failed: false,
+            continuation: false,
+            custom: None,
+        };
+
+        assert_eq!(prompt.get_prompt_color(), reedline::Color::Reset);
+        assert_eq!(
+            prompt.get_prompt_multiline_color(),
+            nu_ansi_term::Color::Default
+        );
+        assert_eq!(prompt.get_indicator_color(), reedline::Color::Reset);
+        assert_eq!(prompt.get_prompt_right_color(), reedline::Color::Reset);
+    }
+
+    #[test]
+    fn interactive_input_is_bold_without_a_foreground_color() {
+        let highlighted = input_highlighter().highlight("puts hello", 10);
+
+        assert_eq!(highlighted.buffer.len(), 1);
+        assert_eq!(highlighted.buffer[0].0, nu_ansi_term::Style::new().bold());
+        assert_eq!(highlighted.buffer[0].1, "puts hello");
     }
 
     #[test]
