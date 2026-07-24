@@ -160,6 +160,27 @@ file as tasks land.
 - [ ] Load curated completion specs, then add man-page-derived specs.
 - [ ] Expose static and dynamic completion overrides through `$sh.complete`.
 
+## Beyond M3 — Invocation
+
+- [x] Run a script named on the command line (`mesh script.mesh a b c`), a
+      command string (`-c "…"`), or stdin (`-s`), alongside the existing
+      interactive and piped paths. Option parsing stops at the first operand so a
+      script's own flags reach it; `--` ends it explicitly. A script is parsed as
+      one unit, so a syntax error rejects the whole file; a missing script exits
+      `127` and an unreadable one `126`. Shebangs work by way of `#` comments.
+- [x] `--help` and `--version`.
+- [x] First slice of the read-only `$sh` namespace: `$sh.args` (a real list, not
+      `$1` / `$@` / `$#`) and `$sh.name`. `sh` joins `env` as a reserved name.
+- [ ] `-i` to force an interactive session when stdin is not a terminal.
+- [ ] Mutating positional arguments (`shift` / `set --`), deferred in `DESIGN.md`
+      along with system-wide `/etc/mesh/*` startup files.
+- [ ] A `source` builtin, and the input **origin** (`script` / `sourced` /
+      `command` / `stdin` / `interactive`) plus `$sh.source` that `DESIGN.md`
+      §"Startup and invocation" leaves as a TODO — a file needs to know it is
+      being sourced, and where it lives.
+- [ ] The rest of `$sh.*`: `$sh.status`, `$sh.pipestatus`, `$sh.pid`,
+      `$sh.interactive`, the stream handles, `$sh.jobs`, and the hook maps.
+
 ## Loose ends
 
 Small items rescued from pull requests that were closed as superseded — the bulk

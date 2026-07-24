@@ -380,8 +380,10 @@ fn glob_pattern(pieces: &Pieces) -> String {
 /// Resolve a variable reference to its string value.
 ///
 /// `$env.KEY` reads the process environment (strict: unset is an error).
-/// `$name` reads the variable store (unbound is an error). Member access on any
-/// namespace other than `env`, and a bare `$env`, are not supported yet.
+/// `$sh` is the shell's own read-only namespace, resolved as a map so member
+/// access, indexing, and modifiers work through the usual paths. `$name` reads
+/// the variable store (unbound is an error). Member access on any namespace
+/// other than `env` and `sh`, and a bare `$env`, are not supported yet.
 fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
     match resolve_value(vref, vars)? {
         Value::String(value) => Ok(value),
@@ -402,10 +404,13 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
             .map(|v| Value::String(v.to_string_lossy().into_owned()))
             .ok_or_else(|| ExpandError::UnsetEnv(key.clone()))?
     } else {
-        let mut value = vars
-            .get(&vref.name)
-            .ok_or_else(|| ExpandError::UnboundVar(vref.name.clone()))?
-            .clone();
+        let mut value = if vref.name == "sh" {
+            vars.shell_namespace()
+        } else {
+            vars.get(&vref.name)
+                .ok_or_else(|| ExpandError::UnboundVar(vref.name.clone()))?
+                .clone()
+        };
         for access in &vref.accesses {
             value = match access {
                 Access::Member(key) => map_value_access(value, key, &vref.name)?,

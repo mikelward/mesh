@@ -32,7 +32,7 @@ use crate::builtins::{self, Builtin};
 use crate::completion::{CompletionCache, CompletionSpec, ValueHint, rank_candidates};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
-use crate::vars::{RegexValue, Value, Vars};
+use crate::vars::{self, RegexValue, Value, Vars};
 use crate::{exec, expand, parser};
 
 const COMPLETION_MENU: &str = "completion_menu";
@@ -116,11 +116,84 @@ pub fn run() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        run_interactive(&options)
-    } else {
-        run_piped(&options)
+    match &options.invocation {
+        Invocation::Print(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        Invocation::Command(text) => run_batch(&text.clone(), &options),
+        Invocation::Script(path) => match read_script(path) {
+            Ok(text) => run_batch(&text, &options),
+            Err(code) => ExitCode::from(code),
+        },
+        Invocation::Stdin => run_piped(&options),
+        Invocation::Default => {
+            if io::stdin().is_terminal() && io::stdout().is_terminal() {
+                run_interactive(&options)
+            } else {
+                run_piped(&options)
+            }
+        }
     }
+}
+
+/// Read a script file, reporting failures with the shell's own status
+/// conventions: `127` when it is not there, `126` when it is there but cannot be
+/// read — the same codes an unrunnable command yields.
+fn read_script(path: &Path) -> Result<String, u8> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) => {
+            eprintln!("mesh: {}: {error}", path.display());
+            Err(if error.kind() == io::ErrorKind::NotFound {
+                127
+            } else {
+                126
+            })
+        }
+    }
+}
+
+/// Run a whole batch of mesh source — a script file or a `-c` string — as the
+/// entire session: startup files, the source, then the logout file.
+///
+/// The source is parsed as one unit, so a syntax error anywhere rejects the
+/// whole batch and nothing runs (`DESIGN.md` §"Error handling"); this is why a
+/// half-valid script cannot leave the shell in a partly-configured state.
+fn run_batch(text: &str, options: &StartupOptions) -> ExitCode {
+    let mut shell = Shell::new();
+    shell
+        .vars
+        .set_invocation(options.name.clone(), options.args.clone());
+    let last = match run_startup_files(options, false, 0, &mut shell) {
+        Step::Continue(code) => code,
+        Step::Exit(code) => return ExitCode::from(run_logout(options, code, &mut shell)),
+        Step::Return(value) => {
+            return ExitCode::from(run_logout(options, status_of(&value), &mut shell));
+        }
+    };
+    let code = match run_line(text, last, false, &mut shell) {
+        Step::Continue(code) | Step::Exit(code) => code,
+        Step::Return(_) => unreachable!("top-level return handled in run_line"),
+    };
+    ExitCode::from(run_logout(options, code, &mut shell))
+}
+
+/// Where this invocation's commands come from, decided by `-c` / `-s` and the
+/// first operand.
+#[derive(Debug, PartialEq, Eq)]
+enum Invocation {
+    /// Neither a script nor `-c`: an interactive session when stdin and stdout
+    /// are both terminals, otherwise commands read from stdin.
+    Default,
+    /// `-s` — read commands from stdin even on a terminal.
+    Stdin,
+    /// `-c TEXT` — run one command string.
+    Command(String),
+    /// A script path operand — run that file.
+    Script(PathBuf),
+    /// `--help` / `--version` — print this text and exit successfully.
+    Print(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -129,6 +202,11 @@ struct StartupOptions {
     no_rc: bool,
     rc_file: Option<PathBuf>,
     save_history: bool,
+    invocation: Invocation,
+    /// Positional arguments, exposed as the `$sh.args` list.
+    args: Vec<String>,
+    /// The shell-or-script name, exposed as `$sh.name` (bash's `$0`).
+    name: String,
 }
 
 impl Default for StartupOptions {
@@ -138,11 +216,35 @@ impl Default for StartupOptions {
             no_rc: false,
             rc_file: None,
             save_history: true,
+            invocation: Invocation::Default,
+            args: Vec::new(),
+            name: "mesh".to_owned(),
         }
     }
 }
 
+const USAGE: &str = "\
+Usage: mesh [OPTIONS] [SCRIPT [ARG ...]]
+       mesh [OPTIONS] -c COMMAND [ARG ...]
+
+Options:
+  -c COMMAND           Run COMMAND, then exit
+  -s                   Read commands from stdin, even on a terminal
+  -l, --login          Run as a login shell (also sources login.mesh)
+      --rcfile FILE    Use FILE instead of rc.mesh
+      --norc           Skip rc.mesh
+      --no-save-history  Keep this session's history in memory only
+  -h, --help           Print help
+  -V, --version        Print version
+
+With no SCRIPT and no -c, mesh is interactive when stdin and stdout are
+terminals, and otherwise reads commands from stdin.
+";
+
 impl StartupOptions {
+    /// Parse the command line. Option parsing stops at the first operand, as it
+    /// does in POSIX shells, so a script's own flags reach the script rather
+    /// than mesh: `mesh deploy.mesh --login` passes `--login` along.
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut options = Self::default();
         let mut args = args.peekable();
@@ -151,16 +253,63 @@ impl StartupOptions {
                 "-l" | "--login" => options.login = true,
                 "--norc" => options.no_rc = true,
                 "--no-save-history" | "--no-history" => options.save_history = false,
+                "-h" | "--help" => {
+                    options.invocation = Invocation::Print(USAGE.to_owned());
+                    return Ok(options);
+                }
+                "-V" | "--version" => {
+                    options.invocation =
+                        Invocation::Print(format!("mesh {}\n", env!("CARGO_PKG_VERSION")));
+                    return Ok(options);
+                }
                 "--rcfile" => {
                     let path = args
                         .next()
                         .ok_or_else(|| "--rcfile requires a file path".to_owned())?;
                     options.rc_file = Some(path.into());
                 }
-                _ => return Err(format!("unknown option `{arg}`")),
+                "-c" => {
+                    let text = args
+                        .next()
+                        .ok_or_else(|| "-c requires a command string".to_owned())?;
+                    options.invocation = Invocation::Command(text);
+                    options.args = args.collect();
+                    return Ok(options);
+                }
+                "-s" => {
+                    options.invocation = Invocation::Stdin;
+                    options.args = args.collect();
+                    return Ok(options);
+                }
+                // `--` ends option parsing without itself being an operand, so
+                // a script whose name looks like an option can still be run.
+                "--" => {
+                    options.take_operands(args);
+                    return Ok(options);
+                }
+                _ if arg.starts_with('-') && arg != "-" => {
+                    return Err(format!("unknown option `{arg}`"));
+                }
+                // The first operand is the script; everything after it is an
+                // argument to that script, options included.
+                _ => {
+                    options.take_operands(std::iter::once(arg).chain(args));
+                    return Ok(options);
+                }
             }
         }
         Ok(options)
+    }
+
+    /// Consume the operand list: the first names the script, the rest are its
+    /// arguments. `$sh.name` becomes the script's name, as bash's `$0` does.
+    fn take_operands(&mut self, operands: impl Iterator<Item = String>) {
+        let mut operands = operands;
+        if let Some(script) = operands.next() {
+            self.name = script.clone();
+            self.invocation = Invocation::Script(script.into());
+            self.args = operands.collect();
+        }
     }
 }
 
@@ -844,8 +993,10 @@ fn pattern_bindings(
 
 fn validate_bindings(bindings: &[(String, Value)]) -> Result<(), String> {
     for (index, (name, _)) in bindings.iter().enumerate() {
-        if name == "env" {
-            return Err("`env` is a reserved name and cannot be a binding".into());
+        if vars::is_reserved_namespace(name) {
+            return Err(format!(
+                "`{name}` is a reserved name and cannot be a binding"
+            ));
         }
         if bindings[..index].iter().any(|(old, _)| old == name) {
             return Err(format!("duplicate binding `{name}`"));
@@ -2671,6 +2822,9 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         }
     }
     let mut shell = Shell::new();
+    shell
+        .vars
+        .set_invocation(options.name.clone(), options.args.clone());
     let mut last = match run_startup_files(options, true, 0, &mut shell) {
         Step::Continue(code) => code,
         Step::Exit(code) => {
@@ -3281,6 +3435,9 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
     // `ManuallyDrop` keeps us from closing fd 0 when the shell exits.
     let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
     let mut shell = Shell::new();
+    shell
+        .vars
+        .set_invocation(options.name.clone(), options.args.clone());
     let mut last = match run_startup_files(options, false, 0, &mut shell) {
         Step::Continue(code) => code,
         Step::Exit(code) => {
@@ -3475,7 +3632,7 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgumentRecall, CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell,
+        ArgumentRecall, CompletionState, Invocation, MeshPrompt, PromptEvent, PromptHook, Shell,
         StartupOptions, Step, TimestampedHistory, argument_completions, command_position,
         command_segment_words, command_words, completed_command, eval_binary,
         expand_history_designators, expansion_word, handle_signal, help_completions,
@@ -3756,6 +3913,64 @@ mod tests {
         assert!(!options.no_rc);
         assert!(options.save_history);
         assert_eq!(options.rc_file, Some(PathBuf::from("/tmp/custom.mesh")));
+    }
+
+    #[test]
+    fn startup_options_take_a_script_and_stop_parsing_options_there() {
+        let options = StartupOptions::parse(
+            ["--login", "deploy.mesh", "--norc", "prod"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(options.login, "options before the script still apply");
+        assert!(!options.no_rc, "--norc after the script belongs to it");
+        assert_eq!(
+            options.invocation,
+            Invocation::Script(PathBuf::from("deploy.mesh"))
+        );
+        assert_eq!(options.name, "deploy.mesh");
+        assert_eq!(options.args, ["--norc", "prod"]);
+    }
+
+    #[test]
+    fn startup_options_route_dash_c_and_dash_s_operands_to_arguments() {
+        let options =
+            StartupOptions::parse(["-c", "puts hi", "a", "b"].into_iter().map(str::to_owned))
+                .unwrap();
+        assert_eq!(
+            options.invocation,
+            Invocation::Command("puts hi".to_owned())
+        );
+        assert_eq!(
+            options.name, "mesh",
+            "a command string is not a script name"
+        );
+        assert_eq!(options.args, ["a", "b"]);
+
+        let options = StartupOptions::parse(["-s", "a"].into_iter().map(str::to_owned)).unwrap();
+        assert_eq!(options.invocation, Invocation::Stdin);
+        assert_eq!(options.args, ["a"]);
+
+        assert_eq!(
+            StartupOptions::parse(["-c"].into_iter().map(str::to_owned)),
+            Err("-c requires a command string".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_double_dash_ends_options_and_a_lone_dash_is_an_operand() {
+        let options =
+            StartupOptions::parse(["--", "--odd-name", "x"].into_iter().map(str::to_owned))
+                .unwrap();
+        assert_eq!(
+            options.invocation,
+            Invocation::Script(PathBuf::from("--odd-name"))
+        );
+        assert_eq!(options.args, ["x"]);
+
+        let options = StartupOptions::parse(["-"].into_iter().map(str::to_owned)).unwrap();
+        assert_eq!(options.invocation, Invocation::Script(PathBuf::from("-")));
     }
 
     #[test]

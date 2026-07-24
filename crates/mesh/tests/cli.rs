@@ -3239,3 +3239,209 @@ fn tilde_rejects_quoted_and_invalid_regex_patterns() {
     assert!(stderr.contains("right operand of `~` must be a regex or bare glob"));
     assert!(stderr.contains("invalid regex"));
 }
+
+// ---------------------------------------------------------------------------
+// Invocation (`mesh SCRIPT`, `-c`, `-s`, `$sh.args` / `$sh.name`)
+// ---------------------------------------------------------------------------
+
+/// Run mesh with command-line arguments and no piped stdin.
+fn run_with_args(args: &[&str]) -> Output {
+    mesh_command()
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run mesh")
+}
+
+/// Write `body` into a fresh script file and return its path.
+fn script(tag: &str, body: &str) -> PathBuf {
+    let path = fresh_dir(tag).join("script.mesh");
+    std::fs::write(&path, body).expect("write script");
+    path
+}
+
+#[test]
+fn runs_a_script_file_named_on_the_command_line() {
+    let path = script("run_script", "puts one\nputs two\n");
+    let out = run_with_args(&[path.to_str().unwrap()]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one\ntwo\n");
+    assert!(out.status.success());
+}
+
+#[test]
+fn a_script_reads_its_arguments_from_sh_args() {
+    let path = script(
+        "script_args",
+        "puts $sh.args:len\nputs $sh.args[0]\nputs ...$sh.args\n",
+    );
+    let out = run_with_args(&[path.to_str().unwrap(), "one", "two three"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "2\none\none two three\n"
+    );
+}
+
+#[test]
+fn sh_name_is_the_script_and_sh_args_is_empty_without_operands() {
+    let path = script("script_name", "puts $sh.name\nputs $sh.args:len\n");
+    let out = run_with_args(&[path.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n0\n", path.display())
+    );
+
+    let out = run_with_input("puts $sh.name\nputs $sh.args:len\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "mesh\n0\n");
+}
+
+#[test]
+fn option_parsing_stops_at_the_script_so_its_flags_reach_it() {
+    let path = script("script_flags", "puts ...$sh.args\n");
+    let out = run_with_args(&[path.to_str().unwrap(), "--login", "-c", "x"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "--login -c x\n");
+}
+
+#[test]
+fn a_script_exit_status_is_its_last_command_or_an_explicit_exit() {
+    let path = script("script_status", "false\n");
+    assert_eq!(
+        run_with_args(&[path.to_str().unwrap()]).status.code(),
+        Some(1)
+    );
+
+    let path = script("script_exit", "exit 3\nputs unreachable\n");
+    let out = run_with_args(&[path.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn a_syntax_error_rejects_the_whole_script_before_anything_runs() {
+    let path = script("script_syntax", "puts before\nresult = 1 < 2 < 3\n");
+    let out = run_with_args(&[path.to_str().unwrap()]);
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("comparisons cannot be chained"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn an_unreadable_script_reports_the_path_with_a_command_like_status() {
+    let dir = fresh_dir("script_missing");
+    let missing = dir.join("nope.mesh");
+    let out = run_with_args(&[missing.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(127));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!("mesh: {}:", missing.display())),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A directory exists but cannot be read as a script: not-found's 127 would
+    // be a lie, so it takes 126 — "found, but not runnable".
+    let out = run_with_args(&[dir.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(126));
+}
+
+#[test]
+fn a_script_runs_from_a_shebang_line() {
+    let path = script(
+        "script_shebang",
+        &format!(
+            "#!{}\nputs \"hi $sh.args[0]\"\n",
+            env!("CARGO_BIN_EXE_mesh")
+        ),
+    );
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&path, permissions).unwrap();
+
+    let out = Command::new(&path)
+        .arg("world")
+        .env("XDG_CONFIG_HOME", isolated_config_home())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run script through its shebang");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi world\n");
+}
+
+#[test]
+fn dash_c_runs_a_command_string_with_its_own_arguments() {
+    let out = run_with_args(&["-c", "puts hi\nputs ...$sh.args\n", "a", "b"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\na b\n");
+    assert!(out.status.success());
+
+    // The command string keeps the shell's own name; only a script renames it.
+    let out = run_with_args(&["-c", "puts $sh.name"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "mesh\n");
+}
+
+#[test]
+fn dash_c_and_dash_s_require_and_consume_the_right_operands() {
+    let out = run_with_args(&["-c"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("-c requires a command string"));
+
+    // `-s` reads stdin and takes the remaining operands as arguments.
+    let mut child = mesh_command()
+        .args(["-s", "p", "q"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"puts ...$sh.args\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "p q\n");
+}
+
+#[test]
+fn a_double_dash_ends_options_without_becoming_the_script() {
+    let path = script("script_ddash", "puts ...$sh.args\n");
+    let out = run_with_args(&["--", path.to_str().unwrap(), "--norc"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "--norc\n");
+}
+
+#[test]
+fn help_and_version_print_and_exit_successfully() {
+    let out = run_with_args(&["--help"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("Usage: mesh"), "{stdout}");
+    assert!(stdout.contains("-c COMMAND"), "{stdout}");
+
+    let out = run_with_args(&["--version"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("mesh "),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = run_with_args(&["--nope"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown option `--nope`"));
+}
+
+#[test]
+fn sh_is_a_reserved_namespace_that_cannot_be_bound() {
+    let out = run_with_input("sh = 1\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reserved name"));
+
+    let out = run_with_input("func f(sh) { puts $sh }\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reserved"));
+}

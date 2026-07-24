@@ -1685,7 +1685,7 @@ impl Parser {
         })
     }
 
-    /// Enforce the signature's per-parameter rules — reserved (`env`), duplicate,
+    /// Enforce the signature's per-parameter rules — reserved (`env`, `sh`), duplicate,
     /// and ordering (nothing after `...rest`; no required after an optional) —
     /// updating the running `seen_optional`/`seen_rest` flags. Shared by the full
     /// [`Parser::parameters`] and the lenient [`Parser::parameters_prefix`] so both
@@ -1698,7 +1698,7 @@ impl Parser {
         seen_optional: &mut bool,
         seen_rest: &mut bool,
     ) -> Result<(), ParseError> {
-        if name == "env" {
+        if crate::vars::is_reserved_namespace(name) {
             return Err(self.error(ParseErrorKind::ReservedParameter(name.to_owned())));
         }
         if existing.into_iter().any(|existing| existing == name) {

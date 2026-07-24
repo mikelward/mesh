@@ -123,6 +123,11 @@ Fuzzy + case-insensitive completion (`nucleo`), the status-dashboard prompt with
 composable hooks, session management (shpool/tmux), regex/`~`, and the rest of
 the `DESIGN.md` surface. Sequenced when the milestones above make them reachable.
 
+Script invocation has since landed on this track — `mesh script.mesh a b c`,
+`mesh -c "…"`, `mesh -s`, shebangs, and the `$sh.args` / `$sh.name` slice of the
+`$sh` namespace — so mesh is no longer stdin-only. See
+[`docs/REFERENCE.md`](docs/REFERENCE.md) §"Invocation".
+
 ---
 
 The near-term, checkable task list lives in [`TODO.md`](TODO.md); this file is
