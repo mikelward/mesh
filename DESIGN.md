@@ -1953,10 +1953,14 @@ M3)*. An arm body is a **block**, the same `{ … }` as an `if` branch or a `fun
   body as an ordinary block (`run_ast_match` → `run_source`): commands execute and
   stream to stdout, and there is *no* value and *no* capture. Here `*.x { ls }` **runs
   `ls`**. This is the common interactive case, and it holds no surprises.
-- **Expression position** — `y = match $x { … }`, a function's value return, an arm of
-  another value expression — evaluates the body *for its value* (`eval_value_body`),
-  and only *then* do the tail rules below apply. Here `*.x { ls }` is the **string**
-  `"ls"`, because the value path never runs a lone word.
+- **Expression position** — `y = match $x { … }`, or a `match` nested inside another
+  value expression — evaluates the body *for its value* (`eval_value_body`), and only
+  *then* do the tail rules below apply. Here `*.x { ls }` is the **string** `"ls"`,
+  because the value path never runs a lone word. *(A **function's value-return** is
+  **not** yet such a context in M3: a `match` as a function's last statement runs through
+  `run_source` → `run_ast_match` in statement position and its value is discarded —
+  structured value-return is unbuilt (`eval_call` implements only `re(…)`), so this
+  awaits that work.)*
 
 In **expression position** a value is produced three ways, resolved by the tail
 (`eval_value_body`):
