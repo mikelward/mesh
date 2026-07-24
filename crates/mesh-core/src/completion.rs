@@ -739,17 +739,29 @@ mod tests {
     #[test]
     fn ignores_option_like_text_in_descriptions() {
         let spec = CompletionSpec::from_help(
-            "Options:\n  --jobs <N>  Number of jobs; use -1 for all CPUs\n  --color <WHEN>  See --help for details\n  -c FILE, --config FILE  Read configuration\n  -f progfile\t\t--file=progfile\n",
+            "Options:\n  --jobs <N>  Number of jobs; use -1 for all CPUs\n  --color <WHEN>  See --help for details\n",
         );
 
-        assert_eq!(
-            spec.matching("-"),
-            ["--color", "--config", "--file", "--jobs", "-c", "-f"]
-        );
+        assert_eq!(spec.matching("-"), ["--color", "--jobs"]);
         assert!(spec.matching("-1").is_empty());
         assert!(spec.matching("--h").is_empty());
+    }
+
+    #[test]
+    fn preserves_aliases_after_per_option_metavars() {
+        let spec =
+            CompletionSpec::from_help("Options:\n  -c FILE, --config FILE  Read configuration\n");
+
+        assert_eq!(spec.matching("-"), ["--config", "-c"]);
         assert_eq!(spec.value_hint("-c"), Some(&ValueHint::File));
         assert_eq!(spec.value_hint("--config"), Some(&ValueHint::File));
+    }
+
+    #[test]
+    fn preserves_tab_aligned_alias_columns() {
+        let spec = CompletionSpec::from_help("Options:\n  -f progfile\t\t--file=progfile\n");
+
+        assert_eq!(spec.matching("-"), ["--file", "-f"]);
     }
 
     #[test]
