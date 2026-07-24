@@ -251,6 +251,9 @@ pub(crate) fn rank_candidates(candidates: Vec<String>, query: &str) -> Vec<Strin
 fn option_names(tokens: &[&str]) -> Vec<String> {
     tokens
         .iter()
+        // Help text often mentions other flags (or negative numbers) in the
+        // description. Only the leading option declaration is authoritative.
+        .take_while(|token| token.starts_with('-'))
         .filter_map(|token| {
             let option = token.trim_end_matches([',', ';']);
             (option.starts_with('-') && option.len() > 1).then(|| {
@@ -701,6 +704,17 @@ mod tests {
         );
 
         assert_eq!(spec.value_hint("--profile"), None);
+    }
+
+    #[test]
+    fn ignores_option_like_text_in_descriptions() {
+        let spec = CompletionSpec::from_help(
+            "Options:\n  --jobs <N>  Number of jobs; use -1 for all CPUs\n  --color <WHEN>  See --help for details\n",
+        );
+
+        assert_eq!(spec.matching("-"), ["--color", "--jobs"]);
+        assert!(spec.matching("-1").is_empty());
+        assert!(spec.matching("--h").is_empty());
     }
 
     #[test]
