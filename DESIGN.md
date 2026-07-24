@@ -1941,27 +1941,23 @@ narrowed the question to four choices; current leanings noted, but all four are 
    grammar. *Lean: narrow*, revisiting only **alternation** on the RHS (`$f ~ *.a|*.b`)
    as the extension that pays for itself. Full type-dispatch parity (Ruby's `===`) is
    rejected — it re-creates the smartmatch trap.
-4. **Arm-body value model** — keep today's tail-coercion (rules above), or move to
-   **block + tail-expression, no coercion** (a bare word is always a command, capture is
-   always explicit `$(…)`), or a Rust-style **`=> expr`** arm. *Lean: block +
-   tail-expression* — it matches what `if` already claims ("a block evaluates to its last
-   expression"), deletes the bare-word/exit-0 sharp edges, and is a language-wide
-   tightening (applies to `if` too), not a `match`-only change. `=>` reads well but forks
-   `match` from mesh's `{ }`-block control flow.
-
-**Open — an explicit value-keyword for typed values?** The exploration weighed requiring
-an **explicit keyword** to produce a typed value (with `puts`/printing the only
-typed-value→stdout op), so `{ … }` blocks stay pure command-context: a bare word always
-*runs*, quotes mean only "group into one word," and the `"$a""$b"` value-vs-command
-ambiguity at a block tail disappears. This **reopens** the settled "value is the last
-expression" rule ([Functions](#functions), [Conditionals](#conditionals-if-is-an-expression))
-and the **single-bare-word block-tail** coercion specifically — *not* the general
-assignment-RHS rule, which stays (`x = greet` is still the string `"greet"`) — reconciling
-them is the open question. Sub-choice if taken: **`yield` (local block/arm value) + `return` (function
-value + early exit)**, two keywords by scope — so a `match` arm can yield the arm's value
-without leaving the function — versus **`return` alone**, which gives functions a value
-but leaves `if`/`match`-arm-yield needing a separate mechanism. Either way `return`'s
-status stays the settled [status view](#functions). *Undecided.*
+4. **Arm-body value model** *(no clear lean — the two live contenders trade off)*. How does
+   a `{ }` arm/block produce a value? Four alternatives: **(a)** today's **tail-coercion**
+   (shipped — bare word→scalar, exit-0 capture — the sharp-edge source); **(b) block +
+   tail-expression, no coercion** — the value is an explicit value tail, a bare word always
+   *runs*, capture is always explicit `$(…)`; matches what `if` already claims ("a block
+   evaluates to its last expression"), but a bare-word *value* still needs quoting and
+   `"$a""$b"` stays ambiguous value-vs-command at a tail; **(c) an explicit value keyword**
+   — `yield`/`return <value>` produces the value, so `{ }` blocks are pure command-context
+   and the `"$a""$b"` ambiguity vanishes (sub-choice: **`yield` local + `return` function**,
+   so a `match` arm yields without leaving the function, vs **`return` alone**, which leaves
+   arm-yield needing a separate mechanism); **(d)** a Rust-style **`=> expr`** arm (forks
+   `match` from mesh's `{ }` blocks). **(b)** and **(c)** are the live pair — (b) is terser
+   but keeps the bare-word classification problem, (c) is explicit but adds a keyword.
+   Whichever wins **reopens** the settled implicit last-expression rule and the
+   **single-bare-word block-tail** coercion — *not* the general assignment-RHS rule
+   (`x = greet` stays the string `"greet"`, per PARSER.md). Language-wide: applies to `if`
+   and `func` too.
 
 **Explored, kept the settled model — `0` = success is correct** *(not a change)*. The
 exploration questioned `int → status` — a bare int read as an exit code rather than data,
