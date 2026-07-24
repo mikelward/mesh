@@ -1949,99 +1949,38 @@ narrowed the question to four choices; current leanings noted, but all four are 
    tightening (applies to `if` too), not a `match`-only change. `=>` reads well but forks
    `match` from mesh's `{ }`-block control flow.
 
-**Proposal (not settled) — an explicit value-keyword model** *(open; **conflicts with**
-the settled function/`if` contract, which it does **not** replace)*. This records a
-direction from the exploration. It **reverses** parts of the currently-settled design
-and is on the table as an alternative, **not** a decision:
+**Open — an explicit value-keyword for typed values?** The exploration weighed requiring
+an **explicit keyword** to produce a typed value (with `puts`/printing the only
+typed-value→stdout op), so `{ … }` blocks stay pure command-context: a bare word always
+*runs*, quotes mean only "group into one word," and the `"$a""$b"` value-vs-command
+ambiguity at a block tail disappears. This **reopens** the settled "value is the last
+expression" and "bare RHS word is a literal string" rules ([Functions](#functions),
+[Conditionals](#conditionals-if-is-an-expression)) — reconciling them is the open
+question. Sub-choice if taken: **`yield` (local block/arm value) + `return` (function
+value + early exit)**, two keywords by scope — so a `match` arm can yield the arm's value
+without leaving the function — versus **`return` alone**, which gives functions a value
+but leaves `if`/`match`-arm-yield needing a separate mechanism. Either way `return`'s
+status stays the settled [status view](#functions). *Undecided.*
 
-- The **settled** contract *(unchanged, and still in force)*: a function's/block's value
-  is its **last expression** — no keyword needed ([Functions](#functions),
-  [Conditionals](#conditionals-if-is-an-expression)); `return`/`return val` is
-  **early-exit only**; **status is a view of the result** (the full per-type mapping —
-  including `command → its own status` — is in [Functions](#functions)); the caller picks
-  value-vs-stream **by syntax** (`f()` value, `$(f)` stdout, bare `f` runs); and a
-  **bare RHS word is a literal string**.
-- The **proposal**: make `puts`/printing the only explicit way to write a **typed value
-  to stdout** as bytes (ordinary command stdout — `ls`, external programs — still streams
-  bytes for pipes and `$(f)` capture; and the settled value-rendering boundary still
-  converts a typed value to bytes when it is **interpolated or passed as external argv**,
-  e.g. `external $n` — both unchanged) and require an
-  **explicit keyword** for a typed value, so `{ … }` blocks are pure command-context (a
-  bare word always *runs*; quotes mean only "group into one word," removing the
-  `"$a""$b"` value-vs-command ambiguity at a block tail). This **reopens** the settled
-  "value is the last expression" rule and the "bare RHS word is a literal string" rule —
-  reconciling the two is itself the open question.
+**Explored, kept the settled model — `0` = success is correct** *(not a change)*. The
+exploration questioned `int → status` (a nonzero int reads as failure, `0` as success/
+truthy) as making a bare int an exit code rather than data. Resolution: **keep it.**
+External commands exit `0` for success with no typed value to consult, so for `if X { }`
+to mean "did X succeed" whether `X` is `grep -q …` or a mesh function, a function's
+`0`/success must be truthy too — that interchangeability is the point, and it just works.
+The residual (an int whose masked status is nonzero can't be returned as successful data)
+is narrow and accepted. Two live scraps this left, both pointed at their canonical homes:
 
-If the proposal is taken, the remaining sub-choice is *which keyword(s)* and how they
-coexist with the settled `return` / `return val`:
-
-- **Option 1 — two keywords, split by scope: `yield` (local) + `return` (function).**
-  `yield <value>` produces the value of the **nearest value-yielding block** — an `if`
-  branch, a `match` arm, a bare `{ }` in expression position — *without* leaving the
-  function; `return <value>` produces the **enclosing function's** value and exits it
-  early. Rationale: local-yield and function-return are genuinely different — a `match`
-  arm inside a function must yield *the arm's* value while the function keeps running
-  (`yield`), which is not the same as bailing out of the whole function (`return`);
-  mirrors generators. `return`'s status is unchanged — the settled view of the result.
-  Cost / sub-questions: two keywords; must define a function body's value (trailing
-  `yield`? explicit `return`? last `yield` wins?); and whether `yield` outside a value
-  context is an error.
-- **Option 2 — one keyword, no separate local yield: `return <value>`.**
-  `return <value>` is the only value keyword; **status stays the settled view of the
-  result** (the full per-type mapping is in [Functions](#functions)) — e.g. `return 5`
-  yields the typed value `5`, read via `f()`, whose status *view* remains `5`. There is no
-  separate value-plus-status channel: the result is one thing and its status is a view of
-  it. (This is essentially the settled `return val` already; the only
-  genuinely *new* part, shared with Option 1, is requiring the keyword in place of an
-  implicit last expression.) Cost / sub-questions: gives **functions** a value but not
-  `match` arms a *local* yield distinct from function-return, so `if`/`match`-as-expression
-  still needs a mechanism — either the same `return` (restricting arm-values to
-  function-tail position) or a separate local form (which collapses back toward Option 1).
-
-The axis underneath both: do we need a *local* value-yield (for `if`/`match` arms)
-distinct from a *function* return? Option 1 says yes (two keywords); Option 2 says no at
-the function level and leaves arm-yield to be settled separately. Note the settled
-design already resolves the status side of this — `return val` carries a value and
-[status is a *view* of the result](#functions) (`return 5` → value `5`, status `5`) —
-so Option 2 is close to what is *already* settled; the genuinely new (and conflicting)
-part of the proposal is only **requiring an explicit keyword** in place of the settled
-implicit last-expression rule.
-
-**Considered and resolved — keep the settled status-view; `0` = success is correct**
-*(explored, not a change)*. The exploration questioned the settled rule that a function's
-status is a *view* of its result — specifically that `int → itself` makes `0` truthy
-(success) and a nonzero int a failure, so a bare int reads as an exit code rather than
-data. The worry: that inverts a data-int's usual truthiness, and you can't `return` a
-nonzero int as *successful data*.
-
-The resolution: **keep it.** `0 = success = truthy` is not a wart — it is forced by the
-world mesh lives in. **External commands exit `0` for success, nonzero for failure**,
-and there is no typed value to consult, only the exit code. For `if X { }` to compose
-uniformly whether `X` is `grep -q …` or a mesh function, a mesh function's `0`/success
-must also be truthy. Aligning with the external convention is exactly what makes commands
-and functions interchangeable in a condition — and it just works. The residual — an int
-whose **status is nonzero** (its low 8 bits, so `return 5` but *not* `return 256`, whose
-status masks to `0` while the full `256` survives as the value, per the settled
-[8-bit masking](#functions)) can't be returned as successful data — is narrow and
-accepted, since `return 0` / `return 1` are used as success/failure anyway (read them as
-`return true` / `return false`).
-
-Condition truthiness of a bare *value* is a **separate, still-open** item — see the
-canonical **Condition truthiness** open question (leaning: `false`, a failed
-command, and a nonzero int are false; **everything else, including `""`, `[]`, and
-`[:]`, is true** — truthiness is never content-emptiness). Two caveats belong here rather
-than restated: **fail-loud (channel-2) errors sit *outside* truthiness** — a
-type / index / decode error in a condition **aborts the statement**, it does not make the
-branch falsy (per the [error model](#error-handling)); and the int case is a **status**
-question, so the 8-bit masking applies (a function returning `256` has status `0`,
-success).
-
-A tangential scrap this surfaced, **deferred**: whether to add an explicit spelling for a
-coded failure so a bare int need not be overloaded. It is not free — any such value has to
-stay a **channel-1** failure (a testable value, per the [error model](#error-handling)),
-so it **cannot** reuse the name "error" (which in mesh means **channel-2** — fail-loud, no
-value, aborts), and defining its status view would touch the exhaustive channel-1 failure
-list (`false` / nonzero int / command status, never value shape). Not pursued here.
+- **Empty `""` / `[]` truthiness** — part of the open **condition-truthiness**
+  question (leaning: only `false`, a failed command, and a nonzero status are false;
+  everything else, empties included, is true). Note `gets()` pins `""` **truthy** — a
+  blank line must not end a read loop — which pulls `[]` toward truthy too, for
+  consistency; making `[]` falsy would need an explicit emptiness test (`:len`/`:empty`)
+  and split it from `""`.
+- **An explicit coded-failure spelling** *(deferred)* — any such value must stay a
+  **channel-1** failure (a testable value) and so **cannot** reuse the name "error"
+  (channel-2: fail-loud, no value, aborts); defining it touches the two-channel
+  [error model](#error-handling). Not pursued here.
 
 ### Tests and comparisons
 
