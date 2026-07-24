@@ -1909,9 +1909,11 @@ exactly like `if`:
 - **Expression position** — `y = match $x { … }`, or nested in another value expression
   — resolves the body to a value by its tail (`eval_value_body`): (1) a
   **value-expression tail** (`{ "text" }`, `{ $v }`, `{ [a b] }`, nested `if`/`match`)
-  yields that value; (2) a body that is a **single bare word** (`{ markdown }`) is the
-  string `"markdown"` — but only when that word is the whole body (`{ puts x; text }`
-  runs `text`); (3) a body ending in a **command** (`{ wc -l < $f }`) runs the **whole
+  yields that value; (2) a body that is a **single bare word** (`{ markdown }`) is read
+  as a **scalar literal** — usually the string `"markdown"`, but a numeric or boolean
+  spelling types accordingly (`{ 7 }` is integer `7`, `{ false }` is boolean `false`),
+  and only when that word is the whole body (`{ puts x; text }` runs `text`); (3) a body
+  ending in a **command** (`{ wc -l < $f }`) runs the **whole
   body** and yields its captured stdout **only on exit 0** — note this captures *every*
   statement's stdout, not just the tail's, so `{ puts a; some-cmd }` includes the `a`
   (nonzero aborts; a bare `$(…)` shares the exit-0 gate). To return a string reliably
