@@ -4,9 +4,10 @@
 //! **function-local** scopes pushed for the duration of a `func` call. Reads
 //! resolve the innermost local scope, then the global scope — a callee never
 //! sees its caller's locals (lexical, not dynamic). Writes land in the innermost
-//! scope (a function-local when one is active, else the global). `export` and
-//! the `$sh.*` surface are deferred to later tasks — see `DESIGN.md`
-//! §"Variables and assignment".
+//! scope (a function-local when one is active, else the global). The read-only
+//! `$sh` namespace holds the invocation entries `$sh.name` and `$sh.args`;
+//! `export` and the rest of the `$sh.*` surface are deferred to later tasks —
+//! see `DESIGN.md` §"Variables and assignment".
 
 use std::collections::HashMap;
 
@@ -44,17 +45,62 @@ impl RegexValue {
 
 type Scope = HashMap<String, Value>;
 
+/// Names the shell owns rather than the user: `$env` is the process
+/// environment, `$sh` is the shell's own state. Neither can be bound by an
+/// assignment, a function parameter, or a pattern.
+pub fn is_reserved_namespace(name: &str) -> bool {
+    matches!(name, "env" | "sh")
+}
+
+/// The shell-or-script name when nothing named it — bash's `$0` for an
+/// interactive shell.
+const DEFAULT_SHELL_NAME: &str = "mesh";
+
 /// Variable bindings: one session-global scope plus a stack of function-local
-/// scopes (one per active `func` call).
-#[derive(Default)]
+/// scopes (one per active `func` call), alongside the read-only `$sh` namespace.
 pub struct Vars {
     global: Scope,
     locals: Vec<Scope>,
+    shell: Vec<(String, Value)>,
+}
+
+impl Default for Vars {
+    fn default() -> Self {
+        Self {
+            global: Scope::new(),
+            locals: Vec::new(),
+            shell: invocation_entries(DEFAULT_SHELL_NAME.to_owned(), Vec::new()),
+        }
+    }
+}
+
+/// The `$sh` entries that describe how mesh was invoked. Only these exist today;
+/// the rest of the `$sh.*` surface in `DESIGN.md` is deferred.
+fn invocation_entries(name: String, args: Vec<String>) -> Vec<(String, Value)> {
+    vec![
+        ("name".to_owned(), Value::String(name)),
+        (
+            "args".to_owned(),
+            Value::List(args.into_iter().map(Value::String).collect()),
+        ),
+    ]
 }
 
 impl Vars {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record how mesh was invoked: `$sh.name` is the script or shell name and
+    /// `$sh.args` the positional arguments, as a real list.
+    pub fn set_invocation(&mut self, name: String, args: Vec<String>) {
+        self.shell = invocation_entries(name, args);
+    }
+
+    /// The read-only `$sh` namespace as an ordered map, so member access,
+    /// indexing, and modifiers all work through the usual map and list paths.
+    pub(crate) fn shell_namespace(&self) -> Value {
+        Value::Map(self.shell.clone())
     }
 
     /// Enter a fresh function-local scope; balanced by [`pop_scope`].

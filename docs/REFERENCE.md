@@ -6,6 +6,58 @@ grows as features land.
 
 ---
 
+## Invocation
+
+```
+mesh                       # interactive when stdin and stdout are terminals
+mesh script.mesh a b c     # run a script; a b c become $sh.args
+mesh -c "puts hi" a b      # run a command string; a b become $sh.args
+mesh -s a b                # read commands from stdin, even on a terminal
+mesh -l / --login          # login shell (also sources login.mesh)
+mesh --rcfile FILE         # use FILE instead of rc.mesh
+mesh --norc                # skip rc.mesh
+mesh --help / --version
+```
+
+With no script and no `-c`, mesh is interactive when both stdin and stdout are
+terminals, and otherwise reads commands from stdin — so `echo 'ls' | mesh` works
+without `-s`.
+
+**Option parsing stops at the first operand**, as in POSIX shells, so a script's
+own flags reach the script rather than mesh: `mesh deploy.mesh --login` passes
+`--login` along in `$sh.args`. Use `--` to end option parsing when a script's
+name itself looks like an option.
+
+A script is read and parsed as a single unit, so a syntax error anywhere in the
+file rejects the whole thing and nothing runs. A script that cannot be found
+exits `127`; one that exists but cannot be read exits `126` — the same codes an
+unrunnable command yields. Otherwise the exit status is the last command's, or
+whatever `exit` was given.
+
+Scripts can carry a shebang, since `#` starts a comment:
+
+```mesh
+#!/usr/bin/env mesh
+puts "hi $sh.args[0]"
+```
+
+### `$sh.args` and `$sh.name`
+
+Positional arguments are a real list — `$sh.args` — not `$1` / `$@` / `$#`:
+
+| Read | Value |
+|---|---|
+| `$sh.args` | The arguments, as a list (spread with `...$sh.args`) |
+| `$sh.args[0]` | The first argument; out of range is an error |
+| `$sh.args:len` | How many there are |
+| `$sh.name` | The script's name, or `mesh` when no script was named |
+
+Both are read-only, and `sh` is a reserved name: it cannot be assigned, used as
+a function parameter, or bound by a pattern. The rest of the `$sh.*` surface in
+`DESIGN.md` is not implemented yet.
+
+---
+
 ## Startup files
 
 Mesh reads configuration from `$XDG_CONFIG_HOME/mesh`, falling back to
