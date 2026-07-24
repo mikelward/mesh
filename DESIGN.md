@@ -2025,26 +2025,28 @@ status masks to `0` while the full `256` survives as the value, per the settled
 accepted, since `return 0` / `return 1` are used as success/failure anyway (read them as
 `return true` / `return false`).
 
-The truthiness **leaning** (still *open* — the unresolved-questions summary flags condition
-truthiness as needing a table/narrowing; this is the current lean, not a settled rule):
-**falsy** = `false`, a **failed command / nonzero exit status**, or an int with a
-**nonzero status** (nonzero low 8 bits) — the **channel-1 failure values**; **truthy** =
-`true`, `0`/success, and every data value —
-strings, lists, maps — **including empty ones** (an empty string or list is a success,
-status `0`, **not** falsy). **Fail-loud (channel-2) errors sit *outside* truthiness
-entirely** — a type / index / decode error in a condition **aborts the statement**, it
-does *not* make the branch falsy (per the [error model](#error-handling)); collapsing it
-into "falsy" would silently turn a bug into a skipped branch.
+Condition truthiness of a bare *value* is a **separate, still-open** item — see the
+canonical **Condition truthiness** open question (leaning: `false`, a failed
+command, and a nonzero int are false; **everything else, including `""`, `[]`, and
+`[:]`, is true** — truthiness is never content-emptiness). Two caveats belong here rather
+than restated: **fail-loud (channel-2) errors sit *outside* truthiness** — a
+type / index / decode error in a condition **aborts the statement**, it does not make the
+branch falsy (per the [error model](#error-handling)); and the int case is a **status**
+question, so the 8-bit masking applies (a function returning `256` has status `0`,
+success).
 
 One small **open** nicety this surfaced: spell an explicit coded failure as
 **`return error <n>`** rather than a bare `return <n>`. Its **status view must be
 defined**, since the settled mapping is exhaustive and views every non-int / non-bool
-value as `0` — so an error value would otherwise be a *success*. Two ways: **(a) sugar
-for `return <n>`** — an int, status `n` (masked), adding no new type; or **(b) a distinct
-error value** whose status views as its embedded code, which **extends (reopens)** the
-"every other value → `0`" mapping with an error-value row. Either way it does **not**
-change the rest of the status view — a bare `return 5` still has status `5`. Undecided,
-including which of (a)/(b).
+value as `0` — so an error value would otherwise be a *success*. Two ways, and the
+masking edge distinguishes them: **(a) sugar for `return <n>`** — an int, status `n`
+(masked) — which *inherits* the masking problem, so `error 0` / `error 256` would view as
+**success** (contradictory for a "failure"); this form must restrict `<n>` to a nonzero
+masked status. **(b) a distinct error value** whose failure comes from its *error-ness*,
+not the number — it is falsy regardless of the code (the code is just an attached
+detail), which **sidesteps** the `0`/`256` edge but **extends (reopens)** the "every
+other value → `0`" mapping with an error-value row. Either way a bare `return 5` still has
+status `5`. Undecided, including which of (a)/(b).
 
 ### Tests and comparisons
 
