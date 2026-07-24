@@ -1,36 +1,60 @@
 //! The function store.
 //!
-//! A `func name(params) { body }` definition binds a named callable. v1 supports
-//! **required named positionals** only; optional defaults, `--flags`, and
-//! `...rest` are deferred (see `DESIGN.md` §"Functions"). Function bodies are
-//! stored as parsed sources and executed recursively on each call.
+//! A `func name(params) { body }` definition binds a named callable. A signature
+//! carries the four roles from `DESIGN.md` §"Functions": required and optional
+//! positionals, boolean/valued `--flags`, and a `...rest` parameter. Function
+//! bodies are stored as parsed sources and executed recursively on each call.
 
 use std::collections::HashMap;
 
-use crate::parser::Source;
+use crate::parser::{Param, ParamKind, Source};
 
-/// A defined function: its positional parameter names and parsed body.
+/// A defined function: its parameters and parsed body.
 pub struct FuncDef {
-    pub params: Vec<String>,
+    pub params: Vec<Param>,
     pub body: Source,
 }
 
 impl FuncDef {
-    /// Produce help in the same conventional shape used by builtin commands.
+    /// Produce help in the same conventional shape used by builtin commands: a
+    /// `Usage:` line with positionals (optionals bracketed, a rest `...`), an
+    /// `Arguments:` list, and an `Options:` block of the declared flags plus
+    /// `--help`.
     pub fn help(&self, name: &str) -> String {
-        let parameters = self
-            .params
-            .iter()
-            .map(|parameter| format!(" <{}>", parameter.to_uppercase()))
-            .collect::<String>();
-        let mut help = format!("Usage: {name}{parameters}\n");
-        if !self.params.is_empty() {
-            help.push_str("\nArguments:\n");
-            for parameter in &self.params {
-                help.push_str(&format!("  <{}>\n", parameter.to_uppercase()));
+        let mut usage = format!("Usage: {name}");
+        let mut arguments = String::new();
+        let mut options = String::new();
+        for param in &self.params {
+            let upper = param.name.to_uppercase();
+            match &param.kind {
+                ParamKind::Required => {
+                    usage.push_str(&format!(" <{upper}>"));
+                    arguments.push_str(&format!("  <{upper}>\n"));
+                }
+                ParamKind::Optional(_) => {
+                    usage.push_str(&format!(" [<{upper}>]"));
+                    arguments.push_str(&format!("  [<{upper}>]\n"));
+                }
+                ParamKind::Rest => {
+                    usage.push_str(&format!(" [<{upper}>...]"));
+                    arguments.push_str(&format!("  [<{upper}>...]\n"));
+                }
+                ParamKind::Switch => {
+                    options.push_str(&format!("  --{}\n", param.name));
+                }
+                ParamKind::Flag(_) => {
+                    options.push_str(&format!("  --{}=<{upper}>\n", param.name));
+                }
             }
         }
-        help.push_str("\nOptions:\n  --help  Print help\n");
+        let mut help = format!("{usage}\n");
+        if !arguments.is_empty() {
+            help.push_str("\nArguments:\n");
+            help.push_str(&arguments);
+        }
+        help.push_str("\nOptions:\n");
+        help.push_str(&options);
+        help.push_str("  --help  Print help\n");
         help
     }
 }

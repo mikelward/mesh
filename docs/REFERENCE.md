@@ -423,18 +423,47 @@ func greet(name) {
 greet world          # -> hi, world
 ```
 
-- **Signature.** v1 accepts **required named positionals** only, separated by
-  commas and/or spaces (`func pair(a, b)` or `func pair(a b)`). Names must be
-  distinct and cannot be `env`. Optional/default (`x = v`), flags (`--flag`), and
-  rest (`...xs`) parameters are not supported yet.
+- **Signature.** Comma-separated parameters carrying the four roles from
+  `DESIGN.md`: a **required positional** (`name`), an **optional positional** with
+  a default (`name = value`), a **flag** (a boolean switch `--name` or a valued
+  `--name = default`), and a trailing **rest** (`...name`). Names must be distinct
+  and cannot be `env`.
+
+  ```
+  func deploy(target, --region = us-west, --force, --tag = latest, ...hosts) {
+    # target  required positional
+    # region  valued flag, defaults to us-west
+    # force   switch: true iff --force was passed
+    # tag     valued flag, defaults to latest
+    # hosts   list of the remaining positionals
+  }
+  deploy prod --force web1 web2       # region=us-west force=true tag=latest hosts=[web1 web2]
+  deploy prod --region=eu-west --tag=v9 ...$fleet
+  ```
+
+  - **Positionals** bind left to right; an optional one (`= default`) may be
+    omitted only from the right, so a required positional cannot follow an
+    optional one, and `...rest` keeps its positionals required (an optional and a
+    rest cannot coexist).
+  - **Flags** are declared with a leading `--`. A bare `--force` is a boolean
+    switch, `false` unless passed; `--tag = default` is a valued flag. At the call
+    site a switch is `--force` and a valued flag is the **attached** `--tag=v9` (a
+    bare `--tag` with no value is an error, never a consume-the-next-token). Flags
+    may appear in any order and are not consumed as positionals; a repeated valued
+    flag takes its **last** value. An argument that begins with `--` but names no
+    declared flag is a loud error.
+  - **`--` ends flag parsing** — everything after a bare `--` is positional/rest,
+    even if it begins with `--`.
+  - **Defaults** are evaluated at call time, in the call's fresh scope, only when
+    the parameter is omitted.
 - **Body.** May span multiple lines; the shell keeps reading until the `{ … }`
   braces balance. Interactively, the continuation prompt is `...`.
 - **Scope.** Each call gets a fresh **function-local** scope: `x = 5` in a body
   binds a local that is gone on return. Reads see the innermost local scope, then
   the global scope — a function never sees its caller's locals.
 - **Resolution.** A name in command position resolves as **builtin → function →
-  external**. The argument count must match the parameters (a mismatch is a loud,
-  recoverable error).
+  external**. The supplied arguments must satisfy the signature (a bad count or an
+  unknown/misused flag is a loud, recoverable error).
 - **Arguments.** A function preserves typed values: a bare list (`f $xs`) arrives
   intact as one list-valued positional, whereas an external command still needs it
   spread (`...$xs`) or joined. A spread contributes one argument per element.
@@ -449,5 +478,4 @@ background), and calling for a value (`f(arg)`) as opposed to running it.
 ## Not yet implemented
 
 Modifier arguments, regex capture modifiers, and heredocs are not yet implemented.
-Function flags/optional/rest parameters and functions in pipelines are also still ahead. See
-[`ROADMAP.md`](../ROADMAP.md).
+Functions in pipelines are also still ahead. See [`ROADMAP.md`](../ROADMAP.md).

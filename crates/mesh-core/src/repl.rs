@@ -471,16 +471,8 @@ fn run_executable(
                 eprintln!("mesh: func: `{name}` is a reserved name and cannot be a function name");
                 return Step::Continue(2);
             }
-            if let Some(duplicate) = parameters
-                .iter()
-                .enumerate()
-                .find_map(|(index, parameter)| {
-                    parameters[..index].contains(parameter).then_some(parameter)
-                })
-            {
-                eprintln!("mesh: func: duplicate parameter `{duplicate}`");
-                return Step::Continue(2);
-            }
+            // Parameter names are already validated (distinct, not `env`) by the
+            // parser's `parameters()`.
             shell.funcs.define(
                 name.clone(),
                 FuncDef {
@@ -1877,7 +1869,9 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
             let help = shell.funcs.get(&name).unwrap().help(&name);
             return Step::Continue(builtins::print_generated_help(&name, &help));
         }
-        return call_func(&name, remove_option_terminator(args), shell);
+        // The `--` terminator and flag parsing are handled during argument
+        // binding in `call_func`.
+        return call_func(&name, args, shell);
     }
     let words = match expand::expand(tokens, &shell.vars) {
         Ok(words) => words,
@@ -1932,16 +1926,6 @@ fn auto_help_requested_strings(args: &[String]) -> bool {
     args.iter()
         .take_while(|arg| arg.as_str() != "--")
         .any(|arg| arg == "--help")
-}
-
-fn remove_option_terminator(mut args: Vec<Value>) -> Vec<Value> {
-    if let Some(index) = args
-        .iter()
-        .position(|arg| matches!(arg, Value::String(value) if value == "--"))
-    {
-        args.remove(index);
-    }
-    args
 }
 
 fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
@@ -2067,27 +2051,21 @@ fn make_return(args: &[String], last: u8) -> Step {
 }
 
 /// Call the function `name` with already-expanded typed `args`. Binds the
-/// positional parameters in a fresh local scope, runs the body, and returns the
-/// function's status — an explicit `return`, else the last command's status. A
-/// list argument counts as **one** positional (it arrives intact as a list
-/// value); an arity mismatch is a recoverable error.
+/// parameters (positionals, `--flags`, and any `...rest`) in a fresh local scope,
+/// runs the body, and returns the function's status — an explicit `return`, else
+/// the last command's status. A list argument counts as **one** positional (it
+/// arrives intact as a list value); a bad argument count or flag is a recoverable
+/// error.
 fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
     let (params, body) = match shell.funcs.get(name) {
         Some(def) => (def.params.clone(), def.body.clone()),
         None => return Step::Continue(exec::run(&[name.to_string()], &mut shell.jobs)),
     };
-    if args.len() != params.len() {
-        eprintln!(
-            "mesh: {name}: expected {} argument(s), got {}",
-            params.len(),
-            args.len()
-        );
-        return Step::Continue(2);
-    }
 
     shell.vars.push_scope();
-    for (param, arg) in params.iter().zip(args) {
-        shell.vars.set_value(param, arg);
+    if let Err(code) = bind_arguments(name, &params, args, shell) {
+        shell.vars.pop_scope();
+        return Step::Continue(code);
     }
     let caller_loop_depth = std::mem::replace(&mut shell.loop_depth, 0);
     let executed = run_source(&body, 0, true, shell);
@@ -2104,6 +2082,160 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
     };
     shell.vars.pop_scope();
     result
+}
+
+/// Match `args` against `params` and bind each parameter in the current (already
+/// pushed) scope. Positionals bind left to right, `--flags` in any order, and a
+/// `...rest` collects the leftovers; a bare `--` ends flag parsing. Returns the
+/// exit status to report on a bad argument count, an unknown/misused flag, or a
+/// default that fails to evaluate.
+fn bind_arguments(
+    name: &str,
+    params: &[parser::Param],
+    args: Vec<Value>,
+    shell: &mut Shell,
+) -> Result<(), u8> {
+    use parser::ParamKind;
+
+    // Positionals in declaration order (`None` default = required); the lone rest.
+    let mut positionals: Vec<(&str, Option<&parser::Expr>)> = Vec::new();
+    let mut rest_name: Option<&str> = None;
+    for param in params {
+        match &param.kind {
+            ParamKind::Required => positionals.push((param.name.as_str(), None)),
+            ParamKind::Optional(default) => positionals.push((param.name.as_str(), Some(default))),
+            ParamKind::Rest => rest_name = Some(param.name.as_str()),
+            ParamKind::Switch | ParamKind::Flag(_) => {}
+        }
+    }
+
+    // Scan the call-site arguments, separating positionals from flags. Only a
+    // `Value::String` beginning with `--` is a flag candidate; everything else
+    // (and everything after a bare `--`) is a positional.
+    let mut positional_values: Vec<Value> = Vec::new();
+    let mut switches_on: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut flag_values: std::collections::HashMap<&str, Value> = std::collections::HashMap::new();
+    let mut flags_ended = false;
+    for arg in args {
+        if !flags_ended && let Value::String(text) = &arg {
+            if text == "--" {
+                flags_ended = true;
+                continue;
+            }
+            if let Some(body) = text.strip_prefix("--")
+                && !body.is_empty()
+            {
+                let (flag, inline) = match body.split_once('=') {
+                    Some((flag, value)) => (flag, Some(value.to_owned())),
+                    None => (body, None),
+                };
+                let declared = params.iter().find(|param| {
+                    param.name == flag
+                        && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
+                });
+                let Some(declared) = declared else {
+                    eprintln!("mesh: {name}: unknown flag `--{flag}`");
+                    return Err(2);
+                };
+                match &declared.kind {
+                    ParamKind::Switch => {
+                        if inline.is_some() {
+                            eprintln!(
+                                "mesh: {name}: flag `--{flag}` is a switch and takes no value"
+                            );
+                            return Err(2);
+                        }
+                        switches_on.insert(declared.name.as_str());
+                    }
+                    ParamKind::Flag(_) => {
+                        let Some(value) = inline else {
+                            eprintln!(
+                                "mesh: {name}: flag `--{flag}` requires a value (write `--{flag}=VALUE`)"
+                            );
+                            return Err(2);
+                        };
+                        // Last occurrence wins for a valued flag.
+                        flag_values.insert(declared.name.as_str(), Value::String(value));
+                    }
+                    _ => unreachable!("only flags are collected here"),
+                }
+                continue;
+            }
+        }
+        positional_values.push(arg);
+    }
+
+    // Arity: every required positional must be filled; without a rest, surplus
+    // positionals are an error.
+    let required = positionals.iter().filter(|(_, d)| d.is_none()).count();
+    let maximum = positionals.len();
+    let supplied = positional_values.len();
+    if supplied < required {
+        if rest_name.is_some() || maximum > required {
+            eprintln!("mesh: {name}: expected at least {required} argument(s), got {supplied}");
+        } else {
+            eprintln!("mesh: {name}: expected {required} argument(s), got {supplied}");
+        }
+        return Err(2);
+    }
+    if rest_name.is_none() && supplied > maximum {
+        if maximum > required {
+            eprintln!("mesh: {name}: expected at most {maximum} argument(s), got {supplied}");
+        } else {
+            eprintln!("mesh: {name}: expected {maximum} argument(s), got {supplied}");
+        }
+        return Err(2);
+    }
+
+    // Bind positionals in order; a missing one is optional (guaranteed by the
+    // arity check) and takes its default, evaluated in the new scope.
+    let mut supplied = positional_values.into_iter();
+    for (param, default) in &positionals {
+        if let Some(value) = supplied.next() {
+            shell.vars.set_value(param, value);
+        } else {
+            let default = default.expect("a missing positional must be optional");
+            let value = evaluate_default(name, param, default, shell)?;
+            shell.vars.set_value(param, value);
+        }
+    }
+    if let Some(rest) = rest_name {
+        shell.vars.set_value(rest, Value::List(supplied.collect()));
+    }
+
+    // Bind flags: a switch is the boolean of "was it passed"; a valued flag takes
+    // its passed value or its default.
+    for param in params {
+        match &param.kind {
+            ParamKind::Switch => {
+                let on = switches_on.contains(param.name.as_str());
+                shell.vars.set_value(&param.name, Value::Boolean(on));
+            }
+            ParamKind::Flag(default) => {
+                let value = match flag_values.remove(param.name.as_str()) {
+                    Some(value) => value,
+                    None => evaluate_default(name, &param.name, default, shell)?,
+                };
+                shell.vars.set_value(&param.name, value);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate a parameter's default expression in the function's fresh scope,
+/// reporting a recoverable error if it fails.
+fn evaluate_default(
+    name: &str,
+    param: &str,
+    default: &parser::Expr,
+    shell: &mut Shell,
+) -> Result<Value, u8> {
+    eval_expr(default, 0, true, shell).map_err(|_| {
+        eprintln!("mesh: {name}: could not evaluate default for `{param}`");
+        2
+    })
 }
 
 /// Return whether the parser needs another physical line to complete the input.

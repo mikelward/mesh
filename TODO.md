@@ -118,9 +118,12 @@ file as tasks land.
       collection operations, including typed list results and chaining.
 - [x] `func` — user-defined functions: `func name(params) { body }` with required
       named positionals, multi-line bodies, function-local (lexical) scope, and
-      `return`. Resolution is builtins → functions → external. Deferred:
-      flags/optionals/rest parameters, functions in pipelines/redirections, and
-      calling for a value (`f(arg)`) vs running (`f arg`).
+      `return`. Resolution is builtins → functions → external.
+- [x] Function signature roles — optional positionals (`name = default`), flags
+      (boolean switch `--name`, valued `--name = default`), and a trailing rest
+      (`...name`), with `--` ending flag parsing and call-time default evaluation.
+      Deferred: functions in pipelines/redirections, and calling for a value
+      (`f(arg)`) vs running (`f arg`).
 - [x] First `if` expression slice — command-status and value conditions, brace-delimited
       `else` / `else if`, multiline bodies, typed assignment-position results,
       and conditional list-pattern binding.

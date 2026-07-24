@@ -1877,15 +1877,146 @@ fn a_reserved_name_cannot_be_a_function() {
 }
 
 #[test]
-fn unsupported_signature_forms_are_parser_errors() {
+fn an_optional_positional_defaults_when_omitted() {
+    let out = run_with_input(
+        "func tag(image, version = latest) { puts \"$image:$version\" }\ntag app\ntag app v9\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "app:latest\napp:v9\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn a_switch_is_false_unless_passed() {
+    let out = run_with_input("func f(--force) { puts $force }\nf\nf --force\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "false\ntrue\n");
+}
+
+#[test]
+fn a_valued_flag_takes_its_value_or_default() {
+    let out = run_with_input("func f(--tag = latest) { puts $tag }\nf\nf --tag=v9\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "latest\nv9\n");
+}
+
+#[test]
+fn flags_bind_in_any_order_and_never_consume_positionals() {
+    // `--force` before the positional, `--tag=` attached, and a rest tail.
+    let out = run_with_input(
+        "func deploy(target, --region = us-west, --force, --tag = latest, ...hosts) {\n  \
+         puts \"$target $region $force $tag\"\n  puts ...$hosts\n}\n\
+         deploy prod --force web1 --tag=v9 web2\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "prod us-west true v9\nweb1 web2\n"
+    );
+}
+
+#[test]
+fn a_rest_parameter_collects_the_leftover_positionals() {
+    let out = run_with_input(
+        "func f(first, ...rest) { puts $first\n  puts ...$rest }\nf a b c\nf solo\n",
+    );
+    // `f a b c` -> first=a, rest=[b c]; `f solo` -> first=solo, rest=[] (empty line).
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb c\nsolo\n\n");
+}
+
+#[test]
+fn the_last_occurrence_of_a_valued_flag_wins() {
+    let out = run_with_input("func f(--tag = d) { puts $tag }\nf --tag=v1 --tag=v2\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v2\n");
+}
+
+#[test]
+fn a_flag_value_can_arrive_spread_from_a_list() {
+    let out = run_with_input(
+        "flags = [--tag=v9 host1]\nfunc f(--tag = d, ...rest) { puts $tag\n  puts ...$rest }\nf ...$flags\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v9\nhost1\n");
+}
+
+#[test]
+fn an_unknown_flag_is_a_loud_error() {
+    let out = run_with_input("func f(a) { puts $a }\nf --bogus x\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown flag `--bogus`"), "{stderr}");
+    // Recoverable: the shell keeps going.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_valued_flag_without_a_value_is_an_error() {
+    let out = run_with_input("func f(--tag = d) { puts $tag }\nf --tag\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("flag `--tag` requires a value"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_switch_given_a_value_is_an_error() {
+    let out = run_with_input("func f(--force) { puts $force }\nf --force=yes\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("flag `--force` is a switch and takes no value"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn the_terminator_sends_flag_like_tokens_to_the_rest() {
+    let out = run_with_input(
+        "func f(--force, ...rest) { puts $force\n  puts ...$rest }\nf -- --force a\n",
+    );
+    // `--` ends flag parsing: `--force` and `a` become rest elements.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "false\n--force a\n");
+}
+
+#[test]
+fn too_many_positionals_without_a_rest_is_an_error() {
+    let out = run_with_input("func f(a, b = 1) { puts $a $b }\nf 1 2 3\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("expected at most 2 argument(s), got 3"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_missing_required_positional_with_optionals_present_reports_a_minimum() {
+    let out = run_with_input("func f(a, b = 1) { puts $a $b }\nf\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("expected at least 1 argument(s), got 0"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn generated_help_shows_flags_optionals_and_rest() {
+    let out = run_with_input(
+        "func deploy(target, --region = us-west, --force, ...hosts) { puts x }\ndeploy --help\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Usage: deploy <TARGET> [<HOSTS>...]\n\nArguments:\n  <TARGET>\n  [<HOSTS>...]\n\nOptions:\n  --region=<REGION>\n  --force\n  --help  Print help\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn invalid_signature_forms_are_parser_errors() {
     for input in [
-        "func f(...xs) { puts hi }\n",
-        "func f(--flag) { puts hi }\n",
-        "func f(x = 1) { puts hi }\n",
         "func f(a b) { puts hi }\n",
         "func f(a,) { puts hi }\n",
         "func f(a, a) { puts hi }\n",
         "func f(env) { puts hi }\n",
+        // A required positional cannot follow an optional one.
+        "func f(a = 1, b) { puts hi }\n",
+        // Nothing may follow a `...rest`, and it cannot pair with an optional.
+        "func f(...xs, a) { puts hi }\n",
+        "func f(a = 1, ...xs) { puts hi }\n",
     ] {
         let out = run_with_input(input);
         assert!(
