@@ -100,6 +100,9 @@ pub enum ParseErrorKind {
     Expected(&'static str),
     ReservedParameter(String),
     DuplicateParameter(String),
+    RequiredAfterOptional(String),
+    ParameterAfterRest(String),
+    OptionalWithRest,
     UnknownEscape(char),
     BadUnicodeEscape,
 }
@@ -135,6 +138,18 @@ impl std::fmt::Display for ParseError {
             ParseErrorKind::DuplicateParameter(name) => {
                 write!(f, "syntax error: duplicate parameter `{name}`")
             }
+            ParseErrorKind::RequiredAfterOptional(name) => write!(
+                f,
+                "syntax error: required parameter `{name}` cannot follow an optional one"
+            ),
+            ParseErrorKind::ParameterAfterRest(name) => write!(
+                f,
+                "syntax error: parameter `{name}` cannot follow a `...rest` parameter"
+            ),
+            ParseErrorKind::OptionalWithRest => write!(
+                f,
+                "syntax error: an optional positional cannot combine with a `...rest` parameter"
+            ),
             ParseErrorKind::UnknownEscape(c) => write!(f, "syntax error: invalid escape \\{c}"),
             ParseErrorKind::BadUnicodeEscape => {
                 write!(f, "syntax error: invalid \\u{{…}} escape")
@@ -186,7 +201,7 @@ pub enum Executable {
     },
     Function {
         name: String,
-        parameters: Vec<String>,
+        parameters: Vec<Param>,
         body: Source,
     },
     If(IfExpr),
@@ -205,6 +220,29 @@ pub enum Executable {
         expression: Expr,
         guard: Option<Guard>,
     },
+}
+
+/// A single `func`/lambda parameter: its name and how it binds at the call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Param {
+    pub name: String,
+    pub kind: ParamKind,
+}
+
+/// The four signature roles a parameter can play (`DESIGN.md` §"Functions").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParamKind {
+    /// A required positional (`name`), bound left to right.
+    Required,
+    /// An optional positional with a default (`name = expr`), omittable from the
+    /// right.
+    Optional(Expr),
+    /// A boolean switch flag (`--name`): `true` iff passed, `false` otherwise.
+    Switch,
+    /// A valued flag with a default (`--name = expr`).
+    Flag(Expr),
+    /// A rest parameter (`...name`, last): collects leftover positionals as a list.
+    Rest,
 }
 
 /// A binding pattern shared by assignments, conditional bindings, loops, and
@@ -346,7 +384,7 @@ pub enum Expr {
         body: Source,
     },
     Lambda {
-        parameters: Vec<String>,
+        parameters: Vec<Param>,
         body: Source,
     },
 }
@@ -1463,19 +1501,35 @@ impl Parser {
         })
     }
 
-    fn parameters(&mut self) -> Result<Vec<String>, ParseError> {
+    fn parameters(&mut self) -> Result<Vec<Param>, ParseError> {
         self.expect(&TokenKind::LParen, "`(`")?;
-        let mut parameters = Vec::new();
+        let mut parameters: Vec<Param> = Vec::new();
+        let mut seen_optional = false;
+        let mut seen_rest = false;
         self.newlines();
         while !self.same(&TokenKind::RParen) {
-            let parameter = self.name()?;
-            if parameter == "env" {
-                return Err(self.error(ParseErrorKind::ReservedParameter(parameter)));
+            let param = self.parameter()?;
+            if param.name == "env" {
+                return Err(self.error(ParseErrorKind::ReservedParameter(param.name)));
             }
-            if parameters.contains(&parameter) {
-                return Err(self.error(ParseErrorKind::DuplicateParameter(parameter)));
+            if parameters.iter().any(|p| p.name == param.name) {
+                return Err(self.error(ParseErrorKind::DuplicateParameter(param.name)));
             }
-            parameters.push(parameter);
+            // Ordering: nothing may follow `...rest`; a required positional may
+            // not follow an optional one (an optional is omittable only from the
+            // right, so a later required could never be reached).
+            if seen_rest {
+                return Err(self.error(ParseErrorKind::ParameterAfterRest(param.name)));
+            }
+            match &param.kind {
+                ParamKind::Rest => seen_rest = true,
+                ParamKind::Optional(_) => seen_optional = true,
+                ParamKind::Required if seen_optional => {
+                    return Err(self.error(ParseErrorKind::RequiredAfterOptional(param.name)));
+                }
+                _ => {}
+            }
+            parameters.push(param);
             let comma = self.eat(&TokenKind::Comma).is_some();
             self.newlines();
             if comma && self.same(&TokenKind::RParen) {
@@ -1489,7 +1543,57 @@ impl Parser {
             }
         }
         self.position += 1;
+        // An optional positional and a `...rest` cannot usefully coexist: the rest
+        // would swallow anything meant for the optional (`DESIGN.md` §"Functions").
+        if seen_optional && seen_rest {
+            return Err(self.error(ParseErrorKind::OptionalWithRest));
+        }
         Ok(parameters)
+    }
+
+    /// Parse one parameter: `...name` (rest), `--name`[` = default`] (switch or
+    /// valued flag), or `name`[` = default`] (required or optional positional).
+    fn parameter(&mut self) -> Result<Param, ParseError> {
+        if self.eat(&TokenKind::Spread).is_some() {
+            let name = self.name()?;
+            return Ok(Param {
+                name,
+                kind: ParamKind::Rest,
+            });
+        }
+        if let Some(name) = self.flag_name_at(0) {
+            self.position += 1;
+            let kind = if self.eat(&TokenKind::Equal).is_some() {
+                self.newlines();
+                ParamKind::Flag(self.expression()?)
+            } else {
+                ParamKind::Switch
+            };
+            return Ok(Param { name, kind });
+        }
+        let name = self.name()?;
+        let kind = if self.eat(&TokenKind::Equal).is_some() {
+            self.newlines();
+            ParamKind::Optional(self.expression()?)
+        } else {
+            ParamKind::Required
+        };
+        Ok(Param { name, kind })
+    }
+
+    /// If the token at `offset` is a bare `--name` word with a valid flag name,
+    /// return that name without the leading dashes.
+    fn flag_name_at(&self, offset: usize) -> Option<String> {
+        let token = self.tokens.get(self.position + offset)?;
+        let TokenKind::Word(word) = &token.value else {
+            return None;
+        };
+        if word_is_quoted(word) {
+            return None;
+        }
+        let text = word.text();
+        let name = text.strip_prefix("--")?;
+        valid_name(name).then(|| name.to_owned())
     }
 
     fn if_expr(&mut self) -> Result<IfExpr, ParseError> {
@@ -2494,16 +2598,44 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(parameters, &["x", "y"]);
+        let names: Vec<&str> = parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["x", "y"]);
+        assert!(parameters.iter().all(|p| p.kind == ParamKind::Required));
         assert_eq!(body.statements.len(), 1);
         for invalid in [
             "func f(x,) {}",
             "func f(x y) {}",
             "func f(x, x) {}",
             "func f(env) {}",
+            // A required positional cannot follow an optional one.
+            "func f(a = 1, b) {}",
+            // Nothing may follow a rest parameter, and it cannot pair with an optional.
+            "func f(...xs, a) {}",
+            "func f(a = 1, ...xs) {}",
         ] {
             assert!(parse(invalid).is_err(), "accepted {invalid:?}");
         }
+    }
+
+    #[test]
+    fn parses_flag_optional_and_rest_parameters() {
+        let tree = complete(
+            "func deploy(env0, --region = us-west, --force, --tag = latest, ...hosts) {\n  puts hi\n}",
+        );
+        let Executable::Function { parameters, .. } = &tree.statements[0].and_or.first else {
+            panic!()
+        };
+        assert_eq!(parameters.len(), 5);
+        assert_eq!(parameters[0].name, "env0");
+        assert_eq!(parameters[0].kind, ParamKind::Required);
+        assert_eq!(parameters[1].name, "region");
+        assert!(matches!(parameters[1].kind, ParamKind::Flag(_)));
+        assert_eq!(parameters[2].name, "force");
+        assert_eq!(parameters[2].kind, ParamKind::Switch);
+        assert_eq!(parameters[3].name, "tag");
+        assert!(matches!(parameters[3].kind, ParamKind::Flag(_)));
+        assert_eq!(parameters[4].name, "hosts");
+        assert_eq!(parameters[4].kind, ParamKind::Rest);
     }
 
     #[test]

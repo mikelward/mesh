@@ -137,18 +137,44 @@ pub fn expand(words: Vec<Word>, vars: &Vars) -> Result<Vec<String>, ExpandError>
 /// reference arrives as one value. Bare integer and boolean literals are typed;
 /// every other word yields string argument(s) via ordinary expansion.
 pub fn expand_values(words: Vec<Word>, vars: &Vars) -> Result<Vec<Value>, ExpandError> {
+    Ok(expand_call_values(words, vars)?
+        .into_iter()
+        .map(|(value, _)| value)
+        .collect())
+}
+
+/// Like [`expand_values`], but tags each value with whether it came from a single
+/// **bare literal** word — one unquoted, un-interpolated `Text` piece. The tag
+/// lets a function call type the attached value of `--flag=value` exactly as it
+/// would the same token passed positionally: a bare `--n=2` is the integer `2`,
+/// while a quoted (`--n="2"`) or interpolated (`--n=$s`) value keeps its expanded
+/// string type. Spread and whole-variable values are never bare.
+pub fn expand_call_values(
+    words: Vec<Word>,
+    vars: &Vars,
+) -> Result<Vec<(Value, bool)>, ExpandError> {
     let mut out = Vec::new();
     for word in words {
         if let Some(vref) = spread_var(&word) {
-            out.extend(spread_values(vref, vars)?);
+            out.extend(spread_values(vref, vars)?.into_iter().map(|v| (v, false)));
         } else if let Some(value) = whole_value(&word, vars) {
-            out.push(value?);
+            out.push((value?, false));
         } else if let Some(value) = scalar_literal(&word) {
-            out.push(value);
+            out.push((value, true));
         } else {
+            let bare = matches!(
+                word.0.as_slice(),
+                [Piece::Text {
+                    expandable: true,
+                    ..
+                }]
+            );
             let mut strings = Vec::new();
             expand_word(word, vars, &mut strings)?;
-            out.extend(strings.into_iter().map(Value::String));
+            // Only an un-split single result is a genuine bare literal (a glob that
+            // matched several paths is not).
+            let bare = bare && strings.len() == 1;
+            out.extend(strings.into_iter().map(|s| (Value::String(s), bare)));
         }
     }
     Ok(out)
@@ -230,10 +256,27 @@ fn scalar_literal(word: &Word) -> Option<Value> {
     else {
         return None;
     };
-    match text.as_str() {
-        "true" => Some(Value::Boolean(true)),
-        "false" => Some(Value::Boolean(false)),
-        _ => text.parse().ok().map(Value::Integer),
+    // A bare word that is not a typed literal falls through to ordinary string
+    // expansion, so only surface `true`/`false`/integers as typed values here.
+    match typed_scalar(text) {
+        Value::String(_) => None,
+        typed => Some(typed),
+    }
+}
+
+/// Type a bare scalar string the way an in-shell function argument is typed:
+/// `true`/`false` become booleans, an integer literal becomes an integer, and
+/// anything else stays a string. Used both for bare literal arguments and for the
+/// attached value of a valued `--flag=value`, so `--n=2` is the integer `2` just
+/// like a positional `2` or the flag's default expression.
+pub(crate) fn typed_scalar(text: &str) -> Value {
+    match text {
+        "true" => Value::Boolean(true),
+        "false" => Value::Boolean(false),
+        _ => text
+            .parse()
+            .map(Value::Integer)
+            .unwrap_or_else(|_| Value::String(text.to_owned())),
     }
 }
 

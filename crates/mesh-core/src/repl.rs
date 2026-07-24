@@ -471,16 +471,8 @@ fn run_executable(
                 eprintln!("mesh: func: `{name}` is a reserved name and cannot be a function name");
                 return Step::Continue(2);
             }
-            if let Some(duplicate) = parameters
-                .iter()
-                .enumerate()
-                .find_map(|(index, parameter)| {
-                    parameters[..index].contains(parameter).then_some(parameter)
-                })
-            {
-                eprintln!("mesh: func: duplicate parameter `{duplicate}`");
-                return Step::Continue(2);
-            }
+            // Parameter names are already validated (distinct, not `env`) by the
+            // parser's `parameters()`.
             shell.funcs.define(
                 name.clone(),
                 FuncDef {
@@ -1930,18 +1922,27 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         && shell.funcs.get(&name).is_some()
     {
         let arg_words: Vec<Word> = tokens.into_iter().skip(1).collect();
-        let args = match expand::expand_values(arg_words, &shell.vars) {
+        // Each arg is tagged with whether it was a bare literal word, so an
+        // attached `--flag=value` types its value the same way the token would
+        // type positionally (see `expand::expand_call_values`).
+        let args = match expand::expand_call_values(arg_words, &shell.vars) {
             Ok(args) => args,
             Err(err) => {
                 eprintln!("mesh: {err}");
                 return Step::Continue(1);
             }
         };
-        if auto_help_requested(&args) {
+        // Intercept `--help` only when the signature does not claim it; a function
+        // that declares a `--help` flag observes the switch itself (`DESIGN.md`
+        // §"Command resolution and help").
+        let declares_help = shell.funcs.get(&name).unwrap().declares_help();
+        if !declares_help && auto_help_requested(&args) {
             let help = shell.funcs.get(&name).unwrap().help(&name);
             return Step::Continue(builtins::print_generated_help(&name, &help));
         }
-        return call_func(&name, remove_option_terminator(args), shell);
+        // The `--` terminator and flag parsing are handled during argument
+        // binding in `call_func`.
+        return call_func(&name, args, shell);
     }
     let words = match expand::expand(tokens, &shell.vars) {
         Ok(words) => words,
@@ -1986,8 +1987,9 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
     }
 }
 
-fn auto_help_requested(args: &[Value]) -> bool {
+fn auto_help_requested(args: &[(Value, bool)]) -> bool {
     args.iter()
+        .map(|(arg, _)| arg)
         .take_while(|arg| !matches!(arg, Value::String(value) if value == "--"))
         .any(|arg| matches!(arg, Value::String(value) if value == "--help"))
 }
@@ -1996,16 +1998,6 @@ fn auto_help_requested_strings(args: &[String]) -> bool {
     args.iter()
         .take_while(|arg| arg.as_str() != "--")
         .any(|arg| arg == "--help")
-}
-
-fn remove_option_terminator(mut args: Vec<Value>) -> Vec<Value> {
-    if let Some(index) = args
-        .iter()
-        .position(|arg| matches!(arg, Value::String(value) if value == "--"))
-    {
-        args.remove(index);
-    }
-    args
 }
 
 fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
@@ -2093,6 +2085,9 @@ fn run_prompt_hooks(event: PromptEvent, args: Vec<Value>, shell: &mut Shell) {
         .filter(|hook| hook.event == event)
         .map(|hook| hook.function.clone())
         .collect();
+    // Hook arguments are computed values (command text, status, elapsed), not
+    // user syntax, so none is a bare literal token.
+    let args: Vec<(Value, bool)> = args.into_iter().map(|value| (value, false)).collect();
     for function in hooks {
         let _ = call_func(&function, args.clone(), shell);
     }
@@ -2131,29 +2126,45 @@ fn make_return(args: &[String], last: u8) -> Step {
 }
 
 /// Call the function `name` with already-expanded typed `args`. Binds the
-/// positional parameters in a fresh local scope, runs the body, and returns the
-/// function's status — an explicit `return`, else the last command's status. A
-/// list argument counts as **one** positional (it arrives intact as a list
-/// value); an arity mismatch is a recoverable error.
-fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
+/// parameters (positionals, `--flags`, and any `...rest`) in a fresh local scope,
+/// runs the body, and returns the function's status — an explicit `return`, else
+/// the last command's status. A list argument counts as **one** positional (it
+/// arrives intact as a list value); a bad argument count or flag is a recoverable
+/// error.
+fn call_func(name: &str, args: Vec<(Value, bool)>, shell: &mut Shell) -> Step {
     let (params, body) = match shell.funcs.get(name) {
         Some(def) => (def.params.clone(), def.body.clone()),
-        None => return Step::Continue(exec::run(&[name.to_string()], &mut shell.jobs)),
+        None => {
+            return Step::Continue(exec::run(&[name.to_string()], &mut shell.jobs));
+        }
     };
-    if args.len() != params.len() {
-        eprintln!(
-            "mesh: {name}: expected {} argument(s), got {}",
-            params.len(),
-            args.len()
-        );
-        return Step::Continue(2);
-    }
 
-    shell.vars.push_scope();
-    for (param, arg) in params.iter().zip(args) {
-        shell.vars.set_value(param, arg);
-    }
+    // Isolate the caller's loop state for the whole call — argument binding
+    // included — so a `break`/`continue` inside an omitted block-bearing default
+    // is reported as outside a loop rather than being attributed to the caller's
+    // loop. Restored on every exit path below.
     let caller_loop_depth = std::mem::replace(&mut shell.loop_depth, 0);
+    shell.vars.push_scope();
+    let bound = bind_arguments(name, &params, args, shell);
+    // A default that ran `break`/`continue` (already reported as outside a loop)
+    // may have left `shell.control` set; clear it so it neither short-circuits the
+    // body nor leaks back to the caller.
+    if matches!(
+        shell.control,
+        Some(parser::ControlKind::Break | parser::ControlKind::Continue)
+    ) {
+        shell.control = None;
+    }
+    if let Err(step) = bound {
+        shell.vars.pop_scope();
+        shell.loop_depth = caller_loop_depth;
+        // A default's `return N` ends the call with that status, like the body's;
+        // an `exit`/runtime step unwinds unchanged.
+        return match step {
+            Step::Return(code) => Step::Continue(code),
+            other => other,
+        };
+    }
     let executed = run_source(&body, 0, true, shell);
     shell.loop_depth = caller_loop_depth;
     if matches!(
@@ -2168,6 +2179,177 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
     };
     shell.vars.pop_scope();
     result
+}
+
+/// Match `args` against `params` and bind each parameter in the current (already
+/// pushed) scope. Positionals bind left to right, `--flags` in any order, and a
+/// `...rest` collects the leftovers; a bare `--` ends flag parsing. Returns the
+/// exit status to report on a bad argument count, an unknown/misused flag, or a
+/// default that fails to evaluate.
+fn bind_arguments(
+    name: &str,
+    params: &[parser::Param],
+    args: Vec<(Value, bool)>,
+    shell: &mut Shell,
+) -> Result<(), Step> {
+    use parser::ParamKind;
+
+    // Positionals in declaration order (`None` default = required); the lone rest.
+    let mut positionals: Vec<(&str, Option<&parser::Expr>)> = Vec::new();
+    let mut rest_name: Option<&str> = None;
+    for param in params {
+        match &param.kind {
+            ParamKind::Required => positionals.push((param.name.as_str(), None)),
+            ParamKind::Optional(default) => positionals.push((param.name.as_str(), Some(default))),
+            ParamKind::Rest => rest_name = Some(param.name.as_str()),
+            ParamKind::Switch | ParamKind::Flag(_) => {}
+        }
+    }
+
+    // Scan the call-site arguments, separating positionals from flags. Only a
+    // `Value::String` beginning with `--` is a flag candidate; everything else
+    // (and everything after a bare `--`) is a positional.
+    let mut positional_values: Vec<Value> = Vec::new();
+    let mut switches_on: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut flag_values: std::collections::HashMap<&str, Value> = std::collections::HashMap::new();
+    let mut flags_ended = false;
+    for (arg, bare) in args {
+        if !flags_ended && let Value::String(text) = &arg {
+            if text == "--" {
+                flags_ended = true;
+                continue;
+            }
+            if let Some(body) = text.strip_prefix("--")
+                && !body.is_empty()
+            {
+                let (flag, inline) = match body.split_once('=') {
+                    Some((flag, value)) => (flag, Some(value.to_owned())),
+                    None => (body, None),
+                };
+                let declared = params.iter().find(|param| {
+                    param.name == flag
+                        && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
+                });
+                let Some(declared) = declared else {
+                    eprintln!("mesh: {name}: unknown flag `--{flag}`");
+                    return Err(Step::Continue(2));
+                };
+                match &declared.kind {
+                    ParamKind::Switch => {
+                        if inline.is_some() {
+                            eprintln!(
+                                "mesh: {name}: flag `--{flag}` is a switch and takes no value"
+                            );
+                            return Err(Step::Continue(2));
+                        }
+                        switches_on.insert(declared.name.as_str());
+                    }
+                    ParamKind::Flag(_) => {
+                        let Some(value) = inline else {
+                            eprintln!(
+                                "mesh: {name}: flag `--{flag}` requires a value (write `--{flag}=VALUE`)"
+                            );
+                            return Err(Step::Continue(2));
+                        };
+                        // Last occurrence wins for a valued flag. A bare literal
+                        // value is typed like the same token passed positionally,
+                        // so `--n=2` binds the integer `2`; a quoted or
+                        // interpolated value (`--n="2"`, `--n=$s`) keeps its
+                        // expanded string type.
+                        let value = if bare {
+                            expand::typed_scalar(&value)
+                        } else {
+                            Value::String(value)
+                        };
+                        flag_values.insert(declared.name.as_str(), value);
+                    }
+                    _ => unreachable!("only flags are collected here"),
+                }
+                continue;
+            }
+        }
+        positional_values.push(arg);
+    }
+
+    // Arity: every required positional must be filled; without a rest, surplus
+    // positionals are an error.
+    let required = positionals.iter().filter(|(_, d)| d.is_none()).count();
+    let maximum = positionals.len();
+    let supplied = positional_values.len();
+    if supplied < required {
+        if rest_name.is_some() || maximum > required {
+            eprintln!("mesh: {name}: expected at least {required} argument(s), got {supplied}");
+        } else {
+            eprintln!("mesh: {name}: expected {required} argument(s), got {supplied}");
+        }
+        return Err(Step::Continue(2));
+    }
+    if rest_name.is_none() && supplied > maximum {
+        if maximum > required {
+            eprintln!("mesh: {name}: expected at most {maximum} argument(s), got {supplied}");
+        } else {
+            eprintln!("mesh: {name}: expected {maximum} argument(s), got {supplied}");
+        }
+        return Err(Step::Continue(2));
+    }
+
+    // Bind every parameter in declaration order, consuming supplied positionals in
+    // sequence. Binding in order means a default — positional or flag — can
+    // reference any earlier-declared parameter, whatever its kind. A missing
+    // positional is optional (guaranteed by the arity check) and takes its default.
+    let mut supplied = positional_values.into_iter();
+    for param in params {
+        match &param.kind {
+            ParamKind::Required => {
+                let value = supplied.next().expect("a required positional is validated");
+                shell.vars.set_value(&param.name, value);
+            }
+            ParamKind::Optional(default) => {
+                let value = match supplied.next() {
+                    Some(value) => value,
+                    None => evaluate_default(name, &param.name, default, shell)?,
+                };
+                shell.vars.set_value(&param.name, value);
+            }
+            ParamKind::Rest => {
+                shell
+                    .vars
+                    .set_value(&param.name, Value::List(supplied.by_ref().collect()));
+            }
+            ParamKind::Switch => {
+                let on = switches_on.contains(param.name.as_str());
+                shell.vars.set_value(&param.name, Value::Boolean(on));
+            }
+            ParamKind::Flag(default) => {
+                let value = match flag_values.remove(param.name.as_str()) {
+                    Some(value) => value,
+                    None => evaluate_default(name, &param.name, default, shell)?,
+                };
+                shell.vars.set_value(&param.name, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate a parameter's default expression in the function's fresh scope. A
+/// nonlocal `exit`/`return` from the default is real control flow and unwinds
+/// through the call; any other failure (a runtime error, or a `break`/`continue`
+/// reported as outside a loop) fails the binding with a recoverable status.
+fn evaluate_default(
+    name: &str,
+    param: &str,
+    default: &parser::Expr,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    eval_expr(default, 0, true, shell).map_err(|step| match step {
+        exit @ Step::Exit(_) => exit,
+        ret @ Step::Return(_) => ret,
+        _ => {
+            eprintln!("mesh: {name}: could not evaluate default for `{param}`");
+            Step::Continue(2)
+        }
+    })
 }
 
 /// Return whether the parser needs another physical line to complete the input.

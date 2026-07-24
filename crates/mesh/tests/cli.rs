@@ -1877,15 +1877,296 @@ fn a_reserved_name_cannot_be_a_function() {
 }
 
 #[test]
-fn unsupported_signature_forms_are_parser_errors() {
+fn an_optional_positional_defaults_when_omitted() {
+    let out = run_with_input(
+        "func tag(image, version = latest) { puts \"$image:$version\" }\ntag app\ntag app v9\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "app:latest\napp:v9\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn a_switch_is_false_unless_passed() {
+    let out = run_with_input("func f(--force) { puts $force }\nf\nf --force\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "false\ntrue\n");
+}
+
+#[test]
+fn a_valued_flag_takes_its_value_or_default() {
+    let out = run_with_input("func f(--tag = latest) { puts $tag }\nf\nf --tag=v9\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "latest\nv9\n");
+}
+
+#[test]
+fn flags_bind_in_any_order_and_never_consume_positionals() {
+    // `--force` before the positional, `--tag=` attached, and a rest tail.
+    let out = run_with_input(
+        "func deploy(target, --region = us-west, --force, --tag = latest, ...hosts) {\n  \
+         puts \"$target $region $force $tag\"\n  puts ...$hosts\n}\n\
+         deploy prod --force web1 --tag=v9 web2\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "prod us-west true v9\nweb1 web2\n"
+    );
+}
+
+#[test]
+fn an_attached_flag_value_is_a_typed_scalar() {
+    // `--n=2` binds the integer `2`, like a positional `2` or the default, so it
+    // participates in arithmetic instead of erroring as a string.
+    let out = run_with_input("func add(--n = 1) { x = $n + 1; puts $x }\nadd\nadd --n=2\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n3\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn an_interpolated_flag_value_keeps_its_string_type() {
+    // Only a bare literal token is typed; a quoted or interpolated value keeps its
+    // expanded string type, exactly like the same value passed positionally.
+    let out = run_with_input(
+        "s = \"2\"\nfunc add(--n = 1) { x = $n + 1; puts $x }\nadd --n=$s\nputs after\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // A string `"2"` is not coerced for arithmetic — same error as a positional string.
+    assert!(stderr.contains("expected integer"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_break_in_a_default_does_not_escape_to_the_callers_loop() {
+    // A function called from inside a loop whose omitted block-bearing default runs
+    // `break` must report it as outside a loop, fail that call, and leave the
+    // caller's loop intact — not silently break out of it.
+    let out = run_with_input(
+        "func f(x = if true { break }) { puts body }\nfor j in [a b] {\n  f\n  puts \"iter $j\"\n}\nputs done\n",
+    );
+    // Both iterations run and the loop finishes; the body never runs (binding failed).
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "iter a\niter b\ndone\n"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("break: not inside a loop"), "{stderr}");
+}
+
+#[test]
+fn a_rest_parameter_collects_the_leftover_positionals() {
+    let out = run_with_input(
+        "func f(first, ...rest) { puts $first\n  puts ...$rest }\nf a b c\nf solo\n",
+    );
+    // `f a b c` -> first=a, rest=[b c]; `f solo` -> first=solo, rest=[] (empty line).
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb c\nsolo\n\n");
+}
+
+#[test]
+fn the_last_occurrence_of_a_valued_flag_wins() {
+    let out = run_with_input("func f(--tag = d) { puts $tag }\nf --tag=v1 --tag=v2\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v2\n");
+}
+
+#[test]
+fn a_flag_value_can_arrive_spread_from_a_list() {
+    let out = run_with_input(
+        "flags = [--tag=v9 host1]\nfunc f(--tag = d, ...rest) { puts $tag\n  puts ...$rest }\nf ...$flags\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v9\nhost1\n");
+}
+
+#[test]
+fn a_default_can_reference_an_earlier_declared_flag() {
+    // Parameters bind in declaration order, so a later default sees an
+    // earlier-declared flag (switch or valued), supplied or defaulted.
+    let out = run_with_input("func f(--force, x = $force) { puts $x }\nf --force\nf\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\nfalse\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn an_unknown_flag_is_a_loud_error() {
+    let out = run_with_input("func f(a) { puts $a }\nf --bogus x\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown flag `--bogus`"), "{stderr}");
+    // Recoverable: the shell keeps going.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_valued_flag_without_a_value_is_an_error() {
+    let out = run_with_input("func f(--tag = d) { puts $tag }\nf --tag\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("flag `--tag` requires a value"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_closed_header_with_an_invalid_default_dispatches_and_recovers() {
+    // `x = ]` is a malformed default, so the definition is reported as a syntax
+    // error and the following command still runs — not swallowed into the buffer.
+    let out = run_with_input("func f(x = ])\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("syntax error"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn exit_from_a_default_propagates_out_of_the_call() {
+    // `exit 7` inside an omitted default is real control flow: it exits the shell
+    // with status 7 rather than being flattened into a binding error.
+    let out = run_with_input("func f(x = if true { exit 7 }) { puts body }\nf\nputs after\n");
+    assert_eq!(out.status.code(), Some(7));
+    // Neither the body nor the following command runs.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn return_from_a_default_ends_the_call_with_that_status() {
+    // `return 7` inside an omitted default ends the call with status 7 (like the
+    // body returning), so the function reads as nonzero and the shell continues.
+    let out = run_with_input(
+        "func f(x = if true { return 7 }) { puts body }\nf && puts ok || puts caught\nputs after\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "caught\nafter\n");
+}
+
+#[test]
+fn a_switch_given_a_value_is_an_error() {
+    let out = run_with_input("func f(--force) { puts $force }\nf --force=yes\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("flag `--force` is a switch and takes no value"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn the_terminator_sends_flag_like_tokens_to_the_rest() {
+    let out = run_with_input(
+        "func f(--force, ...rest) { puts $force\n  puts ...$rest }\nf -- --force a\n",
+    );
+    // `--` ends flag parsing: `--force` and `a` become rest elements.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "false\n--force a\n");
+}
+
+#[test]
+fn too_many_positionals_without_a_rest_is_an_error() {
+    let out = run_with_input("func f(a, b = 1) { puts $a $b }\nf 1 2 3\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("expected at most 2 argument(s), got 3"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_missing_required_positional_with_optionals_present_reports_a_minimum() {
+    let out = run_with_input("func f(a, b = 1) { puts $a $b }\nf\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("expected at least 1 argument(s), got 0"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn generated_help_shows_flags_optionals_and_rest() {
+    let out = run_with_input(
+        "func deploy(target, --region = us-west, --force, ...hosts) { puts x }\ndeploy --help\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Usage: deploy <TARGET> [<HOSTS>...]\n\nArguments:\n  <TARGET>\n  [<HOSTS>...]\n\nOptions:\n  --region=<REGION>\n  --force\n  --help  Print help\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn a_new_form_signature_buffers_across_lines() {
+    // A flag/optional/rest signature split across lines — including the body brace
+    // on a later line — must keep buffering, not dispatch as an incomplete header.
+    let delayed_brace = run_with_input("func f(--force)\n{\n  puts \"$force\"\n}\nf --force\n");
+    assert_eq!(String::from_utf8_lossy(&delayed_brace.stdout), "true\n");
+    assert!(
+        delayed_brace.stderr.is_empty(),
+        "{:?}",
+        delayed_brace.stderr
+    );
+
+    let multiline = run_with_input(
+        "func g(\n  first,\n  --tag = latest,\n  ...rest\n) {\n  puts \"$first $tag\"\n  puts ...$rest\n}\ng app web1 web2\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&multiline.stdout),
+        "app latest\nweb1 web2\n"
+    );
+    assert!(multiline.stderr.is_empty(), "{:?}", multiline.stderr);
+}
+
+#[test]
+fn comments_in_a_multiline_signature_are_ignored() {
+    // A `#` comment in a signature runs to the newline, so a `)`/`,` inside it is
+    // not structure; the definition buffers to its real `)` and defines correctly.
+    let out = run_with_input(
+        "func h(\n  a, # first, and note )\n  b\n) {\n  puts \"$a $b\"\n}\nh 1 2\nputs after\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1 2\nafter\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_default_expression_with_delimiters_buffers_across_lines() {
+    // A default containing `)`, brackets, or a quoted `)`/comma must not be
+    // mistaken for the end of the signature when the body brace is on a later line.
+    let parens = run_with_input("func f(x = (1 + 2))\n{\n  puts $x\n}\nf\n");
+    assert_eq!(String::from_utf8_lossy(&parens.stdout), "3\n");
+    assert!(parens.stderr.is_empty(), "{:?}", parens.stderr);
+
+    let quoted = run_with_input("func g(x = \"a\\\",b\")\n{\n  puts $x\n}\ng\n");
+    assert_eq!(String::from_utf8_lossy(&quoted.stdout), "a\",b\n");
+    assert!(quoted.stderr.is_empty(), "{:?}", quoted.stderr);
+}
+
+#[test]
+fn a_block_bearing_default_buffers_across_lines() {
+    // A default that is a multiline block-bearing expression (`if`) has braces that
+    // are not the function body; the reader must buffer until the signature's `)`,
+    // not dispatch when the inner block closes.
+    let out = run_with_input(
+        "func f(x = if true {\n  1\n} else {\n  2\n}) {\n  puts $x\n}\nf\nputs after\n",
+    );
+    // `f` prints the default `1`; `puts after` runs at top level (nothing leaked).
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\nafter\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_declared_help_flag_is_kept_and_not_synthesized() {
+    // A function that claims `--help` observes the switch in its body instead of
+    // triggering the canned help, and its generated help does not duplicate the
+    // entry (`DESIGN.md` §"Command resolution and help").
+    let out = run_with_input("func f(--help) { puts \"help=$help\" }\nf --help\nf\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "help=true\nhelp=false\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn invalid_signature_forms_are_parser_errors() {
     for input in [
-        "func f(...xs) { puts hi }\n",
-        "func f(--flag) { puts hi }\n",
-        "func f(x = 1) { puts hi }\n",
         "func f(a b) { puts hi }\n",
         "func f(a,) { puts hi }\n",
         "func f(a, a) { puts hi }\n",
         "func f(env) { puts hi }\n",
+        // A required positional cannot follow an optional one.
+        "func f(a = 1, b) { puts hi }\n",
+        // Nothing may follow a `...rest`, and it cannot pair with an optional.
+        "func f(...xs, a) { puts hi }\n",
+        "func f(a = 1, ...xs) { puts hi }\n",
     ] {
         let out = run_with_input(input);
         assert!(
