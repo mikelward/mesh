@@ -1937,7 +1937,7 @@ calls than a flat "rejected," so they are recorded honestly:
 
 | Candidate | Lean | Why |
 | --- | --- | --- |
-| `match $x { P { … } }` | **leading** | Yields the arm's value, like `if`. `match` is the cross-language **pattern-matching** keyword — Rust, Scala, **nushell**, Elixir, and Ruby's `case/in` all use it as a value form (Python spells the arms `match … case …` but its `match` is a **statement**, so it counts as keyword precedent, not expression precedent). Pairs with `~`. |
+| `match $x { P { … } }` | **leading** | Yields the arm's value, like `if`. The *keyword* `match` for value-yielding pattern dispatch is **Rust**, **Scala** (`x match { … }`), and **nushell** (the sibling shell); Python spells the construct `match … case …` but as a **statement**, so it is keyword precedent only. (Expression pattern-matching under *other* keywords is broader still — Ruby's `case`/`in`, ML/Haskell/Elixir's `case` — which is why the keyword choice, not the expression-ness, is the real question.) Pairs with `~`. |
 | `case $x { … }` | **viable** — not dismissed | Ruby's `case`/`when` is a genuine value-returning **expression**, so "`case` can't yield a value" is **false** — the earlier draft was wrong to imply it. The real reasons to still prefer `match`: (a) mesh's arms are *patterns*, which even Ruby spells `case`/**`in`**, not `case`/`when`; (b) in a shell, `case` carries the specific `case … in pat) … ;; esac` shape, so reusing the word with `{ }` braces is *false familiarity* — a known word with an unknown grammar, the trap a clean break is meant to avoid; (c) `match` pairs with `~`. If shell muscle-memory outranks those, `case $x { … }` is defensible. |
 | `switch $x { … }` | declined | The statement-flavored member of the family (C/Java/bash fall-through; PowerShell). **Swift's `switch` *is* an expression** (`let x = switch …`, 5.9+), so it is not a clean statement-only example either — but `switch` still reads as "dispatch for effect" and carries no pattern-matching connotation, so it adds nothing over `match`. |
 | `if $x ~~ { … }` | declined | Perl's **smartmatch** — deprecated and marked experimental for exactly the type-dispatched unpredictability mesh's [error model](#error-handling) avoids (full account below). `~~` is out. |
@@ -1952,15 +1952,20 @@ resolved by the tail:
 - **A bare value tail** — `*.txt { "text" }`, `{ $kind }`, `{ [a b] }`, a nested
   `if`/`match`/`for` — yields that expression's value; earlier lines in the block run
   for effect.
-- **A single bare word** — `*.md { markdown }` — is read as the **string**
-  `"markdown"`, the shorthand that lets arms read like the table at the top of this
-  section. Note the seam: a lone word is *always* a literal string here, even if it
-  names a command, so `{ ls }` is the string `"ls"`, **not** a directory listing.
+- **A whole body that is one bare word** — `*.md { markdown }` — is read as the
+  **string** `"markdown"`, the shorthand that lets arms read like the table at the top
+  of this section. This special case is **single-statement only**: it fires when the
+  *entire* body is that one word, so `{ ls }` is the string `"ls"` (not a directory
+  listing), but the moment the body has earlier statements the tail word is no longer
+  special-cased — `{ puts side; text }` runs `text` as a **command** (and errors if
+  there is no such command). So the bare-word literal is a one-word-body convenience,
+  not a general "tail word is a string" rule.
 - **A command / pipeline tail** — `*.log { grep -c ERROR $f }` — runs the body and the
   arm's value is its **captured stdout** (the bytes-as-value path, same rule as `$(…)`).
 
-To *return a string*, then: write it as the tail — `{ "text" }` (quoted, always
-unambiguous) or `{ text }` (bare single word). This is the same
+To *return a string* reliably, then, write a **quoted** tail — `{ "text" }` — which is
+an expression and works in a body of any length; the bare `{ text }` shorthand is only
+the one-word-body form. This is the same
 bytes-vs-values seam flagged in [Conditionals](#conditionals-if-is-an-expression);
 the arm body inherits it rather than inventing anything.
 
@@ -3263,9 +3268,12 @@ to avoid" rather than promising the latter as done.
   itself — keyword-vs-`case`, and infix `$x match` vs prefix `match $x`
   (see [Matching](#matching-match)). *(Decided this pass: a `/re/` `match` arm does
   **not** auto-bind its captures — capture goes through the value-side `:match`
-  extractor, see [Matching](#matching-match) and [Destructuring](#destructuring).)* Decided this pass: **`match`** replaces `case`
+  extractor, see [Matching](#matching-match) and [Destructuring](#destructuring).)*
+  M3 **ships a multi-way pattern construct** in place of `case`
   (literal/glob/`/regex/`/range/`_` arms; no single-arm sugar — `~` covers the
-  one-test case); **tests** replace `[[ ]]` (`~`/`!~` pattern-match, type-directed
+  one-test case), currently spelled `match $x { … }`; its *spelling* (keyword and
+  prefix-vs-infix) is the open sub-question above, not a settled choice. **Tests**
+  replace `[[ ]]` (`~`/`!~` pattern-match, type-directed
   comparisons, `$p:type`/`:exists`/`:exec` file tests, `and`/`or`/`not` vs command
   `&&`/`||`); the **postfix guard** `stmt if/unless cond` is the one-line form;
   **isolation** is explicit — plain `func` persists cwd/state, `fork { }` /
