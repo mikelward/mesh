@@ -220,11 +220,13 @@ must *abut* the operator, so spacing decides — `echo 2 > f` writes "2" to `f`,
 as in bash — and only a bare run of digits counts, so `""2>f` and `\2>f` are an
 ordinary argument plus a stdout redirect.
 
-Deferred: a **builtin** with a redirection outside a pipeline (needs the
-current shell's descriptors rather than a child's), **descriptor duplication**
-(`2>&1`, `&>`, `>&`, `<&`) and descriptors **above 2** — each rejected with a
-message naming what is missing rather than silently reinterpreted. Also
-deferred: here-strings and a redirection with no command (`> f`).
+A redirected **builtin** applies the targets to the current shell's descriptors
+around the call, as a redirected function does, so no child is involved.
+
+Deferred: **descriptor duplication** (`2>&1`, `&>`, `>&`, `<&`) and descriptors
+**above 2** — each rejected with a message naming what is missing rather than
+silently reinterpreted. Also deferred: here-strings and a redirection with no
+command (`> f`).
 
 ## M2 job builtins
 
@@ -236,7 +238,8 @@ syntax error. Only a command or a pipeline can be backgrounded: `&` on anything
 else — an expression (a value call included), an assignment, an `if`/`match`, a
 loop, or a definition — is refused with `mesh: &: backgrounding … is not
 supported yet`, since those run in the shell itself and there is no child to
-defer them to.
+defer them to. A builtin or function *is* a command, and is backgrounded through
+the same fork a pipeline stage gets.
 
 Ctrl-Z also registers a stopped foreground pipeline in the same job table.
 `jobs` lists registered jobs; `fg [N|%N]` foregrounds one, and `bg [N|%N]`

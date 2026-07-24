@@ -11,23 +11,7 @@ use std::io::IsTerminal;
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
-
-/// Write one diagnostic line to stderr in a single `write`.
-///
-/// `eprintln!` formats directly into the unbuffered `Stderr`, so every piece of
-/// the format string becomes its own `write(2)`. A background redirect helper is
-/// a *separate process* sharing this stderr, so its message and the shell's own
-/// job notices interleave mid-line — `mesh: [1] 4242` followed by the orphaned
-/// remainder of the helper's error. Formatting first and writing once keeps each
-/// line whole, since a pipe write under `PIPE_BUF` is atomic.
-macro_rules! note {
-    ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let line = format!("{}\n", format_args!($($arg)*));
-        let _ = std::io::stderr().write_all(line.as_bytes());
-    }};
-}
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirKind {
@@ -145,21 +129,32 @@ impl JobTable {
         0
     }
 
-    pub fn list(&mut self, args: &[String]) -> u8 {
+    /// List the jobs. `reap` is false in a forked stage, which is not the parent
+    /// of these pids: its `waitpid` would fail with `ECHILD` and report every
+    /// running job as finished. Such a child lists the table it inherited.
+    pub fn list(&mut self, args: &[String], reap: bool) -> u8 {
         if !args.is_empty() {
             note!("mesh: jobs: too many arguments");
             return 1;
         }
-        self.reap();
+        if reap {
+            self.reap();
+        }
+        let mut status = 0;
         for job in &self.jobs {
             let state = if job.state == JobState::Stopped {
                 "Stopped"
             } else {
                 "Running"
             };
-            println!("[{}] {state} {}", job.id, job.command);
+            // A write failure is a failing status, not a panic: `jobs` can be
+            // redirected now that builtins run in the shell.
+            status |= crate::builtins::print_line(
+                "jobs",
+                &format!("[{}] {state} {}", job.id, job.command),
+            );
         }
-        0
+        status
     }
 
     /// Report jobs which completed since the preceding prompt and remove them.
@@ -241,7 +236,7 @@ pub fn run(words: &[String], jobs: &mut JobTable) -> u8 {
         }],
         jobs,
         false,
-        &mut |_| unreachable!("an external command is never an in-shell stage"),
+        &mut |_, _, _| unreachable!("an external command is never an in-shell stage"),
     )
 }
 
@@ -268,16 +263,23 @@ fn fork_in_shell(
     interactive: bool,
     background: bool,
     process_group: Option<libc::pid_t>,
-    run: &mut dyn FnMut(&[String]) -> u8,
+    index: usize,
+    jobs: &mut JobTable,
+    run: &mut dyn FnMut(usize, &Cmd, &mut JobTable) -> u8,
 ) -> std::io::Result<(libc::pid_t, bool, Option<File>)> {
     use std::io::Write;
     use std::os::fd::AsRawFd;
+
+    let redirects_stdout = background && stdout_is_redirected(cmd);
 
     // stdout: a redirection wins over the pipe to the next stage; the last stage
     // with neither inherits the shell's stdout.
     let mut piped_out = false;
     let (child_out, read_end) = match (out_file, is_last) {
         (Some(file), _) => (Some(file), None),
+        // As above: the deferred `> out` takes fd 1, so no pipe is made and the
+        // next stage reads EOF — the same shape the foreground path has.
+        _ if redirects_stdout => (None, None),
         (None, true) => (None, None),
         (None, false) => {
             let mut fds = [0; 2];
@@ -317,6 +319,22 @@ fn fork_in_shell(
         // The child never reads from the pipe it writes to; holding the read end
         // open would keep the next stage from ever seeing EOF.
         drop(read_end);
+        // A background stage's redirections are opened *here*, in the child, as
+        // the external path defers them to its helper process — so a FIFO open
+        // cannot block the shell before the job is registered.
+        let deferred = if background && !cmd.redirs.is_empty() {
+            match open_redirs(&cmd.redirs) {
+                Ok(files) => resolve_fds(files),
+                Err((path, err)) => {
+                    note!("mesh: {path}: {err}");
+                    // SAFETY: `_exit` ends the child without running the parent's
+                    // destructors, exactly as the success path below does.
+                    unsafe { libc::_exit(1) };
+                }
+            }
+        } else {
+            Vec::new()
+        };
         unsafe {
             // Rust sets SIGPIPE to SIG_IGN at startup, so a write to a closed
             // pipe would return EPIPE here and the stage would report a failure
@@ -324,7 +342,7 @@ fn fork_in_shell(
             // external child; do the same, so `f | head -3` ends the way the
             // pipefail rule assumes — killed by SIGPIPE, and not counted.
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-            if interactive || background {
+            if (interactive || background) && !in_forked_stage() {
                 libc::setpgid(0, process_group.unwrap_or(0));
             }
             if interactive {
@@ -338,17 +356,53 @@ fn fork_in_shell(
             }
             if let Some(file) = &child_out {
                 libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO);
-                if cmd.pipe_stderr && !is_last {
-                    libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
-                }
             }
-            // `2> log` applies after the pipe, so an explicit stderr target wins
-            // over `|&`'s copy of stdout.
             if let Some(file) = &err_file {
                 libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
             }
+            // A background stage's own targets, per descriptor, before the `|&`
+            // copy below — a `> out` must move stdout while `|&` can still see
+            // where it went.
+            for (fd, file) in &deferred {
+                libc::dup2(file.as_raw_fd(), *fd);
+            }
+            // `|&` *is* `2>&1` appended after the command's redirections
+            // (`DESIGN.md`), so it copies wherever stdout finally points and wins
+            // over an explicit `2>`. Duplicating from the live descriptor rather
+            // than from the pipe is what makes `f > out |& next` send both
+            // streams to `out` whether or not the stage is backgrounded — adding
+            // `&` must not change where the data goes.
+            if cmd.pipe_stderr && !is_last {
+                libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO);
+            }
+            // Only the duplicates above are the stage's descriptors; the originals
+            // are a second open handle on the same pipe or file. `_exit` never
+            // drops them, so everything this stage starts inherits them — and a
+            // stray *write* end keeps the reader from ever seeing EOF: `func f() {
+            // sleep 60 > /dev/null & }; f | cat` left `cat` waiting for the sleep
+            // even though nothing was writing to it. Neither `libc::pipe` nor the
+            // `dup2` targets set close-on-exec, so closing here is what covers a
+            // nested child whether it execs or not.
+            //
+            // A descriptor already at 0/1/2 is the one being kept rather than a
+            // copy of it: `dup2(n, n)` is a no-op, so closing it would take the
+            // stage's own stream away.
+            for fd in child_in
+                .iter()
+                .chain(child_out.iter())
+                .chain(err_file.iter())
+                .map(|file| file.as_raw_fd())
+                .chain(deferred.iter().map(|(_, file)| file.as_raw_fd()))
+            {
+                if fd > libc::STDERR_FILENO {
+                    libc::close(fd);
+                }
+            }
         }
-        let code = run(&cmd.words);
+        // From here on this process is not the interactive shell: it owns none of
+        // the shell's jobs and must not take the terminal for anything it runs.
+        mark_forked_stage();
+        let code = run(index, cmd, jobs);
         let _ = std::io::stdout().flush();
         // SAFETY: `_exit` ends the child without unwinding or running atexit
         // handlers, which belong to the parent's copy of the shell.
@@ -409,7 +463,7 @@ pub fn run_pipeline(
     cmds: Vec<Cmd>,
     jobs: &mut JobTable,
     background: bool,
-    run_in_shell: &mut dyn FnMut(&[String]) -> u8,
+    run_in_shell: &mut dyn FnMut(usize, &Cmd, &mut JobTable) -> u8,
 ) -> u8 {
     let command_text = cmds
         .iter()
@@ -418,6 +472,10 @@ pub fn run_pipeline(
         .join(" | ");
     let n = cmds.len();
     let interactive = shell_stdin_is_terminal();
+    // A forked stage runs the shell's code but owns no jobs: nested background
+    // work stays in *this* stage's process group — the one the shell already
+    // tracks — instead of starting a group only this copy of the table knows.
+    let forked = in_forked_stage();
     let mut outcomes: Vec<Outcome> = Vec::new();
     // A background job must not consume commands from the shell's input.
     let mut next_stdin = initial_stdin(background, interactive);
@@ -478,10 +536,12 @@ pub fn run_pipeline(
                 interactive,
                 background,
                 process_group,
+                idx,
+                jobs,
                 run_in_shell,
             ) {
                 Ok((pid, piped_out, read_end)) => {
-                    if interactive || background {
+                    if (interactive || background) && !forked {
                         let pgid = process_group.unwrap_or(pid);
                         process_group = Some(pgid);
                         // Repeat setpgid in the parent to close the race with the
@@ -505,7 +565,7 @@ pub fn run_pipeline(
         }
 
         let mut command = if background && !cmd.redirs.is_empty() {
-            match background_redirect_command(&cmd) {
+            match background_redirect_command(&cmd, cmd.pipe_stderr && !is_last) {
                 Ok(command) => command,
                 Err((path, err)) => {
                     note!("mesh: {path}: {err}");
@@ -518,7 +578,7 @@ pub fn run_pipeline(
             command.args(&cmd.words[1..]);
             command
         };
-        if interactive || background {
+        if (interactive || background) && !forked {
             // A zero process group makes the first child a group leader. Later
             // stages join it, so terminal signals address the entire pipeline.
             command.process_group(process_group.unwrap_or(0));
@@ -559,44 +619,75 @@ pub fn run_pipeline(
 
         // stdout: an output redirection wins over the pipe to the next stage;
         // otherwise pipe to the next stage; otherwise inherit (only the last).
+        //
+        // stdout is decided *first* because `|&` is `2>&1` appended after the
+        // command's own redirections (`DESIGN.md`), so it copies wherever stdout
+        // finally points: `> out |&` takes stderr to the file and leaves the next
+        // stage empty, and `2> log |&` loses the log to the pipe. Deciding stderr
+        // first — a combined pipe that `2>` then overrode — gave the opposite
+        // answer in both cases, and disagreed with an in-shell stage, which
+        // dup2s in this order.
+        let merge_stderr = cmd.pipe_stderr && !is_last;
+        // A background external defers its opens to the helper, so — exactly as in
+        // `fork_in_shell` — the shell must read fd 1's fate from `cmd.redirs`
+        // rather than from an opened file. Without this the stage takes the pipe
+        // branch below and records `piped_out`, which excuses a SIGPIPE that the
+        // foreground spelling reports.
+        let defers_stdout = background && stdout_is_redirected(&cmd);
         let mut piped_out = false;
         let mut combined_pipe = None;
-        if cmd.pipe_stderr && !is_last {
-            let mut fds = [0; 2];
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-                note!("mesh: pipe: {}", std::io::Error::last_os_error());
-                outcomes.push(Outcome::Failed(1));
-                continue;
+        let mut merged_stderr = None;
+        if let Some(file) = out_file {
+            if merge_stderr {
+                match file.try_clone() {
+                    Ok(clone) => merged_stderr = Some(clone),
+                    Err(error) => {
+                        note!("mesh: {}: {error}", cmd.words[0]);
+                        outcomes.push(Outcome::Failed(1));
+                        continue;
+                    }
+                }
             }
-            let read = unsafe { File::from_raw_fd(fds[0]) };
-            let write = unsafe { File::from_raw_fd(fds[1]) };
-            let stderr = match write.try_clone() {
-                Ok(file) => file,
-                Err(error) => {
-                    note!("mesh: pipe: {error}");
+            command.stdout(file);
+        } else if !is_last && !defers_stdout {
+            if merge_stderr {
+                // Own the pipe rather than letting `Stdio::piped()` make it, so
+                // both descriptors can be given its write end.
+                let mut fds = [0; 2];
+                if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+                    note!("mesh: pipe: {}", std::io::Error::last_os_error());
                     outcomes.push(Outcome::Failed(1));
                     continue;
                 }
-            };
-            command.stdout(write).stderr(stderr);
-            combined_pipe = Some(read);
-            piped_out = true;
-        } else if let Some(file) = out_file {
-            command.stdout(file);
-        } else if !is_last {
-            command.stdout(Stdio::piped());
+                let read = unsafe { File::from_raw_fd(fds[0]) };
+                let write = unsafe { File::from_raw_fd(fds[1]) };
+                match write.try_clone() {
+                    Ok(clone) => merged_stderr = Some(clone),
+                    Err(error) => {
+                        note!("mesh: pipe: {error}");
+                        outcomes.push(Outcome::Failed(1));
+                        continue;
+                    }
+                }
+                command.stdout(write);
+                combined_pipe = Some(read);
+            } else {
+                command.stdout(Stdio::piped());
+            }
             piped_out = true;
         }
 
-        // `2> log` applies after the pipe, so an explicit stderr target wins over
-        // the copy of stdout `|&` installed above.
-        if let Some(file) = err_file {
+        // stderr: `|&`'s copy of the final stdout wins over an explicit `2>`,
+        // being appended after it; otherwise the explicit target applies.
+        if let Some(file) = merged_stderr {
+            command.stderr(file);
+        } else if let Some(file) = err_file {
             command.stderr(file);
         }
 
         match command.spawn() {
             Ok(mut child) => {
-                if interactive || background {
+                if (interactive || background) && !forked {
                     let pgid = process_group.unwrap_or_else(|| child.id() as i32);
                     process_group = Some(pgid);
                     // Repeat setpgid in the parent to close the race between
@@ -607,10 +698,8 @@ pub fn run_pipeline(
                         libc::setpgid(child.id() as libc::pid_t, pgid);
                     }
                 }
-                if cmd.pipe_stderr && !is_last {
-                    if let Some(pipe) = combined_pipe {
-                        next_stdin = NextIn::Pipe(pipe);
-                    }
+                if let Some(pipe) = combined_pipe {
+                    next_stdin = NextIn::Pipe(pipe);
                 } else if piped_out && let Some(out) = child.stdout.take() {
                     next_stdin = NextIn::Pipe(File::from(std::os::fd::OwnedFd::from(out)));
                 }
@@ -638,6 +727,16 @@ pub fn run_pipeline(
     }
 
     if background {
+        // A forked stage does not register jobs: the table belongs to the shell,
+        // and this copy of it dies with the stage. The children just started are
+        // in the stage's own group, which is the group the shell tracks — so a
+        // signal to the job reaches them for as long as the job lives. `&` means
+        // "do not wait" inside a fork too, so the stage returns rather than
+        // falling through to `wait_outcomes`; the job then completes while the
+        // nested child runs on, exactly as it does in a POSIX shell.
+        if forked {
+            return 0;
+        }
         if let Some(pgid) = process_group {
             let id = jobs.next_id;
             jobs.next_id += 1;
@@ -777,11 +876,36 @@ fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<WaitResult> {
 /// Open background redirects in the child, after `spawn` has returned control
 /// to mesh. This keeps FIFO opens non-blocking for the shell without adding a
 /// PATH-resolved wrapper executable.
-fn background_redirect_command(cmd: &Cmd) -> Result<Command, (String, std::io::Error)> {
+/// Whether a stage's own redirections will take fd 1 off the pipe.
+///
+/// A **background** stage's targets are opened after the fork — in the forked
+/// child, or in the re-executed helper — so the shell has no opened file to look
+/// at even when one of them moves stdout. That matters beyond where the bytes go:
+/// `piped_out` is what tells the wait logic a SIGPIPE was the ignorable "the
+/// reader went away" case, so it has to describe where fd 1 *ends up*. With a
+/// `> out` a SIGPIPE is a real failure, exactly as it is in the foreground.
+///
+/// The open mode is not consulted, only the descriptor: `1< file` replaces fd 1
+/// just as `> file` does, and the foreground path likewise sorts opened targets by
+/// `fd` alone. `resolve_fds` keeps the last redirection per descriptor, so any
+/// redirection naming fd 1 takes it off the pipe.
+fn stdout_is_redirected(cmd: &Cmd) -> bool {
+    cmd.redirs
+        .iter()
+        .any(|redir| redir.fd == libc::STDOUT_FILENO)
+}
+
+fn background_redirect_command(
+    cmd: &Cmd,
+    merge_stderr: bool,
+) -> Result<Command, (String, std::io::Error)> {
     let executable = std::env::current_exe().map_err(|err| (cmd.words[0].clone(), err))?;
     let mut command = Command::new(executable);
     command
         .arg("--mesh-background-redirect")
+        // `|&` travels too: the helper opens the targets, so only it can apply the
+        // implicit `2>&1` *after* them, which is where it belongs.
+        .arg(if merge_stderr { "merge" } else { "plain" })
         .arg(cmd.redirs.len().to_string());
     // Each redirection travels as `KIND FD PATH`, so the descriptor survives the
     // hand-off to the helper as well as the direction does.
@@ -801,17 +925,22 @@ fn background_redirect_command(cmd: &Cmd) -> Result<Command, (String, std::io::E
 /// Internal executable mode used to defer potentially blocking opens until
 /// after the background child has completed `exec`.
 pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
-    let Some(count) = args.first().and_then(|arg| arg.parse::<usize>().ok()) else {
+    let merge_stderr = match args.first().map(String::as_str) {
+        Some("merge") => true,
+        Some("plain") => false,
+        _ => return std::process::ExitCode::from(1),
+    };
+    let Some(count) = args.get(1).and_then(|arg| arg.parse::<usize>().ok()) else {
         return std::process::ExitCode::from(1);
     };
-    let Some(words_start) = count.checked_mul(3).and_then(|count| count.checked_add(1)) else {
+    let Some(words_start) = count.checked_mul(3).and_then(|count| count.checked_add(2)) else {
         return std::process::ExitCode::from(1);
     };
     if words_start >= args.len() {
         return std::process::ExitCode::from(1);
     }
     let mut redirs = Vec::new();
-    for triple in args[1..words_start].chunks_exact(3) {
+    for triple in args[2..words_start].chunks_exact(3) {
         let kind = match triple[0].as_str() {
             "in" => RedirKind::In,
             "out" => RedirKind::Out,
@@ -837,12 +966,35 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
     let words = &args[words_start..];
     let mut command = Command::new(&words[0]);
     command.args(&words[1..]);
+    // `|&` is `2>&1` appended *after* the command's own redirections, so stderr
+    // follows wherever stdout finally points and an explicit `2>` loses to it.
+    // Taken before the targets are handed over, since `stdout` consumes its file.
+    let merged_stderr = if merge_stderr {
+        match opened.iter().find(|(fd, _)| *fd == libc::STDOUT_FILENO) {
+            Some((_, file)) => match file.try_clone() {
+                Ok(clone) => Some(Stdio::from(clone)),
+                Err(err) => {
+                    note!("mesh: {}: {err}", words[0]);
+                    return std::process::ExitCode::from(1);
+                }
+            },
+            // No `>` moved stdout, so it is still the pipe the shell connected.
+            // Inheriting names it explicitly, which is what overrides an
+            // explicit `2>` that this loop is about to apply.
+            None => Some(Stdio::inherit()),
+        }
+    } else {
+        None
+    };
     for (fd, file) in opened {
         match fd {
             libc::STDIN_FILENO => command.stdin(file),
             libc::STDOUT_FILENO => command.stdout(file),
             _ => command.stderr(file),
         };
+    }
+    if let Some(stderr) = merged_stderr {
+        command.stderr(stderr);
     }
     let err = command.exec();
     std::process::ExitCode::from(spawn_error_code(&words[0], &err))
@@ -1080,7 +1232,32 @@ fn terminal_fd() -> libc::c_int {
     }
 }
 
+/// Set once in a forked in-shell stage. Such a child runs the shell's code but
+/// is not the interactive shell: it owns no jobs and must not touch the
+/// terminal.
+static IN_FORKED_STAGE: AtomicBool = AtomicBool::new(false);
+
+/// Mark this process as a forked stage, so nothing it runs afterwards performs
+/// job control.
+///
+/// Without it a nested pipeline inherits the *shell's* answers — stdin is still
+/// a terminal, this call is not itself backgrounded — and so builds a new
+/// foreground process group and calls `tcsetpgrp`. In `func f() { sleep 5 }`
+/// backgrounded with `f &`, that hands the terminal from mesh to the nested
+/// `sleep`, and the prompt stops accepting input.
+pub(crate) fn mark_forked_stage() {
+    IN_FORKED_STAGE.store(true, Ordering::Relaxed);
+}
+
+/// Whether this process is a forked stage rather than the shell itself.
+fn in_forked_stage() -> bool {
+    IN_FORKED_STAGE.load(Ordering::Relaxed)
+}
+
 fn shell_stdin_is_terminal() -> bool {
+    if IN_FORKED_STAGE.load(Ordering::Relaxed) {
+        return false;
+    }
     let saved = SHELL_STDIN.load(Ordering::Relaxed);
     if saved >= 0 {
         return unsafe { libc::isatty(saved) == 1 };
@@ -1227,7 +1404,7 @@ mod tests {
         let mut jobs = JobTable::new();
         assert_eq!(jobs.foreground(&[]), 1);
         assert_eq!(jobs.background(&[]), 1);
-        assert_eq!(jobs.list(&[]), 0);
+        assert_eq!(jobs.list(&[], true), 0);
     }
 
     #[test]

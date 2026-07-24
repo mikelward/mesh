@@ -1332,6 +1332,205 @@ fn background_startup_harness(exec: &MeshExec) -> i32 {
     0
 }
 
+#[test]
+fn nested_background_work_joins_the_stage_group() {
+    // A backgrounded function that backgrounds something itself must not start a
+    // process group of its own: the shell tracks the stage's group, and a nested
+    // group would escape it — and print a second, conflicting `[1]` notice from
+    // inside the fork.
+    //
+    // The nested command still outlives the job, as it does in bash: the stage
+    // returns as soon as it has started it, so the job completes and is reaped
+    // while the child runs on. `&` means "do not wait" inside a fork too. What
+    // this pins down is the group and the single notice, not the lifetime.
+    let dir = fresh_dir("nested_background");
+    let out = run_with_input(&format!(
+        "cd {}\nfunc f() {{ sh -c 'ps -o pgid= -p $$ > pgid' & }}\nf &\nsleep 0.4\n",
+        dir.display()
+    ));
+    let notices = String::from_utf8_lossy(&out.stderr);
+    let started: Vec<&str> = notices
+        .lines()
+        .filter(|line| line.starts_with("[1] "))
+        .collect();
+    assert_eq!(started.len(), 1, "one job notice, got {started:?}");
+    let tracked = started[0].trim_start_matches("[1] ").trim();
+    let nested = std::fs::read_to_string(dir.join("pgid")).expect("nested command ran");
+    assert_eq!(
+        nested.trim(),
+        tracked,
+        "nested background work should share the stage's group"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_stage_does_not_leak_its_pipe_to_nested_background_work() {
+    // The fork duplicates its pipe onto fd 1 and must then close the original.
+    // It leaves via `_exit`, so nothing else ever will — and a second open write
+    // end is inherited by everything the stage starts, keeping the reader from
+    // seeing EOF long after the stage itself has finished.
+    //
+    // The nested command's own streams go to `/dev/null`, so it holds no
+    // legitimate claim on anything: `cat` should report EOF as soon as the stage
+    // exits, and the script reach `puts after`. Both streams have to be
+    // redirected, or the background command keeps *this harness's* captured
+    // stdout/stderr open and the wait would prove nothing about the pipe.
+    let timed = |script: &str| {
+        let start = std::time::Instant::now();
+        let out = run_with_input(script);
+        (out, start.elapsed())
+    };
+    let (redirected, elapsed) =
+        timed("func f() { sleep 5 > /dev/null 2> /dev/null &\nputs hi }\nf | cat\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&redirected.stdout),
+        "hi\nafter\n",
+        "{:?}",
+        redirected.stderr
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the reader waited on a leaked descriptor: {elapsed:?}"
+    );
+
+    // The contrast, which is *not* a leak: with stdout left alone the nested
+    // command inherits the stage's, so it holds the pipe legitimately and the
+    // reader does wait for it. bash agrees — `bash -c 'set -m; f(){ sleep 6 & echo
+    // hi; }; f | cat'` blocks for the sleep, and returns at once as soon as the
+    // sleep's stdout is redirected away.
+    let (inherited, waited) =
+        timed("func f() { sleep 0.5 2> /dev/null &\nputs hi }\nf | cat\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&inherited.stdout),
+        "hi\nafter\n",
+        "{:?}",
+        inherited.stderr
+    );
+    assert!(
+        waited >= std::time::Duration::from_millis(400),
+        "a nested command that inherits the pipe should hold it: {waited:?}"
+    );
+}
+
+#[test]
+fn a_backgrounded_function_leaves_the_terminal_with_the_shell() {
+    // `f &` forks the function, and the body's own `sleep` must not be treated as
+    // a foreground job: the fork is not the interactive shell. If it were, the
+    // nested command would take a new process group and `tcsetpgrp` the terminal
+    // away from mesh, and the prompt would stop accepting input.
+    let exec = MeshExec::new(isolated_config_home());
+    let harness = unsafe { libc::fork() };
+    assert!(
+        harness >= 0,
+        "fork failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if harness == 0 {
+        unsafe { libc::_exit(background_function_terminal_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+fn background_function_terminal_harness(exec: &MeshExec) -> i32 {
+    use std::os::fd::RawFd;
+
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } != 0
+        || unsafe { libc::setsid() } < 0
+        || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
+    {
+        return 10;
+    }
+    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    let harness_group = unsafe { libc::getpgrp() };
+    if unsafe { libc::tcsetpgrp(slave, harness_group) } < 0 {
+        return 11;
+    }
+
+    let mesh = unsafe { libc::fork() };
+    if mesh < 0 {
+        return 12;
+    }
+    if mesh == 0 {
+        unsafe {
+            libc::setpgid(0, 0);
+            libc::dup2(slave, libc::STDIN_FILENO);
+            libc::dup2(slave, libc::STDOUT_FILENO);
+            libc::dup2(slave, libc::STDERR_FILENO);
+            libc::close(master);
+            libc::close(slave);
+        }
+        unsafe { libc::_exit(exec_mesh(exec)) };
+    }
+    unsafe { libc::close(slave) };
+
+    // mesh stops on SIGTTIN reading from a terminal it does not own; hand it over.
+    let mut status = 0;
+    if unsafe { libc::waitpid(mesh, &mut status, libc::WUNTRACED) } != mesh
+        || !libc::WIFSTOPPED(status)
+        || unsafe { libc::tcsetpgrp(master, mesh) } < 0
+        || unsafe { libc::kill(mesh, libc::SIGCONT) } < 0
+    {
+        return 13;
+    }
+    if !pty_wait_for_prompt(master) {
+        return 14;
+    }
+    // The body runs a real external command and *then* reports. Checking right
+    // after `f &` would race the fork: the prompt can return before the stage has
+    // spawned anything, so the window where a nested command could take the
+    // terminal would not have been entered yet.
+    for line in ["func f() { sleep 0.3; puts inner-ran }\n", "f &\n"] {
+        if unsafe { libc::write(master, line.as_ptr().cast(), line.len()) } != line.len() as isize {
+            return 15;
+        }
+        if !pty_wait_for_prompt(master) {
+            return 16;
+        }
+    }
+    // Wait for evidence the nested `sleep` actually ran to completion, so the
+    // whole window has been crossed before the terminal is inspected.
+    if !pty_wait_for_marker(master, b"inner-ran") {
+        return 22;
+    }
+    // The shell, not the backgrounded job's `sleep`, must still own the terminal.
+    if unsafe { libc::tcgetpgrp(master) } != mesh {
+        return 17;
+    }
+    // And it must still be able to run the next command.
+    let alive = "puts alive\n";
+    if unsafe { libc::write(master, alive.as_ptr().cast(), alive.len()) } != alive.len() as isize {
+        return 18;
+    }
+    let Some(echoed) = pty_read_until_prompt(master) else {
+        return 19;
+    };
+    if !echoed.windows(5).any(|part| part == b"alive") {
+        return 20;
+    }
+    if unsafe { libc::write(master, b"\x04".as_ptr().cast(), 1) } != 1 {
+        return 21;
+    }
+    unsafe { libc::waitpid(mesh, &mut status, 0) };
+    unsafe { libc::close(master) };
+    0
+}
+
 /// Act as the small piece of terminal-emulator behavior reedline needs while
 /// waiting for its prompt.
 fn pty_wait_for_prompt(master: std::os::fd::RawFd) -> bool {
@@ -1344,6 +1543,36 @@ fn pty_read_until_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
         .windows(5)
         .any(|part| part == b"mesh$")
         .then_some(prompt)
+}
+
+/// Read from the PTY until `marker` appears, answering cursor-position queries so
+/// reedline keeps going. Used to wait for evidence that a backgrounded body has
+/// actually run, rather than checking the moment the prompt returns.
+fn pty_wait_for_marker(master: std::os::fd::RawFd, marker: &[u8]) -> bool {
+    let mut ready = libc::pollfd {
+        fd: master,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut seen = Vec::new();
+    for _ in 0..40 {
+        if seen.windows(marker.len()).any(|part| part == marker) {
+            return true;
+        }
+        if unsafe { libc::poll(&mut ready, 1, 2_000) } <= 0 {
+            return false;
+        }
+        let mut chunk = [0_u8; 256];
+        let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if count <= 0 {
+            return false;
+        }
+        seen.extend_from_slice(&chunk[..count as usize]);
+        if seen.windows(4).any(|part| part == b"\x1b[6n") {
+            unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
+        }
+    }
+    seen.windows(marker.len()).any(|part| part == marker)
 }
 
 fn pty_read_until_any_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
@@ -1506,12 +1735,444 @@ fn a_builtin_runs_as_a_pipeline_stage() {
 }
 
 #[test]
-fn a_redirected_builtin_is_rejected_for_now() {
+fn a_redirected_builtin_writes_to_the_target() {
+    // A builtin runs inside the shell, so — like a function — its `>` applies to
+    // the shell's own descriptors for the duration of the call.
     let dir = fresh_dir("redir_builtin");
     let out = run_with_input(&format!("cd {}\npwd > f\nputs after\n", dir.display()));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("redirection of a builtin"));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let written = std::fs::read_to_string(dir.join("f")).expect("pwd wrote the file");
+    assert_eq!(
+        written.trim_end(),
+        dir.canonicalize().unwrap().display().to_string()
+    );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_redirected_builtin_survives_a_failing_write() {
+    // A redirected builtin writes through the shell's own descriptors, so a write
+    // error reaches the shell. It must report a failing status, not panic the way
+    // `println!` does — the shell has to still be there for the next statement.
+    let out = run_with_input("prompt > /dev/full\njobs > /dev/full\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after\n",
+        "{:?}",
+        out.stdout
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("mesh: prompt:"), "{stderr:?}");
+    assert!(!stderr.contains("panicked"), "{stderr:?}");
+
+    // The status is the builtin's failure, not the shell's death.
+    let status = run_with_input("prompt > /dev/full\n");
+    assert_eq!(status.status.code(), Some(1));
+
+    // The same holds for a *diagnostic* the builtin writes: `2>` applies to the
+    // shell's own fd 2, so a misuse whose message cannot be delivered must still
+    // return that misuse's status rather than abort the shell.
+    let diagnostic = run_with_input("pwd extra 2> /dev/full\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&diagnostic.stdout),
+        "after\n",
+        "{:?}",
+        diagnostic.stdout
+    );
+    assert!(
+        !String::from_utf8_lossy(&diagnostic.stderr).contains("panicked"),
+        "{:?}",
+        diagnostic.stderr
+    );
+    let misuse = run_with_input("pwd extra 2> /dev/full\n");
+    assert_eq!(misuse.status.code(), Some(1));
+}
+
+#[test]
+fn a_pipeline_stage_expands_its_words_before_its_redirect_target() {
+    // A stage reports the same first failure the unpiped command does, so the
+    // diagnostic does not change just because the command joined a pipeline.
+    let plain = run_with_input("puts $arg_missing > $redir_missing\n");
+    let piped = run_with_input("puts $arg_missing > $redir_missing | cat\n");
+    assert!(
+        String::from_utf8_lossy(&plain.stderr).contains("arg_missing: unbound variable"),
+        "{:?}",
+        plain.stderr
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&piped.stderr),
+        String::from_utf8_lossy(&plain.stderr)
+    );
+
+    // The same order keeps a stage's glob from seeing the file its own `>` is
+    // about to create.
+    let dir = fresh_dir("stage_expand_order");
+    let out = run_with_input(&format!(
+        "cd {}\nputs one > a\nputs * > listing | cat\ncat listing\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a\n",
+        "{:?}",
+        out.stdout
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_in_shell_command_runs_in_the_background() {
+    // Backgrounding needs a child, so a builtin or a function is forked too.
+    let dir = fresh_dir("background_in_shell");
+    let out = run_with_input(&format!(
+        "cd {}\nfunc report() {{ puts done > out }}\nreport &\nputs said > from-builtin &\n\
+         sleep 0.2\ncat out from-builtin\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\nsaid\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_reaped_job_notice_stays_with_the_shell() {
+    // Only the shell can `waitpid`, so it refreshes the table before forking a
+    // stage that can look at it. The `[N] Done` notice it produces is the
+    // *shell's*, not that stage's output — bash writes it to the shell's stderr
+    // whether the command is piped or not, and only the shell knows the reap
+    // happened. Handing it to a stage would mean guessing which stage runs `jobs`,
+    // which is unknowable for a function body.
+    let dir = fresh_dir("reap_notice_owner");
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+    let done = |out: &Output| {
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .filter(|line| line.contains("Done"))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    for (label, pipeline) in [
+        ("direct `jobs`", "jobs 2> a | cat"),
+        ("nested in a function", "shows 2> a | cat"),
+        // Two function stages: only the second calls `jobs`, so no static guess
+        // could pick the right one.
+        ("two functions", "noop 2> a | shows 2> b"),
+    ] {
+        for name in ["a", "b"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        let out = run_with_input(&format!(
+            "cd {}\nfunc noop() {{ true }}\nfunc shows() {{ jobs }}\n             sleep 0.05 &\nsleep 0.3\n{pipeline}\n",
+            dir.display()
+        ));
+        assert_eq!(
+            done(&out),
+            ["[1] Done (0) sleep 0.05"],
+            "{label}: the notice belongs on the shell's stderr"
+        );
+        assert_eq!(read("a"), "", "{label}: a stage must not capture it");
+        assert_eq!(read("b"), "", "{label}: a stage must not capture it");
+    }
+
+    // It survives a stage that never starts, for the same reason: the shell is the
+    // one reporting, so nothing depends on the stage running.
+    let failed =
+        run_with_input("sleep 0.05 &\nsleep 0.3\njobs 2> /missing/log | cat\nputs after\n");
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("/missing/log"), "{stderr:?}");
+    assert!(stderr.contains("] Done (0) sleep 0.05"), "{stderr:?}");
+    assert_eq!(String::from_utf8_lossy(&failed.stdout), "after\n");
+
+    // And a backgrounded stage, whose targets are opened in the child.
+    let backgrounded =
+        run_with_input("sleep 0.05 &\nsleep 0.3\njobs 2> /missing/log &\nsleep 0.2\n");
+    assert!(
+        String::from_utf8_lossy(&backgrounded.stderr).contains("] Done (0) sleep 0.05"),
+        "{:?}",
+        backgrounded.stderr
+    );
+
+    // Reaping removes finished jobs, so a stage that cannot look at the table must
+    // not trigger it: `puts hi | cat` would otherwise take a completed job out
+    // from under a later `fg`, which the unpiped `puts hi` leaves alone.
+    let unrelated = run_with_input("sleep 0.05 &\nsleep 0.3\nputs hi | cat\nfg\nputs end\n");
+    assert!(
+        !String::from_utf8_lossy(&unrelated.stderr).contains("no current job"),
+        "an unrelated stage must not reap: {:?}",
+        unrelated.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&unrelated.stdout), "hi\nend\n");
+
+    // A nested `jobs` still reads a fresh table, which is what the refresh is for.
+    let nested = |tail: &str| {
+        run_with_input(&format!(
+            "sleep 0.05 &\nsleep 0.3\nfunc f() {{ jobs }}\nf{tail}\n"
+        ))
+    };
+    assert_eq!(done(&nested("")), done(&nested(" | cat")));
+    assert_eq!(String::from_utf8_lossy(&nested(" | cat").stdout), "");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn piped_stderr_follows_the_final_stdout_for_every_stage_type() {
+    // `|&` is `2>&1` appended *after* the command's own redirections, so it copies
+    // wherever stdout finally points: `> f |&` takes stderr to the file and leaves
+    // the next stage empty, and `2> f |&` loses the file to the pipe. An external
+    // stage and an in-shell one must answer identically — the same rule bash
+    // applies to both.
+    let dir = fresh_dir("piped_stderr_order");
+    let script = dir.join("both.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'to-stdout\\n'\nprintf 'to-stderr\\n' >&2\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    // (redirection, what the file gets, what the next stage gets)
+    for (redirect, expected_file, expected_pipe) in [
+        (
+            "> f",
+            "to-stdout
+to-stderr
+",
+            "",
+        ),
+        (
+            "2> f",
+            "",
+            "to-stdout
+to-stderr
+",
+        ),
+    ] {
+        // The external spelling and the function spelling of the same command.
+        for stage in ["./both.sh", "callee"] {
+            let _ = std::fs::remove_file(dir.join("f"));
+            let out = run_with_input(&format!(
+                "cd {}\nfunc callee() {{ ./both.sh }}\n{stage} {redirect} |& cat\n",
+                dir.display()
+            ));
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                expected_pipe,
+                "{stage} {redirect}: next stage"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("f")).unwrap_or_default(),
+                expected_file,
+                "{stage} {redirect}: file"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_redirected_stage_still_reports_its_own_sigpipe() {
+    // A SIGPIPE from a *piped* producer is the ignorable "the reader went away"
+    // case. Once `> out` moves fd 1 off the pipe it is a real failure again, and
+    // that must hold for a backgrounded stage too — whose redirections are opened
+    // in the child, so the shell has to reason about where fd 1 *ends up* rather
+    // than what it handed over.
+    let dir = fresh_dir("stage_sigpipe_redirect");
+    let script = |stage: &str, tail: &str| {
+        format!(
+            "cd {}\nfunc dies() {{ sh -c 'kill -PIPE $$' }}\n{stage} > out | cat{tail}\n",
+            dir.display()
+        )
+    };
+    // Both stage kinds defer their opens when backgrounded — the in-shell one to
+    // its fork, the external one to the re-executed helper — so both have to read
+    // fd 1's fate from the redirections rather than from an opened file.
+    for (label, stage) in [("function", "dies"), ("external", "sh -c 'kill -PIPE $$'")] {
+        // Foreground: the shell's exit status is the pipeline's.
+        let foreground = run_with_input(&script(stage, ""));
+        assert_eq!(
+            foreground.status.code(),
+            Some(141),
+            "{label}: {:?}",
+            foreground.stderr
+        );
+
+        // Backgrounded: the job notice carries the same status.
+        let backgrounded = run_with_input(&format!("{}sleep 0.4\njobs\n", script(stage, " &")));
+        let notices = String::from_utf8_lossy(&backgrounded.stderr);
+        assert!(
+            notices.contains("Done (141)"),
+            "{label}: backgrounding hid the failure: {notices:?}"
+        );
+
+        // What matters is the *descriptor*, not the open mode: `1< file` replaces
+        // fd 1 as surely as `> file` does, so it takes the stage off the pipe too.
+        let by_fd = run_with_input(&format!(
+            "func dies() {{ sh -c 'kill -PIPE $$' }}\n{stage} 1< /dev/null | cat &\nsleep 0.4\njobs\n"
+        ));
+        assert!(
+            String::from_utf8_lossy(&by_fd.stderr).contains("Done (141)"),
+            "{label}: `1<` should leave the pipe too: {:?}",
+            by_fd.stderr
+        );
+    }
+
+    // Without the redirection the SIGPIPE stays ignorable, in both spellings.
+    let piped = run_with_input("func dies() { sh -c 'kill -PIPE $$' }\ndies | cat\n");
+    assert_eq!(piped.status.code(), Some(0), "{:?}", piped.stderr);
+    let piped_bg =
+        run_with_input("func dies() { sh -c 'kill -PIPE $$' }\ndies | cat &\nsleep 0.4\njobs\n");
+    assert!(
+        String::from_utf8_lossy(&piped_bg.stderr).contains("Done (0)"),
+        "{:?}",
+        piped_bg.stderr
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn backgrounding_a_stage_does_not_move_its_piped_stderr() {
+    // `|&` is `2>&1` appended after the command's own redirections, so a `> out`
+    // takes stdout *and* the copy `|&` makes of it — the next stage receives
+    // nothing. Adding `&` must not change that: a background stage opens its
+    // targets in the child, and if the copy were made before them it would leave
+    // stderr on the pipe and silently reroute the data.
+    let dir = fresh_dir("background_pipe_stderr");
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+    // Both stage kinds: an in-shell function, which opens its targets in its own
+    // fork, and an external, which defers them to the re-executed helper. The
+    // merge has to happen after the targets in each.
+    for (label, stage) in [
+        ("function", "both"),
+        ("external", "sh -c 'echo out; echo err >&2'"),
+    ] {
+        for name in ["fg-out", "fg-pipe", "bg-out", "bg-pipe"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        let out = run_with_input(&format!(
+            "cd {}\nfunc both() {{ sh -c 'echo out; echo err >&2' }}\n             {stage} > fg-out |& cat > fg-pipe\n{stage} > bg-out |& cat > bg-pipe &\nsleep 0.4\n",
+            dir.display()
+        ));
+        assert_eq!(read("fg-out"), "out\nerr\n", "{label}: {:?}", out.stderr);
+        assert_eq!(
+            read("bg-out"),
+            read("fg-out"),
+            "{label}: backgrounding moved a stream"
+        );
+        assert_eq!(read("fg-pipe"), "", "{label}");
+        assert_eq!(read("bg-pipe"), read("fg-pipe"), "{label}");
+    }
+
+    // The mirror case: `2>` loses to the `|&` copy, so the next stage gets both
+    // streams and the file stays empty — again for either stage kind, foreground
+    // or backgrounded.
+    for (label, stage) in [
+        ("function", "both"),
+        ("external", "sh -c 'echo out; echo err >&2'"),
+    ] {
+        for name in ["fg-err", "fg-pipe", "bg-err", "bg-pipe"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        run_with_input(&format!(
+            "cd {}\nfunc both() {{ sh -c 'echo out; echo err >&2' }}\n             {stage} 2> fg-err |& cat > fg-pipe\n{stage} 2> bg-err |& cat > bg-pipe &\nsleep 0.4\n",
+            dir.display()
+        ));
+        assert_eq!(read("fg-err"), "", "{label}: `2>` should lose to `|&`");
+        assert_eq!(read("bg-err"), read("fg-err"), "{label}");
+        assert_eq!(read("fg-pipe"), "out\nerr\n", "{label}");
+        assert_eq!(read("bg-pipe"), read("fg-pipe"), "{label}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_function_stage_keeps_its_typed_arguments() {
+    // A function takes typed values wherever it is called, so a bare list is one
+    // list-valued positional in a pipeline stage and in the background too — not
+    // the "list value needs `...`" the external argv rule would give.
+    let dir = fresh_dir("stage_typed_args");
+    let out = run_with_input(&format!(
+        "cd {}\nfunc show(xs) {{ puts \"len=$xs:len first=$xs[0]\" }}\nys = [a b]\n\
+         show $ys | tr a-z A-Z\nshow $ys > out\nsleep 0.1\ncat out\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "LEN=2 FIRST=A\nlen=2 first=a\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_shell_dispatched_builtin_works_as_a_pipeline_stage() {
+    // `jobs`, `fg`, `bg`, and the prompt builtins are dispatched by the shell
+    // rather than by `builtins::dispatch`, so a stage that only consulted the
+    // latter fell through to an external lookup and reported "command not found".
+    let out = run_with_input("jobs | cat\nprompt | cat\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "mesh$ \nafter\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn job_control_stays_with_the_shell_that_owns_the_jobs() {
+    // A forked stage runs the shell's code but is not the parent of its jobs, so
+    // `waitpid` there fails with ECHILD. `jobs` must list the table it inherited
+    // without reaping — a running job is Running, not falsely Done — and `fg`,
+    // which has to wait and hand over the terminal, refuses outright.
+    let listed = run_with_input("sleep 2 &\njobs | cat\nputs after\n");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("Running sleep 2"), "{stdout}");
+    assert!(
+        !String::from_utf8_lossy(&listed.stderr).contains("Done"),
+        "{:?}",
+        listed.stderr
+    );
+
+    // A job that finished since the last reap is reported the same either way:
+    // the shell refreshes the table before forking the stage, since the fork
+    // could not.
+    let finished = run_with_input("sleep 0.05 &\nsleep 0.2\njobs | cat\n");
+    let piped = String::from_utf8_lossy(&finished.stderr);
+    assert!(piped.contains("Done"), "{piped}");
+    assert!(
+        !String::from_utf8_lossy(&finished.stdout).contains("Running"),
+        "{:?}",
+        finished.stdout
+    );
+
+    // Nor may a fork do the reaping on the shell's behalf: a function that pipes
+    // `jobs` from a stage of its own is not the parent either, so an unguarded
+    // pre-reap there would report every inherited job as finished.
+    let nested = run_with_input("sleep 2 &\nfunc f() { jobs | cat }\nf | cat\nputs after\njobs\n");
+    let inner = String::from_utf8_lossy(&nested.stdout);
+    assert!(inner.contains("Running sleep 2"), "{inner}");
+    assert!(
+        !String::from_utf8_lossy(&nested.stderr).contains("Done"),
+        "{:?}",
+        nested.stderr
+    );
+
+    let resumed = run_with_input("sleep 2 &\nfg | cat\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&resumed.stderr).contains("no job control in a pipeline stage"),
+        "{:?}",
+        resumed.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&resumed.stdout), "after\n");
+}
+
+#[test]
+fn a_builtin_stage_still_sees_the_previous_status() {
+    // A bare `exit` reuses the preceding status, so the fork has to be handed the
+    // status the pipeline started from rather than a fresh zero.
+    let failed = run_with_input("false\nexit | cat\n");
+    assert_eq!(failed.status.code(), Some(1));
+    let succeeded = run_with_input("true\nexit | cat\n");
+    assert_eq!(succeeded.status.code(), Some(0));
 }
 
 #[test]

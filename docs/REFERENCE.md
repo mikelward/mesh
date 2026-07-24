@@ -649,20 +649,21 @@ greet world          # -> hi, world
   - **Status** is the usual view of the resulting value: an integer is its own
     status, a boolean inverts (`true` is `0`), anything else is `0`. A runtime
     error in the call fails the enclosing statement instead of yielding a value.
-  - **Not backgroundable.** `f() &` is refused, and so is `&` on any statement
-    that is not a command or pipeline — an expression, an assignment, an
-    `if`/`match`, a loop, a definition: the value is produced in this shell, so a
-    backgrounded call would have to hand its result back across a fork.
+  - **Not backgroundable.** `f() &` — the *value* spelling — is refused, and so
+    is `&` on any statement that is not a command or pipeline: an expression, an
+    assignment, an `if`/`match`, a loop, a definition. The value is produced in
+    this shell, so a backgrounded call would have to hand its result back across
+    a fork. The command spelling `f &` is a command, and is backgrounded.
 
-A function can also be a pipeline stage, reading the pipe, writing to the next
-stage, or both (`f | sort`, `echo x | f`, `a | f | b`). A stage runs in its own
-forked process, exactly as an external command does, so the stages run
-concurrently — and, as in every POSIX shell, whatever the stage changes stays in
-that process: a `cd` or an assignment inside `f | cat` does not outlive it.
-Arguments to a piped function arrive as strings.
+A function can also be a pipeline stage or a background job — `f | sort`,
+`echo x | f`, `a | f | b`, `f &`. Each runs in its own forked process, exactly as
+an external command does, so pipeline stages run concurrently and a background
+function returns the prompt immediately. As in every POSIX shell, whatever such a
+call changes stays in that process: a `cd` or an assignment inside `f | cat` does
+not outlive it. Its arguments keep their types, so `f $xs` still passes one list.
+The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
 
-Not yet supported: a function in the background, `:capture` on a call, and
-lambdas.
+Not yet supported: `:capture` on a call, and lambdas.
 
 ## Not yet implemented
 
