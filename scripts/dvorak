@@ -1,0 +1,191 @@
+#!/bin/sh
+# dvorak - switch the keyboard layout to US Dvorak, everywhere it can.
+#
+# Tries every layer that might be in charge of your keymap and applies Dvorak
+# to each one that is actually present, then reports what it did. It is safe to
+# run in any environment: irrelevant layers are skipped, not failed, and no
+# input-method daemon is ever started (we only talk to one if it is already
+# running).
+#
+# Covered:
+#   - Linux virtual console (loadkeys) -- works without root on your own VT
+#   - X11 / generic Xorg               (setxkbmap)
+#   - GNOME (X11 or Wayland)           (gsettings input-sources)
+#   - KDE Plasma                       (kxkbrc + best-effort live reload)
+#   - IBus                             (only if already running)
+#   - Fcitx5                           (only if already running)
+#
+# The layout used throughout is US Dvorak: keymap "dvorak" on the console,
+# XKB "us(dvorak)" / "us+dvorak" everywhere else.
+
+# Not `set -e`: a failure in one layer must not stop us from trying the others.
+
+ran_any=0   # did we attempt at least one applicable layer?
+ok_any=0    # did at least one layer apply cleanly?
+
+say()  { printf '%s\n' "$*"; }
+ok()   { ran_any=1; ok_any=1; printf '  [ok]   %s\n' "$*"; }
+fail() { ran_any=1;          printf '  [fail] %s\n' "$*"; }
+skip() {                     printf '  [skip] %s\n' "$*"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- Linux virtual console -------------------------------------------------
+#
+# loadkeys changes the *console* keymap via the KDSKBENT ioctl. That normally
+# needs CAP_SYS_TTY_CONFIG (root), but the kernel also grants it when the
+# target console is the caller's controlling terminal. So on a real VT
+# (/dev/ttyN) that you are logged in on, `loadkeys dvorak` works as an ordinary
+# user -- which is the whole point of this exercise. We only try it when the
+# controlling terminal really is a VT; inside an SSH session or a graphical
+# terminal emulator (/dev/pts/N) it would either need root or hit the wrong
+# console, so we skip.
+console() {
+	say "Linux console (loadkeys):"
+	if ! have loadkeys; then
+		skip "loadkeys not installed"
+		return
+	fi
+	case "$(tty 2>/dev/null)" in
+	/dev/tty[0-9]*)
+		if loadkeys dvorak >/dev/null 2>&1; then
+			ok "console keymap set to dvorak"
+		else
+			fail "loadkeys dvorak failed (try again on the VT itself)"
+		fi
+		;;
+	*)
+		skip "not on a virtual console (a pty/SSH session cannot set the console keymap)"
+		;;
+	esac
+}
+
+# --- X11 / generic Xorg ----------------------------------------------------
+#
+# setxkbmap talks to the X server, so it only does anything under a real X11
+# display. Under a pure Wayland session there is no X server to talk to (XWayland
+# does not drive the compositor's keymap), and GNOME/KDE override it anyway, so
+# their dedicated handlers below are the real path there. This is the fallback
+# for plain window managers.
+x11() {
+	[ -n "$DISPLAY" ] || return
+	say "X11 (setxkbmap):"
+	if ! have setxkbmap; then
+		skip "setxkbmap not installed"
+		return
+	fi
+	if setxkbmap us -variant dvorak >/dev/null 2>&1; then
+		ok "X keymap set to us(dvorak)"
+	else
+		fail "setxkbmap failed"
+	fi
+}
+
+# --- GNOME (X11 or Wayland) ------------------------------------------------
+#
+# GNOME manages the keyboard through its own input-sources setting and ignores
+# setxkbmap, so this is the correct path under both GNOME/X11 and GNOME/Wayland.
+gnome() {
+	have gsettings || return
+	gsettings list-schemas 2>/dev/null | grep -qx org.gnome.desktop.input-sources || return
+	say "GNOME (gsettings input-sources):"
+	if gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us+dvorak')]" >/dev/null 2>&1; then
+		ok "GNOME input source set to us+dvorak"
+	else
+		fail "could not write org.gnome.desktop.input-sources"
+	fi
+}
+
+# --- KDE Plasma ------------------------------------------------------------
+#
+# Plasma stores its layout in kxkbrc. We write it with kwriteconfig (any major
+# version), then try a live reload. On X11 setxkbmap makes it take effect now;
+# on Wayland the DBus reconfigure below usually does. Worst case it is applied
+# at the next login.
+kde() {
+	# Only bother if this actually looks like a Plasma session.
+	case "${XDG_CURRENT_DESKTOP:-}${KDE_FULL_SESSION:-}" in
+	*KDE*|*true*) : ;;
+	*) return ;;
+	esac
+	kwrite=$(command -v kwriteconfig6 || command -v kwriteconfig5 || command -v kwriteconfig)
+	[ -n "$kwrite" ] || return
+	say "KDE Plasma (kxkbrc):"
+	if "$kwrite" --file kxkbrc --group Layout --key LayoutList us  >/dev/null 2>&1 &&
+	   "$kwrite" --file kxkbrc --group Layout --key VariantList dvorak >/dev/null 2>&1 &&
+	   "$kwrite" --file kxkbrc --group Layout --key Use true >/dev/null 2>&1; then
+		ok "kxkbrc set to us(dvorak)"
+	else
+		fail "could not write kxkbrc"
+		return
+	fi
+	# Best-effort live reload without requiring a re-login.
+	if [ -n "$DISPLAY" ] && have setxkbmap; then
+		setxkbmap us -variant dvorak >/dev/null 2>&1 && say "         (applied to the running X session)"
+	fi
+	for q in qdbus6 qdbus qdbus-qt6 qdbus-qt5; do
+		if have "$q"; then
+			"$q" org.kde.keyboard /Layouts org.kde.KeyboardLayouts.setLayout 0 >/dev/null 2>&1 && break
+		fi
+	done
+}
+
+# --- IBus (only if already running) ----------------------------------------
+#
+# We must not start IBus if it is not already active, so gate on the daemon
+# being up. `ibus engine` sets the current engine to the XKB us:dvorak one.
+ibus() {
+	have ibus || return
+	# `ibus address` prints the bus address when a daemon is running, nothing otherwise.
+	addr=$(ibus address 2>/dev/null)
+	if [ -z "$addr" ] || [ "$addr" = "(null)" ]; then
+		return   # not running; leave it alone
+	fi
+	say "IBus (already running):"
+	if ibus engine 'xkb:us:dvorak:eng' >/dev/null 2>&1; then
+		ok "IBus engine set to xkb:us:dvorak:eng"
+	else
+		fail "could not switch IBus engine"
+	fi
+}
+
+# --- Fcitx5 (only if already running) --------------------------------------
+#
+# Fcitx5 has no clean one-shot "set layout" CLI, but if it is running we can
+# nudge the current group's default layout to Dvorak over DBus. Gated on the
+# daemon being up so we never launch it.
+fcitx() {
+	pgrep -x fcitx5 >/dev/null 2>&1 || return
+	say "Fcitx5 (already running):"
+	if have fcitx5-remote && fcitx5-remote -s 'keyboard-us-dvorak' >/dev/null 2>&1; then
+		ok "Fcitx5 switched to keyboard-us-dvorak"
+	else
+		skip "running, but no scriptable switch available -- set 'US (Dvorak)' in fcitx5-configtool"
+	fi
+}
+
+say "Setting keyboard layout to US Dvorak..."
+say ""
+console
+x11
+gnome
+kde
+ibus
+fcitx
+say ""
+
+if [ "$ran_any" -eq 0 ]; then
+	say "No known keyboard layer applied here. If you are on a plain console,"
+	say "run this from the VT itself; otherwise your desktop may use a mechanism"
+	say "this script does not cover yet."
+	exit 1
+fi
+
+if [ "$ok_any" -eq 1 ]; then
+	say "Done. If a graphical session still shows QWERTY, log out and back in to"
+	say "let the desktop pick up the change."
+	exit 0
+fi
+
+say "Every applicable layer failed to apply Dvorak; see the messages above."
+exit 1
