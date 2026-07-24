@@ -829,26 +829,46 @@ pub fn needs_more_input(text: &str) -> bool {
 /// through to its matching `}` and stays quarantined. Returns `None` when no body
 /// has opened, i.e. the header is still forming or is malformed without a brace.
 fn body_open_offset(text: &str) -> Option<usize> {
-    let brace = text.find('{')?;
-    match text.find('(') {
-        // `(` before the `{`: this is the signature. Find its closing `)`.
-        Some(open) if open < brace => match text[open + 1..brace].find(')') {
-            // Signature closed before the `{`: the body opens at `{` only if just
-            // whitespace sits between `)` and `{` (a real body opener); otherwise
-            // the `{` is separate content and no body opens from this header.
-            Some(rel) => {
-                let close = open + 1 + rel;
-                text[close + 1..brace].trim().is_empty().then_some(brace)
+    let paren = text.find('(');
+    let brace = text.find('{');
+    match paren {
+        // `(` present and before any `{`: this is the signature. Find its matching
+        // `)` honoring nested delimiters and quotes, so a `)`/`{` inside a default
+        // expression (`x = (1 + 2)`, `x = {a: 1}`) is not mistaken for the closer.
+        Some(open) if brace.is_none_or(|b| open < b) => {
+            match signature_close(&text[open + 1..]) {
+                // Signature closed: the body opens at the first non-whitespace after
+                // `)` only if that is `{` (a real body opener); otherwise the `{`, if
+                // any, is separate content and no body opens from this header.
+                Some(rel) => {
+                    let close = open + 1 + rel;
+                    let tail = &text[close + 1..];
+                    let trimmed = tail.trim_start();
+                    trimmed
+                        .starts_with('{')
+                        .then(|| close + 1 + (tail.len() - trimmed.len()))
+                }
+                // The signature `(` never closed. If the partial list is still a
+                // valid prefix, the signature is legitimately forming — including a
+                // block-bearing default like `x = if c { … }` whose `{` is not the
+                // body — so no body has opened yet; keep buffering for the `)`. Only
+                // a provably-malformed header (`func f(x {`) treats an inner `{` as
+                // the body opener so it buffers to the matching `}` and quarantines.
+                None => {
+                    let params = &text[open + 1..];
+                    if params_valid(params, true) {
+                        None
+                    } else {
+                        params.find('{').map(|rel| open + 1 + rel)
+                    }
+                }
             }
-            // The signature `(` never closed before the `{`: the `{` is in the
-            // parameter region of a malformed header — treat it as the body opener
-            // so the definition buffers to its matching `}` and stays quarantined.
-            None => Some(brace),
-        },
+        }
         // `{` before any `(` (or no `(` at all): a body opener only if the header
         // text before it is a valid name prefix (`func f {`); otherwise the `{`
         // belongs to following content (`func`⏎`puts '{'`), not this header.
         _ => {
+            let brace = brace?;
             let head = text[..brace]
                 .trim_start()
                 .strip_prefix("func")
@@ -868,7 +888,15 @@ fn body_open_offset(text: &str) -> Option<usize> {
 /// dispatched immediately — its parse error reported — rather than buffering and
 /// swallowing the commands that follow it.
 fn header_awaits_body(text: &str) -> bool {
-    let rest = text.trim().strip_prefix("func").unwrap_or("").trim_start();
+    // Only the *leading* whitespace is stripped here; the trailing newline is kept
+    // so `params_valid` can tell a final name finalized by the line break (a
+    // duplicate/reserved name to reject) from one the cursor is still extending.
+    // The name check and the closed-signature branch trim locally where needed.
+    let rest = text
+        .trim_start()
+        .strip_prefix("func")
+        .unwrap_or("")
+        .trim_start();
     let Some(paren) = rest.find('(') else {
         // No `(` yet: still forming the name. Keep reading while what we have is a
         // valid identifier *prefix* (or just `func`); an impossible head (`_`, a
@@ -881,19 +909,33 @@ fn header_awaits_body(text: &str) -> bool {
         return false;
     }
     let after_open = &rest[paren + 1..];
-    match after_open.find(')') {
+    match signature_close(after_open) {
         // Params still forming: keep reading only while the partial list could
-        // still be completed into a valid one (`func f(,`, `func f(...`, `func
-        // f(a=` can never be repaired, so they dispatch immediately).
-        None => params_prefix_ok(after_open),
-        // Signature closed: the parameter list must actually parse, and only
-        // whitespace may sit between `)` and the `{`. Reusing `parse_params` means
-        // any signature the parser will reject (`(,)`, `(...xs)`, `(a,a)`) is
-        // dispatched immediately rather than buffering the commands after it.
+        // still be completed into a valid one (`func f(,` and `func f(a,,` can
+        // never be repaired, so they dispatch immediately; `func f(...`, `func
+        // f(--`, and `func f(a =` are valid new-form prefixes and keep reading).
+        None => params_valid(after_open, true),
+        // Signature closed: hand the finished parameter list to the real parser so
+        // any signature it rejects — a bad shape (`(,)`, `(a,a)`) *or* a malformed
+        // default expression (`x = ]`) — dispatches immediately instead of
+        // buffering the commands after it. Only whitespace may sit between the
+        // signature's `)` and the body `{`.
         Some(close) => {
-            parse_params(&after_open[..close]).is_ok() && after_open[close + 1..].trim().is_empty()
+            signature_parses(&after_open[..close]) && after_open[close + 1..].trim().is_empty()
         }
     }
+}
+
+/// Does the finished parameter list `params` form a valid signature? Validated by
+/// the real parser (on a synthesized `func …(params) {}`), so default expressions
+/// and the ordering rules are checked exactly as an executed definition would be —
+/// the completeness helpers only approximate a *still-forming* list.
+fn signature_parses(params: &str) -> bool {
+    let probe = format!("func probe({params}) {{}}");
+    matches!(
+        crate::parser::parse(&probe),
+        Ok(crate::parser::ParseOutcome::Complete(_))
+    )
 }
 
 /// Is `s` a valid *prefix* of a kebab identifier — an ASCII-letter head followed
@@ -906,125 +948,284 @@ fn is_ident_prefix(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Could the partial (still-unclosed) parameter list `list` still be completed
-/// into a valid one by appending more input? Applies the same structural rules as
-/// [`parse_params`], but treats the final token as an in-progress prefix (a bare
-/// name may still be growing), so only *provably* unrepairable content fails: a
-/// leading or doubled comma, a rest/flag/default token (`...`, `-…`, `…=…`), a
-/// finalized name that is invalid/`env`/duplicate, or a trailing token whose head
-/// already cannot start an identifier. A trailing comma is repairable.
-fn params_prefix_ok(list: &str) -> bool {
-    let chars: Vec<char> = list.chars().collect();
-    let mut names: Vec<String> = Vec::new();
-    let mut have_name = false;
-    let mut pending_comma = false;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_whitespace() {
-            i += 1;
-            continue;
-        }
-        if c == ',' {
-            if !have_name || pending_comma {
-                return false; // a comma with no name before it can never be valid
+/// Byte offset (within `after_open`, the text just past the signature's opening
+/// `(`) of the `)` that closes the signature. Delimiters, comments, quotes, raw
+/// strings, and escapes are resolved by the **real tokenizer**
+/// ([`crate::parser::tokenize`]) rather than a bespoke char scan, so this cannot
+/// disagree with the parser about where a token boundary is — a `)` inside a
+/// default's string (`x = ")"`), nested delimiters (`x = (1 + 2)`, `x = [a, b]`),
+/// or a comment (`x = 1 # )`) is never mistaken for the closer, and contextual
+/// operators (`x = /#tag`) are boundaried exactly as the parser sees them.
+/// Returns `None` while the signature is still open — including an unterminated
+/// quote, which makes `tokenize` fail and leaves the reader buffering.
+fn signature_close(after_open: &str) -> Option<usize> {
+    use crate::parser::TokenKind;
+    // An unterminated construct (open quote/raw string) fails to tokenize; the
+    // signature is still open, so `?` returns `None` and the reader buffers.
+    let tokens = crate::parser::tokenize(after_open).ok()?;
+    // The open delimiters seen so far, by kind, so a close is matched against the
+    // right one rather than a bare depth counter. `in_default` is true between a
+    // signature-level `=` and the next signature-level `,`/`)`, marking that the
+    // current parameter carries a default expression.
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_default = false;
+    for token in &tokens {
+        match &token.value {
+            // `$( … )` command capture opens with `CaptureStart` and closes with a
+            // plain `RParen`, so it nests like a paren — otherwise the capture's
+            // `)` would be mistaken for the signature close.
+            TokenKind::LParen | TokenKind::CaptureStart => stack.push('('),
+            TokenKind::LBracket => stack.push('['),
+            TokenKind::LBrace => stack.push('{'),
+            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                let opener = match &token.value {
+                    TokenKind::RParen => '(',
+                    TokenKind::RBracket => '[',
+                    _ => '{',
+                };
+                match stack.last().copied() {
+                    // A matched close pops its nesting level and keeps scanning.
+                    Some(open) if open == opener => {
+                        stack.pop();
+                    }
+                    // A mismatched close inside a stray brace (`func f(x {`, no
+                    // `=`) is the quarantine case: leave it to `body_open_offset`,
+                    // which buffers a forming block default and quarantines a stray
+                    // brace to its matching `}`.
+                    Some('{') if !in_default => return None,
+                    // Every other close resolves the signature region here: the
+                    // signature's own `)` at the outer level, a mismatched close
+                    // inside a default's `( … )`/`[ … ]`/`{ … }`, or a top-level
+                    // stray `]`/`}`. Returning its offset hands the region to
+                    // `signature_parses`, which accepts a real `)` close and
+                    // rejects any malformed shape so the reader dispatches.
+                    _ => return Some(token.span.start),
+                }
             }
-            pending_comma = true;
-            i += 1;
-            continue;
+            TokenKind::Equal if stack.is_empty() => in_default = true,
+            TokenKind::Comma if stack.is_empty() => in_default = false,
+            _ => {}
         }
-        let start = i;
-        while i < chars.len() && chars[i] != ',' && !chars[i].is_whitespace() {
-            i += 1;
-        }
-        let tok: String = chars[start..i].iter().collect();
-        // Forms that can never be a valid positional, even as a prefix.
-        if tok.starts_with("...") || tok.starts_with('-') || tok.contains('=') {
-            return false;
-        }
-        // A delimiter after the token finalizes it; the trailing token may still be
-        // growing. A finalized token must be a valid, non-`env`, non-duplicate
-        // name; the trailing one need only be a valid identifier *prefix* — an
-        // impossible head (`_`, a digit) can never become a name, so reject it now
-        // rather than entering continuation mode.
-        let finalized = i < chars.len();
-        if finalized {
-            if !is_ident(&tok) || tok == "env" || names.iter().any(|n| n == &tok) {
-                return false;
-            }
-            names.push(tok);
-        } else if !is_ident_prefix(&tok) {
-            return false;
-        }
-        have_name = true;
-        pending_comma = false;
     }
+    None
+}
+
+/// Is the `func` parameter list `list` structurally valid enough to keep
+/// buffering? Mirrors the parser's signature grammar (`Parser::parameters`):
+/// each comma-separated segment is a positional (`name` / `name = expr`), a flag
+/// (`--name` / `--name = expr`), or a rest (`...name`). Only the parameter
+/// **name** is validated here (a valid, non-`env`, non-duplicate identifier);
+/// default *expressions* are left to the parser, which validates them and the
+/// ordering rules once the whole definition is in hand. `prefix` marks a
+/// still-forming list (`)` not yet seen), so the final segment may be an
+/// in-progress prefix and a trailing comma is repairable.
+///
+/// The point is only buffer-vs-dispatch: anything the parser accepts must return
+/// `true` so a valid multi-line definition keeps reading, while a shape that can
+/// never be repaired (`,x`, `x,,y`, a bad/`env`/duplicate name) returns `false`
+/// so the malformed header dispatches instead of swallowing later commands.
+fn params_valid(list: &str, prefix: bool) -> bool {
+    if list.trim().is_empty() {
+        return true; // `()` so far, or nothing typed after `(` yet
+    }
+    let segments = split_top_level_commas(list);
+    let last = segments.len() - 1;
+    let mut names: Vec<String> = Vec::new();
+    let mut seen_optional = false;
+    let mut seen_rest = false;
+    for (index, raw) in segments.iter().enumerate() {
+        let segment = raw.trim();
+        if segment.is_empty() {
+            // An empty segment is a leading/interior/doubled comma — never valid —
+            // except a single trailing comma in a still-forming list (`func f(a,`).
+            // Once a `...rest` has closed the list nothing more may follow, so even
+            // that trailing comma is irreparable.
+            return prefix && index == last && !seen_rest;
+        }
+        let forming = prefix && index == last;
+        // Trailing whitespace — a space, or the line's own newline — finalizes the
+        // final segment's name (a token cannot span it). A finalized non-empty name
+        // is validated in full, so a duplicate or reserved final name (`func f(a,
+        // a`⏎, `func f(env`⏎) is rejected instead of buffering the next command; a
+        // bare `...`/`--` still awaiting its name stays forming and keeps reading.
+        let terminated = raw.ends_with(|c: char| c.is_whitespace());
+        if !segment_valid(segment, &mut names, forming, terminated) {
+            return false;
+        }
+        // Ordering (mirrors `Parser::parameters`): nothing may follow a `...rest`;
+        // a required positional may not follow an optional one; an optional and a
+        // rest cannot coexist. A flag/switch is order-independent. A bare final name
+        // the cursor is still extending is not yet fixed as required (it may still
+        // gain `= default`), so its required-after-optional check waits for the
+        // token to finalize.
+        if seen_rest {
+            return false; // a parameter after the rest can never be repaired
+        }
+        let still_extending = forming && !terminated;
+        match order_kind(segment) {
+            OrderKind::Rest => seen_rest = true,
+            OrderKind::Optional => seen_optional = true,
+            OrderKind::Required if seen_optional && !still_extending => return false,
+            _ => {}
+        }
+    }
+    // An optional positional and a `...rest` cannot usefully coexist.
+    !(seen_optional && seen_rest)
+}
+
+/// The ordering-relevant classification of a (structurally valid) parameter
+/// segment, mirroring the kinds `Parser::parameters` sequences: a `...rest`, an
+/// order-independent flag/switch (`--name`), an optional positional (`name =
+/// default`), or a required positional (`name`).
+enum OrderKind {
+    Rest,
+    Flag,
+    Optional,
+    Required,
+}
+
+fn order_kind(segment: &str) -> OrderKind {
+    if segment.starts_with("...") {
+        OrderKind::Rest
+    } else if segment.starts_with("--") {
+        OrderKind::Flag
+    } else if segment.contains('=') {
+        OrderKind::Optional
+    } else {
+        OrderKind::Required
+    }
+}
+
+/// Validate one parameter segment for [`params_valid`]. Classifies it as a rest,
+/// flag, or positional and checks its name; `forming` allows the name to be a
+/// still-growing prefix (only meaningful for the list's final segment).
+fn segment_valid(segment: &str, names: &mut Vec<String>, forming: bool, terminated: bool) -> bool {
+    if let Some(rest) = segment.strip_prefix("...") {
+        // The name must abut `...` (documented `...name`): whitespace between the
+        // `...` and the name is not a rest parameter, matching the parser. A rest
+        // takes no default, so an `=` makes it unrepairable. An empty `rest` is a
+        // bare `...` still awaiting its name, handled by `validate_name`.
+        let adjacent = !rest.starts_with(|c: char| c.is_whitespace());
+        return adjacent
+            && !rest.contains('=')
+            && validate_name(rest.trim(), names, forming, terminated);
+    }
+    let body = match segment.strip_prefix("--") {
+        // A flag name must abut `--` (`--name`), just as the parser reads it from a
+        // single `--name` word: whitespace after `--` is not a flag. An empty body
+        // is a bare `--` still awaiting its name, left to `validate_name`.
+        Some(body) if body.starts_with(|c: char| c.is_whitespace()) => return false,
+        Some(body) => body,
+        None => segment,
+    };
+    // A default detaches at the first `=`; once present, the name is finalized.
+    match body.split_once('=') {
+        // The `=` must sit on the same line as the name: a newline between them
+        // finalizes the name (the parser can no longer attach the default), so
+        // `func f(a⏎= 1)` / `--flag⏎= 1` is irreparable. A newline *after* the `=`
+        // is fine — the default expression may span lines — and is left to the
+        // default (`_default`), which the parser validates once the list closes.
+        Some((name, _default)) => {
+            !name.contains('\n') && validate_name(name.trim(), names, false, terminated)
+        }
+        None => validate_name(body.trim(), names, forming, terminated),
+    }
+}
+
+/// Check a parameter `name` for [`segment_valid`]. A finalized name must be a
+/// valid, non-`env`, non-duplicate identifier (and is recorded for later
+/// duplicate checks); a still-`forming` one whose token the cursor is still
+/// extending need only be a valid identifier prefix. `terminated` marks a final
+/// name trailing whitespace already ended, so it is validated in full even while
+/// forming. An empty name (a `...` / `--` prefix mid-type) is acceptable only
+/// while forming *and* not yet terminated: the parser skips no whitespace between
+/// either prefix and its required name, so `func f(...`⏎ / `func f(--`⏎ can never
+/// be completed and must dispatch rather than buffer the following command.
+fn validate_name(name: &str, names: &mut Vec<String>, forming: bool, terminated: bool) -> bool {
+    if name.is_empty() {
+        return forming && !terminated;
+    }
+    if forming && !terminated {
+        return is_ident_prefix(name);
+    }
+    if !is_ident(name) || name == "env" || names.iter().any(|existing| existing == name) {
+        return false;
+    }
+    names.push(name.to_owned());
     true
 }
 
-/// Parse a parameter list: names separated by commas and/or whitespace. A comma
-/// is a real separator, not ignorable filler — it must sit between two names, so
-/// a leading, trailing, or doubled comma (`,x`, `x,`, `x,,y`) is a loud error
-/// rather than a silently dropped empty. v1 also rejects the deferred flag /
-/// optional / rest forms with a clear message.
-pub(crate) fn parse_params(list: &str) -> Result<Vec<String>, String> {
-    let chars: Vec<char> = list.chars().collect();
-    let mut params: Vec<String> = Vec::new();
-    // A comma needs a name on each side: it is only valid once at least one name
-    // has been read, and never immediately after another comma.
-    let mut have_name = false;
-    let mut pending_comma = false;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_whitespace() {
-            i += 1;
-            continue;
-        }
-        if c == ',' {
-            if !have_name || pending_comma {
-                return Err("func: missing parameter name before `,`".to_string());
+/// Split a parameter list on its top-level commas, ignoring commas nested inside
+/// brackets, parentheses, braces, or quotes (which can appear in a default
+/// expression, e.g. `x = [a, b]` or `x = "a,b"`). Quotes are skipped with the
+/// lexer's own escape and raw-string rules, so an escaped quote (`x = "a\",b"`)
+/// does not end the string early. A trailing comma yields a final empty segment.
+fn split_top_level_commas(list: &str) -> Vec<String> {
+    let chars: Vec<(usize, char)> = list.char_indices().collect();
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    // `word_start` is true at a token boundary (start, or after whitespace or any
+    // punctuation), matching where the tokenizer would begin a fresh word, so a
+    // `#` there is a comment and an `r'…'` is a raw string.
+    let mut word_start = true;
+    let mut k = 0;
+    let push_range = |current: &mut String, from: usize, to: usize| {
+        current.extend(chars[from..to].iter().map(|&(_, c)| c));
+    };
+    while k < chars.len() {
+        let c = chars[k].1;
+        let raw_eligible = word_start;
+        // Only a bareword-continuation char keeps us mid-token; every other
+        // character is a token boundary.
+        word_start = !(c.is_alphanumeric() || c == '_' || c == '-');
+        match c {
+            // The char after a closing quote continues the same word (a bare `#`
+            // there is literal), so leave `word_start` false.
+            '\'' | '"' => {
+                let end = skip_quote(&chars, k + 1, c, true).unwrap_or(chars.len());
+                push_range(&mut current, k, end);
+                k = end;
+                word_start = false;
             }
-            pending_comma = true;
-            i += 1;
-            continue;
+            'r' if raw_eligible
+                && matches!(chars.get(k + 1).map(|&(_, c)| c), Some('\'') | Some('"')) =>
+            {
+                let end = skip_quote(&chars, k + 2, chars[k + 1].1, false).unwrap_or(chars.len());
+                push_range(&mut current, k, end);
+                k = end;
+                word_start = false;
+            }
+            '\\' => {
+                push_range(&mut current, k, (k + 2).min(chars.len()));
+                k += 2;
+            }
+            // A bare `#` at a word boundary is a comment through the newline; drop
+            // it (its `,` is not a separator and its text is not part of the name).
+            '#' if raw_eligible => {
+                let end = chars[k..]
+                    .iter()
+                    .position(|&(_, c)| c == '\n')
+                    .map_or(chars.len(), |offset| k + offset);
+                k = end;
+            }
+            ',' if depth == 0 => {
+                segments.push(std::mem::take(&mut current));
+                k += 1;
+            }
+            _ => {
+                if matches!(c, '(' | '[' | '{') {
+                    depth += 1;
+                } else if matches!(c, ')' | ']' | '}') {
+                    depth = (depth - 1).max(0);
+                }
+                current.push(c);
+                k += 1;
+            }
         }
-        // Read a name token: a run up to the next comma or whitespace.
-        let start = i;
-        while i < chars.len() && chars[i] != ',' && !chars[i].is_whitespace() {
-            i += 1;
-        }
-        let tok: String = chars[start..i].iter().collect();
-        if tok.starts_with("...") {
-            return Err("func: rest parameters (`...name`) are not supported yet".to_string());
-        }
-        if tok.starts_with('-') {
-            return Err("func: flag parameters (`--name`) are not supported yet".to_string());
-        }
-        if tok.contains('=') {
-            return Err("func: optional/default parameters are not supported yet".to_string());
-        }
-        if !is_ident(&tok) {
-            return Err(format!("func: `{tok}` is not a valid parameter name"));
-        }
-        // `env` is the environment namespace (`$env.KEY`), so a parameter named
-        // `env` would bind but never read back — reject it, as assignment does.
-        if tok == "env" {
-            return Err("func: `env` is a reserved name and cannot be a parameter".to_string());
-        }
-        // A repeated name would silently overwrite the earlier positional in the
-        // local scope, making one argument unreachable; diagnose it here.
-        if params.iter().any(|p| p == &tok) {
-            return Err(format!("func: duplicate parameter `{tok}`"));
-        }
-        params.push(tok);
-        have_name = true;
-        pending_comma = false;
     }
-    if pending_comma {
-        return Err("func: missing parameter name after `,`".to_string());
-    }
-    Ok(params)
+    segments.push(current);
+    segments
 }
 
 /// The result of a bare-level brace scan (see [`scan_braces`]).
@@ -1934,17 +2135,29 @@ mod tests {
         // A closed but invalid parameter list is also dispatched immediately —
         // the same validation the parser applies, so no invalid shape buffers.
         assert!(!needs_more_input("func f(,)\n"));
-        assert!(!needs_more_input("func f(...xs)\n"));
         assert!(!needs_more_input("func f(a,a)\n"));
+        // The flag / optional / rest forms are valid signatures, so a closed one
+        // with a delayed body opener keeps buffering rather than dispatching.
+        assert!(needs_more_input("func f(...xs)\n"));
+        assert!(needs_more_input("func f(--force)\n"));
+        assert!(needs_more_input("func f(x = 1)\n"));
+        assert!(needs_more_input("func f(--tag = latest)\n"));
         // An unclosed but provably-invalid parameter list is dispatched too, while
-        // a valid partial list (a name still forming) keeps buffering.
+        // a valid partial list (a name or new-form parameter still forming) keeps
+        // buffering.
         assert!(!needs_more_input("func f(,\n"));
-        assert!(!needs_more_input("func f(...\n"));
-        assert!(!needs_more_input("func f(a=\n"));
         assert!(!needs_more_input("func f(a,a,\n"));
         assert!(needs_more_input("func f(a\n"));
         assert!(needs_more_input("func f(a, b\n"));
         assert!(needs_more_input("func f(a,\n"));
+        // A `...`/`--` prefix with its name attached keeps buffering; a bare prefix
+        // finalized by the newline can never gain its name, so it dispatches.
+        assert!(!needs_more_input("func f(...\n"));
+        assert!(needs_more_input("func f(...xs\n"));
+        assert!(!needs_more_input("func f(--\n"));
+        assert!(needs_more_input("func f(--force\n"));
+        assert!(needs_more_input("func f(a =\n"));
+        assert!(needs_more_input("func f(a = 1,\n"));
         // A trailing parameter token whose head cannot start an identifier is
         // impossible, so it dispatches instead of entering continuation mode.
         assert!(!needs_more_input("func f(_\n"));
@@ -1970,6 +2183,175 @@ mod tests {
         // A malformed header with a brace in the parameter region still quarantines.
         assert!(needs_more_input("func f(x {\nputs LEAK\n"));
         assert!(needs_more_input("func f(') {\nputs LEAKED\n"));
+    }
+
+    #[test]
+    fn needs_more_input_finds_the_signature_close_past_a_default_expression() {
+        // A default expression may itself contain `)`, `{`/`}`, `[`/`]`, a comma,
+        // or a quoted `)` — none of which is the signature's closing `)`. The
+        // signature scan honors nesting and the lexer's quote/escape rules, so a
+        // closed header with a delayed body opener still buffers.
+        assert!(needs_more_input("func f(x = (1 + 2))\n"));
+        assert!(needs_more_input("func f(x = (1 + 2))\n{\n"));
+        assert!(needs_more_input("func f(x = [a, b])\n{\n"));
+        assert!(needs_more_input("func f(x = {k: v})\n{\n"));
+        assert!(needs_more_input("func f(x = \")\")\n{\n"));
+        assert!(needs_more_input("func f(x = \"a\\\",b\")\n{\n"));
+        // The body still opens right after the true signature close.
+        assert!(!needs_more_input("func f(x = (1 + 2)) { puts $x }"));
+        // An unterminated quote in a default keeps the signature open (buffering),
+        // not falsely closed at a later `)`.
+        assert!(needs_more_input("func f(x = \"a)\n"));
+    }
+
+    #[test]
+    fn needs_more_input_dispatches_a_closed_header_with_an_invalid_default() {
+        // A closed signature whose default cannot parse (`x = ]`) is a hard error,
+        // not an incomplete header: dispatch it immediately so the parser reports
+        // the error and the following command is not swallowed into the buffer. A
+        // stray close delimiter no longer hides the signature's real `)`.
+        assert!(!needs_more_input("func f(x = ])\n"));
+        assert!(!needs_more_input("func f(x = })\n"));
+        assert!(!needs_more_input("func f(x = 1 +)\n"));
+        // A well-formed default is still a valid closed signature awaiting its body.
+        assert!(needs_more_input("func f(x = 1 + 2)\n"));
+    }
+
+    #[test]
+    fn needs_more_input_skips_comments_when_scanning_a_signature() {
+        // A `#` comment runs to the newline, so a `)`/`{`/`,` inside it is not
+        // signature structure. The definition keeps buffering for the real `)`.
+        assert!(needs_more_input("func f(x = 1 # comment )\n"));
+        assert!(needs_more_input("func f(x = 1 # comment )\n) {\n"));
+        assert!(needs_more_input("func f(x = 1 # brace {\n) {\n"));
+        assert!(needs_more_input("func f(\n  a, # a, comment\n  b\n"));
+        // The whole definition still closes and defines once its body arrives.
+        assert!(!needs_more_input("func f(x = 1 # c )\n) { puts $x }"));
+        // A `#` mid-word is literal, not a comment, so the `)` still closes.
+        assert!(!needs_more_input("func f(x = a#b) oops\n"));
+        // A delimiter is a word boundary, so a `#` immediately after `{`/`[`/`(`
+        // starts a comment — its `}`/`)` are not signature structure.
+        assert!(needs_more_input("func f(x = if true {# } )\n"));
+        assert!(needs_more_input("func f(x = [# ]\n"));
+        // An operator is a word boundary too, so a `#` after ` + ` is a comment;
+        // its `)` is not the signature close, so the header keeps buffering.
+        assert!(needs_more_input("func f(x = 1 + # note )\n"));
+        // But a `#` is only a comment at a *contextual* word boundary. `/#tag`
+        // tokenizes as one bare word with a literal `#`, so the following `)` is
+        // the real signature close — the definition completes rather than getting
+        // lost in a phantom comment that swallows the `)` to EOF.
+        assert!(!needs_more_input("func f(x = /#tag) { puts $x }"));
+        assert!(!needs_more_input("func f(x = /#tag) oops\n"));
+        // Signature closed at that `)`, so the header now legitimately awaits its
+        // body — buffering for the right reason, not because the `)` was hidden.
+        assert!(needs_more_input("func f(x = /#tag)\n"));
+    }
+
+    #[test]
+    fn needs_more_input_dispatches_a_reserved_or_duplicate_final_name() {
+        // A final parameter name the line break finalized is validated in full, so a
+        // duplicate or reserved (`env`) name dispatches immediately rather than
+        // buffering the following command into the malformed definition. A trailing
+        // space finalizes the name the same way.
+        assert!(!needs_more_input("func f(a, a\n"));
+        assert!(!needs_more_input("func f(env\n"));
+        assert!(!needs_more_input("func f(a, a \n"));
+        // A valid final name still buffers (it may yet be followed by `,`/`)`), and
+        // a bare name the cursor is still extending (no trailing whitespace) too.
+        assert!(needs_more_input("func f(a\n"));
+        assert!(needs_more_input("func f(a, b\n"));
+        assert!(needs_more_input("func f(ab"));
+        // A `...`/`--` prefix mid-type (no trailing whitespace) keeps reading — its
+        // name may still be typed on the same line — but once a newline finalizes
+        // the empty name it can never be completed (the parser skips no whitespace
+        // before the name), so it dispatches instead of buffering later commands.
+        assert!(needs_more_input("func f(..."));
+        assert!(needs_more_input("func f(--"));
+        assert!(!needs_more_input("func f(...\n"));
+        assert!(!needs_more_input("func f(--\n"));
+    }
+
+    #[test]
+    fn needs_more_input_dispatches_an_impossible_parameter_ordering() {
+        // An unclosed signature whose finalized ordering the parser can never accept
+        // dispatches at once rather than buffering the following command: a required
+        // positional after an optional, any parameter after a `...rest`, and an
+        // optional coexisting with a rest.
+        assert!(!needs_more_input("func f(a = 1, b\n"));
+        assert!(!needs_more_input("func f(...xs, a\n"));
+        assert!(!needs_more_input("func f(a = 1, ...xs\n"));
+        assert!(!needs_more_input("func f(...xs,\n"));
+        // A still-extending final bare name is not yet fixed as required (it may
+        // gain `= default`), so `a = 1, b` keeps reading until the token finalizes;
+        // flags are order-independent, and valid orderings still buffer.
+        assert!(needs_more_input("func f(a = 1, b"));
+        assert!(needs_more_input("func f(a = 1, b = 2\n"));
+        assert!(needs_more_input("func f(--tag = latest, a\n"));
+        assert!(needs_more_input("func f(a, ...xs\n"));
+        // A newline between a name and its `=` detaches the default (the parser
+        // finalizes the name at the break), so the header is irreparable and
+        // dispatches; a newline *after* the `=` is a default spanning lines and
+        // keeps buffering.
+        assert!(!needs_more_input("func f(a\n= 1\n"));
+        assert!(!needs_more_input("func f(--flag\n= 1\n"));
+        assert!(needs_more_input("func f(a =\n1\n"));
+        // A `...name`/`--name` prefix requires the name to abut it, matching the
+        // parser: whitespace between the prefix and the name is not a parameter, so
+        // the header dispatches. The adjacent forms still buffer.
+        assert!(!needs_more_input("func f(... xs\n"));
+        assert!(!needs_more_input("func f(-- force\n"));
+        assert!(needs_more_input("func f(...xs\n"));
+        assert!(needs_more_input("func f(--force\n"));
+    }
+
+    #[test]
+    fn needs_more_input_dispatches_a_mismatched_signature_delimiter() {
+        // A default that closes with the wrong delimiter (`[1)`) is malformed, not
+        // incomplete: the `)` does not close the `[`, so dispatch immediately
+        // rather than buffer the following command. A brace context is exempt — it
+        // is handled by the body/quarantine logic, not treated as a bad default.
+        assert!(!needs_more_input("func f(x = [1)\n"));
+        assert!(!needs_more_input("func f(x = (1])\n"));
+        assert!(!needs_more_input("func f(x = [1})\n"));
+        // A balanced nested default is still a valid closed signature.
+        assert!(needs_more_input("func f(x = [1])\n"));
+        // A `$( … )` command capture nests like a paren, so its `)` is not the
+        // signature close: the header keeps buffering for the real `)` and body.
+        assert!(needs_more_input("func f(x = $(puts hi))\n"));
+        assert!(!needs_more_input("func f(x = $(puts hi)) { puts $x }"));
+        // A stray brace with no `=` still quarantines to its matching `}`.
+        assert!(needs_more_input("func f(x {\nputs )\n"));
+        // A top-level stray `]`/`}` before any signature `)` is a hard mismatch,
+        // not an incomplete header: dispatch immediately rather than skip it and
+        // buffer the following command to EOF.
+        assert!(!needs_more_input("func f(x = ]\nputs after\n"));
+        assert!(!needs_more_input("func f(x = }\nputs after\n"));
+    }
+
+    #[test]
+    fn needs_more_input_buffers_a_block_bearing_default() {
+        // A default that is itself a block-bearing expression (`if`/`match`) has
+        // `{ … }` braces that are *not* the function body: while the signature `(`
+        // is still open, an inner block's close must not end buffering. Only a
+        // provably-malformed header (`func f(x {`, no `=`) quarantines from a brace.
+        assert!(needs_more_input("func f(x = if true {\n"));
+        assert!(needs_more_input("func f(x = if true {\n  1\n}\n"));
+        assert!(needs_more_input(
+            "func f(x = if true {\n  1\n} else {\n  2\n}\n"
+        ));
+        assert!(needs_more_input(
+            "func f(x = if true {\n  1\n} else {\n  2\n})\n{\n"
+        ));
+        assert!(!needs_more_input(
+            "func f(x = if true {\n  1\n} else {\n  2\n}) { puts $x }"
+        ));
+        // The malformed stray-brace header still quarantines to its matching `}`.
+        assert!(needs_more_input("func f(x {\n  puts LEAK\n"));
+        assert!(!needs_more_input("func f(x {\n  puts LEAK\n}\n"));
+        // A mismatched closer *inside* a block default (which has an `=`) is
+        // malformed and dispatches, unlike the stray-brace quarantine above.
+        assert!(!needs_more_input("func f(x = if true { 1 ])\n"));
+        assert!(!needs_more_input("func f(x = { 1 ])\n"));
     }
 
     #[test]
