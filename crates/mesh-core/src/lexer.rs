@@ -737,6 +737,16 @@ fn read_name(chars: &[char], start: usize) -> Option<(String, usize)> {
     Some((name, i))
 }
 
+/// Whether the whole of `name` is a valid identifier.
+///
+/// Defined by running [`read_name`] and requiring it to consume everything, so a
+/// caller that validates a name it did not scan itself — an `$env.KEY`
+/// assignment target, say — cannot drift from the rule reads already use.
+pub(crate) fn is_name(name: &str) -> bool {
+    let chars: Vec<char> = name.chars().collect();
+    matches!(read_name(&chars, 0), Some((parsed, end)) if end == chars.len() && parsed == name)
+}
+
 /// Parse the `{HEX}` body of a `\u` escape (from just past the `u`). Returns the
 /// decoded char and how many chars were consumed (including the braces).
 fn parse_unicode_escape(rest: &[char]) -> Option<(char, usize)> {
@@ -1492,9 +1502,21 @@ fn push_char(word: &mut Vec<Piece>, c: char, expandable: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Access, LexError, Piece, Redir, RedirKind, Segment, Sep, Stage, VarRef, Word, split,
-        split_line,
+        Access, LexError, Piece, Redir, RedirKind, Segment, Sep, Stage, VarRef, Word, is_name,
+        split, split_line,
     };
+
+    #[test]
+    fn is_name_matches_exactly_what_read_name_accepts() {
+        // Whole-string validation has to agree with the scanner, so that any
+        // `$env.KEY` reads can spell is also assignable.
+        for name in ["x", "MY-VAR", "PATH", "a_b", "a1-b2"] {
+            assert!(is_name(name), "{name} should be a name");
+        }
+        for name in ["", "-x", "1x", "x-", "a.b", "PATH[0]", "x:dedup"] {
+            assert!(!is_name(name), "{name} should not be a name");
+        }
+    }
 
     fn exp(text: &str) -> Piece {
         Piece::Text {

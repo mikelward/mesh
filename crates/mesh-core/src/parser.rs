@@ -289,12 +289,6 @@ struct ParameterHead {
     has_default: bool,
 }
 
-/// The characters an environment name may contain. Anything else — a `[`, a
-/// `:`, a `.` — means the reference is not a plain `$env.KEY` place.
-fn is_env_key_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
-}
-
 /// A binding pattern shared by assignments, conditional bindings, loops, and
 /// list-shaped match arms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1940,6 +1934,10 @@ impl Parser {
     /// describes a derived value rather than a variable, so none of them is an
     /// assignment target. Those fall through and parse as ordinary expressions,
     /// which is where their real error message comes from.
+    ///
+    /// The key is checked with the same rule reads use, so anything spellable as
+    /// `$env.KEY` is also assignable — including a kebab name like
+    /// `$env.MY-VAR`, which the environment permits and mesh can read.
     fn env_target(&mut self) -> Option<String> {
         let TokenKind::Word(word) = &self.peek()?.value else {
             return None;
@@ -1957,7 +1955,7 @@ impl Parser {
             name.strip_prefix("${env.")
                 .and_then(|k| k.strip_suffix('}'))
         })?;
-        if key.is_empty() || !key.chars().all(is_env_key_char) {
+        if !crate::lexer::is_name(key) {
             return None;
         }
         let key = key.to_owned();
