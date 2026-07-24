@@ -2308,6 +2308,65 @@ fn collection_modifiers_preserve_typed_list_results() {
 }
 
 #[test]
+fn join_and_split_modifiers_take_a_separator_argument() {
+    // `:join(SEP)` folds a list to a string; `:split(SEP)` is its inverse. Both
+    // must sit in expression position (an assignment right-hand side) today —
+    // the command-word tokenizer does not yet carry a modifier's argument list.
+    let out = run_with_input(
+        "dirs = [/usr/bin /bin]\npath = $dirs:join(\":\")\nputs $path\nfields = $path:split(\":\")\nputs $fields:len\nleaf = $path:split(\":\"):first\nputs $leaf\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "/usr/bin:/bin\n2\n/usr/bin\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn split_drops_the_trailing_delimiter_run() {
+    // The separator is a terminator, not a separator: a trailing run of empties
+    // is dropped, interior empties are kept.
+    let out = run_with_input(
+        "a = \"x:y:\"\nn = $a:split(\":\"):len\nputs $n\nb = \"x::y\"\nm = $b:split(\":\"):len\nputs $m\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n3\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn split_operates_on_the_trimmed_capture_value() {
+    // `:split` is a value modifier for now: a `$(…)` capture has its trailing
+    // newline trimmed before the split runs, so the newline is not a field. Raw
+    // split-modifier binding (DESIGN.md) lands with the `:lines`/`:nulls` family.
+    let out = run_with_input("x = $(printf \"a:\\n\"):split(\":\")\nputs $x:len\nputs ...$x\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\na\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn join_of_a_nested_list_fails_loud() {
+    let out = run_with_input("xs = [a b]\nys = [$xs c]\nz = $ys:join(\",\")\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot join a nested list"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success());
+}
+
+#[test]
 fn unknown_modifier_names_remain_literal_suffixes() {
     let out = run_with_input("host = example\nputs $host:port\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "example:port\n");

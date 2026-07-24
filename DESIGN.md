@@ -222,6 +222,16 @@ exception that ignores whitespace entirely — leading, trailing, and runs — s
 never yields empty elements (the classic IFS word-split). `:raw` does not split
 at all (it is the [no-split capture member](#modifiers), one byte-string).
 
+*(Implementation status.* The only split modifier built so far is `:split(SEP)`,
+and it currently behaves as a **value modifier**: it operates on the
+already-evaluated string value, not on a substitution's *raw* capture. A `$(…)`
+receiver has therefore already had its trailing newline trimmed by the time
+`:split` runs — `$(printf "a:\n"):split(":")` is `[a]`, not `[a "\n"]`. Raw-capture
+binding (a split modifier *replacing* the default trim and running on the raw
+bytes) arrives with the rest of this family — `:lines`, `:words`, `:nulls`,
+`:tabs`, `:raw` — none of which is built yet. The trim-then-split interim keeps a
+colon split from stapling a trailing newline onto the last field.)*
+
 **Path components** — for `a/b/foo.tar.gz`:
 
 | Modifier | Result | Meaning |
