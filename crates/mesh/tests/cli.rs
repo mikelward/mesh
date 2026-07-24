@@ -1704,14 +1704,29 @@ fn a_background_redirect_does_not_require_sh_on_path() {
 fn a_failed_background_redirect_reports_mesh_status_one() {
     let dir = fresh_dir("background_redirect_failure");
     let missing = dir.join("missing/out");
-    let out = run_with_input(&format!(
-        "/bin/echo ok > {} &\n/bin/sleep 0.05\njobs\n",
-        missing.display()
-    ));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("Done (1)"), "{stderr}");
-    assert!(stderr.contains(&format!("mesh: {}:", missing.display())));
-    assert!(!stderr.contains("mesh-redir"));
+    // The redirect helper is a separate process writing to the same stderr as the
+    // shell's job notices, so assert on whole *lines*: a non-atomic write splices
+    // the two together (`mesh: [1] 4242` + an orphaned remainder) and a plain
+    // `contains` on a prefix would still pass. Repeat the run because the splice
+    // needs the two writers to overlap, which only happens under contention.
+    for _ in 0..5 {
+        let out = run_with_input(&format!(
+            "/bin/echo ok > {} &\n/bin/sleep 0.05\njobs\n",
+            missing.display()
+        ));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.lines().any(|line| line.contains("] Done (1) ")),
+            "{stderr}"
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.starts_with(&format!("mesh: {}: ", missing.display()))),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("mesh-redir"), "{stderr}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
