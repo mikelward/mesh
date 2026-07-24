@@ -268,12 +268,24 @@ fn option_names(line: &str) -> Vec<String> {
 }
 
 fn declaration_column(line: &str) -> &str {
-    line.char_indices()
-        .zip(line.char_indices().skip(1))
-        .find_map(|((at, character), (_, next))| {
-            (character.is_whitespace() && next.is_whitespace()).then_some(&line[..at])
-        })
-        .unwrap_or(line)
+    let mut whitespace_start = None;
+    let mut whitespace_count = 0;
+    for (at, character) in line
+        .char_indices()
+        .chain(std::iter::once((line.len(), '\0')))
+    {
+        if character.is_whitespace() {
+            whitespace_start.get_or_insert(at);
+            whitespace_count += 1;
+            continue;
+        }
+        if whitespace_count >= 2 && !line[at..].starts_with('-') {
+            return &line[..whitespace_start.expect("whitespace run has a start")];
+        }
+        whitespace_start = None;
+        whitespace_count = 0;
+    }
+    line
 }
 
 fn value_hint(line: &str) -> Option<ValueHint> {
@@ -727,10 +739,13 @@ mod tests {
     #[test]
     fn ignores_option_like_text_in_descriptions() {
         let spec = CompletionSpec::from_help(
-            "Options:\n  --jobs <N>  Number of jobs; use -1 for all CPUs\n  --color <WHEN>  See --help for details\n  -c FILE, --config FILE  Read configuration\n",
+            "Options:\n  --jobs <N>  Number of jobs; use -1 for all CPUs\n  --color <WHEN>  See --help for details\n  -c FILE, --config FILE  Read configuration\n  -f progfile\t\t--file=progfile\n",
         );
 
-        assert_eq!(spec.matching("-"), ["--color", "--config", "--jobs", "-c"]);
+        assert_eq!(
+            spec.matching("-"),
+            ["--color", "--config", "--file", "--jobs", "-c", "-f"]
+        );
         assert!(spec.matching("-1").is_empty());
         assert!(spec.matching("--h").is_empty());
         assert_eq!(spec.value_hint("-c"), Some(&ValueHint::File));
