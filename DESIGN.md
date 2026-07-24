@@ -1949,16 +1949,26 @@ narrowed the question to four choices; current leanings noted, but all four are 
    tightening (applies to `if` too), not a `match`-only change. `=>` reads well but forks
    `match` from mesh's `{ }`-block control flow.
 
-**Open decision — producing a typed value from a function/block** *(open — two
-options, undecided; language-wide, applies to `if` branches, `match` arms, and
-function bodies alike since they share block-value machinery)*.
+**Proposal (not settled) — an explicit value-keyword model** *(open; **conflicts with**
+the settled function/`if` contract, which it does **not** replace)*. This records a
+direction from the exploration. It **reverses** parts of the currently-settled design
+and is on the table as an alternative, **not** a decision:
 
-Settled context: `puts`/printing is the **byte channel** only (streamed by bare `f`,
-captured by `$(f)`). A **typed value** requires an explicit keyword — which lets `{ … }`
-blocks stay pure command-context (a bare word always *runs*; quotes go back to meaning
-only "group into one word," so the `"$a""$b"` value-vs-command ambiguity disappears).
-The open question is *which keyword(s)*, and how they coexist with mesh's current
-`return [N]` (today: exit the function with a **status**).
+- The **settled** contract *(unchanged, and still in force)*: a function's/block's value
+  is its **last expression** — no keyword needed ([Functions](#functions),
+  [Conditionals](#conditionals-if-is-an-expression)); `return`/`return val` is
+  **early-exit only**; **status is a view of the result** (int→itself, bool→`0`/`1`,
+  any other value→`0`); the caller picks value-vs-stream **by syntax** (`f()` value,
+  `$(f)` stdout, bare `f` runs); and a **bare RHS word is a literal string**.
+- The **proposal**: make `puts`/printing the *only* byte producer and require an
+  **explicit keyword** for a typed value, so `{ … }` blocks are pure command-context (a
+  bare word always *runs*; quotes mean only "group into one word," removing the
+  `"$a""$b"` value-vs-command ambiguity at a block tail). This **reopens** the settled
+  "value is the last expression" rule and the "bare RHS word is a literal string" rule —
+  reconciling the two is itself the open question.
+
+If the proposal is taken, the remaining sub-choice is *which keyword(s)* and how they
+coexist with `return [N]`:
 
 - **Option 1 — two keywords, split by scope: `yield` (local) + `return` (function).**
   `yield <value>` produces the value of the **nearest value-yielding block** — an `if`
@@ -1983,9 +1993,12 @@ The open question is *which keyword(s)*, and how they coexist with mesh's curren
 
 The axis underneath both: do we need a *local* value-yield (for `if`/`match` arms)
 distinct from a *function* return? Option 1 says yes (two keywords); Option 2 says no at
-the function level and leaves arm-yield to be settled separately. Either way, `return`'s
-current status-only meaning is changed or joined, so the `return [N]` status idiom needs
-a new home (truthiness, or a distinct word).
+the function level and leaves arm-yield to be settled separately. Note the settled
+design already resolves the status side of this — `return val` carries a value and
+[status is a *view* of the result](#functions) (`return 5` → value `5`, status `5`) —
+so Option 2 is close to what is *already* settled; the genuinely new (and conflicting)
+part of the proposal is only **requiring an explicit keyword** in place of the settled
+implicit last-expression rule.
 
 ### Tests and comparisons
 
