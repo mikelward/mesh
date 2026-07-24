@@ -220,6 +220,17 @@ pub enum Executable {
         iterable: Expr,
         body: Source,
     },
+    /// `while COND { … }` — the condition is tested before each pass, taking the
+    /// same forms `if` does: a command's status or a value's truthiness.
+    While {
+        condition: Box<Executable>,
+        body: Source,
+    },
+    /// `loop { … }` — repeats until a `break`. Clearer than `while true`, and
+    /// the one loop whose header cannot end it.
+    Loop {
+        body: Source,
+    },
     Control {
         kind: ControlKind,
         value: Option<Expr>,
@@ -1402,6 +1413,12 @@ impl Parser {
         if self.word("for") {
             return self.for_expr();
         }
+        if self.word("while") {
+            return self.while_expr();
+        }
+        if self.word("loop") {
+            return self.loop_expr();
+        }
         if self.word("return") || self.word("break") || self.word("continue") {
             return self.control();
         }
@@ -1890,6 +1907,21 @@ impl Parser {
         })
     }
 
+    fn while_expr(&mut self) -> Result<Executable, ParseError> {
+        self.take_word("while");
+        let condition = Box::new(self.condition()?);
+        self.newlines();
+        let body = self.block()?;
+        Ok(Executable::While { condition, body })
+    }
+
+    fn loop_expr(&mut self) -> Result<Executable, ParseError> {
+        self.take_word("loop");
+        self.newlines();
+        let body = self.block()?;
+        Ok(Executable::Loop { body })
+    }
+
     fn match_expr(&mut self) -> Result<MatchExpr, ParseError> {
         self.take_word("match");
         let value = Box::new(self.expression()?);
@@ -2103,7 +2135,7 @@ impl Parser {
             }
             self.position = start;
         }
-        if self.value_start() {
+        if self.condition_value_start() {
             return Ok(Executable::Expression {
                 expression: self.expression()?,
                 guard: None,
@@ -2546,6 +2578,38 @@ impl Parser {
             )
     }
     fn value_start(&mut self) -> bool {
+        self.value_start_in(false)
+    }
+
+    /// [`value_start`] as a **condition** reads it, where a *spaced* `<` / `>`
+    /// after a value-like operand is a comparison rather than a redirection.
+    ///
+    /// `if $i < 3` otherwise parses as the command `$i` with its stdin redirected
+    /// from a file named `3`, which is why `<=`, `>=`, and `!=` worked in a
+    /// condition while `<` and `>` did not. Statement position keeps the redirect
+    /// reading, so `$editor > log` still runs the command named by `$editor` and
+    /// redirects it.
+    fn condition_value_start(&mut self) -> bool {
+        self.value_start_in(true)
+    }
+
+    /// Is the next token a `<` or `>` with whitespace on both sides — the shape
+    /// a comparison takes and an attached redirect (`cmd >out`) does not?
+    fn spaced_comparison(&self) -> bool {
+        let Some(left) = self.peek() else {
+            return false;
+        };
+        self.tokens
+            .get(self.position + 1)
+            .zip(self.tokens.get(self.position + 2))
+            .is_some_and(|(operator, right)| {
+                matches!(operator.value, TokenKind::Less | TokenKind::Greater)
+                    && left.span.end < operator.span.start
+                    && operator.span.end < right.span.start
+            })
+    }
+
+    fn value_start_in(&mut self, in_condition: bool) -> bool {
         match self.peek().map(|token| &token.value) {
             Some(
                 TokenKind::CaptureStart
@@ -2575,17 +2639,15 @@ impl Parser {
                         value_operator(&operator.value) && operator.span.end < right.span.start
                     });
                 let numeric = word.text().parse::<i64>().is_ok();
-                (variable
-                    && !matches!(
-                        self.tokens.get(self.position + 1).map(|token| &token.value),
-                        Some(TokenKind::Less | TokenKind::Greater | TokenKind::Append)
-                    ))
-                    || (quoted
-                        && !matches!(
-                            self.tokens.get(self.position + 1).map(|token| &token.value),
-                            Some(TokenKind::Less | TokenKind::Greater | TokenKind::Append)
-                        )
-                        && self.viable_expression())
+                // `>>` is only ever a redirect, so it stays excluded even in a
+                // condition; `<` and `>` are the two that also spell comparisons.
+                let redirect_next = matches!(
+                    self.tokens.get(self.position + 1).map(|token| &token.value),
+                    Some(TokenKind::Less | TokenKind::Greater | TokenKind::Append)
+                );
+                let comparison_next = in_condition && self.spaced_comparison();
+                (variable && (!redirect_next || comparison_next))
+                    || (quoted && (!redirect_next || comparison_next) && self.viable_expression())
                     || attached_call
                     || (numeric && followed_by_operator)
             }
