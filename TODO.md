@@ -284,6 +284,15 @@ of each PR had landed by another route, but these pieces had not.
 
 ## Icebox / decide later
 
+- [ ] **Whether a path-type `$env` entry should need `...` to print.** Because
+      `$env.PATH` is a list, `puts $env.PATH` is a "list value needs `...`" error
+      and you write `puts ...$env.PATH` or `puts $env.PATH:join(":")`. That is
+      consistent with every other list, and it is what makes `+=` append an entry
+      rather than concatenate a string — but `PATH` is the one list users reach
+      for by reflex from other shells, where it is plain text. Deliberately left
+      consistent for now; revisit if the ceremony grates in practice. The lever,
+      if it ever changes, is a display/serialization rule for path-type entries
+      specifically, not a general list-to-string coercion.
 - [x] **`return` with no argument — use the last status.** `exit` already does
       this (a bare `exit` leaves the last command's status). Apply the same rule
       to `return` when it lands with function bodies.
