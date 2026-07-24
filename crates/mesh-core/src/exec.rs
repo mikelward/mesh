@@ -12,6 +12,22 @@ use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
+/// Write one diagnostic line to stderr in a single `write`.
+///
+/// `eprintln!` formats directly into the unbuffered `Stderr`, so every piece of
+/// the format string becomes its own `write(2)`. A background redirect helper is
+/// a *separate process* sharing this stderr, so its message and the shell's own
+/// job notices interleave mid-line — `mesh: [1] 4242` followed by the orphaned
+/// remainder of the helper's error. Formatting first and writing once keeps each
+/// line whole, since a pipe write under `PIPE_BUF` is atomic.
+macro_rules! note {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let line = format!("{}\n", format_args!($($arg)*));
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    }};
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirKind {
     In,
@@ -83,7 +99,7 @@ impl JobTable {
             WaitResult::Stopped(status) => {
                 job.job_modes = stopped_modes;
                 job.state = JobState::Stopped;
-                eprintln!("[{}] Stopped {}", job.id, job.command);
+                note!("[{}] Stopped {}", job.id, job.command);
                 self.jobs.push(job);
                 status
             }
@@ -100,13 +116,13 @@ impl JobTable {
             return 1;
         }
         job.state = JobState::Running;
-        eprintln!("[{}] Running {}", job.id, job.command);
+        note!("[{}] Running {}", job.id, job.command);
         0
     }
 
     pub fn list(&mut self, args: &[String]) -> u8 {
         if !args.is_empty() {
-            eprintln!("mesh: jobs: too many arguments");
+            note!("mesh: jobs: too many arguments");
             return 1;
         }
         self.reap();
@@ -129,7 +145,7 @@ impl JobTable {
                 match poll_outcomes(&mut self.jobs[index].outcomes) {
                     Some(WaitResult::Complete(status)) => {
                         let job = self.jobs.remove(index);
-                        eprintln!("[{}] Done ({status}) {}", job.id, job.command);
+                        note!("[{}] Done ({status}) {}", job.id, job.command);
                         continue;
                     }
                     Some(WaitResult::Stopped(_)) => self.jobs[index].state = JobState::Stopped,
@@ -142,11 +158,11 @@ impl JobTable {
 
     fn resolve(&self, args: &[String], name: &str) -> Option<usize> {
         if args.len() > 1 {
-            eprintln!("mesh: {name}: too many arguments");
+            note!("mesh: {name}: too many arguments");
             return None;
         }
         if self.jobs.is_empty() {
-            eprintln!("mesh: {name}: no current job");
+            note!("mesh: {name}: no current job");
             return None;
         }
         let Some(reference) = args.first() else {
@@ -162,7 +178,7 @@ impl JobTable {
         {
             Some(index) => Some(index),
             None => {
-                eprintln!("mesh: {name}: {reference}: no such job");
+                note!("mesh: {name}: {reference}: no such job");
                 None
             }
         }
@@ -284,7 +300,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
         let (in_file, out_file) = match redir_result {
             Ok(files) => files,
             Err((path, err)) => {
-                eprintln!("mesh: {path}: {err}");
+                note!("mesh: {path}: {err}");
                 outcomes.push(Outcome::Failed(1));
                 continue;
             }
@@ -294,7 +310,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
             match background_redirect_command(&cmd) {
                 Ok(command) => command,
                 Err((path, err)) => {
-                    eprintln!("mesh: {path}: {err}");
+                    note!("mesh: {path}: {err}");
                     outcomes.push(Outcome::Failed(1));
                     continue;
                 }
@@ -350,7 +366,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
         if cmd.pipe_stderr && !is_last {
             let mut fds = [0; 2];
             if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-                eprintln!("mesh: pipe: {}", std::io::Error::last_os_error());
+                note!("mesh: pipe: {}", std::io::Error::last_os_error());
                 outcomes.push(Outcome::Failed(1));
                 continue;
             }
@@ -359,7 +375,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
             let stderr = match write.try_clone() {
                 Ok(file) => file,
                 Err(error) => {
-                    eprintln!("mesh: pipe: {error}");
+                    note!("mesh: pipe: {error}");
                     outcomes.push(Outcome::Failed(1));
                     continue;
                 }
@@ -418,7 +434,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
         if let Some(pgid) = process_group {
             let id = jobs.next_id;
             jobs.next_id += 1;
-            eprintln!("[{id}] {pgid}");
+            note!("[{id}] {pgid}");
             jobs.jobs.push(Job {
                 id,
                 pgid,
@@ -460,7 +476,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
             if let Some(pgid) = foreground {
                 let id = jobs.next_id;
                 jobs.next_id += 1;
-                eprintln!("[{id}] Stopped {command_text}");
+                note!("[{id}] Stopped {command_text}");
                 jobs.jobs.push(Job {
                     id,
                     pgid,
@@ -602,7 +618,7 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
     let (stdin, stdout) = match open_redirs(&redirs) {
         Ok(files) => files,
         Err((path, err)) => {
-            eprintln!("mesh: {path}: {err}");
+            note!("mesh: {path}: {err}");
             return std::process::ExitCode::from(1);
         }
     };
@@ -621,7 +637,7 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
 
 fn signal_group(pgid: libc::pid_t, signal: libc::c_int, label: &str) -> Result<(), ()> {
     if unsafe { libc::kill(-pgid, signal) } < 0 {
-        eprintln!("mesh: {label}: {}", std::io::Error::last_os_error());
+        note!("mesh: {label}: {}", std::io::Error::last_os_error());
         Err(())
     } else {
         Ok(())
@@ -759,15 +775,15 @@ fn open_redirs(
 fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
     match err.kind() {
         ErrorKind::NotFound => {
-            eprintln!("mesh: command not found: {name}");
+            note!("mesh: command not found: {name}");
             127
         }
         ErrorKind::PermissionDenied => {
-            eprintln!("mesh: permission denied: {name}");
+            note!("mesh: permission denied: {name}");
             126
         }
         _ => {
-            eprintln!("mesh: {name}: {err}");
+            note!("mesh: {name}: {err}");
             126
         }
     }
