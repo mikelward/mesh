@@ -51,8 +51,7 @@ impl CompletionSpec {
         let mut pending_values = None;
         for line in help.lines() {
             let trimmed = line.trim();
-            let tokens: Vec<_> = trimmed.split_whitespace().collect();
-            let options = option_names(&tokens);
+            let options = option_names(trimmed);
             if let Some(pending) = &mut pending_values {
                 match pending {
                     PendingValues::Described { .. } if trimmed.is_empty() => continue,
@@ -108,7 +107,7 @@ impl CompletionSpec {
                         values: enum_values,
                     });
                 }
-            } else if let Some(hint) = value_hint(&tokens) {
+            } else if let Some(hint) = value_hint(trimmed) {
                 for option in &options {
                     values.insert(option.clone(), hint.clone());
                 }
@@ -248,12 +247,13 @@ pub(crate) fn rank_candidates(candidates: Vec<String>, query: &str) -> Vec<Strin
     ranked
 }
 
-fn option_names(tokens: &[&str]) -> Vec<String> {
-    tokens
-        .iter()
-        // Help text often mentions other flags (or negative numbers) in the
-        // description. Only the leading option declaration is authoritative.
-        .take_while(|token| token.starts_with('-'))
+fn option_names(line: &str) -> Vec<String> {
+    let declaration = declaration_column(line);
+    if !declaration.starts_with('-') {
+        return Vec::new();
+    }
+    declaration
+        .split_whitespace()
         .filter_map(|token| {
             let option = token.trim_end_matches([',', ';']);
             (option.starts_with('-') && option.len() > 1).then(|| {
@@ -267,14 +267,32 @@ fn option_names(tokens: &[&str]) -> Vec<String> {
         .collect()
 }
 
-fn value_hint(tokens: &[&str]) -> Option<ValueHint> {
-    let metavar = tokens.iter().find_map(|token| {
-        let token = token.trim_end_matches([',', ';']);
-        token
-            .split_once('=')
-            .map(|(_, value)| value)
-            .or_else(|| (token.starts_with(['<', '[', '{'])).then_some(token))
-    })?;
+fn declaration_column(line: &str) -> &str {
+    line.char_indices()
+        .zip(line.char_indices().skip(1))
+        .find_map(|((at, character), (_, next))| {
+            (character.is_whitespace() && next.is_whitespace()).then_some(&line[..at])
+        })
+        .unwrap_or(line)
+}
+
+fn value_hint(line: &str) -> Option<ValueHint> {
+    let metavar = declaration_column(line)
+        .split_whitespace()
+        .find_map(|token| {
+            let token = token.trim_end_matches([',', ';']);
+            token
+                .split_once('=')
+                .map(|(_, value)| value)
+                .or_else(|| (token.starts_with(['<', '[', '{'])).then_some(token))
+                .or_else(|| {
+                    (!token.starts_with('-')
+                        && token
+                            .chars()
+                            .all(|character| character.is_ascii_uppercase() || character == '_'))
+                    .then_some(token)
+                })
+        })?;
     let metavar = metavar.trim_matches(['<', '>', '[', ']', '{', '}']);
     let alternatives: Vec<_> = metavar
         .split(['|', ','])
@@ -709,12 +727,14 @@ mod tests {
     #[test]
     fn ignores_option_like_text_in_descriptions() {
         let spec = CompletionSpec::from_help(
-            "Options:\n  --jobs <N>  Number of jobs; use -1 for all CPUs\n  --color <WHEN>  See --help for details\n",
+            "Options:\n  --jobs <N>  Number of jobs; use -1 for all CPUs\n  --color <WHEN>  See --help for details\n  -c FILE, --config FILE  Read configuration\n",
         );
 
-        assert_eq!(spec.matching("-"), ["--color", "--jobs"]);
+        assert_eq!(spec.matching("-"), ["--color", "--config", "--jobs", "-c"]);
         assert!(spec.matching("-1").is_empty());
         assert!(spec.matching("--h").is_empty());
+        assert_eq!(spec.value_hint("-c"), Some(&ValueHint::File));
+        assert_eq!(spec.value_hint("--config"), Some(&ValueHint::File));
     }
 
     #[test]
