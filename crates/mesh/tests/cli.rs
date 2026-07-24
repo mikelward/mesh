@@ -3445,3 +3445,146 @@ fn sh_is_a_reserved_namespace_that_cannot_be_bound() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("reserved"));
 }
+
+// ---------------------------------------------------------------------------
+// The `$env` namespace (`$env.KEY = value`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn assigning_env_sets_it_for_this_shell_and_for_children() {
+    let out = run_with_input("$env.MESH_TEST_TOOL = ready\nputs $env.MESH_TEST_TOOL\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ready\n");
+
+    // The point of the environment is what children inherit, so check one.
+    let out = run_with_input("$env.MESH_TEST_TOOL = ready\n/usr/bin/env\n");
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line == "MESH_TEST_TOOL=ready"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn an_env_write_inside_a_function_persists_after_it_returns() {
+    // Export is deliberately a global effect, not a local-by-default binding:
+    // changing what children inherit is the whole point.
+    let out = run_with_input(
+        "func setup() { $env.MESH_TEST_SETUP = done }\nsetup\nputs $env.MESH_TEST_SETUP\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+}
+
+#[test]
+fn appending_to_a_plain_env_entry_concatenates_strings() {
+    let out =
+        run_with_input("$env.MESH_TEST_S = ab\n$env.MESH_TEST_S += cd\nputs $env.MESH_TEST_S\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "abcd\n");
+
+    // Appending to an unset name starts it rather than failing.
+    let out = run_with_input("$env.MESH_TEST_NEW += first\nputs $env.MESH_TEST_NEW\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "first\n");
+}
+
+#[test]
+fn path_type_env_entries_are_lists() {
+    let out = run_with_input(
+        "$env.PATH = [/a /b /a]\n\
+         puts $env.PATH:len\n\
+         puts $env.PATH[0]\n\
+         puts ...$env.PATH[1..]\n\
+         puts ...$env.PATH:dedup\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3\n/a\n/b /a\n/a /b\n"
+    );
+}
+
+#[test]
+fn appending_to_path_adds_an_entry_and_children_see_the_joined_value() {
+    let dir = fresh_dir("env_path_append");
+    let tool = dir.join("mesh-test-tool");
+    std::fs::write(&tool, "#!/bin/sh\necho found me\n").unwrap();
+    let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&tool, permissions).unwrap();
+
+    // The payoff: a directory added to $env.PATH is searched for commands.
+    let out = run_with_input(&format!(
+        "$env.PATH += {}\nputs $env.PATH[-1]\nmesh-test-tool\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\nfound me\n", dir.display()),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn path_splitting_is_exact_so_empty_components_survive() {
+    // `PATH=/a:` means "…and the cwd", so an empty component is meaningful and
+    // a split/join round trip has to be byte-faithful.
+    let out = run_with_input("$env.PATH = [/a \"\" /b]\n/usr/bin/env\n");
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line == "PATH=/a::/b"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = run_with_input("$env.PATH = [/a \"\" /b]\nputs $env.PATH:len\nputs $env.PATH[1]\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n\n");
+}
+
+#[test]
+fn only_strings_cross_into_the_environment() {
+    let out = run_with_input("$env.MESH_TEST_L = [a b]\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("join the list first"), "{stderr}");
+
+    let out = run_with_input("$env.MESH_TEST_M = [a: 1]\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a map"));
+
+    // An environment entry is NUL-terminated, so an embedded NUL is a hard
+    // error rather than a silent truncation.
+    let out = run_with_input("$env.MESH_TEST_N = \"a\\u{0}b\"\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("NUL"));
+}
+
+#[test]
+fn a_joined_list_crosses_into_a_plain_env_entry() {
+    let out = run_with_input(
+        "dirs = [/a /b]\n$env.MESH_TEST_J = $dirs:join(\":\")\nputs $env.MESH_TEST_J\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/a:/b\n");
+}
+
+#[test]
+fn only_a_plain_env_member_is_an_assignment_target() {
+    // An index or a modifier describes a derived value, not a place, so these
+    // stay expressions and fail as such rather than silently assigning.
+    for source in ["$env.PATH[0] = x\n", "$env.PATH:dedup = x\n", "$env = x\n"] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(2), "{source}");
+    }
+
+    // The braced spelling is the same reference, so it is assignable.
+    let out = run_with_input("${env.MESH_TEST_B} = ok\nputs $env.MESH_TEST_B\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+#[test]
+fn reading_an_unset_env_entry_is_still_a_loud_error() {
+    let out = run_with_input("puts $env.MESH_TEST_ABSENT\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not set"));
+}

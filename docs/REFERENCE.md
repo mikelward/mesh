@@ -309,6 +309,44 @@ recovers and continues. An interpolated value is a single literal value — it i
 never split on spaces or matched against filenames. Interpolation happens in bare
 words and `"…"`, never in `'…'` or `r'…'`.
 
+### The environment
+
+`$env.KEY = value` writes the process environment, so children inherit it:
+
+```mesh
+$env.EDITOR = vim
+$env.EDITOR += " -u NONE"     # += concatenates
+```
+
+An environment write is **global on purpose**, even inside a function: changing
+what children inherit is the point, so it persists after the function returns.
+
+Only strings cross the boundary — the environment is a flat `KEY=bytes` table,
+so a list or map is a loud error telling you to join it first
+(`$env.P = $dirs:join(":")`), and an embedded NUL is refused rather than
+silently truncated. Integers and booleans cross as their text.
+
+**Path-type names are lists**, split on the way in and `:`-joined on the way
+out, which is what makes the guarded-PATH idioms work:
+
+```mesh
+$env.PATH += /opt/bin         # append one entry
+$env.PATH = $env.PATH:dedup   # drop duplicates
+puts $env.PATH[0]
+puts $env.PATH:len
+```
+
+The set is fixed for now: `PATH`, `MANPATH`, `CDPATH`, `INFOPATH`,
+`LD_LIBRARY_PATH`, and `PYTHONPATH`. Because these read as lists, `puts
+$env.PATH` needs a spread or a join like any other list. Splitting is **exact** —
+every empty component is kept, since `PATH=/usr/bin:` means "…and the cwd", and a
+split/join round trip is byte-faithful.
+
+Only a plain `$env.KEY` is an assignment target. `$env.PATH[0] = …` and
+`$env.PATH:dedup = …` describe derived values rather than places, so they are
+syntax errors. `export NAME = value`, `export --list NAME`, and `unset` are not
+implemented yet.
+
 Member access and list/map indexing have the same meaning inside `"…"` as they do
 outside it. A slice remains a list and needs `...` in command position; omitted
 bounds and negative bounds are supported. Use braces to delimit a reference

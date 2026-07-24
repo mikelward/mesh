@@ -33,7 +33,7 @@ use crate::completion::{CompletionCache, CompletionSpec, ValueHint, rank_candida
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
 use crate::vars::{self, RegexValue, Value, Vars};
-use crate::{exec, expand, parser};
+use crate::{environ, exec, expand, parser};
 
 const COMPLETION_MENU: &str = "completion_menu";
 
@@ -632,6 +632,19 @@ fn run_executable(
                     |_| Step::Continue(0),
                 )
             }
+            Err(step) => step,
+        },
+        // An environment write is global by design: it changes what children
+        // inherit, so a function-local scope would defeat the point
+        // (`DESIGN.md` §"Variables and assignment").
+        EnvAssignment { key, append, value } => match eval_expr(value, last, in_function, shell) {
+            Ok(value) => environ::write(key, value, *append).map_or_else(
+                |error| {
+                    eprintln!("mesh: {error}");
+                    Step::Continue(1)
+                },
+                |_| Step::Continue(0),
+            ),
             Err(step) => step,
         },
         Function {
