@@ -2035,18 +2035,12 @@ branch falsy (per the [error model](#error-handling)); and the int case is a **s
 question, so the 8-bit masking applies (a function returning `256` has status `0`,
 success).
 
-One small **open** nicety this surfaced: spell an explicit coded failure as
-**`return error <n>`** rather than a bare `return <n>`. Its **status view must be
-defined**, since the settled mapping is exhaustive and views every non-int / non-bool
-value as `0` — so an error value would otherwise be a *success*. Two ways, and the
-masking edge distinguishes them: **(a) sugar for `return <n>`** — an int, status `n`
-(masked) — which *inherits* the masking problem, so `error 0` / `error 256` would view as
-**success** (contradictory for a "failure"); this form must restrict `<n>` to a nonzero
-masked status. **(b) a distinct error value** whose failure comes from its *error-ness*,
-not the number — it is falsy regardless of the code (the code is just an attached
-detail), which **sidesteps** the `0`/`256` edge but **extends (reopens)** the "every
-other value → `0`" mapping with an error-value row. Either way a bare `return 5` still has
-status `5`. Undecided, including which of (a)/(b).
+A tangential scrap this surfaced, **deferred**: whether to add an explicit spelling for a
+coded failure so a bare int need not be overloaded. It is not free — any such value has to
+stay a **channel-1** failure (a testable value, per the [error model](#error-handling)),
+so it **cannot** reuse the name "error" (which in mesh means **channel-2** — fail-loud, no
+value, aborts), and defining its status view would touch the exhaustive channel-1 failure
+list (`false` / nonzero int / command status, never value shape). Not pursued here.
 
 ### Tests and comparisons
 
