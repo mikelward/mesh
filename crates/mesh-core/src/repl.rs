@@ -2191,26 +2191,29 @@ fn bind_arguments(
         return Err(2);
     }
 
-    // Bind positionals in order; a missing one is optional (guaranteed by the
-    // arity check) and takes its default, evaluated in the new scope.
+    // Bind every parameter in declaration order, consuming supplied positionals in
+    // sequence. Binding in order means a default — positional or flag — can
+    // reference any earlier-declared parameter, whatever its kind. A missing
+    // positional is optional (guaranteed by the arity check) and takes its default.
     let mut supplied = positional_values.into_iter();
-    for (param, default) in &positionals {
-        if let Some(value) = supplied.next() {
-            shell.vars.set_value(param, value);
-        } else {
-            let default = default.expect("a missing positional must be optional");
-            let value = evaluate_default(name, param, default, shell)?;
-            shell.vars.set_value(param, value);
-        }
-    }
-    if let Some(rest) = rest_name {
-        shell.vars.set_value(rest, Value::List(supplied.collect()));
-    }
-
-    // Bind flags: a switch is the boolean of "was it passed"; a valued flag takes
-    // its passed value or its default.
     for param in params {
         match &param.kind {
+            ParamKind::Required => {
+                let value = supplied.next().expect("a required positional is validated");
+                shell.vars.set_value(&param.name, value);
+            }
+            ParamKind::Optional(default) => {
+                let value = match supplied.next() {
+                    Some(value) => value,
+                    None => evaluate_default(name, &param.name, default, shell)?,
+                };
+                shell.vars.set_value(&param.name, value);
+            }
+            ParamKind::Rest => {
+                shell
+                    .vars
+                    .set_value(&param.name, Value::List(supplied.by_ref().collect()));
+            }
             ParamKind::Switch => {
                 let on = switches_on.contains(param.name.as_str());
                 shell.vars.set_value(&param.name, Value::Boolean(on));
@@ -2222,7 +2225,6 @@ fn bind_arguments(
                 };
                 shell.vars.set_value(&param.name, value);
             }
-            _ => {}
         }
     }
     Ok(())

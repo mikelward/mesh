@@ -1935,6 +1935,15 @@ fn a_flag_value_can_arrive_spread_from_a_list() {
 }
 
 #[test]
+fn a_default_can_reference_an_earlier_declared_flag() {
+    // Parameters bind in declaration order, so a later default sees an
+    // earlier-declared flag (switch or valued), supplied or defaulted.
+    let out = run_with_input("func f(--force, x = $force) { puts $x }\nf --force\nf\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\nfalse\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn an_unknown_flag_is_a_loud_error() {
     let out = run_with_input("func f(a) { puts $a }\nf --bogus x\nputs after\n");
     let stderr = String::from_utf8_lossy(&out.stderr);
