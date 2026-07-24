@@ -1977,11 +1977,12 @@ three ways, resolved by the tail:
   the bytes-as-value path, same rule as `$(…)`). A **nonzero exit yields no value** — the
   failing status propagates and aborts the whole `match` expression. This bites the
   print-then-fail commands: `grep -c ERROR $f` writes `0` yet **exits 1** on no matches,
-  so `{ grep -c … }` *fails* the arm rather than yielding `"0"` — capture the count with
-  an explicit `{ $(grep -c ERROR $f) }` (or a success-forcing `… ; true`) when you want
-  the output regardless of status. (This status gate is one more reason the implicit
+  so `{ grep -c … }` *fails* the arm rather than yielding `"0"`. A bare `$(…)` capture
+  rides the **same** exit-0 gate (`E::Capture` → `capture_source`), so `{ $(grep -c …) }`
+  fails too — to keep the output regardless of status you must **force success**:
+  `{ $(grep -c ERROR $f; true) }`. (This status gate is one more reason the implicit
   command-tail capture is a sharp edge — a live question is whether value-position blocks
-  should drop implicit capture and require an explicit `$(…)` instead.)
+  should drop implicit capture and require an explicit, still-exit-0-gated `$(…)`.)
 
 To *return a string* reliably, then, write a **quoted** tail — `{ "text" }` — which is
 an expression and works in a body of any length; the bare `{ text }` shorthand is only
