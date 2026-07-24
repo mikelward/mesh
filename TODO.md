@@ -119,6 +119,11 @@ file as tasks land.
       `a | f | b`). Each runs in a forked child so the stages are concurrent
       rather than buffered, which is what lets `f | head -3` end early; state a
       stage changes is confined to it, as in every POSIX shell.
+- [x] `while cond { … }` and `loop { … }`, with `break` / `continue` / `return`
+      behaving as they do in `for`. A condition takes the same forms `if` does.
+      Fixes a related gap along the way: a spaced `<` / `>` in condition position
+      is a comparison rather than a redirection, so `if $i < 3` reads the way
+      `if $i <= 3` already did.
 - [x] Ordered, string-keyed maps: literals (including `[:]`), duplicate-key
       replacement, map spread, strict dot/bracket access, `+=` merge, and
       `:keys` / `:values` / `:len` collection modifiers.

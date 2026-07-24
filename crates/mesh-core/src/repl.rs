@@ -674,6 +674,8 @@ fn run_executable(
             iterable,
             body,
         } => run_ast_for(bindings, iterable, body, last, in_function, shell),
+        While { condition, body } => run_ast_while(Some(condition), body, last, in_function, shell),
+        Loop { body } => run_ast_while(None, body, last, in_function, shell),
         Control { kind, value, guard } => {
             match guard_allows(guard.as_ref(), last, in_function, shell) {
                 Ok(true) => {}
@@ -883,6 +885,57 @@ fn run_ast_for(
             Some(parser::ControlKind::Break) => break,
             Some(parser::ControlKind::Continue) => continue,
             Some(parser::ControlKind::Return) => unreachable!(),
+            None => {}
+        }
+    }
+    shell.loop_depth -= 1;
+    Step::Continue(status)
+}
+
+/// Run `while COND { … }`, or `loop { … }` when there is no condition.
+///
+/// Both are the same machine: test, run the body, repeat. `loop` is the case
+/// whose test always passes, so it can only be left through `break` — or through
+/// a `return` or an error, which unwind past the loop like any other flow.
+fn run_ast_while(
+    condition: Option<&parser::Executable>,
+    body: &parser::Source,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
+    // The loop's own result: 0 when the body never runs, so a condition that is
+    // false from the start succeeds.
+    let mut status = 0;
+    // What the condition reads as "the last status" — the preceding command on
+    // the first test, then whatever the body just did, matching `if`.
+    let mut previous = last;
+    shell.loop_depth += 1;
+    loop {
+        if let Some(condition) = condition {
+            match condition_status(condition, previous, in_function, shell) {
+                Ok(0) => {}
+                Ok(_) => break,
+                Err(step) => {
+                    shell.loop_depth -= 1;
+                    return step;
+                }
+            }
+        }
+        match run_source(body, 0, in_function, shell) {
+            Step::Continue(code) => {
+                status = code;
+                previous = code;
+            }
+            flow => {
+                shell.loop_depth -= 1;
+                return flow;
+            }
+        }
+        match shell.control.take() {
+            Some(parser::ControlKind::Break) => break,
+            Some(parser::ControlKind::Continue) => continue,
+            Some(parser::ControlKind::Return) => unreachable!("`return` unwinds as a Step"),
             None => {}
         }
     }

@@ -497,7 +497,7 @@ An unconditional mismatch is a loud error and binds nothing. Conditional and
 `match` mismatches simply try the other branch or arm. Duplicate and reserved
 bindings are rejected before any value is committed.
 
-## For loops
+## Loops
 
 `for name in value { body }` runs the body once for each top-level list element or
 expanded word. An element containing whitespace remains one value when read
@@ -514,7 +514,32 @@ for key, value in $settings { puts "$key=$value" }
 for [key value] in $pairs { puts "$key=$value" }
 ```
 
-`break` exits the nearest loop and `continue` skips to its next iteration.
+`while condition { body }` tests before each pass, taking the same two condition
+forms `if` does — a value's truthiness or a command's exit status. `loop { body }`
+repeats until something breaks out:
+
+```mesh
+i = 0
+while $i < 3 {
+  puts $i
+  i = $i + 1
+}
+
+while test -e /tmp/lock { sleep 1 }
+
+loop {
+  if deploy-succeeded { break }
+  sleep 5
+}
+```
+
+`break` exits the nearest loop and `continue` skips to its next iteration; both
+work in `for`, `while`, and `loop`, and a `return` inside any of them unwinds the
+whole function. A loop reports the status of its last completed pass.
+
+Note that `<` and `>` also spell redirections. In a **condition** a spaced
+comparison wins — `while $i < 3` compares — while an attached or command-position
+form still redirects (`grep -q x < file`, `$cmd > log`).
 
 ## Match
 

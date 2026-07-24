@@ -3889,3 +3889,105 @@ fn appending_preserves_non_utf8_bytes_already_in_the_environment() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+// ---------------------------------------------------------------------------
+// `while` and `loop`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn while_repeats_until_its_condition_fails() {
+    let out = run_with_input("i = 0\nwhile $i < 3 {\n  puts $i\n  i = $i + 1\n}\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0\n1\n2\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A false condition runs the body zero times.
+    let out = run_with_input("while false { puts never }\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn while_accepts_a_command_status_as_its_condition() {
+    // The same two condition forms `if` takes: a value's truthiness, or a
+    // command's exit status.
+    let out = run_with_input("n = 0\nwhile test $n -lt 2 {\n  puts \"n=$n\"\n  n = $n + 1\n}\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "n=0\nn=1\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn loop_repeats_until_a_break() {
+    let out = run_with_input("i = 0\nloop {\n  i = $i + 1\n  if $i > 2 { break }\n  puts $i\n}\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1\n2\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn break_and_continue_work_in_the_new_loops() {
+    let out = run_with_input(
+        "i = 0\nwhile $i < 5 {\n  i = $i + 1\n  if $i == 2 { continue }\n  puts $i\n}\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n3\n4\n5\n");
+
+    // A `break` leaves only the innermost loop.
+    let out = run_with_input(
+        "for a in [x y] {\n  i = 0\n  while $i < 3 { i = $i + 1\n    if $i == 2 { break } }\n  puts \"$a done\"\n}\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x done\ny done\n");
+}
+
+#[test]
+fn a_return_inside_a_while_unwinds_the_whole_function() {
+    let out = run_with_input(
+        "func f() {\n  i = 0\n  while $i < 9 { i = $i + 1\n    if $i == 3 { return 7 } }\n  puts unreachable\n}\nf\n",
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn a_while_reports_the_status_of_its_last_pass() {
+    let out = run_with_input("i = 0\nwhile $i < 2 { i = $i + 1\n  false }\n");
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn a_spaced_comparison_in_a_condition_is_not_a_redirection() {
+    // `<` and `>` double as redirect operators, so a condition has to tell
+    // `if $i < 3` from `if cmd < file`. `<=`, `>=`, and `!=` always read as
+    // comparisons here; these two now do too.
+    let out =
+        run_with_input("i = 0\nif $i < 3 { puts lt }\nif $i > 9 { puts gt } else { puts le }\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "lt\nle\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A command condition still redirects.
+    let dir = fresh_dir("condition_redirect");
+    let input = dir.join("in.txt");
+    std::fs::write(&input, "hello\n").unwrap();
+    let out = run_with_input(&format!(
+        "if grep -q hello < {} {{ puts found }}\n",
+        input.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "found\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
