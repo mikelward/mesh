@@ -2973,7 +2973,11 @@ impl MeshPrompt {
                 .unwrap_or(if self.failed { "mesh! " } else { "mesh$ " });
         let width = sgr_stripped_width(prompt.rsplit('\n').next().unwrap_or_default());
 
-        format!("{} ", ".".repeat(width.saturating_sub(1)))
+        if width == 0 {
+            String::new()
+        } else {
+            format!("{} ", ".".repeat(width - 1))
+        }
     }
 }
 
@@ -3912,6 +3916,18 @@ mod tests {
             ".. "
         );
         assert_eq!(styled_prompt.render_prompt_multiline_indicator(), ".. ");
+
+        let styling_only_prompt = MeshPrompt {
+            failed: false,
+            continuation: true,
+            custom: Some("\x1b[0m".into()),
+        };
+
+        assert_eq!(
+            styling_only_prompt.render_prompt_indicator(PromptEditMode::Default),
+            ""
+        );
+        assert_eq!(styling_only_prompt.render_prompt_multiline_indicator(), "");
     }
 
     #[test]
