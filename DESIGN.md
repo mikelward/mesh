@@ -1958,7 +1958,8 @@ narrowed the question to four choices; current leanings noted, but all four are 
    additionally **reopens** the implicit last-expression rule, since it requires a keyword
    in its place — (b) *keeps* the tail expression as the value. Neither touches the general
    assignment-RHS rule (`x = greet` stays the string `"greet"`, per PARSER.md).
-   Language-wide: applies to `if` and `func` too.
+   Language-wide: applies to every value-producing block — `if`, `match`, `for`
+   (`ys = for x in $xs { … }`), and `func` bodies alike.
 
 **Explored, kept the settled model — `0` = success is correct** *(not a change)*. The
 exploration questioned `int → status` — a bare int read as an exit code rather than data,
@@ -1973,9 +1974,10 @@ is narrow and accepted. Two live scraps this left, both pointed at their canonic
   question (whose leaning treats empties as **true**; see that entry for the full rule).
   Note `gets()` pins `""` **truthy** — a
   blank line must not end a read loop — which pulls `[]` toward truthy too, for
-  consistency. The tradeoff: with empties **truthy** (the leaning), `if $xs` is always
-  true, so emptiness needs an explicit test (`$xs:len == 0`); making `[]` **falsy** would
-  let `if $xs` *be* the emptiness test but split `[]` from the pinned-truthy `""`.
+  consistency; making `[]` **falsy** would split it from the pinned-truthy `""`. (Where a
+  value's truthiness is even consulted — the assignment-condition RHS, `if xs = f() { … }`,
+  not a bare `if $xs`, since ordinary `if`/`while` take a bool or command — is the
+  canonical entry's to specify.)
 - **An explicit coded-failure spelling** *(deferred)* — any such value must stay a
   **channel-1** failure (a testable value) and so **cannot** reuse the name "error"
   (channel-2: fail-loud, no value, aborts); defining it touches the two-channel
@@ -3309,7 +3311,7 @@ to avoid" rather than promising the latter as done.
   `return`) instead of the settled implicit **last-expression** rule, which would also
   make `{ … }` blocks pure command-context (dropping the **single-bare-word block-tail**
   coercion — *not* the general assignment-RHS rule, which stays). Language-wide — it
-  touches `if`, `match`, and `func` alike.
+  touches every value-producing block: `if`, `match`, `for`, and `func` alike.
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
