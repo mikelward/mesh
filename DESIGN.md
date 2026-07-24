@@ -1960,9 +1960,11 @@ and is on the table as an alternative, **not** a decision:
   **early-exit only**; **status is a view of the result** (int→itself, bool→`0`/`1`,
   any other value→`0`); the caller picks value-vs-stream **by syntax** (`f()` value,
   `$(f)` stdout, bare `f` runs); and a **bare RHS word is a literal string**.
-- The **proposal**: make `puts`/printing the only explicit **typed-value→bytes**
-  operation (ordinary command stdout — `ls`, external programs — still streams bytes for
-  pipes and `$(f)` capture, unchanged) and require an
+- The **proposal**: make `puts`/printing the only explicit way to write a **typed value
+  to stdout** as bytes (ordinary command stdout — `ls`, external programs — still streams
+  bytes for pipes and `$(f)` capture; and the settled value-rendering boundary still
+  converts a typed value to bytes when it is **interpolated or passed as external argv**,
+  e.g. `external $n` — both unchanged) and require an
   **explicit keyword** for a typed value, so `{ … }` blocks are pure command-context (a
   bare word always *runs*; quotes mean only "group into one word," removing the
   `"$a""$b"` value-vs-command ambiguity at a block tail). This **reopens** the settled
@@ -1970,7 +1972,7 @@ and is on the table as an alternative, **not** a decision:
   reconciling the two is itself the open question.
 
 If the proposal is taken, the remaining sub-choice is *which keyword(s)* and how they
-coexist with `return [N]`:
+coexist with the settled `return` / `return val`:
 
 - **Option 1 — two keywords, split by scope: `yield` (local) + `return` (function).**
   `yield <value>` produces the value of the **nearest value-yielding block** — an `if`
