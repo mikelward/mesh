@@ -2047,9 +2047,11 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
                 words: argv,
                 redirs,
                 pipe_stderr: false,
+                in_shell: false,
             }],
             &mut shell.jobs,
             background,
+            &mut |_| unreachable!("an external command is never an in-shell stage"),
         )),
         Err(err) => {
             eprintln!("mesh: {err}");
@@ -2085,13 +2087,7 @@ fn run_multi(stages: Vec<Stage>, background: bool, shell: &mut Shell) -> Step {
             eprintln!("mesh: return: cannot be used in a pipeline");
             return Step::Continue(2);
         }
-        if builtins::is_builtin(&argv[0]) || shell.funcs.get(&argv[0]).is_some() {
-            eprintln!(
-                "mesh: {}: builtins and functions are not supported in a pipeline yet",
-                argv[0]
-            );
-            return Step::Continue(1);
-        }
+        let in_shell = builtins::is_builtin(&argv[0]) || shell.funcs.get(&argv[0]).is_some();
         let redirs = match expand_redirs(redirs, &shell.vars) {
             Ok(redirs) => redirs,
             Err(err) => {
@@ -2103,9 +2099,41 @@ fn run_multi(stages: Vec<Stage>, background: bool, shell: &mut Shell) -> Step {
             words: argv,
             redirs,
             pipe_stderr,
+            in_shell,
         });
     }
-    Step::Continue(exec::run_pipeline(cmds, &mut shell.jobs, background))
+    // The job table has to be borrowed separately from the rest of the shell,
+    // since an in-shell stage runs with `&mut Shell` while the pipeline holds the
+    // table. Moving it out and back keeps both borrows disjoint; the placeholder
+    // left behind is empty, so dropping it signals nothing.
+    let mut jobs = std::mem::replace(&mut shell.jobs, exec::JobTable::new());
+    let status = exec::run_pipeline(cmds, &mut jobs, background, &mut |words| {
+        run_stage_in_shell(words, shell)
+    });
+    shell.jobs = jobs;
+    Step::Continue(status)
+}
+
+/// Run a builtin or function that is a pipeline stage. Called in the forked
+/// child, so an `exit` ends that child and any state it changes dies with it.
+///
+/// Arguments arrive as strings: a pipeline stage's argv went through ordinary
+/// word expansion, and the pipe between stages carries bytes either way, so
+/// there is no typed value to preserve across it.
+fn run_stage_in_shell(words: &[String], shell: &mut Shell) -> u8 {
+    if let Some(builtin) = builtins::dispatch(words, 0) {
+        return match builtin {
+            builtins::Builtin::Status(code) | builtins::Builtin::Exit(code) => code,
+        };
+    }
+    let args = words[1..]
+        .iter()
+        .map(|word| (Value::String(word.clone()), false))
+        .collect();
+    match dispatch_function_call(&words[0], args, shell) {
+        Step::Continue(code) | Step::Exit(code) => code,
+        Step::Return(value) => status_of(&value),
+    }
 }
 
 /// Expand each redirection target to exactly one path. Zero or several words is

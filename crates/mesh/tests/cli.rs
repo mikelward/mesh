@@ -1491,10 +1491,18 @@ fn a_quoted_pipe_is_a_literal_not_an_operator() {
 }
 
 #[test]
-fn a_builtin_in_a_pipeline_is_rejected_for_now() {
+fn a_builtin_runs_as_a_pipeline_stage() {
     let out = run_with_input("puts hi | cat\nputs after\n");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not supported in a pipeline"));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi\nafter\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And as the receiving end, where its own output still reaches the terminal.
+    let out = run_with_input("echo ignored | puts read-nothing\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "read-nothing\n");
 }
 
 #[test]
@@ -2354,13 +2362,75 @@ fn invalid_signature_forms_are_parser_errors() {
 }
 
 #[test]
-fn a_function_in_a_pipeline_is_rejected() {
-    let out = run_with_input("func f() { puts hi }\nf | cat\n");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("not supported in a pipeline"),
+fn a_function_runs_as_a_pipeline_stage() {
+    let out = run_with_input("func f() { puts one\nputs two }\nf | sort -r\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "two\none\n",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn a_function_stage_reads_the_pipe_and_sits_in_the_middle() {
+    // Downstream: the function's body inherits the stage's stdin.
+    let out = run_with_input("func upper() { tr a-z A-Z }\necho abc | upper\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ABC\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And in the middle of three, reading one pipe and writing the next.
+    let out = run_with_input("func pass() { cat }\necho mid | pass | tr a-z A-Z\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "MID\n");
+}
+
+#[test]
+fn pipeline_stages_run_concurrently_rather_than_buffering() {
+    // More than a pipe buffer holds (64 KiB on Linux). Collecting the upstream
+    // stage's output before starting the downstream one would deadlock here, so
+    // this is the test that an in-shell stage really gets its own process.
+    let out = run_with_input("func many() { for i in 1..30000 { puts $i } }\nmany | wc -l\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "29999",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_downstream_stage_closing_the_pipe_ends_an_in_shell_stage_quietly() {
+    // `head` exits after three lines, so the writer takes SIGPIPE. Rust sets
+    // SIGPIPE to SIG_IGN at startup; if the forked stage inherited that it would
+    // see EPIPE, report a write failure, and fail the pipeline instead of ending
+    // silently the way the pipefail rule assumes.
+    let out = run_with_input("func many() { for i in 1..200000 { puts $i } }\nmany | head -3\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1\n2\n3\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "upstream SIGPIPE must not fail the pipeline"
+    );
+}
+
+#[test]
+fn an_in_shell_stage_reports_its_status_and_keeps_its_state_to_itself() {
+    let out = run_with_input("func fail() { return 3 }\nfail | cat\n");
+    assert_eq!(out.status.code(), Some(3));
+
+    // A stage runs in its own process, so what it changes dies with it — the
+    // same bargain every POSIX shell makes for a piped builtin.
+    let out =
+        run_with_input("x = before\nfunc setit() { x = after\nputs done }\nsetit | cat\nputs $x\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\nbefore\n");
 }
 
 #[test]

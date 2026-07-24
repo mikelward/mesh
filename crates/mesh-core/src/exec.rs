@@ -10,7 +10,7 @@ use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 /// Write one diagnostic line to stderr in a single `write`.
@@ -42,6 +42,10 @@ pub struct Cmd {
     pub words: Vec<String>,
     pub redirs: Vec<(RedirKind, String)>,
     pub pipe_stderr: bool,
+    /// A builtin or user function, which mesh runs itself instead of `exec`ing.
+    /// It still gets its own forked process, so the stages of a pipeline run
+    /// concurrently — see [`fork_in_shell`].
+    pub in_shell: bool,
 }
 
 /// Running background jobs and foreground jobs suspended with Ctrl-Z.
@@ -213,10 +217,121 @@ pub fn run(words: &[String], jobs: &mut JobTable) -> u8 {
             words: words.to_vec(),
             redirs: Vec::new(),
             pipe_stderr: false,
+            in_shell: false,
         }],
         jobs,
         false,
+        &mut |_| unreachable!("an external command is never an in-shell stage"),
     )
+}
+
+/// Run one in-shell stage — a builtin or a function — in a forked child.
+///
+/// A pipeline's stages have to run **concurrently**: an upstream stage that
+/// writes more than the pipe buffer blocks until a downstream reader drains it,
+/// so running a builtin to completion in the shell and handing its output on
+/// would deadlock on anything larger than 64 KiB (and could never express `yes |
+/// head`). Forking gives the stage its own process, exactly as an external
+/// command gets, at the cost POSIX shells already pay: state a piped builtin
+/// changes — a `cd`, an assignment — is confined to that child, as in bash.
+///
+/// Returns the child pid and, when this stage pipes onward, the read end for the
+/// next stage.
+#[allow(clippy::too_many_arguments)]
+fn fork_in_shell(
+    cmd: &Cmd,
+    is_last: bool,
+    incoming: NextIn,
+    in_file: Option<File>,
+    out_file: Option<File>,
+    interactive: bool,
+    background: bool,
+    process_group: Option<libc::pid_t>,
+    run: &mut dyn FnMut(&[String]) -> u8,
+) -> std::io::Result<(libc::pid_t, bool, Option<File>)> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    // stdout: a redirection wins over the pipe to the next stage; the last stage
+    // with neither inherits the shell's stdout.
+    let mut piped_out = false;
+    let (child_out, read_end) = match (out_file, is_last) {
+        (Some(file), _) => (Some(file), None),
+        (None, true) => (None, None),
+        (None, false) => {
+            let mut fds = [0; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            piped_out = true;
+            // SAFETY: both descriptors come from a successful `pipe`.
+            unsafe {
+                (
+                    Some(File::from_raw_fd(fds[1])),
+                    Some(File::from_raw_fd(fds[0])),
+                )
+            }
+        }
+    };
+    // stdin: a redirection wins over the incoming pipe; `Null` is the EOF case.
+    let child_in = match (in_file, incoming) {
+        (Some(file), _) => Some(file),
+        (None, NextIn::Pipe(file)) => Some(file),
+        (None, NextIn::Null) => Some(File::open("/dev/null")?),
+        (None, NextIn::Inherit) => None,
+    };
+
+    // Anything buffered belongs to the parent; flushing first keeps the child
+    // from inheriting it and printing a duplicate.
+    let _ = std::io::stdout().flush();
+
+    // SAFETY: fork has no arguments. The child touches only async-signal-safe
+    // syscalls before running the stage, and leaves via `_exit` so no destructor
+    // (notably `JobTable`'s, which signals jobs) runs twice.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if pid == 0 {
+        // The child never reads from the pipe it writes to; holding the read end
+        // open would keep the next stage from ever seeing EOF.
+        drop(read_end);
+        unsafe {
+            // Rust sets SIGPIPE to SIG_IGN at startup, so a write to a closed
+            // pipe would return EPIPE here and the stage would report a failure
+            // instead of dying quietly. `Command` restores the default for an
+            // external child; do the same, so `f | head -3` ends the way the
+            // pipefail rule assumes — killed by SIGPIPE, and not counted.
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            if interactive || background {
+                libc::setpgid(0, process_group.unwrap_or(0));
+            }
+            if interactive {
+                let _ = restore_job_signals();
+                if !background {
+                    set_foreground_group(libc::getpgrp());
+                }
+            }
+            if let Some(file) = &child_in {
+                libc::dup2(file.as_raw_fd(), libc::STDIN_FILENO);
+            }
+            if let Some(file) = &child_out {
+                libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO);
+                if cmd.pipe_stderr && !is_last {
+                    libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+                }
+            }
+        }
+        let code = run(&cmd.words);
+        let _ = std::io::stdout().flush();
+        // SAFETY: `_exit` ends the child without unwinding or running atexit
+        // handlers, which belong to the parent's copy of the shell.
+        unsafe { libc::_exit(code as libc::c_int) };
+    }
+    // The parent must release the write end, or the reader never sees EOF.
+    drop(child_out);
+    drop(child_in);
+    Ok((pid, piped_out, read_end))
 }
 
 /// How the next stage receives its stdin.
@@ -226,8 +341,10 @@ enum NextIn {
     /// EOF (`/dev/null`): the previous stage sent its stdout elsewhere (a
     /// redirect) or failed to spawn, so there is no producer for this stage.
     Null,
-    /// The previous stage's stdout, piped in.
-    Pipe(Stdio),
+    /// The previous stage's stdout, piped in. Held as a `File` rather than a
+    /// `Stdio` because an in-shell stage runs in a fork and needs the raw
+    /// descriptor to `dup2`; `Stdio` is one-way.
+    Pipe(File),
 }
 
 /// A spawned stage awaiting its status, or a stage that failed before running.
@@ -235,8 +352,11 @@ enum Outcome {
     /// `piped_out` is true when this stage's stdout fed a downstream pipe (the
     /// only case where a SIGPIPE can legitimately come from a later stage
     /// closing the pipe).
+    ///
+    /// Identified by pid rather than `Child` so a stage mesh forked itself — a
+    /// builtin or function — is waited on exactly like a spawned one.
     Running {
-        child: Child,
+        pid: libc::pid_t,
         piped_out: bool,
     },
     Completed {
@@ -258,7 +378,12 @@ enum Outcome {
 /// Interactive foreground pipelines and all background pipelines get their own
 /// process group. Non-interactive foreground pipelines stay in mesh's process
 /// group so signals sent to the invoking group reach all stages.
-pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8 {
+pub fn run_pipeline(
+    cmds: Vec<Cmd>,
+    jobs: &mut JobTable,
+    background: bool,
+    run_in_shell: &mut dyn FnMut(&[String]) -> u8,
+) -> u8 {
     let command_text = cmds
         .iter()
         .map(|cmd| cmd.words.join(" "))
@@ -306,6 +431,42 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
                 continue;
             }
         };
+
+        if cmd.in_shell {
+            match fork_in_shell(
+                &cmd,
+                is_last,
+                incoming,
+                in_file,
+                out_file,
+                interactive,
+                background,
+                process_group,
+                run_in_shell,
+            ) {
+                Ok((pid, piped_out, read_end)) => {
+                    if interactive || background {
+                        let pgid = process_group.unwrap_or(pid);
+                        process_group = Some(pgid);
+                        // Repeat setpgid in the parent to close the race with the
+                        // child's own call, exactly as the spawn path does.
+                        // SAFETY: scalar arguments; `pid` came from a successful fork.
+                        unsafe {
+                            libc::setpgid(pid, pgid);
+                        }
+                    }
+                    if let Some(read) = read_end {
+                        next_stdin = NextIn::Pipe(read);
+                    }
+                    outcomes.push(Outcome::Running { pid, piped_out });
+                }
+                Err(err) => {
+                    note!("mesh: {}: {err}", cmd.words[0]);
+                    outcomes.push(Outcome::Failed(1));
+                }
+            }
+            continue;
+        }
 
         let mut command = if background && !cmd.redirs.is_empty() {
             match background_redirect_command(&cmd) {
@@ -355,7 +516,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
                     command.stdin(Stdio::null());
                 }
                 NextIn::Pipe(prev) => {
-                    command.stdin(prev);
+                    command.stdin(Stdio::from(prev));
                 }
             }
         }
@@ -382,7 +543,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
                 }
             };
             command.stdout(write).stderr(stderr);
-            combined_pipe = Some(Stdio::from(read));
+            combined_pipe = Some(read);
             piped_out = true;
         } else if let Some(file) = out_file {
             command.stdout(file);
@@ -409,9 +570,12 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
                         next_stdin = NextIn::Pipe(pipe);
                     }
                 } else if piped_out && let Some(out) = child.stdout.take() {
-                    next_stdin = NextIn::Pipe(out.into());
+                    next_stdin = NextIn::Pipe(File::from(std::os::fd::OwnedFd::from(out)));
                 }
-                outcomes.push(Outcome::Running { child, piped_out });
+                outcomes.push(Outcome::Running {
+                    pid: child.id() as libc::pid_t,
+                    piped_out,
+                });
             }
             Err(err) => {
                 // The child hook hands the terminal to the new process group
@@ -511,8 +675,8 @@ fn wait_outcomes(outcomes: &mut [Outcome]) -> WaitResult {
     let mut stopped = None;
     for outcome in &mut *outcomes {
         let (code, piped_out, did_stop, completed) = match outcome {
-            Outcome::Running { child, piped_out } => {
-                let (code, stopped) = wait_for_job(child).unwrap_or((1, false));
+            Outcome::Running { pid, piped_out } => {
+                let (code, stopped) = wait_for_job(*pid).unwrap_or((1, false));
                 (code, *piped_out, stopped, !stopped)
             }
             Outcome::Completed { code, piped_out } => (*code, *piped_out, false, false),
@@ -535,18 +699,13 @@ fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<WaitResult> {
     let mut any_running = false;
     let mut status = 0;
     for outcome in &mut *outcomes {
-        let Outcome::Running { child, piped_out } = outcome else {
+        let Outcome::Running { pid, piped_out } = outcome else {
             continue;
         };
+        let pid = *pid;
         let piped_out = *piped_out;
         let mut raw = 0;
-        let result = unsafe {
-            libc::waitpid(
-                child.id() as libc::pid_t,
-                &mut raw,
-                libc::WNOHANG | libc::WUNTRACED,
-            )
-        };
+        let result = unsafe { libc::waitpid(pid, &mut raw, libc::WNOHANG | libc::WUNTRACED) };
         if result == 0 {
             any_running = true;
         } else if result > 0 && libc::WIFSTOPPED(raw) {
@@ -672,13 +831,12 @@ fn restore_terminal_modes(modes: &libc::termios) {
 /// termination, which would leave mesh blocked after Ctrl-Z. Reporting a stop
 /// now lets the shell reclaim the terminal; the job-table task will retain the
 /// process and make it available to `fg` / `bg`.
-fn wait_for_job(child: &mut Child) -> std::io::Result<(u8, bool)> {
+fn wait_for_job(pid: libc::pid_t) -> std::io::Result<(u8, bool)> {
     loop {
         let mut status = 0;
-        // SAFETY: child.id() is a live child PID and status points to writable
+        // SAFETY: `pid` is a live child PID and status points to writable
         // storage. WUNTRACED requests the state transition needed for Ctrl-Z.
-        let result =
-            unsafe { libc::waitpid(child.id() as libc::pid_t, &mut status, libc::WUNTRACED) };
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
         if result < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == ErrorKind::Interrupted {

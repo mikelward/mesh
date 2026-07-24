@@ -29,9 +29,8 @@ pub enum Builtin {
     Exit(u8),
 }
 
-/// Does `name` name a builtin? Used to reject a builtin in a pipeline or with a
-/// redirection, which are not supported yet (both need the builtin to write to a
-/// non-stdout target / a forked child).
+/// Does `name` name a builtin? Used to route one to the in-shell path — run
+/// directly for a plain command, or in a forked stage inside a pipeline.
 pub fn is_builtin(name: &str) -> bool {
     NAMES.contains(&name)
 }

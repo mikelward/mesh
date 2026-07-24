@@ -596,12 +596,18 @@ greet world          # -> hi, world
   call, so output from the body — including from an external command it runs —
   lands in the target, and an external it runs can read the redirected input.
 
-Not yet supported: a function in a pipeline or in the background, and calling for
-a value (`f(arg)`) as opposed to running it.
+A function can also be a pipeline stage, reading the pipe, writing to the next
+stage, or both (`f | sort`, `echo x | f`, `a | f | b`). A stage runs in its own
+forked process, exactly as an external command does, so the stages run
+concurrently — and, as in every POSIX shell, whatever the stage changes stays in
+that process: a `cd` or an assignment inside `f | cat` does not outlive it.
+Arguments to a piped function arrive as strings.
+
+Not yet supported: a function in the background, and calling for a value
+(`f(arg)`) as opposed to running it.
 
 ## Not yet implemented
 
 Most modifier arguments (beyond `:split` / `:join`), the command-word form of an
 argument-taking modifier, regex capture modifiers, and heredocs are not yet
-implemented. Functions in pipelines are also still ahead. See
-[`ROADMAP.md`](../ROADMAP.md).
+implemented. See [`ROADMAP.md`](../ROADMAP.md).
