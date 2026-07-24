@@ -1953,6 +1953,801 @@ fn a_bare_return_uses_the_last_status() {
 }
 
 #[test]
+fn a_value_call_returns_the_functions_value() {
+    // `f(args)` calls a function for its value: the last expression, or an explicit
+    // `return`. Positionals are comma-separated inside the parens.
+    let out = run_with_input(
+        "func add(a, b) { $a + $b }\nfunc greet(who) { return \"hi $who\" }\nn = add(2, 3)\nm = greet(world)\nputs \"$n $m\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5 hi world\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_value_call_binds_named_options_like_flags() {
+    // `key: value` options bind the same parameter as `--key` (`force: true` ≡
+    // `--force`), in any order, and omitted flags take their defaults.
+    let src =
+        "func deploy(target, --region = us-west, --force) { return \"$target/$region/$force\" }\n";
+    let out = run_with_input(&format!(
+        "{src}a = deploy(prod, region: eu, force: true)\nb = deploy(app)\nputs \"$a | $b\"\n"
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "prod/eu/true | app/us-west/false\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_value_call_spreads_lists_as_positionals_and_maps_as_options() {
+    let out = run_with_input(
+        "func d(target, --region = us, --force) { return \"$target/$region/$force\" }\nfunc sum3(a, b, c) { $a + $b + $c }\nopts = [region: eu, force: true]\nxs = [10 20 30]\nr = d(prod, ...$opts)\nt = sum3(...$xs)\nputs \"$r $t\"\n",
+    );
+    // The spread map fills the options; the spread list fills the positionals.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "prod/eu/true 60\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_value_call_accepts_the_dashed_option_spelling() {
+    // `--flag` and `key: value` are interchangeable inside a value call
+    // (`DESIGN.md` §"Calling for a value"), so both bind the same parameter — and a
+    // dashed value types like the same token in command position (`--n=2` → int).
+    let src = "func d(target, --force, --tag = latest) { return \"$target/$force/$tag\" }\n";
+    let out = run_with_input(&format!(
+        "{src}r = d(prod, --force)\ns = d(prod, --tag=v2)\nt = d(prod, force: true, tag: v9)\nputs \"$r | $s | $t\"\n"
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "prod/true/latest | prod/false/v2 | prod/true/v9\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_value_call_honors_the_option_terminator_and_scans_spread_elements() {
+    // A bare `--` ends option parsing inside a value call too, so a following
+    // `--force` reaches the rest parameter as data instead of setting the switch.
+    let terminated = run_with_input(
+        "func f(--force, ...rest) { puts \"force=$force\"\n puts ...$rest }\nx = f(--, --force)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&terminated.stdout),
+        "force=false\n--force\n"
+    );
+    assert!(terminated.stderr.is_empty(), "{:?}", terminated.stderr);
+
+    // A spread explodes into call arguments, so a `--flag` element binds its
+    // option rather than becoming a positional (which would be an arity error).
+    let spread = run_with_input(
+        "func g(target, --force) { puts \"$target/$force\" }\nargs = [--force]\ny = g(prod, ...$args)\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&spread.stdout), "prod/true\n");
+    assert!(spread.stderr.is_empty(), "{:?}", spread.stderr);
+
+    // Structured options cannot bind after the terminator either. A `key: value`
+    // has no positional meaning to fall back to (unlike a dashed word), so it is a
+    // recoverable error rather than silently binding — for a direct pair and for a
+    // spread map's entries alike.
+    for source in [
+        "func f(--force, ...rest) { puts \"force=$force\" }\nx = f(--, force: true)\nputs after\n",
+        "func f(--force, ...rest) { puts \"force=$force\" }\nopts = [force: true]\nx = f(--, ...$opts)\nputs after\n",
+    ] {
+        let out = run_with_input(source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("option `force:` cannot follow `--`"),
+            "{source:?}: {stderr}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "after\n",
+            "{source:?}"
+        );
+    }
+}
+
+#[test]
+fn control_flow_in_a_value_call_argument_belongs_to_the_caller() {
+    // An argument expression is evaluated in the caller's scope, so a `return` it
+    // raises unwinds the *caller* — it must not be captured as the callee's result.
+    let returned = run_with_input(
+        "func id(v) { return $v }\nfunc outer() { x = id(if true { return early })\n puts \"NOT REACHED $x\" }\nr = outer()\nputs \"outer=[$r]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&returned.stdout), "outer=[early]\n");
+    assert!(returned.stderr.is_empty(), "{:?}", returned.stderr);
+
+    // Likewise a `break` belongs to the caller's loop rather than being cleared.
+    let broke = run_with_input(
+        "func id(v) { return $v }\nfor i in [1 2 3] {\n  x = id(if true { break })\n  puts \"iter $i\"\n}\nputs done\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&broke.stdout), "done\n");
+
+    // Evaluation stops at the argument that raised it, so a later argument never
+    // runs (no division error) and a named option whose expression broke is never
+    // bound (no spurious type error).
+    let later = run_with_input(
+        "func two(a, b) { return \"$a/$b\" }\nfor i in [1 2] {\n  x = two(if true { break }, 1 / 0)\n  puts \"iter $i\"\n}\nputs done\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&later.stdout), "done\n");
+    assert!(later.stderr.is_empty(), "{:?}", later.stderr);
+
+    let named = run_with_input(
+        "func f(a, --force) { return $a }\nfor i in [1 2] {\n  x = f(if true { break }, force: if true { break })\n  puts \"iter $i\"\n}\nputs done\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&named.stdout), "done\n");
+    assert!(named.stderr.is_empty(), "{:?}", named.stderr);
+
+    // `continue` still skips only its own iteration.
+    let continued = run_with_input(
+        "func id(v) { return $v }\nfor i in [1 2 3] {\n  x = id(if $i == 2 { continue })\n  puts \"iter $i\"\n}\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&continued.stdout),
+        "iter 1\niter 3\ndone\n"
+    );
+
+    // The control flow may be raised from *within* a compound argument: the rest of
+    // that expression must not run either, so no operator is applied to a value
+    // that was never produced (which would report a spurious type error).
+    for source in [
+        "func two(a, b) { return \"$a/$b\" }\nfor i in [1 2] {\n  x = two((if true { break }) + 1, 2)\n  puts \"iter $i\"\n}\nputs done\n",
+        "func one(a) { return $a }\nfor i in [1 2] {\n  x = one(-(if true { break }))\n  puts \"iter $i\"\n}\nputs done\n",
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n", "{source:?}");
+        assert!(out.stderr.is_empty(), "{source:?}: {:?}", out.stderr);
+    }
+}
+
+#[test]
+fn pending_loop_control_stops_every_expression_wrapper() {
+    // `break`/`continue` travel beside the value channel, so a wrapper whose child
+    // raised one has no value to work with: it must stop rather than report a
+    // spurious error about a value that was never produced. This holds for plain
+    // expressions, not just value-call arguments.
+    for source in [
+        // member access
+        "for i in [1] {\n  y = (if true { break }).field\n}\nputs done\n",
+        // index and slice bounds
+        "xs = [1 2 3]\nfor i in [1] {\n  a = $xs[if true { break }]\n}\nputs done\n",
+        "xs = [1 2 3]\nfor i in [1] {\n  b = $xs[(if true { break })..2]\n}\nputs done\n",
+        // modifier
+        "for i in [1] {\n  c = (if true { break }):upper\n}\nputs done\n",
+        // range endpoint
+        "for i in [1] {\n  d = (if true { break })..3\n}\nputs done\n",
+        // and through a value call's argument
+        "func id(v) { return $v }\nfor i in [1] {\n  e = id((if true { break }).foo)\n}\nputs done\n",
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n", "{source:?}");
+        assert!(out.stderr.is_empty(), "{source:?}: {:?}", out.stderr);
+    }
+}
+
+#[test]
+fn pending_loop_control_stops_every_statement_consumer() {
+    // The wrapper audit covers expressions that *build* a value. A statement that
+    // *acts* on one is the other half: a `for` iterable, an `if`/`while`
+    // condition, a `match` subject, a guard. Each must see that no truth value
+    // was produced rather than treat the placeholder as one — otherwise the body
+    // runs, and so do the statements after it, before the loop unwinds.
+    //
+    // The outer `for` runs twice if the `break` is not honored, so a body that
+    // leaks would print twice as well.
+    let call = "func id(v) { return $v }\n";
+    for (label, source) in [
+        (
+            "for iterable",
+            "for a in [1 2] {\n  for i in id(if true { break }) { puts LEAK }\n  puts LEAK-AFTER\n}\n",
+        ),
+        (
+            "if condition",
+            "for a in [1 2] {\n  if id(if true { break }) { puts LEAK } else { puts LEAK }\n  puts LEAK-AFTER\n}\n",
+        ),
+        (
+            "match subject",
+            "for a in [1 2] {\n  match id(if true { break }) { _ { puts LEAK } }\n  puts LEAK-AFTER\n}\n",
+        ),
+        (
+            "guard",
+            "for a in [1 2] {\n  puts LEAK if id(if true { break })\n  puts LEAK-AFTER\n}\n",
+        ),
+        (
+            "expression statement",
+            "for a in [1 2] {\n  id(if true { break })\n  puts LEAK-AFTER\n}\n",
+        ),
+    ] {
+        let out = run_with_input(&format!("{call}{source}puts done\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "done\n",
+            "{label}: {source:?}"
+        );
+        assert!(out.stderr.is_empty(), "{label}: {:?}", out.stderr);
+    }
+
+    // A `match` arm's *guard* is the same: its falsy placeholder must not read as
+    // "this arm does not match", or a later arm runs while the loop is unwinding.
+    for (label, source) in [
+        (
+            "statement mode",
+            "for a in [1 2] {\n  match 7 { 7 if (if true { break }) { puts LEAK } _ { puts LEAK } }\n  puts LEAK-AFTER\n}\n",
+        ),
+        (
+            "value mode",
+            "for a in [1 2] {\n  v = match 7 { 7 if (if true { break }) { puts LEAK\n 1 } _ { puts LEAK\n 2 } }\n  puts LEAK-AFTER\n}\n",
+        ),
+    ] {
+        let out = run_with_input(&format!("{source}puts done\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "done\n",
+            "match guard, {label}: {source:?}"
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "match guard, {label}: {:?}",
+            out.stderr
+        );
+    }
+
+    // A match *pattern* is an expression too, so it can raise control while being
+    // compared. "No match" against a placeholder is not an answer either.
+    for (label, source) in [
+        (
+            "statement mode",
+            "for a in [1 2] {\n  match 1 { id(if true { break }) { puts LEAK } _ { puts LEAK } }\n  puts LEAK-AFTER\n}\n",
+        ),
+        (
+            "value mode",
+            "for a in [1 2] {\n  v = match 1 { id(if true { break }) { 1 } _ { puts LEAK\n 2 } }\n  puts LEAK-AFTER\n}\n",
+        ),
+    ] {
+        let out = run_with_input(&format!("{call}{source}puts done\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "done\n",
+            "match pattern, {label}: {source:?}"
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "match pattern, {label}: {:?}",
+            out.stderr
+        );
+    }
+
+    // A `continue` raised by a `while` *condition* targets that loop and re-tests
+    // it — the condition may have changed the state the next test reads, so
+    // ending the loop instead would skip passes that should run.
+    let retested = run_with_input(
+        "n = 0\nwhile (if $n == 0 { n = 1\n continue } else { $n != 3 }) { puts \"pass n=$n\"\n n = $n + 1 }\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&retested.stdout),
+        "pass n=1\npass n=2\ndone\n",
+        "{:?}",
+        retested.stdout
+    );
+    assert!(retested.stderr.is_empty(), "{:?}", retested.stderr);
+
+    // A `continue` in the same position leaves the pass without running the body,
+    // and the loop still makes its remaining passes.
+    let resumed = run_with_input(&format!(
+        "{call}for a in [1 2] {{\n  for i in id(if $a == 1 {{ continue }} else {{ [ok] }}) {{ puts \"iter=$i\" }}\n  puts \"pass=$a\"\n}}\nputs done\n"
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&resumed.stdout),
+        "iter=ok\npass=2\ndone\n",
+        "{:?}",
+        resumed.stdout
+    );
+    assert!(resumed.stderr.is_empty(), "{:?}", resumed.stderr);
+}
+
+#[test]
+fn a_statements_operands_do_not_become_its_result() {
+    // A condition, a `match` subject, a `for` iterable, an assignment's
+    // right-hand side, a guard: each is an *operand* of the statement around it,
+    // not the statement. An operand that runs statements of its own records
+    // results while doing so, and those belong to the operand — the enclosing
+    // executable still reports its own.
+    //
+    // Every header here ends in a truthy value but records a `false` on the way,
+    // so a leak shows up as `1` (that `false`'s status) instead of `7`.
+    let headers = run_with_input(
+        "func ifc() { 7 + 0\n if (if true { false\n 1 == 1 }) { return } }\n         func whilec() { 7 + 0\n while (if true { false\n 1 == 1 }) { return } }\n         func matchc() { 7 + 0\n match (if true { false\n 9 + 0 }) { _ { return } } }\n         func forc() { 7 + 0\n for i in (if true { false\n [1] }) { return } }\n         a = ifc()\nb = whilec()\nc = matchc()\nd = forc()\n         puts \"[$a][$b][$c][$d]\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&headers.stdout),
+        "[7][7][7][7]\n",
+        "{:?}",
+        headers.stdout
+    );
+    assert!(headers.stderr.is_empty(), "{:?}", headers.stderr);
+
+    // An assignment reports its own *status*, so a compound right-hand side must
+    // not leave the assignment looking like a value-producing statement.
+    let assigned = run_with_input(
+        "func plain() { x = if true { 5 + 0\n 6 + 0 }\n return }\n         func env() { 7 + 0\n $env.MESH_OPERAND = if true { 5 + 0\n 6 + 0 }\n return }\n         a = plain()\nb = env()\nputs \"[$a][$b]\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&assigned.stdout),
+        "[0][0]\n",
+        "{:?}",
+        assigned.stdout
+    );
+
+    // A guarded *pipeline* that is skipped produced nothing, exactly as a guarded
+    // expression does, so the typed result before it still stands.
+    let skipped =
+        run_with_input("func f() { 1 == 2\n puts no if false\n return }\nx = f()\nputs \"[$x]\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&skipped.stdout),
+        "[false]\n",
+        "{:?}",
+        skipped.stdout
+    );
+}
+
+#[test]
+fn a_rejected_background_list_records_its_own_failure() {
+    // The rejection returns above the layer that normally records a statement's
+    // result, so it has to record its own. Otherwise the value an earlier
+    // statement produced still stands and a bare `return` carries that instead of
+    // the failure — the call would look like it succeeded.
+    let out =
+        run_with_input("func f() { 5 + 0\n true && false &\n return }\nx = f()\nputs \"x=[$x]\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "x=[2]\n",
+        "{:?}",
+        out.stdout
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("background conditional lists"),
+        "{:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn an_assignment_whose_value_broke_keeps_the_previous_binding() {
+    // The right-hand side produced no value, so the target must be left alone
+    // rather than overwritten with a placeholder.
+    let out =
+        run_with_input("x = keep\nfor i in [1] {\n  x = if true { break }\n}\nputs \"x=[$x]\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x=[keep]\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // An environment assignment is a place too, whether the value came from an
+    // expression or from a value call.
+    let env = run_with_input(
+        "func id(v) { return $v }\n$env.MESH_KEEP = keep\n\
+         for i in [1] {\n  $env.MESH_KEEP = if true { break }\n}\n\
+         for i in [1] {\n  $env.MESH_KEEP = id(if true { break })\n}\n\
+         puts \"env=[$env.MESH_KEEP]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&env.stdout), "env=[keep]\n");
+    assert!(env.stderr.is_empty(), "{:?}", env.stderr);
+}
+
+#[test]
+fn a_builtin_value_constructor_cannot_be_a_function_name() {
+    // `re(...)` is a built-in value constructor, so a `func re` would be reachable
+    // as a command but never as a value call — reserve the name instead of
+    // shipping a function whose meaning depends on how it is called. The error is
+    // recoverable: the next command still runs.
+    let out = run_with_input("func re(x) { return $x }\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`re` is a built-in value constructor"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // A name that merely contains or resembles it is unaffected.
+    let ok = run_with_input("func read(x) { return \"ok:$x\" }\ny = read(v)\nputs \"$y\"\n");
+    assert_eq!(String::from_utf8_lossy(&ok.stdout), "ok:v\n");
+    assert!(ok.stderr.is_empty(), "{:?}", ok.stderr);
+}
+
+#[test]
+fn a_value_call_evaluates_arguments_in_the_callers_scope() {
+    // `f($x)` reads the caller's `$x`, not the callee's fresh scope.
+    let out = run_with_input("func id(v) { return $v }\nx = outer\ny = id($x)\nputs \"$y\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "outer\n");
+}
+
+#[test]
+fn a_bare_return_carries_the_result_so_far() {
+    // `return` on its own exits early carrying the body's result *so far*, not a
+    // freshly minted status: a value the body produced, the status of a command
+    // that produced none, and the empty string when nothing ran at all.
+    let out = run_with_input(
+        "func carried() { x = hello\n $x\n return }\n\
+         func empty() { return }\n\
+         func failed() { false\n return }\n\
+         a = carried()\nb = empty()\nputs \"[$a][$b]\"\n\
+         failed || puts command-status\nfailed() || puts value-status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[hello][]\ncommand-status\nvalue-status\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // The `return` can be *inside* an `&&` / `||` list, where the result so far
+    // is the executable that just ran in the same list, not the statement before.
+    let chained = run_with_input(
+        "func f() { false || return }\nf && puts bad\nf || puts ok\nv = f()\nputs \"v=[$v]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&chained.stdout), "ok\nv=[1]\n");
+    assert!(chained.stderr.is_empty(), "{:?}", chained.stderr);
+
+    // What produced the result is *observed*: a branch's value survives the `if`
+    // that ran it, and an expression that failed leaves no stale value behind.
+    let observed = run_with_input(
+        "func nested() { if true { 1 == 2 }\n return }\n\
+         func failed() { 2 + 3\n 1 / 0\n return }\n\
+         a = nested()\nb = failed()\nputs \"[$a][$b]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&observed.stdout), "[false][1]\n");
+
+    // A call is a command like any other: the callee's own result, and its mark,
+    // stay with the callee, so the caller records the call's *status*.
+    let nested = run_with_input(
+        "func inner() { 7 + 0 }\nfunc outer() { 42 + 0\n inner\n return }\n\
+         x = outer()\nputs \"x=[$x]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&nested.stdout), "x=[7]\n");
+
+    // An argument's own statements record results of their own; they belong to
+    // neither side, so a failing call still records its failure.
+    let argument = run_with_input(
+        "func need2(a, b) { return \"$a$b\" }\n\
+         func outer() { need2(if true { 0 + 0\n 6 + 0 })\n return }\n\
+         outer && puts bad\nouter || puts ok\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&argument.stdout), "ok\n");
+
+    // A guard that fails leaves the statement unrun, so the previous result — a
+    // typed one — still stands; and a compound argument's own result belongs to
+    // the setup, not to a body that has produced nothing yet.
+    let skipped = run_with_input(
+        "func f() { 1 == 2\n 4 + 5 if false\n return }\n\
+         func g(x) { return }\n\
+         a = f()\nb = g(if true { 1 + 1 })\nputs \"[$a][$b]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&skipped.stdout), "[false][]\n");
+
+    // A quoted scalar statement is a *command* — the spelling that runs a path
+    // with spaces — so its result is its status, not the string.
+    let quoted = run_with_input(
+        "func f() { \"false\"\n return }\nf && puts bad\nf || puts ok\nv = f()\nputs \"v=[$v]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&quoted.stdout), "ok\nv=[1]\n");
+
+    // A compound that ran but produced no value results in the empty string — not
+    // the result the statement before it recorded, and not its own status. That is
+    // what the same construct yields in value position, so the two agree.
+    let empty_compound = run_with_input(
+        "func branch() { 5 + 0\n if true { }\n return }\n         func unbranched() { 5 + 0\n if false { 1 + 1 }\n return }\n         func elsewhere() { 5 + 0\n if false { 9 } else { }\n return }\n         func unmatched() { 5 + 0\n match 1 { 2 { 3 + 3 } }\n return }\n         func unlooped() { 5 + 0\n while false { 1 + 1 }\n return }\n         a = branch()\nb = unbranched()\nc = elsewhere()\nd = unmatched()\ne = unlooped()\n         puts \"[$a][$b][$c][$d][$e]\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&empty_compound.stdout),
+        "[][][][][]\n",
+        "{:?}",
+        empty_compound.stdout
+    );
+    assert!(
+        empty_compound.stderr.is_empty(),
+        "{:?}",
+        empty_compound.stderr
+    );
+    // A branch that *did* produce keeps its value, so the normalization only
+    // applies to a construct that produced nothing.
+    let produced = run_with_input(
+        "func f() { 5 + 0\n if true { 1 == 2 }\n return }\na = f()\nputs \"[$a]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&produced.stdout), "[false]\n");
+
+    // A compound executable reports *its own* value, not its last nested one's: a
+    // `for` collects a value per pass, so a bare `return` after one carries the
+    // aggregate list — the same value the loop yields as the body's last
+    // statement. A pass that produced nothing contributes the empty string.
+    let aggregate = run_with_input(
+        "func carried() { for i in [1 2] { $i + 10 }\n return }\n         func direct() { for i in [1 2] { $i + 10 } }\n         func silent() { for i in [1 2] { }\n return }\n         a = carried()\nb = direct()\nc = silent()\n         puts \"[$a[0]][$a[1]][$b[0]][$b[1]][$c[0]][$c[1]]\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&aggregate.stdout),
+        "[11][12][11][12][][]\n",
+        "{:?}",
+        aggregate.stdout
+    );
+    assert!(aggregate.stderr.is_empty(), "{:?}", aggregate.stderr);
+
+    // An argument is still the *caller's* code, so a bare `return` raised while
+    // evaluating one carries the caller's result so far — the same value the same
+    // `return` carries outside the call. A default is the callee's code, so its
+    // bare `return` carries the callee's result, which is nothing yet.
+    let in_argument = run_with_input(
+        "func id(v) { v }\n\
+         func called() { 5 + 0\n x = id(if true { return })\n puts bad }\n\
+         func plain() { 5 + 0\n if true { return }\n puts bad }\n\
+         func defaulted(x = if true { return }) { puts bad }\n\
+         a = called()\nb = plain()\nc = defaulted()\nputs \"[$a][$b][$c]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&in_argument.stdout), "[5][5][]\n");
+    assert!(in_argument.stderr.is_empty(), "{:?}", in_argument.stderr);
+}
+
+#[test]
+fn a_result_reports_the_status_view_of_its_value() {
+    // An expression statement's status is the view of its value (`DESIGN.md`): an
+    // integer is its own status, a boolean inverts, anything else is 0. That
+    // holds for a value call, for a command-mode call whose body ends in an
+    // implicit value, and for a bare expression.
+    let out = run_with_input(
+        "func f() { return false }\nfunc g() { 1 == 2 }\nfunc t() { 1 == 1 }\nfunc n() { return 3 }\n\
+         f() && puts bad-value-call\nf() || puts ok-value-call\n\
+         g && puts bad-command-call\ng || puts ok-command-call\n\
+         t && puts ok-true\n\
+         n() || puts ok-integer\n\
+         1 == 2 || puts ok-bare\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ok-value-call\nok-command-call\nok-true\nok-integer\nok-bare\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn an_integer_result_becomes_the_exit_status() {
+    // The integer view reaches the shell's own exit status, not just `&&` / `||`.
+    let out = run_with_input("func n() { return 3 }\nn()\n");
+    assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn a_conditional_list_is_still_the_functions_value() {
+    // A final `&&` / `||` list is not a tail expression, but the branch that ran
+    // still produced the body's result.
+    let out = run_with_input(
+        "func f() { 1 == 2 || 3 + 4 }\nfunc g() { 1 == 1 && 4 + 5 }\nx = f()\ny = g()\nputs \"[$x][$y]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[7][9]\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_body_that_produced_nothing_yields_the_empty_string() {
+    // An empty body does not inherit whatever the surrounding code last
+    // recorded: each iteration here produced nothing, so each element is empty.
+    let out = run_with_input(
+        "9 + 0\nxs = for i in [1 2] { }\na = $xs[0]\nb = $xs[1]\nputs \"[$a][$b]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[][]\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_guarded_final_expression_is_still_the_functions_value() {
+    // A guard on the last statement does not stop it being the body's value; a
+    // guard that fails leaves the expression unevaluated, so there is no value.
+    let out = run_with_input(
+        "func f() { 1 + 1 if true }\nfunc g() { 1 + 1 if false }\nx = f()\ny = g()\nputs \"[$x][$y]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[2][]\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // A guard only decides *whether* the statement runs; it is not the statement.
+    // A condition that runs commands of its own must not leave its last status as
+    // the result so far, or the `return` it guards carries the guard's bookkeeping
+    // instead of what the body produced.
+    let compound_guard = run_with_input(
+        "func returned() { 1 + 6\n return if (if 1 == 1 { false\n 1 == 1 }) }\n         func valued() { 1 + 6\n 2 + 3 if (if 1 == 1 { false\n 1 == 1 }) }\n         a = returned()\nb = valued()\nputs \"[$a][$b]\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&compound_guard.stdout),
+        "[7][5]\n",
+        "{:?}",
+        compound_guard.stdout
+    );
+    assert!(
+        compound_guard.stderr.is_empty(),
+        "{:?}",
+        compound_guard.stderr
+    );
+
+    // A guard that fails leaves the expression unrun, which produces *nothing* —
+    // so an earlier statement's result still stands, exactly as a bare `return` in
+    // its place would carry it. Only a body with nothing before it is empty.
+    let earlier = run_with_input(
+        "func kept() { 1 + 1\n 3 + 4 if false }\n         func returned() { 1 + 1\n 3 + 4 if false\n return }\n         a = kept()\nb = returned()\nputs \"[$a][$b]\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&earlier.stdout),
+        "[2][2]\n",
+        "{:?}",
+        earlier.stdout
+    );
+    assert!(earlier.stderr.is_empty(), "{:?}", earlier.stderr);
+}
+
+#[test]
+fn an_out_of_loop_break_in_an_argument_recovers() {
+    // `break` outside any loop is a runtime error, not an unwind: the statement
+    // fails and the script carries on. Inside a loop the same argument leaves the
+    // loop, as it should.
+    let recovered =
+        run_with_input("func id(v) { return $v }\nx = id(if true { break })\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&recovered.stdout), "after\n");
+    assert!(
+        String::from_utf8_lossy(&recovered.stderr).contains("break: not inside a loop"),
+        "{:?}",
+        recovered.stderr
+    );
+
+    let looped = run_with_input(
+        "func id(v) { return $v }\nfor i in [1 2 3] { x = id(if true { break })\n puts \"iter $i\" }\nputs done\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&looped.stdout), "done\n");
+    assert!(looped.stderr.is_empty(), "{:?}", looped.stderr);
+}
+
+#[test]
+fn a_value_call_that_broke_outside_a_loop_fails_like_the_command_call() {
+    // `break` outside a loop is a runtime error. The value call must report the
+    // same failure as `f` in command position, not quietly yield an empty value.
+    let src = "func h() { break }\n";
+    let value = run_with_input(&format!(
+        "{src}z = h() && puts assigned\nz = h() || puts or-ran\n"
+    ));
+    assert_eq!(String::from_utf8_lossy(&value.stdout), "or-ran\n");
+    let command = run_with_input(&format!("{src}h && puts assigned\nh || puts or-ran\n"));
+    assert_eq!(
+        String::from_utf8_lossy(&value.stdout),
+        String::from_utf8_lossy(&command.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&value.stderr).contains("break: not inside a loop"),
+        "{:?}",
+        value.stderr
+    );
+}
+
+#[test]
+fn a_backgrounded_non_command_is_refused() {
+    // `&` needs a child to run in, and only a command or pipeline has one. An
+    // expression's value is produced in this shell, so there is nowhere for a
+    // backgrounded value call's result to go. Refusing is the honest answer;
+    // running it synchronously is not, because the statements after it would see
+    // side effects `&` promised to defer.
+    let out = run_with_input("func f() { puts inside }\nf() &\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after\n",
+        "{:?}",
+        out.stdout
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("&: backgrounding an expression is not supported yet"),
+        "{:?}",
+        out.stderr
+    );
+    // The refusal is a usage error, and it lands before the guard runs.
+    let refused = run_with_input(
+        "func f() { puts inside }\nfunc guard() { puts guard-ran\n return true }\nf() if guard() &\n",
+    );
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(refused.stdout.is_empty(), "{:?}", refused.stdout);
+
+    // A command *is* backgroundable, including the lone quoted spelling that runs
+    // a path needing quotes — that stays a job, not an error.
+    let command = run_with_input("\"/bin/true\" &\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&command.stdout),
+        "after\n",
+        "{:?}",
+        command.stdout
+    );
+    assert!(
+        String::from_utf8_lossy(&command.stderr).starts_with("[1] "),
+        "{:?}",
+        command.stderr
+    );
+
+    // A value call reached through a *compound* statement is the same case: the
+    // `if` runs in this shell, so `&` cannot defer it either, and it must not run
+    // synchronously ahead of the statement after it.
+    let compound =
+        run_with_input("func ready() { return true }\nif ready() { puts inside } &\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&compound.stdout),
+        "after\n",
+        "{:?}",
+        compound.stdout
+    );
+    assert!(
+        String::from_utf8_lossy(&compound.stderr)
+            .contains("&: backgrounding an `if` is not supported yet"),
+        "{:?}",
+        compound.stderr
+    );
+
+    // Every construct that runs in the shell names itself in the diagnostic.
+    for (source, noun) in [
+        ("for i in [1] { puts x } &", "a `for` loop"),
+        ("while false { puts x } &", "a `while` loop"),
+        ("x = 1 + 1 &", "an assignment"),
+        ("$env.KEY = one &", "an environment assignment"),
+        ("func later() { puts x } &", "a function definition"),
+    ] {
+        let out = run_with_input(&format!("{source}\nputs after\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "after\n",
+            "{source}: {:?}",
+            out.stdout
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains(&format!("&: backgrounding {noun} is not supported yet")),
+            "{source}: {:?}",
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn a_value_call_streams_stdout_independently_of_its_value() {
+    // The value call reads the return value; whatever the function prints still
+    // streams (the channels are independent, `DESIGN.md`).
+    let out = run_with_input(
+        "func work() { puts progress\n return done }\nr = work()\nputs \"got $r\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "progress\ngot done\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn value_call_errors_recover_and_run_the_next_command() {
+    // Each bad value call is a recoverable runtime error; the following command
+    // still runs.
+    for (src, needle) in [
+        // An external command has no return value.
+        ("y = grep(foo)\n", "no return value"),
+        // An unknown option name.
+        (
+            "func f(target, --force) { return $target }\nz = f(x, nope: 1)\n",
+            "unknown option `nope:`",
+        ),
+        // A positional passed by name.
+        (
+            "func g(dest) { return $dest }\nz = g(dest: x)\n",
+            "passed by position",
+        ),
+        // Too few arguments.
+        (
+            "func need2(a, b) { $a + $b }\nz = need2(1)\n",
+            "expected 2 argument(s), got 1",
+        ),
+    ] {
+        let out = run_with_input(&format!("{src}puts after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{src:?}: {stderr}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("after"),
+            "{src:?}: after did not run"
+        );
+    }
+}
+
+#[test]
 fn a_function_local_does_not_leak_to_the_caller() {
     // `x` bound inside the function is gone after it returns.
     let out = run_with_input("func setx() { x = inside }\nsetx\nputs \"$x\"\n");

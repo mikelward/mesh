@@ -99,6 +99,7 @@ pub enum ParseErrorKind {
     ChainedComparison,
     Expected(&'static str),
     ReservedParameter(String),
+    ReservedFunctionName(String),
     DuplicateParameter(String),
     RequiredAfterOptional(String),
     ParameterAfterRest(String),
@@ -133,6 +134,12 @@ impl std::fmt::Display for ParseError {
                 write!(
                     f,
                     "syntax error: `{name}` is reserved and cannot be a parameter"
+                )
+            }
+            ParseErrorKind::ReservedFunctionName(name) => {
+                write!(
+                    f,
+                    "syntax error: `{name}` is a built-in value constructor and cannot be a function name"
                 )
             }
             ParseErrorKind::DuplicateParameter(name) => {
@@ -1312,6 +1319,10 @@ fn token_word_pieces(kind: &TokenKind) -> Option<Vec<WordPiece>> {
     }])
 }
 
+/// Names that cannot be user functions because they are built-in **value**
+/// constructors, reachable only through the `name(...)` call form.
+const RESERVED_FUNCTION_NAMES: &[&str] = &["re"];
+
 struct Parser {
     tokens: Vec<Token>,
     position: usize,
@@ -1639,6 +1650,13 @@ impl Parser {
     fn function(&mut self) -> Result<Executable, ParseError> {
         self.take_word("func");
         let name = self.name()?;
+        // `re(...)` is a built-in value constructor. A function of that name would
+        // be reachable as a command (`re x`) but never as a value call, since
+        // `re(x)` always builds a regex — so reserve the name rather than ship a
+        // function that behaves differently depending on how it is called.
+        if RESERVED_FUNCTION_NAMES.contains(&name.as_str()) {
+            return Err(self.error(ParseErrorKind::ReservedFunctionName(name)));
+        }
         let parameters = self.parameters()?;
         self.newlines();
         let body = self.block()?;

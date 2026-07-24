@@ -46,6 +46,26 @@ struct Shell {
     control: Option<parser::ControlKind>,
     loop_depth: usize,
     prompt: PromptConfig,
+    /// The **result so far** of the body being run: the value of the last
+    /// executable that produced one, or the status view of one that did not. A
+    /// bare `return` carries this out (`DESIGN.md` §"Result and `return`").
+    result: Value,
+    /// What the executable that just ran did to `result`. Reported by execution
+    /// rather than inferred from the AST: an `if` whose branch yielded a value
+    /// has produced one, an expression that failed has not, and a statement a
+    /// guard skipped produced nothing at all.
+    produced: Produced,
+}
+
+/// What an executable contributed to the **result so far**.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Produced {
+    /// Nothing of its own: its status *is* its result, as for any command.
+    Status,
+    /// A value, already stored in `Shell::result`.
+    Value,
+    /// Nothing at all — a guard skipped it, so the previous result still stands.
+    Nothing,
 }
 
 #[derive(Default)]
@@ -90,6 +110,8 @@ impl Shell {
             control: None,
             loop_depth: 0,
             prompt: PromptConfig::default(),
+            result: Value::String(String::new()),
+            produced: Produced::Status,
         }
     }
 }
@@ -546,15 +568,24 @@ fn run_source(
     in_function: bool,
     shell: &mut Shell,
 ) -> Step {
+    // What this *body* produced, reported to whatever ran it: the last statement
+    // that produced anything. A body where nothing ran, or whose every statement
+    // was skipped by a guard, produced nothing — so it does not pass the
+    // surrounding code's result off as its own. Same rule as `eval_body`.
+    let mut produced = Produced::Nothing;
     for statement in &source.statements {
         match run_statement(statement, status, in_function, shell) {
             Step::Continue(code) => status = code,
             flow => return flow,
         }
+        if shell.produced != Produced::Nothing {
+            produced = shell.produced;
+        }
         if shell.control.is_some() {
             break;
         }
     }
+    shell.produced = produced;
     Step::Continue(status)
 }
 
@@ -582,9 +613,15 @@ fn run_and_or(
 ) -> Step {
     if background && !node.rest.is_empty() {
         eprintln!("mesh: background conditional lists are not supported yet");
+        // This returns *above* `run_recorded`, which is what normally records a
+        // statement's result, so the rejection is recorded here. Otherwise the
+        // value some earlier statement produced would still stand, and a bare
+        // `return` after it would carry that instead of the failure.
+        shell.result = Value::Integer(2);
+        shell.produced = Produced::Status;
         return Step::Continue(2);
     }
-    let mut step = run_executable(&node.first, background, last, in_function, shell);
+    let mut step = run_recorded(&node.first, background, last, in_function, shell);
     for (op, executable) in &node.rest {
         let Step::Continue(status) = step else {
             return step;
@@ -594,8 +631,34 @@ fn run_and_or(
             parser::AndOrOp::Or => status != 0,
         };
         if run {
-            step = run_executable(executable, background, status, in_function, shell);
+            step = run_recorded(executable, background, status, in_function, shell);
         }
+    }
+    step
+}
+
+/// Run one executable and record the **result so far** it leaves behind, which a
+/// later bare `return` carries out. An expression records its own value; for
+/// anything else — a command, a background statement — the status *is* the
+/// result. Recording per executable rather than per statement is what makes
+/// `false || return` carry the `false`, since the `return` runs inside the list.
+fn run_recorded(
+    executable: &parser::Executable,
+    background: bool,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
+    // What was produced is *observed*, not predicted: an expression that failed
+    // produced nothing, an `if` whose branch yielded a value has produced one,
+    // and a guard that failed left the executable unrun. A nested executable's
+    // report carries out, so the branch's value survives the `if` that ran it.
+    shell.produced = Produced::Status;
+    let step = run_executable(executable, background, last, in_function, shell);
+    if let Step::Continue(code) = step
+        && shell.produced == Produced::Status
+    {
+        shell.result = Value::Integer(i64::from(code));
     }
     step
 }
@@ -608,13 +671,21 @@ fn run_executable(
     shell: &mut Shell,
 ) -> Step {
     use parser::Executable::*;
+    if background && let Some(what) = not_backgroundable(node) {
+        eprintln!("mesh: &: backgrounding {what} is not supported yet");
+        return Step::Continue(2);
+    }
     match node {
         Pipeline(pipeline) => run_ast_pipeline(pipeline, background, last, shell),
         Assignment {
             pattern,
             append,
             value,
-        } => match eval_expr(value, last, in_function, shell) {
+        } => match eval_operand_of(value, last, in_function, shell) {
+            // A right-hand side that raised `break`/`continue` produced no value to
+            // bind — the loop is unwinding, so leave the target as it was rather
+            // than overwriting it with the placeholder.
+            Ok(_) if shell.control.is_some() => Step::Continue(last),
             Ok(value) => {
                 let result = if *append {
                     let parser::BindingPattern::Name(name) = pattern else {
@@ -637,16 +708,22 @@ fn run_executable(
         // An environment write is global by design: it changes what children
         // inherit, so a function-local scope would defeat the point
         // (`DESIGN.md` §"Variables and assignment").
-        EnvAssignment { key, append, value } => match eval_expr(value, last, in_function, shell) {
-            Ok(value) => environ::write(key, value, *append).map_or_else(
-                |error| {
-                    eprintln!("mesh: {error}");
-                    Step::Continue(1)
-                },
-                |_| Step::Continue(0),
-            ),
-            Err(step) => step,
-        },
+        EnvAssignment { key, append, value } => {
+            match eval_operand_of(value, last, in_function, shell) {
+                // As for an ordinary assignment: a right-hand side that raised
+                // `break`/`continue` produced no value, so leave the variable
+                // alone.
+                Ok(_) if shell.control.is_some() => Step::Continue(last),
+                Ok(value) => environ::write(key, value, *append).map_or_else(
+                    |error| {
+                        eprintln!("mesh: {error}");
+                        Step::Continue(1)
+                    },
+                    |_| Step::Continue(0),
+                ),
+                Err(step) => step,
+            }
+        }
         Function {
             name,
             parameters,
@@ -679,7 +756,12 @@ fn run_executable(
         Control { kind, value, guard } => {
             match guard_allows(guard.as_ref(), last, in_function, shell) {
                 Ok(true) => {}
-                Ok(false) => return Step::Continue(last),
+                // Skipped entirely: it produced neither a value nor a status of
+                // its own, so the result so far is still whatever came before.
+                Ok(false) => {
+                    shell.produced = Produced::Nothing;
+                    return Step::Continue(last);
+                }
                 Err(step) => return step,
             }
             match kind {
@@ -697,7 +779,9 @@ fn run_executable(
                         .transpose()
                     {
                         Ok(Some(value)) => Step::Return(value),
-                        Ok(None) => Step::Return(Value::Integer(i64::from(last))),
+                        // A bare `return` carries the result so far, not a
+                        // freshly minted status (`DESIGN.md`).
+                        Ok(None) => Step::Return(shell.result.clone()),
                         Err(step) => step,
                     }
                 }
@@ -723,16 +807,15 @@ fn run_executable(
         Expression { expression, guard } => {
             match guard_allows(guard.as_ref(), last, in_function, shell) {
                 Ok(true) => {}
-                Ok(false) => return Step::Continue(last),
+                // Skipped entirely — see the `Control` arm above.
+                Ok(false) => {
+                    shell.produced = Produced::Nothing;
+                    return Step::Continue(last);
+                }
                 Err(step) => return step,
             }
-            if let parser::Expr::Scalar(word) = expression
-                && word.value.pieces.iter().any(|piece| match piece {
-                    parser::WordPiece::Text { quote, .. }
-                    | parser::WordPiece::Variable { quote, .. } => {
-                        !matches!(quote, parser::QuoteMode::Bare)
-                    }
-                })
+            if runs_as_command(expression)
+                && let parser::Expr::Scalar(word) = expression
             {
                 return run_pipeline(
                     vec![Stage {
@@ -740,17 +823,80 @@ fn run_executable(
                         redirs: Vec::new(),
                         pipe_stderr: false,
                     }],
-                    false,
+                    background,
                     last,
                     shell,
                 );
             }
+            // An expression used as a statement reports the status *view* of its
+            // value (`DESIGN.md` §"Results and status"): an integer is its own
+            // status, a boolean inverts, anything else is 0. That is what lets
+            // `f() && …` and a function whose body ends in `1 == 2` behave the
+            // way the value says they should.
             match eval_expr(expression, last, in_function, shell) {
-                Ok(_) => Step::Continue(0),
+                // An expression cut short by `break`/`continue` yielded a
+                // placeholder, not a value: recording it would leave the loop's
+                // unwinding visible as this statement's result.
+                Ok(_) if shell.control.is_some() => {
+                    shell.produced = Produced::Nothing;
+                    Step::Continue(last)
+                }
+                Ok(value) => {
+                    let code = status_of(&value);
+                    shell.result = value;
+                    shell.produced = Produced::Value;
+                    Step::Continue(code)
+                }
                 Err(step) => step,
             }
         }
     }
+}
+
+/// What `&` cannot defer yet, as the noun to name in the diagnostic — or `None`
+/// for an executable that *can* be backgrounded.
+///
+/// Only a pipeline has a child to hand the work to. Everything else runs in this
+/// shell: an expression produces its value here (a backgrounded value call would
+/// have to send its result back across a fork), and a loop, an assignment, or a
+/// definition changes this shell's own state. Refusing beats running the
+/// statement synchronously, which would break the promise `&` makes to the
+/// statements after it.
+fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
+    use parser::Executable::*;
+    Some(match node {
+        Pipeline(_) => return None,
+        // A lone quoted scalar is a command, so it becomes a pipeline stage and
+        // is backgrounded like any other command.
+        Expression { expression, .. } if runs_as_command(expression) => return None,
+        Expression { .. } => "an expression",
+        Assignment { .. } => "an assignment",
+        EnvAssignment { .. } => "an environment assignment",
+        Function { .. } => "a function definition",
+        If(_) => "an `if`",
+        Match(_) => "a `match`",
+        For { .. } => "a `for` loop",
+        While { .. } => "a `while` loop",
+        Loop { .. } => "a `loop`",
+        Control { kind, .. } => match kind {
+            parser::ControlKind::Return => "`return`",
+            parser::ControlKind::Break => "`break`",
+            parser::ControlKind::Continue => "`continue`",
+        },
+    })
+}
+
+/// Whether an expression statement is really a **command**: a lone scalar word
+/// carrying a quoted piece, the spelling that runs a program whose path needs
+/// quoting (`"/opt/my program"`). Such a statement produces a status, not a
+/// value, which is why its result is recorded like any other command's.
+fn runs_as_command(expression: &parser::Expr) -> bool {
+    matches!(expression, parser::Expr::Scalar(word)
+    if word.value.pieces.iter().any(|piece| match piece {
+        parser::WordPiece::Text { quote, .. } | parser::WordPiece::Variable { quote, .. } => {
+            !matches!(quote, parser::QuoteMode::Bare)
+        }
+    }))
 }
 
 fn guard_allows(
@@ -761,42 +907,98 @@ fn guard_allows(
 ) -> Result<bool, Step> {
     match guard {
         None => Ok(true),
-        Some(guard) => eval_expr(&guard.condition, last, in_function, shell)
-            .map(|value| truthy(&value) != guard.unless),
+        // A guard only decides *whether* the statement runs; it is not the
+        // statement, so its bookkeeping is the operand's — see `eval_operand_of`.
+        // A guard that raised `break`/`continue` produced no truth value, so the
+        // statement it guards does not run: the caller reports it as skipped and
+        // the flag travels on to the loop it belongs to.
+        Some(guard) => eval_operand_of(&guard.condition, last, in_function, shell)
+            .map(|value| shell.control.is_none() && truthy(&value) != guard.unless),
     }
+}
+
+/// Report a compound executable's own result once its body has run.
+///
+/// A construct that *ran* but produced no value — an empty branch, an `if` with
+/// no branch to take, an unmatched `match`, a loop whose body never ran — results
+/// in the **empty string**. Not the result the code before it recorded (the
+/// construct did run, so it is no longer the result so far) and not its own
+/// status: that is what the same construct yields in value position, where
+/// `x = if false { … }` is `""`.
+fn compound_result(step: Step, shell: &mut Shell) -> Step {
+    if matches!(step, Step::Continue(_)) && shell.produced == Produced::Nothing {
+        shell.result = Value::String(String::new());
+        shell.produced = Produced::Value;
+    }
+    step
 }
 
 fn run_ast_if(node: &parser::IfExpr, last: u8, in_function: bool, shell: &mut Shell) -> Step {
     let code = match condition_status(&node.condition, last, in_function, shell) {
-        Ok(code) => code,
+        Ok(Some(code)) => code,
+        // The condition raised `break`/`continue`, so there is no truth value to
+        // branch on. Run nothing and leave the flag for the enclosing loop; the
+        // `if` produced neither a value nor a status of its own.
+        Ok(None) => {
+            shell.produced = Produced::Nothing;
+            return Step::Continue(last);
+        }
         Err(step) => return step,
     };
     if code == 0 {
-        run_source(&node.then_body, 0, in_function, shell)
+        compound_result(run_source(&node.then_body, 0, in_function, shell), shell)
     } else {
         match &node.else_branch {
             Some(parser::ElseBranch::If(next)) => run_ast_if(next, code, in_function, shell),
-            Some(parser::ElseBranch::Block(body)) => run_source(body, 0, in_function, shell),
-            None => Step::Continue(0),
+            Some(parser::ElseBranch::Block(body)) => {
+                compound_result(run_source(body, 0, in_function, shell), shell)
+            }
+            // No branch to take: the `if` ran and produced nothing, so its result
+            // is the empty string rather than the previous statement's.
+            None => {
+                shell.produced = Produced::Nothing;
+                compound_result(Step::Continue(0), shell)
+            }
         }
     }
 }
 
 fn run_ast_match(node: &parser::MatchExpr, last: u8, in_function: bool, shell: &mut Shell) -> Step {
-    let subject = match eval_expr(&node.value, last, in_function, shell) {
+    let subject = match eval_operand_of(&node.value, last, in_function, shell) {
         Ok(value) => value,
         Err(step) => return step,
     };
+    // No subject to match against: the expression raised `break`/`continue`, so
+    // no arm may be selected on the strength of the placeholder.
+    if shell.control.is_some() {
+        shell.produced = Produced::Nothing;
+        return Step::Continue(last);
+    }
     for arm in &node.arms {
-        let bindings = match match_bindings(&arm.pattern, &subject, last, in_function, shell) {
-            Ok(Some(bindings)) => bindings,
-            Ok(None) => continue,
+        let matched = match match_bindings(&arm.pattern, &subject, last, in_function, shell) {
+            Ok(matched) => matched,
             Err(step) => return step,
         };
+        // A pattern is an expression too (`id(if true { break })`), so it can
+        // raise control while being compared. "No match" against a placeholder is
+        // not an answer: stop rather than fall through to a later arm.
+        if shell.control.is_some() {
+            shell.produced = Produced::Nothing;
+            return Step::Continue(last);
+        }
+        let Some(bindings) = matched else { continue };
         let snapshot = shell.vars.active_snapshot();
         commit_bindings(bindings, &mut shell.vars);
         if let Some(guard) = &arm.guard {
-            match eval_expr(guard, last, in_function, shell) {
+            match eval_operand_of(guard, last, in_function, shell) {
+                // The guard raised `break`/`continue`, so it produced no truth
+                // value. Its falsy placeholder must not be read as "this arm does
+                // not match" — that would go on to try later arms and run one.
+                Ok(_) if shell.control.is_some() => {
+                    shell.vars.restore_active(snapshot);
+                    shell.produced = Produced::Nothing;
+                    return Step::Continue(last);
+                }
                 Ok(value) if truthy(&value) => {}
                 Ok(_) => {
                     shell.vars.restore_active(snapshot);
@@ -805,17 +1007,27 @@ fn run_ast_match(node: &parser::MatchExpr, last: u8, in_function: bool, shell: &
                 Err(step) => return step,
             }
         }
-        return run_source(&arm.body, 0, in_function, shell);
+        return compound_result(run_source(&arm.body, 0, in_function, shell), shell);
     }
-    Step::Continue(0)
+    // No arm matched, so nothing produced a value — as for a branchless `if`.
+    shell.produced = Produced::Nothing;
+    compound_result(Step::Continue(0), shell)
 }
 
+/// The status a condition reports, or `None` when evaluating it raised
+/// `break`/`continue`.
+///
+/// A pending control flag means the condition never produced a truth value, so
+/// no caller may take a branch, test a loop, or run a guarded statement on the
+/// strength of it — the placeholder an unwinding expression yields is not an
+/// answer. Each caller decides what "no answer" means for it; none of them may
+/// treat it as false.
 fn condition_status(
     condition: &parser::Executable,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
-) -> Result<u8, Step> {
+) -> Result<Option<u8>, Step> {
     if let parser::Executable::Assignment {
         pattern,
         append: false,
@@ -823,13 +1035,16 @@ fn condition_status(
     } = condition
         && matches!(pattern, parser::BindingPattern::List(_))
     {
-        let value = eval_expr(value, last, in_function, shell)?;
+        let value = eval_operand_of(value, last, in_function, shell)?;
+        if shell.control.is_some() {
+            return Ok(None);
+        }
         return match pattern_bindings(pattern, &value) {
             Ok(Some(bindings)) => {
                 commit_bindings(bindings, &mut shell.vars);
-                Ok(0)
+                Ok(Some(0))
             }
-            Ok(None) => Ok(1),
+            Ok(None) => Ok(Some(1)),
             Err(message) => Err(runtime_message(message)),
         };
     }
@@ -838,11 +1053,15 @@ fn condition_status(
         guard: None,
     } = condition
     {
-        return eval_expr(expression, last, in_function, shell)
-            .map(|value| if truthy(&value) { 0 } else { 1 });
+        let value = eval_operand_of(expression, last, in_function, shell)?;
+        return Ok(shell
+            .control
+            .is_none()
+            .then(|| if truthy(&value) { 0 } else { 1 }));
     }
     match run_executable(condition, false, last, in_function, shell) {
-        Step::Continue(code) => Ok(code),
+        Step::Continue(_) if shell.control.is_some() => Ok(None),
+        Step::Continue(code) => Ok(Some(code)),
         step => Err(step),
     }
 }
@@ -859,15 +1078,30 @@ fn run_ast_for(
         eprintln!("mesh: for: {message}");
         return Step::Continue(2);
     }
-    let value = match eval_expr(iterable, last, in_function, shell) {
+    let value = match eval_operand_of(iterable, last, in_function, shell) {
         Ok(v) => v,
         Err(step) => return step,
     };
+    // The iterable raised `break`/`continue`. It is evaluated before this loop
+    // exists — `loop_depth` still counts the enclosing one — so the flag belongs
+    // to that loop and there is nothing here to iterate. Leaving it set is what
+    // lets the enclosing loop see it; iterating the placeholder would run this
+    // body, and the statements after it, first.
+    if shell.control.is_some() {
+        shell.produced = Produced::Nothing;
+        return Step::Continue(last);
+    }
     let values = match iteration_values(value, bindings.len()) {
         Ok(values) => values,
         Err(message) => return runtime_message(message),
     };
     let mut status = 0;
+    // The loop collects a value per completed pass, exactly as `eval_for_expr`
+    // does, because a `for` *is* the same construct in either position: its
+    // result is the aggregate, not the last pass. Without this the loop would
+    // leave its final iteration's value behind as the result so far, and a bare
+    // `return` after it would carry that scalar instead of the list.
+    let mut results = Vec::new();
     shell.loop_depth += 1;
     for values in values {
         if let Err(message) = bind_iteration(bindings, values, shell) {
@@ -881,14 +1115,21 @@ fn run_ast_for(
                 return flow;
             }
         }
+        let pass = if shell.produced == Produced::Nothing {
+            Value::String(String::new())
+        } else {
+            shell.result.clone()
+        };
         match shell.control.take() {
             Some(parser::ControlKind::Break) => break,
             Some(parser::ControlKind::Continue) => continue,
             Some(parser::ControlKind::Return) => unreachable!(),
-            None => {}
+            None => results.push(pass),
         }
     }
     shell.loop_depth -= 1;
+    shell.result = Value::List(results);
+    shell.produced = Produced::Value;
     Step::Continue(status)
 }
 
@@ -910,12 +1151,26 @@ fn run_ast_while(
     // What the condition reads as "the last status" — the preceding command on
     // the first test, then whatever the body just did, matching `if`.
     let mut previous = last;
+    // A body that never runs leaves this in place, so the loop reports having
+    // produced nothing; each pass's `run_source` overwrites it otherwise.
+    shell.produced = Produced::Nothing;
     shell.loop_depth += 1;
     loop {
         if let Some(condition) = condition {
             match condition_status(condition, previous, in_function, shell) {
-                Ok(0) => {}
-                Ok(_) => break,
+                Ok(Some(0)) => {}
+                Ok(Some(_)) => break,
+                // The condition raised `break`/`continue`. It sits inside this
+                // loop's header, and `loop_depth` already counts this loop, so it
+                // targets this loop.
+                Ok(None) => match shell.control.take() {
+                    Some(parser::ControlKind::Break) => break,
+                    // `continue` skips to the next pass, which re-tests the
+                    // condition — it may have changed state that makes the next
+                    // test answer differently. A condition that changes nothing
+                    // spins, exactly as `while true { continue }` does.
+                    _ => continue,
+                },
                 Err(step) => {
                     shell.loop_depth -= 1;
                     return step;
@@ -940,7 +1195,7 @@ fn run_ast_while(
         }
     }
     shell.loop_depth -= 1;
-    Step::Continue(status)
+    compound_result(Step::Continue(status), shell)
 }
 
 fn iteration_values(value: Value, binding_count: usize) -> Result<Vec<Vec<Value>>, String> {
@@ -1100,7 +1355,13 @@ fn run_ast_pipeline(
     for (index, command) in node.stages.iter().enumerate() {
         match guard_allows(command.guard.as_ref(), last, false, shell) {
             Ok(true) => {}
-            Ok(false) => return Step::Continue(last),
+            // Skipped entirely, as for a guarded expression or control word: it
+            // produced neither a value nor a status, so the previous result still
+            // stands rather than being replaced by the inherited one.
+            Ok(false) => {
+                shell.produced = Produced::Nothing;
+                return Step::Continue(last);
+            }
             Err(step) => return step,
         }
         let mut words = Vec::new();
@@ -1211,6 +1472,56 @@ fn parse_bound(value: &str) -> Option<i64> {
     (!value.is_empty()).then(|| value.parse().expect("parser validated list bound"))
 }
 
+/// Evaluate a sub-expression, returning `None` when it raised pending control flow
+/// (`break`/`continue`).
+///
+/// `break`/`continue` travel on `shell.control` rather than through `Step`, so a
+/// child can "succeed" with a placeholder while the loop is really unwinding. A
+/// wrapper that then applies its own operation would report a spurious error
+/// (`member access .foo requires a map`) about a value that was never produced,
+/// so every wrapper stops here instead.
+fn eval_operand(
+    expr: &parser::Expr,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Option<Value>, Step> {
+    let value = eval_expr(expr, last, in_function, shell)?;
+    Ok(shell.control.is_none().then_some(value))
+}
+
+/// Evaluate an expression that is an **operand** of the statement around it — a
+/// condition, a `match` subject, a `for` iterable, an assignment's right-hand
+/// side, a guard — rather than the statement's own result.
+///
+/// Such an operand can run statements of its own (`if (if c { false; … })`), and
+/// what those recorded is the operand's bookkeeping, not the statement's. So
+/// `result`/`produced` are put back afterwards and the enclosing executable goes
+/// on to report its own result — an assignment records its status, a compound
+/// records its branch's value, a `return` carries what the *body* produced.
+///
+/// `shell.control` is deliberately *not* restored: a `break` raised inside an
+/// operand is real control flow and still belongs to the loop it names.
+fn eval_operand_of(
+    expr: &parser::Expr,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let saved_result = shell.result.clone();
+    let saved_produced = shell.produced;
+    let value = eval_expr(expr, last, in_function, shell);
+    shell.result = saved_result;
+    shell.produced = saved_produced;
+    value
+}
+
+/// The value an expression yields when control flow is already unwinding — never
+/// consumed, since the statement layer acts on `shell.control` instead.
+fn control_placeholder() -> Value {
+    Value::String(String::new())
+}
+
 fn eval_expr(
     expr: &parser::Expr,
     last: u8,
@@ -1218,6 +1529,14 @@ fn eval_expr(
     shell: &mut Shell,
 ) -> Result<Value, Step> {
     use parser::{BinaryOp as B, Expr as E, ListItem, MapItem, UnaryOp as U};
+    // A `break`/`continue` raised by an earlier sub-expression (`(if c { break }) + 1`)
+    // is pending control flow: the rest of the expression must not run. Yield a
+    // placeholder so no further side effect happens and no operator is applied to
+    // a value that was never really produced; the statement layer acts on
+    // `shell.control`.
+    if shell.control.is_some() {
+        return Ok(control_placeholder());
+    }
     match expr {
         E::Scalar(word) => expand::expand_values(vec![expansion_word(&word.value)], &shell.vars)
             .map_err(|e| {
@@ -1307,13 +1626,21 @@ fn eval_expr(
         E::Unary {
             op: U::Negate,
             expression,
-        } => number(&eval_expr(expression, last, in_function, shell)?)
-            .and_then(|n| n.checked_neg().ok_or_else(|| "numeric overflow".into()))
-            .map(Value::Integer)
-            .map_err(|m| {
-                eprintln!("mesh: {m}");
-                Step::Continue(1)
-            }),
+        } => {
+            let operand = eval_expr(expression, last, in_function, shell)?;
+            // As in `Binary`: an operand that raised control flow produced no value
+            // to negate, so skip the operator rather than report a type error.
+            if shell.control.is_some() {
+                return Ok(control_placeholder());
+            }
+            number(&operand)
+                .and_then(|n| n.checked_neg().ok_or_else(|| "numeric overflow".into()))
+                .map(Value::Integer)
+                .map_err(|m| {
+                    eprintln!("mesh: {m}");
+                    Step::Continue(1)
+                })
+        }
         E::Unary {
             op: U::Spread,
             expression,
@@ -1327,6 +1654,12 @@ fn eval_expr(
                 return Ok(bool_value(true));
             }
             let r = eval_expr(right, last, in_function, shell)?;
+            // An operand that raised `break`/`continue` produced no real value, so
+            // do not apply the operator to the placeholder (which would report a
+            // spurious type error); the pending control flow is what matters.
+            if shell.control.is_some() {
+                return Ok(control_placeholder());
+            }
             eval_binary(l, *op, r).map_err(|m| {
                 eprintln!("mesh: {m}");
                 Step::Continue(1)
@@ -1343,31 +1676,44 @@ fn eval_expr(
                         Step::Continue(1)
                     });
             }
-            match eval_expr(value, last, in_function, shell)? {
+            let Some(value) = eval_operand(value, last, in_function, shell)? else {
+                return Ok(control_placeholder());
+            };
+            match value {
                 Value::Map(entries) => map_lookup(&entries, name),
                 _ => runtime_error(format!("member access .{name} requires a map")),
             }
         }
         E::Index { value, index } => {
-            let value = eval_expr(value, last, in_function, shell)?;
+            let Some(value) = eval_operand(value, last, in_function, shell)? else {
+                return Ok(control_placeholder());
+            };
             if let E::Range {
                 start,
                 end,
                 inclusive,
             } = index.as_ref()
             {
+                // `Ok(None)` here means "no bound written"; a bound whose expression
+                // raised control flow is reported separately through `broke`.
+                let mut broke = false;
                 let mut bound = |expression: &Option<Box<E>>| -> Result<Option<i64>, Step> {
-                    expression
-                        .as_ref()
-                        .map(|expression| {
-                            eval_expr(expression, last, in_function, shell)
-                                .and_then(|value| number(&value).map_err(runtime_message))
-                        })
-                        .transpose()
+                    let Some(expression) = expression.as_ref() else {
+                        return Ok(None);
+                    };
+                    let Some(value) = eval_operand(expression, last, in_function, shell)? else {
+                        broke = true;
+                        return Ok(None);
+                    };
+                    number(&value).map(Some).map_err(runtime_message)
                 };
+                let (low, high) = (bound(start)?, bound(end)?);
+                if broke {
+                    return Ok(control_placeholder());
+                }
                 return match value {
                     Value::List(values) => Ok(Value::List(
-                        expand::slice(&values, bound(start)?, bound(end)?, *inclusive).to_vec(),
+                        expand::slice(&values, low, high, *inclusive).to_vec(),
                     )),
                     Value::String(_)
                     | Value::Integer(_)
@@ -1377,7 +1723,9 @@ fn eval_expr(
                     Value::Map(_) => runtime_error("cannot slice a map value"),
                 };
             }
-            let index_value = eval_expr(index, last, in_function, shell)?;
+            let Some(index_value) = eval_operand(index, last, in_function, shell)? else {
+                return Ok(control_placeholder());
+            };
             match value {
                 Value::List(values) => {
                     let index = number(&index_value).map_err(runtime_message)?;
@@ -1416,7 +1764,9 @@ fn eval_expr(
             name,
             arguments,
         } => {
-            let mut value = eval_expr(value, last, in_function, shell)?;
+            let Some(mut value) = eval_operand(value, last, in_function, shell)? else {
+                return Ok(control_placeholder());
+            };
             if let Value::Regex(regex) = &mut value {
                 if arguments.is_some() {
                     return runtime_error(format!("modifier :{name} does not take arguments"));
@@ -1469,11 +1819,15 @@ fn eval_expr(
             end,
             inclusive,
         } => {
-            let start = range_endpoint(start.as_deref(), 0, last, in_function, shell)?;
+            let Some(start) = range_endpoint(start.as_deref(), 0, last, in_function, shell)? else {
+                return Ok(control_placeholder());
+            };
             let Some(end) = end.as_deref() else {
                 return runtime_error("an open-ended range cannot be used as a value");
             };
-            let end = range_endpoint(Some(end), 0, last, in_function, shell)?;
+            let Some(end) = range_endpoint(Some(end), 0, last, in_function, shell)? else {
+                return Ok(control_placeholder());
+            };
             let stop = if *inclusive {
                 end.checked_add(1)
                     .ok_or_else(|| runtime_message("range endpoint overflow"))?
@@ -1493,12 +1847,17 @@ fn range_endpoint(
     last: u8,
     in_function: bool,
     shell: &mut Shell,
-) -> Result<i64, Step> {
+) -> Result<Option<i64>, Step> {
     let Some(expression) = expression else {
-        return Ok(default);
+        return Ok(Some(default));
     };
-    match eval_expr(expression, last, in_function, shell)? {
-        Value::Integer(value) => Ok(value),
+    // `None` means the endpoint raised `break`/`continue`; the caller stops rather
+    // than type-checking a value that was never produced.
+    let Some(value) = eval_operand(expression, last, in_function, shell)? else {
+        return Ok(None);
+    };
+    match value {
+        Value::Integer(value) => Ok(Some(value)),
         _ => runtime_error("range endpoints must be integers"),
     }
 }
@@ -1513,10 +1872,15 @@ fn eval_call(
     let parser::Expr::Scalar(word) = callee else {
         return runtime_error("call target is not callable");
     };
-    if word.value.text() != "re" {
+    let name = word.value.text();
+    if name != "re" {
+        // A user function called for its value; an external (or unknown) command
+        // has no return value — point at `$(…)` for its output instead.
+        if shell.funcs.get(&name).is_some() {
+            return call_func_for_value(&name, arguments, last, in_function, shell);
+        }
         return runtime_error(format!(
-            "call `{}` is not implemented yet",
-            word.value.text()
+            "{name}: a command has no return value; use `$({name} …)` to capture its output"
         ));
     }
     let mut pattern = None;
@@ -1673,7 +2037,10 @@ fn eval_if_expr(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    let code = condition_status(&node.condition, last, in_function, shell)?;
+    let Some(code) = condition_status(&node.condition, last, in_function, shell)? else {
+        // As in `run_ast_if`: no truth value, so no branch runs.
+        return Ok(control_placeholder());
+    };
     if code == 0 {
         eval_value_body(&node.then_body, 0, in_function, shell)
     } else {
@@ -1691,18 +2058,33 @@ fn eval_match_expr(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    let subject = eval_expr(&node.value, last, in_function, shell)?;
+    let subject = eval_operand_of(&node.value, last, in_function, shell)?;
+    if shell.control.is_some() {
+        // As in `run_ast_match`: no subject, so no arm.
+        return Ok(control_placeholder());
+    }
     for arm in &node.arms {
-        let bindings = match_bindings(&arm.pattern, &subject, last, in_function, shell)?;
-        let Some(bindings) = bindings else { continue };
+        let matched = match_bindings(&arm.pattern, &subject, last, in_function, shell)?;
+        // As in `run_ast_match`: a pattern that raised control stops the match.
+        if shell.control.is_some() {
+            return Ok(control_placeholder());
+        }
+        let Some(bindings) = matched else { continue };
         let snapshot = shell.vars.active_snapshot();
         validate_bindings(&bindings).map_err(runtime_message)?;
         commit_bindings(bindings, &mut shell.vars);
-        if let Some(guard) = &arm.guard
-            && !truthy(&eval_expr(guard, last, in_function, shell)?)
-        {
-            shell.vars.restore_active(snapshot);
-            continue;
+        if let Some(guard) = &arm.guard {
+            let passed = truthy(&eval_operand_of(guard, last, in_function, shell)?);
+            // As in `run_ast_match`: a guard that raised `break`/`continue`
+            // produced no truth value, so no later arm may be tried.
+            if shell.control.is_some() {
+                shell.vars.restore_active(snapshot);
+                return Ok(control_placeholder());
+            }
+            if !passed {
+                shell.vars.restore_active(snapshot);
+                continue;
+            }
         }
         return eval_value_body(&arm.body, 0, in_function, shell);
     }
@@ -1809,7 +2191,12 @@ fn eval_for_expr(
     shell: &mut Shell,
 ) -> Result<Value, Step> {
     validate_patterns(bindings).map_err(runtime_message)?;
-    let iterable = eval_expr(iterable, last, in_function, shell)?;
+    let iterable = eval_operand_of(iterable, last, in_function, shell)?;
+    if shell.control.is_some() {
+        // As in `run_ast_for`: the flag belongs to the enclosing loop, and there
+        // is nothing to iterate.
+        return Ok(control_placeholder());
+    }
     let values = iteration_values(iterable, bindings.len()).map_err(runtime_message)?;
     let mut results = Vec::new();
     shell.loop_depth += 1;
@@ -1842,14 +2229,27 @@ fn eval_body(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
+    // Whether *this* body produced anything. An empty body — or one whose every
+    // statement was skipped — yields the empty string rather than inheriting
+    // whatever the surrounding code last recorded.
+    let mut recorded = false;
     for (index, statement) in body.statements.iter().enumerate() {
         let final_statement = index + 1 == body.statements.len();
         if final_statement && !statement.background && statement.and_or.rest.is_empty() {
             match &statement.and_or.first {
-                parser::Executable::Expression {
-                    expression,
-                    guard: None,
-                } => return eval_expr(expression, last, in_function, shell),
+                parser::Executable::Expression { expression, guard } => {
+                    // A guarded final expression still yields the body's value —
+                    // when its guard passes. A guard that fails leaves it unrun,
+                    // which produces nothing rather than producing emptiness, so
+                    // an earlier statement's result still stands: the same answer
+                    // a bare `return` in its place would carry.
+                    return match guard_allows(guard.as_ref(), last, in_function, shell) {
+                        Ok(true) => eval_expr(expression, last, in_function, shell),
+                        Ok(false) if recorded => Ok(shell.result.clone()),
+                        Ok(false) => Ok(Value::String(String::new())),
+                        Err(step) => Err(step),
+                    };
+                }
                 parser::Executable::If(node) => {
                     return eval_if_expr(node, last, in_function, shell);
                 }
@@ -1870,11 +2270,19 @@ fn eval_body(
             Step::Continue(code) => last = code,
             flow => return Err(flow),
         }
+        recorded |= shell.produced != Produced::Nothing;
         if shell.control.is_some() {
             return Ok(Value::String(String::new()));
         }
     }
-    Ok(Value::String(String::new()))
+    // The last statement was not a tail expression — an `&&`/`||` list, a
+    // command, a background job. Its recorded result is still the body's, the
+    // same one a bare `return` would have carried out.
+    if recorded {
+        Ok(shell.result.clone())
+    } else {
+        Ok(Value::String(String::new()))
+    }
 }
 
 fn truthy(value: &Value) -> bool {
@@ -2283,7 +2691,7 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
     // `return` ends the enclosing function (a recoverable error at top
     // level; `run_line` decides which by `in_function`).
     if words[0] == "return" {
-        return make_return(&words[1..], last);
+        return make_return(&words[1..], shell);
     }
     if builtins::is_builtin(&words[0]) && auto_help_requested_strings(&words[1..]) {
         return Step::Continue(builtins::print_help(&words[0]));
@@ -2437,9 +2845,10 @@ fn command_name(tokens: &[Word], vars: &Vars) -> Option<String> {
 /// integer `7`, `true`/`false` → booleans, else a string) and carried as the
 /// result, its status a view of that value. A surplus operand is reported and
 /// does not unwind (the function keeps running).
-fn make_return(args: &[String], last: u8) -> Step {
+fn make_return(args: &[String], shell: &Shell) -> Step {
     match args {
-        [] => Step::Return(Value::Integer(i64::from(last))),
+        // Bare: the result so far (`DESIGN.md` §"Result and `return`").
+        [] => Step::Return(shell.result.clone()),
         [value] => Step::Return(expand::typed_scalar(value)),
         _ => {
             eprintln!("mesh: return: too many arguments");
@@ -2467,6 +2876,13 @@ fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &
     // is reported as outside a loop rather than being attributed to the caller's
     // loop. Restored on every exit path below.
     let caller_loop_depth = std::mem::replace(&mut shell.loop_depth, 0);
+    // The callee starts with no result of its own, so a bare `return` before
+    // anything ran carries the empty string rather than the caller's value. The
+    // mark travels with it: a callee that ended in a value must not leave the
+    // caller thinking *this call* produced one, or the call's status goes
+    // unrecorded.
+    let caller_result = std::mem::replace(&mut shell.result, Value::String(String::new()));
+    let caller_produced = std::mem::replace(&mut shell.produced, Produced::Status);
     shell.vars.push_scope();
     let bound = bind_arguments(name, &params, args, flags_enabled, shell);
     // A default that ran `break`/`continue` (already reported as outside a loop)
@@ -2481,6 +2897,8 @@ fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &
     if let Err(step) = bound {
         shell.vars.pop_scope();
         shell.loop_depth = caller_loop_depth;
+        shell.result = caller_result;
+        shell.produced = caller_produced;
         // A default's `return N` ends the call with that status, like the body's;
         // an `exit`/runtime step unwinds unchanged.
         return match step {
@@ -2488,8 +2906,15 @@ fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &
             other => other,
         };
     }
+    // Binding may have evaluated a default whose body produced a result; that
+    // belongs to the setup, not to this call. The body starts from nothing, so a
+    // bare `return` before it produces anything still carries the empty string.
+    shell.result = Value::String(String::new());
+    shell.produced = Produced::Status;
     let executed = run_source(&body, 0, true, shell);
     shell.loop_depth = caller_loop_depth;
+    shell.result = caller_result;
+    shell.produced = caller_produced;
     if matches!(
         shell.control,
         Some(parser::ControlKind::Break | parser::ControlKind::Continue)
@@ -2502,6 +2927,111 @@ fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &
     };
     shell.vars.pop_scope();
     result
+}
+
+/// Call a user function for its **value** (`x = f(arg, key: value)`): evaluate the
+/// value-mode arguments in the caller's scope, bind them in a fresh callee scope,
+/// run the body, and return its result — the last expression's value, or the
+/// value carried by an explicit `return`. Stdout still streams: the value and
+/// byte channels are independent (`DESIGN.md` §"Calling for a value"). Loop state
+/// is isolated exactly as in [`call_func`].
+fn call_func_for_value(
+    name: &str,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let Some((params, body)) = shell
+        .funcs
+        .get(name)
+        .map(|def| (def.params.clone(), def.body.clone()))
+    else {
+        unreachable!("call_func_for_value is only reached for a declared function");
+    };
+
+    // Copied, not taken: an argument body records results of its own
+    // (`f(if c { a; b })`), and those belong to neither the caller nor the callee,
+    // so the copy is put back on every path below. The caller's own result stays
+    // in place while the arguments run, because the arguments are still the
+    // caller's code — a bare `return` one of them raises (`f(if c { return })`)
+    // carries the caller's result so far, exactly as it would outside the call.
+    let caller_result = shell.result.clone();
+    let caller_produced = shell.produced;
+
+    // Arguments are evaluated in the caller's scope, before *any* callee state is
+    // touched, so `f($x)` reads the caller's `$x` — and so caller-owned control
+    // flow raised by an argument (`f(if c { return e })`) propagates out unchanged
+    // rather than entering the callee cleanup below, which would normalize a
+    // `return` into this call's value. Loop state stays the caller's until the
+    // call itself begins, so an argument's `break` belongs to the caller's loop.
+    let scanned = evaluate_value_arguments(name, &params, arguments, last, in_function, shell);
+    // A `break`/`continue` an argument raised belongs to the caller's loop, so it
+    // is checked before the argument outcome — an out-of-loop one arrives as an
+    // error *and* leaves the flag set, and both need answering together.
+    if shell.control.is_some() {
+        shell.result = caller_result;
+        shell.produced = caller_produced;
+        // With a loop to leave, hand the flag back and skip the call. Without
+        // one, the `break` was already reported as an error: clear the flag and
+        // fail the statement, or the rest of the script would never run.
+        if shell.loop_depth == 0 {
+            shell.control = None;
+            return Err(Step::Continue(1));
+        }
+        return Ok(Value::String(String::new()));
+    }
+    let (positionals, switches_on, flag_values) = match scanned {
+        Ok(scanned) => scanned,
+        Err(step) => {
+            shell.result = caller_result;
+            shell.produced = caller_produced;
+            return Err(step);
+        }
+    };
+
+    let caller_loop_depth = std::mem::replace(&mut shell.loop_depth, 0);
+    // Callee territory starts here, so the arguments' transient results are
+    // dropped: a default's own bare `return` carries the callee's result so far,
+    // not the caller's and not an argument's, as in `call_func`.
+    shell.result = Value::String(String::new());
+    shell.produced = Produced::Status;
+    shell.vars.push_scope();
+    let outcome = match bind_scanned(name, &params, positionals, switches_on, flag_values, shell) {
+        Ok(()) => {
+            // A default body may itself have produced a result; that belongs to
+            // the setup, so the body starts from nothing too.
+            shell.result = Value::String(String::new());
+            shell.produced = Produced::Status;
+            eval_body(&body, 0, true, shell)
+        }
+        Err(step) => Err(step),
+    };
+    // A `break`/`continue` the callee left set escaped its own loops — already
+    // reported as "not inside a loop". It must not leak back to the caller, and
+    // like any runtime error it fails the call instead of yielding a value, so
+    // `x = f() && …` short-circuits exactly as the command-mode call does.
+    let escaped = matches!(
+        shell.control,
+        Some(parser::ControlKind::Break | parser::ControlKind::Continue)
+    );
+    if escaped {
+        shell.control = None;
+    }
+    shell.vars.pop_scope();
+    shell.loop_depth = caller_loop_depth;
+    shell.result = caller_result;
+    shell.produced = caller_produced;
+    match outcome {
+        // `exit` unwinds regardless: it leaves the shell, not just this call.
+        Err(step @ Step::Exit(_)) => Err(step),
+        // The diagnostic is already on stderr, so fail quietly with its status.
+        _ if escaped => Err(Step::Continue(1)),
+        Ok(value) => Ok(value),
+        // An explicit `return val` yields its value; a runtime step unwinds.
+        Err(Step::Return(value)) => Ok(value),
+        Err(other) => Err(other),
+    }
 }
 
 /// Match `args` against `params` and bind each parameter in the current (already
@@ -2521,20 +3051,6 @@ fn bind_arguments(
     flags_enabled: bool,
     shell: &mut Shell,
 ) -> Result<(), Step> {
-    use parser::ParamKind;
-
-    // Positionals in declaration order (`None` default = required); the lone rest.
-    let mut positionals: Vec<(&str, Option<&parser::Expr>)> = Vec::new();
-    let mut rest_name: Option<&str> = None;
-    for param in params {
-        match &param.kind {
-            ParamKind::Required => positionals.push((param.name.as_str(), None)),
-            ParamKind::Optional(default) => positionals.push((param.name.as_str(), Some(default))),
-            ParamKind::Rest => rest_name = Some(param.name.as_str()),
-            ParamKind::Switch | ParamKind::Flag(_) => {}
-        }
-    }
-
     // Scan the call-site arguments, separating positionals from flags. Only a
     // `Value::String` beginning with `--` is a flag candidate; everything else
     // (and everything after a bare `--`) is a positional. With `flags_enabled`
@@ -2555,69 +3071,63 @@ fn bind_arguments(
             if let Some(body) = text.strip_prefix("--")
                 && !body.is_empty()
             {
-                let (flag, inline) = match body.split_once('=') {
-                    Some((flag, value)) => (flag, Some(value.to_owned())),
-                    None => (body, None),
-                };
-                let declared = params.iter().find(|param| {
-                    param.name == flag
-                        && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
-                });
-                let Some(declared) = declared else {
-                    eprintln!("mesh: {name}: unknown flag `--{flag}`");
-                    return Err(Step::Continue(2));
-                };
-                match &declared.kind {
-                    ParamKind::Switch => {
-                        if inline.is_some() {
-                            eprintln!(
-                                "mesh: {name}: flag `--{flag}` is a switch and takes no value"
-                            );
-                            return Err(Step::Continue(2));
-                        }
-                        switches_on.insert(declared.name.as_str());
-                    }
-                    ParamKind::Flag(_) => {
-                        let Some(value) = inline else {
-                            eprintln!(
-                                "mesh: {name}: flag `--{flag}` requires a value (write `--{flag}=VALUE`)"
-                            );
-                            return Err(Step::Continue(2));
-                        };
-                        // Last occurrence wins for a valued flag. A bare literal
-                        // value is typed like the same token passed positionally,
-                        // so `--n=2` binds the integer `2`; a quoted or
-                        // interpolated value (`--n="2"`, `--n=$s`) keeps its
-                        // expanded string type.
-                        let value = if bare {
-                            expand::typed_scalar(&value)
-                        } else {
-                            Value::String(value)
-                        };
-                        flag_values.insert(declared.name.as_str(), value);
-                    }
-                    _ => unreachable!("only flags are collected here"),
-                }
+                bind_dashed_option(name, params, body, bare, &mut switches_on, &mut flag_values)?;
                 continue;
             }
         }
         positional_values.push(arg);
     }
 
+    bind_scanned(
+        name,
+        params,
+        positional_values,
+        switches_on,
+        flag_values,
+        shell,
+    )
+}
+
+/// Bind a function's parameters from already-separated call arguments — the
+/// leftover **positionals** (left to right, with the surplus collected by a
+/// `...rest`), the **switches** turned on, and the **valued flags** — applying
+/// the arity rules and evaluating any omitted parameter's default in declaration
+/// order. Shared by the command-mode [`bind_arguments`] (which parses `--flag`
+/// tokens) and the value-mode `bind_value_arguments` (which reads `key: value`
+/// options), so both modes bind identically once arguments are separated.
+fn bind_scanned<'p>(
+    name: &str,
+    params: &'p [parser::Param],
+    positional_values: Vec<Value>,
+    switches_on: std::collections::HashSet<&'p str>,
+    mut flag_values: std::collections::HashMap<&'p str, Value>,
+    shell: &mut Shell,
+) -> Result<(), Step> {
+    use parser::ParamKind;
+
     // Arity: every required positional must be filled; without a rest, surplus
     // positionals are an error.
-    let required = positionals.iter().filter(|(_, d)| d.is_none()).count();
-    let maximum = positionals.len();
+    let required = params
+        .iter()
+        .filter(|param| matches!(param.kind, ParamKind::Required))
+        .count();
+    let maximum = params
+        .iter()
+        .filter(|param| matches!(param.kind, ParamKind::Required | ParamKind::Optional(_)))
+        .count();
+    let has_rest = params
+        .iter()
+        .any(|param| matches!(param.kind, ParamKind::Rest));
     let supplied = positional_values.len();
     if supplied < required {
-        if rest_name.is_some() || maximum > required {
+        if has_rest || maximum > required {
             eprintln!("mesh: {name}: expected at least {required} argument(s), got {supplied}");
         } else {
             eprintln!("mesh: {name}: expected {required} argument(s), got {supplied}");
         }
         return Err(Step::Continue(2));
     }
-    if rest_name.is_none() && supplied > maximum {
+    if !has_rest && supplied > maximum {
         if maximum > required {
             eprintln!("mesh: {name}: expected at most {maximum} argument(s), got {supplied}");
         } else {
@@ -2660,6 +3170,272 @@ fn bind_arguments(
                 };
                 shell.vars.set_value(&param.name, value);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate a **value-mode** call's arguments (`f(arg, key: value, ...$spread)`)
+/// in the **caller's** scope into the separated form [`bind_scanned`] expects:
+/// leftover positionals, switches turned on, and valued flags. A `key: value`
+/// option binds the switch/flag of that name (`force: true` ≡ `--force`,
+/// `tag: v2` ≡ `--tag=v2`); a spread contributes a list's elements as positionals
+/// or a map's entries as options. Positionals are positional-only, so a `key:` on
+/// a positional parameter — or an unknown name — is an error.
+#[allow(clippy::type_complexity)]
+fn evaluate_value_arguments<'p>(
+    name: &str,
+    params: &'p [parser::Param],
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<
+    (
+        Vec<Value>,
+        std::collections::HashSet<&'p str>,
+        std::collections::HashMap<&'p str, Value>,
+    ),
+    Step,
+> {
+    let mut positionals: Vec<Value> = Vec::new();
+    let mut switches_on: std::collections::HashSet<&'p str> = std::collections::HashSet::new();
+    let mut flag_values: std::collections::HashMap<&'p str, Value> =
+        std::collections::HashMap::new();
+    let mut flags_ended = false;
+    for argument in arguments {
+        // Every argument form begins by evaluating one expression in the caller's
+        // scope, so evaluate here and check for caller-owned loop control once.
+        let expression = match argument {
+            parser::Argument::Positional(expression)
+            | parser::Argument::Named(_, expression)
+            | parser::Argument::Spread(expression) => expression,
+        };
+        let bare = is_bare_literal_word(expression);
+        let value = eval_expr(expression, last, in_function, shell)?;
+        // A `break`/`continue` the argument raised belongs to the caller's loop.
+        // Stop at once — before binding this argument or evaluating any later one —
+        // so `f(if c { break }, 1 / 0)` reports no division error and a switch whose
+        // expression broke is never type-checked. The caller sees `shell.control`
+        // set and skips the call.
+        if shell.control.is_some() {
+            return Ok((positionals, switches_on, flag_values));
+        }
+        match argument {
+            parser::Argument::Positional(_) => scan_call_value(
+                name,
+                params,
+                value,
+                bare,
+                &mut flags_ended,
+                &mut positionals,
+                &mut switches_on,
+                &mut flag_values,
+            )?,
+            parser::Argument::Named(key, _) => {
+                reject_option_after_terminator(name, key, flags_ended)?;
+                bind_named_option(name, params, key, value, &mut switches_on, &mut flag_values)?;
+            }
+            parser::Argument::Spread(_) => match value {
+                // A spread explodes into call arguments, so each element goes
+                // through the same scan: a `--` element terminates option parsing
+                // and a `--flag` element binds its option, exactly as in command
+                // mode. Elements are values, not literal tokens, so none is `bare`.
+                Value::List(items) => {
+                    for item in items {
+                        scan_call_value(
+                            name,
+                            params,
+                            item,
+                            false,
+                            &mut flags_ended,
+                            &mut positionals,
+                            &mut switches_on,
+                            &mut flag_values,
+                        )?;
+                    }
+                }
+                Value::Map(entries) => {
+                    for (key, value) in entries {
+                        reject_option_after_terminator(name, &key, flags_ended)?;
+                        bind_named_option(
+                            name,
+                            params,
+                            &key,
+                            value,
+                            &mut switches_on,
+                            &mut flag_values,
+                        )?;
+                    }
+                }
+                _ => {
+                    return runtime_error(format!(
+                        "{name}: a spread argument must be a list (of positionals) or a map (of options)"
+                    ));
+                }
+            },
+        }
+    }
+    Ok((positionals, switches_on, flag_values))
+}
+
+/// A bare `--` ends option parsing, so no option may follow it — and a `key:
+/// value` pair (or a spread map entry) has no positional meaning to fall back to,
+/// unlike a dashed word. Report it rather than silently binding the option the
+/// terminator just said would not be one.
+fn reject_option_after_terminator(name: &str, key: &str, flags_ended: bool) -> Result<(), Step> {
+    if flags_ended {
+        eprintln!("mesh: {name}: option `{key}:` cannot follow `--`");
+        return Err(Step::Continue(2));
+    }
+    Ok(())
+}
+
+/// Route one value-mode call argument to the right place: a bare `--` ends option
+/// parsing (everything after it is positional, even if it looks like a flag), a
+/// `--name`/`--name=value` string binds that option, and anything else is a
+/// positional. Shared by direct positional arguments and spread elements so both
+/// follow the command-mode rules (`DESIGN.md` §"Functions").
+#[allow(clippy::too_many_arguments)]
+fn scan_call_value<'p>(
+    name: &str,
+    params: &'p [parser::Param],
+    value: Value,
+    bare: bool,
+    flags_ended: &mut bool,
+    positionals: &mut Vec<Value>,
+    switches_on: &mut std::collections::HashSet<&'p str>,
+    flag_values: &mut std::collections::HashMap<&'p str, Value>,
+) -> Result<(), Step> {
+    if !*flags_ended && let Value::String(text) = &value {
+        if text == "--" {
+            *flags_ended = true;
+            return Ok(());
+        }
+        if let Some(body) = text.strip_prefix("--")
+            && !body.is_empty()
+        {
+            return bind_dashed_option(name, params, body, bare, switches_on, flag_values);
+        }
+    }
+    positionals.push(value);
+    Ok(())
+}
+
+/// Is `expression` a single unquoted literal word? Such an argument types like the
+/// same token written in command position, so a dashed `--n=2` written inside a
+/// value call binds the integer `2` while `--n="2"` keeps its string type.
+fn is_bare_literal_word(expression: &parser::Expr) -> bool {
+    let parser::Expr::Scalar(word) = expression else {
+        return false;
+    };
+    word.value.pieces.iter().all(|piece| {
+        matches!(
+            piece,
+            parser::WordPiece::Text {
+                quote: parser::QuoteMode::Bare,
+                ..
+            }
+        )
+    })
+}
+
+/// Bind one **dashed** option token — `body` is the text after the leading `--`,
+/// so `force` or `tag=v2` — to the switch or valued flag it names. `bare` marks a
+/// value that came from an unquoted literal word, so `--n=2` types as the integer
+/// `2` while `--n="2"` stays a string. Shared by command mode and value mode: the
+/// two spellings are interchangeable (`DESIGN.md` §"Calling for a value"), so
+/// `f(prod, --force)` binds the same switch as `f(prod, force: true)`.
+fn bind_dashed_option<'p>(
+    name: &str,
+    params: &'p [parser::Param],
+    body: &str,
+    bare: bool,
+    switches_on: &mut std::collections::HashSet<&'p str>,
+    flag_values: &mut std::collections::HashMap<&'p str, Value>,
+) -> Result<(), Step> {
+    use parser::ParamKind;
+    let (flag, inline) = match body.split_once('=') {
+        Some((flag, value)) => (flag, Some(value.to_owned())),
+        None => (body, None),
+    };
+    let declared = params.iter().find(|param| {
+        param.name == flag && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
+    });
+    let Some(declared) = declared else {
+        eprintln!("mesh: {name}: unknown flag `--{flag}`");
+        return Err(Step::Continue(2));
+    };
+    match &declared.kind {
+        ParamKind::Switch => {
+            if inline.is_some() {
+                eprintln!("mesh: {name}: flag `--{flag}` is a switch and takes no value");
+                return Err(Step::Continue(2));
+            }
+            switches_on.insert(declared.name.as_str());
+        }
+        ParamKind::Flag(_) => {
+            let Some(value) = inline else {
+                eprintln!(
+                    "mesh: {name}: flag `--{flag}` requires a value (write `--{flag}=VALUE`)"
+                );
+                return Err(Step::Continue(2));
+            };
+            // Last occurrence wins for a valued flag. A bare literal value is typed
+            // like the same token passed positionally, so `--n=2` binds the integer
+            // `2`; a quoted or interpolated value (`--n="2"`, `--n=$s`) keeps its
+            // expanded string type.
+            let value = if bare {
+                expand::typed_scalar(&value)
+            } else {
+                Value::String(value)
+            };
+            flag_values.insert(declared.name.as_str(), value);
+        }
+        _ => unreachable!("only flags are collected here"),
+    }
+    Ok(())
+}
+
+/// Bind one value-mode `key: value` option to the switch or flag named `key`.
+/// `force: true`/`false` sets a switch on/off; `tag: v` sets a valued flag (last
+/// wins). A positional parameter is passed by position only, and an unknown name
+/// is an error.
+fn bind_named_option<'p>(
+    name: &str,
+    params: &'p [parser::Param],
+    key: &str,
+    value: Value,
+    switches_on: &mut std::collections::HashSet<&'p str>,
+    flag_values: &mut std::collections::HashMap<&'p str, Value>,
+) -> Result<(), Step> {
+    use parser::ParamKind;
+    let Some(param) = params.iter().find(|param| param.name == key) else {
+        eprintln!("mesh: {name}: unknown option `{key}:`");
+        return Err(Step::Continue(2));
+    };
+    match &param.kind {
+        ParamKind::Switch => {
+            let Value::Boolean(on) = value else {
+                eprintln!(
+                    "mesh: {name}: switch `{key}:` takes a boolean (`{key}: true` or `{key}: false`)"
+                );
+                return Err(Step::Continue(2));
+            };
+            if on {
+                switches_on.insert(param.name.as_str());
+            } else {
+                switches_on.remove(param.name.as_str());
+            }
+        }
+        ParamKind::Flag(_) => {
+            flag_values.insert(param.name.as_str(), value);
+        }
+        ParamKind::Required | ParamKind::Optional(_) | ParamKind::Rest => {
+            eprintln!(
+                "mesh: {name}: `{key}` is a positional parameter, passed by position not `{key}:`"
+            );
+            return Err(Step::Continue(2));
         }
     }
     Ok(())
