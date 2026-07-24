@@ -1941,13 +1941,47 @@ narrowed the question to four choices; current leanings noted, but all four are 
    grammar. *Lean: narrow*, revisiting only **alternation** on the RHS (`$f ~ *.a|*.b`)
    as the extension that pays for itself. Full type-dispatch parity (Ruby's `===`) is
    rejected — it re-creates the smartmatch trap.
-4. **Arm-body value model** — keep today's tail-coercion (rules above), or move to
-   **block + tail-expression, no coercion** (a bare word is always a command, capture is
-   always explicit `$(…)`), or a Rust-style **`=> expr`** arm. *Lean: block +
-   tail-expression* — it matches what `if` already claims ("a block evaluates to its last
-   expression"), deletes the bare-word/exit-0 sharp edges, and is a language-wide
-   tightening (applies to `if` too), not a `match`-only change. `=>` reads well but forks
-   `match` from mesh's `{ }`-block control flow.
+4. **Arm-body value model** *(no clear lean — the two live contenders trade off)*. How does
+   a `{ }` arm/block produce a value? Four alternatives: **(a)** today's **tail-coercion**
+   (shipped — bare word→scalar, exit-0 capture — the sharp-edge source); **(b) block +
+   tail-expression, no coercion** — the value is an explicit value tail, a bare word always
+   *runs*, capture is always explicit `$(…)`; matches what `if` already claims ("a block
+   evaluates to its last expression"), but a bare-word *value* still needs quoting and
+   `"$a""$b"` stays ambiguous value-vs-command at a tail; **(c) an explicit value keyword**
+   — `yield`/`return <value>` produces the value, so `{ }` blocks are pure command-context
+   and the `"$a""$b"` ambiguity vanishes (sub-choice: **`yield` local + `return` function**,
+   so a `match` arm yields without leaving the function, vs **`return` alone**, which leaves
+   arm-yield needing a separate mechanism); **(d)** a Rust-style **`=> expr`** arm (forks
+   `match` from mesh's `{ }` blocks). **(b)** and **(c)** are the live pair — (b) is terser
+   but keeps the bare-word classification problem, (c) is explicit but adds a keyword.
+   Both drop the **single-bare-word block-tail** coercion (a bare word runs); only **(c)**
+   additionally **reopens** the implicit last-expression rule, since it requires a keyword
+   in its place — (b) *keeps* the tail expression as the value. Neither touches the general
+   assignment-RHS rule (`x = greet` stays the string `"greet"`, per PARSER.md).
+   Language-wide: applies to every value-producing block — `if`, `match`, `for`
+   (`ys = for x in $xs { … }`), and `func` bodies alike.
+
+**Explored, kept the settled model — `0` = success is correct** *(not a change)*. The
+exploration questioned `int → status` — a bare int read as an exit code rather than data,
+its truthiness following the status view, not the number. Resolution: **keep it.**
+External commands exit `0` for success with no typed value to consult, so for `if X { }`
+to mean "did X succeed" whether `X` is `grep -q …` or a mesh function, a function's
+`0`/success must be truthy too — that interchangeability is the point, and it just works.
+The residual (an int whose masked status is nonzero can't be returned as successful data)
+is narrow and accepted. Two live scraps this left, both pointed at their canonical homes:
+
+- **Empty `""` / `[]` truthiness** — part of the open **condition-truthiness**
+  question (whose leaning treats empties as **true**; see that entry for the full rule).
+  Note `gets()` pins `""` **truthy** — a
+  blank line must not end a read loop — which pulls `[]` toward truthy too, for
+  consistency; making `[]` **falsy** would split it from the pinned-truthy `""`. (Where a
+  value's truthiness is even consulted — the assignment-condition RHS, `if xs = f() { … }`,
+  not a bare `if $xs`, since ordinary `if`/`while` take a bool or command — is the
+  canonical entry's to specify.)
+- **An explicit coded-failure spelling** *(deferred)* — any such value must stay a
+  **channel-1** failure (a testable value) and so **cannot** reuse the name "error"
+  (channel-2: fail-loud, no value, aborts); defining it touches the two-channel
+  [error model](#error-handling). Not pursued here.
 
 ### Tests and comparisons
 
@@ -3268,10 +3302,16 @@ to avoid" rather than promising the latter as done.
   error → `$(…)`). Lambdas are `func(params) { … }` (anonymous, one param
   grammar), passed to `:map` / `:filter` / `:each`.
 - **Remaining function questions** — whether a **`func` defined inside a `func`**
-  is visible only there; and a **TODO — dynamic scope**: the "extract a chunk
+  is visible only there; a **TODO — dynamic scope**: the "extract a chunk
   into a subfunction" goal that fixed cwd as *persist* would be served further by
   letting an extracted helper see the caller's locals — weigh dynamic (or opt-in
-  dynamic) scope against the lexical default.
+  dynamic) scope against the lexical default; and an **open value-production
+  question** *(from the match-syntax exploration — see [Matching](#matching-match))*:
+  whether functions/blocks should require an **explicit value keyword** (`yield` /
+  `return`) instead of the settled implicit **last-expression** rule, which would also
+  make `{ … }` blocks pure command-context (dropping the **single-bare-word block-tail**
+  coercion — *not* the general assignment-RHS rule, which stays). Language-wide — it
+  touches every value-producing block: `if`, `match`, `for`, and `func` alike.
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
