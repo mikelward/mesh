@@ -5,7 +5,7 @@ members = ["crates/mesh", "crates/mesh-core", "crates/mesh-platform"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 repository = "https://github.com/mikelward/mesh"
 license = "MIT OR Apache-2.0"
 

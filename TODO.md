@@ -160,6 +160,26 @@ file as tasks land.
 - [ ] Load curated completion specs, then add man-page-derived specs.
 - [ ] Expose static and dynamic completion overrides through `$sh.complete`.
 
+## Loose ends
+
+Small items rescued from pull requests that were closed as superseded — the bulk
+of each PR had landed by another route, but these pieces had not.
+
+- [ ] **FreeBSD compile-check in CI.** `mesh-platform` normalizes the `TIOCSCTTY`
+      ioctl request type for the BSD ABI, but nothing verifies it still compiles
+      there; only Linux and macOS are checked. A `cargo check --target
+      x86_64-unknown-freebsd` job would keep the shim honest.
+- [ ] **Carry `fork` isolation into the build track.** `DESIGN.md` specifies
+      `fork { … }` and `fork func name(params) { … }` as the explicit isolation
+      forms, but the keyword is absent from `GRAMMAR.md` and `docs/`, is not
+      listed among the deferred syntax there, and does not parse — `fork { pwd }`
+      is a syntax error today.
+- [ ] **Document bold input in `DESIGN.md`.** Interactive input renders bold
+      (`repl.rs`, `input_highlighter`), but the *design* — uniform weight rather
+      than token-aware color, live as you type, surviving Enter into scrollback,
+      and whether it gets a `$sh.options.bold-input` off switch — is written down
+      nowhere.
+
 ## Decisions made
 
 - **Merge method:** rebase. **Toolchain:** floating `stable`. **Loop autonomy:**

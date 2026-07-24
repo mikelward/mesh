@@ -41,3 +41,29 @@ jobs:
           CC_x86_64_apple_darwin: zig cc -target x86_64-macos
           CRATE_CC_NO_DEFAULTS: "1"
         run: cargo check --workspace --all-targets --target x86_64-apple-darwin
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build against the floor declared in Cargo.toml rather than trusting the
+      # number by hand — the previously declared 1.85 had silently stopped
+      # compiling once a dependency required newer Rust.
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          version="$(grep '^rust-version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          # A two-component MSRV (1.95) selects rustup's moving 1.95.x channel,
+          # which would keep passing on 1.95.1 even if the floor release itself
+          # stopped compiling. Append .0 to pin the exact floor.
+          case "$version" in *.*.*) ;; *) version="$version.0" ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install MSRV toolchain
+        run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+
+      # `+toolchain` overrides rust-toolchain.toml, which floats on stable.
+      - name: Check
+        run: cargo +${{ steps.msrv.outputs.version }} check --workspace --locked
