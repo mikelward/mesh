@@ -1954,10 +1954,11 @@ narrowed the question to four choices; current leanings noted, but all four are 
    arm-yield needing a separate mechanism); **(d)** a Rust-style **`=> expr`** arm (forks
    `match` from mesh's `{ }` blocks). **(b)** and **(c)** are the live pair — (b) is terser
    but keeps the bare-word classification problem, (c) is explicit but adds a keyword.
-   Whichever wins **reopens** the settled implicit last-expression rule and the
-   **single-bare-word block-tail** coercion — *not* the general assignment-RHS rule
-   (`x = greet` stays the string `"greet"`, per PARSER.md). Language-wide: applies to `if`
-   and `func` too.
+   Both drop the **single-bare-word block-tail** coercion (a bare word runs); only **(c)**
+   additionally **reopens** the implicit last-expression rule, since it requires a keyword
+   in its place — (b) *keeps* the tail expression as the value. Neither touches the general
+   assignment-RHS rule (`x = greet` stays the string `"greet"`, per PARSER.md).
+   Language-wide: applies to `if` and `func` too.
 
 **Explored, kept the settled model — `0` = success is correct** *(not a change)*. The
 exploration questioned `int → status` — a bare int read as an exit code rather than data,
@@ -1969,8 +1970,8 @@ The residual (an int whose masked status is nonzero can't be returned as success
 is narrow and accepted. Two live scraps this left, both pointed at their canonical homes:
 
 - **Empty `""` / `[]` truthiness** — part of the open **condition-truthiness**
-  question (leaning: only `false`, a failed command, and a nonzero status are false;
-  everything else, empties included, is true). Note `gets()` pins `""` **truthy** — a
+  question (whose leaning treats empties as **true**; see that entry for the full rule).
+  Note `gets()` pins `""` **truthy** — a
   blank line must not end a read loop — which pulls `[]` toward truthy too, for
   consistency. The tradeoff: with empties **truthy** (the leaning), `if $xs` is always
   true, so emptiness needs an explicit test (`$xs:len == 0`); making `[]` **falsy** would
@@ -3306,8 +3307,9 @@ to avoid" rather than promising the latter as done.
   question** *(from the match-syntax exploration — see [Matching](#matching-match))*:
   whether functions/blocks should require an **explicit value keyword** (`yield` /
   `return`) instead of the settled implicit **last-expression** rule, which would also
-  make `{ … }` blocks pure command-context (reopening "bare RHS word is a literal
-  string"). Language-wide — it touches `if`, `match`, and `func` alike.
+  make `{ … }` blocks pure command-context (dropping the **single-bare-word block-tail**
+  coercion — *not* the general assignment-RHS rule, which stays). Language-wide — it
+  touches `if`, `match`, and `func` alike.
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
