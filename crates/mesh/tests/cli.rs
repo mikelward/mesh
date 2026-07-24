@@ -2160,7 +2160,14 @@ fn a_reserved_or_duplicate_final_name_dispatches_and_recovers() {
     // An unclosed signature whose final name is finalized by the line break and is
     // a duplicate or reserved (`env`) is reported at once and the following command
     // still runs, not swallowed into the buffer while awaiting the body.
-    for input in ["func f(a, a\nputs after\n", "func f(env\nputs after\n"] {
+    for input in [
+        "func f(a, a\nputs after\n",
+        "func f(env\nputs after\n",
+        // A reserved or duplicate name with an unfinished default is irreparable
+        // too — finishing the default can't make the name valid.
+        "func f(env =\nputs after\n",
+        "func f(a, a =\nputs after\n",
+    ] {
         let out = run_with_input(input);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("syntax error"), "{input:?}: {stderr}");

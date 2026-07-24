@@ -245,6 +245,41 @@ pub enum ParamKind {
     Rest,
 }
 
+/// A parameter's ordering role, the only thing the sequencing rules care about
+/// (defaults and flag values are irrelevant to ordering). Derived from a full
+/// [`ParamKind`] or from a still-forming [`ParameterHead`] so both the executed
+/// parse and the continuation check apply the same rules.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrderClass {
+    Required,
+    Optional,
+    Rest,
+    /// A flag or switch — order-independent.
+    Independent,
+}
+
+impl ParamKind {
+    fn order_class(&self) -> OrderClass {
+        match self {
+            ParamKind::Required => OrderClass::Required,
+            ParamKind::Optional(_) => OrderClass::Optional,
+            ParamKind::Rest => OrderClass::Rest,
+            ParamKind::Switch | ParamKind::Flag(_) => OrderClass::Independent,
+        }
+    }
+}
+
+/// The result of parsing a parameter's *head* — its name and role — before any
+/// valued default expression. Splitting the head out lets a name be validated
+/// (reserved/duplicate/ordering) before the default is parsed, so a bad name with
+/// an unfinished default (`func f(env =`⏎) dispatches instead of buffering.
+struct ParameterHead {
+    name: String,
+    class: OrderClass,
+    /// Whether an `=` was consumed, so a default expression still needs parsing.
+    has_default: bool,
+}
+
 /// A binding pattern shared by assignments, conditional bindings, loops, and
 /// list-shaped match arms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,6 +505,52 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
         }
         Err(error) => Err(error),
     }
+}
+
+/// How a still-open `func` parameter list (the text after `(`, before any `)`)
+/// relates to the signature grammar — used by the multi-line reader to decide
+/// buffer-vs-dispatch without a second copy of the grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixStatus {
+    /// A complete, valid parameter list so far (the `)` may still follow).
+    Complete,
+    /// A valid list that simply ran out of input mid-parameter (a default not yet
+    /// typed, a trailing comma) — keep reading.
+    Incomplete,
+    /// A shape the parser can never accept (bad/`env`/duplicate name, a bad
+    /// ordering, a detached default) — dispatch so the error is reported now.
+    Malformed,
+}
+
+/// Classify a still-open parameter list `list` with the **real** signature
+/// grammar (the same [`Parser::parameter`] and ordering rules an executed
+/// definition uses), so the reader never needs to re-implement that grammar.
+///
+/// Caller contract: `list` is the text just past the signature's `(`, with the
+/// closing `)` not yet present, and any final token the user may still be typing
+/// already trimmed (so the parser does not finalize a growing name early).
+pub fn params_prefix_status(list: &str) -> PrefixStatus {
+    // A tokenize failure is an unterminated quote/raw string — the same thing that
+    // makes `parse()` return an error (it propagates `tokenize(..)?`), so it is a
+    // hard error the reader dispatches, not an open construct to buffer.
+    let Ok(tokens) = tokenize(list) else {
+        return PrefixStatus::Malformed;
+    };
+    Parser {
+        tokens,
+        position: 0,
+        source_len: list.len(),
+    }
+    .parameters_prefix()
+}
+
+/// A parse error that only means "the input ran out" — the reader buffers on it
+/// rather than dispatching, matching how [`parse`] maps these to `Incomplete`.
+fn is_incomplete(kind: &ParseErrorKind) -> bool {
+    matches!(
+        kind,
+        ParseErrorKind::UnexpectedEnd | ParseErrorKind::Unterminated(_)
+    )
 }
 
 struct Lexer<'a> {
@@ -1509,26 +1590,14 @@ impl Parser {
         self.newlines();
         while !self.same(&TokenKind::RParen) {
             let param = self.parameter()?;
-            if param.name == "env" {
-                return Err(self.error(ParseErrorKind::ReservedParameter(param.name)));
-            }
-            if parameters.iter().any(|p| p.name == param.name) {
-                return Err(self.error(ParseErrorKind::DuplicateParameter(param.name)));
-            }
-            // Ordering: nothing may follow `...rest`; a required positional may
-            // not follow an optional one (an optional is omittable only from the
-            // right, so a later required could never be reached).
-            if seen_rest {
-                return Err(self.error(ParseErrorKind::ParameterAfterRest(param.name)));
-            }
-            match &param.kind {
-                ParamKind::Rest => seen_rest = true,
-                ParamKind::Optional(_) => seen_optional = true,
-                ParamKind::Required if seen_optional => {
-                    return Err(self.error(ParseErrorKind::RequiredAfterOptional(param.name)));
-                }
-                _ => {}
-            }
+            let names = parameters.iter().map(|p| p.name.as_str());
+            self.check_param_order(
+                &param.name,
+                param.kind.order_class(),
+                names,
+                &mut seen_optional,
+                &mut seen_rest,
+            )?;
             parameters.push(param);
             let comma = self.eat(&TokenKind::Comma).is_some();
             self.newlines();
@@ -1551,9 +1620,11 @@ impl Parser {
         Ok(parameters)
     }
 
-    /// Parse one parameter: `...name` (rest), `--name`[` = default`] (switch or
-    /// valued flag), or `name`[` = default`] (required or optional positional).
-    fn parameter(&mut self) -> Result<Param, ParseError> {
+    /// Parse a parameter's head — name and role, plus whether a `=` default marker
+    /// was consumed — without parsing the default expression itself. `...name`
+    /// (rest), `--name`[` =`] (switch or valued flag), or `name`[` =`] (required or
+    /// optional positional).
+    fn parameter_head(&mut self) -> Result<ParameterHead, ParseError> {
         if let Some(spread) = self.eat(&TokenKind::Spread) {
             // The documented `...name` grammar requires the name to abut `...`; a
             // space or newline between them is not a rest parameter. At EOF (no
@@ -1564,30 +1635,153 @@ impl Parser {
             {
                 return Err(self.error(ParseErrorKind::Expected("a name immediately after `...`")));
             }
-            let name = self.name()?;
-            return Ok(Param {
-                name,
-                kind: ParamKind::Rest,
+            return Ok(ParameterHead {
+                name: self.name()?,
+                class: OrderClass::Rest,
+                has_default: false,
             });
         }
         if let Some(name) = self.flag_name_at(0) {
             self.position += 1;
-            let kind = if self.eat(&TokenKind::Equal).is_some() {
+            let has_default = self.eat(&TokenKind::Equal).is_some();
+            if has_default {
                 self.newlines();
-                ParamKind::Flag(self.expression()?)
-            } else {
-                ParamKind::Switch
-            };
-            return Ok(Param { name, kind });
+            }
+            return Ok(ParameterHead {
+                name,
+                class: OrderClass::Independent,
+                has_default,
+            });
         }
         let name = self.name()?;
-        let kind = if self.eat(&TokenKind::Equal).is_some() {
+        let has_default = self.eat(&TokenKind::Equal).is_some();
+        if has_default {
             self.newlines();
-            ParamKind::Optional(self.expression()?)
-        } else {
-            ParamKind::Required
+        }
+        Ok(ParameterHead {
+            name,
+            class: if has_default {
+                OrderClass::Optional
+            } else {
+                OrderClass::Required
+            },
+            has_default,
+        })
+    }
+
+    /// Parse one full parameter, including any valued default expression.
+    fn parameter(&mut self) -> Result<Param, ParseError> {
+        let head = self.parameter_head()?;
+        let kind = match head.class {
+            OrderClass::Rest => ParamKind::Rest,
+            OrderClass::Required => ParamKind::Required,
+            OrderClass::Optional => ParamKind::Optional(self.expression()?),
+            OrderClass::Independent if head.has_default => ParamKind::Flag(self.expression()?),
+            OrderClass::Independent => ParamKind::Switch,
         };
-        Ok(Param { name, kind })
+        Ok(Param {
+            name: head.name,
+            kind,
+        })
+    }
+
+    /// Enforce the signature's per-parameter rules — reserved (`env`), duplicate,
+    /// and ordering (nothing after `...rest`; no required after an optional) —
+    /// updating the running `seen_optional`/`seen_rest` flags. Shared by the full
+    /// [`Parser::parameters`] and the lenient [`Parser::parameters_prefix`] so both
+    /// apply exactly the same grammar.
+    fn check_param_order<'a>(
+        &self,
+        name: &str,
+        class: OrderClass,
+        existing: impl Iterator<Item = &'a str>,
+        seen_optional: &mut bool,
+        seen_rest: &mut bool,
+    ) -> Result<(), ParseError> {
+        if name == "env" {
+            return Err(self.error(ParseErrorKind::ReservedParameter(name.to_owned())));
+        }
+        if existing.into_iter().any(|existing| existing == name) {
+            return Err(self.error(ParseErrorKind::DuplicateParameter(name.to_owned())));
+        }
+        if *seen_rest {
+            return Err(self.error(ParseErrorKind::ParameterAfterRest(name.to_owned())));
+        }
+        match class {
+            OrderClass::Rest => *seen_rest = true,
+            OrderClass::Optional => *seen_optional = true,
+            OrderClass::Required if *seen_optional => {
+                return Err(self.error(ParseErrorKind::RequiredAfterOptional(name.to_owned())));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Classify a still-open parameter list (tokens with no closing `)`), using
+    /// the real [`Parser::parameter`] and [`Parser::check_param_order`]. Running
+    /// out of input mid-parameter or after a comma is [`PrefixStatus::Incomplete`]
+    /// (keep reading); a hard grammar violation is [`PrefixStatus::Malformed`]
+    /// (dispatch); a clean boundary is [`PrefixStatus::Complete`].
+    fn parameters_prefix(&mut self) -> PrefixStatus {
+        let mut names: Vec<String> = Vec::new();
+        let mut seen_optional = false;
+        let mut seen_rest = false;
+        loop {
+            self.newlines();
+            if self.at_end() {
+                break; // empty list, or a repairable trailing comma
+            }
+            // Parse the head (name + role) first. Ran out mid-head (a `...`/`--`
+            // still awaiting its name) is a repairable prefix; anything else there
+            // is a hard error.
+            let head = match self.parameter_head() {
+                Ok(head) => head,
+                Err(error) if is_incomplete(&error.kind) => return PrefixStatus::Incomplete,
+                Err(_) => return PrefixStatus::Malformed,
+            };
+            // Validate the name *before* the default: a reserved/duplicate/out-of-
+            // order name can never be repaired by finishing the default, so it must
+            // dispatch even when the default is unfinished (`func f(env =`⏎).
+            if self
+                .check_param_order(
+                    &head.name,
+                    head.class,
+                    names.iter().map(String::as_str),
+                    &mut seen_optional,
+                    &mut seen_rest,
+                )
+                .is_err()
+            {
+                return PrefixStatus::Malformed;
+            }
+            names.push(head.name);
+            if head.has_default {
+                // A default not yet closed keeps buffering; a malformed one (`x = ]`)
+                // dispatches, exactly as the parser judges it.
+                match self.expression() {
+                    Ok(_) => {}
+                    Err(error) if is_incomplete(&error.kind) => return PrefixStatus::Incomplete,
+                    Err(_) => return PrefixStatus::Malformed,
+                }
+            }
+            self.newlines();
+            if self.at_end() {
+                break;
+            }
+            if self.eat(&TokenKind::Comma).is_none() {
+                return PrefixStatus::Malformed; // e.g. `a b` — two names, no comma
+            }
+            if seen_rest {
+                // A comma after the rest introduces a parameter that can never be
+                // valid (`...xs, …` / the `...xs,)` close is rejected too).
+                return PrefixStatus::Malformed;
+            }
+        }
+        if seen_optional && seen_rest {
+            return PrefixStatus::Malformed;
+        }
+        PrefixStatus::Complete
     }
 
     /// If the token at `offset` is a bare `--name` word with a valid flag name,
