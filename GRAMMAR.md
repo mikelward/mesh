@@ -134,7 +134,10 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
   lists support `:len`; and lists support `:first`, `:last`, `:rest`, `:init`,
   and `:dedup`. Path and string modifiers map over lists, while collection
   modifiers consume the list as a whole. An unrecognized name after `:` remains
-  literal text, preserving constructions such as `$host:$port`.
+  literal text, preserving constructions such as `$host:$port`. In this
+  interpolation form modifiers are argument-free; the parenthesized argument form
+  (`:split(SEP)`, `:join(SEP)`) is a value expression — see
+  [`PARSER.md`](PARSER.md).
 - **Reads fail loud**: an **unbound** variable is an error (no null / always-on
   `set -u`), and the shell recovers to the next line. Assignment always creates.
   A **malformed `${…}`** (missing `}`, or an invalid name inside) is a syntax
@@ -145,8 +148,10 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
 - **Hyphens** are interior only: `$a-$b` is `$a` + `-` + `$b`, while
   `$auto-fetch` is one name.
 
-Deferred: maps, modifier arguments such as `:join(SEP)`, `export`, `global`/`unset`,
-function-local scope, the `$sh.*` surface, and `$env:get(K, default)`.
+Deferred: maps, most modifier arguments (`:split(SEP)` / `:join(SEP)` now work in a
+value expression; the command-word form and others such as `:get(K, default)` are
+still ahead), `export`, `global`/`unset`, function-local scope, and the `$sh.*`
+surface.
 
 ## Task 7 — sequencing (`;`, `&&`, `||`)
 

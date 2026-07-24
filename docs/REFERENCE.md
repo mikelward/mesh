@@ -288,11 +288,33 @@ is literal text, so `$host:$port` is not mistaken for a modifier chain.
 | `:dedup` | list | Remove later duplicates, preserving first occurrence order. |
 | `:keys` | map | Keys as an insertion-ordered list. |
 | `:values` | map | Values as an insertion-ordered list. |
+| `:split(SEP)` | string | Split on the literal separator into a list. |
+| `:join(SEP)` | list | Fold the list into a string, `SEP` between elements. |
 
 Path and case modifiers map over lists. Collection modifiers consume a list or
 map as a whole. List results retain their type: use `...$xs:rest` in command position,
-or bind them directly with `ys = $xs:rest`. Modifier arguments—including
-`:join(SEP)`, `:split(SEP)`, and `:get(KEY, DEFAULT)`—are not implemented yet.
+or bind them directly with `ys = $xs:rest`.
+
+A modifier that takes an argument writes it in parentheses, comma-separated like a
+value call: `$path:split(":")`, `$dirs:join(":")`. `:split(SEP)` turns a string into
+a list on the literal `SEP`, and `:join(SEP)` is the complementary fold — it
+stringifies each element (a nested list or map is a fail-loud error) and places
+`SEP` between them. `:split` treats the separator as a **terminator, not a
+separator**: a trailing run of empty fields is dropped (`"a:b:":split(":")` is
+`[a b]`), interior empties are kept (`"a::b":split(":")` is `[a "" b]`), and an
+empty or all-separator string is the empty list. The two are not exact inverses:
+because `:split` trims a trailing empty field, `:join` then `:split` round-trips
+losslessly only when the list has no empty final element (`[a ""]:join(":")` is
+`"a:"`, which splits back to `[a]`).
+
+`:split` operates on the **already-evaluated** value, so a `$(…)` capture has had
+its trailing newline trimmed before `:split` runs (`$(printf "a:\n"):split(":")`
+is `[a]`). Binding a split modifier to a substitution's *raw* bytes — the
+`DESIGN.md` split-modifier behavior, shared with the not-yet-built `:lines` /
+`:nulls` / `:raw` family — is deferred. Argument-taking modifiers currently work in expression position (an
+assignment right-hand side or other value context); the command-word form
+(`echo $dirs:join(":")`) is not wired up yet. Other argument-taking modifiers such
+as `:get(KEY, DEFAULT)` remain unimplemented.
 
 Bare decimal literals and `true` / `false` produce typed integer and boolean
 values. Arithmetic requires integers, comparisons return booleans, and strings
@@ -477,5 +499,7 @@ background), and calling for a value (`f(arg)`) as opposed to running it.
 
 ## Not yet implemented
 
-Modifier arguments, regex capture modifiers, and heredocs are not yet implemented.
-Functions in pipelines are also still ahead. See [`ROADMAP.md`](../ROADMAP.md).
+Most modifier arguments (beyond `:split` / `:join`), the command-word form of an
+argument-taking modifier, regex capture modifiers, and heredocs are not yet
+implemented. Functions in pipelines are also still ahead. See
+[`ROADMAP.md`](../ROADMAP.md).

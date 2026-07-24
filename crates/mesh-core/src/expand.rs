@@ -659,6 +659,80 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
     }
 }
 
+/// `:split(SEP)` — turn a string into a list by splitting on the literal
+/// separator `separator`. The separator is a **terminator, not a separator**:
+/// a trailing run of empty fields is dropped (`"a:b:"` → `[a b]`), while interior
+/// empties are kept (`"a::b"` → `[a "" b]`). An empty string — or one that is
+/// only separators — yields the empty list. Maps over neither lists nor maps: it
+/// consumes exactly one string (per `DESIGN.md`, split modifiers act on a single
+/// string/capture, not element-wise).
+pub(crate) fn split_value(value: Value, separator: &str) -> Result<Value, ExpandError> {
+    if separator.is_empty() {
+        return Err(ExpandError::Modifier {
+            name: "split".into(),
+            message: "separator must not be empty".into(),
+        });
+    }
+    let Value::String(text) = value else {
+        return Err(ExpandError::Modifier {
+            name: "split".into(),
+            message: "requires a string".into(),
+        });
+    };
+    let mut fields: Vec<Value> = text
+        .split(separator)
+        .map(|s| Value::String(s.into()))
+        .collect();
+    // Drop the trailing run of empty fields (terminator semantics).
+    while matches!(fields.last(), Some(Value::String(s)) if s.is_empty()) {
+        fields.pop();
+    }
+    Ok(Value::List(fields))
+}
+
+/// `:join(SEP)` — fold a list back into a single string, placing `separator`
+/// between elements. Each element is stringified (string as-is, integer and
+/// boolean rendered); a nested list or map is a fail-loud error, as there is no
+/// implicit deep flattening (per `DESIGN.md`).
+pub(crate) fn join_value(value: Value, separator: &str) -> Result<Value, ExpandError> {
+    let Value::List(items) = value else {
+        return Err(ExpandError::Modifier {
+            name: "join".into(),
+            message: "requires a list".into(),
+        });
+    };
+    let mut out = String::new();
+    for (index, item) in items.into_iter().enumerate() {
+        if index > 0 {
+            out.push_str(separator);
+        }
+        match item {
+            Value::String(s) => out.push_str(&s),
+            Value::Integer(n) => out.push_str(&n.to_string()),
+            Value::Boolean(b) => out.push_str(&b.to_string()),
+            Value::List(_) => {
+                return Err(ExpandError::Modifier {
+                    name: "join".into(),
+                    message: "cannot join a nested list".into(),
+                });
+            }
+            Value::Map(_) => {
+                return Err(ExpandError::Modifier {
+                    name: "join".into(),
+                    message: "cannot join a map element".into(),
+                });
+            }
+            Value::Regex(_) | Value::Glob(_) => {
+                return Err(ExpandError::Modifier {
+                    name: "join".into(),
+                    message: "cannot join a pattern element".into(),
+                });
+            }
+        }
+    }
+    Ok(Value::String(out))
+}
+
 fn modifier_name(modifier: Modifier) -> &'static str {
     match modifier {
         Modifier::Dir => "dir",
@@ -794,8 +868,119 @@ fn has_glob_meta(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Access, Modifier, VarRef, apply_tilde, has_glob_meta, resolve_value};
+    use super::{
+        Access, ExpandError, Modifier, VarRef, apply_tilde, has_glob_meta, join_value,
+        resolve_value, split_value,
+    };
     use crate::vars::{Value, Vars};
+
+    fn list(items: &[&str]) -> Value {
+        Value::List(items.iter().map(|s| Value::String((*s).into())).collect())
+    }
+
+    #[test]
+    fn split_drops_only_the_trailing_empty_run() {
+        assert_eq!(
+            split_value(Value::String("a:b:c".into()), ":"),
+            Ok(list(&["a", "b", "c"]))
+        );
+        // A trailing run of separators contributes no fields (terminator, not separator).
+        assert_eq!(
+            split_value(Value::String("a:b:".into()), ":"),
+            Ok(list(&["a", "b"]))
+        );
+        assert_eq!(
+            split_value(Value::String("a:b::".into()), ":"),
+            Ok(list(&["a", "b"]))
+        );
+        // Interior empties survive.
+        assert_eq!(
+            split_value(Value::String("a::b".into()), ":"),
+            Ok(list(&["a", "", "b"]))
+        );
+    }
+
+    #[test]
+    fn split_of_empty_or_all_separators_is_the_empty_list() {
+        assert_eq!(
+            split_value(Value::String(String::new()), ":"),
+            Ok(Value::List(vec![]))
+        );
+        assert_eq!(
+            split_value(Value::String("::".into()), ":"),
+            Ok(Value::List(vec![]))
+        );
+    }
+
+    #[test]
+    fn split_supports_a_multi_character_separator() {
+        assert_eq!(
+            split_value(Value::String("a::b::c".into()), "::"),
+            Ok(list(&["a", "b", "c"]))
+        );
+    }
+
+    #[test]
+    fn split_rejects_an_empty_separator_and_non_strings() {
+        assert!(matches!(
+            split_value(Value::String("abc".into()), ""),
+            Err(ExpandError::Modifier { name, .. }) if name == "split"
+        ));
+        assert!(matches!(
+            split_value(list(&["a", "b"]), ":"),
+            Err(ExpandError::Modifier { name, .. }) if name == "split"
+        ));
+    }
+
+    #[test]
+    fn join_folds_a_list_and_stringifies_scalars() {
+        assert_eq!(
+            join_value(list(&["/usr/bin", "/bin"]), ":"),
+            Ok(Value::String("/usr/bin:/bin".into()))
+        );
+        assert_eq!(
+            join_value(
+                Value::List(vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Boolean(true)
+                ]),
+                "+",
+            ),
+            Ok(Value::String("1+2+true".into()))
+        );
+        assert_eq!(
+            join_value(Value::List(vec![]), ","),
+            Ok(Value::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn split_then_join_round_trips_without_a_trailing_separator() {
+        let split = split_value(Value::String("a,b,c".into()), ",").unwrap();
+        assert_eq!(join_value(split, ","), Ok(Value::String("a,b,c".into())));
+    }
+
+    #[test]
+    fn join_then_split_is_lossy_on_a_trailing_empty_element() {
+        // `:split` trims the trailing empty field, so the two are not exact
+        // inverses — a final "" does not survive a round trip.
+        let joined = join_value(list(&["a", ""]), ":").unwrap();
+        assert_eq!(joined, Value::String("a:".into()));
+        assert_eq!(split_value(joined, ":"), Ok(list(&["a"])));
+    }
+
+    #[test]
+    fn join_rejects_non_lists_and_nested_collections() {
+        assert!(matches!(
+            join_value(Value::String("hi".into()), ","),
+            Err(ExpandError::Modifier { name, .. }) if name == "join"
+        ));
+        assert!(matches!(
+            join_value(Value::List(vec![list(&["a"])]), ","),
+            Err(ExpandError::Modifier { name, .. }) if name == "join"
+        ));
+    }
 
     #[test]
     fn detects_glob_metacharacters() {

@@ -116,6 +116,10 @@ file as tasks land.
 - [x] Remaining scalar types (integers and booleans).
 - [x] Initial argument-free `:` modifiers: path/string transforms and list
       collection operations, including typed list results and chaining.
+- [x] First argument-taking `:` modifiers, `:split(SEP)` / `:join(SEP)`, in value
+      expressions (terminator-style trailing-empty trim on split; fail-loud on a
+      nested element for join). Deferred: the command-word form and other
+      argument-taking modifiers (`:get`, `:has`, `:replaceall`, …).
 - [x] `func` — user-defined functions: `func name(params) { body }` with required
       named positionals, multi-line bodies, function-local (lexical) scope, and
       `return`. Resolution is builtins → functions → external.
