@@ -56,8 +56,12 @@ In an interactive shell, Tab completes according to the cursor's current word:
 Suggestions are ranked using fuzzy, smart-case matching: an all-lowercase query
 ignores case, while any uppercase letter makes the whole query case-sensitive.
 Exact-case matches rank ahead of case-folded matches. For example,
-`cd pic<Tab>` can complete to `cd Pictures/`. File, directory, and enumerated
-argument types inferred from help output narrow suggestions to suitable values.
+`cd pic<Tab>` can complete to `cd Pictures/`. A single suggestion completes
+immediately; ambiguous suggestions open a columnar menu, where repeated Tab or
+the arrow keys move the selection and Enter accepts it. File, directory, and
+enumerated argument types inferred from option declarations narrow suggestions
+to suitable values. File and directory positionals inferred from `Usage:` lines,
+including Vim's `[file ..]`, do the same for ordinary command arguments.
 External-command help probes have null stdin, a two-second timeout, and a
 one-MiB output cap.
 
