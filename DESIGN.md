@@ -1864,7 +1864,7 @@ Rules:
   returns the groups (positional → list, named → map); see
   [Destructuring](#destructuring). A `/re/` **arm** does **not** *auto*-bind its
   groups *(decided — resolving the earlier open)*: a bare `/re/` arm is a pure
-  yes/no predicate exactly like the `~` it mirrors (see the alignment note below),
+  yes/no predicate exactly like the `~` it mirrors (see the `~`/`match` note below),
   and to *capture* you go through `:match` explicitly — an `if`-binding
   `if [a b] = $x:match(/re/) { … }`, or a match over the capture result,
   `match $x:match(/re/) { [a b] { … } false { … } }` (a bare `[a b] = …` is *not*
@@ -1883,135 +1883,69 @@ Rules:
   glob / `/re/` element, or nesting) and **map-shape** patterns (`[k: v]`) stay
   **deferred** until the need is real.
 
-**How `~` and `match` relate — a containment, not an equivalence.** The tie between
-the two is real but must be stated precisely, because the shipped M3 scopes are not
-identical:
+**`~` and `match` share one pattern vocabulary, but `~` is a strict subset** *(current
+M3 behavior)*. For a **string** subject and a **glob or regex** pattern,
+`match $x { P { … } }` takes the `P` arm iff `$x ~ P` — that shared core is learned
+once. But an arm does strictly more than a `~` RHS:
 
-> For a **string** subject `$x` and a **glob or regex** pattern `P`,
-> `match $x { P { … } }` takes the `P` arm **iff `$x ~ P` is true.**
-
-Over *that* shared subset — globs (`*.txt`) and `/re/` against a string — the two use
-one vocabulary, learned once. But a `match` arm is a **superset** of a `~` RHS:
-
-| Pattern | `match` arm | `~` RHS | Note |
-| --- | --- | --- | --- |
-| glob `*.txt`, `/re/` | ✔ | ✔ | the shared core; the equivalence above holds here |
-| literal on any type, `match 7 { 7 { … } }` | ✔ (`==`) | ✗ | `~` requires a **string** left operand, so `7 ~ …` errors |
-| range `1..=9` | ✔ | ✗ | arm tests list-membership of the range; `~` has no range RHS |
-| alternation `a \| b` | ✔ | ✗ | arm-level; `~`'s RHS is a single glob/regex value |
-| list-binding `[a b]`, `[cmd ...rest]` | ✔ | ✗ | destructuring; `~` is a bool, binds nothing |
-
-So `~` is the **scalar, string-only** slice of the arm grammar. This leaves a genuine
-design lever *(open)*: either keep `~` deliberately narrow (a string-vs-pattern
-predicate) and accept that `match` does strictly more, **or widen `~`** — `$n ~ 1..=9`,
-`$f ~ *.a|*.b`, `7 ~ 7` — to make the containment total. Ruby makes it total through
-`===` (a `Range`, a `Class`, a `Regexp` each define their own case-test); the cost is
-that `~` stops being "string matched against a pattern" and becomes a type-dispatched
-operator (see the smartmatch caution below). Leaning: keep `~` narrow, document the
-superset, revisit alternation on the `~` RHS (`$f ~ *.a|*.b`) as the one extension
-that pays for itself.
-
-**The shape asymmetry — infix `~` vs prefix `match` *(open)*.** A real wart: `$x ~ P`
-is **infix** (subject on the left), but `match $x { … }` is **prefix** (keyword,
-then subject). Everything else mesh does to a value is subject-first — postfix
-modifiers (`$x:upper`, `$p:type`), the `:match` method, and `~` itself — so prefix
-`match` is the odd one out, pulling toward the *control-flow* family (`if`/`for`/`while`
-are all keyword-first) rather than the *value-operation* family. Two ways to resolve,
-neither yet chosen:
-
-- **Subject-first `match`** — `$x match { *.txt { … } }`, the **Scala** shape (`x match
-  { case … }`). Now both spell the subject on the left, `match` reads as the n-arm
-  generalization of `~`, and it flows left-to-right like a pipe — arguably the more
-  shell-native order. Cost: diverges from `match $x` in Rust / Python / **nushell**
-  (the sibling shell).
-- **Keep prefix `match`** — accept the asymmetry as the price of aligning with the
-  familiar `match x`/`case x` head-first form and with mesh's own `if`/`for` keywords.
-
-This is exactly the "align the tilde operator and the match expression" question from
-the exploration prompt, and it is **not** closed here — see the recommendation note.
-
-**Keyword and operator — the field, and where each lands.** Six spellings were
-weighed against mesh's *expression* identity (an arm must yield a value) and its
-*subject-first* idiom. `match` + `~` is the current lean, but two rows are closer
-calls than a flat "rejected," so they are recorded honestly:
-
-| Candidate | Lean | Why |
+| Pattern | `match` arm | `~` RHS |
 | --- | --- | --- |
-| `match $x { P { … } }` | **leading** | Yields the arm's value, like `if`. The *keyword* `match` for value-yielding pattern dispatch is **Rust**, **Scala** (`x match { … }`), and **nushell** (the sibling shell); Python spells the construct `match … case …` but as a **statement**, so it is keyword precedent only. (Expression pattern-matching under *other* keywords is broader still — Ruby's `case`/`in`, ML/Haskell/Elixir's `case` — which is why the keyword choice, not the expression-ness, is the real question.) Pairs with `~`. |
-| `case $x { … }` | **viable** — not dismissed | Ruby's `case`/`when` is a genuine value-returning **expression**, so "`case` can't yield a value" is **false** — the earlier draft was wrong to imply it. The real reasons to still prefer `match`: (a) mesh's arms are *patterns*, which even Ruby spells `case`/**`in`**, not `case`/`when`; (b) in a shell, `case` carries the specific `case … in pat) … ;; esac` shape, so reusing the word with `{ }` braces is *false familiarity* — a known word with an unknown grammar, the trap a clean break is meant to avoid; (c) `match` pairs with `~`. If shell muscle-memory outranks those, `case $x { … }` is defensible. |
-| `switch $x { … }` | declined | The statement-flavored member of the family (C/Java/bash fall-through; PowerShell). **Swift's `switch` *is* an expression** (`let x = switch …`, 5.9+), so it is not a clean statement-only example either — but `switch` still reads as "dispatch for effect" and carries no pattern-matching connotation, so it adds nothing over `match`. |
-| `if $x ~~ { … }` | declined | Perl's **smartmatch** — deprecated and marked experimental for exactly the type-dispatched unpredictability mesh's [error model](#error-handling) avoids (full account below). `~~` is out. |
-| `if match $x { … }` / `if $x match { … }` | declined | Fuses `if` with `match`, but `match` is **already** an expression — bare `match $x { … }` runs in statement position and `x = match …` binds — so the `if` wrapper adds a keyword and falsely implies a boolean. |
-| `if $x ~ P { … } else if $x ~ Q { … }` | **kept (free)** | Not a rival to `match` but its **small-scale** form — already `if` + `~`, no new grammar. Good for a few heterogeneous branches (mixed `~`, comparisons, commands); `match` is for many arms on one subject. |
+| glob `*.txt`, regex `/re/` (string subject) | ✔ | ✔ |
+| literal on any type (`match 7 { 7 { … } }`) | ✔ (`==`) | ✗ — `~` needs a **string** left operand |
+| range `1..=9` | ✔ | ✗ |
+| alternation `a \| b` | ✔ | ✗ — `~`'s RHS is one glob/regex value |
+| list-binding `[a b]`, `[cmd ...rest]` | ✔ | ✗ — `~` is a bool, binds nothing |
 
-**Arm bodies — what a `{ … }` arm may hold, and how it yields a value** *(shipped —
-M3)*. An arm body is a **block**, the same `{ … }` as an `if` branch or a `func` body —
-*not* restricted to a single expression or a callable. Whether that block becomes a
-**value** or just **runs** depends on the `match`'s position, exactly like `if`:
+So `~` is the scalar, string-only slice of the arm grammar; `match` adds literal-on-any-
+type, ranges, alternation, and destructuring.
 
-- **Statement position** — `match $x { … }` on its own line — runs the selected arm's
-  body as an ordinary block (`run_ast_match` → `run_source`): commands execute and
-  stream to stdout, and there is *no* value and *no* capture. Here `*.x { ls }` **runs
-  `ls`**. This is the common interactive case, and it holds no surprises.
-- **Expression position** — `y = match $x { … }`, or a `match` nested inside another
-  value expression — evaluates the body *for its value* (`eval_value_body`), and only
-  *then* do the tail rules below apply. Here `*.x { ls }` is the **string** `"ls"`,
-  because the value path never runs a lone word. *(A **function's value-return** is
-  **not** yet such a context in M3: a `match` as a function's last statement runs through
-  `run_source` → `run_ast_match` in statement position and its value is discarded —
-  structured value-return is unbuilt (`eval_call` implements only `re(…)`), so this
-  awaits that work.)*
+**How an arm body yields a value** *(current M3 behavior)*. An arm body is a **block**,
+the same `{ … }` as an `if` branch. Whether it produces a value depends on position,
+exactly like `if`:
 
-In **expression position** a value is produced three ways, resolved by the tail
-(`eval_value_body`):
+- **Statement position** — `match $x { … }` on its own line — runs the arm as an
+  ordinary block: commands execute and stream, *no* value, *no* capture. `*.x { ls }`
+  runs `ls`.
+- **Expression position** — `y = match $x { … }`, or nested in another value expression
+  — resolves the body to a value by its tail (`eval_value_body`): (1) a
+  **value-expression tail** (`{ "text" }`, `{ $v }`, `{ [a b] }`, nested `if`/`match`)
+  yields that value; (2) a body that is a **single bare word** (`{ markdown }`) is the
+  string `"markdown"` — but only when that word is the whole body (`{ puts x; text }`
+  runs `text`); (3) a body ending in a **command** (`{ wc -l < $f }`) runs the **whole
+  body** and yields its captured stdout **only on exit 0** — note this captures *every*
+  statement's stdout, not just the tail's, so `{ puts a; some-cmd }` includes the `a`
+  (nonzero aborts; a bare `$(…)` shares the exit-0 gate). To return a string reliably
+  today, quote it: `{ "text" }`.
+  *(A function's value-return is **not** yet an expression context — a `match` as a
+  function's last statement runs in statement position and the value is discarded;
+  structured value-return / value-calls beyond `re(…)` are unbuilt.)*
 
-1. **A value-expression tail** — `*.txt { "text" }`, `{ $kind }`, `{ [a b] }`, a nested
-   `if`/`match`/`for` — yields that expression's value; earlier lines run for effect.
-2. **A single-word body** — `*.md { markdown }`, where the *entire* body is one bare
-   word — is read as the **string** `"markdown"`. This is single-statement only: `{ ls }`
-   is the string `"ls"`, but add any earlier statement and the tail word is a **command**
-   again (`{ puts side; text }` runs `text`).
-3. **A command / pipeline tail** — `*.log { wc -l < $f }` — runs the body and, **only on
-   exit `0`**, yields its **captured stdout** (trailing newline trimmed). A nonzero exit
-   yields no value and aborts the match. The print-then-fail footgun: `grep -c` prints
-   `0` but exits 1 on no matches, and a bare `$(…)` rides the same gate, so
-   `{ $(grep -c ERROR $f; true) }` (success-forced) is the way to keep the count.
+**Design levers under consideration** *(open — none decided this pass)*. The exploration
+narrowed the question to four choices; current leanings noted, but all four are open:
 
-To return a string reliably today, write a **quoted** tail — `{ "text" }` — which is a
-value-expression and works at any body length. This is the shared block-value behavior
-`if` uses ([Conditionals](#conditionals-if-is-an-expression)); the arm inherits it.
-
-**Design question — should an arm take a *block* instead of a coerced expression?**
-*(open)* The `{ … }` syntax *reads* as a statement block, yet rules 2–3 above quietly
-coerce that block into a value — the source of every sharp edge in this note (the
-bare-word/command flip, the exit-0 capture gate). If we lean into "it is a block," two
-cleaner models drop the coercion:
-
-- **Block, value = tail expression, no coercion** *(leaning)*. Statements run top to
-  bottom; the block's value is its final statement **iff that statement is a
-  value-expression** (`"str"`, `$v`, `[a b]`, `f()`, a nested `if`/`match`), otherwise
-  the block ran for effect and yields `""`. Rules 2 and 3 disappear: a bare word is
-  *always* a command (`{ ls }` runs `ls`, value `""`), and to capture you write an
-  explicit `$(…)`. One rule, no footguns:
-  ```
-  kind = match $file {
-    *.md  { "markdown" }      # tail is a value-expression → the string
-    *.txt { "text" }
-    _     { $(file -b $file) }  # explicit capture when you want stdout
-  }
-  ```
-  This is exactly what mesh already *says* `if` does ("a block evaluates to its last
-  expression"), so adopting it is a language-wide tightening of the block-value rule,
-  not a `match`-only change.
-- **Expression arm via `=>`** (Rust / nushell): `pattern => expr`, with `=> { block }`
-  when you need statements. `*.md => "markdown"`. Makes the value-nature explicit and the
-  one-liner brace-free, but adds `=>` punctuation and **diverges from mesh's own
-  `if`/`for`/`while`**, which are all `{ }`-block, never `=>`.
-
-Recommendation: the **block + tail-expression** model — it keeps the `{ }` shape
-consistent with `if`/`for`, honors the "it's a block" reading, and deletes the coercion
-magic (and with it this whole footgun list). `=>` reads well for pure one-liners but
-forks `match` away from the rest of mesh's control flow.
+1. **Shape** — prefix `match $x { … }` (Rust / nushell, and consistent with mesh's own
+   prefix `if`/`for`/`while`) vs **subject-first** `$x match { … }` (Scala; aligns with
+   the infix, subject-first `~` and `:mod`) vs `case $x { … }`. *Lean: prefix* — `if` is
+   mesh's own precedent for an expression-that-branches, and it is prefix; the
+   `~`/`match` "asymmetry" then just reflects operator-vs-keyword, as with `==` vs `if`.
+2. **Keyword** — `match` vs `case`. `case`/`when` is a genuine value-returning expression
+   in Ruby, so `case` is viable. *Lean: `match`* — mesh's arms are *patterns* (Ruby
+   spells those `case`/**`in`**), the cross-language pattern keyword is `match`
+   (Rust/Scala/nushell), reusing shell `case` with `{ }` braces is false familiarity
+   (no `in`/`;;`/`esac`), and `match` pairs with `~`. `switch` (statement-flavored) and
+   `~~` (Perl **smartmatch** — deprecated for its type-dispatched unpredictability) are
+   declined.
+3. **`~` scope** — keep it narrow (string vs glob/regex) or widen it toward the arm
+   grammar. *Lean: narrow*, revisiting only **alternation** on the RHS (`$f ~ *.a|*.b`)
+   as the extension that pays for itself. Full type-dispatch parity (Ruby's `===`) is
+   rejected — it re-creates the smartmatch trap.
+4. **Arm-body value model** — keep today's tail-coercion (rules above), or move to
+   **block + tail-expression, no coercion** (a bare word is always a command, capture is
+   always explicit `$(…)`), or a Rust-style **`=> expr`** arm. *Lean: block +
+   tail-expression* — it matches what `if` already claims ("a block evaluates to its last
+   expression"), deletes the bare-word/exit-0 sharp edges, and is a language-wide
+   tightening (applies to `if` too), not a `match`-only change. `=>` reads well but forks
+   `match` from mesh's `{ }`-block control flow.
 
 ### Tests and comparisons
 
