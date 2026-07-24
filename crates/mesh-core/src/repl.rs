@@ -1865,7 +1865,11 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
                 return Step::Continue(1);
             }
         };
-        if auto_help_requested(&args) {
+        // Intercept `--help` only when the signature does not claim it; a function
+        // that declares a `--help` flag observes the switch itself (`DESIGN.md`
+        // §"Command resolution and help").
+        let declares_help = shell.funcs.get(&name).unwrap().declares_help();
+        if !declares_help && auto_help_requested(&args) {
             let help = shell.funcs.get(&name).unwrap().help(&name);
             return Step::Continue(builtins::print_generated_help(&name, &help));
         }

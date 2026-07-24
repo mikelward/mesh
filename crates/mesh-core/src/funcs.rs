@@ -16,10 +16,19 @@ pub struct FuncDef {
 }
 
 impl FuncDef {
+    /// Whether the signature declares its own `--help` flag (switch or valued). A
+    /// function that claims `--help` keeps it: the canned help never overrides the
+    /// function's own contract (`DESIGN.md` §"Command resolution and help").
+    pub fn declares_help(&self) -> bool {
+        self.params.iter().any(|param| {
+            param.name == "help" && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
+        })
+    }
+
     /// Produce help in the same conventional shape used by builtin commands: a
     /// `Usage:` line with positionals (optionals bracketed, a rest `...`), an
-    /// `Arguments:` list, and an `Options:` block of the declared flags plus
-    /// `--help`.
+    /// `Arguments:` list, and an `Options:` block of the declared flags plus a
+    /// synthesized `--help` (unless the signature declares its own).
     pub fn help(&self, name: &str) -> String {
         let mut usage = format!("Usage: {name}");
         let mut arguments = String::new();
@@ -54,7 +63,10 @@ impl FuncDef {
         }
         help.push_str("\nOptions:\n");
         help.push_str(&options);
-        help.push_str("  --help  Print help\n");
+        // A declared `--help` is already listed above; don't duplicate it.
+        if !self.declares_help() {
+            help.push_str("  --help  Print help\n");
+        }
         help
     }
 }

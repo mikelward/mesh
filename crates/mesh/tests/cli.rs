@@ -2006,6 +2006,19 @@ fn generated_help_shows_flags_optionals_and_rest() {
 }
 
 #[test]
+fn a_declared_help_flag_is_kept_and_not_synthesized() {
+    // A function that claims `--help` observes the switch in its body instead of
+    // triggering the canned help, and its generated help does not duplicate the
+    // entry (`DESIGN.md` §"Command resolution and help").
+    let out = run_with_input("func f(--help) { puts \"help=$help\" }\nf --help\nf\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "help=true\nhelp=false\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
 fn invalid_signature_forms_are_parser_errors() {
     for input in [
         "func f(a b) { puts hi }\n",
