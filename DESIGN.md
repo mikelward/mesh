@@ -2023,16 +2023,23 @@ can't return a *nonzero* int as successful data — is narrow and accepted, sinc
 `return 0` / `return 1` are used as success/failure anyway (read them as
 `return true` / `return false`).
 
-For the record, correcting a mis-statement made during the exploration, the truthiness
-rule is: **falsy = `false`, an `error`, or a nonzero status; truthy = `true`, `0`/success,
-and every data value — strings, lists, maps — *including empty ones*** (an empty string
-or list is a success, status `0`, **not** falsy).
+The truthiness **leaning** (still *open* — the unresolved-questions summary flags condition
+truthiness as needing a table/narrowing; this is the current lean, not a settled rule):
+**falsy** = `false`, a **failed command / nonzero exit status**, or a nonzero int — the
+**channel-1 failure values**; **truthy** = `true`, `0`/success, and every data value —
+strings, lists, maps — **including empty ones** (an empty string or list is a success,
+status `0`, **not** falsy). **Fail-loud (channel-2) errors sit *outside* truthiness
+entirely** — a type / index / decode error in a condition **aborts the statement**, it
+does *not* make the branch falsy (per the [error model](#error-handling)); collapsing it
+into "falsy" would silently turn a bug into a skipped branch.
 
 One small **open** nicety this surfaced: spell an explicit coded failure as
-**`return error <n>`** — an error *value* carrying the exit code — rather than overloading
-a bare `return <n>`, leaving bare returns for data/success. That would add a returnable
-**error value** (mesh's current fail-loud errors are not values); additive, undecided, and
-independent of the resolution above.
+**`return error <n>`** — a returnable **error value** carrying an exit code. This does
+**not** change the status view or reclaim bare ints for data: a bare `return 5` still has
+status `5` (a failure when observed), exactly as above; `return error <n>` is only a
+clearer spelling for "fail with this code" than reusing a bare int, and it would add a
+returnable error *value* distinct from mesh's channel-2 fail-loud errors. Additive
+spelling, undecided.
 
 ### Tests and comparisons
 
