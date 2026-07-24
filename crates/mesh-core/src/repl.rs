@@ -44,6 +44,10 @@ struct Shell {
     funcs: Funcs,
     jobs: exec::JobTable,
     control: Option<parser::ControlKind>,
+    /// True in a forked pipeline stage or background job: this process runs the
+    /// shell's code but owns none of its children, so job control is not its to
+    /// perform.
+    forked: bool,
     loop_depth: usize,
     prompt: PromptConfig,
     /// The **result so far** of the body being run: the value of the last
@@ -108,6 +112,7 @@ impl Shell {
             funcs: Funcs::new(),
             jobs: exec::JobTable::new(),
             control: None,
+            forked: false,
             loop_depth: 0,
             prompt: PromptConfig::default(),
             result: Value::String(String::new()),
@@ -134,14 +139,13 @@ pub fn run() -> ExitCode {
     let options = match StartupOptions::parse(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(message) => {
-            eprintln!("mesh: {message}");
+            note!("mesh: {message}");
             return ExitCode::from(2);
         }
     };
     match &options.invocation {
         Invocation::Print(text) => {
-            print!("{text}");
-            ExitCode::SUCCESS
+            ExitCode::from(builtins::write_stdout("stdout", text.as_bytes()))
         }
         Invocation::Command(text) => run_batch(&text.clone(), &options),
         Invocation::Script(path) => match read_script(path) {
@@ -166,7 +170,7 @@ fn read_script(path: &Path) -> Result<String, u8> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(error) => {
-            eprintln!("mesh: {}: {error}", path.display());
+            note!("mesh: {}: {error}", path.display());
             Err(if error.kind() == io::ErrorKind::NotFound {
                 127
             } else {
@@ -470,7 +474,7 @@ fn run_config_file(path: &Path, last: u8, shell: &mut Shell) -> Step {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Step::Continue(last),
         Err(error) => {
-            eprintln!("mesh: {}: {error}", path.display());
+            note!("mesh: {}: {error}", path.display());
             return Step::Continue(1);
         }
     };
@@ -545,11 +549,11 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
     let step = match parser::parse(text) {
         Ok(parser::ParseOutcome::Complete(source)) => run_source(&source, last, in_function, shell),
         Ok(parser::ParseOutcome::Incomplete) => {
-            eprintln!("mesh: syntax error: unexpected end of input");
+            note!("mesh: syntax error: unexpected end of input");
             Step::Continue(2)
         }
         Err(error) => {
-            eprintln!("mesh: {error}");
+            note!("mesh: {error}");
             Step::Continue(2)
         }
     };
@@ -612,7 +616,7 @@ fn run_and_or(
     shell: &mut Shell,
 ) -> Step {
     if background && !node.rest.is_empty() {
-        eprintln!("mesh: background conditional lists are not supported yet");
+        note!("mesh: background conditional lists are not supported yet");
         // This returns *above* `run_recorded`, which is what normally records a
         // statement's result, so the rejection is recorded here. Otherwise the
         // value some earlier statement produced would still stand, and a bare
@@ -672,7 +676,7 @@ fn run_executable(
 ) -> Step {
     use parser::Executable::*;
     if background && let Some(what) = not_backgroundable(node) {
-        eprintln!("mesh: &: backgrounding {what} is not supported yet");
+        note!("mesh: &: backgrounding {what} is not supported yet");
         return Step::Continue(2);
     }
     match node {
@@ -697,7 +701,7 @@ fn run_executable(
                 };
                 result.map_or_else(
                     |error| {
-                        eprintln!("mesh: {error}");
+                        note!("mesh: {error}");
                         Step::Continue(1)
                     },
                     |_| Step::Continue(0),
@@ -716,7 +720,7 @@ fn run_executable(
                 Ok(_) if shell.control.is_some() => Step::Continue(last),
                 Ok(value) => environ::write(key, value, *append).map_or_else(
                     |error| {
-                        eprintln!("mesh: {error}");
+                        note!("mesh: {error}");
                         Step::Continue(1)
                     },
                     |_| Step::Continue(0),
@@ -730,7 +734,7 @@ fn run_executable(
             body,
         } => {
             if name == "func" || name == "return" || builtins::is_builtin(name) {
-                eprintln!("mesh: func: `{name}` is a reserved name and cannot be a function name");
+                note!("mesh: func: `{name}` is a reserved name and cannot be a function name");
                 return Step::Continue(2);
             }
             // Parameter names are already validated (distinct, not `env`) by the
@@ -767,7 +771,7 @@ fn run_executable(
             match kind {
                 parser::ControlKind::Return => {
                     if !in_function {
-                        eprintln!("mesh: return: not inside a function");
+                        note!("mesh: return: not inside a function");
                         return Step::Continue(1);
                     }
                     // `return val` unwinds carrying any value (its status is a view
@@ -787,7 +791,7 @@ fn run_executable(
                 }
                 parser::ControlKind::Break | parser::ControlKind::Continue => {
                     if shell.loop_depth == 0 {
-                        eprintln!(
+                        note!(
                             "mesh: {}: not inside a loop",
                             if matches!(kind, parser::ControlKind::Break) {
                                 "break"
@@ -1075,7 +1079,7 @@ fn run_ast_for(
     shell: &mut Shell,
 ) -> Step {
     if let Err(message) = validate_patterns(bindings) {
-        eprintln!("mesh: for: {message}");
+        note!("mesh: for: {message}");
         return Step::Continue(2);
     }
     let value = match eval_operand_of(iterable, last, in_function, shell) {
@@ -1377,7 +1381,7 @@ fn run_ast_pipeline(
                         parser::RedirectKind::Output => exec::RedirKind::Out,
                         parser::RedirectKind::Append => exec::RedirKind::Append,
                         parser::RedirectKind::Heredoc => {
-                            eprintln!("mesh: heredoc execution is not supported yet");
+                            note!("mesh: heredoc execution is not supported yet");
                             return Step::Continue(1);
                         }
                     },
@@ -1540,7 +1544,7 @@ fn eval_expr(
     match expr {
         E::Scalar(word) => expand::expand_values(vec![expansion_word(&word.value)], &shell.vars)
             .map_err(|e| {
-                eprintln!("mesh: {e}");
+                note!("mesh: {e}");
                 Step::Continue(1)
             })
             .map(|mut v| {
@@ -1559,7 +1563,7 @@ fn eval_expr(
         E::Variable(name) => {
             let reference = expansion_variable(&name.value, parser::QuoteMode::Bare);
             expand::resolve_value(&reference, &shell.vars).map_err(|error| {
-                eprintln!("mesh: {error}");
+                note!("mesh: {error}");
                 Step::Continue(1)
             })
         }
@@ -1637,7 +1641,7 @@ fn eval_expr(
                 .and_then(|n| n.checked_neg().ok_or_else(|| "numeric overflow".into()))
                 .map(Value::Integer)
                 .map_err(|m| {
-                    eprintln!("mesh: {m}");
+                    note!("mesh: {m}");
                     Step::Continue(1)
                 })
         }
@@ -1661,7 +1665,7 @@ fn eval_expr(
                 return Ok(control_placeholder());
             }
             eval_binary(l, *op, r).map_err(|m| {
-                eprintln!("mesh: {m}");
+                note!("mesh: {m}");
                 Step::Continue(1)
             })
         }
@@ -1672,7 +1676,7 @@ fn eval_expr(
                 return std::env::var_os(name)
                     .map(|value| Value::String(value.to_string_lossy().into_owned()))
                     .ok_or_else(|| {
-                        eprintln!("mesh: $env.{name}: not set");
+                        note!("mesh: $env.{name}: not set");
                         Step::Continue(1)
                     });
             }
@@ -1739,7 +1743,7 @@ fn eval_expr(
                         .and_then(|i| values.get(i))
                         .cloned()
                         .ok_or_else(|| {
-                            eprintln!("mesh: list index {index} out of range");
+                            note!("mesh: list index {index} out of range");
                             Step::Continue(1)
                         })
                 }
@@ -1978,7 +1982,7 @@ fn single_string_argument(
 }
 
 fn runtime_message(message: impl std::fmt::Display) -> Step {
-    eprintln!("mesh: {message}");
+    note!("mesh: {message}");
     Step::Continue(1)
 }
 
@@ -2417,16 +2421,16 @@ fn run_pipeline(mut stages: Vec<Stage>, background: bool, last: u8, shell: &mut 
     if stages.len() == 1 {
         run_single(stages.pop().unwrap(), background, last, shell)
     } else {
-        run_multi(stages, background, shell)
+        run_multi(stages, background, last, shell)
     }
 }
 
 /// Run a one-stage pipeline. Without redirections this is the full command
-/// surface: an assignment or a builtin/function/external command. With
-/// redirections it is an external command or an in-shell **function** (whose
-/// redirection is applied to the shell's own descriptors around the call, since
-/// there is no child to configure); a redirected builtin, and backgrounding
-/// anything in-shell, are not supported yet.
+/// surface: an assignment or a builtin/function/external command. A redirected
+/// in-shell command — builtin or function — runs in the shell with the targets
+/// applied to its own descriptors around the call, since there is no child to
+/// configure. Backgrounding needs a child, so it goes through the pipeline path,
+/// which forks the stage.
 fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> Step {
     let Stage {
         words,
@@ -2436,12 +2440,12 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
     if redirs.is_empty() && !background {
         return run_command(words, last, shell);
     }
-    // An in-shell function runs inside the shell, so a redirection on it is applied
-    // to the shell's own descriptors for the duration of the call rather than
-    // configured on a child. Backgrounding still needs a child, so it stays
-    // unsupported and falls through to the message below.
-    if !background
-        && let Some(name) = command_name(&words, &shell.vars)
+    // A function takes typed arguments in every position, so it is resolved before
+    // the external argv rule turns a bare list into an error. Foreground: the
+    // redirection applies to the shell's own descriptors around the in-process
+    // call, since there is no child to configure. Background: there *is* a child —
+    // the fork the pipeline path makes.
+    if let Some(name) = command_name(&words, &shell.vars)
         && shell.funcs.get(&name).is_some()
     {
         // Expand the arguments *before* the targets are opened: `f * > summary`
@@ -2455,15 +2459,29 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
         let opened = match expand_redirs(redirs, &shell.vars) {
             Ok(redirs) => redirs,
             Err(err) => {
-                eprintln!("mesh: {err}");
+                note!("mesh: {err}");
                 return Step::Continue(1);
             }
         };
+        if background {
+            return Step::Continue(run_stages(
+                vec![exec::Cmd {
+                    words: vec![name],
+                    redirs: opened,
+                    pipe_stderr: false,
+                    in_shell: true,
+                }],
+                vec![StageBody::Function(args)],
+                background,
+                last,
+                shell,
+            ));
+        }
         return match exec::with_redirections(&opened, || dispatch_function_call(&name, args, shell))
         {
             Ok(step) => step,
             Err((path, err)) => {
-                eprintln!("mesh: {path}: {err}");
+                note!("mesh: {path}: {err}");
                 Step::Continue(1)
             }
         };
@@ -2471,132 +2489,218 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
     let argv = match expand::expand(words, &shell.vars) {
         Ok(argv) => argv,
         Err(err) => {
-            eprintln!("mesh: {err}");
+            note!("mesh: {err}");
             return Step::Continue(1);
         }
     };
     if argv.is_empty() {
-        eprintln!("mesh: redirection with no command is not supported yet");
+        note!("mesh: redirection with no command is not supported yet");
         return Step::Continue(1);
     }
     // `return` is control flow handled on the no-redirection path; with a
     // redirection or in the background it never reaches that handler, so reject
     // it rather than launch an external `return` while the body keeps running.
     if argv[0] == "return" {
-        eprintln!("mesh: return: cannot be redirected or backgrounded");
+        note!("mesh: return: cannot be redirected or backgrounded");
         return Step::Continue(2);
     }
-    if builtins::is_builtin(&argv[0]) {
-        if background {
-            eprintln!(
-                "mesh: {}: builtins cannot run in the background yet",
-                argv[0]
-            );
-        } else {
-            eprintln!(
-                "mesh: {}: redirection of a builtin is not supported yet",
-                argv[0]
-            );
-        }
-        return Step::Continue(1);
-    }
-    if shell.funcs.get(&argv[0]).is_some() {
-        eprintln!(
-            "mesh: {}: redirection or backgrounding of a function is not supported yet",
-            argv[0]
-        );
-        return Step::Continue(1);
-    }
-    match expand_redirs(redirs, &shell.vars) {
-        Ok(redirs) => Step::Continue(exec::run_pipeline(
-            vec![exec::Cmd {
-                words: argv,
-                redirs,
-                pipe_stderr: false,
-                in_shell: false,
-            }],
-            &mut shell.jobs,
-            background,
-            &mut |_| unreachable!("an external command is never an in-shell stage"),
-        )),
+    // A redirected builtin runs in the shell like a redirected function: the
+    // targets apply to the shell's own descriptors around the call, so there is
+    // nothing to configure on a child.
+    let builtin = builtins::is_builtin(&argv[0]);
+    let opened = match expand_redirs(redirs, &shell.vars) {
+        Ok(redirs) => redirs,
         Err(err) => {
-            eprintln!("mesh: {err}");
-            Step::Continue(1)
+            note!("mesh: {err}");
+            return Step::Continue(1);
         }
+    };
+    if builtin && !background {
+        return match exec::with_redirections(&opened, || run_expanded(argv, last, shell)) {
+            Ok(step) => step,
+            Err((path, err)) => {
+                note!("mesh: {path}: {err}");
+                Step::Continue(1)
+            }
+        };
     }
+    // Backgrounding needs a child even for an in-shell command, so it goes
+    // through the pipeline path, which forks for a builtin. (A function was
+    // resolved above, where its arguments keep their types.)
+    Step::Continue(run_stages(
+        vec![exec::Cmd {
+            words: argv,
+            redirs: opened,
+            pipe_stderr: false,
+            in_shell: builtin,
+        }],
+        vec![if builtin {
+            StageBody::Builtin
+        } else {
+            StageBody::External
+        }],
+        background,
+        last,
+        shell,
+    ))
 }
 
-/// Run a multi-stage pipeline (`a | b | c`). Every stage must be an external
-/// command; a builtin or function in a pipeline is not supported yet.
-fn run_multi(stages: Vec<Stage>, background: bool, shell: &mut Shell) -> Step {
+/// Run a multi-stage pipeline (`a | b | c`). Each stage is an external command, a
+/// builtin, or a function; the in-shell ones run in a forked stage so all the
+/// stages run concurrently.
+fn run_multi(stages: Vec<Stage>, background: bool, last: u8, shell: &mut Shell) -> Step {
     let mut cmds = Vec::with_capacity(stages.len());
+    let mut bodies = Vec::with_capacity(stages.len());
     for stage in stages {
         let Stage {
             words,
             redirs,
             pipe_stderr,
         } = stage;
-        let argv = match expand::expand(words, &shell.vars) {
-            Ok(argv) => argv,
-            Err(err) => {
-                eprintln!("mesh: {err}");
+        // Command words expand before the redirect targets, the order `run_single`
+        // uses, so a stage reports the same first failure the unpiped command
+        // does — and `f * > summary` cannot glob the file the redirection is
+        // about to create.
+        //
+        // Resolve a function *before* expanding for argv, exactly as
+        // `run_command` does, so a bare list argument reaches it as one typed
+        // value rather than meeting the external-command rule.
+        let function =
+            command_name(&words, &shell.vars).filter(|name| shell.funcs.get(name).is_some());
+        let (stage_words, body) = if let Some(name) = function {
+            let arg_words: Vec<Word> = words.into_iter().skip(1).collect();
+            let args = match expand_function_args(arg_words, &shell.vars) {
+                Ok(args) => args,
+                Err(step) => return step,
+            };
+            // The arguments are typed values, and mesh has no implicit
+            // stringification for a list or map, so only the name goes into the
+            // words a job listing echoes back.
+            (vec![name], StageBody::Function(args))
+        } else {
+            let argv = match expand::expand(words, &shell.vars) {
+                Ok(argv) => argv,
+                Err(err) => {
+                    note!("mesh: {err}");
+                    return Step::Continue(1);
+                }
+            };
+            if argv.is_empty() {
+                note!("mesh: empty command in a pipeline");
                 return Step::Continue(1);
             }
+            // `return` unwinds the enclosing function; it has no meaning as a
+            // pipeline stage, so reject it rather than launch an external
+            // `return`.
+            if argv[0] == "return" {
+                note!("mesh: return: cannot be used in a pipeline");
+                return Step::Continue(2);
+            }
+            let body = if builtins::is_builtin(&argv[0]) {
+                StageBody::Builtin
+            } else {
+                StageBody::External
+            };
+            (argv, body)
         };
-        if argv.is_empty() {
-            eprintln!("mesh: empty command in a pipeline");
-            return Step::Continue(1);
-        }
-        // `return` unwinds the enclosing function; it has no meaning as a pipeline
-        // stage, so reject it rather than launch an external `return`.
-        if argv[0] == "return" {
-            eprintln!("mesh: return: cannot be used in a pipeline");
-            return Step::Continue(2);
-        }
-        let in_shell = builtins::is_builtin(&argv[0]) || shell.funcs.get(&argv[0]).is_some();
-        let redirs = match expand_redirs(redirs, &shell.vars) {
+        let opened = match expand_redirs(redirs, &shell.vars) {
             Ok(redirs) => redirs,
             Err(err) => {
-                eprintln!("mesh: {err}");
+                note!("mesh: {err}");
                 return Step::Continue(1);
             }
         };
         cmds.push(exec::Cmd {
-            words: argv,
-            redirs,
+            words: stage_words,
+            redirs: opened,
             pipe_stderr,
-            in_shell,
+            in_shell: !matches!(body, StageBody::External),
         });
+        bodies.push(body);
     }
-    // The job table has to be borrowed separately from the rest of the shell,
-    // since an in-shell stage runs with `&mut Shell` while the pipeline holds the
-    // table. Moving it out and back keeps both borrows disjoint; the placeholder
-    // left behind is empty, so dropping it signals nothing.
+    Step::Continue(run_stages(cmds, bodies, background, last, shell))
+}
+
+/// What an in-shell stage runs, kept beside the `exec::Cmd` describing it.
+enum StageBody {
+    /// An external program: `exec` runs it, there is no in-shell body.
+    External,
+    /// A builtin, run from the stage's expanded words.
+    Builtin,
+    /// A function, with its arguments already expanded as **typed values** — the
+    /// same guarantee a plain call gives, so `f $xs` still passes one list.
+    Function(Vec<(Value, bool)>),
+}
+
+/// Run `cmds` as a pipeline, giving each in-shell stage the body in `bodies`
+/// (parallel to `cmds`) to run in its fork.
+///
+/// The job table is moved out of the shell for the call, since the pipeline holds
+/// it while a stage body holds `&mut Shell`; the child swaps it back before
+/// running, so a `jobs` stage still lists the real jobs.
+fn run_stages(
+    cmds: Vec<exec::Cmd>,
+    bodies: Vec<StageBody>,
+    background: bool,
+    last: u8,
+    shell: &mut Shell,
+) -> u8 {
+    debug_assert_eq!(cmds.len(), bodies.len());
     let mut jobs = std::mem::replace(&mut shell.jobs, exec::JobTable::new());
-    let status = exec::run_pipeline(cmds, &mut jobs, background, &mut |words| {
-        run_stage_in_shell(words, shell)
+    // No fork may reap: it is not the parent of the pids in the table it
+    // inherited, so its `waitpid` fails with `ECHILD` and reports every job as
+    // finished. The shell therefore refreshes the table before forking a stage
+    // that can *look* at it, and only such a stage: reaping removes finished jobs,
+    // so doing it for `puts hi | cat` would take a completed job out from under a
+    // later `fg`, which the unpiped `puts hi` leaves alone.
+    //
+    // A plain `jobs` qualifies (`jobs --help` and a misuse never reach the
+    // listing). So does any *function* stage, conservatively: its body can reach
+    // `jobs` and is not statically knowable.
+    //
+    // The `[N] Done` notice is the **shell's**, and stays here. It is not the
+    // stage's output even when a stage's `jobs` is what prompted the reap: bash
+    // writes it to the shell's stderr whether the command is piped or not
+    // (`jobs 2> log | cat` and `jobs 2> log` both leave `log` empty), and it is
+    // the only process that knows the reap happened. Handing it to a stage instead
+    // meant guessing which stage would run `jobs` — unknowable for a function
+    // body, and wrong outright with two of them — and losing the notice whenever
+    // that stage never started.
+    if !shell.forked
+        && cmds.iter().zip(&bodies).any(|(cmd, body)| match body {
+            StageBody::Builtin => cmd.words == ["jobs"],
+            StageBody::Function(_) => true,
+            StageBody::External => false,
+        })
+    {
+        jobs.reap();
+    }
+    let status = exec::run_pipeline(cmds, &mut jobs, background, &mut |index, cmd, jobs| {
+        std::mem::swap(&mut shell.jobs, jobs);
+        let status = run_stage_in_shell(&bodies[index], cmd, last, shell);
+        std::mem::swap(&mut shell.jobs, jobs);
+        status
     });
     shell.jobs = jobs;
-    Step::Continue(status)
+    status
 }
 
 /// Run a builtin or function that is a pipeline stage. Called in the forked
 /// child, so an `exit` ends that child and any state it changes dies with it.
 ///
-/// Arguments arrive as strings: a pipeline stage's argv went through ordinary
-/// word expansion, and the pipe between stages carries bytes either way, so
-/// there is no typed value to preserve across it.
-fn run_stage_in_shell(words: &[String], shell: &mut Shell) -> u8 {
-    if let Some(builtin) = builtins::dispatch(words, 0) {
-        return match builtin {
-            builtins::Builtin::Status(code) | builtins::Builtin::Exit(code) => code,
-        };
-    }
-    let args = words[1..]
-        .iter()
-        .map(|word| (Value::String(word.clone()), false))
-        .collect();
-    match dispatch_function_call(&words[0], args, shell) {
+/// `last` is the status the pipeline started from, which a status-sensitive
+/// builtin — a bare `exit` — still reads.
+fn run_stage_in_shell(body: &StageBody, cmd: &exec::Cmd, last: u8, shell: &mut Shell) -> u8 {
+    shell.forked = true;
+    let step = match body {
+        StageBody::Function(args) => dispatch_function_call(&cmd.words[0], args.clone(), shell),
+        // Not `builtins::dispatch`: `jobs`, `fg`, `bg`, and the prompt builtins
+        // are dispatched by the shell, and would otherwise fall through to an
+        // external lookup and report "command not found".
+        StageBody::Builtin => run_expanded(cmd.words.clone(), last, shell),
+        StageBody::External => unreachable!("an external stage has no in-shell body"),
+    };
+    match step {
         Step::Continue(code) | Step::Exit(code) => code,
         Step::Return(value) => status_of(&value),
     }
@@ -2638,7 +2742,7 @@ fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirectio
 /// truncating a target must not change what a glob argument matches.
 fn expand_function_args(arg_words: Vec<Word>, vars: &Vars) -> Result<Vec<(Value, bool)>, Step> {
     expand::expand_call_values(arg_words, vars).map_err(|err| {
-        eprintln!("mesh: {err}");
+        note!("mesh: {err}");
         Step::Continue(1)
     })
 }
@@ -2679,10 +2783,18 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
     let words = match expand::expand(tokens, &shell.vars) {
         Ok(words) => words,
         Err(err) => {
-            eprintln!("mesh: {err}");
+            note!("mesh: {err}");
             return Step::Continue(1);
         }
     };
+    run_expanded(words, last, shell)
+}
+
+/// Run a command whose words are already expanded: `return`, generated help, the
+/// prompt and job-control builtins, then the builtin → external chain. A function
+/// has already been resolved by the caller, which still has its unexpanded words
+/// and so can keep its arguments typed.
+fn run_expanded(words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     if words.is_empty() {
         // A command whose words all expanded away (e.g. a glob with no
         // matches) is an empty-list result — status 0 per `DESIGN.md`.
@@ -2701,10 +2813,18 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         "prompt-hook" => return configure_prompt_hook(&words[1..], shell),
         _ => {}
     }
+    // Job control belongs to the shell that owns the jobs. A forked stage is not
+    // the parent of those pids, so it can list what it inherited but cannot wait
+    // on them or hand them the terminal — the same answer bash gives in a
+    // subshell.
     let job_status = match words[0].as_str() {
+        "fg" | "bg" if shell.forked => {
+            note!("mesh: {}: no job control in a pipeline stage", words[0]);
+            Some(1)
+        }
         "fg" => Some(shell.jobs.foreground(&words[1..])),
         "bg" => Some(shell.jobs.background(&words[1..])),
-        "jobs" => Some(shell.jobs.list(&words[1..])),
+        "jobs" => Some(shell.jobs.list(&words[1..], !shell.forked)),
         _ => None,
     };
     if let Some(code) = job_status {
@@ -2735,8 +2855,11 @@ fn auto_help_requested_strings(args: &[String]) -> bool {
 fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
     match args {
         [] => {
-            println!("{}", shell.prompt.text.as_deref().unwrap_or("mesh$ "));
-            Step::Continue(0)
+            let text = shell.prompt.text.clone();
+            Step::Continue(builtins::print_line(
+                "prompt",
+                text.as_deref().unwrap_or("mesh$ "),
+            ))
         }
         [flag] if flag == "--reset" => {
             shell.prompt.text = None;
@@ -2747,7 +2870,7 @@ fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
             Step::Continue(0)
         }
         _ => {
-            eprintln!("mesh: prompt: expected one prompt string or --reset");
+            note!("mesh: prompt: expected one prompt string or --reset");
             Step::Continue(2)
         }
     }
@@ -2755,7 +2878,7 @@ fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
 
 fn configure_prompt_hook(args: &[String], shell: &mut Shell) -> Step {
     let invalid = || {
-        eprintln!("mesh: prompt-hook: expected [EVENT] NAME FUNCTION or --remove [EVENT] NAME");
+        note!("mesh: prompt-hook: expected [EVENT] NAME FUNCTION or --remove [EVENT] NAME");
         Step::Continue(2)
     };
     match args {
@@ -2789,7 +2912,7 @@ fn configure_prompt_hook(args: &[String], shell: &mut Shell) -> Step {
 
 fn register_prompt_hook(event: PromptEvent, name: &str, function: &str, shell: &mut Shell) -> Step {
     if shell.funcs.get(function).is_none() {
-        eprintln!("mesh: prompt-hook: `{function}` is not a function");
+        note!("mesh: prompt-hook: `{function}` is not a function");
         return Step::Continue(1);
     }
     if let Some(hook) = shell
@@ -2851,7 +2974,7 @@ fn make_return(args: &[String], shell: &Shell) -> Step {
         [] => Step::Return(shell.result.clone()),
         [value] => Step::Return(expand::typed_scalar(value)),
         _ => {
-            eprintln!("mesh: return: too many arguments");
+            note!("mesh: return: too many arguments");
             Step::Continue(1)
         }
     }
@@ -3121,17 +3244,17 @@ fn bind_scanned<'p>(
     let supplied = positional_values.len();
     if supplied < required {
         if has_rest || maximum > required {
-            eprintln!("mesh: {name}: expected at least {required} argument(s), got {supplied}");
+            note!("mesh: {name}: expected at least {required} argument(s), got {supplied}");
         } else {
-            eprintln!("mesh: {name}: expected {required} argument(s), got {supplied}");
+            note!("mesh: {name}: expected {required} argument(s), got {supplied}");
         }
         return Err(Step::Continue(2));
     }
     if !has_rest && supplied > maximum {
         if maximum > required {
-            eprintln!("mesh: {name}: expected at most {maximum} argument(s), got {supplied}");
+            note!("mesh: {name}: expected at most {maximum} argument(s), got {supplied}");
         } else {
-            eprintln!("mesh: {name}: expected {maximum} argument(s), got {supplied}");
+            note!("mesh: {name}: expected {maximum} argument(s), got {supplied}");
         }
         return Err(Step::Continue(2));
     }
@@ -3285,7 +3408,7 @@ fn evaluate_value_arguments<'p>(
 /// terminator just said would not be one.
 fn reject_option_after_terminator(name: &str, key: &str, flags_ended: bool) -> Result<(), Step> {
     if flags_ended {
-        eprintln!("mesh: {name}: option `{key}:` cannot follow `--`");
+        note!("mesh: {name}: option `{key}:` cannot follow `--`");
         return Err(Step::Continue(2));
     }
     Ok(())
@@ -3363,22 +3486,20 @@ fn bind_dashed_option<'p>(
         param.name == flag && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
     });
     let Some(declared) = declared else {
-        eprintln!("mesh: {name}: unknown flag `--{flag}`");
+        note!("mesh: {name}: unknown flag `--{flag}`");
         return Err(Step::Continue(2));
     };
     match &declared.kind {
         ParamKind::Switch => {
             if inline.is_some() {
-                eprintln!("mesh: {name}: flag `--{flag}` is a switch and takes no value");
+                note!("mesh: {name}: flag `--{flag}` is a switch and takes no value");
                 return Err(Step::Continue(2));
             }
             switches_on.insert(declared.name.as_str());
         }
         ParamKind::Flag(_) => {
             let Some(value) = inline else {
-                eprintln!(
-                    "mesh: {name}: flag `--{flag}` requires a value (write `--{flag}=VALUE`)"
-                );
+                note!("mesh: {name}: flag `--{flag}` requires a value (write `--{flag}=VALUE`)");
                 return Err(Step::Continue(2));
             };
             // Last occurrence wins for a valued flag. A bare literal value is typed
@@ -3411,13 +3532,13 @@ fn bind_named_option<'p>(
 ) -> Result<(), Step> {
     use parser::ParamKind;
     let Some(param) = params.iter().find(|param| param.name == key) else {
-        eprintln!("mesh: {name}: unknown option `{key}:`");
+        note!("mesh: {name}: unknown option `{key}:`");
         return Err(Step::Continue(2));
     };
     match &param.kind {
         ParamKind::Switch => {
             let Value::Boolean(on) = value else {
-                eprintln!(
+                note!(
                     "mesh: {name}: switch `{key}:` takes a boolean (`{key}: true` or `{key}: false`)"
                 );
                 return Err(Step::Continue(2));
@@ -3432,7 +3553,7 @@ fn bind_named_option<'p>(
             flag_values.insert(param.name.as_str(), value);
         }
         ParamKind::Required | ParamKind::Optional(_) | ParamKind::Rest => {
-            eprintln!(
+            note!(
                 "mesh: {name}: `{key}` is a positional parameter, passed by position not `{key}:`"
             );
             return Err(Step::Continue(2));
@@ -3455,7 +3576,7 @@ fn evaluate_default(
         exit @ Step::Exit(_) => exit,
         ret @ Step::Return(_) => ret,
         _ => {
-            eprintln!("mesh: {name}: could not evaluate default for `{param}`");
+            note!("mesh: {name}: could not evaluate default for `{param}`");
             Step::Continue(2)
         }
     })
@@ -3708,11 +3829,11 @@ fn expand_history_designators(
 
 fn run_interactive(options: &StartupOptions) -> ExitCode {
     if let Err(err) = wait_until_foreground() {
-        eprintln!("mesh: could not acquire terminal foreground: {err}");
+        note!("mesh: could not acquire terminal foreground: {err}");
         return ExitCode::from(1);
     }
     if let Err(err) = ignore_interactive_signals() {
-        eprintln!("mesh: could not configure interactive signals: {err}");
+        note!("mesh: could not configure interactive signals: {err}");
         return ExitCode::from(1);
     }
     let completion = Arc::new(RwLock::new(CompletionState::default()));
@@ -3745,7 +3866,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                     .with_history(Box::new(history))
                     .with_history_session_id(session);
             }
-            Err(err) => eprintln!("mesh: could not open history database: {err}"),
+            Err(err) => note!("mesh: could not open history database: {err}"),
         }
     }
     let mut shell = Shell::new();
@@ -3796,13 +3917,13 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                         ) {
                             Ok(expanded) => {
                                 if expanded != line {
-                                    eprintln!("{expanded}");
+                                    note!("{expanded}");
                                     rewritten = true;
                                 }
                                 Signal::Success(expanded)
                             }
                             Err(message) => {
-                                eprintln!("mesh: {message}");
+                                note!("mesh: {message}");
                                 // The line never runs, so drop the raw row
                                 // reedline stored for it before re-prompting.
                                 if let Some(session) = history_session {
@@ -3833,7 +3954,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                         rewritten,
                     )
                 {
-                    eprintln!("mesh: could not update history database: {err}");
+                    note!("mesh: could not update history database: {err}");
                 }
                 match handle_signal(signal, last, &mut shell, &mut pending) {
                     None => continue, // an unfinished `func` body: read the next line
@@ -3856,7 +3977,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                 }
             }
             Err(err) => {
-                eprintln!("mesh: line editor error: {err}");
+                note!("mesh: line editor error: {err}");
                 return ExitCode::from(run_logout(options, 1, &mut shell));
             }
         }
@@ -4386,7 +4507,7 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
             Ok(0) => break, // EOF
             Ok(_) => {}
             Err(err) => {
-                eprintln!("mesh: read error: {err}");
+                note!("mesh: read error: {err}");
                 return ExitCode::from(run_logout(options, 1, &mut shell));
             }
         }
@@ -4396,7 +4517,7 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
         let text: &str = match std::str::from_utf8(&line) {
             Ok(text) => text,
             Err(_) => {
-                eprintln!("mesh: invalid UTF-8 in input");
+                note!("mesh: invalid UTF-8 in input");
                 last = 1;
                 lossy = String::from_utf8_lossy(&line).into_owned();
                 if pending.is_empty() && !needs_more_input(&lossy) {

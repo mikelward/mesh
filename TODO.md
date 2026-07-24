@@ -50,8 +50,7 @@ file as tasks land.
       defaults, on external commands, functions, forked pipeline stages, and
       background commands. The digits must abut the operator, so `echo 2 > f`
       still writes "2". Deferred: descriptor *duplication* (`2>&1`, `&>`, `>&`,
-      `<&`), descriptors above 2, redirected builtins outside a pipeline, and
-      redirection without a command.
+      `<&`), descriptors above 2, and redirection without a command.
 - [x] Fork-based executor and process groups (`fork`/`exec`, `setpgid`,
       `tcsetpgrp`) so mesh can own the terminal and manage foreground jobs.
 - [x] Signal handling: terminal signals target the foreground process group;
@@ -143,8 +142,11 @@ file as tasks land.
 - [x] Redirecting a function (`f > out`, `f >> log`, `f < in`) — applied to the
       shell's own descriptors around the in-process call, so the body's output
       (including from externals it runs) lands in the target and stdout is
-      restored afterward. Still deferred: redirected builtins and backgrounding
-      an in-shell command.
+      restored afterward. A redirected **builtin** takes the same route.
+- [x] Backgrounding an in-shell command (`f &`, `puts hi &`) — the same fork a
+      pipeline stage gets, so the job joins the table like any other. A function
+      keeps its typed arguments as a stage and in the background, and a stage
+      runs with the status the pipeline started from, which a bare `exit` reads.
 - [x] Calling for a value — `f(arg, key: value, ...$spread)` returns the
       function's value (last expression, or an explicit `return`), with `key:`
       options binding the same parameter as `--flag`; command position (`f arg`)

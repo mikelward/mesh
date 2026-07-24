@@ -92,7 +92,7 @@ pub fn dispatch(words: &[String], last: u8) -> Option<Builtin> {
 /// `getcwd` path for now.
 fn cd(args: &[String]) -> u8 {
     if args.len() > 1 {
-        eprintln!("mesh: cd: too many arguments");
+        note!("mesh: cd: too many arguments");
         return 1;
     }
     // Keep targets as `OsString` so a non-UTF-8 `$HOME`/`$OLDPWD` reaches the OS
@@ -102,7 +102,7 @@ fn cd(args: &[String]) -> u8 {
         None => match env::var_os("HOME") {
             Some(home) => home,
             None => {
-                eprintln!("mesh: cd: HOME not set");
+                note!("mesh: cd: HOME not set");
                 return 1;
             }
         },
@@ -112,7 +112,7 @@ fn cd(args: &[String]) -> u8 {
                 old
             }
             None => {
-                eprintln!("mesh: cd: OLDPWD not set");
+                note!("mesh: cd: OLDPWD not set");
                 return 1;
             }
         },
@@ -122,7 +122,7 @@ fn cd(args: &[String]) -> u8 {
     let previous = env::current_dir().ok();
     let path = Path::new(&target);
     if let Err(err) = env::set_current_dir(path) {
-        eprintln!("mesh: cd: {}: {err}", path.display());
+        note!("mesh: cd: {}: {err}", path.display());
         return 1;
     }
 
@@ -143,6 +143,16 @@ fn cd(args: &[String]) -> u8 {
     status
 }
 
+/// Print `line` and a newline on stdout as a builtin does: `0` on success, `1`
+/// on a write error. Use this instead of `println!` anywhere a builtin's output
+/// can be redirected — `println!` panics on a failed write, which would abort the
+/// whole shell over `prompt >/dev/full`.
+pub(crate) fn print_line(label: &str, line: &str) -> u8 {
+    let mut bytes = line.as_bytes().to_vec();
+    bytes.push(b'\n');
+    write_stdout(label, &bytes)
+}
+
 /// The bytes to print for a path: its raw `OsStr` bytes plus a newline, so a
 /// non-UTF-8 path is emitted exactly rather than lossily via `Display`.
 fn path_line(path: &OsStr) -> Vec<u8> {
@@ -155,12 +165,12 @@ fn path_line(path: &OsStr) -> Vec<u8> {
 /// error. An ordinary I/O failure (a full disk, a closed pipe) must report a
 /// failure, never crash the REPL — so this never panics the way `println!` does.
 /// A broken pipe is silent (the reader went away), the way a shell takes SIGPIPE.
-fn write_stdout(label: &str, bytes: &[u8]) -> u8 {
+pub(crate) fn write_stdout(label: &str, bytes: &[u8]) -> u8 {
     match std::io::stdout().write_all(bytes) {
         Ok(()) => 0,
         Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => 1,
         Err(err) => {
-            eprintln!("mesh: {label}: {err}");
+            note!("mesh: {label}: {err}");
             1
         }
     }
@@ -171,13 +181,13 @@ fn write_stdout(label: &str, bytes: &[u8]) -> u8 {
 /// M0-level: no `-L`/`-P` flags and no logical-cwd tracking yet.
 fn pwd(args: &[String]) -> u8 {
     if !args.is_empty() {
-        eprintln!("mesh: pwd: too many arguments");
+        note!("mesh: pwd: too many arguments");
         return 1;
     }
     match env::current_dir() {
         Ok(dir) => write_stdout("pwd", &path_line(dir.as_os_str())),
         Err(err) => {
-            eprintln!("mesh: pwd: {err}");
+            note!("mesh: pwd: {err}");
             1
         }
     }
@@ -201,7 +211,7 @@ fn puts(args: &[String]) -> u8 {
 /// reports it and keeps running rather than exiting on it.
 fn exit(args: &[String], last: u8) -> Builtin {
     if args.len() > 1 {
-        eprintln!("mesh: exit: too many arguments");
+        note!("mesh: exit: too many arguments");
         return Builtin::Status(1);
     }
     match args.first() {
@@ -209,7 +219,7 @@ fn exit(args: &[String], last: u8) -> Builtin {
         Some(arg) => match arg.parse::<i64>() {
             Ok(code) => Builtin::Exit(code.rem_euclid(256) as u8),
             Err(_) => {
-                eprintln!("mesh: exit: {arg}: numeric argument required");
+                note!("mesh: exit: {arg}: numeric argument required");
                 Builtin::Exit(2)
             }
         },
