@@ -1858,7 +1858,10 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         && shell.funcs.get(&name).is_some()
     {
         let arg_words: Vec<Word> = tokens.into_iter().skip(1).collect();
-        let args = match expand::expand_values(arg_words, &shell.vars) {
+        // Each arg is tagged with whether it was a bare literal word, so an
+        // attached `--flag=value` types its value the same way the token would
+        // type positionally (see `expand::expand_call_values`).
+        let args = match expand::expand_call_values(arg_words, &shell.vars) {
             Ok(args) => args,
             Err(err) => {
                 eprintln!("mesh: {err}");
@@ -1920,8 +1923,9 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
     }
 }
 
-fn auto_help_requested(args: &[Value]) -> bool {
+fn auto_help_requested(args: &[(Value, bool)]) -> bool {
     args.iter()
+        .map(|(arg, _)| arg)
         .take_while(|arg| !matches!(arg, Value::String(value) if value == "--"))
         .any(|arg| matches!(arg, Value::String(value) if value == "--help"))
 }
@@ -2017,6 +2021,9 @@ fn run_prompt_hooks(event: PromptEvent, args: Vec<Value>, shell: &mut Shell) {
         .filter(|hook| hook.event == event)
         .map(|hook| hook.function.clone())
         .collect();
+    // Hook arguments are computed values (command text, status, elapsed), not
+    // user syntax, so none is a bare literal token.
+    let args: Vec<(Value, bool)> = args.into_iter().map(|value| (value, false)).collect();
     for function in hooks {
         let _ = call_func(&function, args.clone(), shell);
     }
@@ -2060,10 +2067,12 @@ fn make_return(args: &[String], last: u8) -> Step {
 /// the last command's status. A list argument counts as **one** positional (it
 /// arrives intact as a list value); a bad argument count or flag is a recoverable
 /// error.
-fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
+fn call_func(name: &str, args: Vec<(Value, bool)>, shell: &mut Shell) -> Step {
     let (params, body) = match shell.funcs.get(name) {
         Some(def) => (def.params.clone(), def.body.clone()),
-        None => return Step::Continue(exec::run(&[name.to_string()], &mut shell.jobs)),
+        None => {
+            return Step::Continue(exec::run(&[name.to_string()], &mut shell.jobs));
+        }
     };
 
     // Isolate the caller's loop state for the whole call — argument binding
@@ -2116,7 +2125,7 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
 fn bind_arguments(
     name: &str,
     params: &[parser::Param],
-    args: Vec<Value>,
+    args: Vec<(Value, bool)>,
     shell: &mut Shell,
 ) -> Result<(), Step> {
     use parser::ParamKind;
@@ -2140,7 +2149,7 @@ fn bind_arguments(
     let mut switches_on: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut flag_values: std::collections::HashMap<&str, Value> = std::collections::HashMap::new();
     let mut flags_ended = false;
-    for arg in args {
+    for (arg, bare) in args {
         if !flags_ended && let Value::String(text) = &arg {
             if text == "--" {
                 flags_ended = true;
@@ -2178,11 +2187,17 @@ fn bind_arguments(
                             );
                             return Err(Step::Continue(2));
                         };
-                        // Last occurrence wins for a valued flag. The attached
-                        // value is typed like any other scalar argument, so
-                        // `--n=2` binds the integer `2` — matching a positional
-                        // `2` and the flag's own default expression.
-                        flag_values.insert(declared.name.as_str(), expand::typed_scalar(&value));
+                        // Last occurrence wins for a valued flag. A bare literal
+                        // value is typed like the same token passed positionally,
+                        // so `--n=2` binds the integer `2`; a quoted or
+                        // interpolated value (`--n="2"`, `--n=$s`) keeps its
+                        // expanded string type.
+                        let value = if bare {
+                            expand::typed_scalar(&value)
+                        } else {
+                            Value::String(value)
+                        };
+                        flag_values.insert(declared.name.as_str(), value);
                     }
                     _ => unreachable!("only flags are collected here"),
                 }

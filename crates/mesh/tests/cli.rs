@@ -1921,6 +1921,19 @@ fn an_attached_flag_value_is_a_typed_scalar() {
 }
 
 #[test]
+fn an_interpolated_flag_value_keeps_its_string_type() {
+    // Only a bare literal token is typed; a quoted or interpolated value keeps its
+    // expanded string type, exactly like the same value passed positionally.
+    let out = run_with_input(
+        "s = \"2\"\nfunc add(--n = 1) { x = $n + 1; puts $x }\nadd --n=$s\nputs after\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // A string `"2"` is not coerced for arithmetic — same error as a positional string.
+    assert!(stderr.contains("expected integer"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
 fn a_break_in_a_default_does_not_escape_to_the_callers_loop() {
     // A function called from inside a loop whose omitted block-bearing default runs
     // `break` must report it as outside a loop, fail that call, and leave the
