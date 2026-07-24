@@ -3315,9 +3315,11 @@ to avoid" rather than promising the latter as done.
   **not** auto-bind its captures — capture goes through the value-side `:match`
   extractor, see [Matching](#matching-match) and [Destructuring](#destructuring).)*
   M3 **ships a multi-way pattern construct** in place of `case`
-  (literal/glob/`/regex/`/range/`_` arms; no single-arm sugar — `~` covers the
-  one-test case), currently spelled `match $x { … }`; its *spelling* (keyword and
-  prefix-vs-infix) is the open sub-question above, not a settled choice. **Tests**
+  (literal/glob/`/regex/`/range/`_` arms; no single-arm sugar — `~` covers the one-test
+  case only for the **string glob/regex** subset it shares with an arm, not literal,
+  range, or list-binding tests, see [Matching](#matching-match)), currently spelled
+  `match $x { … }`; its *spelling* (keyword and prefix-vs-infix) is the open
+  sub-question above, not a settled choice. **Tests**
   replace `[[ ]]` (`~`/`!~` pattern-match, type-directed
   comparisons, `$p:type`/`:exists`/`:exec` file tests, `and`/`or`/`not` vs command
   `&&`/`||`); the **postfix guard** `stmt if/unless cond` is the one-line form;
