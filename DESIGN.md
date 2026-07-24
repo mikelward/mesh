@@ -3301,10 +3301,15 @@ to avoid" rather than promising the latter as done.
   error → `$(…)`). Lambdas are `func(params) { … }` (anonymous, one param
   grammar), passed to `:map` / `:filter` / `:each`.
 - **Remaining function questions** — whether a **`func` defined inside a `func`**
-  is visible only there; and a **TODO — dynamic scope**: the "extract a chunk
+  is visible only there; a **TODO — dynamic scope**: the "extract a chunk
   into a subfunction" goal that fixed cwd as *persist* would be served further by
   letting an extracted helper see the caller's locals — weigh dynamic (or opt-in
-  dynamic) scope against the lexical default.
+  dynamic) scope against the lexical default; and an **open value-production
+  question** *(from the match-syntax exploration — see [Matching](#matching-match))*:
+  whether functions/blocks should require an **explicit value keyword** (`yield` /
+  `return`) instead of the settled implicit **last-expression** rule, which would also
+  make `{ … }` blocks pure command-context (reopening "bare RHS word is a literal
+  string"). Language-wide — it touches `if`, `match`, and `func` alike.
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
