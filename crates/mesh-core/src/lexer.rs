@@ -856,7 +856,7 @@ fn body_open_offset(text: &str) -> Option<usize> {
                 // the body opener so it buffers to the matching `}` and quarantines.
                 None => {
                     let params = &text[open + 1..];
-                    if params_valid(params, true) {
+                    if params_valid(params) {
                         None
                     } else {
                         params.find('{').map(|rel| open + 1 + rel)
@@ -914,7 +914,7 @@ fn header_awaits_body(text: &str) -> bool {
         // still be completed into a valid one (`func f(,` and `func f(a,,` can
         // never be repaired, so they dispatch immediately; `func f(...`, `func
         // f(--`, and `func f(a =` are valid new-form prefixes and keep reading).
-        None => params_valid(after_open, true),
+        None => params_valid(after_open),
         // Signature closed: hand the finished parameter list to the real parser so
         // any signature it rejects — a bad shape (`(,)`, `(a,a)`) *or* a malformed
         // default expression (`x = ]`) — dispatches immediately instead of
@@ -1010,222 +1010,75 @@ fn signature_close(after_open: &str) -> Option<usize> {
     None
 }
 
-/// Is the `func` parameter list `list` structurally valid enough to keep
-/// buffering? Mirrors the parser's signature grammar (`Parser::parameters`):
-/// each comma-separated segment is a positional (`name` / `name = expr`), a flag
-/// (`--name` / `--name = expr`), or a rest (`...name`). Only the parameter
-/// **name** is validated here (a valid, non-`env`, non-duplicate identifier);
-/// default *expressions* are left to the parser, which validates them and the
-/// ordering rules once the whole definition is in hand. `prefix` marks a
-/// still-forming list (`)` not yet seen), so the final segment may be an
-/// in-progress prefix and a trailing comma is repairable.
+/// Does the still-open `func` parameter list `list` (the text just past `(`, no
+/// `)` yet) let the definition keep buffering? Delegates to the **real** parser
+/// ([`crate::parser::params_prefix_status`]) so there is no second copy of the
+/// signature grammar to drift from it: only a shape the parser can never accept
+/// dispatches, while a valid or still-incomplete prefix keeps reading.
 ///
-/// The point is only buffer-vs-dispatch: anything the parser accepts must return
-/// `true` so a valid multi-line definition keeps reading, while a shape that can
-/// never be repaired (`,x`, `x,,y`, a bad/`env`/duplicate name) returns `false`
-/// so the malformed header dispatches instead of swallowing later commands.
-fn params_valid(list: &str, prefix: bool) -> bool {
-    if list.trim().is_empty() {
-        return true; // `()` so far, or nothing typed after `(` yet
-    }
-    let segments = split_top_level_commas(list);
-    let last = segments.len() - 1;
-    let mut names: Vec<String> = Vec::new();
-    let mut seen_optional = false;
-    let mut seen_rest = false;
-    for (index, raw) in segments.iter().enumerate() {
-        let segment = raw.trim();
-        if segment.is_empty() {
-            // An empty segment is a leading/interior/doubled comma — never valid —
-            // except a single trailing comma in a still-forming list (`func f(a,`).
-            // Once a `...rest` has closed the list nothing more may follow, so even
-            // that trailing comma is irreparable.
-            return prefix && index == last && !seen_rest;
-        }
-        let forming = prefix && index == last;
-        // Trailing whitespace — a space, or the line's own newline — finalizes the
-        // final segment's name (a token cannot span it). A finalized non-empty name
-        // is validated in full, so a duplicate or reserved final name (`func f(a,
-        // a`⏎, `func f(env`⏎) is rejected instead of buffering the next command; a
-        // bare `...`/`--` still awaiting its name stays forming and keeps reading.
-        let terminated = raw.ends_with(|c: char| c.is_whitespace());
-        if !segment_valid(segment, &mut names, forming, terminated) {
-            return false;
-        }
-        // Ordering (mirrors `Parser::parameters`): nothing may follow a `...rest`;
-        // a required positional may not follow an optional one; an optional and a
-        // rest cannot coexist. A flag/switch is order-independent. A bare final name
-        // the cursor is still extending is not yet fixed as required (it may still
-        // gain `= default`), so its required-after-optional check waits for the
-        // token to finalize.
-        if seen_rest {
-            return false; // a parameter after the rest can never be repaired
-        }
-        let still_extending = forming && !terminated;
-        match order_kind(segment) {
-            OrderKind::Rest => seen_rest = true,
-            OrderKind::Optional => seen_optional = true,
-            OrderKind::Required if seen_optional && !still_extending => return false,
-            _ => {}
-        }
-    }
-    // An optional positional and a `...rest` cannot usefully coexist.
-    !(seen_optional && seen_rest)
-}
-
-/// The ordering-relevant classification of a (structurally valid) parameter
-/// segment, mirroring the kinds `Parser::parameters` sequences: a `...rest`, an
-/// order-independent flag/switch (`--name`), an optional positional (`name =
-/// default`), or a required positional (`name`).
-enum OrderKind {
-    Rest,
-    Flag,
-    Optional,
-    Required,
-}
-
-fn order_kind(segment: &str) -> OrderKind {
-    if segment.starts_with("...") {
-        OrderKind::Rest
-    } else if segment.starts_with("--") {
-        OrderKind::Flag
-    } else if segment.contains('=') {
-        OrderKind::Optional
-    } else {
-        OrderKind::Required
+/// The reader-specific concern is a final token the user may still be typing.
+/// [`strip_growing_tail`] removes it so the parser judges only the settled prefix
+/// — a growing bare word (`a = 1, b`, where `b` may yet become `b = 2`) or a
+/// growing string. Whether a growing string is allowed depends on where it sits:
+/// after a `=` the parser is still expecting a value (an unterminated, possibly
+/// multi-line string default keeps buffering), but at a name boundary a string
+/// can never be a parameter name, so it dispatches.
+fn params_valid(list: &str) -> bool {
+    use crate::parser::PrefixStatus;
+    let (settled, tail) = strip_growing_tail(list);
+    match crate::parser::params_prefix_status(settled) {
+        PrefixStatus::Malformed => false,
+        // Still expecting more (a value after `=`, another parameter after `,`):
+        // any growing tail — a name, a string default — is fine, keep reading.
+        PrefixStatus::Incomplete => true,
+        // A clean boundary: a parameter name is expected next. A growing bare word
+        // is a valid name-start, but a growing string can never be a name.
+        PrefixStatus::Complete => !matches!(tail, GrowingTail::Quote),
     }
 }
 
-/// Validate one parameter segment for [`params_valid`]. Classifies it as a rest,
-/// flag, or positional and checks its name; `forming` allows the name to be a
-/// still-growing prefix (only meaningful for the list's final segment).
-fn segment_valid(segment: &str, names: &mut Vec<String>, forming: bool, terminated: bool) -> bool {
-    if let Some(rest) = segment.strip_prefix("...") {
-        // The name must abut `...` (documented `...name`): whitespace between the
-        // `...` and the name is not a rest parameter, matching the parser. A rest
-        // takes no default, so an `=` makes it unrepairable. An empty `rest` is a
-        // bare `...` still awaiting its name, handled by `validate_name`.
-        let adjacent = !rest.starts_with(|c: char| c.is_whitespace());
-        return adjacent
-            && !rest.contains('=')
-            && validate_name(rest.trim(), names, forming, terminated);
-    }
-    let body = match segment.strip_prefix("--") {
-        // A flag name must abut `--` (`--name`), just as the parser reads it from a
-        // single `--name` word: whitespace after `--` is not a flag. An empty body
-        // is a bare `--` still awaiting its name, left to `validate_name`.
-        Some(body) if body.starts_with(|c: char| c.is_whitespace()) => return false,
-        Some(body) => body,
-        None => segment,
-    };
-    // A default detaches at the first `=`; once present, the name is finalized.
-    match body.split_once('=') {
-        // The `=` must sit on the same line as the name: a newline between them
-        // finalizes the name (the parser can no longer attach the default), so
-        // `func f(a⏎= 1)` / `--flag⏎= 1` is irreparable. A newline *after* the `=`
-        // is fine — the default expression may span lines — and is left to the
-        // default (`_default`), which the parser validates once the list closes.
-        Some((name, _default)) => {
-            !name.contains('\n') && validate_name(name.trim(), names, false, terminated)
-        }
-        None => validate_name(body.trim(), names, forming, terminated),
-    }
+/// A final token in a parameter list that the user may still be extending.
+enum GrowingTail {
+    /// Nothing strippable — the list ends at a settled boundary.
+    None,
+    /// A trailing bare word abutting end-of-input (a growing name/`--flag`/rest).
+    Word,
+    /// A trailing unterminated string (`x = "ab…`) — its value is still being
+    /// typed and may run onto later lines.
+    Quote,
 }
 
-/// Check a parameter `name` for [`segment_valid`]. A finalized name must be a
-/// valid, non-`env`, non-duplicate identifier (and is recorded for later
-/// duplicate checks); a still-`forming` one whose token the cursor is still
-/// extending need only be a valid identifier prefix. `terminated` marks a final
-/// name trailing whitespace already ended, so it is validated in full even while
-/// forming. An empty name (a `...` / `--` prefix mid-type) is acceptable only
-/// while forming *and* not yet terminated: the parser skips no whitespace between
-/// either prefix and its required name, so `func f(...`⏎ / `func f(--`⏎ can never
-/// be completed and must dispatch rather than buffer the following command.
-fn validate_name(name: &str, names: &mut Vec<String>, forming: bool, terminated: bool) -> bool {
-    if name.is_empty() {
-        return forming && !terminated;
-    }
-    if forming && !terminated {
-        return is_ident_prefix(name);
-    }
-    if !is_ident(name) || name == "env" || names.iter().any(|existing| existing == name) {
-        return false;
-    }
-    names.push(name.to_owned());
-    true
-}
-
-/// Split a parameter list on its top-level commas, ignoring commas nested inside
-/// brackets, parentheses, braces, or quotes (which can appear in a default
-/// expression, e.g. `x = [a, b]` or `x = "a,b"`). Quotes are skipped with the
-/// lexer's own escape and raw-string rules, so an escaped quote (`x = "a\",b"`)
-/// does not end the string early. A trailing comma yields a final empty segment.
-fn split_top_level_commas(list: &str) -> Vec<String> {
-    let chars: Vec<(usize, char)> = list.char_indices().collect();
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0i32;
-    // `word_start` is true at a token boundary (start, or after whitespace or any
-    // punctuation), matching where the tokenizer would begin a fresh word, so a
-    // `#` there is a comment and an `r'…'` is a raw string.
-    let mut word_start = true;
-    let mut k = 0;
-    let push_range = |current: &mut String, from: usize, to: usize| {
-        current.extend(chars[from..to].iter().map(|&(_, c)| c));
-    };
-    while k < chars.len() {
-        let c = chars[k].1;
-        let raw_eligible = word_start;
-        // Only a bareword-continuation char keeps us mid-token; every other
-        // character is a token boundary.
-        word_start = !(c.is_alphanumeric() || c == '_' || c == '-');
-        match c {
-            // The char after a closing quote continues the same word (a bare `#`
-            // there is literal), so leave `word_start` false.
-            '\'' | '"' => {
-                let end = skip_quote(&chars, k + 1, c, true).unwrap_or(chars.len());
-                push_range(&mut current, k, end);
-                k = end;
-                word_start = false;
-            }
-            'r' if raw_eligible
-                && matches!(chars.get(k + 1).map(|&(_, c)| c), Some('\'') | Some('"')) =>
+/// Split off a final token that abuts the end of `list` and is still being typed,
+/// returning the settled prefix before it and what kind of tail it was. Trailing
+/// whitespace means the last token is already settled, so `list` is returned
+/// whole with [`GrowingTail::None`]. A growing token implies no newline has been
+/// typed yet, so there is never a following command to swallow — buffering it is
+/// safe, and the settled prefix is what [`params_valid`] hands to the parser.
+fn strip_growing_tail(list: &str) -> (&str, GrowingTail) {
+    match crate::parser::tokenize(list) {
+        Ok(tokens) => match tokens.last() {
+            Some(last)
+                if matches!(last.value, crate::parser::TokenKind::Word(_))
+                    && last.span.end == list.len() =>
             {
-                let end = skip_quote(&chars, k + 2, chars[k + 1].1, false).unwrap_or(chars.len());
-                push_range(&mut current, k, end);
-                k = end;
-                word_start = false;
+                (&list[..last.span.start], GrowingTail::Word)
             }
-            '\\' => {
-                push_range(&mut current, k, (k + 2).min(chars.len()));
-                k += 2;
-            }
-            // A bare `#` at a word boundary is a comment through the newline; drop
-            // it (its `,` is not a separator and its text is not part of the name).
-            '#' if raw_eligible => {
-                let end = chars[k..]
-                    .iter()
-                    .position(|&(_, c)| c == '\n')
-                    .map_or(chars.len(), |offset| k + offset);
-                k = end;
-            }
-            ',' if depth == 0 => {
-                segments.push(std::mem::take(&mut current));
-                k += 1;
-            }
-            _ => {
-                if matches!(c, '(' | '[' | '{') {
-                    depth += 1;
-                } else if matches!(c, ')' | ']' | '}') {
-                    depth = (depth - 1).max(0);
-                }
-                current.push(c);
-                k += 1;
-            }
+            _ => (list, GrowingTail::None),
+        },
+        // Tokenizing failed on an unterminated string: strip from the opening
+        // quote (its span starts there) so the settled prefix before it decides.
+        // Any other tokenize failure isn't a growing tail — leave it for the
+        // parser to reject.
+        Err(error)
+            if matches!(
+                error.kind,
+                crate::parser::ParseErrorKind::Unterminated('\'' | '"')
+            ) =>
+        {
+            (&list[..error.span.start], GrowingTail::Quote)
         }
+        Err(_) => (list, GrowingTail::None),
     }
-    segments.push(current);
-    segments
 }
 
 /// The result of a bare-level brace scan (see [`scan_braces`]).
@@ -2269,6 +2122,16 @@ mod tests {
         assert!(needs_more_input("func f(--"));
         assert!(!needs_more_input("func f(...\n"));
         assert!(!needs_more_input("func f(--\n"));
+        // A reserved or duplicate name is rejected even when its default is still
+        // unfinished — finishing the default can never make the name valid — so it
+        // dispatches rather than buffering the next line into the definition. A
+        // valid name with an unfinished default still buffers (the default may run
+        // onto later lines).
+        assert!(!needs_more_input("func f(env =\n"));
+        assert!(!needs_more_input("func f(a, a =\n"));
+        assert!(!needs_more_input("func f(--env =\n"));
+        assert!(needs_more_input("func f(a =\n"));
+        assert!(needs_more_input("func f(a, b =\n"));
     }
 
     #[test]
@@ -2302,6 +2165,50 @@ mod tests {
         assert!(!needs_more_input("func f(-- force\n"));
         assert!(needs_more_input("func f(...xs\n"));
         assert!(needs_more_input("func f(--force\n"));
+    }
+
+    #[test]
+    fn the_reader_and_parser_agree_on_signature_validity() {
+        // The reader's still-forming check delegates to the parser, so the two can
+        // never disagree about whether a closed signature is valid. For a matrix of
+        // parameter lists, a newline-terminated open header dispatches exactly when
+        // the parser rejects the same list closed — a growing (unterminated) final
+        // token is the only reader-specific exception, so terminate each list.
+        for list in [
+            "",
+            "a",
+            "a, b",
+            "a = 1",
+            "a = 1, b = 2",
+            "--force",
+            "--tag = latest",
+            "...xs",
+            "a, ...xs",
+            "a, --force, ...xs",
+            "env",
+            "a, a",
+            "a = 1, b",
+            "...xs, a",
+            "a = 1, ...xs",
+            "... xs",
+            "-- force",
+            "...\nxs",
+            "a\n= 1",
+            "a b",
+            "a,,b",
+            ",a",
+            "a = ]",
+        ] {
+            let parser_accepts = matches!(
+                crate::parser::parse(&format!("func f({list}) {{}}")),
+                Ok(crate::parser::ParseOutcome::Complete(_))
+            );
+            let reader_buffers = needs_more_input(&format!("func f({list}\n"));
+            assert_eq!(
+                parser_accepts, reader_buffers,
+                "disagreement on {list:?}: parser_accepts={parser_accepts} reader_buffers={reader_buffers}"
+            );
+        }
     }
 
     #[test]
