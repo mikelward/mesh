@@ -19,6 +19,30 @@ cargo run -p mesh      # start the shell
 cargo test --workspace # run the tests
 ```
 
+## Installing
+
+This repository is a Cargo workspace, so its root `Cargo.toml` is a *virtual*
+manifest with no package of its own. A bare `cargo install` — which installs the
+current directory, like `cargo install --path .` — therefore fails from the root
+with:
+
+```
+error: found a virtual manifest instead of a package manifest
+```
+
+Point `--path` at the `mesh` package instead of the workspace root. Installing
+from git needs no such qualifier: `mesh` is the workspace's only installable
+binary, so Cargo selects it automatically.
+
+```sh
+cargo install --locked --path crates/mesh                  # from a local checkout
+cargo install --locked --git https://github.com/mikelward/mesh   # straight from git
+```
+
+`--locked` installs the exact dependency versions from the committed `Cargo.lock`
+rather than re-resolving to newer ones. Both commands place a `mesh` binary in
+`~/.cargo/bin`.
+
 ## Releases
 
 Every push to `main` publishes a Linux x86-64 binary. The version is
