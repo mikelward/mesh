@@ -2781,11 +2781,14 @@ finds your last command, while another *live* terminal's commands never become y
 - **`!!`** — the previous command line.
 - **`!string`** — the most recent command that *starts with* `string`
   (`!git` → your last `git …`).
-- **`!$`** — the last argument of the previous command *line*. Because expansion
-  reads the stored history (not the current input), it refers to a *separately
-  submitted* line: run `mkdir foo`, then on the next line `cd !$` → `foo` (not the
-  same-line `mkdir foo; cd !$`, where `mkdir foo` isn't in history yet).
-  (`!*` for all args, and `!n` / `!-n` by index, are natural extensions — deferred.)
+- **`!^`** / **`!$`** / **`!*`** — word designators on the previous command
+  *line*: `!^` its first argument, `!$` its last, `!*` all of them (joined by
+  spaces). An empty argument list leaves `!*` empty but makes `!^` / `!$` an error,
+  as does having no previous command. Because expansion reads the stored history
+  (not the current input), they refer to a *separately submitted* line: run
+  `mkdir foo`, then on the next line `cd !$` → `foo` (not the same-line
+  `mkdir foo; cd !$`, where `mkdir foo` isn't in history yet).
+  (`!n` / `!-n` by index are natural extensions — deferred.)
 - **Substitution** — two spellings: the terse **`^old^new`** for the everyday
   "fix my last command" (line-start; previous command), and a general
   **`:old=new`** modifier on *any* history reference (`!!:foo=bar`,
@@ -2798,10 +2801,11 @@ finds your last command, while another *live* terminal's commands never become y
   (`!git:old\ thing=new\ thing`). `^old^new` is just shorthand for `!!:old=new`.
 
 **The `!` clash is resolved lexically:** `!` introduces an expansion only when
-immediately followed by a **supported designator** — `!` (→ `!!`), `$` (→ `!$`), or
-a word character (→ `!string`). A digit, `-`, or `*` does **not** activate
-expansion in the MVP (they are reserved for the deferred `!n` / `!-n` / `!*`), and
-neither do `=` / `~` (the operators `!=` / `!~`) or a lone `!` — all left literal. Two safety wins over bash: expansion happens **only unquoted** —
+immediately followed by a **supported designator** — `!` (→ `!!`), `^` (→ `!^`),
+`$` (→ `!$`), `*` (→ `!*`), or a word character (→ `!string`). A digit or `-` does
+**not** activate expansion in the MVP (they are reserved for the deferred `!n` /
+`!-n`), and neither do `=` / `~` (the operators `!=` / `!~`) or a lone `!` — all
+left literal. Two safety wins over bash: expansion happens **only unquoted** —
 *both* single and double quotes make `!` literal (bash expanding `!` inside double
 quotes is a classic footgun) — with `\!` to escape and a
 **`$sh.options.histexpand = off`** switch to turn it off entirely.
@@ -3232,7 +3236,8 @@ to avoid" rather than promising the latter as done.
   literal suffix rather than member access ([Variables and assignment](#variables-and-assignment)).
 - **Predicate qualifier syntax** — confirm `size >` / `age <` / `mtime <` forms.
 - **History expansion — decided** ([History expansion](#history-expansion)):
-  interactive-only, quote-safe `!!` / `!string` / `!$` (with `!*` / `!n` deferred);
+  interactive-only, quote-safe `!!` / `!string` / `!^` / `!$` / `!*` (with `!n`
+  by index deferred);
   the `!` clash resolved lexically (a designator must follow, so `!=` / `!~` and a
   lone `!` are untouched); both quotes make `!` literal, `\!` escapes, and
   `$sh.options.histexpand = off` disables it. Substitution is a chainable,

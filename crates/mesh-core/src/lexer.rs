@@ -1147,6 +1147,238 @@ pub fn scan_braces(text: &str, start_depth: i32) -> BraceScan {
     BraceScan { close, depth }
 }
 
+/// Locate the interactive `!^` / `!$` / `!*` history word designators in `line`
+/// that sit in bare (unquoted, unescaped) text, honoring the lexer's quote,
+/// escape, raw-string, and interpolation rules so a designator inside any of them
+/// stays literal. Strings span physical lines exactly as the lexer parses them,
+/// so `prefix` — the already-buffered lines of a multi-line command — seeds the
+/// quote and raw-eligibility state. Returns each designator's byte offset within
+/// `line` (not the combined text) and its character, left to right.
+pub fn history_designators(prefix: &str, line: &str) -> Vec<(usize, char)> {
+    let prefix_len = prefix.len();
+    let combined: Vec<(usize, char)> = prefix
+        .char_indices()
+        .chain(line.char_indices().map(|(byte, c)| (byte + prefix_len, c)))
+        .collect();
+    let mut hits = Vec::new();
+    // Raw-string eligibility, tracked exactly as `split_line` / `scan_braces`.
+    let mut word_start = true;
+    let mut after_equals = false;
+    // Heredoc delimiters queued on the current line, consumed at its newline.
+    let mut heredocs: Vec<String> = Vec::new();
+    let mut k = 0;
+    while k < combined.len() {
+        let (byte, c) = combined[k];
+        let raw_eligible = word_start || after_equals;
+        word_start = false;
+        after_equals = false;
+        match c {
+            // The newline after a `<<delim` line begins the queued heredoc bodies;
+            // their raw document text never expands, so skip past each body and its
+            // closing delimiter line (as `consume_heredocs` records them).
+            '\n' if !heredocs.is_empty() => {
+                k += 1;
+                for delimiter in std::mem::take(&mut heredocs) {
+                    loop {
+                        let line_start = k;
+                        while k < combined.len() && combined[k].1 != '\n' {
+                            k += 1;
+                        }
+                        let mut body_line: String =
+                            combined[line_start..k].iter().map(|&(_, c)| c).collect();
+                        if body_line.ends_with('\r') {
+                            body_line.pop();
+                        }
+                        let at_end = k >= combined.len();
+                        if !at_end {
+                            k += 1;
+                        }
+                        if body_line == delimiter || at_end {
+                            break;
+                        }
+                    }
+                }
+                word_start = true;
+            }
+            _ if c.is_whitespace() => {
+                word_start = true;
+                k += 1;
+            }
+            // A bare backslash escapes the next char, so `\!` / `\'` are literal.
+            // A `\`-newline is a line continuation the parser drops without
+            // starting a word, so it preserves token-start eligibility (a comment
+            // or raw prefix can still begin the next line); any other escaped char
+            // becomes word text.
+            '\\' => {
+                if combined.get(k + 1).map(|&(_, c)| c) == Some('\n') {
+                    word_start = raw_eligible;
+                }
+                k += 2;
+            }
+            '\'' | '"' => k = skip_string(&combined, k + 1, c, true),
+            'r' if raw_eligible
+                && matches!(combined.get(k + 1).map(|&(_, c)| c), Some('\'') | Some('"')) =>
+            {
+                k = skip_string(&combined, k + 2, combined[k + 1].1, false);
+            }
+            '$' if combined.get(k + 1).map(|&(_, c)| c) == Some('{') => {
+                k = skip_interpolation(&combined, k + 2);
+            }
+            // A bare `#` (at a token start) begins a comment: the parser discards
+            // the rest of the physical line, so no designator past it expands.
+            '#' if raw_eligible => {
+                while k < combined.len() && combined[k].1 != '\n' {
+                    k += 1;
+                }
+            }
+            '!' => match combined.get(k + 1).map(|&(_, c)| c) {
+                Some(designator @ ('^' | '$' | '*')) => {
+                    if byte >= prefix_len {
+                        hits.push((byte - prefix_len, designator));
+                    }
+                    k += 2;
+                }
+                // `!=` / `!~` are operator tokens, hence word boundaries; a lone
+                // `!` is ordinary word text.
+                Some('=' | '~') => {
+                    word_start = true;
+                    k += 2;
+                }
+                _ => k += 1,
+            },
+            // `<<` is the heredoc operator: capture its delimiter word so the body
+            // on the following line(s) can be skipped as literal document text.
+            // A bare designator in the delimiter still expands, so its hit is
+            // recorded while the delimiter is read.
+            '<' if combined.get(k + 1).map(|&(_, c)| c) == Some('<') => {
+                let (delimiter, next) =
+                    read_heredoc_delimiter(&combined, k + 2, prefix_len, &mut hits);
+                if let Some(delimiter) = delimiter {
+                    heredocs.push(delimiter);
+                }
+                word_start = true;
+                k = next;
+            }
+            // Punctuation the parser's tokenizer treats as its own token is a word
+            // boundary, so the next word is fresh and a raw prefix there is raw:
+            // the first word of a compact `func f(){…}` body or `f(…, …)` call,
+            // and — since the parser re-merges adjacent tokens into a command word
+            // — the raw prefix in `key:r'…'` or `a.r'…'` too.
+            '{' | '}' | '(' | ')' | '[' | ']' | ',' | ':' | '.' | ';' | '|' | '<' | '>' => {
+                word_start = true;
+                k += 1;
+            }
+            '&' => {
+                word_start = true;
+                k += if combined.get(k + 1).map(|&(_, c)| c) == Some('&') {
+                    2
+                } else {
+                    1
+                };
+            }
+            '=' => {
+                after_equals = true;
+                k += 1;
+            }
+            _ => k += 1,
+        }
+    }
+    hits
+}
+
+/// Read a heredoc delimiter word starting just past `<<`, returning its text
+/// (quotes stripped and pieces concatenated, matching `word.text()`) and the
+/// index after it. Leading spaces/tabs are skipped; the word is a run of bare,
+/// quoted, and escaped pieces (`"EO"F` → `EOF`) ending at whitespace or token
+/// punctuation. A bare `!^` / `!$` / `!*` in the delimiter is a designator that
+/// still expands, so its hit is recorded (respecting the `prefix` boundary).
+/// Returns `None` when no delimiter word is present.
+fn read_heredoc_delimiter(
+    chars: &[(usize, char)],
+    mut k: usize,
+    prefix_len: usize,
+    hits: &mut Vec<(usize, char)>,
+) -> (Option<String>, usize) {
+    while k < chars.len() && matches!(chars[k].1, ' ' | '\t') {
+        k += 1;
+    }
+    let mut delimiter = String::new();
+    let mut consumed = false;
+    while let Some(&(byte, ch)) = chars.get(k) {
+        match ch {
+            ' ' | '\t' | '\n' => break,
+            '{' | '}' | '(' | ')' | '[' | ']' | ',' | ':' | '.' | ';' | '|' | '<' | '>' | '&'
+            | '=' => break,
+            '\'' | '"' => {
+                consumed = true;
+                k += 1;
+                while let Some(&(_, inner)) = chars.get(k) {
+                    if inner == '\\'
+                        && let Some(&(_, escaped)) = chars.get(k + 1)
+                    {
+                        delimiter.push(escaped);
+                        k += 2;
+                        continue;
+                    }
+                    if inner == ch {
+                        k += 1;
+                        break;
+                    }
+                    delimiter.push(inner);
+                    k += 1;
+                }
+            }
+            '\\' => {
+                consumed = true;
+                if let Some(&(_, escaped)) = chars.get(k + 1) {
+                    delimiter.push(escaped);
+                    k += 2;
+                } else {
+                    k += 1;
+                }
+            }
+            '!' if matches!(chars.get(k + 1).map(|&(_, c)| c), Some('^' | '$' | '*')) => {
+                let designator = chars[k + 1].1;
+                if byte >= prefix_len {
+                    hits.push((byte - prefix_len, designator));
+                }
+                delimiter.push('!');
+                delimiter.push(designator);
+                consumed = true;
+                k += 2;
+            }
+            _ => {
+                delimiter.push(ch);
+                consumed = true;
+                k += 1;
+            }
+        }
+    }
+    (consumed.then_some(delimiter), k)
+}
+
+/// Skip from just past an opening `quote` to just past its close, using the
+/// lexer's string rules: with `escapes`, a backslash escapes the next char (so
+/// `\'` / `\"` do not close). Unlike [`skip_quote`], a newline is an ordinary
+/// character — `"…"` / `'…'` span physical lines exactly as [`lex_escaped`]
+/// parses them — and an unterminated string runs to the end of the text. Returns
+/// the index past the close, or past the end when unterminated.
+fn skip_string(chars: &[(usize, char)], start: usize, quote: char, escapes: bool) -> usize {
+    let mut k = start;
+    while k < chars.len() {
+        let c = chars[k].1;
+        if escapes && c == '\\' {
+            k += 2;
+            continue;
+        }
+        if c == quote {
+            return k + 1;
+        }
+        k += 1;
+    }
+    k
+}
+
 /// Skip a bare `${…}` interpolation from just past the `{`. Its braces do not
 /// count as block structure. Stops at the closing `}` or a line break.
 fn skip_interpolation(chars: &[(usize, char)], start: usize) -> usize {
@@ -1541,6 +1773,101 @@ mod tests {
     fn unterminated_quote_is_an_error() {
         assert_eq!(split("'oops"), Err(LexError::UnterminatedQuote('\'')));
         assert_eq!(split(r"r'oops"), Err(LexError::UnterminatedQuote('\'')));
+    }
+
+    use super::history_designators;
+
+    #[test]
+    fn history_designators_finds_only_bare_bangs() {
+        // Bare designators are located by byte offset, left to right.
+        assert_eq!(
+            history_designators("", "cp !^ !$"),
+            vec![(3, '^'), (6, '$')]
+        );
+        // Quotes, raw strings, escapes, and interpolation keep a bang literal.
+        assert!(history_designators("", "puts '!$'").is_empty());
+        assert!(history_designators("", "puts \"!$\"").is_empty());
+        assert!(history_designators("", "puts r'!$'").is_empty());
+        assert!(history_designators("", "puts \\!$").is_empty());
+        assert!(history_designators("", "puts ${!$}").is_empty());
+        // mesh single quotes escape `\'`, so the string stays open across it.
+        assert!(history_designators("", "puts 'can\\'t !$'").is_empty());
+        // `!=` / `!~` and a lone bang are not designators.
+        assert!(history_designators("", "test 1 != 2 !~ x !").is_empty());
+    }
+
+    #[test]
+    fn history_designators_treat_delimiters_as_word_boundaries() {
+        // A compact body opens a fresh word after `{`, so `r'x\'` is a raw string
+        // (no escapes) and the following `!$` is bare and found.
+        assert_eq!(
+            history_designators("", r"func f(){r'x\' !$}"),
+            vec![(15, '$')]
+        );
+        // Likewise inside a compact call argument list: `(` and `,` are fresh
+        // words, so the raw string ends at its quote and `!$` is bare.
+        assert_eq!(history_designators("", r"f(r'x\', !$)"), vec![(9, '$')]);
+        // A colon is a token boundary too, so the raw prefix in `key:r'…'` is raw
+        // and the trailing `!$` is bare.
+        assert_eq!(
+            history_designators("", r"puts key:r'x\' !$"),
+            vec![(15, '$')]
+        );
+    }
+
+    #[test]
+    fn history_designators_skip_comments() {
+        // A bare `#` starts a comment; nothing after it on the line expands.
+        assert!(history_designators("", "# !$").is_empty());
+        assert!(history_designators("", "puts hi # !$").is_empty());
+        // A `#` in the middle of a word is literal, so the `!$` still expands.
+        assert_eq!(history_designators("", "puts a#!$"), vec![(7, '$')]);
+        // A comment on a buffered line does not suppress the next line.
+        assert_eq!(history_designators("puts x # note\n", "!$"), vec![(0, '$')]);
+        // A `\`-newline continuation keeps token-start eligibility, so a `#` that
+        // opens the continued line is still a comment.
+        assert!(history_designators("func f() { \\\n", "# !$").is_empty());
+        // `!~` / `!=` are operator tokens, so an adjacent `#` still starts a
+        // comment and the trailing designator is ignored.
+        assert!(history_designators("", "puts a!~# !$").is_empty());
+        assert!(history_designators("", "puts a!=# !$").is_empty());
+    }
+
+    #[test]
+    fn history_designators_skip_heredoc_bodies() {
+        // A heredoc body is raw document text — a designator inside it is literal,
+        // whether the delimiter is quoted or bare.
+        assert!(history_designators("cat << 'EOF'\n", "hello !$").is_empty());
+        assert!(history_designators("cat << EOF\n", "hello !$").is_empty());
+        // A designator after the body's closing delimiter still expands.
+        assert_eq!(
+            history_designators("cat << EOF\nbody\nEOF\n", "puts !$"),
+            vec![(5, '$')]
+        );
+        // A designator on the `<<delim` line itself (before the body) expands.
+        assert_eq!(history_designators("", "cat !$ << EOF"), vec![(4, '$')]);
+        // A composite delimiter (`"EO"F` → `EOF`) is matched as its full text, so
+        // the body ends at the real `EOF` and a later designator still expands.
+        assert_eq!(
+            history_designators("cat << \"EO\"F\nbody\nEOF\n", "puts !$"),
+            vec![(5, '$')]
+        );
+        // A bare designator used as the delimiter itself expands.
+        assert_eq!(history_designators("", "cat <<!$"), vec![(6, '$')]);
+        // A quoted designator in the delimiter stays literal.
+        assert!(history_designators("", "cat <<'!$'").is_empty());
+    }
+
+    #[test]
+    fn history_designators_carry_state_from_the_pending_prefix() {
+        // A double-quoted string opened in a buffered line keeps a designator on
+        // the continuation line literal — strings span physical lines.
+        assert!(history_designators("func f() {\nputs \"hello\n", "!$\"").is_empty());
+        // Once the string closes, a later bare designator is found.
+        assert_eq!(
+            history_designators("func f() {\nputs \"hello\n", "!$\" !$"),
+            vec![(4, '$')]
+        );
     }
 
     use super::{needs_more_input, scan_braces};

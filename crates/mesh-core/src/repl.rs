@@ -2188,6 +2188,7 @@ fn needs_more_input(text: &str) -> bool {
 struct ArgumentRecall {
     arguments: Vec<String>,
     inserted: Option<(usize, String, usize)>,
+    previous: Option<String>,
 }
 
 impl ArgumentRecall {
@@ -2218,9 +2219,21 @@ impl ArgumentRecall {
 
     fn remember(&mut self, line: &str) {
         self.inserted = None;
+        // A blank submission is not an event — reedline never persists one, so
+        // keep the prior command for last-argument recall and history designators.
+        if line.trim().is_empty() {
+            return;
+        }
+        self.previous = Some(line.to_owned());
         if let Some(argument) = last_argument(line) {
             self.arguments.push(argument);
         }
+    }
+
+    /// The most recently completed command line, the event `!^` / `!$` / `!*`
+    /// expand against.
+    fn previous(&self) -> Option<&str> {
+        self.previous.as_deref()
     }
 
     fn insert(&mut self, editor: &mut Reedline) {
@@ -2256,8 +2269,12 @@ fn persist_logical_history(
     signal: &Signal,
     pending: &str,
     saved_submissions: usize,
+    rewritten: bool,
 ) -> reedline::Result<()> {
-    if pending.is_empty() {
+    // A single physical line reedline already stored verbatim needs no work
+    // unless history expansion rewrote it, in which case the stored raw row is
+    // replaced below with the expanded command the shell actually ran.
+    if pending.is_empty() && !rewritten {
         return Ok(());
     }
     let completed = completed_command(signal, pending);
@@ -2265,8 +2282,33 @@ fn persist_logical_history(
         return Ok(());
     }
 
+    remove_recent_history_rows(history, session, saved_submissions)?;
+
+    // An expansion that leaves only whitespace (a bare `!*` with no arguments,
+    // with or without surrounding spaces) runs nothing, so drop the raw rows
+    // above but store no replacement.
+    if let Some(command) = completed.filter(|command| !command.trim().is_empty()) {
+        let mut item = HistoryItem::from_command_line(command);
+        item.session_id = session;
+        history.save(item)?;
+    }
+    Ok(())
+}
+
+/// Delete the `count` most recent rows for `session`, newest first. Reassembly
+/// of a multi-line command and history expansion both use this to drop the raw
+/// per-line rows reedline saves before re-storing the logical command; a failed
+/// expansion uses it to discard the line that never ran.
+fn remove_recent_history_rows(
+    history: &mut dyn History,
+    session: Option<HistorySessionId>,
+    count: usize,
+) -> reedline::Result<()> {
+    let mut remaining = count;
+    if remaining == 0 {
+        return Ok(());
+    }
     let entries = history.search(SearchQuery::everything(SearchDirection::Backward, session))?;
-    let mut remaining = saved_submissions;
     for entry in entries
         .into_iter()
         .filter(|entry| entry.session_id == session)
@@ -2279,16 +2321,17 @@ fn persist_logical_history(
             remaining -= 1;
         }
     }
-
-    if let Some(command) = completed {
-        let mut item = HistoryItem::from_command_line(command);
-        item.session_id = session;
-        history.save(item)?;
-    }
     Ok(())
 }
 
 fn last_argument(line: &str) -> Option<String> {
+    command_words(line)?.get(1..)?.last().cloned()
+}
+
+/// The source text of each word in the last pipeline stage of the last
+/// statement, command word first. Backs last-argument recall and the
+/// `!^` / `!$` / `!*` history designators, which slice this list.
+fn command_words(line: &str) -> Option<Vec<String>> {
     let parser::ParseOutcome::Complete(source) = parser::parse(line).ok()? else {
         return None;
     };
@@ -2301,18 +2344,75 @@ fn last_argument(line: &str) -> Option<String> {
     let parser::Executable::Pipeline(pipeline) = executable else {
         return None;
     };
-    let words: Vec<_> = pipeline
+    let words: Vec<String> = pipeline
         .stages
         .last()?
         .items
         .iter()
         .filter_map(|item| match item {
-            parser::CommandItem::Word(word) => Some(word),
+            parser::CommandItem::Word(word) => line.get(word.span.clone()).map(str::to_owned),
             parser::CommandItem::Redirect { .. } => None,
         })
         .collect();
-    let argument = words.get(1..)?.last()?;
-    line.get(argument.span.clone()).map(str::to_owned)
+    (!words.is_empty()).then_some(words)
+}
+
+/// Expand the interactive `!^` / `!$` / `!*` history word designators against
+/// the previous command line, leaving everything else byte-for-byte unchanged.
+///
+/// This runs as a pre-parse pass but stays quote-safe by delegating the scan to
+/// [`lexer::history_designators`], which honors the lexer's own quote, escape,
+/// raw-string, and interpolation rules: a `!` inside a string (including one that
+/// spans continuation lines), after a backslash, or not followed by a supported
+/// designator is left literal (the deferred `!!` / `!string` / `!n` forms fall
+/// through here). `!^` is the first argument of the previous command, `!$` its
+/// last argument, and `!*` all of them joined by spaces. An empty argument list —
+/// a bare command, an assignment, or any line without sliceable command words —
+/// leaves `!*` empty but makes `!^` / `!$` an error; only a truly absent event
+/// (no previous command) errors for all three.
+///
+/// `pending` is the already-buffered part of a multi-line command (empty for a
+/// single line); it seeds the scanner's quote and raw-eligibility state so a
+/// designator inside a quote opened on an earlier line stays literal.
+fn expand_history_designators(
+    line: &str,
+    pending: &str,
+    previous: Option<&str>,
+) -> Result<String, String> {
+    let designators = crate::lexer::history_designators(pending, line);
+    if designators.is_empty() {
+        return Ok(line.to_owned());
+    }
+    let mut words: Option<Vec<String>> = None;
+    let mut computed = false;
+    let mut out = String::with_capacity(line.len());
+    let mut last = 0;
+    for (offset, designator) in designators {
+        out.push_str(&line[last..offset]);
+        if previous.is_none() {
+            return Err(format!("!{designator}: no previous command"));
+        }
+        if !computed {
+            words = previous.and_then(command_words);
+            computed = true;
+        }
+        // A previous line with no sliceable command words — an assignment, a
+        // control-flow statement, an unparsable line — has an empty argument
+        // list, exactly like a bare command.
+        let arguments = words
+            .as_deref()
+            .and_then(|words| words.get(1..))
+            .unwrap_or_default();
+        let no_arguments = || format!("!{designator}: previous command has no arguments");
+        match designator {
+            '^' => out.push_str(arguments.first().ok_or_else(no_arguments)?),
+            '$' => out.push_str(arguments.last().ok_or_else(no_arguments)?),
+            _ => out.push_str(&arguments.join(" ")),
+        }
+        last = offset + '!'.len_utf8() + designator.len_utf8();
+    }
+    out.push_str(&line[last..]);
+    Ok(out)
 }
 
 fn run_interactive(options: &StartupOptions) -> ExitCode {
@@ -2383,9 +2483,46 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                 argument_recall.insert(&mut editor);
             }
             Ok(signal) => {
-                if history_session.is_some()
-                    && matches!(&signal, Signal::Success(line) if !line.is_empty())
-                {
+                let mut rewritten = false;
+                // Reedline persists a raw row for every non-empty submitted line,
+                // even when history expansion later empties it (a bare `!*` with
+                // no arguments), so count the raw submission — not the expanded
+                // signal — to keep the row bookkeeping accurate.
+                let mut raw_saved = false;
+                let signal = match signal {
+                    Signal::Success(line) if !line.is_empty() => {
+                        raw_saved = true;
+                        match expand_history_designators(
+                            &line,
+                            &pending,
+                            argument_recall.previous(),
+                        ) {
+                            Ok(expanded) => {
+                                if expanded != line {
+                                    eprintln!("{expanded}");
+                                    rewritten = true;
+                                }
+                                Signal::Success(expanded)
+                            }
+                            Err(message) => {
+                                eprintln!("mesh: {message}");
+                                // The line never runs, so drop the raw row
+                                // reedline stored for it before re-prompting.
+                                if let Some(session) = history_session {
+                                    let _ = remove_recent_history_rows(
+                                        editor.history_mut(),
+                                        Some(session),
+                                        1,
+                                    );
+                                }
+                                last = 2;
+                                continue;
+                            }
+                        }
+                    }
+                    other => other,
+                };
+                if history_session.is_some() && raw_saved {
                     pending_history_rows += 1;
                 }
                 let completed_command = completed_command(&signal, &pending);
@@ -2396,6 +2533,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                         &signal,
                         &pending,
                         pending_history_rows,
+                        rewritten,
                     )
                 {
                     eprintln!("mesh: could not update history database: {err}");
@@ -3122,9 +3260,10 @@ mod tests {
     use super::{
         ArgumentRecall, CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell,
         StartupOptions, Step, TimestampedHistory, argument_completions, command_position,
-        command_segment_words, completed_command, eval_binary, expansion_word, handle_signal,
-        help_completions, history_path_from, input_highlighter, interactive_keybindings,
-        interruptible_task, last_argument, needs_more_input, open_history, path_completions_sync,
+        command_segment_words, command_words, completed_command, eval_binary,
+        expand_history_designators, expansion_word, handle_signal, help_completions,
+        history_path_from, input_highlighter, interactive_keybindings, interruptible_task,
+        last_argument, needs_more_input, open_history, path_completions_sync,
         persist_logical_history, prepare_history_path, run_line, run_prompt_hooks, run_source,
         variable_completions,
     };
@@ -3132,7 +3271,7 @@ mod tests {
     use crate::vars::Value;
     use reedline::{
         EditCommand, Highlighter, History, HistoryItem, KeyModifiers, Prompt, PromptEditMode,
-        Reedline, ReedlineEvent, Signal, SqliteBackedHistory,
+        Reedline, ReedlineEvent, SearchDirection, SearchQuery, Signal, SqliteBackedHistory,
     };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -3164,6 +3303,174 @@ mod tests {
             Some("key:value")
         );
         assert_eq!(last_argument("puts"), None);
+    }
+
+    #[test]
+    fn command_words_returns_command_word_first_then_arguments() {
+        assert_eq!(
+            command_words("git commit -m \"a message\""),
+            Some(vec![
+                "git".to_owned(),
+                "commit".to_owned(),
+                "-m".to_owned(),
+                "\"a message\"".to_owned(),
+            ])
+        );
+        // Word list is drawn from the last stage of the last statement.
+        assert_eq!(
+            command_words("ls old | grep needle"),
+            Some(vec!["grep".to_owned(), "needle".to_owned(),])
+        );
+        assert_eq!(command_words(""), None);
+    }
+
+    #[test]
+    fn history_designators_expand_against_the_previous_command() {
+        let previous = Some("git commit -m msg");
+        assert_eq!(
+            expand_history_designators("show !^", "", previous).unwrap(),
+            "show commit"
+        );
+        assert_eq!(
+            expand_history_designators("show !$", "", previous).unwrap(),
+            "show msg"
+        );
+        assert_eq!(
+            expand_history_designators("show !*", "", previous).unwrap(),
+            "show commit -m msg"
+        );
+        // Several designators in one line each resolve independently.
+        assert_eq!(
+            expand_history_designators("cp !^ !$", "", previous).unwrap(),
+            "cp commit msg"
+        );
+    }
+
+    #[test]
+    fn history_designators_stay_literal_when_quoted_or_escaped() {
+        let previous = Some("git commit -m msg");
+        assert_eq!(
+            expand_history_designators("puts '!$'", "", previous).unwrap(),
+            "puts '!$'"
+        );
+        assert_eq!(
+            expand_history_designators("puts \"!$\"", "", previous).unwrap(),
+            "puts \"!$\""
+        );
+        assert_eq!(
+            expand_history_designators("puts \\!$", "", previous).unwrap(),
+            "puts \\!$"
+        );
+        // A bang that is not a supported designator is left alone.
+        assert_eq!(
+            expand_history_designators("test 1 != 2", "", previous).unwrap(),
+            "test 1 != 2"
+        );
+        assert_eq!(
+            expand_history_designators("puts hi!", "", previous).unwrap(),
+            "puts hi!"
+        );
+    }
+
+    #[test]
+    fn history_designators_respect_lexer_quote_rules() {
+        let previous = Some("git commit -m msg");
+        // mesh single quotes escape `\'`, so the string stays open and the
+        // designator inside it is literal (POSIX would close at the apostrophe).
+        assert_eq!(
+            expand_history_designators("puts 'can\\'t !$'", "", previous).unwrap(),
+            "puts 'can\\'t !$'"
+        );
+        // Raw strings take no escapes; the designator inside stays literal.
+        assert_eq!(
+            expand_history_designators("puts r'!$'", "", previous).unwrap(),
+            "puts r'!$'"
+        );
+        // A bare `\!` escape keeps the bang literal.
+        assert_eq!(
+            expand_history_designators("puts \\!*", "", previous).unwrap(),
+            "puts \\!*"
+        );
+    }
+
+    #[test]
+    fn history_designators_carry_quote_state_across_continuation_lines() {
+        let previous = Some("puts prior arg");
+        // The double quote opens on a buffered `func` body line, so a designator
+        // on the continuation line is inside the string and stays literal.
+        assert_eq!(
+            expand_history_designators("!$\"", "func f() {\nputs \"hello\n", previous).unwrap(),
+            "!$\""
+        );
+        // Once that quote closes, a later designator on the same line expands.
+        assert_eq!(
+            expand_history_designators("!$\" !$", "func f() {\nputs \"hello\n", previous).unwrap(),
+            "!$\" arg"
+        );
+    }
+
+    #[test]
+    fn history_designators_star_is_empty_when_there_are_no_arguments() {
+        let previous = Some("ls");
+        assert_eq!(
+            expand_history_designators("puts !*", "", previous).unwrap(),
+            "puts "
+        );
+    }
+
+    #[test]
+    fn history_designators_treat_an_argumentless_event_as_empty() {
+        // An assignment is a real event with no command words: `!*` is empty,
+        // `!^` / `!$` report no arguments — not a missing event.
+        assert!(command_words("x = 1").is_none());
+        let previous = Some("x = 1");
+        assert_eq!(
+            expand_history_designators("puts !*", "", previous).unwrap(),
+            "puts "
+        );
+        assert_eq!(
+            expand_history_designators("puts !$", "", previous),
+            Err("!$: previous command has no arguments".to_owned())
+        );
+        assert_eq!(
+            expand_history_designators("puts !^", "", previous),
+            Err("!^: previous command has no arguments".to_owned())
+        );
+    }
+
+    #[test]
+    fn history_designators_error_without_a_usable_event() {
+        assert_eq!(
+            expand_history_designators("cd !$", "", None),
+            Err("!$: no previous command".to_owned())
+        );
+        assert_eq!(
+            expand_history_designators("cd !^", "", Some("ls")),
+            Err("!^: previous command has no arguments".to_owned())
+        );
+        assert_eq!(
+            expand_history_designators("cd !$", "", Some("ls")),
+            Err("!$: previous command has no arguments".to_owned())
+        );
+    }
+
+    #[test]
+    fn argument_recall_remembers_the_previous_command_line() {
+        let mut recall = ArgumentRecall::default();
+        assert_eq!(recall.previous(), None);
+        recall.remember("git status");
+        recall.remember("cargo build --release");
+        assert_eq!(recall.previous(), Some("cargo build --release"));
+    }
+
+    #[test]
+    fn a_blank_submission_keeps_the_previous_command() {
+        let mut recall = ArgumentRecall::default();
+        recall.remember("mkdir foo");
+        // Pressing Enter on an empty prompt is not an event; `!$` still finds foo.
+        recall.remember("");
+        recall.remember("   ");
+        assert_eq!(recall.previous(), Some("mkdir foo"));
     }
 
     #[test]
@@ -3414,6 +3721,7 @@ mod tests {
             &Signal::Success("}".into()),
             &pending,
             3,
+            false,
         )
         .unwrap();
         drop(saved);
@@ -3457,6 +3765,7 @@ mod tests {
             &Signal::Success("followed by last\"".into()),
             "puts \"first\n",
             2,
+            false,
         )
         .unwrap();
         drop(saved);
@@ -3492,8 +3801,15 @@ mod tests {
         let mut item = HistoryItem::from_command_line("func f() {");
         item.session_id = saved_session;
         saved.save(item).unwrap();
-        persist_logical_history(&mut saved, saved_session, &Signal::CtrlC, "func f() {\n", 1)
-            .unwrap();
+        persist_logical_history(
+            &mut saved,
+            saved_session,
+            &Signal::CtrlC,
+            "func f() {\n",
+            1,
+            false,
+        )
+        .unwrap();
         let mut item = HistoryItem::from_command_line("puts public");
         item.session_id = saved_session;
         saved.save(item).unwrap();
@@ -3538,6 +3854,7 @@ mod tests {
             &Signal::Success("}".into()),
             "func f() {\n\n",
             2,
+            false,
         )
         .unwrap();
         drop(saved);
@@ -3554,6 +3871,106 @@ mod tests {
 
         assert_eq!(recall.arguments, ["public"]);
         drop(current);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn history_expansion_replaces_the_raw_single_line_row() {
+        let path = temporary_history_path("history.sqlite3");
+        prepare_history_path(&path).unwrap();
+        let session = Reedline::create_history_session_id();
+        let mut saved = TimestampedHistory(
+            SqliteBackedHistory::with_file(path.clone(), session, Some(SystemTime::now().into()))
+                .unwrap(),
+        );
+        // reedline stores the raw line the moment the user submits it.
+        let mut item = HistoryItem::from_command_line("cd !$");
+        item.session_id = session;
+        saved.save(item).unwrap();
+        // History expansion ran `cd foo`, so the stored row must become that.
+        persist_logical_history(
+            &mut saved,
+            session,
+            &Signal::Success("cd foo".into()),
+            "",
+            1,
+            true,
+        )
+        .unwrap();
+
+        let commands: Vec<_> = saved
+            .search(SearchQuery::everything(SearchDirection::Backward, session))
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.command_line)
+            .collect();
+        assert_eq!(commands, ["cd foo"]);
+        drop(saved);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn history_expansion_to_an_empty_line_leaves_no_row() {
+        let path = temporary_history_path("history.sqlite3");
+        prepare_history_path(&path).unwrap();
+        let session = Reedline::create_history_session_id();
+        let mut saved = TimestampedHistory(
+            SqliteBackedHistory::with_file(path.clone(), session, Some(SystemTime::now().into()))
+                .unwrap(),
+        );
+        // reedline stored the raw ` !* `; expanding it against an argumentless
+        // event yields a whitespace-only line that never runs.
+        let mut item = HistoryItem::from_command_line(" !* ");
+        item.session_id = session;
+        saved.save(item).unwrap();
+        persist_logical_history(
+            &mut saved,
+            session,
+            &Signal::Success("  ".to_owned()),
+            "",
+            1,
+            true,
+        )
+        .unwrap();
+
+        let entries = saved
+            .search(SearchQuery::everything(SearchDirection::Backward, session))
+            .unwrap();
+        assert!(entries.is_empty());
+        drop(saved);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unexpanded_single_line_history_is_left_untouched() {
+        let path = temporary_history_path("history.sqlite3");
+        prepare_history_path(&path).unwrap();
+        let session = Reedline::create_history_session_id();
+        let mut saved = TimestampedHistory(
+            SqliteBackedHistory::with_file(path.clone(), session, Some(SystemTime::now().into()))
+                .unwrap(),
+        );
+        let mut item = HistoryItem::from_command_line("ls -l");
+        item.session_id = session;
+        let id = saved.save(item).unwrap().id;
+        // A command with no expansion keeps reedline's original row (and its id).
+        persist_logical_history(
+            &mut saved,
+            session,
+            &Signal::Success("ls -l".into()),
+            "",
+            1,
+            false,
+        )
+        .unwrap();
+
+        let entries = saved
+            .search(SearchQuery::everything(SearchDirection::Backward, session))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command_line, "ls -l");
+        assert_eq!(entries[0].id, id);
+        drop(saved);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
