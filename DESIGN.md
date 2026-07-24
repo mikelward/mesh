@@ -2018,15 +2018,18 @@ world mesh lives in. **External commands exit `0` for success, nonzero for failu
 and there is no typed value to consult, only the exit code. For `if X { }` to compose
 uniformly whether `X` is `grep -q …` or a mesh function, a mesh function's `0`/success
 must also be truthy. Aligning with the external convention is exactly what makes commands
-and functions interchangeable in a condition — and it just works. The residual — you
-can't return a *nonzero* int as successful data — is narrow and accepted, since
-`return 0` / `return 1` are used as success/failure anyway (read them as
+and functions interchangeable in a condition — and it just works. The residual — an int
+whose **status is nonzero** (its low 8 bits, so `return 5` but *not* `return 256`, whose
+status masks to `0` while the full `256` survives as the value, per the settled
+[8-bit masking](#functions)) can't be returned as successful data — is narrow and
+accepted, since `return 0` / `return 1` are used as success/failure anyway (read them as
 `return true` / `return false`).
 
 The truthiness **leaning** (still *open* — the unresolved-questions summary flags condition
 truthiness as needing a table/narrowing; this is the current lean, not a settled rule):
-**falsy** = `false`, a **failed command / nonzero exit status**, or a nonzero int — the
-**channel-1 failure values**; **truthy** = `true`, `0`/success, and every data value —
+**falsy** = `false`, a **failed command / nonzero exit status**, or an int with a
+**nonzero status** (nonzero low 8 bits) — the **channel-1 failure values**; **truthy** =
+`true`, `0`/success, and every data value —
 strings, lists, maps — **including empty ones** (an empty string or list is a success,
 status `0`, **not** falsy). **Fail-loud (channel-2) errors sit *outside* truthiness
 entirely** — a type / index / decode error in a condition **aborts the statement**, it
@@ -2034,12 +2037,14 @@ does *not* make the branch falsy (per the [error model](#error-handling)); colla
 into "falsy" would silently turn a bug into a skipped branch.
 
 One small **open** nicety this surfaced: spell an explicit coded failure as
-**`return error <n>`** — a returnable **error value** carrying an exit code. This does
-**not** change the status view or reclaim bare ints for data: a bare `return 5` still has
-status `5` (a failure when observed), exactly as above; `return error <n>` is only a
-clearer spelling for "fail with this code" than reusing a bare int, and it would add a
-returnable error *value* distinct from mesh's channel-2 fail-loud errors. Additive
-spelling, undecided.
+**`return error <n>`** rather than a bare `return <n>`. Its **status view must be
+defined**, since the settled mapping is exhaustive and views every non-int / non-bool
+value as `0` — so an error value would otherwise be a *success*. Two ways: **(a) sugar
+for `return <n>`** — an int, status `n` (masked), adding no new type; or **(b) a distinct
+error value** whose status views as its embedded code, which **extends (reopens)** the
+"every other value → `0`" mapping with an error-value row. Either way it does **not**
+change the rest of the status view — a bare `return 5` still has status `5`. Undecided,
+including which of (a)/(b).
 
 ### Tests and comparisons
 
