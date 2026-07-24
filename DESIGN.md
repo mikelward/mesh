@@ -1954,9 +1954,10 @@ an **explicit keyword** to produce a typed value (with `puts`/printing the only
 typed-value→stdout op), so `{ … }` blocks stay pure command-context: a bare word always
 *runs*, quotes mean only "group into one word," and the `"$a""$b"` value-vs-command
 ambiguity at a block tail disappears. This **reopens** the settled "value is the last
-expression" and "bare RHS word is a literal string" rules ([Functions](#functions),
-[Conditionals](#conditionals-if-is-an-expression)) — reconciling them is the open
-question. Sub-choice if taken: **`yield` (local block/arm value) + `return` (function
+expression" rule ([Functions](#functions), [Conditionals](#conditionals-if-is-an-expression))
+and the **single-bare-word block-tail** coercion specifically — *not* the general
+assignment-RHS rule, which stays (`x = greet` is still the string `"greet"`) — reconciling
+them is the open question. Sub-choice if taken: **`yield` (local block/arm value) + `return` (function
 value + early exit)**, two keywords by scope — so a `match` arm can yield the arm's value
 without leaving the function — versus **`return` alone**, which gives functions a value
 but leaves `if`/`match`-arm-yield needing a separate mechanism. Either way `return`'s
@@ -1975,8 +1976,9 @@ is narrow and accepted. Two live scraps this left, both pointed at their canonic
   question (leaning: only `false`, a failed command, and a nonzero status are false;
   everything else, empties included, is true). Note `gets()` pins `""` **truthy** — a
   blank line must not end a read loop — which pulls `[]` toward truthy too, for
-  consistency; making `[]` falsy would need an explicit emptiness test (`:len`/`:empty`)
-  and split it from `""`.
+  consistency. The tradeoff: with empties **truthy** (the leaning), `if $xs` is always
+  true, so emptiness needs an explicit test (`$xs:len == 0`); making `[]` **falsy** would
+  let `if $xs` *be* the emptiness test but split `[]` from the pinned-truthy `""`.
 - **An explicit coded-failure spelling** *(deferred)* — any such value must stay a
   **channel-1** failure (a testable value) and so **cannot** reuse the name "error"
   (channel-2: fail-loud, no value, aborts); defining it touches the two-channel
