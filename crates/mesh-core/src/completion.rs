@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher};
 
-const CACHE_VERSION: &str = "mesh-completion-v3";
+const CACHE_VERSION: &str = "mesh-completion-v4";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ValueHint {
@@ -28,6 +28,7 @@ pub(crate) enum ValueHint {
 pub(crate) struct CompletionSpec {
     candidates: Vec<String>,
     values: HashMap<String, ValueHint>,
+    positional: Option<ValueHint>,
 }
 
 #[derive(Debug)]
@@ -46,12 +47,20 @@ impl CompletionSpec {
     pub(crate) fn from_help(help: &str) -> Self {
         let mut candidates = Vec::new();
         let mut values = HashMap::new();
+        let mut positional = None;
         let mut commands = false;
         let mut current_options = Vec::new();
         let mut pending_values = None;
         for line in help.lines() {
             let trimmed = line.trim();
             let tokens: Vec<_> = trimmed.split_whitespace().collect();
+            if trimmed
+                .get(.."usage:".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("usage:"))
+                && let Some(hint) = positional_hint(&tokens[1..])
+            {
+                positional = Some(hint);
+            }
             let options = option_names(&tokens);
             if let Some(pending) = &mut pending_values {
                 match pending {
@@ -131,7 +140,11 @@ impl CompletionSpec {
         finish_pending_values(&mut values, pending_values);
         candidates.sort();
         candidates.dedup();
-        Self { candidates, values }
+        Self {
+            candidates,
+            values,
+            positional,
+        }
     }
 
     pub(crate) fn matching(&self, prefix: &str) -> Vec<String> {
@@ -148,6 +161,10 @@ impl CompletionSpec {
 
     pub(crate) fn value_hint(&self, option: &str) -> Option<&ValueHint> {
         self.values.get(option)
+    }
+
+    pub(crate) fn positional_hint(&self) -> Option<&ValueHint> {
+        self.positional.as_ref()
     }
 
     fn encode(&self, fingerprint: &str) -> String {
@@ -175,6 +192,10 @@ impl CompletionSpec {
                 }
             }
         }
+        if let Some(hint) = &self.positional {
+            encoded.push_str("positional");
+            encode_hint(&mut encoded, hint);
+        }
         encoded
     }
 
@@ -190,18 +211,38 @@ impl CompletionSpec {
                 "candidate" => spec.candidates.push(fields.next()?.to_owned()),
                 "value" => {
                     let option = fields.next()?.to_owned();
-                    let hint = match fields.next()? {
-                        "file" => ValueHint::File,
-                        "directory" => ValueHint::Directory,
-                        "enum" => ValueHint::Enum(fields.map(str::to_owned).collect()),
-                        _ => return None,
-                    };
+                    let hint = decode_hint(&mut fields)?;
                     spec.values.insert(option, hint);
                 }
+                "positional" => spec.positional = Some(decode_hint(&mut fields)?),
                 _ => return None,
             }
         }
         Some(spec)
+    }
+}
+
+fn encode_hint(encoded: &mut String, hint: &ValueHint) {
+    match hint {
+        ValueHint::File => encoded.push_str("\tfile\n"),
+        ValueHint::Directory => encoded.push_str("\tdirectory\n"),
+        ValueHint::Enum(values) => {
+            encoded.push_str("\tenum");
+            for value in values {
+                encoded.push('\t');
+                encoded.push_str(value);
+            }
+            encoded.push('\n');
+        }
+    }
+}
+
+fn decode_hint<'a>(fields: &mut impl Iterator<Item = &'a str>) -> Option<ValueHint> {
+    match fields.next()? {
+        "file" => Some(ValueHint::File),
+        "directory" => Some(ValueHint::Directory),
+        "enum" => Some(ValueHint::Enum(fields.map(str::to_owned).collect())),
+        _ => None,
     }
 }
 
@@ -293,6 +334,20 @@ fn value_hint(tokens: &[&str]) -> Option<ValueHint> {
         ));
     }
     None
+}
+
+fn positional_hint(tokens: &[&str]) -> Option<ValueHint> {
+    let hints: Vec<_> = tokens
+        .iter()
+        .filter_map(|token| value_hint(&[*token]))
+        .collect();
+    if hints.contains(&ValueHint::File) {
+        Some(ValueHint::File)
+    } else if hints.contains(&ValueHint::Directory) {
+        Some(ValueHint::Directory)
+    } else {
+        None
+    }
 }
 
 fn inline_possible_values(line: &str) -> Option<(Vec<String>, bool)> {
@@ -639,6 +694,35 @@ mod tests {
         assert_eq!(spec.value_hint("--placeholder"), None);
         assert_eq!(
             CompletionSpec::decode(&spec.encode("test"), "test"),
+            Some(spec)
+        );
+    }
+
+    #[test]
+    fn parses_vim_usage_file_positionals() {
+        let spec = CompletionSpec::from_help(
+            "VIM - Vi IMproved 9.2\n\
+             \n\
+             Usage: vim [arguments] [file ..]       edit specified file(s)\n\
+                or: vim [arguments] -               read text from stdin\n\
+                or: vim [arguments] -t tag          edit file where tag is defined\n\
+                or: vim [arguments] -q [errorfile]  edit file with first error\n\
+             \n\
+             Arguments:\n\
+                --                 Only file names after this\n\
+                -v                 Vi mode (like \"vi\")\n\
+                -T <terminal>      Set terminal type to <terminal>\n\
+                --not-a-term       Skip warning for input/output not being a terminal\n\
+                -u <vimrc>         Use <vimrc> instead of any .vimrc\n\
+                +<lnum>            Start at line <lnum>\n",
+        );
+
+        assert_eq!(spec.positional_hint(), Some(&ValueHint::File));
+        assert_eq!(spec.matching("-T"), ["-T"]);
+        assert_eq!(spec.matching("--not"), ["--not-a-term"]);
+        assert_eq!(spec.matching("-u"), ["-u"]);
+        assert_eq!(
+            CompletionSpec::decode(&spec.encode("vim"), "vim"),
             Some(spec)
         );
     }

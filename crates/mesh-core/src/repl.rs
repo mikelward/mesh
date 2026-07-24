@@ -19,10 +19,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reedline::{
-    Color, Completer, EditCommand, Emacs, History, HistoryItem, HistoryItemId, HistorySessionId,
-    KeyCode, KeyModifiers, Prompt, PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent,
-    SearchDirection, SearchQuery, Signal, SimpleMatchHighlighter, Span, SqliteBackedHistory,
-    Suggestion, default_emacs_keybindings,
+    Color, ColumnarMenu, Completer, EditCommand, Emacs, History, HistoryItem, HistoryItemId,
+    HistorySessionId, KeyCode, KeyModifiers, Keybindings, MenuBuilder, Prompt, PromptEditMode,
+    PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, SearchDirection, SearchQuery,
+    Signal, SimpleMatchHighlighter, Span, SqliteBackedHistory, Suggestion,
+    default_emacs_keybindings,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -32,6 +33,8 @@ use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
 use crate::vars::{RegexValue, Value, Vars};
 use crate::{exec, expand, parser};
+
+const COMPLETION_MENU: &str = "completion_menu";
 
 /// The mutable shell session threaded through the run loop: variable scopes,
 /// defined functions, and the job table.
@@ -2257,16 +2260,14 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         return ExitCode::from(1);
     }
     let completion = Arc::new(RwLock::new(CompletionState::default()));
-    let mut keybindings = default_emacs_keybindings();
-    keybindings.add_binding(
-        KeyModifiers::ALT,
-        KeyCode::Char('.'),
-        ReedlineEvent::ExecuteHostCommand("mesh:recall-last-argument".to_owned()),
-    );
+    let keybindings = interactive_keybindings();
+    let completion_menu = completion_menu();
     let mut editor = Reedline::create()
         .with_edit_mode(Box::new(Emacs::new(keybindings)))
+        .with_quick_completions(true)
         .with_highlighter(Box::new(input_highlighter()))
         .with_visual_selection_style(nu_ansi_term::Style::default())
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(completion_menu)))
         .with_completer(Box::new(MeshCompleter {
             state: Arc::clone(&completion),
         }));
@@ -2362,8 +2363,38 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     }
 }
 
+fn interactive_keybindings() -> Keybindings {
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::ALT,
+        KeyCode::Char('.'),
+        ReedlineEvent::ExecuteHostCommand("mesh:recall-last-argument".to_owned()),
+    );
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu(COMPLETION_MENU.to_owned()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+    keybindings
+}
+
 fn input_highlighter() -> SimpleMatchHighlighter {
     SimpleMatchHighlighter::default().with_neutral_style(nu_ansi_term::Style::new().bold())
+}
+
+fn completion_menu() -> ColumnarMenu {
+    let plain = nu_ansi_term::Style::default();
+    let selected = plain.bold().reverse();
+    ColumnarMenu::default()
+        .with_name(COMPLETION_MENU)
+        .with_text_style(plain)
+        .with_selected_text_style(selected)
+        .with_description_text_style(plain)
+        .with_match_text_style(plain.underline())
+        .with_selected_match_text_style(selected.underline())
 }
 
 fn completed_command(signal: &Signal, pending: &str) -> Option<String> {
@@ -2490,7 +2521,10 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
         }
     }
     let parent_help = completion_for(state, parent);
-    let paths = path_completions(word);
+    let paths = parent_help.positional_hint().map_or_else(
+        || path_completions(word),
+        |hint| value_completions(hint, word),
+    );
     let mut parent_values = parent_help.matching(word);
 
     if word.starts_with('-') {
@@ -2976,15 +3010,16 @@ mod tests {
         ArgumentRecall, CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell,
         StartupOptions, Step, TimestampedHistory, argument_completions, command_position,
         command_segment_words, completed_command, eval_binary, expansion_word, handle_signal,
-        help_completions, history_path_from, input_highlighter, interruptible_task, last_argument,
-        needs_more_input, open_history, path_completions_sync, persist_logical_history,
-        prepare_history_path, run_line, run_prompt_hooks, run_source, variable_completions,
+        help_completions, history_path_from, input_highlighter, interactive_keybindings,
+        interruptible_task, last_argument, needs_more_input, open_history, path_completions_sync,
+        persist_logical_history, prepare_history_path, run_line, run_prompt_hooks, run_source,
+        variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
     use reedline::{
-        EditCommand, Highlighter, History, HistoryItem, Prompt, PromptEditMode, Reedline, Signal,
-        SqliteBackedHistory,
+        EditCommand, Highlighter, History, HistoryItem, KeyModifiers, Prompt, PromptEditMode,
+        Reedline, ReedlineEvent, Signal, SqliteBackedHistory,
     };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -3589,6 +3624,48 @@ mod tests {
         assert_eq!(
             argument_completions(&state, &["cat".into(), prefix.clone()], &prefix),
             [format!("{}/", child.display())]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tab_opens_and_advances_the_completion_menu() {
+        assert_eq!(
+            interactive_keybindings().find_binding(KeyModifiers::NONE, reedline::KeyCode::Tab),
+            Some(ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::Menu(super::COMPLETION_MENU.to_owned()),
+                ReedlineEvent::MenuNext,
+            ]))
+        );
+    }
+
+    #[test]
+    fn vim_usage_completes_positional_files() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!("mesh-vim-help-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cargo_lock = dir.join("Cargo.lock");
+        let cargo_toml = dir.join("Cargo.toml");
+        fs::write(&cargo_lock, "").unwrap();
+        fs::write(&cargo_toml, "").unwrap();
+        let prefix = format!("{}/C", dir.display());
+        let state = CompletionState {
+            help: [(
+                "vi".into(),
+                "VIM - Vi IMproved 9.2\n\nUsage: vim [arguments] [file ..]       edit specified file(s)\n"
+                    .into(),
+            )]
+            .into(),
+            ..CompletionState::default()
+        };
+
+        assert_eq!(
+            argument_completions(&state, &["vi".into(), prefix.clone()], &prefix),
+            [
+                cargo_lock.to_string_lossy().into_owned(),
+                cargo_toml.to_string_lossy().into_owned()
+            ]
         );
         fs::remove_dir_all(dir).unwrap();
     }
