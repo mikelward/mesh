@@ -1972,8 +1972,16 @@ three ways, resolved by the tail:
   special-cased — `{ puts side; text }` runs `text` as a **command** (and errors if
   there is no such command). So the bare-word literal is a one-word-body convenience,
   not a general "tail word is a string" rule.
-- **A command / pipeline tail** — `*.log { grep -c ERROR $f }` — runs the body and the
-  arm's value is its **captured stdout** (the bytes-as-value path, same rule as `$(…)`).
+- **A command / pipeline tail** — `*.log { wc -l < $f }` — runs the body and, **only if
+  it exits `0`**, the arm's value is its **captured stdout** (trailing newlines trimmed;
+  the bytes-as-value path, same rule as `$(…)`). A **nonzero exit yields no value** — the
+  failing status propagates and aborts the whole `match` expression. This bites the
+  print-then-fail commands: `grep -c ERROR $f` writes `0` yet **exits 1** on no matches,
+  so `{ grep -c … }` *fails* the arm rather than yielding `"0"` — capture the count with
+  an explicit `{ $(grep -c ERROR $f) }` (or a success-forcing `… ; true`) when you want
+  the output regardless of status. (This status gate is one more reason the implicit
+  command-tail capture is a sharp edge — a live question is whether value-position blocks
+  should drop implicit capture and require an explicit `$(…)` instead.)
 
 To *return a string* reliably, then, write a **quoted** tail — `{ "text" }` — which is
 an expression and works in a body of any length; the bare `{ text }` shorthand is only
