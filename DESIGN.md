@@ -1977,9 +1977,10 @@ coexist with `return [N]`:
   early. Rationale: local-yield and function-return are genuinely different — a `match`
   arm inside a function must yield *the arm's* value while the function keeps running
   (`yield`), which is not the same as bailing out of the whole function (`return`);
-  mirrors generators. Cost / sub-questions: two keywords; must define a function body's
-  value (trailing `yield`? explicit `return`? last `yield` wins?); whether `yield`
-  outside a value context is an error; and `return`'s status role still needs settling.
+  mirrors generators. `return`'s status is unchanged — the settled view of the result.
+  Cost / sub-questions: two keywords; must define a function body's value (trailing
+  `yield`? explicit `return`? last `yield` wins?); and whether `yield` outside a value
+  context is an error.
 - **Option 2 — one keyword, no separate local yield: `return <value>`.**
   `return <value>` is the only value keyword; **status stays the settled view of the
   result** — an int's status is the int itself (so `return 5` yields the typed value `5`,
