@@ -20,6 +20,7 @@ reedline = { version = "0.49.0", features = ["sqlite"] }
 regex = "1.11.3"
 rusqlite = "0.40.1"
 unicode-segmentation = "1.12.0"
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 mesh-platform = { path = "../mesh-platform" }
