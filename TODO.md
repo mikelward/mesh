@@ -128,6 +128,11 @@ file as tasks land.
       (`...name`), with `--` ending flag parsing and call-time default evaluation.
       Deferred: functions in pipelines/redirections, and calling for a value
       (`f(arg)`) vs running (`f arg`).
+- [x] Redirecting a function (`f > out`, `f >> log`, `f < in`) — applied to the
+      shell's own descriptors around the in-process call, so the body's output
+      (including from externals it runs) lands in the target and stdout is
+      restored afterward. Still deferred: redirected builtins, backgrounding an
+      in-shell command, and functions as pipeline stages.
 - [x] First `if` expression slice — command-status and value conditions, brace-delimited
       `else` / `else if`, multiline bodies, typed assignment-position results,
       and conditional list-pattern binding.
