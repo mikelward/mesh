@@ -883,15 +883,16 @@ fn header_awaits_body(text: &str) -> bool {
     let after_open = &rest[paren + 1..];
     match after_open.find(')') {
         // Params still forming: keep reading only while the partial list could
-        // still be completed into a valid one (`func f(,`, `func f(...`, `func
-        // f(a=` can never be repaired, so they dispatch immediately).
-        None => params_prefix_ok(after_open),
-        // Signature closed: the parameter list must actually parse, and only
-        // whitespace may sit between `)` and the `{`. Reusing `parse_params` means
-        // any signature the parser will reject (`(,)`, `(...xs)`, `(a,a)`) is
-        // dispatched immediately rather than buffering the commands after it.
+        // still be completed into a valid one (`func f(,` and `func f(a,,` can
+        // never be repaired, so they dispatch immediately; `func f(...`, `func
+        // f(--`, and `func f(a =` are valid new-form prefixes and keep reading).
+        None => params_valid(after_open, true),
+        // Signature closed: the parameter list must be structurally valid, and
+        // only whitespace may sit between `)` and the `{`. A shape the parser
+        // clearly rejects (`(,)`, `(a,a)`) is dispatched immediately rather than
+        // buffering the commands after it.
         Some(close) => {
-            parse_params(&after_open[..close]).is_ok() && after_open[close + 1..].trim().is_empty()
+            params_valid(&after_open[..close], false) && after_open[close + 1..].trim().is_empty()
         }
     }
 }
@@ -906,125 +907,106 @@ fn is_ident_prefix(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Could the partial (still-unclosed) parameter list `list` still be completed
-/// into a valid one by appending more input? Applies the same structural rules as
-/// [`parse_params`], but treats the final token as an in-progress prefix (a bare
-/// name may still be growing), so only *provably* unrepairable content fails: a
-/// leading or doubled comma, a rest/flag/default token (`...`, `-…`, `…=…`), a
-/// finalized name that is invalid/`env`/duplicate, or a trailing token whose head
-/// already cannot start an identifier. A trailing comma is repairable.
-fn params_prefix_ok(list: &str) -> bool {
-    let chars: Vec<char> = list.chars().collect();
+/// Is the `func` parameter list `list` structurally valid enough to keep
+/// buffering? Mirrors the parser's signature grammar (`Parser::parameters`):
+/// each comma-separated segment is a positional (`name` / `name = expr`), a flag
+/// (`--name` / `--name = expr`), or a rest (`...name`). Only the parameter
+/// **name** is validated here (a valid, non-`env`, non-duplicate identifier);
+/// default *expressions* are left to the parser, which validates them and the
+/// ordering rules once the whole definition is in hand. `prefix` marks a
+/// still-forming list (`)` not yet seen), so the final segment may be an
+/// in-progress prefix and a trailing comma is repairable.
+///
+/// The point is only buffer-vs-dispatch: anything the parser accepts must return
+/// `true` so a valid multi-line definition keeps reading, while a shape that can
+/// never be repaired (`,x`, `x,,y`, a bad/`env`/duplicate name) returns `false`
+/// so the malformed header dispatches instead of swallowing later commands.
+fn params_valid(list: &str, prefix: bool) -> bool {
+    if list.trim().is_empty() {
+        return true; // `()` so far, or nothing typed after `(` yet
+    }
+    let segments = split_top_level_commas(list);
+    let last = segments.len() - 1;
     let mut names: Vec<String> = Vec::new();
-    let mut have_name = false;
-    let mut pending_comma = false;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_whitespace() {
-            i += 1;
-            continue;
+    for (index, segment) in segments.iter().enumerate() {
+        let segment = segment.trim();
+        let forming = prefix && index == last;
+        if segment.is_empty() {
+            // An empty segment is a leading/interior/doubled comma — never valid —
+            // except a single trailing comma in a still-forming list (`func f(a,`).
+            return forming;
         }
-        if c == ',' {
-            if !have_name || pending_comma {
-                return false; // a comma with no name before it can never be valid
-            }
-            pending_comma = true;
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < chars.len() && chars[i] != ',' && !chars[i].is_whitespace() {
-            i += 1;
-        }
-        let tok: String = chars[start..i].iter().collect();
-        // Forms that can never be a valid positional, even as a prefix.
-        if tok.starts_with("...") || tok.starts_with('-') || tok.contains('=') {
+        if !segment_valid(segment, &mut names, forming) {
             return false;
         }
-        // A delimiter after the token finalizes it; the trailing token may still be
-        // growing. A finalized token must be a valid, non-`env`, non-duplicate
-        // name; the trailing one need only be a valid identifier *prefix* — an
-        // impossible head (`_`, a digit) can never become a name, so reject it now
-        // rather than entering continuation mode.
-        let finalized = i < chars.len();
-        if finalized {
-            if !is_ident(&tok) || tok == "env" || names.iter().any(|n| n == &tok) {
-                return false;
-            }
-            names.push(tok);
-        } else if !is_ident_prefix(&tok) {
-            return false;
-        }
-        have_name = true;
-        pending_comma = false;
     }
     true
 }
 
-/// Parse a parameter list: names separated by commas and/or whitespace. A comma
-/// is a real separator, not ignorable filler — it must sit between two names, so
-/// a leading, trailing, or doubled comma (`,x`, `x,`, `x,,y`) is a loud error
-/// rather than a silently dropped empty. v1 also rejects the deferred flag /
-/// optional / rest forms with a clear message.
-pub(crate) fn parse_params(list: &str) -> Result<Vec<String>, String> {
-    let chars: Vec<char> = list.chars().collect();
-    let mut params: Vec<String> = Vec::new();
-    // A comma needs a name on each side: it is only valid once at least one name
-    // has been read, and never immediately after another comma.
-    let mut have_name = false;
-    let mut pending_comma = false;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_whitespace() {
-            i += 1;
-            continue;
-        }
-        if c == ',' {
-            if !have_name || pending_comma {
-                return Err("func: missing parameter name before `,`".to_string());
+/// Validate one parameter segment for [`params_valid`]. Classifies it as a rest,
+/// flag, or positional and checks its name; `forming` allows the name to be a
+/// still-growing prefix (only meaningful for the list's final segment).
+fn segment_valid(segment: &str, names: &mut Vec<String>, forming: bool) -> bool {
+    if let Some(rest) = segment.strip_prefix("...") {
+        // A rest takes no default; an `=` makes it unrepairable.
+        return !rest.contains('=') && validate_name(rest.trim(), names, forming);
+    }
+    let body = segment.strip_prefix("--").unwrap_or(segment);
+    // A default detaches at the first `=`; once present, the name is finalized.
+    match body.split_once('=') {
+        Some((name, _default)) => validate_name(name.trim(), names, false),
+        None => validate_name(body.trim(), names, forming),
+    }
+}
+
+/// Check a parameter `name` for [`segment_valid`]. A finalized name must be a
+/// valid, non-`env`, non-duplicate identifier (and is recorded for later
+/// duplicate checks); a still-`forming` one need only be a valid identifier
+/// prefix. An empty name is only acceptable while forming (`...` / `--` mid-type).
+fn validate_name(name: &str, names: &mut Vec<String>, forming: bool) -> bool {
+    if name.is_empty() {
+        return forming;
+    }
+    if forming {
+        return is_ident_prefix(name);
+    }
+    if !is_ident(name) || name == "env" || names.iter().any(|existing| existing == name) {
+        return false;
+    }
+    names.push(name.to_owned());
+    true
+}
+
+/// Split a parameter list on its top-level commas, ignoring commas nested inside
+/// brackets, parentheses, braces, or quotes (which can appear in a default
+/// expression, e.g. `x = [a, b]`). A trailing comma yields a final empty segment.
+fn split_top_level_commas(list: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    for c in list.chars() {
+        if let Some(active) = quote {
+            current.push(c);
+            if c == active {
+                quote = None;
             }
-            pending_comma = true;
-            i += 1;
             continue;
         }
-        // Read a name token: a run up to the next comma or whitespace.
-        let start = i;
-        while i < chars.len() && chars[i] != ',' && !chars[i].is_whitespace() {
-            i += 1;
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                segments.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
         }
-        let tok: String = chars[start..i].iter().collect();
-        if tok.starts_with("...") {
-            return Err("func: rest parameters (`...name`) are not supported yet".to_string());
-        }
-        if tok.starts_with('-') {
-            return Err("func: flag parameters (`--name`) are not supported yet".to_string());
-        }
-        if tok.contains('=') {
-            return Err("func: optional/default parameters are not supported yet".to_string());
-        }
-        if !is_ident(&tok) {
-            return Err(format!("func: `{tok}` is not a valid parameter name"));
-        }
-        // `env` is the environment namespace (`$env.KEY`), so a parameter named
-        // `env` would bind but never read back — reject it, as assignment does.
-        if tok == "env" {
-            return Err("func: `env` is a reserved name and cannot be a parameter".to_string());
-        }
-        // A repeated name would silently overwrite the earlier positional in the
-        // local scope, making one argument unreachable; diagnose it here.
-        if params.iter().any(|p| p == &tok) {
-            return Err(format!("func: duplicate parameter `{tok}`"));
-        }
-        params.push(tok);
-        have_name = true;
-        pending_comma = false;
+        current.push(c);
     }
-    if pending_comma {
-        return Err("func: missing parameter name after `,`".to_string());
-    }
-    Ok(params)
+    segments.push(current);
+    segments
 }
 
 /// The result of a bare-level brace scan (see [`scan_braces`]).
@@ -1607,17 +1589,27 @@ mod tests {
         // A closed but invalid parameter list is also dispatched immediately —
         // the same validation the parser applies, so no invalid shape buffers.
         assert!(!needs_more_input("func f(,)\n"));
-        assert!(!needs_more_input("func f(...xs)\n"));
         assert!(!needs_more_input("func f(a,a)\n"));
+        // The flag / optional / rest forms are valid signatures, so a closed one
+        // with a delayed body opener keeps buffering rather than dispatching.
+        assert!(needs_more_input("func f(...xs)\n"));
+        assert!(needs_more_input("func f(--force)\n"));
+        assert!(needs_more_input("func f(x = 1)\n"));
+        assert!(needs_more_input("func f(--tag = latest)\n"));
         // An unclosed but provably-invalid parameter list is dispatched too, while
-        // a valid partial list (a name still forming) keeps buffering.
+        // a valid partial list (a name or new-form parameter still forming) keeps
+        // buffering.
         assert!(!needs_more_input("func f(,\n"));
-        assert!(!needs_more_input("func f(...\n"));
-        assert!(!needs_more_input("func f(a=\n"));
         assert!(!needs_more_input("func f(a,a,\n"));
         assert!(needs_more_input("func f(a\n"));
         assert!(needs_more_input("func f(a, b\n"));
         assert!(needs_more_input("func f(a,\n"));
+        assert!(needs_more_input("func f(...\n"));
+        assert!(needs_more_input("func f(...xs\n"));
+        assert!(needs_more_input("func f(--\n"));
+        assert!(needs_more_input("func f(--force\n"));
+        assert!(needs_more_input("func f(a =\n"));
+        assert!(needs_more_input("func f(a = 1,\n"));
         // A trailing parameter token whose head cannot start an identifier is
         // impossible, so it dispatches instead of entering continuation mode.
         assert!(!needs_more_input("func f(_\n"));

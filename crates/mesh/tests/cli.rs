@@ -2015,6 +2015,28 @@ fn generated_help_shows_flags_optionals_and_rest() {
 }
 
 #[test]
+fn a_new_form_signature_buffers_across_lines() {
+    // A flag/optional/rest signature split across lines — including the body brace
+    // on a later line — must keep buffering, not dispatch as an incomplete header.
+    let delayed_brace = run_with_input("func f(--force)\n{\n  puts \"$force\"\n}\nf --force\n");
+    assert_eq!(String::from_utf8_lossy(&delayed_brace.stdout), "true\n");
+    assert!(
+        delayed_brace.stderr.is_empty(),
+        "{:?}",
+        delayed_brace.stderr
+    );
+
+    let multiline = run_with_input(
+        "func g(\n  first,\n  --tag = latest,\n  ...rest\n) {\n  puts \"$first $tag\"\n  puts ...$rest\n}\ng app web1 web2\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&multiline.stdout),
+        "app latest\nweb1 web2\n"
+    );
+    assert!(multiline.stderr.is_empty(), "{:?}", multiline.stderr);
+}
+
+#[test]
 fn a_declared_help_flag_is_kept_and_not_synthesized() {
     // A function that claims `--help` observes the switch in its body instead of
     // triggering the canned help, and its generated help does not duplicate the
