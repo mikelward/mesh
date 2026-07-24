@@ -57,11 +57,12 @@ cargo build --release  # optimized build
 cargo install --locked --path crates/mesh   # install the mesh binary into ~/.cargo/bin
 ```
 
-The root `Cargo.toml` is a virtual manifest, so `cargo install` must target the
-`mesh` package (`--path crates/mesh`, or `--git <url> mesh`) rather than the
-workspace root — installing the root fails with *"found a virtual manifest
-instead of a package manifest."* Pass `--locked` to install the exact
-dependency versions from the committed `Cargo.lock`.
+The root `Cargo.toml` is a virtual manifest, so a bare `cargo install` (or
+`--path .`) from the root fails with *"found a virtual manifest instead of a
+package manifest."* Point `--path` at `crates/mesh` instead. A git install
+(`--git <url>`) needs no package name — `mesh` is the workspace's only
+installable binary, so Cargo picks it automatically. Pass `--locked` to install
+the exact dependency versions from the committed `Cargo.lock`.
 
 `Cargo.lock` **is committed** (mesh is a binary, so builds are reproducible).
 

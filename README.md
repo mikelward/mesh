@@ -22,24 +22,26 @@ cargo test --workspace # run the tests
 ## Installing
 
 This repository is a Cargo workspace, so its root `Cargo.toml` is a *virtual*
-manifest with no package of its own. Running `cargo install` (or
-`cargo install --path .`) from the root therefore fails with:
+manifest with no package of its own. A bare `cargo install` — which installs the
+current directory, like `cargo install --path .` — therefore fails from the root
+with:
 
 ```
 error: found a virtual manifest instead of a package manifest
 ```
 
-Point `cargo install` at the `mesh` package instead of the workspace root:
+Point `--path` at the `mesh` package instead of the workspace root. Installing
+from git needs no such qualifier: `mesh` is the workspace's only installable
+binary, so Cargo selects it automatically.
 
 ```sh
-cargo install --locked --path crates/mesh                       # from a local checkout
-cargo install --locked --git https://github.com/mikelward/mesh mesh   # straight from git
+cargo install --locked --path crates/mesh                  # from a local checkout
+cargo install --locked --git https://github.com/mikelward/mesh   # straight from git
 ```
 
-The trailing `mesh` in the `--git` form names the package to install; without it
-Cargo hits the same virtual-manifest error. `--locked` installs the exact
-dependency versions from the committed `Cargo.lock` rather than re-resolving to
-newer ones. Both commands place a `mesh` binary in `~/.cargo/bin`.
+`--locked` installs the exact dependency versions from the committed `Cargo.lock`
+rather than re-resolving to newer ones. Both commands place a `mesh` binary in
+`~/.cargo/bin`.
 
 ## Releases
 
