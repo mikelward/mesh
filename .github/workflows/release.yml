@@ -73,7 +73,7 @@ jobs:
           staging="mesh-$version-$TARGET"
           mkdir "$staging"
           cp "target/$TARGET/release/mesh" "$staging/"
-          cp README.md "$staging/"
+          cp README.md LICENSE-APACHE LICENSE-MIT "$staging/"
           tar -czf "$archive" "$staging"
           sha256sum "$archive" > "$archive.sha256"
           printf 'archive=%s\n' "$archive" >> "$GITHUB_ENV"
