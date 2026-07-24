@@ -218,6 +218,11 @@ own exit code at end of input.
 | `128 + n` | Killed by signal `n`. |
 | `2` | Syntax error (the shell recovers and continues). |
 
+A **value** used as a statement reports the status *view* of that value: an
+integer is its own status (masked to 0–255), a boolean inverts (`true` is `0`),
+and anything else is `0`. So `1 == 2 || puts nope` prints, and a function whose
+body ends in a boolean fails when that boolean is false.
+
 ## Expansion
 
 Applied to each word before the command runs.
@@ -610,16 +615,44 @@ greet world          # -> hi, world
 - **Arguments.** A function preserves typed values: a bare list (`f $xs`) arrives
   intact as one list-valued positional, whereas an external command still needs it
   spread (`...$xs`) or joined. A spread contributes one argument per element.
-- **Result.** A function's status is its last command's status, or `0` for an
-  empty body. `return N` exits early with status `N` (masked to 0–255, like
-  `exit`); a bare `return` uses the status so far. Both stop the rest of the body.
-  At top level `return` is a recoverable error.
+- **Result.** A function's status is its last statement's status, or `0` for an
+  empty body — and when that last statement is an expression, its status is the
+  view of the resulting value, so a body ending in `1 == 2` fails. `return expr`
+  exits early carrying a value (viewed the same way: `return 3` is status `3`,
+  masked to 0–255, like `exit`); a bare `return` carries the **result so far** —
+  the last value the body produced, or the status of a command that produced
+  none, or the empty string if nothing ran. Both stop the rest of the body. At
+  top level `return` is a recoverable error.
 
 - **Redirection.** A function takes `>`, `>>`, `<`, and `2>` like any command
   (`f > out.txt`, `r < input`). Because a function runs inside the shell, the
   redirection applies to the shell's own descriptors for the duration of the
   call, so output from the body — including from an external command it runs —
   lands in the target, and an external it runs can read the redirected input.
+
+- **Calling for a value.** `f(arg, key: value, ...$spread)` calls `f` and yields
+  its **value** — the last expression of the body, or the value an explicit
+  `return` carries — so a function can be used in an expression. Command position
+  (`f arg`) is unchanged: it runs the function for its status.
+
+  ```
+  func double(n) { return $n * 2 }
+  x = double(21)                      # x is 42
+  ```
+
+  - **Arguments** are expressions, evaluated in the caller's scope. `key: value`
+    binds the same parameter as the flag `--key`, so `d(prod, force: true)` and
+    `d(prod, --force)` are the same call as `d prod --force`; a bare `--` ends
+    option parsing; `...$list` spreads positionals and `...$map` spreads options.
+  - **Channels stay independent.** The value returns through the call while the
+    body's stdout streams as usual (`DESIGN.md`).
+  - **Status** is the usual view of the resulting value: an integer is its own
+    status, a boolean inverts (`true` is `0`), anything else is `0`. A runtime
+    error in the call fails the enclosing statement instead of yielding a value.
+  - **Not backgroundable.** `f() &` is refused, and so is `&` on any statement
+    that is not a command or pipeline — an expression, an assignment, an
+    `if`/`match`, a loop, a definition: the value is produced in this shell, so a
+    backgrounded call would have to hand its result back across a fork.
 
 A function can also be a pipeline stage, reading the pipe, writing to the next
 stage, or both (`f | sort`, `echo x | f`, `a | f | b`). A stage runs in its own
@@ -628,8 +661,8 @@ concurrently — and, as in every POSIX shell, whatever the stage changes stays 
 that process: a `cd` or an assignment inside `f | cat` does not outlive it.
 Arguments to a piped function arrive as strings.
 
-Not yet supported: a function in the background, and calling for a value
-(`f(arg)`) as opposed to running it.
+Not yet supported: a function in the background, `:capture` on a call, and
+lambdas.
 
 ## Not yet implemented
 

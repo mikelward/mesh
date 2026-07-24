@@ -232,7 +232,11 @@ Bare `&` ends the preceding command or pipeline, launches it in a background
 process group, and acts as a sequence boundary (`sleep 1 & puts ready`). Its
 stdin defaults to `/dev/null`, preventing a background command from consuming
 later shell input. Quoted or escaped `&` remains literal. An empty `&` is a
-syntax error. Assignments and builtins cannot be launched in the background yet.
+syntax error. Only a command or a pipeline can be backgrounded: `&` on anything
+else — an expression (a value call included), an assignment, an `if`/`match`, a
+loop, or a definition — is refused with `mesh: &: backgrounding … is not
+supported yet`, since those run in the shell itself and there is no child to
+defer them to.
 
 Ctrl-Z also registers a stopped foreground pipeline in the same job table.
 `jobs` lists registered jobs; `fg [N|%N]` foregrounds one, and `bg [N|%N]`
@@ -315,15 +319,21 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
   body binds a local (gone on return). Reads resolve the innermost local scope,
   then the global scope only — a callee never sees its caller's locals (lexical,
   not dynamic).
-- **`return`.** `return N` sets the status (masked to 0–255, like `exit`); a bare
-  `return` uses the status so far. Either stops the rest of the body. A function's
-  result is its last command's status, or **0** for an empty body or a bare
+- **`return`.** `return expr` carries a value out of the body; a bare `return`
+  carries the result so far — the last value the body produced, or the status of
+  a command that produced none. Either stops the rest of the body. In command
+  position the status is the usual view of that value (an integer is its own
+  status, masked to 0–255, like `exit`). A function's status is otherwise its
+  last command's status, or **0** for an empty body or a bare
   `return` before anything ran (`DESIGN.md`). At top level `return` is a
   recoverable error that does **not** abort a `;` sequence.
-- **Deferred:** a function in a multi-stage pipeline or with a redirection (or in
-  the background) is rejected (needs the fork-based executor); flags/optionals/
-  rest parameters; `func` composing with separators; and calling for a value
-  (`f(arg)`) vs. running (`f arg`) — only the run form exists today.
+- **Calling for a value.** `f(arg, key: value, ...$spread)` yields the body's
+  value — its last expression, or the value carried by `return` — while `f arg`
+  runs the function for its status. `key: value` binds the parameter its `--key`
+  flag would.
+- **Deferred:** a function in the background is rejected (needs the fork-based
+  executor); `func` composing with separators; `:capture` on a call; and
+  lambdas.
 
 ## Task 10 — `if` expressions
 

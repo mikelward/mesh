@@ -140,13 +140,17 @@ file as tasks land.
 - [x] Function signature roles — optional positionals (`name = default`), flags
       (boolean switch `--name`, valued `--name = default`), and a trailing rest
       (`...name`), with `--` ending flag parsing and call-time default evaluation.
-      Deferred: functions in pipelines/redirections, and calling for a value
-      (`f(arg)`) vs running (`f arg`).
 - [x] Redirecting a function (`f > out`, `f >> log`, `f < in`) — applied to the
       shell's own descriptors around the in-process call, so the body's output
       (including from externals it runs) lands in the target and stdout is
       restored afterward. Still deferred: redirected builtins and backgrounding
       an in-shell command.
+- [x] Calling for a value — `f(arg, key: value, ...$spread)` returns the
+      function's value (last expression, or an explicit `return`), with `key:`
+      options binding the same parameter as `--flag`; command position (`f arg`)
+      still streams. Deferred: `:capture`, lambdas, and a bare literal as an
+      implicit result (`{ 42 }` parses `42` as a command — use `return 42` or an
+      operator expression).
 - [x] First `if` expression slice — command-status and value conditions, brace-delimited
       `else` / `else if`, multiline bodies, typed assignment-position results,
       and conditional list-pattern binding.
