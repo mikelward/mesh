@@ -382,6 +382,7 @@ dependencies = [
  "regex",
  "rusqlite",
  "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

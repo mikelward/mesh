@@ -26,6 +26,7 @@ use reedline::{
     default_emacs_keybindings,
 };
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::builtins::{self, Builtin};
 use crate::completion::{CompletionCache, CompletionSpec, ValueHint, rank_candidates};
@@ -2954,13 +2955,26 @@ fn read_line(reader: &mut impl Read, out: &mut Vec<u8>) -> io::Result<usize> {
     Ok(out.len())
 }
 
-/// The minimal two-glyph prompt: `mesh$` after success, `mesh!` after failure,
-/// `...` while a multi-line input unit is incomplete. The full status-dashboard
-/// prompt from `DESIGN.md` is a later milestone.
+/// The minimal two-glyph prompt: `mesh$` after success and `mesh!` after failure.
+/// A continuation prompt fills the width of the current prompt's last line with
+/// dots and a trailing space. The full status-dashboard prompt from `DESIGN.md`
+/// is a later milestone.
 struct MeshPrompt {
     failed: bool,
     continuation: bool,
     custom: Option<String>,
+}
+
+impl MeshPrompt {
+    fn continuation_indicator(&self) -> String {
+        let prompt =
+            self.custom
+                .as_deref()
+                .unwrap_or(if self.failed { "mesh! " } else { "mesh$ " });
+        let width = prompt.rsplit('\n').next().unwrap_or_default().width();
+
+        format!("{} ", ".".repeat(width.saturating_sub(1)))
+    }
 }
 
 impl Prompt for MeshPrompt {
@@ -2972,7 +2986,7 @@ impl Prompt for MeshPrompt {
     }
     fn render_prompt_indicator(&self, _edit_mode: PromptEditMode) -> Cow<'_, str> {
         if self.continuation {
-            Cow::Borrowed("... ")
+            Cow::Owned(self.continuation_indicator())
         } else if let Some(prompt) = &self.custom {
             Cow::Borrowed(prompt)
         } else if self.failed {
@@ -2982,7 +2996,7 @@ impl Prompt for MeshPrompt {
         }
     }
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
-        Cow::Borrowed("... ")
+        Cow::Owned(self.continuation_indicator())
     }
     fn render_prompt_history_search_indicator(
         &self,
@@ -3828,6 +3842,33 @@ mod tests {
             Step::Continue(0)
         );
         assert!(shell.prompt.text.is_none());
+    }
+
+    #[test]
+    fn continuation_prompts_match_the_current_prompt_last_line() {
+        let default_prompt = MeshPrompt {
+            failed: false,
+            continuation: true,
+            custom: None,
+        };
+
+        assert_eq!(
+            default_prompt.render_prompt_indicator(PromptEditMode::Default),
+            "..... "
+        );
+        assert_eq!(default_prompt.render_prompt_multiline_indicator(), "..... ");
+
+        let custom_prompt = MeshPrompt {
+            failed: false,
+            continuation: true,
+            custom: Some("heading\nλ> ".into()),
+        };
+
+        assert_eq!(
+            custom_prompt.render_prompt_indicator(PromptEditMode::Default),
+            ".. "
+        );
+        assert_eq!(custom_prompt.render_prompt_multiline_indicator(), ".. ");
     }
 
     #[test]
