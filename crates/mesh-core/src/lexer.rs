@@ -972,17 +972,13 @@ fn signature_close(after_open: &str) -> Option<usize> {
                     k += 1;
                 }
             }
-            '\'' | '"' => match skip_quote(&chars, k + 1, c, true) {
-                Some(next) => k = next,
-                None => return None, // an unterminated quote: keep buffering
-            },
+            // An unterminated quote (`skip_quote` → `None`) leaves the signature
+            // open, so `?` returns `None` and the reader keeps buffering.
+            '\'' | '"' => k = skip_quote(&chars, k + 1, c, true)?,
             'r' if raw_eligible
                 && matches!(chars.get(k + 1).map(|&(_, c)| c), Some('\'') | Some('"')) =>
             {
-                match skip_quote(&chars, k + 2, chars[k + 1].1, false) {
-                    Some(next) => k = next,
-                    None => return None,
-                }
+                k = skip_quote(&chars, k + 2, chars[k + 1].1, false)?;
             }
             '(' | '[' | '{' => {
                 depth += 1;
