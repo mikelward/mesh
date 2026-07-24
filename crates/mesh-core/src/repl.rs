@@ -2066,12 +2066,27 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
         None => return Step::Continue(exec::run(&[name.to_string()], &mut shell.jobs)),
     };
 
+    // Isolate the caller's loop state for the whole call — argument binding
+    // included — so a `break`/`continue` inside an omitted block-bearing default
+    // is reported as outside a loop rather than being attributed to the caller's
+    // loop. Restored on every exit path below.
+    let caller_loop_depth = std::mem::replace(&mut shell.loop_depth, 0);
     shell.vars.push_scope();
-    if let Err(code) = bind_arguments(name, &params, args, shell) {
+    let bound = bind_arguments(name, &params, args, shell);
+    // A default that ran `break`/`continue` (already reported as outside a loop)
+    // may have left `shell.control` set; clear it so it neither short-circuits the
+    // body nor leaks back to the caller.
+    if matches!(
+        shell.control,
+        Some(parser::ControlKind::Break | parser::ControlKind::Continue)
+    ) {
+        shell.control = None;
+    }
+    if let Err(code) = bound {
         shell.vars.pop_scope();
+        shell.loop_depth = caller_loop_depth;
         return Step::Continue(code);
     }
-    let caller_loop_depth = std::mem::replace(&mut shell.loop_depth, 0);
     let executed = run_source(&body, 0, true, shell);
     shell.loop_depth = caller_loop_depth;
     if matches!(
@@ -2158,8 +2173,11 @@ fn bind_arguments(
                             );
                             return Err(2);
                         };
-                        // Last occurrence wins for a valued flag.
-                        flag_values.insert(declared.name.as_str(), Value::String(value));
+                        // Last occurrence wins for a valued flag. The attached
+                        // value is typed like any other scalar argument, so
+                        // `--n=2` binds the integer `2` — matching a positional
+                        // `2` and the flag's own default expression.
+                        flag_values.insert(declared.name.as_str(), expand::typed_scalar(&value));
                     }
                     _ => unreachable!("only flags are collected here"),
                 }

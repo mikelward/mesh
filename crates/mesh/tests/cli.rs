@@ -1912,6 +1912,32 @@ fn flags_bind_in_any_order_and_never_consume_positionals() {
 }
 
 #[test]
+fn an_attached_flag_value_is_a_typed_scalar() {
+    // `--n=2` binds the integer `2`, like a positional `2` or the default, so it
+    // participates in arithmetic instead of erroring as a string.
+    let out = run_with_input("func add(--n = 1) { x = $n + 1; puts $x }\nadd\nadd --n=2\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n3\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_break_in_a_default_does_not_escape_to_the_callers_loop() {
+    // A function called from inside a loop whose omitted block-bearing default runs
+    // `break` must report it as outside a loop, fail that call, and leave the
+    // caller's loop intact — not silently break out of it.
+    let out = run_with_input(
+        "func f(x = if true { break }) { puts body }\nfor j in [a b] {\n  f\n  puts \"iter $j\"\n}\nputs done\n",
+    );
+    // Both iterations run and the loop finishes; the body never runs (binding failed).
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "iter a\niter b\ndone\n"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("break: not inside a loop"), "{stderr}");
+}
+
+#[test]
 fn a_rest_parameter_collects_the_leftover_positionals() {
     let out = run_with_input(
         "func f(first, ...rest) { puts $first\n  puts ...$rest }\nf a b c\nf solo\n",

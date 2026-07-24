@@ -230,10 +230,27 @@ fn scalar_literal(word: &Word) -> Option<Value> {
     else {
         return None;
     };
-    match text.as_str() {
-        "true" => Some(Value::Boolean(true)),
-        "false" => Some(Value::Boolean(false)),
-        _ => text.parse().ok().map(Value::Integer),
+    // A bare word that is not a typed literal falls through to ordinary string
+    // expansion, so only surface `true`/`false`/integers as typed values here.
+    match typed_scalar(text) {
+        Value::String(_) => None,
+        typed => Some(typed),
+    }
+}
+
+/// Type a bare scalar string the way an in-shell function argument is typed:
+/// `true`/`false` become booleans, an integer literal becomes an integer, and
+/// anything else stays a string. Used both for bare literal arguments and for the
+/// attached value of a valued `--flag=value`, so `--n=2` is the integer `2` just
+/// like a positional `2` or the flag's default expression.
+pub(crate) fn typed_scalar(text: &str) -> Value {
+    match text {
+        "true" => Value::Boolean(true),
+        "false" => Value::Boolean(false),
+        _ => text
+            .parse()
+            .map(Value::Integer)
+            .unwrap_or_else(|_| Value::String(text.to_owned())),
     }
 }
 
