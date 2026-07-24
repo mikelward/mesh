@@ -898,6 +898,7 @@ mod tests {
         );
         let words = vec![command.to_string_lossy().into_owned()];
         CompletionCache::new(Some(cache_dir.clone())).spec_for(&words);
+        let command = fs::canonicalize(command).unwrap();
         let entry = cache_dir.join(cache_name(&command, &[]));
         fs::write(entry, "not a completion cache").unwrap();
 
