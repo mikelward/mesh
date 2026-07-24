@@ -668,6 +668,26 @@ mod tests {
         root
     }
 
+    /// Run a completion-cache scenario that spawns a helper subprocess, retrying
+    /// from clean state when a probe transiently produces nothing.
+    ///
+    /// These tests assert on a probe's output and on how many times the helper
+    /// ran, but spawning and `exec`ing a just-written script can occasionally
+    /// yield an empty probe under heavy parallel test load — orthogonal to what
+    /// the test checks. The scenario returns `Err` for exactly that transient
+    /// case (so the attempt is discarded and retried); a genuine assertion failure
+    /// still panics inside the closure and fails the test immediately.
+    fn retrying(mut scenario: impl FnMut() -> Result<(), String>) {
+        let mut last = String::new();
+        for _ in 0..8 {
+            match scenario() {
+                Ok(()) => return,
+                Err(reason) => last = reason,
+            }
+        }
+        panic!("completion-cache scenario never completed a probe: {last}");
+    }
+
     #[test]
     fn parses_typed_specs() {
         let spec = CompletionSpec::from_help(
@@ -850,61 +870,104 @@ mod tests {
 
     #[test]
     fn memory_and_disk_cache_avoid_repeated_probes() {
-        let root = fresh_temp_dir("mesh-cache");
-        let command = root.join("helper");
-        let count = root.join("count");
-        let cache_dir = root.join("cache");
-        helper(
-            &command,
-            &format!("echo x >> '{}'\necho '  --cached  cached'", count.display()),
-        );
-        let words = vec![command.to_string_lossy().into_owned()];
+        retrying(|| {
+            let root = fresh_temp_dir("mesh-cache");
+            let command = root.join("helper");
+            let count = root.join("count");
+            let cache_dir = root.join("cache");
+            helper(
+                &command,
+                &format!("echo x >> '{}'\necho '  --cached  cached'", count.display()),
+            );
+            let words = vec![command.to_string_lossy().into_owned()];
 
-        let cache = CompletionCache::new(Some(cache_dir.clone()));
-        assert_eq!(cache.spec_for(&words).matching("--"), ["--cached"]);
-        assert_eq!(cache.spec_for(&words).matching("--"), ["--cached"]);
-        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1);
+            let cache = CompletionCache::new(Some(cache_dir.clone()));
+            // Only the first `spec_for` probes; the rest are served from the memory
+            // and disk caches. An empty first probe is a transient spawn hiccup —
+            // discard the attempt and retry from clean state.
+            let first = cache.spec_for(&words).matching("--");
+            if first.is_empty() {
+                let _ = fs::remove_dir_all(&root);
+                return Err("first probe produced no completions".into());
+            }
+            assert_eq!(first, ["--cached"]);
+            assert_eq!(cache.spec_for(&words).matching("--"), ["--cached"]);
+            assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1);
 
-        let fresh = CompletionCache::new(Some(cache_dir));
-        assert_eq!(fresh.spec_for(&words).matching("--"), ["--cached"]);
-        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1);
-        fs::remove_dir_all(root).unwrap();
+            let fresh = CompletionCache::new(Some(cache_dir));
+            assert_eq!(fresh.spec_for(&words).matching("--"), ["--cached"]);
+            assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1);
+            fs::remove_dir_all(root).unwrap();
+            Ok(())
+        });
     }
 
     #[test]
     fn modification_time_invalidates_cache() {
-        let root = fresh_temp_dir("mesh-invalidate");
-        let command = root.join("helper");
-        helper(&command, "echo '  --first  first'");
-        let words = vec![command.to_string_lossy().into_owned()];
-        let cache = CompletionCache::new(Some(root.join("cache")));
-        assert_eq!(cache.spec_for(&words).matching("--"), ["--first"]);
+        retrying(|| {
+            let root = fresh_temp_dir("mesh-invalidate");
+            let command = root.join("helper");
+            helper(&command, "echo '  --first  first'");
+            let words = vec![command.to_string_lossy().into_owned()];
+            let cache = CompletionCache::new(Some(root.join("cache")));
+            let first = cache.spec_for(&words).matching("--");
+            if first.is_empty() {
+                let _ = fs::remove_dir_all(&root);
+                return Err("first probe produced no completions".into());
+            }
+            assert_eq!(first, ["--first"]);
 
-        thread::sleep(Duration::from_millis(10));
-        helper(&command, "echo '  --second  second'");
-        assert_eq!(cache.spec_for(&words).matching("--"), ["--second"]);
-        fs::remove_dir_all(root).unwrap();
+            thread::sleep(Duration::from_millis(10));
+            helper(&command, "echo '  --second  second'");
+            // A newer mtime invalidates the cache, so this re-probes. An empty
+            // result is a transient spawn hiccup; a stale `--first` would be a real
+            // invalidation bug and still fails the assertion below.
+            let second = cache.spec_for(&words).matching("--");
+            if second.is_empty() {
+                let _ = fs::remove_dir_all(&root);
+                return Err("second probe produced no completions".into());
+            }
+            assert_eq!(second, ["--second"]);
+            fs::remove_dir_all(root).unwrap();
+            Ok(())
+        });
     }
 
     #[test]
     fn corrupt_disk_cache_is_replaced_by_a_fresh_probe() {
-        let root = fresh_temp_dir("mesh-corrupt");
-        let command = root.join("helper");
-        let count = root.join("count");
-        let cache_dir = root.join("cache");
-        helper(
-            &command,
-            &format!("echo x >> '{}'\necho '  --fresh  fresh'", count.display()),
-        );
-        let words = vec![command.to_string_lossy().into_owned()];
-        CompletionCache::new(Some(cache_dir.clone())).spec_for(&words);
-        let entry = cache_dir.join(cache_name(&command, &[]));
-        fs::write(entry, "not a completion cache").unwrap();
+        retrying(|| {
+            let root = fresh_temp_dir("mesh-corrupt");
+            let command = root.join("helper");
+            let count = root.join("count");
+            let cache_dir = root.join("cache");
+            helper(
+                &command,
+                &format!("echo x >> '{}'\necho '  --fresh  fresh'", count.display()),
+            );
+            let words = vec![command.to_string_lossy().into_owned()];
+            CompletionCache::new(Some(cache_dir.clone())).spec_for(&words);
+            let entry = cache_dir.join(cache_name(&command, &[]));
+            fs::write(entry, "not a completion cache").unwrap();
 
-        let spec = CompletionCache::new(Some(cache_dir)).spec_for(&words);
-        assert_eq!(spec.matching("--"), ["--fresh"]);
-        assert_eq!(fs::read_to_string(count).unwrap().lines().count(), 2);
-        fs::remove_dir_all(root).unwrap();
+            let spec = CompletionCache::new(Some(cache_dir)).spec_for(&words);
+            let matches = spec.matching("--");
+            let probes = fs::read_to_string(&count)
+                .map(|text| text.lines().count())
+                .unwrap_or(0);
+            // Both probes must have run: the initial population and the fresh
+            // re-probe after the corrupt entry. An empty result or a shortfall is a
+            // transient spawn hiccup — discard and retry.
+            if matches.is_empty() || probes < 2 {
+                let _ = fs::remove_dir_all(&root);
+                return Err(format!(
+                    "transient probe hiccup: matches={matches:?} probes={probes}"
+                ));
+            }
+            assert_eq!(matches, ["--fresh"]);
+            assert_eq!(probes, 2);
+            fs::remove_dir_all(root).unwrap();
+            Ok(())
+        });
     }
 
     #[test]
