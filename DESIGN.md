@@ -2006,6 +2006,45 @@ so Option 2 is close to what is *already* settled; the genuinely new (and confli
 part of the proposal is only **requiring an explicit keyword** in place of the settled
 implicit last-expression rule.
 
+**Proposal (not settled) — decouple a function's value from its status (StatusOr-style)**
+*(open; **reopens** the settled [error model](#error-handling), specifically "status is a
+view of the result")*.
+
+- **The wart it addresses.** Under the settled rule that a function's status is a *view*
+  of its result (int→itself, bool→`0`/`1`, any other value→`0`), a bare `int` return is
+  really an **exit code, not data**: `return 5` reads as "failure, code 5," and `0` is
+  **truthy** (success) while every other type's zero/empty is falsy — so an int's
+  truthiness is *inverted* relative to a string's, because `int` is doing double duty as
+  both data and error-code. The irreducible root: `0` means "success" as a **status** but
+  "zero/empty" as **data** — opposite truthiness — and one `int` type cannot be both.
+- **The proposal.** Separate them: a function's **value** is data (an `int` is just a
+  number, `0` falsy like everywhere else) and its **failure** is a distinct channel,
+  signaled **explicitly** (a `false`, or an error/status) — **never** by "nonzero int."
+  The caller must confront failure to reach the value (StatusOr / Rust `Result` / Go
+  `(v, err)`).
+- **Ergonomics — the unpack is the `if let`, not manual two-value handling.** mesh
+  already has the machinery, so this need not cost Go's `if err != nil` boilerplate:
+  - `v = f()` (bare bind) **asserts success** — fail-loud if `f` failed (the strict
+    bind), so a failed result can't be used silently;
+  - `if v = f() { use $v } else { handle failure }` — the **`if let`**: binds the value on
+    success, **branches on status**, handles failure in `else` (Rust's `if let Ok(v)`);
+  - `[out val] = f():capture` — the explicit full unpack when both channels are wanted.
+- **Condition rule (value-vs-status resolved by syntax).** A call's role in a condition is
+  set by its form, so "is a call its value or its status" is never ambiguous: bare `f` in
+  a condition tests **status** (the command form); `f()` / `if v = f()` produce the
+  **value**, and the `if let` branches on **success**, binding the value. Crucially the
+  `if let` branches on **status, not the value's data-truthiness** — which is what lets
+  `return 0` be honest data: `if n = count() { … }` takes the then-branch and binds
+  `n = 0` because `f` *succeeded*; `0`'s own falsiness never enters in.
+- **What it reopens / costs.** This reverses the settled "status is a view of the result"
+  and the "nonzero int = failure" convention — load-bearing parts of the
+  [error model](#error-handling). It also implies a **split**: `if external_cmd { }` still
+  branches on the process exit status (an external command has no typed value), while
+  `if my_func { }` / `if v = f()` branch on a mesh function's explicit success — two rules
+  for `if` depending on the callee. Whether that split is coherent or confusing is the
+  open question. *(This reverses an earlier lean in this exploration that "status is a view
+  of the result" was fine; the int-as-data overload is what changed it.)*
+
 ### Tests and comparisons
 
 This is the surface that replaces bash `[[ … ]]` — the pieces a condition needs,
