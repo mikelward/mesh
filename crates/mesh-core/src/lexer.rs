@@ -848,10 +848,20 @@ fn body_open_offset(text: &str) -> Option<usize> {
                         .starts_with('{')
                         .then(|| close + 1 + (tail.len() - trimmed.len()))
                 }
-                // The signature `(` never closed: a `{` in the parameter region is a
-                // malformed header (`func f(x {`) — treat it as the body opener so
-                // the definition buffers to its matching `}` and stays quarantined.
-                None => text[open + 1..].find('{').map(|rel| open + 1 + rel),
+                // The signature `(` never closed. If the partial list is still a
+                // valid prefix, the signature is legitimately forming — including a
+                // block-bearing default like `x = if c { … }` whose `{` is not the
+                // body — so no body has opened yet; keep buffering for the `)`. Only
+                // a provably-malformed header (`func f(x {`) treats an inner `{` as
+                // the body opener so it buffers to the matching `}` and quarantines.
+                None => {
+                    let params = &text[open + 1..];
+                    if params_valid(params, true) {
+                        None
+                    } else {
+                        params.find('{').map(|rel| open + 1 + rel)
+                    }
+                }
             }
         }
         // `{` before any `(` (or no `(` at all): a body opener only if the header
@@ -1750,6 +1760,28 @@ mod tests {
         // An unterminated quote in a default keeps the signature open (buffering),
         // not falsely closed at a later `)`.
         assert!(needs_more_input("func f(x = \"a)\n"));
+    }
+
+    #[test]
+    fn needs_more_input_buffers_a_block_bearing_default() {
+        // A default that is itself a block-bearing expression (`if`/`match`) has
+        // `{ … }` braces that are *not* the function body: while the signature `(`
+        // is still open, an inner block's close must not end buffering. Only a
+        // provably-malformed header (`func f(x {`, no `=`) quarantines from a brace.
+        assert!(needs_more_input("func f(x = if true {\n"));
+        assert!(needs_more_input("func f(x = if true {\n  1\n}\n"));
+        assert!(needs_more_input(
+            "func f(x = if true {\n  1\n} else {\n  2\n}\n"
+        ));
+        assert!(needs_more_input(
+            "func f(x = if true {\n  1\n} else {\n  2\n})\n{\n"
+        ));
+        assert!(!needs_more_input(
+            "func f(x = if true {\n  1\n} else {\n  2\n}) { puts $x }"
+        ));
+        // The malformed stray-brace header still quarantines to its matching `}`.
+        assert!(needs_more_input("func f(x {\n  puts LEAK\n"));
+        assert!(!needs_more_input("func f(x {\n  puts LEAK\n}\n"));
     }
 
     #[test]

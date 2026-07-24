@@ -2050,6 +2050,19 @@ fn a_default_expression_with_delimiters_buffers_across_lines() {
 }
 
 #[test]
+fn a_block_bearing_default_buffers_across_lines() {
+    // A default that is a multiline block-bearing expression (`if`) has braces that
+    // are not the function body; the reader must buffer until the signature's `)`,
+    // not dispatch when the inner block closes.
+    let out = run_with_input(
+        "func f(x = if true {\n  1\n} else {\n  2\n}) {\n  puts $x\n}\nf\nputs after\n",
+    );
+    // `f` prints the default `1`; `puts after` runs at top level (nothing leaked).
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\nafter\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
 fn a_declared_help_flag_is_kept_and_not_synthesized() {
     // A function that claims `--help` observes the switch in its body instead of
     // triggering the canned help, and its generated help does not duplicate the
