@@ -1957,9 +1957,10 @@ and is on the table as an alternative, **not** a decision:
 - The **settled** contract *(unchanged, and still in force)*: a function's/block's value
   is its **last expression** — no keyword needed ([Functions](#functions),
   [Conditionals](#conditionals-if-is-an-expression)); `return`/`return val` is
-  **early-exit only**; **status is a view of the result** (int→itself, bool→`0`/`1`,
-  any other value→`0`); the caller picks value-vs-stream **by syntax** (`f()` value,
-  `$(f)` stdout, bare `f` runs); and a **bare RHS word is a literal string**.
+  **early-exit only**; **status is a view of the result** (the full per-type mapping —
+  including `command → its own status` — is in [Functions](#functions)); the caller picks
+  value-vs-stream **by syntax** (`f()` value, `$(f)` stdout, bare `f` runs); and a
+  **bare RHS word is a literal string**.
 - The **proposal**: make `puts`/printing the only explicit way to write a **typed value
   to stdout** as bytes (ordinary command stdout — `ls`, external programs — still streams
   bytes for pipes and `$(f)` capture; and the settled value-rendering boundary still
@@ -1987,10 +1988,10 @@ coexist with the settled `return` / `return val`:
   context is an error.
 - **Option 2 — one keyword, no separate local yield: `return <value>`.**
   `return <value>` is the only value keyword; **status stays the settled view of the
-  result** — an int's status is the int itself (so `return 5` yields the typed value `5`,
-  read via `f()`, whose status *view* remains `5`), a bool's is `0`/`1`, any other value's
-  is `0`. There is no separate value-plus-status channel: the result is one thing and its
-  status is a view of it. (This is essentially the settled `return val` already; the only
+  result** (the full per-type mapping is in [Functions](#functions)) — e.g. `return 5`
+  yields the typed value `5`, read via `f()`, whose status *view* remains `5`. There is no
+  separate value-plus-status channel: the result is one thing and its status is a view of
+  it. (This is essentially the settled `return val` already; the only
   genuinely *new* part, shared with Option 1, is requiring the keyword in place of an
   implicit last expression.) Cost / sub-questions: gives **functions** a value but not
   `match` arms a *local* yield distinct from function-return, so `if`/`match`-as-expression
