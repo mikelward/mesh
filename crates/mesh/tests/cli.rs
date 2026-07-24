@@ -1803,6 +1803,32 @@ fn a_return_value_is_masked_to_eight_bits() {
 }
 
 #[test]
+fn return_carries_a_typed_value_whose_status_is_a_view_of_it() {
+    // `return <value>` now accepts any value, not only an integer; the exit status
+    // is a view of it (`DESIGN.md` §"Functions"): an integer is its own status, a
+    // boolean inverts (`true` → 0, `false` → 1), and any other type is success.
+    let boolean = run_with_input(
+        "func ok() { return true }\nfunc bad() { return false }\nok && puts t\nbad || puts f\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&boolean.stdout), "t\nf\n");
+    assert!(boolean.stderr.is_empty(), "{:?}", boolean.stderr);
+    // A returned string or list is success — and no longer the old "numeric
+    // argument required" error.
+    let other = run_with_input(
+        "func s() { return \"hi\" }\nfunc l() { return [1 2 3] }\ns && puts sok\nl && puts lok\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&other.stdout), "sok\nlok\n");
+    assert!(other.stderr.is_empty(), "{:?}", other.stderr);
+}
+
+#[test]
+fn a_bare_return_uses_the_last_status() {
+    // A `return` with no argument carries the last status, like `exit` with none.
+    let out = run_with_input("func f() { false\n return }\nf || puts nonzero\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nonzero\n");
+}
+
+#[test]
 fn a_function_local_does_not_leak_to_the_caller() {
     // `x` bound inside the function is gone after it returns.
     let out = run_with_input("func setx() { x = inside }\nsetx\nputs \"$x\"\n");

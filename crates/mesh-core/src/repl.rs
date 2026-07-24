@@ -339,9 +339,32 @@ enum Step {
     Continue(u8),
     /// `exit` was invoked; leave the shell with this status.
     Exit(u8),
-    /// `return` was invoked; unwind the current function with this status. At top
-    /// level (no function) `run_line` reports it as a recoverable error instead.
-    Return(u8),
+    /// `return` was invoked; unwind the current function carrying its result
+    /// value. Exit status is a *view* of that value ([`status_of`]). At top level
+    /// (no function) `run_line` reports it as a recoverable error instead.
+    Return(Value),
+}
+
+impl Step {
+    /// The exit status this step contributes as the new "last status".
+    fn status(&self) -> u8 {
+        match self {
+            Step::Continue(code) | Step::Exit(code) => *code,
+            Step::Return(value) => status_of(value),
+        }
+    }
+}
+
+/// A mesh value's exit status — the "status is a view of the result" rule from
+/// `DESIGN.md` §"Functions": an integer is its own status, a boolean inverts
+/// (`true` → 0, `false` → 1, the Unix convention), and every other value type is
+/// `0` (producing a value is success).
+fn status_of(value: &Value) -> u8 {
+    match value {
+        Value::Integer(code) => code.rem_euclid(256) as u8,
+        Value::Boolean(ok) => u8::from(!ok),
+        _ => 0,
+    }
 }
 
 /// Parse and run one input unit against the session. `in_function` is true while
@@ -501,17 +524,16 @@ fn run_executable(
                         eprintln!("mesh: return: not inside a function");
                         return Step::Continue(1);
                     }
-                    let code = value
+                    // `return val` unwinds carrying any value (its status is a view
+                    // of the value); a bare `return` carries the last status, so it
+                    // reads the same as `exit` with no argument (`DESIGN.md`).
+                    match value
                         .as_ref()
                         .map(|v| eval_expr(v, last, in_function, shell))
-                        .transpose();
-                    match code {
-                        Ok(Some(Value::Integer(code))) => Step::Return(code.rem_euclid(256) as u8),
-                        Ok(None) => Step::Return(last),
-                        Ok(Some(_)) => {
-                            eprintln!("mesh: return: numeric argument required");
-                            Step::Continue(2)
-                        }
+                        .transpose()
+                    {
+                        Ok(Some(value)) => Step::Return(value),
+                        Ok(None) => Step::Return(Value::Integer(i64::from(last))),
                         Err(step) => step,
                     }
                 }
@@ -2108,19 +2130,15 @@ fn command_name(tokens: &[Word], vars: &Vars) -> Option<String> {
     (argv.len() == 1).then(|| argv.pop().unwrap())
 }
 
-/// Build the [`Step::Return`] for a `return` command: no argument uses the last
-/// status; a numeric argument is masked to 0–255. A surplus or non-numeric
-/// operand is reported and does not unwind (the function keeps running).
+/// Build the [`Step::Return`] for a `return` command word: no argument uses the
+/// last status; a single argument is typed like any bare scalar (`7` → the
+/// integer `7`, `true`/`false` → booleans, else a string) and carried as the
+/// result, its status a view of that value. A surplus operand is reported and
+/// does not unwind (the function keeps running).
 fn make_return(args: &[String], last: u8) -> Step {
     match args {
-        [] => Step::Return(last),
-        [n] => match n.parse::<i64>() {
-            Ok(code) => Step::Return(code.rem_euclid(256) as u8),
-            Err(_) => {
-                eprintln!("mesh: return: {n}: numeric argument required");
-                Step::Continue(2)
-            }
-        },
+        [] => Step::Return(Value::Integer(i64::from(last))),
+        [value] => Step::Return(expand::typed_scalar(value)),
         _ => {
             eprintln!("mesh: return: too many arguments");
             Step::Continue(1)
@@ -2164,7 +2182,7 @@ fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &
         // A default's `return N` ends the call with that status, like the body's;
         // an `exit`/runtime step unwinds unchanged.
         return match step {
-            Step::Return(code) => Step::Continue(code),
+            Step::Return(value) => Step::Continue(status_of(&value)),
             other => other,
         };
     }
@@ -2177,7 +2195,7 @@ fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &
         shell.control = None;
     }
     let result = match executed {
-        Step::Return(code) => Step::Continue(code),
+        Step::Return(value) => Step::Continue(status_of(&value)),
         other => other,
     };
     shell.vars.pop_scope();
@@ -2655,8 +2673,11 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     let mut shell = Shell::new();
     let mut last = match run_startup_files(options, true, 0, &mut shell) {
         Step::Continue(code) => code,
-        Step::Exit(code) | Step::Return(code) => {
+        Step::Exit(code) => {
             return ExitCode::from(run_logout(options, code, &mut shell));
+        }
+        Step::Return(value) => {
+            return ExitCode::from(run_logout(options, status_of(&value), &mut shell));
         }
     };
     let mut pending = String::new();
@@ -3227,9 +3248,7 @@ fn handle_signal(
             );
             let start = Instant::now();
             let step = run_line(&text, last, false, shell);
-            let status = match step {
-                Step::Continue(code) | Step::Exit(code) | Step::Return(code) => code,
-            };
+            let status = step.status();
             let elapsed = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
             run_prompt_hooks(
                 PromptEvent::PostExec,
@@ -3264,8 +3283,11 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
     let mut shell = Shell::new();
     let mut last = match run_startup_files(options, false, 0, &mut shell) {
         Step::Continue(code) => code,
-        Step::Exit(code) | Step::Return(code) => {
+        Step::Exit(code) => {
             return ExitCode::from(run_logout(options, code, &mut shell));
+        }
+        Step::Return(value) => {
+            return ExitCode::from(run_logout(options, status_of(&value), &mut shell));
         }
     };
     let mut pending = String::new();
