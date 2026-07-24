@@ -2006,48 +2006,33 @@ so Option 2 is close to what is *already* settled; the genuinely new (and confli
 part of the proposal is only **requiring an explicit keyword** in place of the settled
 implicit last-expression rule.
 
-**Proposal (not settled) — decouple a function's value from its status (StatusOr-style)**
-*(open; **reopens** the settled [error model](#error-handling), specifically "status is a
-view of the result")*.
+**Considered and resolved — keep the settled status-view; `0` = success is correct**
+*(explored, not a change)*. The exploration questioned the settled rule that a function's
+status is a *view* of its result — specifically that `int → itself` makes `0` truthy
+(success) and a nonzero int a failure, so a bare int reads as an exit code rather than
+data. The worry: that inverts a data-int's usual truthiness, and you can't `return` a
+nonzero int as *successful data*.
 
-- **The wart it addresses.** Under the settled rule that a function's status is a *view*
-  of its result (int→itself, bool→`0`/`1`, any other value→`0`), a bare `int` return is
-  really an **exit code, not data**: `return 5` reads as "failure, code 5," and `0` is
-  **truthy** (success) while every other type's zero/empty is falsy — so an int's
-  truthiness is *inverted* relative to a string's, because `int` is doing double duty as
-  both data and error-code. The irreducible root: `0` means "success" as a **status** but
-  "zero/empty" as **data** — opposite truthiness — and one `int` type cannot be both.
-- **The proposal.** Separate them: a function's **value** is data (an `int` is just a
-  number, `0` falsy like everywhere else) and its **failure** is a distinct channel,
-  signaled **explicitly** (a `false`, or an error/status) — **never** by "nonzero int."
-  The caller must confront failure to reach the value (StatusOr / Rust `Result` / Go
-  `(v, err)`).
-- **Ergonomics — the unpack is the `if let`, not manual two-value handling.** mesh
-  already has the machinery, so this need not cost Go's `if err != nil` boilerplate:
-  - `v = f()` (bare bind) **asserts success** — fail-loud if `f` failed (the strict
-    bind), so a failed result can't be used silently;
-  - `if v = f() { use $v } else { handle failure }` — the **`if let`**: binds the value on
-    success, **branches on status**, handles failure in `else` (Rust's `if let Ok(v)`);
-  - `r = f():capture` — the explicit full form: the settled
-    [`:capture`](#calling-for-a-value-and-lambdas) returns a **record** (`$r.value`,
-    `$r.out` / `$r.err`, `$r.status`), so the value and the failure channel are both in
-    hand at once — the settled machinery already provides the "value + status together"
-    the proposal wants.
-- **Condition rule (value-vs-status resolved by syntax).** A call's role in a condition is
-  set by its form, so "is a call its value or its status" is never ambiguous: bare `f` in
-  a condition tests **status** (the command form); `f()` / `if v = f()` produce the
-  **value**, and the `if let` branches on **success**, binding the value. Crucially the
-  `if let` branches on **status, not the value's data-truthiness** — which is what lets
-  `return 0` be honest data: `if n = count() { … }` takes the then-branch and binds
-  `n = 0` because `f` *succeeded*; `0`'s own falsiness never enters in.
-- **What it reopens / costs.** This reverses the settled "status is a view of the result"
-  and the "nonzero int = failure" convention — load-bearing parts of the
-  [error model](#error-handling). It also implies a **split**: `if external_cmd { }` still
-  branches on the process exit status (an external command has no typed value), while
-  `if my_func { }` / `if v = f()` branch on a mesh function's explicit success — two rules
-  for `if` depending on the callee. Whether that split is coherent or confusing is the
-  open question. *(This reverses an earlier lean in this exploration that "status is a view
-  of the result" was fine; the int-as-data overload is what changed it.)*
+The resolution: **keep it.** `0 = success = truthy` is not a wart — it is forced by the
+world mesh lives in. **External commands exit `0` for success, nonzero for failure**,
+and there is no typed value to consult, only the exit code. For `if X { }` to compose
+uniformly whether `X` is `grep -q …` or a mesh function, a mesh function's `0`/success
+must also be truthy. Aligning with the external convention is exactly what makes commands
+and functions interchangeable in a condition — and it just works. The residual — you
+can't return a *nonzero* int as successful data — is narrow and accepted, since
+`return 0` / `return 1` are used as success/failure anyway (read them as
+`return true` / `return false`).
+
+For the record, correcting a mis-statement made during the exploration, the truthiness
+rule is: **falsy = `false`, an `error`, or a nonzero status; truthy = `true`, `0`/success,
+and every data value — strings, lists, maps — *including empty ones*** (an empty string
+or list is a success, status `0`, **not** falsy).
+
+One small **open** nicety this surfaced: spell an explicit coded failure as
+**`return error <n>`** — an error *value* carrying the exit code — rather than overloading
+a bare `return <n>`, leaving bare returns for data/success. That would add a returnable
+**error value** (mesh's current fail-loud errors are not values); additive, undecided, and
+independent of the resolution above.
 
 ### Tests and comparisons
 
