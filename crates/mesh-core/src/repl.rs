@@ -18,11 +18,13 @@ use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crossterm::style::Color;
+use nu_ansi_term::Style;
 use reedline::{
-    Completer, EditCommand, Emacs, History, HistoryItem, HistoryItemId, HistorySessionId, KeyCode,
-    KeyModifiers, Prompt, PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent,
-    SearchDirection, SearchQuery, Signal, Span, SqliteBackedHistory, Suggestion,
-    default_emacs_keybindings,
+    Completer, EditCommand, Emacs, Highlighter, History, HistoryItem, HistoryItemId,
+    HistorySessionId, KeyCode, KeyModifiers, Prompt, PromptEditMode, PromptHistorySearch, Reedline,
+    ReedlineEvent, SearchDirection, SearchQuery, Signal, Span, SqliteBackedHistory, StyledText,
+    Suggestion, default_emacs_keybindings,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -2265,6 +2267,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     );
     let mut editor = Reedline::create()
         .with_edit_mode(Box::new(Emacs::new(keybindings)))
+        .with_highlighter(Box::new(MeshHighlighter))
         .with_completer(Box::new(MeshCompleter {
             state: Arc::clone(&completion),
         }));
@@ -2923,6 +2926,16 @@ struct MeshPrompt {
     custom: Option<String>,
 }
 
+struct MeshHighlighter;
+
+impl Highlighter for MeshHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        let mut styled = StyledText::new();
+        styled.push((Style::new().bold(), line.to_owned()));
+        styled
+    }
+}
+
 impl Prompt for MeshPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
         Cow::Borrowed("")
@@ -2950,13 +2963,19 @@ impl Prompt for MeshPrompt {
     ) -> Cow<'_, str> {
         Cow::Borrowed("search: ")
     }
+    fn get_indicator_color(&self) -> Color {
+        Color::Reset
+    }
+    fn get_prompt_multiline_color(&self) -> nu_ansi_term::Color {
+        nu_ansi_term::Color::Default
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgumentRecall, CompletionState, MeshPrompt, PromptEvent, PromptHook, Shell,
-        StartupOptions, Step, TimestampedHistory, argument_completions, command_position,
+        ArgumentRecall, CompletionState, MeshHighlighter, MeshPrompt, PromptEvent, PromptHook,
+        Shell, StartupOptions, Step, TimestampedHistory, argument_completions, command_position,
         command_segment_words, completed_command, eval_binary, expansion_word, handle_signal,
         help_completions, history_path_from, interruptible_task, last_argument, needs_more_input,
         open_history, path_completions_sync, persist_logical_history, prepare_history_path,
@@ -2964,6 +2983,9 @@ mod tests {
     };
     use crate::parser;
     use crate::vars::Value;
+    use crossterm::style::Color;
+    use nu_ansi_term::Style;
+    use reedline::Highlighter;
     use reedline::{
         EditCommand, History, HistoryItem, Prompt, PromptEditMode, Reedline, Signal,
         SqliteBackedHistory,
@@ -3710,6 +3732,31 @@ mod tests {
             None
         );
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn interactive_text_is_bold_without_overriding_the_terminal_color() {
+        let highlighted = MeshHighlighter.highlight("echo hello", 5);
+
+        assert_eq!(
+            highlighted.buffer,
+            [(Style::new().bold(), "echo hello".into())]
+        );
+    }
+
+    #[test]
+    fn prompt_indicators_use_the_terminal_default_color() {
+        let prompt = MeshPrompt {
+            failed: false,
+            continuation: false,
+            custom: None,
+        };
+
+        assert_eq!(prompt.get_indicator_color(), Color::Reset);
+        assert_eq!(
+            prompt.get_prompt_multiline_color(),
+            nu_ansi_term::Color::Default
+        );
     }
 
     #[test]

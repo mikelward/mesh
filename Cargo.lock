@@ -373,9 +373,11 @@ name = "mesh-core"
 version = "0.0.0"
 dependencies = [
  "chrono",
+ "crossterm",
  "glob",
  "libc",
  "mesh-platform",
+ "nu-ansi-term",
  "nucleo-matcher",
  "reedline",
  "regex",
