@@ -590,7 +590,7 @@ greet world          # -> hi, world
   `exit`); a bare `return` uses the status so far. Both stop the rest of the body.
   At top level `return` is a recoverable error.
 
-- **Redirection.** A function takes `>`, `>>`, and `<` like any command
+- **Redirection.** A function takes `>`, `>>`, `<`, and `2>` like any command
   (`f > out.txt`, `r < input`). Because a function runs inside the shell, the
   redirection applies to the shell's own descriptors for the duration of the
   call, so output from the body — including from an external command it runs —

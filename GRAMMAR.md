@@ -214,12 +214,17 @@ command spawns; fully interleaving open and spawn needs per-child fd setup after
 `fork`, which arrives with job control. Ordinary file redirection and pipes are
 unaffected.
 
-Deferred: a **builtin** in a multi-stage pipeline or with a redirection is not
-supported yet (needs a forked child / an output sink) and is rejected with a
-clear message — use an external command (`echo … > f`) meanwhile. A **descriptor
-redirect** (`2>`, `&>`, and their `>>` forms) is also deferred and **rejected as
-a syntax error** rather than silently reinterpreted. Also deferred: here-strings
-and a redirection with no command (`> f`).
+A **descriptor prefix** names the stream to retarget: `2> log`, `2>> log`, and
+`1> out` alongside the default `> out` (stdout) and `< in` (stdin). The digits
+must *abut* the operator, so spacing decides — `echo 2 > f` writes "2" to `f`,
+as in bash — and only a bare run of digits counts, so `""2>f` and `\2>f` are an
+ordinary argument plus a stdout redirect.
+
+Deferred: a **builtin** with a redirection outside a pipeline (needs the
+current shell's descriptors rather than a child's), **descriptor duplication**
+(`2>&1`, `&>`, `>&`, `<&`) and descriptors **above 2** — each rejected with a
+message naming what is missing rather than silently reinterpreted. Also
+deferred: here-strings and a redirection with no command (`> f`).
 
 ## M2 job builtins
 

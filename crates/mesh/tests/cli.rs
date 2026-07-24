@@ -1580,41 +1580,142 @@ fn redirections_apply_in_source_order() {
 }
 
 #[test]
-fn a_descriptor_redirect_is_rejected_for_now() {
-    // `2>err` and `&>f` are deferred descriptor redirects — rejected loudly, not
-    // silently reinterpreted as a stdout redirect with a stray `2`/`&` argument.
-    let out = run_with_input("echo hello 2>err\nputs after\n");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("descriptor redirection"));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
-    for command in ["true;2>err", "true&&2>err", "false||2>err", "echo x|2>err"] {
-        let boundary = run_with_input(&format!("{command}\nputs after\n"));
+fn descriptor_duplication_is_still_rejected() {
+    // `2>&1`, `&>f`, `>&2`, `<&0` duplicate one descriptor onto another, which is
+    // a different mechanism from retargeting one at a file — still deferred, and
+    // rejected loudly rather than silently reinterpreted.
+    for source in [
+        "ls /nope 2>&1\n",
+        "echo hello &>f\n",
+        "echo hello&>f\n",
+        "echo hi >&2\n",
+        "cat <&0\n",
+    ] {
+        let out = run_with_input(source);
         assert!(
-            String::from_utf8_lossy(&boundary.stderr).contains("descriptor redirection"),
-            "{command:?} should reject the descriptor redirect"
+            String::from_utf8_lossy(&out.stderr).contains("descriptor duplication"),
+            "{source:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
-        assert_eq!(String::from_utf8_lossy(&boundary.stdout), "after\n");
     }
-    let amp = run_with_input("echo hello &>f\nputs after\n");
-    assert!(String::from_utf8_lossy(&amp.stderr).contains("descriptor redirection"));
-    // `&>` attached to a preceding argument (`hello&>f`) is still rejected.
-    let attached = run_with_input("echo hello&>f\nputs after\n");
-    assert!(String::from_utf8_lossy(&attached.stderr).contains("descriptor redirection"));
-    // The fd-duplication form with `&` after the operator (`>&2`, `<&0`) too.
-    let dup = run_with_input("echo hi >&2\nputs after\n");
-    assert!(String::from_utf8_lossy(&dup.stderr).contains("descriptor redirection"));
-    let dupin = run_with_input("cat <&0\nputs after\n");
-    assert!(String::from_utf8_lossy(&dupin.stderr).contains("descriptor redirection"));
-    // But an escaped `\&` is a literal, so `hi\&>f` is a normal redirect.
+
+    // An escaped `\&` is a literal, so `hi\&>f` is an ordinary redirect.
     let dir = fresh_dir("redir_escaped_amp");
     let esc = run_with_input(&format!("cd {}\necho hi\\&>f\ncat f\n", dir.display()));
     assert_eq!(String::from_utf8_lossy(&esc.stdout), "hi&\n");
     let _ = std::fs::remove_dir_all(&dir);
-    // And a bare fd needs *only* digits abutting the operator: an empty quote
-    // (`""2>f`) or an escaped digit (`\2>f`) is a normal argument + redirect.
+}
+
+#[test]
+fn stderr_can_be_redirected_to_a_file() {
+    let dir = fresh_dir("redir_stderr");
+    let err = dir.join("err.txt");
+    let out = run_with_input(&format!(
+        "ls /nonexistent-path 2> {}\nputs after\n",
+        err.display()
+    ));
+    // stdout is untouched; the diagnostic went to the file.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    let captured = std::fs::read_to_string(&err).unwrap();
+    assert!(captured.contains("/nonexistent-path"), "{captured:?}");
+
+    // `2>>` appends rather than truncating.
+    run_with_input(&format!("ls /nonexistent-path 2>> {}\n", err.display()));
+    let appended = std::fs::read_to_string(&err).unwrap();
+    assert_eq!(appended.lines().count(), 2, "{appended:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn each_descriptor_takes_its_own_target() {
+    let dir = fresh_dir("redir_both");
+    let (out_path, err_path) = (dir.join("o.txt"), dir.join("e.txt"));
+    let out = run_with_input(&format!(
+        "sh -c 'echo O; echo E >&2' > {} 2> {}\n",
+        out_path.display(),
+        err_path.display()
+    ));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&out_path).unwrap(), "O\n");
+    assert_eq!(std::fs::read_to_string(&err_path).unwrap(), "E\n");
+
+    // `1>` names stdout explicitly, the same as a bare `>`.
+    let one = dir.join("one.txt");
+    run_with_input(&format!("echo hi 1> {}\n", one.display()));
+    assert_eq!(std::fs::read_to_string(&one).unwrap(), "hi\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_descriptor_prefix_must_abut_the_operator() {
+    // Spacing decides, as in bash: `echo 2 > f` writes "2" to f rather than
+    // redirecting descriptor 2.
+    let dir = fresh_dir("redir_fd_spacing");
+    let file = dir.join("f.txt");
+    run_with_input(&format!("echo 2 > {}\n", file.display()));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "2\n");
+
+    // A bare fd needs *only* digits abutting the operator, so an empty quote
+    // (`""2>f`) is an ordinary argument plus a stdout redirect.
     let dir2 = fresh_dir("redir_empty_quote_fd");
     let eq = run_with_input(&format!("cd {}\necho \"\"2>f\ncat f\n", dir2.display()));
     assert_eq!(String::from_utf8_lossy(&eq.stdout), "2\n");
+    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
+}
+
+#[test]
+fn stderr_redirection_reaches_in_shell_commands_too() {
+    let dir = fresh_dir("redir_stderr_in_shell");
+    let (f_err, p_err) = (dir.join("f.txt"), dir.join("p.txt"));
+
+    // A redirected function applies it to the shell's own descriptors...
+    let out = run_with_input(&format!(
+        "func noisy() {{ sh -c 'echo out; echo err >&2' }}\nnoisy 2> {}\n",
+        f_err.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
+    assert_eq!(std::fs::read_to_string(&f_err).unwrap(), "err\n");
+
+    // ...and a forked pipeline stage applies it in the child.
+    let out = run_with_input(&format!(
+        "func noisy() {{ sh -c 'echo out; echo err >&2' }}\nnoisy 2> {} | tr a-z A-Z\n",
+        p_err.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "OUT\n");
+    assert_eq!(std::fs::read_to_string(&p_err).unwrap(), "err\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_background_command_can_redirect_stderr() {
+    // The background path defers its opens to a re-executed helper, so the
+    // descriptor has to survive that argv hand-off as well as the direction does.
+    let dir = fresh_dir("redir_stderr_background");
+    let err = dir.join("bg.txt");
+    let out = run_with_input(&format!(
+        "ls /nonexistent-path 2> {} &\nsleep 0.3\n",
+        err.display()
+    ));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("[1]"));
+    let captured = std::fs::read_to_string(&err).unwrap();
+    assert!(captured.contains("/nonexistent-path"), "{captured:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_descriptor_above_two_is_rejected_with_a_specific_message() {
+    let out = run_with_input("cat 3< f\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("higher descriptors"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 }
 
 #[test]

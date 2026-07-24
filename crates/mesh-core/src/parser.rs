@@ -329,6 +329,9 @@ pub enum CommandItem {
     Word(Spanned<Word>),
     Redirect {
         kind: RedirectKind,
+        /// The descriptor named by a `N>`-style prefix, if any. `None` means the
+        /// default for the direction: stdin for `<`, stdout for `>` / `>>`.
+        fd: Option<u32>,
         target: Spanned<Word>,
         body: Option<Spanned<HeredocBody>>,
     },
@@ -594,7 +597,9 @@ impl<'a> Lexer<'a> {
                 .any(|operator| self.source[self.position..].starts_with(operator))
             {
                 return Err(ParseError {
-                    kind: ParseErrorKind::Expected("descriptor redirection is not supported yet"),
+                    kind: ParseErrorKind::Expected(
+                        "descriptor duplication (`2>&1`, `&>`) is not supported yet",
+                    ),
                     span: start..start + 2,
                 });
             }
@@ -1496,18 +1501,35 @@ impl Parser {
             };
             if let Some(kind) = kind {
                 let operator_start = self.tokens[self.position - 1].span.start;
-                if items.last().is_some_and(|item| {
-                    matches!(
-                        item,
-                        CommandItem::Word(word)
-                            if word.span.end == operator_start
-                                && matches!(word.value.pieces.as_slice(),
-                                    [WordPiece::Text { text, quote: QuoteMode::Bare }]
-                                        if text.chars().all(|c| c.is_ascii_digit()))
-                    )
-                }) {
+                // `2> file`: a bare run of digits *abutting* the operator names
+                // the descriptor and is not an argument. Spacing decides —
+                // `echo 2 > f` writes "2" to f, exactly as in bash.
+                let fd = match items.last() {
+                    Some(CommandItem::Word(word))
+                        if word.span.end == operator_start
+                            && matches!(word.value.pieces.as_slice(),
+                                [WordPiece::Text { text, quote: QuoteMode::Bare }]
+                                    if text.chars().all(|c| c.is_ascii_digit())) =>
+                    {
+                        let WordPiece::Text { text, .. } = &word.value.pieces[0] else {
+                            unreachable!("matched a bare text piece")
+                        };
+                        let descriptor = text.parse::<u32>().map_err(|_| {
+                            self.error(ParseErrorKind::Expected("a descriptor mesh can redirect"))
+                        })?;
+                        if descriptor > 2 {
+                            return Err(self.error(ParseErrorKind::Expected(
+                                "a descriptor of 0, 1, or 2; higher descriptors are not supported yet",
+                            )));
+                        }
+                        items.pop();
+                        Some(descriptor)
+                    }
+                    _ => None,
+                };
+                if fd.is_some() && kind == RedirectKind::Heredoc {
                     return Err(self.error(ParseErrorKind::Expected(
-                        "descriptor redirection is not supported yet",
+                        "a heredoc on a descriptor other than stdin",
                     )));
                 }
                 if self.at_command_end() {
@@ -1535,7 +1557,12 @@ impl Parser {
                 } else {
                     None
                 };
-                items.push(CommandItem::Redirect { kind, target, body });
+                items.push(CommandItem::Redirect {
+                    kind,
+                    fd,
+                    target,
+                    body,
+                });
             } else {
                 items.push(CommandItem::Word(self.command_word()?));
             }

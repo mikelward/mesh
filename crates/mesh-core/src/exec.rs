@@ -36,11 +36,31 @@ pub enum RedirKind {
     Append,
 }
 
+/// One redirection: which descriptor it retargets, in which direction, and the
+/// file it names. `fd` lets `2> log` reach stderr while a bare `> log` keeps its
+/// default of stdout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redirection {
+    pub fd: libc::c_int,
+    pub kind: RedirKind,
+    pub path: String,
+}
+
+impl Redirection {
+    /// The descriptor a direction retargets when no `N` prefix named one.
+    pub fn default_fd(kind: RedirKind) -> libc::c_int {
+        match kind {
+            RedirKind::In => libc::STDIN_FILENO,
+            RedirKind::Out | RedirKind::Append => libc::STDOUT_FILENO,
+        }
+    }
+}
+
 /// A pipeline stage: an expanded argv and its redirections (in source order;
 /// for a given direction the last one wins, as in POSIX shells).
 pub struct Cmd {
     pub words: Vec<String>,
-    pub redirs: Vec<(RedirKind, String)>,
+    pub redirs: Vec<Redirection>,
     pub pipe_stderr: bool,
     /// A builtin or user function, which mesh runs itself instead of `exec`ing.
     /// It still gets its own forked process, so the stages of a pipeline run
@@ -244,6 +264,7 @@ fn fork_in_shell(
     incoming: NextIn,
     in_file: Option<File>,
     out_file: Option<File>,
+    err_file: Option<File>,
     interactive: bool,
     background: bool,
     process_group: Option<libc::pid_t>,
@@ -321,6 +342,11 @@ fn fork_in_shell(
                     libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
                 }
             }
+            // `2> log` applies after the pipe, so an explicit stderr target wins
+            // over `|&`'s copy of stdout.
+            if let Some(file) = &err_file {
+                libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+            }
         }
         let code = run(&cmd.words);
         let _ = std::io::stdout().flush();
@@ -331,6 +357,7 @@ fn fork_in_shell(
     // The parent must release the write end, or the reader never sees EOF.
     drop(child_out);
     drop(child_in);
+    drop(err_file);
     Ok((pid, piped_out, read_end))
 }
 
@@ -402,7 +429,7 @@ pub fn run_pipeline(
     // opened by one stage does not block a peer opened by another stage of the
     // same pipeline (`cat < fifo | cmd > fifo`) before the writer is spawned.
     let opened = if background {
-        (0..n).map(|_| Ok((None, None))).collect()
+        (0..n).map(|_| Ok(Vec::new())).collect()
     } else {
         std::thread::scope(|scope| {
             let handles: Vec<_> = cmds
@@ -411,7 +438,7 @@ pub fn run_pipeline(
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| Ok((None, None))))
+                .map(|h| h.join().unwrap_or_else(|_| Ok(Vec::new())))
                 .collect::<Vec<_>>()
         })
     };
@@ -423,14 +450,22 @@ pub fn run_pipeline(
         // one reading `/dev/null` rather than the shell's stdin.
         let incoming = std::mem::replace(&mut next_stdin, NextIn::Null);
 
-        let (in_file, out_file) = match redir_result {
-            Ok(files) => files,
+        let opened = match redir_result {
+            Ok(files) => resolve_fds(files),
             Err((path, err)) => {
                 note!("mesh: {path}: {err}");
                 outcomes.push(Outcome::Failed(1));
                 continue;
             }
         };
+        let (mut in_file, mut out_file, mut err_file) = (None, None, None);
+        for (fd, file) in opened {
+            match fd {
+                libc::STDIN_FILENO => in_file = Some(file),
+                libc::STDOUT_FILENO => out_file = Some(file),
+                _ => err_file = Some(file),
+            }
+        }
 
         if cmd.in_shell {
             match fork_in_shell(
@@ -439,6 +474,7 @@ pub fn run_pipeline(
                 incoming,
                 in_file,
                 out_file,
+                err_file,
                 interactive,
                 background,
                 process_group,
@@ -550,6 +586,12 @@ pub fn run_pipeline(
         } else if !is_last {
             command.stdout(Stdio::piped());
             piped_out = true;
+        }
+
+        // `2> log` applies after the pipe, so an explicit stderr target wins over
+        // the copy of stdout `|&` installed above.
+        if let Some(file) = err_file {
+            command.stderr(file);
         }
 
         match command.spawn() {
@@ -741,12 +783,15 @@ fn background_redirect_command(cmd: &Cmd) -> Result<Command, (String, std::io::E
     command
         .arg("--mesh-background-redirect")
         .arg(cmd.redirs.len().to_string());
-    for (kind, path) in &cmd.redirs {
+    // Each redirection travels as `KIND FD PATH`, so the descriptor survives the
+    // hand-off to the helper as well as the direction does.
+    for Redirection { fd, kind, path } in &cmd.redirs {
         command.arg(match kind {
             RedirKind::In => "in",
             RedirKind::Out => "out",
             RedirKind::Append => "append",
         });
+        command.arg(fd.to_string());
         command.arg(path);
     }
     command.args(&cmd.words);
@@ -759,24 +804,31 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
     let Some(count) = args.first().and_then(|arg| arg.parse::<usize>().ok()) else {
         return std::process::ExitCode::from(1);
     };
-    let Some(words_start) = count.checked_mul(2).and_then(|count| count.checked_add(1)) else {
+    let Some(words_start) = count.checked_mul(3).and_then(|count| count.checked_add(1)) else {
         return std::process::ExitCode::from(1);
     };
     if words_start >= args.len() {
         return std::process::ExitCode::from(1);
     }
     let mut redirs = Vec::new();
-    for pair in args[1..words_start].chunks_exact(2) {
-        let kind = match pair[0].as_str() {
+    for triple in args[1..words_start].chunks_exact(3) {
+        let kind = match triple[0].as_str() {
             "in" => RedirKind::In,
             "out" => RedirKind::Out,
             "append" => RedirKind::Append,
             _ => return std::process::ExitCode::from(1),
         };
-        redirs.push((kind, pair[1].clone()));
+        let Ok(fd) = triple[1].parse::<libc::c_int>() else {
+            return std::process::ExitCode::from(1);
+        };
+        redirs.push(Redirection {
+            fd,
+            kind,
+            path: triple[2].clone(),
+        });
     }
-    let (stdin, stdout) = match open_redirs(&redirs) {
-        Ok(files) => files,
+    let opened = match open_redirs(&redirs) {
+        Ok(files) => resolve_fds(files),
         Err((path, err)) => {
             note!("mesh: {path}: {err}");
             return std::process::ExitCode::from(1);
@@ -785,11 +837,12 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
     let words = &args[words_start..];
     let mut command = Command::new(&words[0]);
     command.args(&words[1..]);
-    if let Some(stdin) = stdin {
-        command.stdin(stdin);
-    }
-    if let Some(stdout) = stdout {
-        command.stdout(stdout);
+    for (fd, file) in opened {
+        match fd {
+            libc::STDIN_FILENO => command.stdin(file),
+            libc::STDOUT_FILENO => command.stdout(file),
+            _ => command.stderr(file),
+        };
     }
     let err = command.exec();
     std::process::ExitCode::from(spawn_error_code(&words[0], &err))
@@ -921,23 +974,23 @@ fn set_foreground_group(pgid: libc::pid_t) {
 /// `body` does **not** run — it must never execute against a half-applied
 /// redirection.
 pub(crate) fn with_redirections<T>(
-    redirs: &[(RedirKind, String)],
+    redirs: &[Redirection],
     body: impl FnOnce() -> T,
 ) -> Result<T, (String, std::io::Error)> {
     use std::io::Write;
 
-    let (stdin_file, stdout_file) = open_redirs(redirs)?;
+    let opened = resolve_fds(open_redirs(redirs)?);
     // Anything already buffered belongs to the *previous* stdout.
     let _ = std::io::stdout().flush();
 
-    // The path each direction resolved to, for an error message. `open_redirs`
-    // applies "last one wins" per direction, so match that here.
-    let path_for = |wanted: &[RedirKind]| {
+    // The path a descriptor resolved to, for an error message. `resolve_fds`
+    // applies "last one wins" per descriptor, so match that here.
+    let path_for = |fd: libc::c_int| {
         redirs
             .iter()
             .rev()
-            .find(|(kind, _)| wanted.contains(kind))
-            .map(|(_, path)| path.clone())
+            .find(|redir| redir.fd == fd)
+            .map(|redir| redir.path.clone())
             .unwrap_or_default()
     };
 
@@ -951,24 +1004,12 @@ pub(crate) fn with_redirections<T>(
             }
         }
     };
-    for (file, target, kinds) in [
-        (
-            stdin_file.as_ref(),
-            libc::STDIN_FILENO,
-            &[RedirKind::In][..],
-        ),
-        (
-            stdout_file.as_ref(),
-            libc::STDOUT_FILENO,
-            &[RedirKind::Out, RedirKind::Append][..],
-        ),
-    ] {
-        let Some(file) = file else { continue };
-        match swap_descriptor(file, target) {
-            Ok(saved) => swapped.push((saved, target)),
+    for (target, file) in &opened {
+        match swap_descriptor(file, *target) {
+            Ok(saved) => swapped.push((saved, *target)),
             Err(err) => {
                 restore(&mut swapped);
-                return Err((path_for(kinds), err));
+                return Err((path_for(*target), err));
             }
         }
     }
@@ -1047,28 +1088,35 @@ fn shell_stdin_is_terminal() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// Open every redirection target, in source order, paired with the descriptor it
+/// replaces. Every one is opened even when a later redirection supersedes it, so
+/// `> a > b` still truncates `a` — the same observable effect bash has.
 fn open_redirs(
-    redirs: &[(RedirKind, String)],
-) -> Result<(Option<File>, Option<File>), (String, std::io::Error)> {
-    let mut stdin_file = None;
-    let mut stdout_file = None;
-    for (kind, path) in redirs {
-        match kind {
-            RedirKind::In => stdin_file = Some(File::open(path).map_err(|e| (path.clone(), e))?),
-            RedirKind::Out => {
-                stdout_file = Some(File::create(path).map_err(|e| (path.clone(), e))?)
-            }
-            RedirKind::Append => {
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .map_err(|e| (path.clone(), e))?;
-                stdout_file = Some(file);
-            }
+    redirs: &[Redirection],
+) -> Result<Vec<(libc::c_int, File)>, (String, std::io::Error)> {
+    let mut opened = Vec::with_capacity(redirs.len());
+    for Redirection { fd, kind, path } in redirs {
+        let file = match kind {
+            RedirKind::In => File::open(path),
+            RedirKind::Out => File::create(path),
+            RedirKind::Append => OpenOptions::new().create(true).append(true).open(path),
+        };
+        opened.push((*fd, file.map_err(|e| (path.clone(), e))?));
+    }
+    Ok(opened)
+}
+
+/// Reduce opened redirections to the file each descriptor ends up with — last
+/// one wins per descriptor, as in POSIX shells.
+fn resolve_fds(opened: Vec<(libc::c_int, File)>) -> Vec<(libc::c_int, File)> {
+    let mut resolved: Vec<(libc::c_int, File)> = Vec::new();
+    for (fd, file) in opened {
+        match resolved.iter_mut().find(|(target, _)| *target == fd) {
+            Some(slot) => slot.1 = file,
+            None => resolved.push((fd, file)),
         }
     }
-    Ok((stdin_file, stdout_file))
+    resolved
 }
 
 /// Map a spawn error to a status and report it (`127` not-found, else `126`).
@@ -1092,9 +1140,9 @@ fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        JobTable, NextIn, RedirKind, initial_stdin, restore_job_signals, restore_terminal_modes,
-        run, set_foreground_group, shell_stdin_is_terminal, terminal_fd, terminal_modes,
-        with_redirections,
+        JobTable, NextIn, RedirKind, Redirection, initial_stdin, restore_job_signals,
+        restore_terminal_modes, run, set_foreground_group, shell_stdin_is_terminal, terminal_fd,
+        terminal_modes, with_redirections,
     };
 
     #[test]
@@ -1132,7 +1180,11 @@ mod tests {
 
         let path = std::env::temp_dir().join(format!("mesh-redir-tty-{}", std::process::id()));
         let wrote = std::fs::write(&path, "input\n").is_ok();
-        let redirs = [(RedirKind::In, path.to_string_lossy().into_owned())];
+        let redirs = [Redirection {
+            fd: libc::STDIN_FILENO,
+            kind: RedirKind::In,
+            path: path.to_string_lossy().into_owned(),
+        }];
         // Inside the redirection fd 0 is the file, but the session is still a TTY
         // and job control must still reach the *terminal*: reading its modes and
         // handing it to a process group both have to work, or a child would run
