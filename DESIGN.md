@@ -1946,8 +1946,20 @@ calls than a flat "rejected," so they are recorded honestly:
 
 **Arm bodies — what a `{ … }` arm may hold, and how it yields a value** *(shipped —
 M3)*. An arm body is a **block**, the same `{ … }` as an `if` branch or a `func` body —
-*not* restricted to a single expression or a callable. It becomes a value three ways,
-resolved by the tail:
+*not* restricted to a single expression or a callable. Whether that block becomes a
+**value** or just **runs** depends on the `match`'s position, exactly like `if`:
+
+- **Statement position** — `match $x { … }` on its own line — runs the selected arm's
+  body as an ordinary block (`run_ast_match` → `run_source`): commands execute and
+  stream to stdout, and there is *no* value and *no* capture. Here `*.x { ls }` **runs
+  `ls`**. This is the common interactive case, and it holds no surprises.
+- **Expression position** — `y = match $x { … }`, a function's value return, an arm of
+  another value expression — evaluates the body *for its value* (`eval_value_body`),
+  and only *then* do the tail rules below apply. Here `*.x { ls }` is the **string**
+  `"ls"`, because the value path never runs a lone word.
+
+The rest of this note is the **expression-position** value rules; a value is produced
+three ways, resolved by the tail:
 
 - **A bare value tail** — `*.txt { "text" }`, `{ $kind }`, `{ [a b] }`, a nested
   `if`/`match`/`for` — yields that expression's value; earlier lines in the block run
