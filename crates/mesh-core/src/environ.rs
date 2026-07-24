@@ -8,6 +8,8 @@
 //! rule. See `DESIGN.md` §"Variables and assignment".
 
 use std::env;
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use crate::vars::Value;
 
@@ -55,15 +57,11 @@ fn split_path(raw: &str) -> Vec<Value> {
 /// Returns the message to report when the value cannot cross the boundary.
 pub(crate) fn write(key: &str, value: Value, append: bool) -> Result<(), String> {
     let value = if append {
-        match combine(key, value)? {
-            Some(combined) => combined,
-            None => return Ok(()),
-        }
+        append_bytes(key, value)?
     } else {
-        value
+        OsString::from(serialize(key, value)?)
     };
-    let text = serialize(key, value)?;
-    if text.contains('\0') {
+    if value.as_bytes().contains(&0) {
         return Err(format!(
             "$env.{key}: an environment value cannot contain a NUL byte"
         ));
@@ -71,33 +69,32 @@ pub(crate) fn write(key: &str, value: Value, append: bool) -> Result<(), String>
     // SAFETY: the shell runs its execution loop single-threaded, so mutating the
     // environment here races with nothing — the same reasoning `cd` relies on
     // when it updates `$env.PWD`.
-    unsafe { env::set_var(key, text) };
+    unsafe { env::set_var(key, value) };
     Ok(())
 }
 
-/// The value `key` should end up holding after `+=` — its current contents
-/// followed by `addition`. A path-type name grows by elements, anything else by
-/// string concatenation. `None` means "nothing to do".
-fn combine(key: &str, addition: Value) -> Result<Option<Value>, String> {
-    let current = read(key);
-    if is_path_var(key) {
-        let mut entries = match current {
-            Some(Value::List(entries)) => entries,
-            // Unset: `+=` starts the list rather than failing, since an absent
-            // PATH and an empty one mean the same thing to a child.
-            _ => Vec::new(),
-        };
-        match addition {
-            Value::List(added) => entries.extend(added),
-            scalar => entries.push(scalar),
-        }
-        return Ok(Some(Value::List(entries)));
-    }
-    let Some(Value::String(current)) = current else {
-        return Ok(Some(addition));
+/// The bytes `key` should hold after `+=`: what is there now, then `addition`,
+/// separated by `:` for a path-type name.
+///
+/// This works on the **raw bytes** rather than reading the current value into a
+/// mesh `Value` first. Environment values are arbitrary non-NUL bytes, but a
+/// mesh string is UTF-8, so decoding what is already there would replace any
+/// invalid sequence with U+FFFD and write the mangled version back — quietly
+/// breaking, say, a non-UTF-8 `PATH` component that had been resolving fine.
+/// Appending never needs to look at the existing bytes, so it does not.
+fn append_bytes(key: &str, addition: Value) -> Result<OsString, String> {
+    let addition = serialize(key, addition)?;
+    // Unset: `+=` starts the value rather than failing, and takes no separator —
+    // an absent name and an empty one mean the same thing to a child.
+    let Some(current) = env::var_os(key) else {
+        return Ok(OsString::from(addition));
     };
-    let added = serialize(key, addition)?;
-    Ok(Some(Value::String(format!("{current}{added}"))))
+    let mut bytes = current.into_vec();
+    if is_path_var(key) {
+        bytes.push(PATH_SEPARATOR as u8);
+    }
+    bytes.extend_from_slice(addition.as_bytes());
+    Ok(OsString::from_vec(bytes))
 }
 
 /// Render a value as the bytes the environment carries, or explain why it

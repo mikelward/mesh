@@ -6,7 +6,7 @@
 //! stderr, and the exit code.
 
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -3631,4 +3631,90 @@ fn reading_an_unset_env_entry_is_still_a_loud_error() {
     let out = run_with_input("puts $env.MESH_TEST_ABSENT\nputs after\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("not set"));
+}
+
+#[test]
+fn any_env_name_that_can_be_read_can_also_be_assigned() {
+    // The environment permits an interior hyphen and `$env.MY-VAR` reads it, so
+    // assignment has to accept exactly the names reads do.
+    let out = run_with_input("$env.MESH-TEST-KEBAB = ok\nputs $env.MESH-TEST-KEBAB\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ok\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = mesh_command()
+        .env("MESH-TEST-INHERITED", "from-parent")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"puts $env.MESH-TEST-INHERITED\n")?;
+            child.wait_with_output()
+        })
+        .expect("run mesh");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "from-parent\n");
+}
+
+#[test]
+fn appending_preserves_non_utf8_bytes_already_in_the_environment() {
+    // Environment values are arbitrary non-NUL bytes. Decoding the current value
+    // into a mesh string to append would replace an invalid sequence with U+FFFD
+    // and write the mangled bytes back, silently breaking a PATH entry that had
+    // been resolving fine.
+    let weird = std::ffi::OsString::from_vec(b"/usr/bin:/x\xffy".to_vec());
+    let out = mesh_command()
+        .env("PATH", &weird)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"$env.PATH += /new\n/usr/bin/env\n")?;
+            child.wait_with_output()
+        })
+        .expect("run mesh");
+    assert!(
+        out.stdout
+            .split(|byte| *byte == b'\n')
+            .any(|line| line == b"PATH=/usr/bin:/x\xffy:/new"),
+        "the original bytes should survive: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // The same for a plain (non-path) entry, which concatenates instead.
+    let weird = std::ffi::OsString::from_vec(b"a\xffb".to_vec());
+    let out = mesh_command()
+        .env("MESH_TEST_RAW", &weird)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"$env.MESH_TEST_RAW += Z\n/usr/bin/env\n")?;
+            child.wait_with_output()
+        })
+        .expect("run mesh");
+    assert!(
+        out.stdout
+            .split(|byte| *byte == b'\n')
+            .any(|line| line == b"MESH_TEST_RAW=a\xffbZ"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }

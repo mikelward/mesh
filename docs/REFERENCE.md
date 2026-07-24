@@ -342,10 +342,16 @@ $env.PATH` needs a spread or a join like any other list. Splitting is **exact** 
 every empty component is kept, since `PATH=/usr/bin:` means "…and the cwd", and a
 split/join round trip is byte-faithful.
 
-Only a plain `$env.KEY` is an assignment target. `$env.PATH[0] = …` and
+Only a plain `$env.KEY` is an assignment target — any name you can read you can
+also assign, including a kebab name like `$env.MY-VAR`. `$env.PATH[0] = …` and
 `$env.PATH:dedup = …` describe derived values rather than places, so they are
 syntax errors. `export NAME = value`, `export --list NAME`, and `unset` are not
 implemented yet.
+
+`+=` works on the raw bytes already in the environment, so a value that is not
+valid UTF-8 survives being appended to. Reading such a value into mesh still
+renders it lossily, so `$env.K = $env.K` — an explicit read and write back —
+does not round-trip; that waits on `OsString`-backed words.
 
 Member access and list/map indexing have the same meaning inside `"…"` as they do
 outside it. A slice remains a list and needs `...` in command position; omitted
