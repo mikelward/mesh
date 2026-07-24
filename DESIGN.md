@@ -1958,37 +1958,56 @@ M3)*. An arm body is a **block**, the same `{ … }` as an `if` branch or a `fun
   and only *then* do the tail rules below apply. Here `*.x { ls }` is the **string**
   `"ls"`, because the value path never runs a lone word.
 
-The rest of this note is the **expression-position** value rules; a value is produced
-three ways, resolved by the tail:
+In **expression position** a value is produced three ways, resolved by the tail
+(`eval_value_body`):
 
-- **A bare value tail** — `*.txt { "text" }`, `{ $kind }`, `{ [a b] }`, a nested
-  `if`/`match`/`for` — yields that expression's value; earlier lines in the block run
-  for effect.
-- **A whole body that is one bare word** — `*.md { markdown }` — is read as the
-  **string** `"markdown"`, the shorthand that lets arms read like the table at the top
-  of this section. This special case is **single-statement only**: it fires when the
-  *entire* body is that one word, so `{ ls }` is the string `"ls"` (not a directory
-  listing), but the moment the body has earlier statements the tail word is no longer
-  special-cased — `{ puts side; text }` runs `text` as a **command** (and errors if
-  there is no such command). So the bare-word literal is a one-word-body convenience,
-  not a general "tail word is a string" rule.
-- **A command / pipeline tail** — `*.log { wc -l < $f }` — runs the body and, **only if
-  it exits `0`**, the arm's value is its **captured stdout** (trailing newlines trimmed;
-  the bytes-as-value path, same rule as `$(…)`). A **nonzero exit yields no value** — the
-  failing status propagates and aborts the whole `match` expression. This bites the
-  print-then-fail commands: `grep -c ERROR $f` writes `0` yet **exits 1** on no matches,
-  so `{ grep -c … }` *fails* the arm rather than yielding `"0"`. A bare `$(…)` capture
-  rides the **same** exit-0 gate (`E::Capture` → `capture_source`), so `{ $(grep -c …) }`
-  fails too — to keep the output regardless of status you must **force success**:
-  `{ $(grep -c ERROR $f; true) }`. (This status gate is one more reason the implicit
-  command-tail capture is a sharp edge — a live question is whether value-position blocks
-  should drop implicit capture and require an explicit, still-exit-0-gated `$(…)`.)
+1. **A value-expression tail** — `*.txt { "text" }`, `{ $kind }`, `{ [a b] }`, a nested
+   `if`/`match`/`for` — yields that expression's value; earlier lines run for effect.
+2. **A single-word body** — `*.md { markdown }`, where the *entire* body is one bare
+   word — is read as the **string** `"markdown"`. This is single-statement only: `{ ls }`
+   is the string `"ls"`, but add any earlier statement and the tail word is a **command**
+   again (`{ puts side; text }` runs `text`).
+3. **A command / pipeline tail** — `*.log { wc -l < $f }` — runs the body and, **only on
+   exit `0`**, yields its **captured stdout** (trailing newline trimmed). A nonzero exit
+   yields no value and aborts the match. The print-then-fail footgun: `grep -c` prints
+   `0` but exits 1 on no matches, and a bare `$(…)` rides the same gate, so
+   `{ $(grep -c ERROR $f; true) }` (success-forced) is the way to keep the count.
 
-To *return a string* reliably, then, write a **quoted** tail — `{ "text" }` — which is
-an expression and works in a body of any length; the bare `{ text }` shorthand is only
-the one-word-body form. This is the same
-bytes-vs-values seam flagged in [Conditionals](#conditionals-if-is-an-expression);
-the arm body inherits it rather than inventing anything.
+To return a string reliably today, write a **quoted** tail — `{ "text" }` — which is a
+value-expression and works at any body length. This is the shared block-value behavior
+`if` uses ([Conditionals](#conditionals-if-is-an-expression)); the arm inherits it.
+
+**Design question — should an arm take a *block* instead of a coerced expression?**
+*(open)* The `{ … }` syntax *reads* as a statement block, yet rules 2–3 above quietly
+coerce that block into a value — the source of every sharp edge in this note (the
+bare-word/command flip, the exit-0 capture gate). If we lean into "it is a block," two
+cleaner models drop the coercion:
+
+- **Block, value = tail expression, no coercion** *(leaning)*. Statements run top to
+  bottom; the block's value is its final statement **iff that statement is a
+  value-expression** (`"str"`, `$v`, `[a b]`, `f()`, a nested `if`/`match`), otherwise
+  the block ran for effect and yields `""`. Rules 2 and 3 disappear: a bare word is
+  *always* a command (`{ ls }` runs `ls`, value `""`), and to capture you write an
+  explicit `$(…)`. One rule, no footguns:
+  ```
+  kind = match $file {
+    *.md  { "markdown" }      # tail is a value-expression → the string
+    *.txt { "text" }
+    _     { $(file -b $file) }  # explicit capture when you want stdout
+  }
+  ```
+  This is exactly what mesh already *says* `if` does ("a block evaluates to its last
+  expression"), so adopting it is a language-wide tightening of the block-value rule,
+  not a `match`-only change.
+- **Expression arm via `=>`** (Rust / nushell): `pattern => expr`, with `=> { block }`
+  when you need statements. `*.md => "markdown"`. Makes the value-nature explicit and the
+  one-liner brace-free, but adds `=>` punctuation and **diverges from mesh's own
+  `if`/`for`/`while`**, which are all `{ }`-block, never `=>`.
+
+Recommendation: the **block + tail-expression** model — it keeps the `{ }` shape
+consistent with `if`/`for`, honors the "it's a block" reading, and deletes the coercion
+magic (and with it this whole footgun list). `=>` reads well for pure one-liners but
+forks `match` away from the rest of mesh's control flow.
 
 ### Tests and comparisons
 
@@ -2074,8 +2093,9 @@ So `case` → `match`, and the everyday `[[ … ]]` jobs map to a comparison, a 
 pattern-match, a file-test modifier, or an `and`/`or`/`not` of those — no
 special `[[` context, and none of its word-splitting quirks. The binary file
 relations (`-nt`/`-ot`/`-ef`) are settled above as `$a:mtime > $b:mtime` and
-`$a:same($b)`; the one straggler still tracked, not hand-waved, is regex
-**captures** (bash's `BASH_REMATCH`), with the `match`-arm capture question above.
+`$a:same($b)`. Regex **captures** (bash's `BASH_REMATCH`) are settled too: they go
+through the value-side `:match` extractor, and a `/re/` `match` arm does **not**
+auto-bind (see [Matching](#matching-match)) — so `~` stays a pure predicate.
 
 ### Error handling
 
