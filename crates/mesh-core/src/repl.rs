@@ -2082,10 +2082,15 @@ fn call_func(name: &str, args: Vec<Value>, shell: &mut Shell) -> Step {
     ) {
         shell.control = None;
     }
-    if let Err(code) = bound {
+    if let Err(step) = bound {
         shell.vars.pop_scope();
         shell.loop_depth = caller_loop_depth;
-        return Step::Continue(code);
+        // A default's `return N` ends the call with that status, like the body's;
+        // an `exit`/runtime step unwinds unchanged.
+        return match step {
+            Step::Return(code) => Step::Continue(code),
+            other => other,
+        };
     }
     let executed = run_source(&body, 0, true, shell);
     shell.loop_depth = caller_loop_depth;
@@ -2113,7 +2118,7 @@ fn bind_arguments(
     params: &[parser::Param],
     args: Vec<Value>,
     shell: &mut Shell,
-) -> Result<(), u8> {
+) -> Result<(), Step> {
     use parser::ParamKind;
 
     // Positionals in declaration order (`None` default = required); the lone rest.
@@ -2154,7 +2159,7 @@ fn bind_arguments(
                 });
                 let Some(declared) = declared else {
                     eprintln!("mesh: {name}: unknown flag `--{flag}`");
-                    return Err(2);
+                    return Err(Step::Continue(2));
                 };
                 match &declared.kind {
                     ParamKind::Switch => {
@@ -2162,7 +2167,7 @@ fn bind_arguments(
                             eprintln!(
                                 "mesh: {name}: flag `--{flag}` is a switch and takes no value"
                             );
-                            return Err(2);
+                            return Err(Step::Continue(2));
                         }
                         switches_on.insert(declared.name.as_str());
                     }
@@ -2171,7 +2176,7 @@ fn bind_arguments(
                             eprintln!(
                                 "mesh: {name}: flag `--{flag}` requires a value (write `--{flag}=VALUE`)"
                             );
-                            return Err(2);
+                            return Err(Step::Continue(2));
                         };
                         // Last occurrence wins for a valued flag. The attached
                         // value is typed like any other scalar argument, so
@@ -2198,7 +2203,7 @@ fn bind_arguments(
         } else {
             eprintln!("mesh: {name}: expected {required} argument(s), got {supplied}");
         }
-        return Err(2);
+        return Err(Step::Continue(2));
     }
     if rest_name.is_none() && supplied > maximum {
         if maximum > required {
@@ -2206,7 +2211,7 @@ fn bind_arguments(
         } else {
             eprintln!("mesh: {name}: expected {maximum} argument(s), got {supplied}");
         }
-        return Err(2);
+        return Err(Step::Continue(2));
     }
 
     // Bind every parameter in declaration order, consuming supplied positionals in
@@ -2248,17 +2253,23 @@ fn bind_arguments(
     Ok(())
 }
 
-/// Evaluate a parameter's default expression in the function's fresh scope,
-/// reporting a recoverable error if it fails.
+/// Evaluate a parameter's default expression in the function's fresh scope. A
+/// nonlocal `exit`/`return` from the default is real control flow and unwinds
+/// through the call; any other failure (a runtime error, or a `break`/`continue`
+/// reported as outside a loop) fails the binding with a recoverable status.
 fn evaluate_default(
     name: &str,
     param: &str,
     default: &parser::Expr,
     shell: &mut Shell,
-) -> Result<Value, u8> {
-    eval_expr(default, 0, true, shell).map_err(|_| {
-        eprintln!("mesh: {name}: could not evaluate default for `{param}`");
-        2
+) -> Result<Value, Step> {
+    eval_expr(default, 0, true, shell).map_err(|step| match step {
+        exit @ Step::Exit(_) => exit,
+        ret @ Step::Return(_) => ret,
+        _ => {
+            eprintln!("mesh: {name}: could not evaluate default for `{param}`");
+            Step::Continue(2)
+        }
     })
 }
 

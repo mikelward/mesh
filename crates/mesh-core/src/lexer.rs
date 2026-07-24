@@ -907,14 +907,27 @@ fn header_awaits_body(text: &str) -> bool {
         // never be repaired, so they dispatch immediately; `func f(...`, `func
         // f(--`, and `func f(a =` are valid new-form prefixes and keep reading).
         None => params_valid(after_open, true),
-        // Signature closed: the parameter list must be structurally valid, and
-        // only whitespace may sit between `)` and the `{`. A shape the parser
-        // clearly rejects (`(,)`, `(a,a)`) is dispatched immediately rather than
-        // buffering the commands after it.
+        // Signature closed: hand the finished parameter list to the real parser so
+        // any signature it rejects — a bad shape (`(,)`, `(a,a)`) *or* a malformed
+        // default expression (`x = ]`) — dispatches immediately instead of
+        // buffering the commands after it. Only whitespace may sit between the
+        // signature's `)` and the body `{`.
         Some(close) => {
-            params_valid(&after_open[..close], false) && after_open[close + 1..].trim().is_empty()
+            signature_parses(&after_open[..close]) && after_open[close + 1..].trim().is_empty()
         }
     }
+}
+
+/// Does the finished parameter list `params` form a valid signature? Validated by
+/// the real parser (on a synthesized `func …(params) {}`), so default expressions
+/// and the ordering rules are checked exactly as an executed definition would be —
+/// the completeness helpers only approximate a *still-forming* list.
+fn signature_parses(params: &str) -> bool {
+    let probe = format!("func probe({params}) {{}}");
+    matches!(
+        crate::parser::parse(&probe),
+        Ok(crate::parser::ParseOutcome::Complete(_))
+    )
 }
 
 /// Is `s` a valid *prefix* of a kebab identifier — an ASCII-letter head followed
@@ -968,8 +981,11 @@ fn signature_close(after_open: &str) -> Option<usize> {
                 k += 1;
             }
             ')' if depth == 0 => return Some(byte),
+            // A stray close delimiter at depth 0 is unbalanced; clamp instead of
+            // going negative so a later real `)` still closes the signature (the
+            // malformed default is then rejected by `signature_parses`).
             ')' | ']' | '}' => {
-                depth -= 1;
+                depth = (depth - 1).max(0);
                 k += 1;
             }
             '=' | ',' => {
@@ -1100,7 +1116,7 @@ fn split_top_level_commas(list: &str) -> Vec<String> {
                 if matches!(c, '(' | '[' | '{') {
                     depth += 1;
                 } else if matches!(c, ')' | ']' | '}') {
-                    depth -= 1;
+                    depth = (depth - 1).max(0);
                 } else if c.is_whitespace() {
                     word_start = true;
                 } else if c == '=' {
@@ -1760,6 +1776,19 @@ mod tests {
         // An unterminated quote in a default keeps the signature open (buffering),
         // not falsely closed at a later `)`.
         assert!(needs_more_input("func f(x = \"a)\n"));
+    }
+
+    #[test]
+    fn needs_more_input_dispatches_a_closed_header_with_an_invalid_default() {
+        // A closed signature whose default cannot parse (`x = ]`) is a hard error,
+        // not an incomplete header: dispatch it immediately so the parser reports
+        // the error and the following command is not swallowed into the buffer. A
+        // stray close delimiter no longer hides the signature's real `)`.
+        assert!(!needs_more_input("func f(x = ])\n"));
+        assert!(!needs_more_input("func f(x = })\n"));
+        assert!(!needs_more_input("func f(x = 1 +)\n"));
+        // A well-formed default is still a valid closed signature awaiting its body.
+        assert!(needs_more_input("func f(x = 1 + 2)\n"));
     }
 
     #[test]

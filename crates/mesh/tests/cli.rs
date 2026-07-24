@@ -1987,6 +1987,36 @@ fn a_valued_flag_without_a_value_is_an_error() {
 }
 
 #[test]
+fn a_closed_header_with_an_invalid_default_dispatches_and_recovers() {
+    // `x = ]` is a malformed default, so the definition is reported as a syntax
+    // error and the following command still runs — not swallowed into the buffer.
+    let out = run_with_input("func f(x = ])\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("syntax error"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn exit_from_a_default_propagates_out_of_the_call() {
+    // `exit 7` inside an omitted default is real control flow: it exits the shell
+    // with status 7 rather than being flattened into a binding error.
+    let out = run_with_input("func f(x = if true { exit 7 }) { puts body }\nf\nputs after\n");
+    assert_eq!(out.status.code(), Some(7));
+    // Neither the body nor the following command runs.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn return_from_a_default_ends_the_call_with_that_status() {
+    // `return 7` inside an omitted default ends the call with status 7 (like the
+    // body returning), so the function reads as nonzero and the shell continues.
+    let out = run_with_input(
+        "func f(x = if true { return 7 }) { puts body }\nf && puts ok || puts caught\nputs after\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "caught\nafter\n");
+}
+
+#[test]
 fn a_switch_given_a_value_is_an_error() {
     let out = run_with_input("func f(--force) { puts $force }\nf --force=yes\nputs after\n");
     let stderr = String::from_utf8_lossy(&out.stderr);
