@@ -165,6 +165,23 @@ file as tasks land.
 - [ ] Load curated completion specs, then add man-page-derived specs.
 - [ ] Expose static and dynamic completion overrides through `$sh.complete`.
 
+## Beyond M3 — The environment
+
+- [x] `$env.KEY = value` and `$env.KEY += value` write the process environment,
+      so children inherit them. Global even inside a function, per `DESIGN.md`.
+      Only strings cross: a list or map is a loud error naming `:join`, and an
+      embedded NUL is refused rather than truncated.
+- [x] Path-type entries (`PATH`, `MANPATH`, `CDPATH`, `INFOPATH`,
+      `LD_LIBRARY_PATH`, `PYTHONPATH`) are lists — split on read, `:`-joined on
+      write, exactly, so every empty component survives a round trip. This is
+      what makes `$env.PATH += /opt/bin` and `$env.PATH:dedup` work.
+- [ ] `export NAME = value` as the other spelling, plus `export --list NAME` to
+      opt an arbitrary name into the path-type set.
+- [ ] `unset` and `global`, deferred alongside `export` in `DESIGN.md`
+      §"Built-ins".
+- [ ] General member assignment (`$m.key = v`), of which the `$env.KEY` form
+      here is a special case with its own byte-boundary rules.
+
 ## Beyond M3 — Invocation
 
 - [x] Run a script named on the command line (`mesh script.mesh a b c`), a

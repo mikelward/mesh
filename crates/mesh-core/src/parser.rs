@@ -199,6 +199,15 @@ pub enum Executable {
         append: bool,
         value: Expr,
     },
+    /// `$env.KEY = value` — a write to the process environment rather than to a
+    /// mesh binding. Separate from [`Executable::Assignment`] because `$env` is
+    /// a reserved namespace whose entries are bytes, not typed values; general
+    /// member assignment (`$m.key = v`) is a later, wider change.
+    EnvAssignment {
+        key: String,
+        append: bool,
+        value: Expr,
+    },
     Function {
         name: String,
         parameters: Vec<Param>,
@@ -278,6 +287,12 @@ struct ParameterHead {
     class: OrderClass,
     /// Whether an `=` was consumed, so a default expression still needs parsing.
     has_default: bool,
+}
+
+/// The characters an environment name may contain. Anything else — a `[`, a
+/// `:`, a `.` — means the reference is not a plain `$env.KEY` place.
+fn is_env_key_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 /// A binding pattern shared by assignments, conditional bindings, loops, and
@@ -1392,6 +1407,20 @@ impl Parser {
             return self.control();
         }
         let assignment_start = self.position;
+        if let Some(key) = self.env_target() {
+            if matches!(
+                self.peek().map(|token| &token.value),
+                Some(TokenKind::Equal | TokenKind::PlusEqual)
+            ) {
+                let append = self.eat(&TokenKind::PlusEqual).is_some();
+                if !append {
+                    self.expect(&TokenKind::Equal, "`=`")?;
+                }
+                let value = self.expression()?;
+                return Ok(Executable::EnvAssignment { key, append, value });
+            }
+            self.position = assignment_start;
+        }
         if self.word_text_at(0).is_some() || self.same(&TokenKind::LBracket) {
             if let Ok(pattern) = self.binding_pattern()
                 && matches!(
@@ -1902,6 +1931,38 @@ impl Parser {
             bindings.push(self.binding_pattern()?);
         }
         Ok(bindings)
+    }
+
+    /// A bare `$env.KEY` in assignment position, consumed on a match.
+    ///
+    /// Only a plain member is a place you can assign: `$env` alone names the
+    /// whole namespace, and an index, slice, or modifier (`$env.PATH:dedup`)
+    /// describes a derived value rather than a variable, so none of them is an
+    /// assignment target. Those fall through and parse as ordinary expressions,
+    /// which is where their real error message comes from.
+    fn env_target(&mut self) -> Option<String> {
+        let TokenKind::Word(word) = &self.peek()?.value else {
+            return None;
+        };
+        let [
+            WordPiece::Variable {
+                name,
+                quote: QuoteMode::Bare,
+            },
+        ] = word.pieces.as_slice()
+        else {
+            return None;
+        };
+        let key = name.strip_prefix("$env.").or_else(|| {
+            name.strip_prefix("${env.")
+                .and_then(|k| k.strip_suffix('}'))
+        })?;
+        if key.is_empty() || !key.chars().all(is_env_key_char) {
+            return None;
+        }
+        let key = key.to_owned();
+        self.next();
+        Some(key)
     }
 
     fn binding_pattern(&mut self) -> Result<BindingPattern, ParseError> {

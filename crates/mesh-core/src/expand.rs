@@ -379,7 +379,8 @@ fn glob_pattern(pieces: &Pieces) -> String {
 
 /// Resolve a variable reference to its string value.
 ///
-/// `$env.KEY` reads the process environment (strict: unset is an error).
+/// `$env.KEY` reads the process environment (strict: unset is an error), as a
+/// list for the path-type names and a string otherwise.
 /// `$sh` is the shell's own read-only namespace, resolved as a map so member
 /// access, indexing, and modifiers work through the usual paths. `$name` reads
 /// the variable store (unbound is an error). Member access on any namespace
@@ -396,69 +397,73 @@ fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
 }
 
 pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandError> {
-    let mut value = if vref.name == "env" {
-        let [Access::Member(key)] = vref.accesses.as_slice() else {
+    // `$env.KEY` consumes its member to name the entry; any further access
+    // indexes into the value it read, which is what makes `$env.PATH[0]` and
+    // `$env.PATH[1..]` work on the path-type lists.
+    let (mut value, accesses) = if vref.name == "env" {
+        let [Access::Member(key), rest @ ..] = vref.accesses.as_slice() else {
             return Err(ExpandError::Unsupported("$env".to_string()));
         };
-        env::var_os(key)
-            .map(|v| Value::String(v.to_string_lossy().into_owned()))
-            .ok_or_else(|| ExpandError::UnsetEnv(key.clone()))?
+        (
+            crate::environ::read(key).ok_or_else(|| ExpandError::UnsetEnv(key.clone()))?,
+            rest,
+        )
+    } else if vref.name == "sh" {
+        (vars.shell_namespace(), vref.accesses.as_slice())
     } else {
-        let mut value = if vref.name == "sh" {
-            vars.shell_namespace()
-        } else {
+        (
             vars.get(&vref.name)
                 .ok_or_else(|| ExpandError::UnboundVar(vref.name.clone()))?
-                .clone()
-        };
-        for access in &vref.accesses {
-            value = match access {
-                Access::Member(key) => map_value_access(value, key, &vref.name)?,
-                Access::Subscript(subscript) => {
-                    let key = subscript_key(subscript, vars)?;
-                    match value {
-                        Value::List(values) => {
-                            let index = key.parse::<i64>().map_err(|_| {
-                                ExpandError::Unsupported("list index must be an integer".into())
-                            })?;
-                            let offset = if index < 0 {
-                                values.len() as i128 + index as i128
-                            } else {
-                                index as i128
-                            };
-                            usize::try_from(offset)
-                                .ok()
-                                .and_then(|offset| values.get(offset))
-                                .cloned()
-                                .ok_or_else(|| ExpandError::IndexOutOfRange {
-                                    name: vref.name.clone(),
-                                    index,
-                                })?
-                        }
-                        Value::Map(_) => map_value_access(value, &key, &vref.name)?,
-                        Value::String(_)
-                        | Value::Integer(_)
-                        | Value::Boolean(_)
-                        | Value::Regex(_)
-                        | Value::Glob(_) => {
-                            return Err(ExpandError::NotAList(vref.name.clone()));
-                        }
+                .clone(),
+            vref.accesses.as_slice(),
+        )
+    };
+    for access in accesses {
+        value = match access {
+            Access::Member(key) => map_value_access(value, key, &vref.name)?,
+            Access::Subscript(subscript) => {
+                let key = subscript_key(subscript, vars)?;
+                match value {
+                    Value::List(values) => {
+                        let index = key.parse::<i64>().map_err(|_| {
+                            ExpandError::Unsupported("list index must be an integer".into())
+                        })?;
+                        let offset = if index < 0 {
+                            values.len() as i128 + index as i128
+                        } else {
+                            index as i128
+                        };
+                        usize::try_from(offset)
+                            .ok()
+                            .and_then(|offset| values.get(offset))
+                            .cloned()
+                            .ok_or_else(|| ExpandError::IndexOutOfRange {
+                                name: vref.name.clone(),
+                                index,
+                            })?
+                    }
+                    Value::Map(_) => map_value_access(value, &key, &vref.name)?,
+                    Value::String(_)
+                    | Value::Integer(_)
+                    | Value::Boolean(_)
+                    | Value::Regex(_)
+                    | Value::Glob(_) => {
+                        return Err(ExpandError::NotAList(vref.name.clone()));
                     }
                 }
-                Access::Slice {
-                    start,
-                    end,
-                    inclusive,
-                } => match value {
-                    Value::List(values) => {
-                        Value::List(slice(&values, *start, *end, *inclusive).to_vec())
-                    }
-                    _ => return Err(ExpandError::NotAList(vref.name.clone())),
-                },
-            };
-        }
-        value
-    };
+            }
+            Access::Slice {
+                start,
+                end,
+                inclusive,
+            } => match value {
+                Value::List(values) => {
+                    Value::List(slice(&values, *start, *end, *inclusive).to_vec())
+                }
+                _ => return Err(ExpandError::NotAList(vref.name.clone())),
+            },
+        };
+    }
     for modifier in &vref.modifiers {
         value = apply_modifier(value, *modifier)?;
     }

@@ -123,6 +123,10 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
   whole statement; `name = value` (spaced) is the compound-value form. Position
   separates assignment from a `k=v` *argument*: `git commit --author=me` and
   `env FOO=1 cmd` are commands, not bindings.
+- **`$env.KEY = value`** (and `+=`) writes the process environment rather than a
+  mesh binding, and is global even inside a function. Only a plain member is a
+  place: an index or modifier (`$env.PATH[0] =`, `$env.PATH:dedup =`) is a syntax
+  error.
 - **`$name` / `${name}`** read a variable; **`$env.KEY` / `${env.KEY}`** read the
   environment (strict), and **`$xs[N]` / `${xs[N]}`** read an exact list element.
   These forms have the same meaning in bare words and `"…"`; braces delimit a

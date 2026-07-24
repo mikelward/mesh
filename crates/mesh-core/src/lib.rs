@@ -6,6 +6,7 @@
 
 mod builtins;
 mod completion;
+mod environ;
 mod exec;
 mod expand;
 mod funcs;
