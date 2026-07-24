@@ -2971,10 +2971,41 @@ impl MeshPrompt {
             self.custom
                 .as_deref()
                 .unwrap_or(if self.failed { "mesh! " } else { "mesh$ " });
-        let width = prompt.rsplit('\n').next().unwrap_or_default().width();
+        let width = sgr_stripped_width(prompt.rsplit('\n').next().unwrap_or_default());
 
         format!("{} ", ".".repeat(width.saturating_sub(1)))
     }
+}
+
+fn sgr_stripped_width(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut width = 0;
+    let mut visible_start = 0;
+    let mut index = 0;
+
+    while index + 1 < bytes.len() {
+        if bytes[index] != b'\x1b' || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+
+        let mut end = index + 2;
+        while end < bytes.len() && (0x30..=0x3f).contains(&bytes[end]) {
+            end += 1;
+        }
+        while end < bytes.len() && (0x20..=0x2f).contains(&bytes[end]) {
+            end += 1;
+        }
+        if end < bytes.len() && bytes[end] == b'm' {
+            width += text[visible_start..index].width();
+            visible_start = end + 1;
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+    }
+
+    width + text[visible_start..].width()
 }
 
 impl Prompt for MeshPrompt {
@@ -3869,6 +3900,18 @@ mod tests {
             ".. "
         );
         assert_eq!(custom_prompt.render_prompt_multiline_indicator(), ".. ");
+
+        let styled_prompt = MeshPrompt {
+            failed: false,
+            continuation: true,
+            custom: Some("\x1b[31mλ> \x1b[0m".into()),
+        };
+
+        assert_eq!(
+            styled_prompt.render_prompt_indicator(PromptEditMode::Default),
+            ".. "
+        );
+        assert_eq!(styled_prompt.render_prompt_multiline_indicator(), ".. ");
     }
 
     #[test]
