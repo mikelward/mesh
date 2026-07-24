@@ -546,8 +546,14 @@ greet world          # -> hi, world
   `exit`); a bare `return` uses the status so far. Both stop the rest of the body.
   At top level `return` is a recoverable error.
 
-Not yet supported: a function in a pipeline or with a redirection (or in the
-background), and calling for a value (`f(arg)`) as opposed to running it.
+- **Redirection.** A function takes `>`, `>>`, and `<` like any command
+  (`f > out.txt`, `r < input`). Because a function runs inside the shell, the
+  redirection applies to the shell's own descriptors for the duration of the
+  call, so output from the body — including from an external command it runs —
+  lands in the target, and an external it runs can read the redirected input.
+
+Not yet supported: a function in a pipeline or in the background, and calling for
+a value (`f(arg)`) as opposed to running it.
 
 ## Not yet implemented
 

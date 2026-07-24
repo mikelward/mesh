@@ -11,6 +11,7 @@ use std::io::IsTerminal;
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 /// Write one diagnostic line to stderr in a single `write`.
 ///
@@ -264,7 +265,7 @@ pub fn run_pipeline(cmds: Vec<Cmd>, jobs: &mut JobTable, background: bool) -> u8
         .collect::<Vec<_>>()
         .join(" | ");
     let n = cmds.len();
-    let interactive = std::io::stdin().is_terminal();
+    let interactive = shell_stdin_is_terminal();
     let mut outcomes: Vec<Outcome> = Vec::new();
     // A background job must not consume commands from the shell's input.
     let mut next_stdin = initial_stdin(background, interactive);
@@ -655,7 +656,7 @@ fn reclaim_terminal(modes: Option<&libc::termios>) {
 fn terminal_modes() -> Option<libc::termios> {
     let mut modes = std::mem::MaybeUninit::uninit();
     // SAFETY: tcgetattr initializes `modes` on success.
-    (unsafe { libc::tcgetattr(libc::STDIN_FILENO, modes.as_mut_ptr()) } == 0)
+    (unsafe { libc::tcgetattr(terminal_fd(), modes.as_mut_ptr()) } == 0)
         .then(|| unsafe { modes.assume_init() })
 }
 
@@ -663,7 +664,7 @@ fn restore_terminal_modes(modes: &libc::termios) {
     // SAFETY: `modes` came from tcgetattr for this terminal. Errors are best
     // effort here: command status must remain the foreground job's status.
     unsafe {
-        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSADRAIN, modes);
+        libc::tcsetattr(terminal_fd(), libc::TCSADRAIN, modes);
     }
 }
 
@@ -737,7 +738,7 @@ fn set_foreground_group(pgid: libc::pid_t) {
         libc::sigemptyset(&mut block);
         libc::sigaddset(&mut block, libc::SIGTTOU);
         libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
-        libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+        libc::tcsetpgrp(terminal_fd(), pgid);
         libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
     }
 }
@@ -747,6 +748,147 @@ fn set_foreground_group(pgid: libc::pid_t) {
 /// both). Returns the final stdin/stdout target — the last redirection of each
 /// direction wins. On the first failure, returns the offending path and error.
 #[allow(clippy::type_complexity)]
+/// Apply `redirs` to **this** process's stdin/stdout for the duration of `body`,
+/// restoring the original descriptors afterward, and return `body`'s result.
+///
+/// An external command configures its redirections on the child it spawns, but an
+/// in-shell function runs inside the shell itself, so there is no child to
+/// configure: its `>`/`>>`/`<` have to be swapped onto the shell's own
+/// descriptors around the call. Rust's buffered stdout is flushed on both sides
+/// of the swap so output lands in the file it was written for.
+///
+/// Opening a target can fail (a missing input, an unwritable path) and so can the
+/// descriptor swap itself (`EMFILE` near the descriptor limit). Either way the
+/// error is returned with the path, every swap already made is rolled back, and
+/// `body` does **not** run — it must never execute against a half-applied
+/// redirection.
+pub(crate) fn with_redirections<T>(
+    redirs: &[(RedirKind, String)],
+    body: impl FnOnce() -> T,
+) -> Result<T, (String, std::io::Error)> {
+    use std::io::Write;
+
+    let (stdin_file, stdout_file) = open_redirs(redirs)?;
+    // Anything already buffered belongs to the *previous* stdout.
+    let _ = std::io::stdout().flush();
+
+    // The path each direction resolved to, for an error message. `open_redirs`
+    // applies "last one wins" per direction, so match that here.
+    let path_for = |wanted: &[RedirKind]| {
+        redirs
+            .iter()
+            .rev()
+            .find(|(kind, _)| wanted.contains(kind))
+            .map(|(_, path)| path.clone())
+            .unwrap_or_default()
+    };
+
+    let mut swapped: Vec<(libc::c_int, libc::c_int)> = Vec::new();
+    let restore = |swapped: &mut Vec<(libc::c_int, libc::c_int)>| {
+        // Restore in reverse so the descriptors return to their original state.
+        for (saved, target) in swapped.drain(..).rev() {
+            unsafe {
+                libc::dup2(saved, target);
+                libc::close(saved);
+            }
+        }
+    };
+    for (file, target, kinds) in [
+        (
+            stdin_file.as_ref(),
+            libc::STDIN_FILENO,
+            &[RedirKind::In][..],
+        ),
+        (
+            stdout_file.as_ref(),
+            libc::STDOUT_FILENO,
+            &[RedirKind::Out, RedirKind::Append][..],
+        ),
+    ] {
+        let Some(file) = file else { continue };
+        match swap_descriptor(file, target) {
+            Ok(saved) => swapped.push((saved, target)),
+            Err(err) => {
+                restore(&mut swapped);
+                return Err((path_for(kinds), err));
+            }
+        }
+    }
+
+    // While stdin is swapped to a file, fd 0 no longer says whether this is an
+    // interactive session, so publish the saved descriptor for `shell_stdin`.
+    let stdin_saved = swapped
+        .iter()
+        .find(|(_, target)| *target == libc::STDIN_FILENO)
+        .map(|(saved, _)| *saved);
+    let published = stdin_saved.filter(|_| SHELL_STDIN.load(Ordering::Relaxed) < 0);
+    if let Some(saved) = published {
+        SHELL_STDIN.store(saved, Ordering::Relaxed);
+    }
+
+    let result = body();
+
+    if published.is_some() {
+        SHELL_STDIN.store(-1, Ordering::Relaxed);
+    }
+    // Flush what the body wrote before restoring, or it would land on the
+    // restored descriptor instead of the redirection target.
+    let _ = std::io::stdout().flush();
+    restore(&mut swapped);
+    Ok(result)
+}
+
+/// `dup` `target` aside and point it at `file`, returning the saved descriptor.
+fn swap_descriptor(file: &File, target: libc::c_int) -> Result<libc::c_int, std::io::Error> {
+    use std::os::fd::AsRawFd;
+    let saved = unsafe { libc::dup(target) };
+    if saved < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::dup2(file.as_raw_fd(), target) } < 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(saved) };
+        return Err(error);
+    }
+    Ok(saved)
+}
+
+/// The shell's own stdin while an in-process redirection has fd 0 pointed at a
+/// file, or `-1` when fd 0 *is* the shell's stdin. Only the outermost redirection
+/// publishes here, so a nested one cannot mistake an outer redirect's file for the
+/// session's terminal.
+static SHELL_STDIN: AtomicI32 = AtomicI32::new(-1);
+
+/// Is the shell session interactive — i.e. is *its* stdin a terminal?
+///
+/// Read this rather than fd 0 directly: a function running under `f < file` has
+/// fd 0 temporarily pointed at that file, and treating the session as
+/// non-interactive there would skip process-group setup and signal restoration,
+/// leaving a child with mesh's ignored terminal signals (so Ctrl-C could not
+/// reach it).
+/// The descriptor that refers to the shell's controlling terminal.
+///
+/// Job control — reading/restoring terminal modes and handing the terminal to a
+/// foreground process group — must use this rather than fd 0: under `f < file`
+/// fd 0 is a regular file, and `tcsetpgrp`/`tcgetattr` on it fail, which would
+/// leave mesh's own group in the foreground so Ctrl-C never reached the child.
+fn terminal_fd() -> libc::c_int {
+    let saved = SHELL_STDIN.load(Ordering::Relaxed);
+    if saved >= 0 {
+        saved
+    } else {
+        libc::STDIN_FILENO
+    }
+}
+
+fn shell_stdin_is_terminal() -> bool {
+    let saved = SHELL_STDIN.load(Ordering::Relaxed);
+    if saved >= 0 {
+        return unsafe { libc::isatty(saved) == 1 };
+    }
+    std::io::stdin().is_terminal()
+}
+
 fn open_redirs(
     redirs: &[(RedirKind, String)],
 ) -> Result<(Option<File>, Option<File>), (String, std::io::Error)> {
@@ -792,9 +934,77 @@ fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        JobTable, NextIn, initial_stdin, restore_job_signals, restore_terminal_modes, run,
-        terminal_modes,
+        JobTable, NextIn, RedirKind, initial_stdin, restore_job_signals, restore_terminal_modes,
+        run, set_foreground_group, shell_stdin_is_terminal, terminal_fd, terminal_modes,
+        with_redirections,
     };
+
+    #[test]
+    fn redirecting_stdin_keeps_the_session_interactive() {
+        // `f < file` points fd 0 at a regular file for the duration of the call.
+        // The *session* is still interactive, and `run_pipeline` must see that:
+        // otherwise it skips process-group setup and signal restoration, leaving a
+        // child with mesh's ignored terminal signals so Ctrl-C could not reach it.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid != 0 {
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0, "child assertions failed");
+            return;
+        }
+        // Child: give fd 0 a *controlling* terminal, so the session reads as
+        // interactive and job control (`tcsetpgrp`) is permitted.
+        let mut master = -1;
+        let mut slave = -1;
+        let ok = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } == 0
+            && unsafe { libc::setsid() } >= 0
+            && unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } >= 0
+            && unsafe { libc::dup2(slave, libc::STDIN_FILENO) } == libc::STDIN_FILENO
+            && shell_stdin_is_terminal();
+
+        let path = std::env::temp_dir().join(format!("mesh-redir-tty-{}", std::process::id()));
+        let wrote = std::fs::write(&path, "input\n").is_ok();
+        let redirs = [(RedirKind::In, path.to_string_lossy().into_owned())];
+        // Inside the redirection fd 0 is the file, but the session is still a TTY
+        // and job control must still reach the *terminal*: reading its modes and
+        // handing it to a process group both have to work, or a child would run
+        // with mesh's ignored terminal signals and Ctrl-C could not stop it.
+        let group = unsafe { libc::getpgrp() };
+        let inside = with_redirections(&redirs, || {
+            let fd_zero_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            let modes_readable = terminal_modes().is_some();
+            set_foreground_group(group);
+            let foreground = unsafe { libc::tcgetpgrp(terminal_fd()) };
+            (
+                shell_stdin_is_terminal(),
+                fd_zero_is_tty,
+                modes_readable,
+                foreground,
+            )
+        });
+        let _ = std::fs::remove_file(&path);
+        // Session still interactive, fd 0 is not the tty, terminal modes readable,
+        // and the terminal's foreground group is the one we just set.
+        let inside_ok = matches!(inside, Ok((true, false, true, fg)) if fg == group);
+        // ...and it is restored afterward.
+        let after_ok = shell_stdin_is_terminal() && terminal_modes().is_some();
+
+        // Exit without closing the PTY: closing the master of the controlling
+        // terminal would SIGHUP this session before `_exit` reported the result.
+        let _ = master;
+        let _ = slave;
+        unsafe { libc::_exit(i32::from(!(ok && wrote && inside_ok && after_ok))) };
+    }
 
     #[test]
     fn interactive_background_jobs_keep_terminal_stdin() {

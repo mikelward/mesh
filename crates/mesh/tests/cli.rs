@@ -2364,20 +2364,64 @@ fn a_function_in_a_pipeline_is_rejected() {
 }
 
 #[test]
-fn a_redirected_function_is_rejected() {
+fn a_redirected_function_writes_to_the_target() {
+    // A function runs inside the shell, so its `>` is applied to the shell's own
+    // stdout for the duration of the call. Output written by the body — including
+    // by an external command it runs — lands in the file, and the shell's stdout is
+    // restored afterward.
     let dir = fresh_dir("func_redirect");
     let target = dir.join("out");
     let out = run_with_input(&format!(
-        "func f() {{ puts hi }}\nf > {}\n",
+        "func f() {{ puts hi\n puts there }}\nf > {}\nputs back-on-stdout\n",
         target.display()
     ));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("redirection or backgrounding of a function"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(!target.exists());
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "back-on-stdout\n");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "hi\nthere\n");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_redirected_function_appends_and_reads_stdin() {
+    let dir = fresh_dir("func_redirect_more");
+    let target = dir.join("out");
+    let input = dir.join("in");
+    std::fs::write(&input, "from-the-file\n").unwrap();
+    let out = run_with_input(&format!(
+        "func w() {{ puts one }}\nw > {t}\nw >> {t}\nfunc r() {{ cat }}\nr < {i}\n",
+        t = target.display(),
+        i = input.display()
+    ));
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    // `>` then `>>` accumulates; `<` feeds the body (here an external `cat`).
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "one\none\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "from-the-file\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_redirected_functions_arguments_are_expanded_before_the_target_is_opened() {
+    // Creating the redirection target must not change what the call's own glob
+    // matches — the external-command path builds its argv before opening too. In a
+    // directory holding only `input`, `f * > summary` passes just `input`.
+    let dir = fresh_dir("func_redirect_glob");
+    std::fs::write(dir.join("input"), "").unwrap();
+    let out = run_with_input(&format!(
+        "cd {}\nfunc f(...xs) {{ puts ...$xs }}\nf * > summary\ncat summary\n",
+        dir.display()
+    ));
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "input\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_unopenable_redirect_target_for_a_function_is_reported() {
+    // The open failure is reported with its path and the shell keeps going.
+    let out = run_with_input("func f() { puts hi }\nf > /nonexistent-dir/out\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("/nonexistent-dir/out"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 }
 
 #[test]

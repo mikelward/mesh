@@ -1944,8 +1944,10 @@ fn run_pipeline(mut stages: Vec<Stage>, background: bool, last: u8, shell: &mut 
 
 /// Run a one-stage pipeline. Without redirections this is the full command
 /// surface: an assignment or a builtin/function/external command. With
-/// redirections it is an external command only (a redirected builtin or function
-/// is not supported yet).
+/// redirections it is an external command or an in-shell **function** (whose
+/// redirection is applied to the shell's own descriptors around the call, since
+/// there is no child to configure); a redirected builtin, and backgrounding
+/// anything in-shell, are not supported yet.
 fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> Step {
     let Stage {
         words,
@@ -1954,6 +1956,38 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
     } = stage;
     if redirs.is_empty() && !background {
         return run_command(words, last, shell);
+    }
+    // An in-shell function runs inside the shell, so a redirection on it is applied
+    // to the shell's own descriptors for the duration of the call rather than
+    // configured on a child. Backgrounding still needs a child, so it stays
+    // unsupported and falls through to the message below.
+    if !background
+        && let Some(name) = command_name(&words, &shell.vars)
+        && shell.funcs.get(&name).is_some()
+    {
+        // Expand the arguments *before* the targets are opened: `f * > summary`
+        // must not see the `summary` the redirection is about to create. (The
+        // external path likewise builds its argv before opening.)
+        let arg_words: Vec<Word> = words.into_iter().skip(1).collect();
+        let args = match expand_function_args(arg_words, &shell.vars) {
+            Ok(args) => args,
+            Err(step) => return step,
+        };
+        let opened = match expand_redirs(redirs, &shell.vars) {
+            Ok(redirs) => redirs,
+            Err(err) => {
+                eprintln!("mesh: {err}");
+                return Step::Continue(1);
+            }
+        };
+        return match exec::with_redirections(&opened, || dispatch_function_call(&name, args, shell))
+        {
+            Ok(step) => step,
+            Err((path, err)) => {
+                eprintln!("mesh: {path}: {err}");
+                Step::Continue(1)
+            }
+        };
     }
     let argv = match expand::expand(words, &shell.vars) {
         Ok(argv) => argv,
@@ -2084,6 +2118,37 @@ fn expand_redirs(
 /// Run one command with no redirections: classify it as an assignment or a
 /// command and act. `last` is the previous status (the default for a bare `exit`
 /// or `return`).
+/// Expand a function call's argument words into typed values. Each is tagged with
+/// whether it came from a bare literal word, so an attached `--flag=value` types
+/// its value the same way the token would type positionally (see
+/// [`expand::expand_call_values`]).
+///
+/// Kept separate from [`dispatch_function_call`] because a redirected call must
+/// expand its arguments *before* the redirection targets are opened: creating or
+/// truncating a target must not change what a glob argument matches.
+fn expand_function_args(arg_words: Vec<Word>, vars: &Vars) -> Result<Vec<(Value, bool)>, Step> {
+    expand::expand_call_values(arg_words, vars).map_err(|err| {
+        eprintln!("mesh: {err}");
+        Step::Continue(1)
+    })
+}
+
+/// Run an in-shell function call whose arguments are already expanded: generated
+/// `--help` first, then the call itself.
+fn dispatch_function_call(name: &str, args: Vec<(Value, bool)>, shell: &mut Shell) -> Step {
+    // Intercept `--help` only when the signature does not claim it; a function
+    // that declares a `--help` flag observes the switch itself (`DESIGN.md`
+    // §"Command resolution and help").
+    let declares_help = shell.funcs.get(name).is_some_and(|def| def.declares_help());
+    if !declares_help && auto_help_requested(&args) {
+        let help = shell.funcs.get(name).expect("declared function").help(name);
+        return Step::Continue(builtins::print_generated_help(name, &help));
+    }
+    // The `--` terminator and flag parsing are handled during argument binding in
+    // `call_func`. A command-position call parses flags.
+    call_func(name, args, true, shell)
+}
+
 fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
     // Resolve an in-shell function *before* the external-argv rule turns a
     // bare list argument into an error, so an unspread list reaches the
@@ -2095,27 +2160,11 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         && shell.funcs.get(&name).is_some()
     {
         let arg_words: Vec<Word> = tokens.into_iter().skip(1).collect();
-        // Each arg is tagged with whether it was a bare literal word, so an
-        // attached `--flag=value` types its value the same way the token would
-        // type positionally (see `expand::expand_call_values`).
-        let args = match expand::expand_call_values(arg_words, &shell.vars) {
+        let args = match expand_function_args(arg_words, &shell.vars) {
             Ok(args) => args,
-            Err(err) => {
-                eprintln!("mesh: {err}");
-                return Step::Continue(1);
-            }
+            Err(step) => return step,
         };
-        // Intercept `--help` only when the signature does not claim it; a function
-        // that declares a `--help` flag observes the switch itself (`DESIGN.md`
-        // §"Command resolution and help").
-        let declares_help = shell.funcs.get(&name).unwrap().declares_help();
-        if !declares_help && auto_help_requested(&args) {
-            let help = shell.funcs.get(&name).unwrap().help(&name);
-            return Step::Continue(builtins::print_generated_help(&name, &help));
-        }
-        // The `--` terminator and flag parsing are handled during argument
-        // binding in `call_func`. A command-position call parses flags.
-        return call_func(&name, args, true, shell);
+        return dispatch_function_call(&name, args, shell);
     }
     let words = match expand::expand(tokens, &shell.vars) {
         Ok(words) => words,
