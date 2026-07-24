@@ -74,9 +74,10 @@ integration tests need no terminal. The rest of the interactive stack named in
 | `nucleo-matcher` | fuzzy completion | MPL-2.0 | **in use** |
 
 Add a dependency only when a milestone calls for it; prefer a small, focused
-crate over a framework. Note the license column when the repo license is chosen
-(see `TODO.md`): all planned deps are permissive except `nucleo`, which is
-MPL-2.0 (weak, file-level copyleft — compatible with a permissive project).
+crate over a framework. The repo is licensed `MIT OR Apache-2.0`; keep the
+license column permissive-compatible. All planned deps are permissive except
+`nucleo`, which is MPL-2.0 (weak, file-level copyleft — compatible with a
+permissive project).
 
 ## Testing
 

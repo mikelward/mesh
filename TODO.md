@@ -168,8 +168,9 @@ file as tasks land.
   chosen over a Rust-style `r#"…"#` delimiter. Its value-producing spelling (vs
   command-redirection) is still open below. Implementation lands with the quoting
   task (task 5).
-- **Repo license = decide later** (leave unlicensed for now; revisit before any
-  real release). Recorded in "Decisions needed" below for visibility.
+- **Repo license = `MIT OR Apache-2.0`** (the Rust-ecosystem norm, as used by Rust
+  itself). `LICENSE-APACHE` and `LICENSE-MIT` live at the repo root and every crate
+  declares `license = "MIT OR Apache-2.0"`.
 - **Glob no-match → empty** (nullglob-style: the pattern expands to zero words).
   This is *principled*, not a compromise, and fully consistent with "absence is
   loud": specific-element access (`xs[99]`, `$map.key`) errors because you asked
@@ -210,11 +211,11 @@ file as tasks land.
         heredoc, but the only heredoc specified today is command-redirection (feeds
         bytes to a command; an unquoted delimiter would expand). A raw,
         *value-producing* heredoc spelling still needs defining.
-- [ ] **Choose a repo license** — *decided: later* (revisit before any real
-      release). Nothing constrains the choice today: all current/planned deps are
-      permissive (`reedline`/`nix`/`crossterm` MIT) except `nucleo` **MPL-2.0**
-      (weak, file-level copyleft — compatible with a permissive project). Likely
-      landing spot: `MIT OR Apache-2.0` (the Rust-ecosystem norm).
+- [x] **Choose a repo license** — *decided: `MIT OR Apache-2.0`* (the
+      Rust-ecosystem norm, as used by Rust itself). Nothing constrained the choice:
+      all current/planned deps are permissive (`reedline`/`nix`/`crossterm` MIT)
+      except `nucleo` **MPL-2.0** (weak, file-level copyleft — compatible with a
+      permissive project). `LICENSE-APACHE`/`LICENSE-MIT` are at the repo root.
 
 ## Icebox / decide later
 

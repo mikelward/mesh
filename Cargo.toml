@@ -7,6 +7,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 repository = "https://github.com/mikelward/mesh"
+license = "MIT OR Apache-2.0"
 
 # Lints applied across every workspace crate. Warnings are denied in CI
 # (`cargo clippy -- -D warnings`); keep the source clean rather than sprinkling
