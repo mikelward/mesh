@@ -464,6 +464,25 @@ mesh$ <strong>puts $tmp</strong>
 mesh: tmp: unbound variable
 </pre>
 
+A signature can do more than required positionals. A parameter with `= value` is
+optional, a `--name` parameter is a flag (a bare `--force` switch or a valued
+`--tag = default`), and a trailing `...name` collects whatever is left:
+
+<pre>
+mesh$ <strong>func deploy(target, --tag = latest, --force, ...hosts) {</strong>
+...   <strong>puts "$target $tag $force"; puts ...$hosts</strong>
+... <strong>}</strong>
+mesh$ <strong>deploy prod --force web1 web2</strong>
+prod latest true
+web1 web2
+mesh$ <strong>deploy prod --tag=v9 web1</strong>
+prod v9 false
+web1
+</pre>
+
+Flags can appear in any order and never get swallowed as positionals; a bare `--`
+ends flag parsing so a later `--word` reaches `...hosts` as data.
+
 `return` leaves a function early; `return N` also sets its status, so a function
 reads as true/false in `&&` / `||`:
 
