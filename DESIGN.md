@@ -1980,16 +1980,17 @@ coexist with `return [N]`:
   mirrors generators. Cost / sub-questions: two keywords; must define a function body's
   value (trailing `yield`? explicit `return`? last `yield` wins?); whether `yield`
   outside a value context is an error; and `return`'s status role still needs settling.
-- **Option 2 — one keyword, value carries status: `return <value>` only.**
-  `return <value>` is the sole value mechanism; the returned value's **truthiness** *is*
-  the success/failure status — consistent with mesh's model, where failure is already "a
-  `false` / a nonzero int / a failed command." So `return 5` is the integer `5` (its
-  truthiness the status), never "exit status 5." Rationale: one keyword, no new concept,
-  folds result and status into one value. Cost / sub-questions: redefines today's
-  `return [N]`; and it gives **functions** a value but not `match` arms a *local* yield,
-  so `if`/`match`-as-expression still needs a mechanism — either the same `return`
-  (restricting arm-values to function-tail position) or a separate local form (which
-  collapses back toward Option 1).
+- **Option 2 — one keyword, no separate local yield: `return <value>`.**
+  `return <value>` is the only value keyword; **status stays the settled view of the
+  result** — an int's status is the int itself (so `return 5` yields the typed value `5`,
+  read via `f()`, whose status *view* remains `5`), a bool's is `0`/`1`, any other value's
+  is `0`. There is no separate value-plus-status channel: the result is one thing and its
+  status is a view of it. (This is essentially the settled `return val` already; the only
+  genuinely *new* part, shared with Option 1, is requiring the keyword in place of an
+  implicit last expression.) Cost / sub-questions: gives **functions** a value but not
+  `match` arms a *local* yield distinct from function-return, so `if`/`match`-as-expression
+  still needs a mechanism — either the same `return` (restricting arm-values to
+  function-tail position) or a separate local form (which collapses back toward Option 1).
 
 The axis underneath both: do we need a *local* value-yield (for `if`/`match` arms)
 distinct from a *function* return? Option 1 says yes (two keywords); Option 2 says no at
