@@ -1949,6 +1949,44 @@ narrowed the question to four choices; current leanings noted, but all four are 
    tightening (applies to `if` too), not a `match`-only change. `=>` reads well but forks
    `match` from mesh's `{ }`-block control flow.
 
+**Open decision — producing a typed value from a function/block** *(open — two
+options, undecided; language-wide, applies to `if` branches, `match` arms, and
+function bodies alike since they share block-value machinery)*.
+
+Settled context: `puts`/printing is the **byte channel** only (streamed by bare `f`,
+captured by `$(f)`). A **typed value** requires an explicit keyword — which lets `{ … }`
+blocks stay pure command-context (a bare word always *runs*; quotes go back to meaning
+only "group into one word," so the `"$a""$b"` value-vs-command ambiguity disappears).
+The open question is *which keyword(s)*, and how they coexist with mesh's current
+`return [N]` (today: exit the function with a **status**).
+
+- **Option 1 — two keywords, split by scope: `yield` (local) + `return` (function).**
+  `yield <value>` produces the value of the **nearest value-yielding block** — an `if`
+  branch, a `match` arm, a bare `{ }` in expression position — *without* leaving the
+  function; `return <value>` produces the **enclosing function's** value and exits it
+  early. Rationale: local-yield and function-return are genuinely different — a `match`
+  arm inside a function must yield *the arm's* value while the function keeps running
+  (`yield`), which is not the same as bailing out of the whole function (`return`);
+  mirrors generators. Cost / sub-questions: two keywords; must define a function body's
+  value (trailing `yield`? explicit `return`? last `yield` wins?); whether `yield`
+  outside a value context is an error; and `return`'s status role still needs settling.
+- **Option 2 — one keyword, value carries status: `return <value>` only.**
+  `return <value>` is the sole value mechanism; the returned value's **truthiness** *is*
+  the success/failure status — consistent with mesh's model, where failure is already "a
+  `false` / a nonzero int / a failed command." So `return 5` is the integer `5` (its
+  truthiness the status), never "exit status 5." Rationale: one keyword, no new concept,
+  folds result and status into one value. Cost / sub-questions: redefines today's
+  `return [N]`; and it gives **functions** a value but not `match` arms a *local* yield,
+  so `if`/`match`-as-expression still needs a mechanism — either the same `return`
+  (restricting arm-values to function-tail position) or a separate local form (which
+  collapses back toward Option 1).
+
+The axis underneath both: do we need a *local* value-yield (for `if`/`match` arms)
+distinct from a *function* return? Option 1 says yes (two keywords); Option 2 says no at
+the function level and leaves arm-yield to be settled separately. Either way, `return`'s
+current status-only meaning is changed or joined, so the `return [N]` status idiom needs
+a new home (truthiness, or a distinct word).
+
 ### Tests and comparisons
 
 This is the surface that replaces bash `[[ … ]]` — the pieces a condition needs,
