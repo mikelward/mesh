@@ -2028,7 +2028,11 @@ view of the result")*.
     bind), so a failed result can't be used silently;
   - `if v = f() { use $v } else { handle failure }` — the **`if let`**: binds the value on
     success, **branches on status**, handles failure in `else` (Rust's `if let Ok(v)`);
-  - `[out val] = f():capture` — the explicit full unpack when both channels are wanted.
+  - `r = f():capture` — the explicit full form: the settled
+    [`:capture`](#calling-for-a-value-and-lambdas) returns a **record** (`$r.value`,
+    `$r.out` / `$r.err`, `$r.status`), so the value and the failure channel are both in
+    hand at once — the settled machinery already provides the "value + status together"
+    the proposal wants.
 - **Condition rule (value-vs-status resolved by syntax).** A call's role in a condition is
   set by its form, so "is a call its value or its status" is never ambiguous: bare `f` in
   a condition tests **status** (the command form); `f()` / `if v = f()` produce the
