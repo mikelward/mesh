@@ -407,7 +407,13 @@ file as tasks land.
       at the moment a job finishes rather than at the next prompt, `$sh.jobs`
       that is current without something having to read it, and the `jobdone` hook
       `DESIGN.md` reserves — which cannot be honest while nothing knows a job is
-      done until asked.
+      done until asked. It would also close the last of the stopped-job races:
+      `wait` reports a stopped job's cached stop rather than blocking, since a
+      stopped job does not finish on its own, so a job killed *out* of its stop
+      by something other than this shell's own `kill` can be reported as stopped
+      by a `wait` whose single poll ran before the kernel posted the exit. Our
+      own `kill -KILL` clears the mark so that wait blocks instead, but nothing
+      can do the same for a `kill -9` typed in another terminal.
       What makes it a real change rather than a swap: the poll's contract is that
       *looking never changes what the shell does*, and a handler mutating the
       table breaks the single-threaded assumption that contract rests on, so the

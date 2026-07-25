@@ -2413,10 +2413,18 @@ fn a_stopped_job_is_still_watched() {
     //
     // Killed where it stands — it stayed listed as stopped for good, and `wait`
     // handed back the stop status (147) rather than how it actually ended.
-    let killed = run_with_input(
-        "sh -c 'kill -STOP $$; sleep 5' &\nsleep 0.3\nkill -KILL %1\nsleep 0.3\nwait 1\nputs waited=$sh.status\n",
-    );
-    assert_eq!(String::from_utf8_lossy(&killed.stdout), "waited=137\n");
+    //
+    // No sleep between the kill and the wait, deliberately. An earlier version
+    // of this test had one, which hid a race: the single non-blocking poll `wait`
+    // does can run before the kernel has posted the termination, and on a `None`
+    // poll the cached stop was what got reported. Repeated, because a race that
+    // is merely likely to show would pass often enough to look fixed.
+    for _ in 0..10 {
+        let killed = run_with_input(
+            "sh -c 'kill -STOP $$; sleep 5' &\nsleep 0.3\nkill -KILL %1\nwait 1\nputs waited=$sh.status\n",
+        );
+        assert_eq!(String::from_utf8_lossy(&killed.stdout), "waited=137\n");
+    }
 
     // Continued by something other than this table — here a `kill -CONT` in a
     // pipeline stage, whose copy of the table dies with the stage. Only asking
