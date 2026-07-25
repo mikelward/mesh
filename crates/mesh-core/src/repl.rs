@@ -2150,6 +2150,26 @@ fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
     }
 }
 
+/// Read through a job handle before an access applies to it.
+///
+/// Expansion resolves handles on its own side of the language, so every access
+/// form here has to as well — otherwise whether a handle can be read depends on
+/// how it reached the access rather than on what it is. `($j).state` needed
+/// this, and `($j)["state"]` needed it separately; anything that later grows a
+/// third way to reach into a value should call this rather than learn it again.
+///
+/// A bare handle never comes through here, which is what leaves it with no byte
+/// form and lets `kill $j` mean a job.
+fn through_handle(value: Value, shell: &Shell) -> Result<Value, Step> {
+    match value {
+        Value::Job(id) => match shell.vars.job_record(id) {
+            Some(record) => Ok(record),
+            None => runtime_error(format!("job {id} is no longer in the job table")),
+        },
+        other => Ok(other),
+    }
+}
+
 fn parse_bound(value: &str) -> Option<i64> {
     (!value.is_empty()).then(|| value.parse().expect("parser validated list bound"))
 }
@@ -2361,20 +2381,7 @@ fn eval_expr(
             let Some(value) = eval_operand(value, last, in_function, shell)? else {
                 return Ok(control_placeholder());
             };
-            // A handle reaching here rather than through a variable's own access
-            // chain — `($j).state`, or a function that returned one — is read
-            // through in the same way. Expansion resolves handles on its side of
-            // the language; without this, whether `.state` works depends on how
-            // the handle got here rather than on what it is.
-            let value = match value {
-                Value::Job(id) => match shell.vars.job_record(id) {
-                    Some(record) => record,
-                    None => {
-                        return runtime_error(format!("job {id} is no longer in the job table"));
-                    }
-                },
-                other => other,
-            };
+            let value = through_handle(value, shell)?;
             match value {
                 Value::Map(entries) => map_lookup(&entries, name),
                 _ => runtime_error(format!("member access .{name} requires a map")),
@@ -2384,6 +2391,7 @@ fn eval_expr(
             let Some(value) = eval_operand(value, last, in_function, shell)? else {
                 return Ok(control_placeholder());
             };
+            let value = through_handle(value, shell)?;
             if let E::Range {
                 start,
                 end,

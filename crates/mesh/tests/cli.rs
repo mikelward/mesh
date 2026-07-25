@@ -2107,6 +2107,8 @@ fn a_handle_reads_the_same_however_it_arrives() {
     // only expansion knew about handles. So `$j.state` worked while `($j).state`
     // and a handle returned from a function did not — whether a handle could be
     // read depended on how it reached the `.`, not on what it was.
+    // Both access forms, since indexing and member access are separate arms and
+    // each needed teaching on its own.
     let out = run_with_input(
         "j = sh -c 'sleep 0.2; exit 6' &\na = ($j).state\nputs a=$a\nfunc ident(x) { return $x }\nb = ident($j).state\nputs b=$b\nsleep 0.5\nc = ($j).status\nputs c=$c\nd = ($sh.jobs[1]).state\nputs d=$d\n",
     );
@@ -2117,8 +2119,37 @@ fn a_handle_reads_the_same_however_it_arrives() {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    let indexed = run_with_input(
+        "j = sh -c 'sleep 0.2; exit 6' &\na = ($j)[\"state\"]\nputs a=$a\nfunc ident(x) { return $x }\nb = ident($j)[\"state\"]\nputs b=$b\nsleep 0.5\nc = ($j)[\"status\"]\nputs c=$c\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&indexed.stdout),
+        "a=running\nb=running\nc=6\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    // A value that genuinely cannot be indexed still says so.
+    let scalar = run_with_input("s = hello\nx = ($s)[\"k\"]\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&scalar.stderr).contains("cannot index a scalar value"),
+        "{:?}",
+        scalar.stderr
+    );
+
     // And a job that has left the table says so here too, rather than reporting
     // that a handle is not a map.
+    for access in [".status", "[\"status\"]"] {
+        let gone = run_with_input(&format!(
+            "j = sh -c 'exit 3' &\nwait $j\nx = ($j){access}\nputs after\n"
+        ));
+        assert!(
+            String::from_utf8_lossy(&gone.stderr).contains("job 1 is no longer in the job table"),
+            "{access}: {:?}",
+            gone.stderr
+        );
+        assert_eq!(String::from_utf8_lossy(&gone.stdout), "after\n", "{access}");
+    }
     let gone = run_with_input("j = sh -c 'exit 3' &\nwait $j\nx = ($j).status\nputs after\n");
     assert!(
         String::from_utf8_lossy(&gone.stderr).contains("job 1 is no longer in the job table"),
