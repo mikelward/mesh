@@ -10724,36 +10724,57 @@ fn the_smallest_integer_is_a_literal_like_any_other() {
     );
 }
 
-/// The fold is narrow on purpose: it claims a bare run of digits and nothing
-/// else, so the forms that are strings or variables keep the runtime negation
-/// that type-checks them, and a magnitude too large even with a sign keeps
-/// failing loudly rather than becoming a string. Double negation still resolves
-/// at runtime, since the outer operand is no longer a bare run of digits.
+/// Which forms the sign folds into, and which keep the runtime negation.
+///
+/// One row per form so a failure names the form rather than a position in a
+/// concatenated line. Every row here except the `i64::MIN` one was checked
+/// against the pre-fold binary and is unchanged by it.
 #[test]
-fn folding_the_sign_does_not_swallow_the_forms_that_are_not_literals() {
-    let out = run_with_input(
-        "n = 5\n\
-         a = -$n\n\
-         b = - -5\n\
-         e = -(-5)\n\
-         c = 3 - 5\n\
-         d = -0\n\
-         puts $a $b $c $d $e\n",
-    );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "-5 5 -2 0 5\n");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+fn folding_the_sign_claims_literals_and_nothing_else() {
+    for (source, expected) in [
+        // Folded: a bare magnitude that fits. The third is the whole reason the
+        // fold exists — it has no positive counterpart to negate.
+        ("x = -5", "-5"),
+        ("x = -0", "0"),
+        ("x = -9223372036854775808", "-9223372036854775808"),
+        ("x = 9223372036854775807", "9223372036854775807"),
+        // Not folded: the operand is not a bare literal, so the negation stays
+        // and happens at runtime — same answer, different route.
+        ("n = 5\nx = -$n", "-5"),
+        // Double negation folds only the inner sign; the outer operand is then
+        // signed rather than bare, so it negates at runtime as it always did.
+        ("x = - -5", "5"),
+        ("x = -(-5)", "5"),
+        // Not a negation at all: `-abc` and `--5` each lex as one bare word, so
+        // the fold never sees them, and a `-` between two operands is
+        // subtraction.
+        ("x = -abc", "-abc"),
+        ("x = --5", "--5"),
+        ("x = 3 - 5", "-2"),
+    ] {
+        let out = run_with_input(&format!("{source}\nputs $x\n"));
+        assert!(
+            out.status.success(),
+            "{source:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{expected}\n"),
+            "{source:?}"
+        );
+    }
 
-    // Past `i64::MIN` there is no literal to fold into, so this stays a negation
-    // over a word that is not an integer — a loud error, not the string "-9…".
-    let overflow = run_with_input("x = -99999999999999999999\nputs $x\n");
-    assert!(!overflow.status.success());
-    assert!(
-        String::from_utf8_lossy(&overflow.stderr).contains("expected integer"),
-        "got {}",
-        String::from_utf8_lossy(&overflow.stderr)
-    );
+    // Nothing to fold into, so these stay negations over operands that are not
+    // integers — a loud error rather than a quiet string. A quoted `5` is a
+    // string on purpose; past the range there is no literal in reach.
+    for source in ["x = -\"5\"", "x = -99999999999999999999"] {
+        let out = run_with_input(&format!("{source}\nputs $x\n"));
+        assert!(!out.status.success(), "{source:?} should have failed");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("expected integer"),
+            "{source:?} gave {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
