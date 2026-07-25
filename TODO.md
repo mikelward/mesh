@@ -395,6 +395,26 @@ file as tasks land.
       job leaves the previous is promoted and the job behind it fills `%-`. An
       id still wins over a prefix, so `%1` is job 1. Deferred with a message that
       names it: `%?string`, the substring match `DESIGN.md` also defers.
+- [ ] **Learn about job state changes from `SIGCHLD` rather than by polling.**
+      The table is refreshed by *polling*: `info` and `reap` ask `waitpid` what
+      has changed since they last looked, which is why job state is only ever as
+      fresh as the last command boundary and why several changes noticed in one
+      pass arrive without an order between them. A handler that fires on
+      `SIGCHLD` and records each transition as it happens is what bash does, and
+      is the shape that fixes the class rather than its symptoms.
+      What it would buy, beyond the stop-ordering entry below: a `[1] Done` notice
+      at the moment a job finishes rather than at the next prompt, `$sh.jobs`
+      that is current without something having to read it, and the `jobdone` hook
+      `DESIGN.md` reserves — which cannot be honest while nothing knows a job is
+      done until asked.
+      What makes it a real change rather than a swap: the poll's contract is that
+      *looking never changes what the shell does*, and a handler mutating the
+      table breaks the single-threaded assumption that contract rests on, so the
+      handler can only record (async-signal-safe) and let the loop drain it. It
+      must also not consume a notification a foreground `wait_outcomes` is about
+      to want — the same hazard that rules out a central
+      `waitpid(-1, WNOHANG | WUNTRACED)` drain today — so reaping has to move
+      behind one owner rather than being done wherever it is convenient.
 - [ ] **Stops noticed together are ordered by the table, not by when they
       happened.** `info` and `reap` learn about stops by *polling*: a pass finds
       "these jobs are stopped now" and marks each current, in the order the table
