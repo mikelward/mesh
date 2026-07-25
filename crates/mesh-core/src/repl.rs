@@ -1007,7 +1007,7 @@ fn run_executable(
         } => run_ast_for(bindings, iterable, body, last, in_function, shell),
         While { condition, body } => run_ast_while(Some(condition), body, last, in_function, shell),
         Loop { body } => run_ast_while(None, body, last, in_function, shell),
-        Fork { body } => run_forked_block(body, last, in_function, shell),
+        Fork { body } => run_forked_block(body, in_function, shell),
         Control { kind, value, guard } => {
             match guard_allows(guard.as_ref(), last, in_function, shell) {
                 Ok(true) => {}
@@ -1412,7 +1412,7 @@ fn run_ast_for(
 /// child, so its status arrives here as an ordinary result instead of ending the
 /// shell. Only bytes cross back, as `DESIGN.md` says of a subshell — the child's
 /// stdout is the shell's, so what it prints appears, but no value returns.
-fn run_forked_block(body: &parser::Source, last: u8, in_function: bool, shell: &mut Shell) -> Step {
+fn run_forked_block(body: &parser::Source, in_function: bool, shell: &mut Shell) -> Step {
     // A subshell is a status, never a value: nothing typed survives the process
     // boundary, so whatever the surrounding code had produced is not passed off
     // as this block's own.
@@ -1424,7 +1424,10 @@ fn run_forked_block(body: &parser::Source, last: u8, in_function: bool, shell: &
         // reports every running job as finished — and `$sh.jobs` keeps the
         // snapshot it inherited. The same flag a forked pipeline stage sets.
         shell.forked = true;
-        match run_source(body, last, in_function, shell) {
+        // Seeded at 0, as every other compound body is. A subshell is a fresh
+        // boundary: `false; fork { }` reporting 1 would carry a failure from
+        // outside it across the very edge the construct exists to draw.
+        match run_source(body, 0, in_function, shell) {
             Step::Continue(code) | Step::Exit(code) => code,
             // A `return` that reached the top of a subshell body has no caller
             // left inside it; its value's status is what the child exits with.

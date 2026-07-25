@@ -1163,7 +1163,15 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 
-    let shell_modes = if interactive { terminal_modes() } else { None };
+    // Job control belongs to the process that *owns* it. A `fork` inside an
+    // already-forked stage — `func f() { fork { … } }` backgrounded with `f &` —
+    // still reports an interactive session, but that process is not the shell:
+    // taking the terminal there hands it to a background job's group, and once
+    // that job exits the real shell no longer owns it and the prompt stops
+    // reading. `in_forked_stage` is the existing answer to "am I the shell", so
+    // it is asked here rather than trusted to every caller.
+    let job_control = interactive && !in_forked_stage();
+    let shell_modes = if job_control { terminal_modes() } else { None };
 
     // SAFETY: fork has no arguments. The child runs `body` and leaves via
     // `_exit`, so it never unwinds back through the parent's stack or runs a
@@ -1184,7 +1192,7 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
         // caller's signal dispositions through untouched: a batch runner that
         // launches a script with `SIGINT` ignored means it to stay ignored, and
         // entering a `fork` block is not a reason to change the contract.
-        if interactive {
+        if job_control {
             // SAFETY: scalar arguments; this is the child, so 0 means itself.
             unsafe { libc::setpgid(0, 0) };
             // An interactive shell ignores the terminal signals so Ctrl-C reaches
@@ -1212,7 +1220,7 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
     // does nothing rather than losing one.
     // Set from the parent as well as the child, so neither side races the other
     // into needing the group that is not there yet.
-    if interactive {
+    if job_control {
         // SAFETY: scalar arguments naming this process's own child.
         unsafe { libc::setpgid(pid, pid) };
     }
@@ -1229,9 +1237,9 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
         // subshell exited.
         // SAFETY: scalar arguments. Negating a pid names its process group,
         // which exists only when this fork made one.
-        unsafe { libc::kill(if interactive { -pid } else { pid }, libc::SIGCONT) };
+        unsafe { libc::kill(if job_control { -pid } else { pid }, libc::SIGCONT) };
     };
-    if interactive {
+    if job_control {
         reclaim_terminal(shell_modes.as_ref());
     }
     Ok(status)
