@@ -91,17 +91,12 @@ pub struct JobTable {
     next_id: usize,
     /// Job ids, most recently current first: `%+` is the head and `%-` the one
     /// behind it. A job moves to the head when it is registered, when it stops,
-    /// and when `bg` starts it again — the events that make it the one you most
-    /// likely mean.
+    /// and when `bg` starts it again.
     ///
-    /// The **whole** order is kept rather than just those two, because the pair
-    /// alone cannot survive the head leaving: promoting `%-` needs a third job
-    /// to fill the slot it vacates, and once `bg` or a stop has moved something
-    /// forward, registration order is no longer the answer. `bg 2`, `bg 1`,
-    /// `bg 3` over four jobs leaves recency `3 1 2 4`, where reconstructing from
-    /// the table gave job 4 rather than job 2.
-    ///
-    /// Ids rather than indices, so removing a job cannot silently repoint them.
+    /// The whole order is kept, not just those two, because promoting `%-` needs
+    /// a third job to fill the slot it vacates — and registration order cannot
+    /// supply it once `bg` or a stop has moved a job forward. Ids rather than
+    /// indices, so removing a job cannot silently repoint them.
     recency: Vec<usize>,
 }
 
