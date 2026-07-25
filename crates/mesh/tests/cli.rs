@@ -1767,11 +1767,7 @@ fn pty_wait_for_prompt(master: std::os::fd::RawFd) -> bool {
 }
 
 fn pty_read_until_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
-    let prompt = pty_read_until_any_prompt(master)?;
-    prompt
-        .windows(5)
-        .any(|part| part == b"mesh$")
-        .then_some(prompt)
+    pty_read_until_one_of(master, &[b"mesh$"])
 }
 
 /// Read from the PTY until `marker` appears, answering cursor-position queries so
@@ -1818,17 +1814,42 @@ fn pty_wait_for_marker(master: std::os::fd::RawFd, marker: &[u8]) -> bool {
 /// has genuinely gone quiet is caught as quickly as before; only a stream that
 /// keeps delivering gets the extra reads.
 fn pty_read_until_any_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
+    pty_read_until_one_of(master, &[b"mesh$", b"mesh!"])
+}
+
+/// Read until one of `accept` appears, answering cursor-position queries so
+/// reedline keeps going, then drain briefly for whatever trails it.
+///
+/// Which prompts count has to be the *caller's* choice rather than a check it
+/// applies afterwards. Waiting for any prompt and then testing for `mesh$`
+/// stopped at the first prompt of either kind, and a failing command leaves
+/// `mesh!` on the screen for reedline to repaint while the next line is typed —
+/// so the read returned this, having never waited for the `mesh$` it was after:
+///
+/// ```text
+/// puts recovered\r\nmesh: command not found: …\r\n…[1;1H…mesh! …
+/// ```
+///
+/// Bounded by wall clock, not by a count of reads: a prompt costs far more bytes
+/// than it looks, since reedline wraps it in cursor saves, clears and color
+/// resets, and a loaded machine returns the same bytes in more, smaller reads.
+/// The per-poll timeouts still fail fast, so a shell that has genuinely gone
+/// quiet is caught as quickly as before.
+fn pty_read_until_one_of(master: std::os::fd::RawFd, accept: &[&[u8]]) -> Option<Vec<u8>> {
     let mut ready = libc::pollfd {
         fd: master,
         events: libc::POLLIN,
         revents: 0,
     };
+    let seen = |bytes: &[u8]| {
+        accept
+            .iter()
+            .any(|want| bytes.windows(want.len()).any(|part| part == *want))
+    };
     let mut prompt = Vec::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
-        let found = prompt
-            .windows(5)
-            .any(|part| part == b"mesh$" || part == b"mesh!");
+        let found = seen(&prompt);
         let timeout = if found { 50 } else { 2_000 };
         if unsafe { libc::poll(&mut ready, 1, timeout) } <= 0 {
             return found.then_some(prompt);
@@ -1843,10 +1864,7 @@ fn pty_read_until_any_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
             unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
         }
     }
-    prompt
-        .windows(5)
-        .any(|part| part == b"mesh$" || part == b"mesh!")
-        .then_some(prompt)
+    seen(&prompt).then_some(prompt)
 }
 
 #[test]
