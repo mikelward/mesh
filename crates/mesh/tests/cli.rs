@@ -2333,6 +2333,59 @@ fn kill_leaves_the_signal_number_to_the_kernel() {
 }
 
 #[test]
+fn kill_cont_puts_the_job_back_to_running() {
+    // Continuing a job by hand is `bg` by another spelling, and the table has to
+    // agree. Nothing else notices a continue: the poll watches for exits and
+    // stops, so a job left marked stopped stayed that way — `jobs` kept saying
+    // `Stopped`, and `wait` handed back the cached stop status (147) while the
+    // job ran on to its real exit.
+    let out = run_with_input(
+        "sh -c 'kill -STOP $$; sleep 0.3; exit 5' &\nsleep 0.3\nkill -CONT %1\njobs\nwait 1\nputs waited=$sh.status\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[1] Running"), "{stdout}");
+    assert!(stdout.contains("waited=5"), "{stdout}");
+}
+
+#[test]
+fn a_map_cannot_forge_a_job_handle() {
+    // `m = [id: 1]` is ordinary data. Reading an `id` out of any map would make a
+    // handle forgeable, and signalling a job on the strength of a field name is
+    // exactly what having a distinct handle value is for.
+    let out = run_with_input("sleep 30 &\nm = [id: 1]\nkill $m\nputs forged=$sh.status\njobs\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("forged=1"), "{stdout}");
+    assert!(
+        stdout.contains("[1] Running"),
+        "the forged map signalled a job: {stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("kill: a map is not a job"),
+        "{:?}",
+        out.stderr
+    );
+
+    // The real thing still reaches the job, since the table publishes handles.
+    let real = run_with_input("sleep 30 &\nkill $sh.jobs[1]\nwait 1\nputs real=$sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&real.stdout), "real=143\n");
+}
+
+#[test]
+fn kill_knows_the_posix_signal_names() {
+    // The table used to hold a subset, so ordinary names were refused as
+    // invalid. These are POSIX, so every platform mesh builds for has them.
+    for name in ["TRAP", "BUS", "URG", "XCPU", "SYS", "SIGVTALRM"] {
+        let out = run_with_input(&format!("sleep 9 &\nkill -{name} %1\nputs after\n"));
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("invalid signal"),
+            "{name}: {:?}",
+            out.stderr
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{name}");
+    }
+}
+
+#[test]
 fn kill_reports_what_it_cannot_do() {
     for (line, needle) in [
         ("kill", "kill: expected a job or a pid"),
