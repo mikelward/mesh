@@ -3159,12 +3159,22 @@ impl Parser {
     /// `$xs[0 + 0] > 0`, each turning a value statement into a command that truncated
     /// a file. A command word cannot contain either, so this stops where one stops.
     fn command_word_end(&self) -> Option<usize> {
-        let word = self.tokens.get(self.position)?;
+        self.command_word_end_from(self.position)
+    }
+
+    /// [`command_word_end`](Self::command_word_end) measured from an arbitrary token
+    /// rather than the cursor, for the one operand that does not start at the cursor:
+    /// a **signed** numeral, whose sign is its own token and whose word therefore sits
+    /// one along. Hard-coding that offset instead skipped the modifier scan, so
+    /// `-1:repr:int < 0` looked at the `:` rather than the `<` and reached the command
+    /// parser while `1:repr:int > 0` compared.
+    fn command_word_end_from(&self, start: usize) -> Option<usize> {
+        let word = self.tokens.get(start)?;
         if !matches!(word.value, TokenKind::Word(_)) {
             return None;
         }
         let mut end = word.span.end;
-        let mut index = self.position + 1;
+        let mut index = start + 1;
         while let (Some(colon), Some(name)) = (self.tokens.get(index), self.tokens.get(index + 1)) {
             let attached = colon.span.start == end && name.span.start == colon.span.end;
             if !matches!(colon.value, TokenKind::Colon)
@@ -3236,7 +3246,12 @@ impl Parser {
         {
             return false;
         }
-        let after = self.position + 2;
+        // Where the *completed* operand ends, not where its first token does: a numeral
+        // carries attached `:modifier` suffixes like any other word, and the operator
+        // sits past them. `-1:repr:int < 0` otherwise looked at the `:`.
+        let Some(after) = self.command_word_end_from(self.position + 1) else {
+            return false;
+        };
         match self.tokens.get(after).map(|token| &token.value) {
             // `<` / `>` spell a redirect too, so attachment decides, exactly as it does
             // for an unsigned numeral.
@@ -4093,6 +4108,11 @@ mod tests {
             "42",
             "-1",
             "-9223372036854775808",
+            // Modifier chains on both signs: the operator sits past them, and the
+            // signed form reached it by a hard-coded offset that skipped the scan.
+            "1:repr",
+            "-1:repr",
+            "-1:repr:int",
         ] {
             for (source, expected_command) in [
                 (format!("{operand} > out"), false),

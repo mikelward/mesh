@@ -8508,6 +8508,30 @@ fn a_spaced_comparison_on_a_numeral_is_not_a_redirection() {
     );
     assert!(!dir.join("0").exists(), "a boundary comparison redirected");
 
+    // A numeral carries attached `:modifier` suffixes like any other word, and the
+    // operator sits past them. The signed form reached it by a hard-coded offset
+    // that skipped the modifier scan, so `-1:repr:int < 0` looked at the `:` while
+    // `1:repr:int > 0` beside it compared.
+    std::fs::write(
+        dir.join("run.mesh"),
+        "if -1:repr:int < 0 { puts neg-mod } else { puts wrong }\n\
+         if 1:repr:int > 0 { puts pos-mod } else { puts wrong }\n",
+    )
+    .unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "neg-mod\npos-mod\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!dir.join("0").exists(), "a modified comparison redirected");
+
     // And the attached spelling still redirects, so a numeral obeys attachment in
     // both directions rather than simply losing its command reading.
     std::fs::write(dir.join("run.mesh"), "42 >out.txt\n").unwrap();
