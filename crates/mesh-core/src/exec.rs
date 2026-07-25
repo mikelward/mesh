@@ -212,15 +212,22 @@ impl JobTable {
             note!("[{}] Done ({status}) {}", job.id, job.command);
             return status;
         }
-        let mut job = self.jobs.remove(index);
-        set_foreground_group(job.pgid);
+        // The job leaves the table only once the resume has actually taken.
+        // Removing it first meant a `SIGCONT` that did not land dropped it on
+        // the floor: gone from `jobs`, unreachable by a later `fg` or `wait`,
+        // never reaped or reported — and with `%+` / `%-` still holding its id,
+        // so both fell through to the one surviving job and aliased each other.
+        let job = &self.jobs[index];
+        let (pgid, shell_modes) = (job.pgid, job.shell_modes);
+        set_foreground_group(pgid);
         if let Some(modes) = &job.job_modes {
             restore_terminal_modes(modes);
         }
-        if signal_group(job.pgid, libc::SIGCONT, "fg").is_err() {
-            reclaim_terminal(job.shell_modes.as_ref());
+        if signal_group(pgid, libc::SIGCONT, "fg").is_err() {
+            reclaim_terminal(shell_modes.as_ref());
             return 1;
         }
+        let mut job = self.jobs.remove(index);
         job.state = JobState::Running;
         let result = wait_outcomes(&mut job.outcomes);
         let stopped_modes = matches!(result, WaitResult::Stopped(_))
