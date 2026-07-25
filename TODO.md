@@ -453,10 +453,28 @@ of each PR had landed by another route, but these pieces had not.
       form is that mesh's own literal syntax is the encoding: the child writes the
       value as the text you would have typed, on a pipe of its own, and the parent
       reads it back with the ordinary expression parser. What crosses is then
-      exactly what has a literal form. Missing: a value → literal writer with exact
-      quoting (`42` must not collide with `"42"`), and the temp-file fallback for a
-      value larger than a pipe buffer. Decide before `fork func`, since a value call
-      on one is the case that needs it.
+      exactly what has a literal form. **The writer has landed** as `:repr`, with
+      the quoting exact (`42` and `'42'` stay apart, as do `[]` and `[:]`) and the
+      formless types refused by name, so "what crosses" is settled and enforced in
+      one place. The temp-file fallback listed here turned out **not** to be
+      needed: that is `$( … )`'s two-pipe deadlock, and a value channel is one
+      pipe the parent can drain before it waits. What is left is the plumbing —
+      the pipe itself, a reader that parses exactly one literal (rather than
+      running arbitrary source through the statement evaluator), and
+      length-prefixing so a grandchild holding the write end open cannot hang the
+      read. Decide before `fork func`, since a value call on one is the case that
+      needs it.
+- [ ] **`i64::MIN` has no readable literal.** `x = -9223372036854775808` fails
+      with "expected integer" while `i64::MIN + 1` and `i64::MAX` both work: the
+      parser builds a negation over the magnitude `9223372036854775808`, which does
+      not fit an `i64`, so the operand is already a string by the time the sign
+      would apply (`parser.rs` `prefix`, `expand.rs` `typed_scalar`). The fix is to
+      fold the sign into the literal at parse time, as Rust itself does — which
+      changes how *every* negative literal parses, so it wants its own change
+      rather than riding along with one. Found by the `:repr` round-trip tests,
+      where it is the one value the writer can spell and the reader cannot take
+      back; pinned by `the_smallest_integer_writes_correctly_but_does_not_read_back_yet`
+      in `repl.rs`, which fails when this is fixed.
 - [ ] **The rest of `fork` isolation.** Two pieces of the `DESIGN.md` cluster are
       still open. **`fork func name(params) { … }`**, a func whose *body* is a
       subshell, needs a decision first: a subshell returns only bytes, so what does

@@ -3692,6 +3692,7 @@ const MODIFIER_NAMES: &[&str] = &[
     "replaceall",
     "replaceend",
     "replacestart",
+    "repr",
     "rest",
     "s",
     "same",

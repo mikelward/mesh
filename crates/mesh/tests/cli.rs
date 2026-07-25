@@ -10625,3 +10625,72 @@ fn a_fork_nested_in_a_background_stage_still_runs() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `:repr` writes a value back as the source you would have typed for it.
+///
+/// The exactness is the point rather than the prettiness: the pairs below are
+/// values that print identically under any ordinary display (`42` and `"42"`,
+/// `[]` and `[:]`) and have to come out distinguishable here.
+#[test]
+fn repr_writes_a_value_as_the_literal_you_would_have_typed() {
+    let out = run_with_input(
+        "m = [k: 1, 'a b': [2, true]]\n\
+         puts $m:repr\n\
+         x = 42\n\
+         s = \"42\"\n\
+         puts $x:repr $s:repr\n\
+         e = [:]\n\
+         l = []\n\
+         puts $e:repr $l:repr\n\
+         puts $m:keys:repr\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "['k': 1, 'a b': [2, true]]\n42 '42'\n[:] []\n['k', 'a b']\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A value with no literal form is refused by name rather than approximated.
+///
+/// An approximation is worse than an error here: whatever it printed would read
+/// back as a *different* value, which is exactly what `:repr` exists to rule out.
+#[test]
+fn repr_refuses_a_value_that_has_no_literal_form() {
+    let out = run_with_input("puts $sh.stdin:repr\n");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("a stream handle has no literal form"),
+        "got {stderr}"
+    );
+}
+
+/// Escaping is the inverse of the lexer's, so text that contains the quote, a
+/// backslash, or a control character survives being written and read again.
+#[test]
+fn repr_quotes_text_that_would_otherwise_not_read_back() {
+    let out = run_with_input(
+        "a = \"it's\"\n\
+         b = 'a$b'\n\
+         c = 'tab\there'\n\
+         puts $a:repr\n\
+         puts $b:repr\n\
+         puts $c:repr\n",
+    );
+    // `'…'` does not interpolate, so `$` needs no escape — that is why the
+    // writer chooses it over `\"…\"`.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "'it\\'s'\n'a$b'\n'tab\\there'\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

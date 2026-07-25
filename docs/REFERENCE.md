@@ -829,6 +829,7 @@ is literal text, so `$host:$port` is not mistaken for a modifier chain.
 | `:exec` / `:x` | list or path | Keep the executables (`test -x`). |
 | `:keys` | map | Keys as an insertion-ordered list. |
 | `:values` | map | Values as an insertion-ordered list. |
+| `:repr` | any value with a literal form | The value written as the mesh source you would have typed for it, as a string. |
 | `:split(SEP)` | string | Split on the literal separator into a list. |
 | `:join(SEP)` | list | Fold the list into a string, `SEP` between elements. |
 
@@ -849,6 +850,33 @@ is not there — the others answer `false`, but a missing file has no type word.
 Note that a searchable directory carries the execute bit, so `:exec` alone keeps
 directories; `:f:x` is the executable-files idiom. List results retain their type: use `...$xs:rest` in command position,
 or bind them directly with `ys = $xs:rest`.
+
+`:repr` is the odd one out: rather than transforming a value it **writes one
+down**, as the mesh source you would have typed to get it back.
+
+```mesh
+m = [k: 1, 'a b': [2, true]]
+puts $m:repr                  # ['k': 1, 'a b': [2, true]]
+x = 42
+s = "42"
+puts $x:repr $s:repr          # 42 '42'
+```
+
+The contract is round-trip rather than pretty-printing, and that is what the
+quoting is for: `42` and `"42"` are different values, so a string is always
+quoted even when it would read as a bare word, and the empty map keeps its own
+`[:]` spelling so it cannot come back as the empty list `[]`. It is the natural
+way to see what you actually have — `puts $m` on a map or list is an error,
+because a collection has no argv form.
+
+A value with **no** literal form is a loud error rather than an approximation
+that would read back as something else: a stream handle, a function, a glob
+(writing the pattern back would re-glob it), and for now a regex, whose flags
+ride on `:` modifiers that are not implemented yet.
+
+```mesh
+puts $sh.stdin:repr           # mesh: :repr: a stream handle has no literal form
+```
 
 A modifier that takes an argument writes it in parentheses, comma-separated like a
 value call: `$path:split(":")`, `$dirs:join(":")`. `:split(SEP)` turns a string into
