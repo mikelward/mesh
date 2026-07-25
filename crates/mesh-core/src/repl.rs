@@ -3992,12 +3992,18 @@ fn run_multi(stages: Vec<Stage>, background: bool, last: u8, shell: &mut Shell) 
             // words a job listing echoes back.
             (vec![name], StageBody::Function(args))
         } else {
-            let argv = match expand::expand(words, &shell.vars) {
-                Ok(argv) => argv,
-                Err(err) => {
+            // A stage expands its own words, so a job builtin needs the same
+            // handle-preserving conversion here as it gets elsewhere.
+            let expanded = match job_builtin_words(&words, &shell.vars) {
+                Some(words) => words,
+                None => expand::expand(words, &shell.vars).map_err(|err| {
                     note!("mesh: {err}");
-                    return Step::Continue(1);
-                }
+                    Step::Continue(1)
+                }),
+            };
+            let argv = match expanded {
+                Ok(argv) => argv,
+                Err(step) => return step,
             };
             if argv.is_empty() {
                 note!("mesh: empty command in a pipeline");
@@ -4273,65 +4279,73 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
     run_expanded(words, last, shell)
 }
 
-/// A job builtin's words, with its arguments expanded as **values** so a handle
-/// survives to name a job rather than meeting the argv rule that refuses it as
-/// bytes. `None` when this is not a job builtin.
+/// A job builtin's words, with any **handle** argument turned into the `%id`
+/// reference the builtin understands. `None` when this is not a job builtin.
 ///
-/// Shared by the plain and redirected command paths, which expand separately:
-/// `kill $j 2>/dev/null` has to mean what `kill $j` means, and routing only one
-/// of them through here left the redirected spelling reporting that the handle
-/// had no text form — before even opening the redirect, so the job survived.
+/// Each argument is expanded on its own, and only a handle takes the typed
+/// route: everything else keeps exactly the text ordinary expansion produces.
+/// That distinction is load-bearing, because a job builtin's options are not
+/// just data. Expanding them as values types `-0` as the integer `0` and drops
+/// the sign along with it, which turns `kill -0 $pid` — ask whether it is
+/// alive — into `kill 0 $pid`, and pid 0 is *the caller's own process group*.
+///
+/// Shared by every path that runs a command, since they expand separately:
+/// `kill $j`, `kill $j 2>/dev/null` and `kill $j | cat` have to agree.
 fn job_builtin_words(words: &[Word], vars: &Vars) -> Option<Result<Vec<String>, Step>> {
     let name = command_name(words, vars)?;
     if !matches!(name.as_str(), "fg" | "bg" | "wait" | "kill") {
         return None;
     }
-    let arguments: Vec<Word> = words.iter().skip(1).cloned().collect();
-    let values = match expand::expand_values(arguments, vars) {
-        Ok(values) => values,
-        Err(err) => {
-            note!("mesh: {err}");
-            return Some(Err(Step::Continue(1)));
+    let mut expanded = vec![name];
+    for word in words.iter().skip(1) {
+        match job_reference_word(word, vars, &expanded[0]) {
+            Ok(Some(reference)) => expanded.push(reference),
+            Ok(None) => match expand::expand(vec![word.clone()], vars) {
+                Ok(strings) => expanded.extend(strings),
+                Err(err) => {
+                    note!("mesh: {err}");
+                    return Some(Err(Step::Continue(1)));
+                }
+            },
+            Err(step) => return Some(Err(step)),
         }
-    };
-    Some(job_reference_words(values, &name).map(|references| {
-        let mut expanded = vec![name];
-        expanded.extend(references);
-        expanded
-    }))
+    }
+    Some(Ok(expanded))
 }
 
-/// The reference words a job builtin understands, from its evaluated arguments.
+/// The `%id` this word names, if it is a job handle; `None` leaves it to
+/// ordinary expansion.
 ///
 /// A handle becomes **`%id`** rather than a bare id on purpose: `fg 2` and
 /// `fg %2` mean the same job, but for `kill` a bare number is a *pid*, and `$j`
-/// must never be able to arrive as one. Everything else takes the ordinary argv
-/// rule, so `%+`, `-9` and a literal pid pass straight through.
-fn job_reference_words(values: Vec<Value>, name: &str) -> Result<Vec<String>, Step> {
-    let mut words = Vec::new();
-    for value in values {
-        match value {
-            Value::Job(id) => words.push(format!("%{id}")),
-            // `DESIGN.md` makes `$sh.jobs[2]` a handle as well. Its record
-            // carries the id that the map key holds for the table's own reads.
-            Value::Map(entries) => {
-                let id = entries
-                    .iter()
-                    .find_map(|(key, value)| match (key.as_str(), value) {
-                        ("id", Value::Integer(id)) => Some(*id),
-                        _ => None,
-                    });
-                match id {
-                    Some(id) => words.push(format!("%{id}")),
-                    None => {
-                        return runtime_error(format!("{name}: a map is not a job"));
-                    }
-                }
+/// must never be able to arrive as one.
+fn job_reference_word(word: &Word, vars: &Vars, name: &str) -> Result<Option<String>, Step> {
+    let Ok(values) = expand::expand_values(vec![word.clone()], vars) else {
+        // Whatever is wrong with it, ordinary expansion reports it below in the
+        // terms the rest of the shell uses.
+        return Ok(None);
+    };
+    let [value] = values.as_slice() else {
+        return Ok(None);
+    };
+    match value {
+        Value::Job(id) => Ok(Some(format!("%{id}"))),
+        // `DESIGN.md` makes `$sh.jobs[2]` a handle as well; a map that is not a
+        // job record has no business being read for one.
+        Value::Map(entries) => {
+            let id = entries
+                .iter()
+                .find_map(|(key, value)| match (key.as_str(), value) {
+                    ("id", Value::Integer(id)) => Some(*id),
+                    _ => None,
+                });
+            match id {
+                Some(id) => Ok(Some(format!("%{id}"))),
+                None => runtime_error(format!("{name}: a map is not a job")),
             }
-            other => words.extend(argv_words(&other, name)?),
         }
+        _ => Ok(None),
     }
-    Ok(words)
 }
 
 /// Run a command whose words are already expanded: `return`, generated help, the
@@ -4365,7 +4379,11 @@ fn run_expanded(words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     // on them or hand them the terminal — the same answer bash gives in a
     // subshell.
     let job_status = match words[0].as_str() {
-        "fg" | "bg" | "wait" | "kill" if shell.forked => {
+        // `kill` is deliberately absent: it neither waits nor touches the
+        // terminal, and signalling needs permission rather than parenthood, so a
+        // forked stage can do it with the table it inherited — `kill %1 | cat`
+        // works as bash's does.
+        "fg" | "bg" | "wait" if shell.forked => {
             note!("mesh: {}: no job control in a pipeline stage", words[0]);
             Some(1)
         }
