@@ -3526,6 +3526,183 @@ fn a_lambda_is_a_value_called_through_its_variable() {
 }
 
 #[test]
+fn the_higher_order_modifiers_apply_a_callable_per_element() {
+    // `:map` / `:filter` / `:each` are what lambdas are for (`DESIGN.md`). Each takes
+    // one callable and applies it to every element; they chain with the ordinary
+    // modifiers, and the callable can arrive through a variable just as well as
+    // written inline.
+    let out = run_with_input(
+        "xs = [1 2 3 4]\n\
+         doubled = $xs:map(func(x) { $x * 2 })\n\
+         evens = $xs:filter(func(x) { $x % 2 == 0 })\n\
+         fs = [\"a.txt\" \"b.md\" \"c.txt\"]\n\
+         stems = $fs:filter(func(f) { $f:ext == txt }):map(func(f) { $f:stem })\n\
+         twice = func(n) { $n * 2 }\n\
+         through = [5]:map($twice)\n\
+         puts ...$doubled\n\
+         puts ...$evens\n\
+         puts ...$stems\n\
+         puts ...$through\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "2 4 6 8\n2 4\na c\n10\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // `:each` runs for effect, in order, and yields mesh's "nothing" rather than the
+    // list — so a chain cannot read side-effecting code as a transform.
+    let each = run_with_input("r = [a b]:each(func(x) { puts got-$x })\nputs \"[$r]\"\n");
+    assert_eq!(String::from_utf8_lossy(&each.stdout), "got-a\ngot-b\n[]\n");
+
+    // An empty list is not a special case.
+    let empty = run_with_input("ys = []:map(func(x) { $x })\nputs $ys:len\n");
+    assert_eq!(String::from_utf8_lossy(&empty.stdout), "0\n");
+
+    // Elements keep their types: a list element arrives as a list, not a rendering.
+    let nested = run_with_input(
+        "xss = [[1 2] [3]]\n\
+         lens = $xss:map(func(l) { $l:len })\n\
+         kept = $xss:filter(func(l) { $l:len == 2 })\n\
+         puts ...$lens\n\
+         puts \"$kept:len $kept[0]:len\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&nested.stdout), "2 1\n1 2\n");
+}
+
+#[test]
+fn a_filter_predicate_must_answer_with_a_boolean() {
+    // mesh's truthiness is the *shell's* — an integer is true when it is zero — so
+    // reading a predicate loosely would make `:filter(func(x) { $x })` keep the
+    // zeros, and a transform used as a predicate (`:filter(:dir)`, once a bare
+    // modifier reference is callable) keep everything, since a dirname is always a
+    // non-empty string. `DESIGN.md` raises that footgun as an open question and
+    // leans loud; requiring `true`/`false` makes it unreachable.
+    for (predicate, kind) in [
+        ("func(x) { $x }", "an integer"),
+        ("func(x) { \"yes\" }", "a string"),
+        ("func(x) { [1] }", "a list"),
+    ] {
+        let out = run_with_input(&format!(
+            "xs = [1 2]\nys = $xs:filter({predicate})\nputs after\n"
+        ));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "modifier :filter predicate must return a boolean, got {kind}"
+            )),
+            "{predicate}: {stderr:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    }
+}
+
+#[test]
+fn a_higher_order_callable_behaves_like_any_other_call() {
+    // The point of routing these through the same machinery a written call uses: a
+    // `return`, an arity mismatch, a runtime error, an escaped `break`, and an
+    // `exit` all behave exactly as they do in `f(x)`.
+    let returned = run_with_input("ys = [1 2]:map(func(x) { return $x * 10 })\nputs ...$ys\n");
+    assert_eq!(String::from_utf8_lossy(&returned.stdout), "10 20\n");
+
+    for (src, needle) in [
+        // Arity is checked per element, naming the modifier that made the call.
+        ("ys = [1 2]:map(func(a, b) { $a })\n", "expected 2 argument"),
+        // A runtime error inside fails the statement rather than yielding a value.
+        ("ys = [1]:map(func(x) { $x + $nope })\n", "unbound variable"),
+        // A `break` with no loop of its own is reported and fails the call.
+        ("ys = [1]:map(func(x) { break })\n", "not inside a loop"),
+        // The argument has to be callable at all.
+        (
+            "ys = [1]:map(5)\n",
+            "argument must be a function, got an integer",
+        ),
+        // And the subject has to be a list, with the fix pointed at.
+        (
+            "m = [a: 1]\nys = $m:map(func(x) { $x })\n",
+            "requires a list; for a map use `:keys` or `:values` first",
+        ),
+        // Written bare, they report the missing argument rather than claiming to be
+        // unimplemented — they are classified as argument-taking alongside
+        // `:split` / `:join`.
+        ("ys = [1 2]:map\n", "modifier :map requires an argument"),
+        (
+            "ys = [1 2]:filter\n",
+            "modifier :filter requires an argument",
+        ),
+        ("ys = [1 2]:each\n", "modifier :each requires an argument"),
+    ] {
+        let out = run_with_input(&format!("{src}puts after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{src:?}: {stderr:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{src:?}");
+    }
+
+    // `exit` leaves the shell from inside a callable, as it does anywhere.
+    let exited = run_with_input("[1 2]:each(func(x) { exit 5 })\nputs unreachable\n");
+    assert_eq!(exited.status.code(), Some(5));
+    assert!(exited.stdout.is_empty(), "{:?}", exited.stdout);
+
+    // Loop state is the callee's: a `break` inside the callable does not escape into
+    // the loop the caller is running.
+    let looped = run_with_input(
+        "for i in [1 2] {\n  ys = [9]:map(func(x) { break })\n  puts iter-$i\n}\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&looped.stdout),
+        "iter-1\niter-2\ndone\n"
+    );
+
+    // And scope is a lambda's: globals yes, the enclosing function's locals no.
+    let scoped = run_with_input(
+        "g = 10\nfunc outer() { n = 2\n  return [1]:map(func(x) { $x * $g })\n}\n\
+         ys = outer()\nputs ...$ys\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&scoped.stdout), "10\n");
+}
+
+#[test]
+fn a_modifier_argument_that_raises_loop_control_does_not_become_the_argument() {
+    // An argument is an *operand*, so it can raise `break`/`continue`. An unwinding
+    // `eval_expr` hands back a placeholder empty string; type-checking that reads it
+    // as the argument and reports a type error instead of leaving the loop. `:split`
+    // was worse than a wrong type name — an empty separator has its own rule, so the
+    // `break` surfaced as "separator must not be empty".
+    for (subject, argument) in [
+        // The higher-order modifiers, added here.
+        ("[9]", ":map(if $i == 2 { break } else { func(x) { $x } })"),
+        // And the pre-existing string-argument ones, which had the same hole.
+        ("\"a b\"", ":split(if $i == 2 { break } else { \" \" })"),
+    ] {
+        let out = run_with_input(&format!(
+            "for i in [1 2 3] {{\n  puts before-$i\n  ys = {subject}{argument}\n  puts after-$i\n}}\nputs done\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "before-1\nafter-1\nbefore-2\ndone\n",
+            "{argument}: the break should leave the loop"
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "{argument}: no diagnostic: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // `continue` is told apart from `break`: iteration 2 is skipped, 3 still runs.
+    let continued = run_with_input(
+        "for i in [1 2 3] {\n  puts before-$i\n  \
+         ys = [9]:map(if $i == 2 { continue } else { func(x) { $x } })\n  \
+         puts after-$i\n}\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&continued.stdout),
+        "before-1\nafter-1\nbefore-2\nbefore-3\nafter-3\ndone\n"
+    );
+    assert!(continued.stderr.is_empty(), "{:?}", continued.stderr);
+}
+
+#[test]
 fn a_lambda_travels_as_a_value() {
     // Being a value is the point: a lambda passes to a function, which calls it
     // through the parameter it arrived in; it survives inside a list or a map and

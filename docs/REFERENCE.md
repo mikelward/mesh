@@ -747,8 +747,35 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
     just as an uncaptured value call does, and the diagnostic is reported on the
     shell's stderr rather than disappearing into a record.
 
-Not yet supported: the higher-order modifiers that give lambdas their main use
-(`:map` / `:filter` / `:each`), including a bare `:mod` reference as a callable;
+- **The higher-order modifiers.** `:map`, `:filter`, and `:each` each take one
+  **callable** and apply it to every element of a list — written inline, or reached
+  through a variable:
+
+  ```
+  xs = [1 2 3 4]
+  doubled = $xs:map(func(x) { $x * 2 })          # [2 4 6 8]
+  evens   = $xs:filter(func(x) { $x % 2 == 0 })  # [2 4]
+  $xs:each(func(x) { puts $x })                  # for effect
+
+  fs = ["a.txt" "b.md" "c.txt"]
+  stems = $fs:filter(func(f) { $f:ext == txt }):map(func(f) { $f:stem })
+  ```
+
+  - **The call is an ordinary call.** They go through the same machinery `f(x)`
+    does, so `return`, an arity mismatch, a runtime error, an escaped `break`, and
+    `exit` behave exactly as they would in a written call — including loop-state
+    isolation, so a `break` inside the callable does not escape into a loop the
+    caller is running.
+  - **`:filter` requires a boolean.** Not a truthy value: mesh's truthiness is the
+    shell's, where an integer is true when it is *zero*, so a loose reading would
+    make `:filter(func(x) { $x })` keep the zeros. A predicate that must say `true`
+    or `false` cannot fall into that.
+  - **`:each` yields the empty string**, mesh's "nothing produced" — not the list —
+    so a chain cannot silently read side-effecting code as a transform.
+  - **A list subject only.** On a map they are a loud error pointing at `:keys` or
+    `:values`; elements keep their types, so a list element arrives as a list.
+
+Not yet supported: a bare `:mod` reference as a callable (`$files:filter(:exec)`);
 and the richer `:capture` fields `DESIGN.md` leaves open (timing, a `pipestatus`
 list). `.out`/`.err` are strings rather than true byte-strings — mesh has no
 byte-string type yet, so a capture that is not valid UTF-8 is a loud error.

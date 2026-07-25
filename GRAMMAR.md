@@ -358,6 +358,20 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
   with **no text form** — a command argument, an interpolation, or `$env.*`
   refuses it — and equality is **identity**, so a copied binding is the same
   function and a separately written twin is not.
+- **The higher-order modifiers.** `:map`, `:filter`, and `:each` each take one
+  **callable** — a lambda, or a function value reached through a variable — and
+  apply it to every element of a list: `$xs:map(func(x) { $x * 2 })`. They chain
+  with the ordinary modifiers. The call goes through the same machinery a written
+  call uses, so `return`, an arity mismatch, a runtime error, an escaped `break`,
+  and `exit` behave exactly as they do in `f(x)` — loop state included, so a
+  `break` inside the callable does not escape into the caller's loop.
+  `:filter` requires the predicate to answer with a **boolean**, not a truthy
+  value: mesh's truthiness is the shell's, where an integer is true when it is
+  *zero*, so a loose reading would keep the zeros (and, once a bare `:mod` is
+  callable, make `:filter(:dir)` keep everything). `:each` yields the empty
+  string — mesh's "nothing produced" — rather than the list, so a chain cannot
+  read side-effecting code as a transform. The subject must be a **list**; a map
+  is a loud error pointing at `:keys` / `:values`.
 - **`:capture`.** `f(…):capture` runs the call and yields a **record of every
   channel**: `.value`, `.out`, `.err`, `.status`. It is an *invocation-level*
   modifier, recognized on the call before the call runs — a value modifier would

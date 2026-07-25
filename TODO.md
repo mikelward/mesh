@@ -161,9 +161,15 @@ file as tasks land.
       value, value-called through the variable it is bound to (`$double(5)`),
       reusing the whole signature grammar. Scope is a `func`'s: parameters and
       globals, with no capture of the enclosing function's locals. A function
-      value has no text form and compares by identity. Deferred: the
-      higher-order modifiers that give lambdas their main use (`:map` /
-      `:filter` / `:each`), and a bare `:mod` reference as a callable.
+      value has no text form and compares by identity. Deferred: a bare `:mod`
+      reference as a callable.
+- [x] The higher-order modifiers `:map` / `:filter` / `:each`, each taking one
+      callable and applying it per element, through the same call machinery a
+      written call uses — so `return`, arity, a runtime error, an escaped
+      `break`, and `exit` all behave identically. `:filter` requires a
+      **boolean**, which settles the transform-as-predicate footgun `DESIGN.md`
+      raises as open; `:each` yields the empty string, not the list. A list
+      subject only: a map is a loud error pointing at `:keys` / `:values`.
 - [x] `f(…):capture` — the channel record (`.value` / `.out` / `.err` /
       `.status`), as an invocation-level modifier that wraps execution, including
       on an external (minus `.value`, positional arguments only). `.out`/`.err`

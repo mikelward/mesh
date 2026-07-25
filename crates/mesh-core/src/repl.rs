@@ -2034,11 +2034,11 @@ fn eval_call(
 /// give a clearer error when such a modifier is written bare (`:split` without
 /// arguments) rather than the generic "not implemented yet".
 fn modifier_takes_arguments(name: &str) -> bool {
-    matches!(name, "join" | "split")
+    matches!(name, "join" | "split" | "map" | "filter" | "each")
 }
 
 /// Evaluate a modifier that carries a parenthesized argument list (`:split(SEP)`,
-/// `:join(SEP)`). The argument-free set is handled by [`expand::apply_modifier`].
+/// `:map(f)`). The argument-free set is handled by [`expand::apply_modifier`].
 fn eval_modifier_with_arguments(
     name: &str,
     value: Value,
@@ -2049,13 +2049,86 @@ fn eval_modifier_with_arguments(
 ) -> Result<Value, Step> {
     match name {
         "split" | "join" => {
-            let separator = single_string_argument(name, arguments, last, in_function, shell)?;
+            let Some(separator) =
+                single_string_argument(name, arguments, last, in_function, shell)?
+            else {
+                return Ok(control_placeholder());
+            };
             let result = if name == "split" {
                 expand::split_value(value, &separator)
             } else {
                 expand::join_value(value, &separator)
             };
             result.map_err(runtime_message)
+        }
+        // The higher-order modifiers. Each takes one **callable** — a lambda, or a
+        // named function reached through a variable — and applies it per element.
+        // They are the reason lambdas exist (`DESIGN.md` §"Calling for a value, and
+        // lambdas"), and they go through the same call machinery a written call
+        // does, so a `return`, a bad arity, or an `exit` inside the callable behaves
+        // exactly as it would anywhere else.
+        "map" | "filter" | "each" => {
+            let Some(callable) =
+                single_callable_argument(name, arguments, last, in_function, shell)?
+            else {
+                return Ok(control_placeholder());
+            };
+            let Value::List(elements) = value else {
+                return runtime_error(format!(
+                    "modifier :{name} requires a list; for a map use `:keys` or `:values` first"
+                ));
+            };
+            // Named once, not per element: the label only reaches a diagnostic.
+            let label = format!(":{name}");
+            // `:each` never pushes, so it reserves nothing: holding a second
+            // list-sized allocation for a vector that is discarded would double the
+            // peak for the one modifier that produces no list.
+            let mut mapped = Vec::with_capacity(if name == "each" { 0 } else { elements.len() });
+            for element in elements {
+                match name {
+                    // The element is handed over, not copied: `:map` and `:each` have
+                    // no use for it afterwards, and a nested collection would be a
+                    // deep clone per iteration. Only `:filter` keeps it, because it
+                    // is the thing being kept.
+                    "map" => {
+                        mapped.push(call_callable_for_value(&label, &callable, element, shell)?);
+                    }
+                    "filter" => {
+                        let produced =
+                            call_callable_for_value(&label, &callable, element.clone(), shell)?;
+                        // A **boolean**, not a truthy value. mesh's truthiness is the
+                        // shell's — an integer is true when it is *zero* — so reading
+                        // a predicate loosely would make `:filter(func(x) { $x })`
+                        // keep the zeros, and `:filter(:dir)` keep everything, since
+                        // a dirname is always a non-empty string. `DESIGN.md` raises
+                        // exactly that footgun as an open question and leans loud; a
+                        // predicate that must say `true` or `false` cannot fall into
+                        // it.
+                        match produced {
+                            Value::Boolean(true) => mapped.push(element),
+                            Value::Boolean(false) => {}
+                            other => {
+                                return runtime_error(format!(
+                                    "modifier :filter predicate must return a boolean, got {}",
+                                    value_kind(&other)
+                                ));
+                            }
+                        }
+                    }
+                    // `:each` runs for effect. Its result is the empty string —
+                    // mesh's "nothing produced", the same answer an empty function
+                    // body gives — rather than the list, so a chain cannot silently
+                    // read side-effecting code as a transform.
+                    _ => {
+                        call_callable_for_value(&label, &callable, element, shell)?;
+                    }
+                }
+            }
+            Ok(match name {
+                "map" => Value::List(mapped),
+                "filter" => Value::List(mapped),
+                _ => Value::String(String::new()),
+            })
         }
         _ if expand::Modifier::from_name(name).is_some() => {
             runtime_error(format!("modifier :{name} does not take arguments"))
@@ -2066,19 +2139,68 @@ fn eval_modifier_with_arguments(
     }
 }
 
+/// Evaluate a modifier's single positional argument and require it to be callable.
+/// `None` means the argument raised `break`/`continue`: the caller stops rather than
+/// type-checking a value that was never produced. Without that, the placeholder an
+/// unwinding `eval_expr` returns is read as the argument itself and reported as a
+/// type error — hiding the control flow behind a diagnostic about a string.
+fn single_callable_argument(
+    name: &str,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Option<vars::FuncValue>, Step> {
+    let [parser::Argument::Positional(expression)] = arguments else {
+        return runtime_error(format!("modifier :{name} takes exactly one argument"));
+    };
+    let Some(value) = eval_operand(expression, last, in_function, shell)? else {
+        return Ok(None);
+    };
+    match value {
+        Value::Function(function) => Ok(Some(function)),
+        other => runtime_error(format!(
+            "modifier :{name} argument must be a function, got {}",
+            value_kind(&other)
+        )),
+    }
+}
+
+/// How to name a value's type in a diagnostic.
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) => "a string",
+        Value::Integer(_) => "an integer",
+        Value::Boolean(_) => "a boolean",
+        Value::List(_) => "a list",
+        Value::Map(_) => "a map",
+        Value::Regex(_) => "a regex",
+        Value::Glob(_) => "a glob",
+        Value::Function(_) => "a function",
+    }
+}
+
 /// Evaluate a modifier's single positional argument and require it to be a string.
+///
+/// `None` for pending control flow, as in [`single_callable_argument`]. Reading the
+/// placeholder as the argument was worse here than a wrong type name: an empty
+/// separator has its own rule, so `"a b":split(if c { break })` reported
+/// "separator must not be empty" and buried the `break` entirely.
 fn single_string_argument(
     name: &str,
     arguments: &[parser::Argument],
     last: u8,
     in_function: bool,
     shell: &mut Shell,
-) -> Result<String, Step> {
+) -> Result<Option<String>, Step> {
     let [parser::Argument::Positional(expression)] = arguments else {
         return runtime_error(format!("modifier :{name} takes exactly one argument"));
     };
-    match eval_expr(expression, last, in_function, shell)? {
-        Value::String(value) => Ok(value),
+    let Some(value) = eval_operand(expression, last, in_function, shell)? else {
+        return Ok(None);
+    };
+    match value {
+        Value::String(value) => Ok(Some(value)),
         _ => runtime_error(format!("modifier :{name} argument must be a string")),
     }
 }
@@ -3573,6 +3695,33 @@ fn call_signature_for_value(
         }
     };
 
+    run_call_body_for_value(
+        body,
+        caller_result,
+        caller_produced,
+        |shell| bind_scanned(name, params, positionals, switches_on, flag_values, shell),
+        shell,
+    )
+}
+
+/// The **callee half** of a value-mode call: a fresh scope, the binding, the body,
+/// and the outcome mapped to a value — with the caller's loop state and result put
+/// back on every path out.
+///
+/// `bind` is the only thing that differs between call shapes, which is why it is a
+/// parameter rather than two copies of this: a source-level call arrives with its
+/// arguments already scanned from syntax, while a **synthesized** one — a
+/// higher-order modifier handing a list element to a callable — arrives with a
+/// value and no syntax at all. Both then have to isolate loop state, reset the
+/// result, and normalize `return` identically, and the way to guarantee that is
+/// for there to be one of it.
+fn run_call_body_for_value(
+    body: &parser::Source,
+    caller_result: Value,
+    caller_produced: Produced,
+    bind: impl FnOnce(&mut Shell) -> Result<(), Step>,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
     let caller_loop_depth = std::mem::replace(&mut shell.loop_depth, 0);
     // Callee territory starts here, so the arguments' transient results are
     // dropped: a default's own bare `return` carries the callee's result so far,
@@ -3580,7 +3729,7 @@ fn call_signature_for_value(
     shell.result = Value::String(String::new());
     shell.produced = Produced::Status;
     shell.vars.push_scope();
-    let outcome = match bind_scanned(name, params, positionals, switches_on, flag_values, shell) {
+    let outcome = match bind(shell) {
         Ok(()) => {
             // A default body may itself have produced a result; that belongs to
             // the setup, so the body starts from nothing too.
@@ -3615,6 +3764,37 @@ fn call_signature_for_value(
         Err(Step::Return(value)) => Ok(value),
         Err(other) => Err(other),
     }
+}
+
+/// Call a function **value** with one already-computed argument, for its value.
+///
+/// This is the higher-order path: `$xs:map(f)` has an element, not source text, so
+/// there is nothing to evaluate and the value binds positionally. Flag parsing is
+/// off for the same reason it is off for a prompt hook — the argument is data, so a
+/// string that happens to read `--force` is a string, not an option.
+fn call_callable_for_value(
+    name: &str,
+    function: &vars::FuncValue,
+    argument: Value,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let caller_result = shell.result.clone();
+    let caller_produced = shell.produced;
+    run_call_body_for_value(
+        function.body(),
+        caller_result,
+        caller_produced,
+        |shell| {
+            bind_arguments(
+                name,
+                function.params(),
+                vec![(argument, false)],
+                false,
+                shell,
+            )
+        },
+        shell,
+    )
 }
 
 /// Match `args` against `params` and bind each parameter in the current (already
