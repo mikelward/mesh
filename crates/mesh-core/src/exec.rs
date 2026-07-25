@@ -89,12 +89,20 @@ pub struct Cmd {
 pub struct JobTable {
     jobs: Vec<Job>,
     next_id: usize,
-    /// The job `%%` / `%+` names, and the one `%-` names behind it. A job takes
-    /// the current spot when it is registered, when it stops, and when `bg`
-    /// starts it again — the events that make it the one you most likely mean.
+    /// Job ids, most recently current first: `%+` is the head and `%-` the one
+    /// behind it. A job moves to the head when it is registered, when it stops,
+    /// and when `bg` starts it again — the events that make it the one you most
+    /// likely mean.
+    ///
+    /// The **whole** order is kept rather than just those two, because the pair
+    /// alone cannot survive the head leaving: promoting `%-` needs a third job
+    /// to fill the slot it vacates, and once `bg` or a stop has moved something
+    /// forward, registration order is no longer the answer. `bg 2`, `bg 1`,
+    /// `bg 3` over four jobs leaves recency `3 1 2 4`, where reconstructing from
+    /// the table gave job 4 rather than job 2.
+    ///
     /// Ids rather than indices, so removing a job cannot silently repoint them.
-    current: Option<usize>,
-    previous: Option<usize>,
+    recency: Vec<usize>,
 }
 
 struct Job {
@@ -188,8 +196,7 @@ impl JobTable {
         Self {
             jobs: Vec::new(),
             next_id: 1,
-            current: None,
-            previous: None,
+            recency: Vec::new(),
         }
     }
 
@@ -383,56 +390,30 @@ impl JobTable {
         }
     }
 
-    /// Make `id` the current job, pushing the one it displaces to `%-`.
+    /// Make `id` the current job, pushing the one it displaces behind it.
     fn mark_current(&mut self, id: usize) {
-        if self.current == Some(id) {
-            return;
-        }
-        // A job that was `%-` and is now `%+` leaves nothing behind it, so the
-        // slot is refilled below rather than kept pointing at the same job twice.
-        if self.previous == Some(id) {
-            self.previous = None;
-        }
-        self.previous = self.current.or(self.previous);
-        self.current = Some(id);
-        self.refill_previous();
+        self.recency.retain(|&known| known != id);
+        self.recency.insert(0, id);
     }
 
-    /// Drop a job that has left the table from `%+` / `%-`, promoting behind it.
+    /// Drop a job that has left the table, promoting everything behind it.
     fn forget(&mut self, id: usize) {
-        if self.current == Some(id) {
-            self.current = self.previous.take();
-        } else if self.previous == Some(id) {
-            self.previous = None;
-        }
-        if self.current.is_none() {
-            self.current = self.jobs.last().map(|job| job.id);
-        }
-        self.refill_previous();
-    }
-
-    /// Point `%-` at the most recent job that is not already `%+`.
-    fn refill_previous(&mut self) {
-        if self.previous.is_some_and(|id| self.index_of(id).is_some()) {
-            return;
-        }
-        self.previous = self
-            .jobs
-            .iter()
-            .rev()
-            .map(|job| job.id)
-            .find(|id| Some(*id) != self.current);
+        self.recency.retain(|&known| known != id);
     }
 
     fn index_of(&self, id: usize) -> Option<usize> {
         self.jobs.iter().position(|job| job.id == id)
     }
 
-    /// Where `%+` points, falling back to the newest job — a table that has
-    /// jobs always has a current one, even if nothing has marked it yet.
+    /// The job at `depth` in recency order — 0 for `%+`, 1 for `%-`.
+    fn by_recency(&self, depth: usize) -> Option<usize> {
+        self.recency.get(depth).and_then(|id| self.index_of(*id))
+    }
+
+    /// Where `%+` points, falling back to the newest job — a table with jobs in
+    /// it always has a current one, even if nothing has marked it yet.
     fn current_index(&self) -> Option<usize> {
-        self.current
-            .and_then(|id| self.index_of(id))
+        self.by_recency(0)
             .or_else(|| self.jobs.len().checked_sub(1))
     }
 
@@ -454,7 +435,7 @@ impl JobTable {
         };
         let found = match reference.strip_prefix('%') {
             Some("%" | "+") => self.current_index(),
-            Some("-") => self.previous.and_then(|id| self.index_of(id)),
+            Some("-") => self.by_recency(1),
             Some(rest) if rest.starts_with('?') => {
                 // `DESIGN.md` keeps `%?string` for the substring match and defers
                 // it; saying so beats reporting it as a job that does not exist.
