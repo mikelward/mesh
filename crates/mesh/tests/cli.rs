@@ -7034,3 +7034,149 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     let out = run_with_input("status = mine\nputs $status\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "mine\n");
 }
+
+// ---------------------------------------------------------------------------
+// unset and global
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unset_removes_a_binding_rather_than_emptying_it() {
+    // The two states that stand in for a missing null: `x = ""` is *bound to
+    // empty*, `unset x` is *unbound*, and only the second makes a read fail.
+    let out = run_with_input("x = ''\nputs empty if $x == ''\nunset x\nputs $x\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "empty\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("x: unbound variable"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Several at once, and unsetting what was never bound anywhere is loud —
+    // the same fail-loud rule a read follows — without stopping the shell.
+    let out = run_with_input("a = 1\nb = 2\nunset a b\nunset nope\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nope: unbound variable"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // Blocks open no scope, so a binding made inside one is unset from outside.
+    let out = run_with_input("if true { y = 1 }\nunset y\nputs gone if $sh.status == 0\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "gone\n");
+}
+
+#[test]
+fn unset_acts_on_the_current_scope_only() {
+    // Dropping a local reveals the global it was shadowing, because reads
+    // resolve outward — `unset` removes a binding, it does not create a hole.
+    let out =
+        run_with_input("x = outer\nfunc f() { x = inner\n  unset x\n  puts $x }\nf\nputs $x\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "outer\nouter\n");
+
+    // With no local to drop, plain `unset` leaves the global alone rather than
+    // reaching through — the same rule that makes assignment local by default.
+    let out = run_with_input("x = outer\nfunc f() { unset x }\nf\nputs $x\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "outer\n");
+
+    // `global unset` is how you say you meant the global, symmetric with
+    // `global name = value`.
+    let out = run_with_input("x = outer\nfunc f() { global unset x }\nf\nputs $x\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("x: unbound variable"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn global_writes_the_session_scope_from_inside_a_function() {
+    let out = run_with_input(
+        "count = 0\nfunc tick() { global count = $count + 1 }\ntick\ntick\nputs $count\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+
+    // Without it, assignment is local by default and the global is untouched.
+    let out = run_with_input("count = 0\nfunc tick() { count = 99 }\ntick\nputs $count\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+
+    // `+=` too, and on a typed value rather than a string.
+    let out = run_with_input("xs = [a]\nfunc add() { global xs += [b] }\nadd\nputs ...$xs\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a b\n");
+
+    // Appending to a name the *global* scope does not hold is an error, even if
+    // a local of that name exists: `global` names one scope, not "whatever is
+    // visible".
+    let out = run_with_input("func f() { n = 1\n  global n += 1 }\nf\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("n: unbound variable"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // A destructuring pattern puts every name in the one scope named.
+    let out = run_with_input("func f() { global [p q] = [1 2] }\nf\nputs $p $q\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1 2\n");
+}
+
+#[test]
+fn a_local_keeps_shadowing_a_global_it_just_wrote() {
+    // `global x = …` writes the global; it does not retarget the local that is
+    // already shadowing it, so the function still reads its own value. Surprising
+    // enough to pin: the alternative (silently dropping the local) would make
+    // `global` mean two different things depending on what came before.
+    let out =
+        run_with_input("x = out\nfunc f() { x = in\n  global x = set\n  puts $x }\nf\nputs $x\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "in\nset\n");
+
+    // And scope stays lexical: a callee's `global` never touches its caller's
+    // local, only the session scope.
+    let out = run_with_input(
+        "g = 0\nfunc inner() { global g = 9 }\n\
+         func outer() { g = 1\n  inner\n  puts $g }\nouter\nputs $g\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n9\n");
+}
+
+#[test]
+fn global_and_unset_are_only_keywords_where_a_statement_can_follow() {
+    // Neither is reserved in `DESIGN.md` — only `env` and `sh` are — so both
+    // must still work as ordinary variable names.
+    let out = run_with_input("global = 5\nputs $global\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+    let out = run_with_input("unset = 7\nputs $unset\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+    let out = run_with_input("global += 1\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The reserved namespaces cannot be unset.
+    for name in ["env", "sh"] {
+        let out = run_with_input(&format!("unset {name}\nputs after\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("is reserved"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    }
+
+    // `global` governs an assignment, so a command after it is refused with a
+    // message that says which, rather than a bare "unexpected token".
+    let out = run_with_input("func f() { puts hi }\nglobal f\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("it governs an assignment"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_with_input("unset\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("a name to unset"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

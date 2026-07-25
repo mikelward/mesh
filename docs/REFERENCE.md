@@ -376,8 +376,79 @@ name=value            # unspaced form
 ```
 
 A name starts with a letter, then letters, digits, `_`, and interior `-` (a
-hyphen must sit between two name characters). A bare `_` is not a name. Bindings
-are session-global.
+hyphen must sit between two name characters). A bare `_` is not a name. At top
+level, bindings are session-global.
+
+### Scope: `global` and `unset`
+
+There are exactly two scopes: the **session-global** one, and a fresh
+**function-local** one per call. Inside a function, assignment binds a **local by
+default** — the deliberate inverse of bash — so writing the session scope is
+something you say:
+
+```mesh
+count = 0
+func tick() {
+  n = 1                        # a new local, gone on return
+  global count = $count + 1    # the session-global
+}
+```
+
+`global` takes `=`, `+=`, and destructuring (`global [p q] = $pair`); every name
+a pattern binds lands in the one scope named. It governs an assignment only, so
+`global f` is a syntax error rather than a call.
+
+`global name = …` writes the global; it does **not** retarget a local already
+shadowing that name, so a function that has both keeps reading its own:
+
+```mesh
+x = out
+func f() {
+  x = in
+  global x = set
+  puts $x                      # in  — the local still shadows
+}
+f
+puts $x                        # set
+```
+
+**`unset name`** removes a binding from the **current** scope. This is not the
+same as `x = ""`: that is *bound to the empty string*, while unset is *unbound*,
+and only the second makes a read fail. Those are the two states that stand in for
+a missing null.
+
+```mesh
+x = ''
+puts $x                        # prints an empty line
+unset x
+puts $x                        # error: x: unbound variable
+```
+
+It takes several names at once, and unsetting a name bound in no visible scope is
+a loud, recoverable error — the same fail-loud rule reads follow.
+
+Inside a function, plain `unset` drops the local only. If that local was shadowing
+a global, the global becomes visible again; if there was no local, the global is
+left alone rather than reached through — matching the rule that makes assignment
+local. **`global unset name`** is how to remove a session-global from inside a
+function, symmetric with `global name = value`.
+
+```mesh
+x = outer
+func f() { unset x }
+f
+puts $x                        # outer — untouched
+```
+
+Blocks (`if`, `for`, `while`, `loop`) open no scope, so a name bound inside one is
+an ordinary binding of the enclosing scope and `unset` reaches it.
+
+Neither word is reserved — only `env` and `sh` are — so a variable may still be
+called `global` or `unset`; they lead a statement only where one can follow.
+Unsetting `env` or `sh` is refused.
+
+Not yet supported: deleting a collection element (`unset $m.key`, `unset $xs[i]`),
+which waits on general member assignment.
 
 Lists are bracketed, space-separated values. They preserve nesting: `$xs` in a
 literal inserts a list as one nested element, while `...$xs` flattens exactly
@@ -722,7 +793,8 @@ greet world          # -> hi, world
   braces balance. Interactively, the continuation prompt is `...`.
 - **Scope.** Each call gets a fresh **function-local** scope: `x = 5` in a body
   binds a local that is gone on return. Reads see the innermost local scope, then
-  the global scope — a function never sees its caller's locals.
+  the global scope — a function never sees its caller's locals. To write the
+  session scope on purpose, say `global` (see below).
 - **Resolution.** A name in command position resolves as **builtin → function →
   external**. The supplied arguments must satisfy the signature (a bad count or an
   unknown/misused flag is a loud, recoverable error).
