@@ -461,13 +461,13 @@ is independent but touches the same file.
       limit check and then opens its path or **performs** its duplication. The
       per-stage thread is kept, so the seed each stage starts from is built up
       front. Closed the `EMFILE` ordering case and the limit pre-pass case below.
-- [ ] **2. Resolve a background stage's destinations without opening.** With (1)
-      in place, replace the syntactic `stdout_is_redirected` scan with stdout's
-      actual resolved destination, which a background stage can compute without
-      opening anything (its opens belong to the child). Closes both spellings of
-      the lost-pipe case below. `piped_out` must keep tracking the *final*
-      destination, or a `SIGPIPE` from a stage whose stdout really ends on a file
-      gets excused when it is real.
+- [x] **2. Resolve a background stage's destinations without opening** — *done*.
+      The syntactic `stdout_is_redirected` scan is gone; a background stage takes
+      the same walk in `Acquire::Deferred` mode, which opens nothing and
+      duplicates nothing (those belong to the child) and reports only where each
+      descriptor lands. Closed both spellings of the lost-pipe case below.
+      `piped_out` follows that answer, so a `SIGPIPE` from a stage whose stdout
+      really ends on a file still counts.
 - [ ] **3. Spawn externals with `fork` + `execvp` instead of `Command`.**
       `Command::spawn` makes a private close-on-exec pipe for the child to report
       `exec` failures on; it takes a low descriptor, and the hook that installs
@@ -497,18 +497,16 @@ reproduced against the built binary and compared with bash.
       ones — `execvp` sets `errno`, so the child reports 126/127 itself and no
       private pipe is involved. Carries process groups, the interactive
       signal/terminal hooks and the `Stdio` wiring with it.
-- [ ] **A backgrounded in-shell stage loses its pipe.** Two spellings reach it:
-      `func f() { puts low }; f 3>&1 > file 1>&3 | tr a-z A-Z &`, where stdout is
-      moved away and put back, and `func f() { sh -c 'echo low >&2' };
-      f 2>&1 > file | tr a-z A-Z &`, where the pipe ends up held by stderr alone.
-      Both print `low` directly where bash pipes `LOW`, and both because
-      `stdout_is_redirected` scans `cmd.redirs`
-      for anything targeting fd 1 and so trips on the `>`, even
-      though source order puts stdout back on the pipe. It has to be based on
-      stdout's *resolved* destination — which for a background stage means
-      resolving the redirections without opening anything, since the opens are
-      deferred to the child. `piped_out` must keep tracking the final
-      destination too: if stdout really ends on a file, a `SIGPIPE` is real.
+- [x] **A backgrounded in-shell stage loses its pipe** — *fixed*.
+      `stdout_is_redirected` scanned `cmd.redirs` for anything targeting fd 1, so
+      it tripped on the `>` in `f 3>&1 > file 1>&3 | tr a-z A-Z &` and in
+      `f 2>&1 > file | tr a-z A-Z &` even though source order leaves the pipe
+      held. Both printed `low` past the pipeline where bash pipes `LOW`. A
+      background stage is now resolved by the same walk as any other, in
+      `Acquire::Deferred` mode: it opens nothing and duplicates nothing (those
+      belong to the child) and reports only where each descriptor lands, so the
+      shell can ask whether *anything* is still on the pipe. `piped_out` follows
+      that answer, so `> file` still makes a `SIGPIPE` real.
 - [x] **A duplication that cannot be afforded still lets later targets be
       opened** — *fixed*. `open_paths` and `resolve_sources` are now one
       source-ordered walk (`resolve_redirs`) that acquires every descriptor as it
