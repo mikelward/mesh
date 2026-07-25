@@ -4268,7 +4268,10 @@ fn run_expanded(words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
         }
         "fg" => Some(shell.jobs.foreground(&words[1..])),
         "bg" => Some(shell.jobs.background(&words[1..])),
-        "wait" => Some(shell.jobs.wait(&words[1..])),
+        "wait" => {
+            let interactive = shell.vars.interactive();
+            Some(shell.jobs.wait(&words[1..], interactive))
+        }
         "jobs" => Some(shell.jobs.list(&words[1..], !shell.forked)),
         _ => None,
     };

@@ -229,7 +229,14 @@ impl JobTable {
     /// The job leaves the table once it is waited for, which is what keeps the
     /// prompt from also announcing `[1] Done (0) …` for a status the caller has
     /// already been given.
-    pub fn wait(&mut self, args: &[String]) -> u8 {
+    ///
+    /// `interactive` decides whether Ctrl-C may abandon the wait. Only the
+    /// interactive shell ignores SIGINT on its own account, so only there is an
+    /// uninterruptible wait a trap the user cannot get out of. A non-interactive
+    /// shell keeps whatever disposition it was given — including an ignore
+    /// inherited from a batch parent, which is that parent saying interrupts are
+    /// not to take effect here.
+    pub fn wait(&mut self, args: &[String], interactive: bool) -> u8 {
         // Bare `wait` means "every child, with an aggregate status" in bash,
         // while `fg`'s no-operand default means "the most recent one". The two
         // read alike and differ in what they do, so the operand is required
@@ -249,7 +256,12 @@ impl JobTable {
             note!("[{}] Stopped {}", job.id, job.command);
             return status;
         }
-        let result = wait_outcomes_until(&mut self.jobs[index].outcomes, OnInterrupt::Abandon);
+        let on_interrupt = if interactive {
+            OnInterrupt::Abandon
+        } else {
+            OnInterrupt::Resume
+        };
+        let result = wait_outcomes_until(&mut self.jobs[index].outcomes, on_interrupt);
         match result {
             Some(WaitResult::Complete(status)) => {
                 self.jobs.remove(index);
@@ -1420,8 +1432,33 @@ fn wait_status(status: libc::c_int) -> u8 {
 /// Set by [`SigintCatcher`]'s handler; read by the wait that installed it.
 static SIGINT_SEEN: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn note_interrupt(_signal: libc::c_int) {
+/// The thread whose `waitpid` the catcher exists to cut short, as a
+/// `pthread_t`. Zero when no wait is in progress.
+static WAITING_THREAD: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn note_interrupt(signal: libc::c_int) {
     SIGINT_SEEN.store(true, Ordering::SeqCst);
+    // Only the thread that runs the handler gets its `waitpid` cut short, and a
+    // process-directed SIGINT goes to whichever thread does not block it. That
+    // is not always the waiter: `$(…)` and `:capture` run their body with a
+    // reader thread draining the pipe, so the signal can land there and set this
+    // flag while the wait itself sleeps on. Forwarding it to the waiter makes
+    // the `EINTR` happen where it is needed, whoever received the signal.
+    let waiting = WAITING_THREAD.load(Ordering::SeqCst);
+    if waiting == 0 {
+        return;
+    }
+    // SAFETY: `waiting` is a `pthread_t` published by `install` for a thread
+    // that is blocked in the wait it belongs to, and cleared before that thread
+    // returns. `pthread_self`, `pthread_equal` and `pthread_kill` are all
+    // async-signal-safe; the equality test is what stops the forward from
+    // recurring once it arrives.
+    unsafe {
+        let waiter = waiting as libc::pthread_t;
+        if libc::pthread_equal(libc::pthread_self(), waiter) == 0 {
+            libc::pthread_kill(waiter, signal);
+        }
+    }
 }
 
 /// Make SIGINT interrupt a blocking wait, putting the previous disposition back
@@ -1476,10 +1513,15 @@ impl SigintCatcher {
                 note_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
             libc::sigemptyset(&mut action.sa_mask);
             action.sa_flags = 0;
-            // Cleared while still blocked, so unblocking cannot deliver a SIGINT
-            // whose flag this then wipes.
+            // Both published while still blocked, so unblocking cannot deliver a
+            // SIGINT whose flag this then wipes, nor one the handler would find
+            // no waiter to forward to.
             SIGINT_SEEN.store(false, Ordering::SeqCst);
+            WAITING_THREAD.store(libc::pthread_self() as usize, Ordering::SeqCst);
             let installed = libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) == 0;
+            if !installed {
+                WAITING_THREAD.store(0, Ordering::SeqCst);
+            }
             restore_mask();
             installed.then_some(Self { previous })
         }
@@ -1488,6 +1530,10 @@ impl SigintCatcher {
 
 impl Drop for SigintCatcher {
     fn drop(&mut self) {
+        // The waiter is cleared first: once the disposition is back to the
+        // shell's own ignore there is nothing to forward, and a stale
+        // `pthread_t` here would name a thread that has moved on.
+        WAITING_THREAD.store(0, Ordering::SeqCst);
         // SAFETY: `previous` was filled in by `sigaction` for this same signal.
         unsafe {
             libc::sigaction(libc::SIGINT, &self.previous, std::ptr::null_mut());
@@ -2357,10 +2403,75 @@ fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        JobTable, NextIn, RedirKind, RedirTarget, Redirection, initial_stdin, restore_job_signals,
-        restore_terminal_modes, run, set_foreground_group, shell_stdin_is_terminal, terminal_fd,
-        terminal_modes, with_redirections,
+        JobTable, NextIn, RedirKind, RedirTarget, Redirection, SigintCatcher, initial_stdin,
+        restore_job_signals, restore_terminal_modes, run, set_foreground_group,
+        shell_stdin_is_terminal, terminal_fd, terminal_modes, with_redirections,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A SIGINT delivered to *another* thread still cuts the waiter's wait short.
+    ///
+    /// A process-directed signal goes to whichever thread does not block it, and
+    /// only the thread that runs the handler has its blocking call interrupted.
+    /// `$(…)` and `:capture` run their body with a reader thread draining the
+    /// pipe, so the signal can land there while the wait sleeps on — which is
+    /// why the catcher forwards it to the thread that is actually waiting.
+    #[test]
+    fn an_interrupt_on_another_thread_reaches_the_waiter() {
+        // The catcher only installs over the shell's own ignore, so this stands
+        // that in. The disposition is process-wide, so it goes back at the end;
+        // nothing else in this suite reads it outside a fork of its own.
+        let mut original: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: scalar out-parameter for this signal, zeroed before the call.
+        unsafe {
+            libc::sigaction(libc::SIGINT, std::ptr::null(), &mut original);
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+        }
+
+        static INSTALLED: AtomicBool = AtomicBool::new(false);
+        static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+        let waiter = std::thread::spawn(|| {
+            let catcher = SigintCatcher::install();
+            INSTALLED.store(catcher.is_some(), Ordering::SeqCst);
+            // A bounded sleep rather than a `pause`, so a forward that never
+            // arrives ends the test instead of stranding this thread. Waking
+            // early is the whole assertion: `nanosleep` fails with `EINTR` only
+            // when a handler ran *here*.
+            let nap = libc::timespec {
+                tv_sec: 5,
+                tv_nsec: 0,
+            };
+            // SAFETY: a valid timespec and a writable out-parameter.
+            let slept = unsafe { libc::nanosleep(&nap, std::ptr::null_mut()) };
+            INTERRUPTED.store(slept < 0, Ordering::SeqCst);
+        });
+
+        for _ in 0..500 {
+            if INSTALLED.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Long enough for the waiter to be inside `nanosleep`: a signal arriving
+        // before it gets there would prove nothing about interrupting a wait.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Deliberately *this* thread, standing in for the capture reader that a
+        // process-directed SIGINT can land on instead of the waiter.
+        // SAFETY: signalling a live thread of this process.
+        unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGINT) };
+
+        waiter.join().expect("waiter thread panicked");
+        let installed = INSTALLED.load(Ordering::SeqCst);
+        let interrupted = INTERRUPTED.load(Ordering::SeqCst);
+        // SAFETY: `original` was filled in by `sigaction` for this same signal.
+        unsafe { libc::sigaction(libc::SIGINT, &original, std::ptr::null_mut()) };
+
+        assert!(installed, "the catcher did not install over SIG_IGN");
+        assert!(
+            interrupted,
+            "a SIGINT on another thread left the waiter sleeping"
+        );
+    }
 
     #[test]
     fn redirecting_stdin_keeps_the_session_interactive() {
