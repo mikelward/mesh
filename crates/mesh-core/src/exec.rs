@@ -329,6 +329,9 @@ fn fork_in_shell(
     in_file: Option<File>,
     out_file: Option<File>,
     err_file: Option<File>,
+    // Descriptors above the standard three, installed by the child itself since
+    // there is no `Stdio` slot to hand them to.
+    extra_files: Vec<(libc::c_int, File)>,
     // `stdout_to_pipe` / `stderr_to_pipe`: did each stream resolve to this
     // stage's outgoing pipe? Passed in rather than re-derived from `pipe_stderr`,
     // so a duplication that put stderr on the pipe (`f 2>&1 | g`) reaches the
@@ -448,6 +451,11 @@ fn fork_in_shell(
             }
             if let Some(file) = &child_err_pipe {
                 libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+            }
+            // Descriptors above the standard three, which no `Stdio` slot
+            // covers. Placed before `|&` for the same reason `deferred` is.
+            for (fd, file) in &extra_files {
+                libc::dup2(file.as_raw_fd(), *fd);
             }
             // A background stage's own targets, per descriptor, before the `|&`
             // copy below — a `> out` must move stdout while `|&` can still see
@@ -601,19 +609,27 @@ pub fn run_pipeline(
         // Seed each descriptor with where it points *before* any redirection, so
         // a duplication copies the pipe or the terminal as it stands at that
         // point in the sequence.
-        let seed = [
-            match &incoming {
-                NextIn::Inherit => Source::Inherit(libc::STDIN_FILENO),
-                NextIn::Null => Source::Null,
-                NextIn::Pipe(_) => Source::Pipe,
-            },
-            if is_last {
-                Source::Inherit(libc::STDOUT_FILENO)
-            } else {
-                Source::Pipe
-            },
-            Source::Inherit(libc::STDERR_FILENO),
-        ];
+        let seed: Sources = [
+            (
+                libc::STDIN_FILENO,
+                match &incoming {
+                    NextIn::Inherit => Source::Inherit(libc::STDIN_FILENO),
+                    NextIn::Null => Source::Null,
+                    NextIn::Pipe(_) => Source::Pipe,
+                },
+            ),
+            (
+                libc::STDOUT_FILENO,
+                if is_last {
+                    Source::Inherit(libc::STDOUT_FILENO)
+                } else {
+                    Source::Pipe
+                },
+            ),
+            (libc::STDERR_FILENO, Source::Inherit(libc::STDERR_FILENO)),
+        ]
+        .into_iter()
+        .collect();
         let sources = match redir_result.and_then(|files| resolve_sources(&cmd.redirs, files, seed))
         {
             Ok(sources) => sources,
@@ -625,8 +641,8 @@ pub fn run_pipeline(
         };
         // A descriptor that resolved to this stage's outgoing pipe cannot become
         // a file here — the pipe is made below — so it is carried as intent.
-        let stdout_to_pipe = matches!(sources[1], Source::Pipe);
-        let stderr_to_pipe = matches!(sources[2], Source::Pipe);
+        let stdout_to_pipe = sources.is_pipe(libc::STDOUT_FILENO);
+        let stderr_to_pipe = sources.is_pipe(libc::STDERR_FILENO);
         let files = match sources_to_files(sources) {
             Ok(files) => files,
             Err((path, err)) => {
@@ -636,11 +652,15 @@ pub fn run_pipeline(
             }
         };
         let (mut in_file, mut out_file, mut err_file) = (None, None, None);
+        // Anything above the standard three is carried separately and installed
+        // in the child, since only these have a `Stdio` slot to be handed to.
+        let mut extra_files = Vec::new();
         for (fd, file) in files {
             match fd {
                 libc::STDIN_FILENO => in_file = Some(file),
                 libc::STDOUT_FILENO => out_file = Some(file),
-                _ => err_file = Some(file),
+                libc::STDERR_FILENO => err_file = Some(file),
+                other => extra_files.push((other, file)),
             }
         }
 
@@ -652,6 +672,7 @@ pub fn run_pipeline(
                 in_file,
                 out_file,
                 err_file,
+                extra_files,
                 stdout_to_pipe,
                 stderr_to_pipe,
                 interactive,
@@ -720,6 +741,23 @@ pub fn run_pipeline(
                         Ok(())
                     });
                 }
+            }
+        }
+
+        // Descriptors above the standard three have no `Stdio` slot, so the
+        // child installs them itself between fork and exec. The files move into
+        // the closure, which is what keeps them open until then; `dup2` clears
+        // `FD_CLOEXEC` on the descriptor it creates, so they survive the exec
+        // that the originals would not.
+        if !extra_files.is_empty() {
+            // SAFETY: `dup2` is async-signal-safe, the bar `pre_exec` sets.
+            unsafe {
+                command.pre_exec(move || {
+                    for (fd, file) in &extra_files {
+                        install_descriptor(file, *fd)?;
+                    }
+                    Ok(())
+                });
             }
         }
 
@@ -1180,12 +1218,34 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
     } else {
         None
     };
+    // Anything past the standard three has no `Stdio` slot, so the child puts it
+    // in place itself — the same split the pipeline path makes.
+    let mut extra_files = Vec::new();
     for (fd, file) in opened {
         match fd {
-            libc::STDIN_FILENO => command.stdin(file),
-            libc::STDOUT_FILENO => command.stdout(file),
-            _ => command.stderr(file),
-        };
+            libc::STDIN_FILENO => {
+                command.stdin(file);
+            }
+            libc::STDOUT_FILENO => {
+                command.stdout(file);
+            }
+            libc::STDERR_FILENO => {
+                command.stderr(file);
+            }
+            other => extra_files.push((other, file)),
+        }
+    }
+    if !extra_files.is_empty() {
+        // SAFETY: `install_descriptor` uses only async-signal-safe calls, the
+        // bar `pre_exec` sets.
+        unsafe {
+            command.pre_exec(move || {
+                for (fd, file) in &extra_files {
+                    install_descriptor(file, *fd)?;
+                }
+                Ok(())
+            });
+        }
     }
     if let Some(stderr) = merged_stderr {
         command.stderr(stderr);
@@ -1353,8 +1413,14 @@ pub(crate) fn with_redirections<T>(
         // Restore in reverse so the descriptors return to their original state.
         for (saved, target) in swapped.drain(..).rev() {
             unsafe {
-                libc::dup2(saved, target);
-                libc::close(saved);
+                // `-1` marks a descriptor this redirection created, so there is
+                // nothing to put back — closing it is the restore.
+                if saved < 0 {
+                    libc::close(target);
+                } else {
+                    libc::dup2(saved, target);
+                    libc::close(saved);
+                }
             }
         }
     };
@@ -1391,16 +1457,30 @@ pub(crate) fn with_redirections<T>(
     Ok(result)
 }
 
-/// `dup` `target` aside and point it at `file`, returning the saved descriptor.
+/// `dup` `target` aside and point it at `file`, returning the saved descriptor —
+/// or `-1` when there was nothing to save.
+///
+/// A redirection may name a descriptor the shell does not have open (`f 3> log`),
+/// which `dup` answers with `EBADF`. That is not a failure: the redirection
+/// *creates* that descriptor, and the restore closes it again rather than putting
+/// something back.
 fn swap_descriptor(file: &File, target: libc::c_int) -> Result<libc::c_int, std::io::Error> {
-    use std::os::fd::AsRawFd;
-    let saved = unsafe { libc::dup(target) };
-    if saved < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { libc::dup2(file.as_raw_fd(), target) } < 0 {
-        let error = std::io::Error::last_os_error();
-        unsafe { libc::close(saved) };
+    // SAFETY: `fcntl(F_GETFD)` only reads the descriptor's flags, and answers
+    // whether it is open at all without disturbing it.
+    let was_open = unsafe { libc::fcntl(target, libc::F_GETFD) } >= 0;
+    let saved = if was_open {
+        let saved = unsafe { libc::dup(target) };
+        if saved < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        saved
+    } else {
+        -1
+    };
+    if let Err(error) = install_descriptor(file, target) {
+        if saved >= 0 {
+            unsafe { libc::close(saved) };
+        }
         return Err(error);
     }
     Ok(saved)
@@ -1513,26 +1593,69 @@ impl Source {
     }
 }
 
-/// The pre-redirection destinations for a context that simply inherits all three
-/// — the background helper, and a background stage opening its own targets.
-fn inherited_seed() -> [Source; 3] {
+/// Where each descriptor ends up, keyed by descriptor rather than positional.
+///
+/// The standard three are always present; a redirection may introduce others
+/// (`3< file`), so this is a map and not a `[Source; 3]`. Kept as a sorted `Vec`
+/// because it holds three entries in almost every command and a handful at most.
+#[derive(Default)]
+pub(crate) struct Sources(Vec<(libc::c_int, Source)>);
+
+impl Sources {
+    fn get(&self, fd: libc::c_int) -> Option<&Source> {
+        self.0
+            .iter()
+            .find(|(candidate, _)| *candidate == fd)
+            .map(|(_, source)| source)
+    }
+
+    fn set(&mut self, fd: libc::c_int, source: Source) {
+        match self.0.iter_mut().find(|(candidate, _)| *candidate == fd) {
+            Some((_, slot)) => *slot = source,
+            None => {
+                self.0.push((fd, source));
+                self.0.sort_by_key(|(fd, _)| *fd);
+            }
+        }
+    }
+
+    /// Whether this descriptor's destination is the stage's outgoing pipe, which
+    /// cannot become a file here because the caller makes the pipe.
+    fn is_pipe(&self, fd: libc::c_int) -> bool {
+        matches!(self.get(fd), Some(Source::Pipe))
+    }
+}
+
+impl FromIterator<(libc::c_int, Source)> for Sources {
+    fn from_iter<T: IntoIterator<Item = (libc::c_int, Source)>>(entries: T) -> Self {
+        let mut sources = Self::default();
+        for (fd, source) in entries {
+            sources.set(fd, source);
+        }
+        sources
+    }
+}
+
+/// The pre-redirection destinations for a context that simply inherits the
+/// standard three — the background helper, and a background stage opening its
+/// own targets.
+fn inherited_seed() -> Sources {
     [
-        Source::Inherit(libc::STDIN_FILENO),
-        Source::Inherit(libc::STDOUT_FILENO),
-        Source::Inherit(libc::STDERR_FILENO),
+        (libc::STDIN_FILENO, Source::Inherit(libc::STDIN_FILENO)),
+        (libc::STDOUT_FILENO, Source::Inherit(libc::STDOUT_FILENO)),
+        (libc::STDERR_FILENO, Source::Inherit(libc::STDERR_FILENO)),
     ]
+    .into_iter()
+    .collect()
 }
 
 /// Turn resolved sources into the files each descriptor should be given.
 /// `Source::Pipe` yields nothing: the pipe is created by the caller that owns it.
 fn sources_to_files(
-    sources: [Source; 3],
+    sources: Sources,
 ) -> Result<Vec<(libc::c_int, File)>, (String, std::io::Error)> {
     let mut files = Vec::new();
-    for (fd, source) in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
-        .into_iter()
-        .zip(sources)
-    {
+    for (fd, source) in sources.0 {
         let described = format!("&{fd}");
         if let Some(file) = source.into_file(fd).map_err(|e| (described, e))? {
             files.push((fd, file));
@@ -1633,11 +1756,11 @@ fn open_paths(redirs: &[Redirection]) -> Result<Vec<Option<File>>, (String, std:
 fn resolve_sources(
     redirs: &[Redirection],
     opened: Vec<Option<File>>,
-    seed: [Source; 3],
-) -> Result<[Source; 3], (String, std::io::Error)> {
+    seed: Sources,
+) -> Result<Sources, (String, std::io::Error)> {
     let mut state = seed;
     for (redir, file) in redirs.iter().zip(opened) {
-        state[redir.fd as usize] = match (&redir.target, file) {
+        let resolved = match (&redir.target, file) {
             (RedirTarget::Path(_) | RedirTarget::Heredoc(_), Some(file)) => Source::File(file),
             (RedirTarget::Path(path), None) => {
                 return Err((
@@ -1651,12 +1774,50 @@ fn resolve_sources(
                     std::io::Error::other("heredoc body was not opened"),
                 ));
             }
-            (RedirTarget::Descriptor(from), _) => state[*from as usize]
+            // Duplicating a descriptor nothing has opened is `EBADF`, the same
+            // answer the kernel gives — a copy of nothing is not an inheritance
+            // of the shell's own fd of that number.
+            (RedirTarget::Descriptor(from), _) => state
+                .get(*from)
+                .ok_or_else(|| {
+                    (
+                        format!("&{from}"),
+                        std::io::Error::from_raw_os_error(libc::EBADF),
+                    )
+                })?
                 .duplicate()
                 .map_err(|e| (format!("&{from}"), e))?,
         };
+        state.set(redir.fd, resolved);
     }
     Ok(state)
+}
+
+/// Put `file` on descriptor `fd` in a child, so it survives a following `exec`.
+///
+/// Not simply `dup2`: when the file already *is* that descriptor, `dup2` returns
+/// success without doing anything — and pointedly without clearing
+/// `FD_CLOEXEC`, which Rust sets on every file it opens. The descriptor would
+/// then close at `exec` and the command would see `EBADF` on a redirection that
+/// looked applied. `3< file` hit this whenever the open landed on fd 3, while a
+/// higher one like `9<` worked, since there `dup2` really did make a new
+/// descriptor and new descriptors do not inherit the flag.
+fn install_descriptor(file: &File, fd: libc::c_int) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let raw = file.as_raw_fd();
+    // SAFETY: both calls take a descriptor this process owns, and both are
+    // async-signal-safe, which is the bar `pre_exec` sets.
+    unsafe {
+        if raw == fd {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        } else if libc::dup2(raw, fd) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Map a spawn error to a status and report it (`127` not-found, else `126`).
