@@ -8121,8 +8121,7 @@ mod tests {
             Value::Integer(42),
             Value::Integer(-5),
             Value::Integer(i64::MAX),
-            // `i64::MIN` is deliberately absent — see the test below, where the
-            // gap is on the reader's side rather than the writer's.
+            Value::Integer(i64::MIN),
             Value::Boolean(true),
             Value::Boolean(false),
             // Strings whose text is another type's literal: these fail the trip
@@ -8167,32 +8166,26 @@ mod tests {
         }
     }
 
-    /// The one integer the writer refuses, because the **reader** cannot take it
-    /// back: `-9223372036854775808` parses as a negation applied to
-    /// `9223372036854775808`, a magnitude that does not fit an `i64`, so the
-    /// operand is a string by the time the sign would apply and the negation
-    /// reports "expected integer". `i64::MIN + 1` and `i64::MAX` both round-trip,
-    /// which places the fault at the reader rather than in the writer.
+    /// Both ends of the integer range survive the trip.
     ///
-    /// The writer refuses anyway. Emitting text that does not read back would
-    /// break the round-trip contract for a **reachable** value — `x =
-    /// -9223372036854775807 - 1` lands on it — and a contract with one silent hole
-    /// is not one the fork value channel could build on.
-    ///
-    /// Both halves are pinned so the follow-up cannot half-land: when the parser
-    /// folds the sign into the literal, the second assertion fails, and the fix is
-    /// to delete the refusal and move `i64::MIN` into the round-trip cases above.
+    /// `i64::MIN` is the case that needed the parser fix: the magnitudes are not
+    /// symmetric, so `-9223372036854775808` has no positive counterpart, and while
+    /// the sign was applied at runtime the literal read `9223372036854775808`
+    /// first — too large for an `i64` — and failed with "expected integer". The
+    /// writer refused the value meanwhile rather than emit text that would not
+    /// read back; now that the parser folds the sign into the literal, it writes.
     #[test]
-    fn the_smallest_integer_is_refused_until_the_reader_can_take_it() {
-        assert_eq!(
-            Value::Integer(i64::MIN).to_literal(),
-            Err(crate::vars::NoLiteral::MinInteger)
-        );
+    fn both_ends_of_the_integer_range_round_trip() {
+        for value in [Value::Integer(i64::MIN), Value::Integer(i64::MAX)] {
+            assert_eq!(round_trip(&value), value, "{value:?} did not survive");
+        }
+        // The reachable route to `i64::MIN`, since it cannot be reached by typing
+        // a literal until this parses — which is exactly what was fixed.
         let mut shell = Shell::new();
         assert_eq!(
-            run_line("x = -9223372036854775808", 0, false, &mut shell),
-            Step::Continue(1),
-            "the reader now takes i64::MIN — drop the refusal and move it into the round-trip cases"
+            run_line("x = -9223372036854775807 - 1", 0, false, &mut shell),
+            Step::Continue(0)
         );
+        assert_eq!(shell.vars.get("x"), Some(&Value::Integer(i64::MIN)));
     }
 }

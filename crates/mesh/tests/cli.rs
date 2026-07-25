@@ -10695,26 +10695,65 @@ fn repr_quotes_text_that_would_otherwise_not_read_back() {
     );
 }
 
-/// `i64::MIN` is reachable by arithmetic even though it cannot be written as a
-/// literal, so `:repr` has to refuse it rather than hand back text that fails to
-/// read back. Without the refusal this is the one input that breaks the
-/// round-trip contract from inside ordinary mesh code.
+/// The smallest integer needs the sign folded into its literal, because its
+/// magnitude has no positive counterpart. Typing it, reaching it by arithmetic,
+/// and writing it back with `:repr` all have to agree.
 #[test]
-fn repr_refuses_the_smallest_integer_it_cannot_write_readably() {
+fn the_smallest_integer_is_a_literal_like_any_other() {
     let out = run_with_input(
-        "x = -9223372036854775807 - 1\n\
-         puts $x\n\
-         puts $x:repr\n",
+        "typed = -9223372036854775808\n\
+         computed = -9223372036854775807 - 1\n\
+         same = $computed == $typed\n\
+         puts $typed $computed\n\
+         puts $typed:repr\n\
+         puts $same\n\
+         big = 9223372036854775807\n\
+         puts $big\n",
     );
-    // The value itself is fine — it is only its *literal* that does not exist.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "-9223372036854775808\n"
+        "-9223372036854775808 -9223372036854775808\n\
+         -9223372036854775808\n\
+         true\n\
+         9223372036854775807\n"
     );
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("the smallest integer has no literal the parser reads back"),
-        "got {stderr}"
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The fold is narrow on purpose: it claims a bare run of digits and nothing
+/// else, so the forms that are strings or variables keep the runtime negation
+/// that type-checks them, and a magnitude too large even with a sign keeps
+/// failing loudly rather than becoming a string. Double negation still resolves
+/// at runtime, since the outer operand is no longer a bare run of digits.
+#[test]
+fn folding_the_sign_does_not_swallow_the_forms_that_are_not_literals() {
+    let out = run_with_input(
+        "n = 5\n\
+         a = -$n\n\
+         b = - -5\n\
+         e = -(-5)\n\
+         c = 3 - 5\n\
+         d = -0\n\
+         puts $a $b $c $d $e\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "-5 5 -2 0 5\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Past `i64::MIN` there is no literal to fold into, so this stays a negation
+    // over a word that is not an integer — a loud error, not the string "-9…".
+    let overflow = run_with_input("x = -99999999999999999999\nputs $x\n");
+    assert!(!overflow.status.success());
+    assert!(
+        String::from_utf8_lossy(&overflow.stderr).contains("expected integer"),
+        "got {}",
+        String::from_utf8_lossy(&overflow.stderr)
     );
 }
