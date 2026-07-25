@@ -251,7 +251,13 @@ impl JobTable {
                 job.state = JobState::Stopped(status);
                 note!("[{}] Stopped {}", job.id, job.command);
                 let id = job.id;
-                self.jobs.push(job);
+                // Back where it was, not on the end. The table's order is
+                // registration order — that is what `$sh.jobs` documents itself
+                // as publishing, and what `%prefix` reads to find the *most
+                // recently registered* matching command. Appending here made a
+                // job that had been foregrounded and stopped look like the
+                // newest one to both.
+                self.jobs.insert(index.min(self.jobs.len()), job);
                 self.mark_current(id);
                 status
             }
@@ -2505,11 +2511,82 @@ fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        JobTable, NextIn, RedirKind, RedirTarget, Redirection, SigintCatcher, initial_stdin,
-        restore_job_signals, restore_terminal_modes, run, set_foreground_group,
-        shell_stdin_is_terminal, terminal_fd, terminal_modes, with_redirections,
+        Job, JobState, JobTable, NextIn, Outcome, RedirKind, RedirTarget, Redirection,
+        SigintCatcher, initial_stdin, restore_job_signals, restore_terminal_modes, run,
+        set_foreground_group, shell_stdin_is_terminal, terminal_fd, terminal_modes,
+        with_redirections,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A resume that cannot be signalled leaves the job where it was.
+    ///
+    /// `fg` used to remove the job before signalling it and return early when
+    /// the `SIGCONT` failed, dropping it: gone from the table, unreachable by a
+    /// later `fg` or `wait`, never reaped, and with the recency sigils still
+    /// holding its id.
+    ///
+    /// The failure is deterministic here because the job is built with a process
+    /// group that no longer exists while one of its processes is still alive —
+    /// so the poll above the signal still reports it running, and the `kill` on
+    /// the group still fails. That is the shape of the race in miniature, and
+    /// the only way to hold the two apart on purpose.
+    #[test]
+    fn a_resume_that_cannot_be_signalled_keeps_its_job() {
+        // A pid that has been reaped names no process group, so signalling it
+        // fails; a live child keeps the poll from reporting the job finished.
+        let gone = unsafe { libc::fork() };
+        assert!(gone >= 0);
+        if gone == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let mut discard = 0;
+        assert_eq!(unsafe { libc::waitpid(gone, &mut discard, 0) }, gone);
+
+        let alive = unsafe { libc::fork() };
+        assert!(alive >= 0);
+        if alive == 0 {
+            // Long enough to outlive the test, and reaped by it below.
+            unsafe {
+                libc::sleep(30);
+                libc::_exit(0);
+            }
+        }
+
+        let mut table = JobTable::new();
+        for (id, pgid, pid) in [(1, gone, alive), (2, alive, alive)] {
+            table.jobs.push(Job {
+                id,
+                pgid,
+                command: format!("job {id}"),
+                outcomes: vec![Outcome::Running {
+                    pid,
+                    piped_out: false,
+                }],
+                shell_modes: None,
+                job_modes: None,
+                state: JobState::Running,
+            });
+            table.mark_current(id);
+        }
+        table.next_id = 3;
+
+        let status = table.foreground(&["1".to_owned()]);
+
+        // Reap before asserting, so a failure cannot leave the child behind.
+        unsafe {
+            libc::kill(alive, libc::SIGKILL);
+            libc::waitpid(alive, &mut discard, 0);
+        }
+
+        assert_eq!(status, 1, "a resume that cannot be signalled is a failure");
+        assert!(
+            table.index_of(1).is_some(),
+            "the job was dropped from the table"
+        );
+        // And the sigils still describe the table rather than aliasing onto the
+        // one survivor, which is how the dropped job first showed itself.
+        assert_ne!(table.by_recency(0), table.by_recency(1));
+    }
 
     /// A SIGINT delivered to *another* thread still cuts the waiter's wait short.
     ///

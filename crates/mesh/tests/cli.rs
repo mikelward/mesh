@@ -2002,6 +2002,28 @@ fn recency_survives_the_current_job_leaving() {
 }
 
 #[test]
+fn a_foregrounded_job_that_stops_again_keeps_its_place() {
+    // `%prefix` means the most recently *registered* matching command, which it
+    // reads off the table's own order. `fg` used to put a job that stopped again
+    // back on the end, so an older job could look like the newest one to
+    // `%prefix` — and to `$sh.jobs`, which documents itself as insertion-ordered.
+    //
+    // Job 1 stops at once, is foregrounded, and stops a second time; job 2 is
+    // the newer `sh`. `%sh` has to be job 2, and picking the misplaced job 1
+    // shows up as its stop status rather than an exit status.
+    let out = run_with_input(
+        "sh -c 'kill -STOP $$; kill -STOP $$; exit 1' &
+sh -c 'sleep 0.6; exit 2' &
+sleep 0.3
+fg 1
+wait %sh
+puts matched=$sh.status
+",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "matched=2\n");
+}
+
+#[test]
 fn a_percent_prefix_names_the_most_recent_matching_command() {
     // The most recent match, not the first: two jobs start with `sh`, and the
     // later one is what `%sh` means.
