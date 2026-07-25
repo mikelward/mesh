@@ -150,9 +150,8 @@ file as tasks land.
 - [x] Calling for a value — `f(arg, key: value, ...$spread)` returns the
       function's value (last expression, or an explicit `return`), with `key:`
       options binding the same parameter as `--flag`; command position (`f arg`)
-      still streams. Deferred: `:capture`, and a bare literal as an
-      implicit result (`{ 42 }` parses `42` as a command — use `return 42` or an
-      operator expression).
+      still streams. Deferred: a bare literal as an implicit result (`{ 42 }`
+      parses `42` as a command — use `return 42` or an operator expression).
 - [x] Lambdas — `func(params) { body }` as an expression yielding a function
       value, value-called through the variable it is bound to (`$double(5)`),
       reusing the whole signature grammar. Scope is a `func`'s: parameters and
@@ -160,6 +159,13 @@ file as tasks land.
       value has no text form and compares by identity. Deferred: the
       higher-order modifiers that give lambdas their main use (`:map` /
       `:filter` / `:each`), and a bare `:mod` reference as a callable.
+- [x] `f(…):capture` — the channel record (`.value` / `.out` / `.err` /
+      `.status`), as an invocation-level modifier that wraps execution, including
+      on an external (minus `.value`, positional arguments only). `.out`/`.err`
+      are the bytes as written. Deferred: the richer fields `DESIGN.md` leaves
+      open (timing, a `pipestatus` list), and true **byte**-strings — mesh has no
+      byte-string type yet, so a capture that is not valid UTF-8 is a loud error
+      rather than raw bytes.
 - [x] First `if` expression slice — command-status and value conditions, brace-delimited
       `else` / `else if`, multiline bodies, typed assignment-position results,
       and conditional list-pattern binding.

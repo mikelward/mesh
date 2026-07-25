@@ -1770,6 +1770,28 @@ fn eval_expr(
             name,
             arguments,
         } => {
+            // `:capture` is an *invocation-level* modifier, not a value one: it has
+            // to wrap execution, because by the time a value modifier saw the
+            // return value the stdout would already have streamed away — the same
+            // reason `$(…)` is a wrapper rather than a postfix (`DESIGN.md`
+            // §"Calling for a value"). So it is recognized on the call, before the
+            // call runs, rather than applied to what the call produced.
+            if name == "capture" {
+                if arguments.is_some() {
+                    return runtime_error("modifier :capture does not take arguments");
+                }
+                let E::Call {
+                    callee,
+                    arguments: call_arguments,
+                } = value.as_ref()
+                else {
+                    return runtime_error(
+                        ":capture applies to a call — write `f(…):capture`, or `$(…)` for a \
+                         command's output",
+                    );
+                };
+                return capture_call(callee, call_arguments, last, in_function, shell);
+            }
             let Some(mut value) = eval_operand(value, last, in_function, shell)? else {
                 return Ok(control_placeholder());
             };
@@ -2036,37 +2058,346 @@ fn runtime_error<T>(message: impl std::fmt::Display) -> Result<T, Step> {
     Err(runtime_message(message))
 }
 
+/// One descriptor diverted to a pipe for the duration of a capture: the pipe's
+/// read end, and the `dup` of the original to put back afterwards.
+struct Diverted {
+    reader: File,
+    /// The `dup` of the original descriptor, or `-1` once put back. A `Cell` so
+    /// restoring takes `&self`: the pipe's read end is borrowed by the draining
+    /// thread at the moment the descriptor has to go back.
+    saved: std::cell::Cell<i32>,
+    fd: i32,
+}
+
+impl Diverted {
+    /// Point `fd` at a fresh pipe, keeping a copy of what was there.
+    ///
+    /// Everything this holds is **close-on-exec**, so a command the capture runs
+    /// inherits only the standard descriptors `dup2` installs. Without that, the
+    /// backup of the real stdout is just another open descriptor in the child, and
+    /// `sh -c 'echo escaped >&5'` writes straight past the capture to the terminal;
+    /// the pipe's own read end leaks the same way. `dup2` clears the flag on the
+    /// descriptor it installs, so 0/1/2 still cross `exec` as they must.
+    fn new(fd: i32) -> io::Result<Self> {
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // `F_DUPFD_CLOEXEC` rather than `dup` + a second `fcntl`: one call, and no
+        // window where a concurrent `exec` could inherit the backup.
+        let saved = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        let read_cloexec = unsafe { libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) };
+        if saved < 0 || read_cloexec < 0 || unsafe { libc::dup2(fds[1], fd) } < 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+                if saved >= 0 {
+                    libc::close(saved);
+                }
+            }
+            return Err(error);
+        }
+        // The write end lives on only as `fd` itself; keeping this copy open would
+        // stop the reader from ever seeing EOF.
+        unsafe { libc::close(fds[1]) };
+        Ok(Self {
+            reader: unsafe { File::from_raw_fd(fds[0]) },
+            saved: std::cell::Cell::new(saved),
+            fd,
+        })
+    }
+
+    /// Put the original descriptor back. Called explicitly before the pipe is
+    /// drained, so a diagnostic raised while reading still reaches the real stderr;
+    /// `Drop` covers every path that leaves before reaching that point.
+    ///
+    /// Idempotent: `saved` is cleared, so the later `Drop` does nothing rather than
+    /// `dup2`-ing a descriptor that has already been closed.
+    fn restore(&self) {
+        let saved = self.saved.replace(-1);
+        if saved < 0 {
+            return;
+        }
+        unsafe {
+            libc::dup2(saved, self.fd);
+            libc::close(saved);
+        }
+    }
+}
+
+impl Drop for Diverted {
+    /// A capture must never leave the shell's own descriptor pointing at a pipe
+    /// with no reader — later output would be lost or fail with `EPIPE`, and the
+    /// `dup` would leak. Diverting the *second* descriptor can fail (a process near
+    /// `RLIMIT_NOFILE`), and an argument can raise control flow mid-capture, so the
+    /// restore cannot rely on reaching the end of the function.
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// Divert both of the shell's output descriptors to pipes, run `body`, and return
+/// what it produced beside the two captured streams.
+///
+/// Both pipes are drained on their own threads, which is load-bearing rather than
+/// tidy: reading them in sequence deadlocks as soon as `body` fills the 64 KiB
+/// buffer on the channel that is not being read yet.
+///
+/// The descriptors go back *before* the pipes are drained, so a diagnostic raised
+/// while reading still reaches the real stderr — and `Diverted::drop` covers the
+/// paths that leave early, including a failure to divert the second descriptor.
+fn with_channels_captured<T>(
+    shell: &mut Shell,
+    body: impl FnOnce(&mut Shell) -> T,
+) -> Result<(T, String, String), Step> {
+    let out = Diverted::new(libc::STDOUT_FILENO).map_err(runtime_message)?;
+    // Should this one fail, `out` is dropped on the way out and stdout goes back;
+    // leaving it on a pipe with no reader would lose every later write.
+    let err = Diverted::new(libc::STDERR_FILENO).map_err(runtime_message)?;
+    let mut out_reader = &out.reader;
+    let mut err_reader = &err.reader;
+    let (produced, out_read, err_read) = std::thread::scope(|scope| {
+        // A panic inside this closure — `Scope::spawn` failing when the OS refuses a
+        // thread, or the body itself — unwinds, and `thread::scope` then *joins*
+        // whichever reader already started. A reader waiting for EOF on a still-live
+        // write end would wait forever, hanging the shell. This guard is a closure
+        // local, so it drops while unwinding out of the closure, which is before
+        // that join: restoring closes the write ends and lets the join finish.
+        //
+        // The descriptors themselves cannot simply be moved in here — the readers
+        // borrow them, so their destructors may not run inside the closure — which
+        // is why the guard borrows instead. `restore` is idempotent, so this
+        // composes with the explicit call on the normal path below.
+        struct RestoreOnUnwind<'a>(&'a Diverted, &'a Diverted);
+        impl Drop for RestoreOnUnwind<'_> {
+            fn drop(&mut self) {
+                self.0.restore();
+                self.1.restore();
+            }
+        }
+        let _restore = RestoreOnUnwind(&out, &err);
+        let read_out = scope.spawn(move || {
+            let mut text = String::new();
+            out_reader.read_to_string(&mut text).map(|_| text)
+        });
+        let read_err = scope.spawn(move || {
+            let mut text = String::new();
+            err_reader.read_to_string(&mut text).map(|_| text)
+        });
+        let produced = body(shell);
+        let _ = io::stdout().flush();
+        out.restore();
+        err.restore();
+        (produced, read_out.join(), read_err.join())
+    });
+    let captured = |joined: std::thread::Result<io::Result<String>>| match joined {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(error)) => runtime_error(error),
+        Err(_) => runtime_error("capture reader panicked"),
+    };
+    Ok((produced, captured(out_read)?, captured(err_read)?))
+}
+
+/// `f(…):capture` — run the call and return a **record of every channel**:
+/// `.value` (the return value), `.out` and `.err` (its stdout / stderr), and
+/// `.status` (the exit int), per `DESIGN.md` §"Calling for a value".
+///
+/// Both descriptors are diverted for the duration, and both are drained on
+/// threads: a body that fills the 64 KiB pipe buffer on one channel would
+/// otherwise block forever while nothing was reading it.
+///
+/// `.out`/`.err` are the bytes **as written** — no trailing-newline trim, unlike
+/// `$(…)` — because the record is meant to bake in no split policy: `:lines`,
+/// `:split`, and friends are how you divide them up.
+fn capture_call(
+    callee: &parser::Expr,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    // A *command* — builtin or external — has no return value, so its record comes
+    // back without `.value`. This is the one case where a value call on a command
+    // is allowed at all, since it asks for the channel record rather than a value
+    // the command lacks.
+    let command = match callee {
+        parser::Expr::Scalar(word) => {
+            let name = word.value.text();
+            (name != "re" && shell.funcs.get(&name).is_none()).then_some(name)
+        }
+        _ => None,
+    };
+    if let Some(name) = command {
+        return capture_command(&name, arguments, last, in_function, shell);
+    }
+
+    let (outcome, out_text, err_text) = with_channels_captured(shell, |shell| {
+        eval_call(callee, arguments, last, in_function, shell)
+    })?;
+    // A runtime error in the call fails the enclosing statement, as it does for a
+    // plain value call — `:capture` observes a call's channels, it does not turn a
+    // failure into data. Its diagnostic went to the captured stderr, so it is
+    // re-reported here or it would vanish with the record.
+    let value = match outcome {
+        Ok(value) => value,
+        Err(step) => {
+            if !err_text.is_empty() {
+                note!("{}", err_text.trim_end_matches('\n'));
+            }
+            return Err(step);
+        }
+    };
+    Ok(channel_record(
+        Some(value.clone()),
+        out_text,
+        err_text,
+        status_of(&value),
+    ))
+}
+
+/// `cmd(args):capture` on a **command**: the same record minus `.value`, since
+/// there is none — reading it is then a loud no-such-field, exactly as
+/// `DESIGN.md` specifies.
+///
+/// "Command" covers a builtin as well as an external. Both are reached through
+/// `run_expanded`, the post-expansion half of `run_command`, so `puts(x):capture`
+/// runs *the builtin* rather than looking for a program called `puts` — and
+/// `pwd():capture` does not silently reach `/bin/pwd`. It also means an `exit`
+/// still leaves the shell: its `Step` unwinds out of the capture, with the
+/// descriptors put back on the way.
+///
+/// Positional arguments only. A command has no signature and no canonical
+/// named-option encoding, so a `key: value` pair or a map spread has nothing to
+/// bind to; pass the intended argv token as a positional instead.
+fn capture_command(
+    name: &str,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    // The arguments are evaluated *inside* the capture, not before it. An argument
+    // can print — `echo(side()):capture` — and `:capture` is defined over the whole
+    // invocation, so everything written while evaluating the call belongs in the
+    // record. Doing it first would put that output on the terminal and leave the
+    // record holding only the command's own, which is not what the same argument
+    // does in a captured mesh call.
+    let (outcome, out_text, err_text) = with_channels_captured(shell, |shell| {
+        let mut words = vec![name.to_string()];
+        for argument in arguments {
+            match argument {
+                parser::Argument::Positional(expression) => {
+                    let Some(value) = eval_operand(expression, last, in_function, shell)? else {
+                        return Ok(None);
+                    };
+                    words.extend(argv_words(&value, name)?);
+                }
+                parser::Argument::Spread(expression) => {
+                    let Some(value) = eval_operand(expression, last, in_function, shell)? else {
+                        return Ok(None);
+                    };
+                    match value {
+                        Value::List(values) => {
+                            for value in &values {
+                                words.extend(argv_words(value, name)?);
+                            }
+                        }
+                        _ => {
+                            return runtime_error(format!(
+                                "{name}: only a list can be spread into a command's arguments"
+                            ));
+                        }
+                    }
+                }
+                parser::Argument::Named(option, _) => {
+                    return runtime_error(format!(
+                        "{name}: `{option}:` needs a signature to bind to; an external takes \
+                         positional arguments only — pass `\"--{option}=…\"` as one"
+                    ));
+                }
+            }
+        }
+        // `run_expanded` resolves builtins → functions → external exactly as command
+        // position does. A function name cannot arrive here (the caller sent it to
+        // the value-call path), so this is a builtin or an external.
+        match run_expanded(words, last, shell) {
+            Step::Continue(status) => Ok(Some(status)),
+            // `exit` leaves the shell rather than reporting a status into a record.
+            step => Err(step),
+        }
+    })?;
+    // An argument that failed did so with its diagnostic on the captured stderr, so
+    // it is re-reported here rather than vanishing with the record — the same rule
+    // `capture_call` applies to a call that never ran.
+    let status = match outcome {
+        Ok(Some(status)) => status,
+        // Control flow is unwinding; the statement layer acts on `shell.control`.
+        Ok(None) => return Ok(control_placeholder()),
+        Err(step) => {
+            if !err_text.is_empty() {
+                note!("{}", err_text.trim_end_matches('\n'));
+            }
+            return Err(step);
+        }
+    };
+    // A nonzero exit is the point of asking, not a failure: `grep(x):capture` on no
+    // match reports status 1 in the record rather than failing the statement.
+    Ok(channel_record(None, out_text, err_text, status))
+}
+
+/// The record `:capture` returns. An ordered map, so `$r.value` / `$r.out` read it
+/// through the usual member access and a missing `.value` is the usual loud
+/// "map key not found".
+fn channel_record(value: Option<Value>, out: String, err: String, status: u8) -> Value {
+    let mut entries = Vec::with_capacity(4);
+    if let Some(value) = value {
+        entries.push(("value".to_string(), value));
+    }
+    entries.push(("out".to_string(), Value::String(out)));
+    entries.push(("err".to_string(), Value::String(err)));
+    entries.push(("status".to_string(), Value::Integer(status.into())));
+    Value::Map(entries)
+}
+
+/// The argv tokens a value contributes to an external's command line — the same
+/// bytes-only rule expansion applies, since an external takes bytes.
+fn argv_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
+    match value {
+        Value::String(text) => Ok(vec![text.clone()]),
+        Value::Integer(number) => Ok(vec![number.to_string()]),
+        Value::Boolean(flag) => Ok(vec![flag.to_string()]),
+        Value::List(_) => runtime_error(format!(
+            "{name}: a list needs `...` to become command arguments"
+        )),
+        Value::Map(_) => runtime_error(format!("{name}: a map cannot be a command argument")),
+        Value::Regex(_) | Value::Glob(_) => {
+            runtime_error(format!("{name}: a pattern cannot be a command argument"))
+        }
+        Value::Function(_) => runtime_error(format!("{name}: a function value has no text form")),
+    }
+}
+
 fn capture_source(
     source: &parser::Source,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    let mut fds = [0; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-        return runtime_error(io::Error::last_os_error());
-    }
-    let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
-    if saved < 0 || unsafe { libc::dup2(fds[1], libc::STDOUT_FILENO) } < 0 {
-        unsafe {
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-        }
-        return runtime_error(io::Error::last_os_error());
-    }
-    unsafe { libc::close(fds[1]) };
-    let mut reader = unsafe { File::from_raw_fd(fds[0]) };
+    // Diverted through the same type `:capture` uses, so the close-on-exec and
+    // always-restore guarantees hold here too: `$(sh -c 'echo escaped >&5')` wrote
+    // past the capture to the terminal while the backup of the real stdout was an
+    // inheritable descriptor.
+    let diverted = Diverted::new(libc::STDOUT_FILENO).map_err(runtime_message)?;
+    let mut reader = &diverted.reader;
     let (step, read_result) = std::thread::scope(|scope| {
-        let read = scope.spawn(|| {
+        let read = scope.spawn(move || {
             let mut output = String::new();
             reader.read_to_string(&mut output).map(|_| output)
         });
         let step = run_source(source, last, in_function, shell);
         let _ = io::stdout().flush();
-        unsafe {
-            libc::dup2(saved, libc::STDOUT_FILENO);
-            libc::close(saved);
-        }
+        diverted.restore();
         (step, read.join())
     });
     let output = match read_result {
@@ -4748,14 +5079,14 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgumentRecall, CompletionState, Invocation, MeshPrompt, PromptEvent, PromptHook, Shell,
-        StartupOptions, Step, TimestampedHistory, argument_completions, command_position,
+        ArgumentRecall, CompletionState, Diverted, Invocation, MeshPrompt, PromptEvent, PromptHook,
+        Shell, StartupOptions, Step, TimestampedHistory, argument_completions, command_position,
         command_segment_words, command_words, completed_command, eval_binary,
         expand_history_designators, expansion_word, handle_signal, help_completions,
         history_path_from, input_highlighter, interactive_keybindings, interruptible_task,
         last_argument, needs_more_input, open_history, path_completions_sync,
         persist_logical_history, prepare_history_path, run_line, run_prompt_hooks, run_source,
-        variable_completions,
+        variable_completions, with_channels_captured,
     };
     use crate::parser;
     use crate::vars::Value;
@@ -6383,5 +6714,89 @@ mod tests {
         );
         assert_eq!(run_line("setx", 0, false, &mut shell), Step::Continue(0));
         assert_eq!(shell.vars.get("x"), None);
+    }
+
+    /// A capture must never leave the shell's descriptor on a pipe with no reader:
+    /// later writes would be lost or fail with `EPIPE`, and the `dup` would leak.
+    /// Diverting the *second* descriptor can fail on its own (a process near
+    /// `RLIMIT_NOFILE`), so the restore cannot depend on reaching the end of the
+    /// capture — `Drop` has to do it.
+    #[test]
+    fn a_diverted_descriptor_goes_back_when_it_is_dropped() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        // Stand in for "the shell's stdout": a pipe whose read end we can inspect.
+        let mut original = [0; 2];
+        assert!(unsafe { libc::pipe(original.as_mut_ptr()) } >= 0);
+        let mut original_read = unsafe { std::fs::File::from_raw_fd(original[0]) };
+        let mut target = unsafe { std::fs::File::from_raw_fd(original[1]) };
+        let fd = target.as_raw_fd();
+
+        {
+            let diverted = Diverted::new(fd).expect("divert");
+            let mut writer = unsafe { std::fs::File::from_raw_fd(libc::dup(fd)) };
+            writeln!(writer, "captured").unwrap();
+            drop(writer);
+            // Left without an explicit restore, exactly as an early return would.
+            drop(diverted);
+        }
+
+        writeln!(target, "after").unwrap();
+        drop(target);
+        let mut landed = String::new();
+        original_read.read_to_string(&mut landed).unwrap();
+        assert_eq!(
+            landed, "after\n",
+            "the descriptor should be back, and only post-restore writes should land"
+        );
+    }
+
+    /// A panic inside the capture must not hang the shell. `thread::scope` joins the
+    /// readers while unwinding, and a reader waiting for EOF on a live write end
+    /// would wait forever — so the descriptors have to go back *before* that join.
+    /// A panicking body is the reachable version of `Scope::spawn` failing when the
+    /// OS refuses a thread; both unwind through the same path.
+    #[test]
+    fn a_panic_inside_a_capture_does_not_hang() {
+        // Written straight to the descriptor: this test runs under libtest, which
+        // intercepts `print!` above the fd layer, so a `print!` would never reach
+        // the pipe being tested.
+        fn write_fd(fd: i32, text: &str) {
+            unsafe {
+                libc::write(fd, text.as_ptr().cast(), text.len());
+            }
+        }
+
+        let mut shell = Shell::new();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_channels_captured(&mut shell, |_| {
+                write_fd(libc::STDOUT_FILENO, "before the panic");
+                panic!("body blew up");
+            });
+        }));
+        assert!(
+            unwound.is_err(),
+            "the panic should propagate, not be swallowed"
+        );
+
+        // Reaching here at all is the point — a hang is the failure this guards
+        // against. That the next capture still carries a write through proves the
+        // descriptors went back: one left on a reader-less pipe would lose it.
+        //
+        // `contains`, not `==`: this diverts the *process-wide* stdout while libtest
+        // runs other tests on other threads, so anything they write lands in the
+        // capture too. Asserting equality passed locally and failed in CI on a
+        // neighbour's progress line. The exact bytes are pinned by
+        // `a_diverted_descriptor_goes_back_when_it_is_dropped`, which owns its
+        // descriptor and cannot race.
+        let mut shell = Shell::new();
+        let (_, out, err) = with_channels_captured(&mut shell, |_| {
+            write_fd(libc::STDOUT_FILENO, "after-the-panic");
+            write_fd(libc::STDERR_FILENO, "err-after-the-panic");
+        })
+        .expect("capture again");
+        assert!(out.contains("after-the-panic"), "{out:?}");
+        assert!(err.contains("err-after-the-panic"), "{err:?}");
     }
 }
