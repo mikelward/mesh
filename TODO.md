@@ -66,15 +66,16 @@ file as tasks land.
       disagree); `<< 'END'` is raw. The body reaches the command as an unlinked
       temporary file rather than a pipe, so a body larger than the pipe buffer
       cannot deadlock the shell, and a line-at-a-time reader waits for the
-      delimiter directly rather than re-parsing the body per line. Deferred:
-      backgrounding a heredoc, and the value-producing spelling (still
-      unspecified — see the design entry below).
+      delimiter directly rather than re-parsing the body per line. Backgrounding
+      one works too, since the stage writes the temporary in its own process.
+      Deferred: the value-producing spelling (still unspecified — see the design
+      entry below).
 - [x] Here-strings: `cmd <<< word` feeds the expanded word plus a trailing
       newline, bash's behavior. The word expands like any other argument and
       must come to exactly one, the rule every redirection target follows; it
       travels by the same unlinked temporary file a heredoc body uses. `<<<`
-      names no descriptor, and backgrounding one is refused for the reason a
-      heredoc's is.
+      names no descriptor, and backgrounding one works for the reason a
+      heredoc's does.
 - [x] Fork-based executor and process groups (`fork`/`exec`, `setpgid`,
       `tcsetpgrp`) so mesh can own the terminal and manage foreground jobs.
 - [x] Signal handling: terminal signals target the foreground process group;
@@ -450,34 +451,24 @@ of each PR had landed by another route, but these pieces had not.
       and whether it gets a `$sh.options.bold-input` off switch — is written down
       nowhere.
 
-## Redirection: one source-ordered pass
+## Redirection: one source-ordered pass ✅ (done)
 
-The three items below are the same change seen from three sides, and doing them
-together is much cheaper than one at a time. Sequence: (1) unblocks (2), and (3)
-is independent but touches the same file.
+Three sides of one change, done together. What each closed is written up in the
+entries below, which is where the reasoning now lives.
 
-- [x] **1. Merge `open_paths` and `resolve_sources` into one walk** — *done*, as
-      `resolve_redirs`: each redirection, as the walk reaches it, does its own
+- [x] **1. Merge `open_paths` and `resolve_sources` into one walk** — as
+      `resolve_redirs`: each redirection, where the walk reaches it, does its own
       limit check and then opens its path or **performs** its duplication. The
       per-stage thread is kept, so the seed each stage starts from is built up
-      front. Closed the `EMFILE` ordering case and the limit pre-pass case below.
-- [x] **2. Resolve a background stage's destinations without opening** — *done*.
-      The syntactic `stdout_is_redirected` scan is gone; a background stage takes
-      the same walk in `Acquire::Deferred` mode, which opens nothing and
-      duplicates nothing (those belong to the child) and reports only where each
-      descriptor lands. Closed both spellings of the lost-pipe case below.
-      `piped_out` follows that answer, so a `SIGPIPE` from a stage whose stdout
-      really ends on a file still counts.
-- [ ] **3. Spawn externals with `fork` + `execvp` instead of `Command`.**
-      `Command::spawn` makes a private close-on-exec pipe for the child to report
-      `exec` failures on; it takes a low descriptor, and the hook that installs
-      descriptors above 2 overwrites it, so `mesh_no_such_command 4> out` writes
-      a binary error packet into `out` and exits 1 instead of 127 with no
-      diagnostic. `std` exposes no way to see or reserve that descriptor, and
-      `pre_exec` runs after the pipe already exists. `execvp` sets `errno`, so
-      the child reports 126/127 itself and no private pipe is involved. Carries
-      process groups, `restore_job_signals` / `set_foreground_group`, and the
-      `Stdio` wiring with it.
+      front.
+- [x] **2. Resolve a background stage's destinations without opening** — the
+      same walk in `Acquire::Deferred` mode, which opens nothing and duplicates
+      nothing (those belong to the child) and reports only where each descriptor
+      lands. The syntactic `stdout_is_redirected` scan is gone.
+- [x] **3. Spawn externals with `fork` + `execvp` instead of `Command`** —
+      through the same `fork_stage` an in-shell stage uses, so a stage that
+      cannot `exec` reports 126/127 from its own process. Took the
+      `--mesh-background-redirect` helper with it.
 
 ## Redirection edge cases
 
@@ -486,17 +477,22 @@ needs a descriptor above 2, a resource limit, or a failed `exec` to reach, so
 none affects a redirection that worked before that change. Every one below was
 reproduced against the built binary and compared with bash.
 
-- [ ] **A failed `exec` writes into the redirection target.** `mesh_no_such_command
-      4> out` puts Rust's binary `NOEX` packet into `out` and exits 1 instead of
-      127, with no `command not found`. `Command::spawn` makes a private
-      close-on-exec pipe for the child to report `exec` failures on, it takes a
-      low descriptor, and the hook that installs descriptors above 2 overwrites
-      it; `std` exposes no way to see or reserve that descriptor, and `pre_exec`
-      runs after the pipe already exists. The fix is to `fork` and `execvp`
-      directly for these stages, as `fork_in_shell` already does for in-shell
-      ones — `execvp` sets `errno`, so the child reports 126/127 itself and no
-      private pipe is involved. Carries process groups, the interactive
-      signal/terminal hooks and the `Stdio` wiring with it.
+All but the last are now fixed; the fixed entries are kept for the reasoning,
+and the open one is at the bottom.
+
+- [x] **A failed `exec` writes into the redirection target** — *fixed*.
+      `Command::spawn`'s private close-on-exec error pipe took a low descriptor
+      and the hook that installs descriptors above 2 overwrote it, so
+      `mesh_no_such_command 4> out` put Rust's binary `NOEX` packet into `out`
+      and exited 1. External stages now `fork` and `execvp` themselves through
+      the same `fork_stage` an in-shell stage uses, so the child reports 126/127
+      from its own process and no private pipe is involved. Two consequences
+      worth knowing: the report now goes to *the stage's* stderr, as bash's does
+      (`missing 2> log` logs it), and the re-executed
+      `--mesh-background-redirect` helper is gone — a forked child can open its
+      own targets after the parent has moved on, which is all the helper existed
+      to provide. That also lifts the refusal to background a heredoc or
+      here-string, whose body no longer has to travel as argv.
 - [x] **A backgrounded in-shell stage loses its pipe** — *fixed*.
       `stdout_is_redirected` scanned `cmd.redirs` for anything targeting fd 1, so
       it tripped on the `>` in `f 3>&1 > file 1>&3 | tr a-z A-Z &` and in

@@ -284,6 +284,54 @@ fn missing_command_reports_127() {
 }
 
 #[test]
+fn a_failed_exec_reports_itself_rather_than_writing_to_a_target() {
+    // `Command::spawn` makes a private close-on-exec pipe for the child to
+    // report an `exec` failure on. It takes a low descriptor, and installing a
+    // stage's own descriptors overwrote it: `missing 4> out` put Rust's binary
+    // error packet into `out` and exited 1, with no `command not found`. The
+    // stage `execvp`s itself now, so it reports 126/127 from its own process and
+    // there is no private pipe to clobber.
+    let dir = fresh_dir("exec_failure");
+    let out = run_with_input(&format!(
+        "this_command_does_not_exist_42 4> {}\nputs after\n",
+        dir.join("target.txt").to_string_lossy()
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("command not found"), "{stderr}");
+    assert_eq!(
+        std::fs::read(dir.join("target.txt")).unwrap_or_default(),
+        b"",
+        "the failure was written into the redirection target"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // Reported by the stage, so its own redirections apply to the report — the
+    // same place bash puts it.
+    let out = run_with_input(&format!(
+        "this_command_does_not_exist_42 2> {}\nputs after\n",
+        dir.join("log.txt").to_string_lossy()
+    ));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(dir.join("log.txt"))
+            .unwrap_or_default()
+            .contains("command not found"),
+        "the redirection did not carry the report"
+    );
+
+    // A file that exists but cannot be executed is `126`, still from the stage.
+    let unrunnable = dir.join("unrunnable");
+    std::fs::write(&unrunnable, "not executable\n").expect("write the file");
+    let out = run_with_input(&format!("{}\n", unrunnable.to_string_lossy()));
+    assert_eq!(out.status.code(), Some(126), "{:?}", out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn exit_status_propagates() {
     let out = run_with_input("exit 3\n");
     assert_eq!(out.status.code(), Some(3));
@@ -2006,9 +2054,9 @@ fn a_redirected_stage_still_reports_its_own_sigpipe() {
             dir.display()
         )
     };
-    // Both stage kinds defer their opens when backgrounded — the in-shell one to
-    // its fork, the external one to the re-executed helper — so both have to read
-    // fd 1's fate from the redirections rather than from an opened file.
+    // Both stage kinds defer their opens when backgrounded — each to its own
+    // fork — so both have to read fd 1's fate from the redirections rather than
+    // from an opened file.
     for (label, stage) in [("function", "dies"), ("external", "sh -c 'kill -PIPE $$'")] {
         // Foreground: the shell's exit status is the pipeline's.
         let foreground = run_with_input(&script(stage, ""));
@@ -2062,8 +2110,8 @@ fn backgrounding_keeps_a_pipe_the_redirections_leave_on_it() {
     // belong to the child) and asks where they leave the pipe.
     let dir = fresh_dir("background_kept_pipe");
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
-    // Both stage kinds: an in-shell function, which opens its targets in its own
-    // fork, and an external, which defers them to the re-executed helper.
+    // Both stage kinds: an in-shell function and an external, each of which
+    // opens its targets in its own fork.
     for (label, low, quiet) in [
         ("function", "low", "quiet"),
         ("external", "sh -c 'echo low'", "sh -c 'echo low >&2'"),
@@ -2141,9 +2189,9 @@ fn backgrounding_a_stage_does_not_move_its_piped_stderr() {
     // stderr on the pipe and silently reroute the data.
     let dir = fresh_dir("background_pipe_stderr");
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
-    // Both stage kinds: an in-shell function, which opens its targets in its own
-    // fork, and an external, which defers them to the re-executed helper. The
-    // merge has to happen after the targets in each.
+    // Both stage kinds: an in-shell function and an external, each of which
+    // opens its targets in its own fork. The merge has to happen after the
+    // targets in each.
     for (label, stage) in [
         ("function", "both"),
         ("external", "sh -c 'echo out; echo err >&2'"),
@@ -2447,8 +2495,9 @@ fn stderr_redirection_reaches_in_shell_commands_too() {
 
 #[test]
 fn a_background_command_can_redirect_stderr() {
-    // The background path defers its opens to a re-executed helper, so the
-    // descriptor has to survive that argv hand-off as well as the direction does.
+    // The background path opens its targets in the forked child rather than in
+    // the shell, so the descriptor has to survive that hand-off as well as the
+    // direction does.
     let dir = fresh_dir("redir_stderr_background");
     let err = dir.join("bg.txt");
     let out = run_with_input(&format!(
@@ -3108,6 +3157,9 @@ fn a_background_fifo_redirect_does_not_block_the_shell() {
 
 #[test]
 fn a_background_redirect_does_not_require_sh_on_path() {
+    // A background stage opens its own targets after the fork, which must not
+    // cost a wrapper executable to be found: nothing here is reachable through
+    // `PATH` except the command the user actually named.
     let dir = fresh_dir("background_redirect_path");
     let output = dir.join("out");
     let mut child = mesh_command()
@@ -3133,11 +3185,12 @@ fn a_background_redirect_does_not_require_sh_on_path() {
 fn a_failed_background_redirect_reports_mesh_status_one() {
     let dir = fresh_dir("background_redirect_failure");
     let missing = dir.join("missing/out");
-    // The redirect helper is a separate process writing to the same stderr as the
-    // shell's job notices, so assert on whole *lines*: a non-atomic write splices
-    // the two together (`mesh: [1] 4242` + an orphaned remainder) and a plain
-    // `contains` on a prefix would still pass. Repeat the run because the splice
-    // needs the two writers to overlap, which only happens under contention.
+    // The stage reports its own failure, from a process writing to the same
+    // stderr as the shell's job notices, so assert on whole *lines*: a
+    // non-atomic write splices the two together (`mesh: [1] 4242` + an orphaned
+    // remainder) and a plain `contains` on a prefix would still pass. Repeat the
+    // run because the splice needs the two writers to overlap, which only
+    // happens under contention.
     for _ in 0..5 {
         let out = run_with_input(&format!(
             "/bin/echo ok > {} &\n/bin/sleep 0.05\njobs\n",
@@ -3332,18 +3385,24 @@ fn only_a_lone_numeral_becomes_a_value() {
     // unconsumed and turn a command that runs today into a syntax error — which
     // rejects the whole script, a much bigger change than the diagnostic it
     // replaced.
-    for piped in ["42 | cat", "42 |& cat"] {
+    //
+    // The diagnostic comes from the stage's own process, after its redirections
+    // have been applied, so `|&` carries it into the pipe and it arrives on
+    // stdout — which is where bash puts it too.
+    for (piped, reported_on_stdout) in [("42 | cat", false), ("42 |& cat", true)] {
         let out = run_with_input(&format!("{piped}\nputs after\n"));
         let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let reported = if reported_on_stdout { &stdout } else { &stderr };
         assert!(
-            stderr.contains("command not found: 42"),
-            "{piped}: {stderr:?}"
+            reported.contains("command not found: 42"),
+            "{piped}: {reported:?}"
         );
         assert!(
             !stderr.contains("syntax error"),
             "{piped} must stay a pipeline: {stderr:?}"
         );
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{piped}");
+        assert!(stdout.ends_with("after\n"), "{piped}: {stdout:?}");
     }
 
     // The separators an expression statement *can* take are unaffected: 42 is a
@@ -8785,20 +8844,6 @@ fn a_long_heredoc_body_is_read_in_linear_time() {
 }
 
 #[test]
-fn backgrounding_a_heredoc_is_refused_rather_than_truncated() {
-    // A background external defers its opens to a helper reached through argv,
-    // and a body cannot travel that way: a large one exceeds the argument limit
-    // and an embedded NUL cannot be represented at all.
-    let out = run_with_input("cat << END &\nbody\nEND\nputs after\n");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("backgrounded"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
-}
-
-#[test]
 fn concurrent_heredocs_get_distinct_temporary_files() {
     // Stages open their redirections concurrently, and empty bodies gave no
     // distinguishing information of their own, so the names have to be unique by
@@ -8932,22 +8977,28 @@ fn a_here_string_cannot_name_another_descriptor() {
 }
 
 #[test]
-fn backgrounding_a_here_string_is_refused_rather_than_truncated() {
-    // Same reason as a heredoc: a background external's redirections are opened
-    // by a helper reached through argv, which arbitrary text cannot travel
-    // through. The message names the spelling the user actually wrote.
-    let out = run_with_input("cat <<< body &\nputs after\n");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("here-string cannot be backgrounded"),
-        "{stderr}"
-    );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+fn input_text_can_be_backgrounded() {
+    // Refused while a background external's targets were opened by a helper
+    // process reached through argv: arbitrary text cannot travel that way — a
+    // body past the argument limit, an embedded NUL. The stage forks and
+    // `execvp`s itself now, so the body reaches its own process as memory and
+    // the temporary is written there.
+    for spelling in ["cat <<< body &", "cat << END &\nbody\nEND"] {
+        let out = run_with_input(&format!("{spelling}\nsleep 0.3\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "body\n",
+            "{spelling}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 
-    // The heredoc wording is still its own, not swallowed by the shared check.
-    let out = run_with_input("cat << END &\nbody\nEND\nputs after\n");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("heredoc cannot be backgrounded"),
+    // Including a body no argument list could have carried.
+    let body = "x".repeat(200_000);
+    let out = run_with_input(&format!("sh -c 'wc -c' << END &\n{body}\nEND\nsleep 0.4\n"));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "200001",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

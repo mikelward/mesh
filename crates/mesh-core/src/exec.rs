@@ -9,8 +9,6 @@ use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::os::fd::FromRawFd;
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,28 +328,102 @@ pub fn run(words: &[String], jobs: &mut JobTable) -> u8 {
     .status
 }
 
-/// Run one in-shell stage — a builtin or a function — in a forked child.
+/// What a forked stage does once its descriptors are in place.
+enum StageBody<'a> {
+    /// Replace the child with an external command.
+    ///
+    /// `execvp` rather than `Command::spawn`: `spawn` makes a private
+    /// close-on-exec pipe for the child to report an `exec` failure on, it takes
+    /// a low descriptor, and installing this stage's own descriptors overwrote
+    /// it — `mesh_no_such_command 4> out` put Rust's binary error packet into
+    /// `out` and exited 1 instead of reporting `command not found` and 127.
+    /// `std` exposes no way to see or reserve that descriptor, and `pre_exec`
+    /// runs after the pipe already exists. `execvp` sets `errno` instead, so the
+    /// child reports 126/127 itself and no private pipe is involved.
+    Exec(Program),
+    /// A builtin or a function, run by this copy of the shell.
+    ///
+    /// A pipeline's stages have to run **concurrently**: an upstream stage that
+    /// writes more than the pipe buffer blocks until a downstream reader drains
+    /// it, so running a builtin to completion in the shell and handing its
+    /// output on would deadlock on anything larger than 64 KiB (and could never
+    /// express `yes | head`). Forking gives the stage its own process, exactly
+    /// as an external command gets, at the cost POSIX shells already pay: state
+    /// a piped builtin changes — a `cd`, an assignment — is confined to that
+    /// child, as in bash.
+    InShell {
+        index: usize,
+        jobs: &'a mut JobTable,
+        run: &'a mut dyn FnMut(usize, &Cmd, &mut JobTable) -> u8,
+    },
+}
+
+/// A command's path and argv as `execvp` wants them, converted **before** the
+/// fork: `CString::new` allocates, and a forked child must not.
+struct Program {
+    /// Owns what `argv` points into. Never read directly.
+    _words: Vec<std::ffi::CString>,
+    /// `argv[0]` is the program, and the list is NULL-terminated.
+    argv: Vec<*const libc::c_char>,
+}
+
+impl Program {
+    /// Fails on an interior NUL, which `execvp` could not express — the same
+    /// `InvalidInput` `Command::spawn` gave it — and on an empty `words`, which
+    /// the caller already rules out but which would leave no `argv[0]` to pass.
+    fn new(words: &[String]) -> std::io::Result<Self> {
+        if words.is_empty() {
+            return Err(std::io::Error::from(ErrorKind::InvalidInput));
+        }
+        let converted = words
+            .iter()
+            .map(|word| std::ffi::CString::new(word.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?;
+        let mut argv: Vec<*const libc::c_char> =
+            converted.iter().map(|word| word.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        Ok(Self {
+            _words: converted,
+            argv,
+        })
+    }
+
+    /// Replace this process with the command, or return why it could not.
+    ///
+    /// # Safety
+    /// Only after `fork`, in the child: on success nothing of this process
+    /// survives, and on failure the caller must `_exit` rather than return into
+    /// the shell's copy of itself.
+    unsafe fn exec(&self) -> std::io::Error {
+        // SAFETY: `argv` holds at least the program and a NULL terminator, and
+        // every pointer in it is owned by `_words`, which outlives this call.
+        unsafe { libc::execvp(self.argv[0], self.argv.as_ptr()) };
+        std::io::Error::last_os_error()
+    }
+}
+
+/// Run one pipeline stage in a forked child, with every descriptor it takes
+/// installed before its body starts.
 ///
-/// A pipeline's stages have to run **concurrently**: an upstream stage that
-/// writes more than the pipe buffer blocks until a downstream reader drains it,
-/// so running a builtin to completion in the shell and handing its output on
-/// would deadlock on anything larger than 64 KiB (and could never express `yes |
-/// head`). Forking gives the stage its own process, exactly as an external
-/// command gets, at the cost POSIX shells already pay: state a piped builtin
-/// changes — a `cd`, an assignment — is confined to that child, as in bash.
+/// Both stage kinds fork: an external command so that the child can `execvp`
+/// itself and report its own failure, and a builtin or function so that the
+/// stages of a pipeline run concurrently. What differs is only what runs after
+/// the descriptors are in place — see [`StageBody`].
 ///
 /// Returns the child pid and, when this stage pipes onward, the read end for the
 /// next stage.
 #[allow(clippy::too_many_arguments)]
-fn fork_in_shell(
+fn fork_stage(
     cmd: &Cmd,
     is_last: bool,
     incoming: NextIn,
     in_file: Option<File>,
     out_file: Option<File>,
     mut err_file: Option<File>,
-    // Descriptors above the standard three, installed by the child itself since
-    // there is no `Stdio` slot to hand them to.
+    // Descriptors above the standard three, carried separately only because the
+    // three below are named individually; the child installs all of them
+    // together.
     mut extra_files: Vec<(libc::c_int, File)>,
     // Descriptors that resolved to this stage's outgoing pipe but are not the
     // stdout or stderr that carry it. Each is given its own handle on the write
@@ -370,9 +442,7 @@ fn fork_in_shell(
     interactive: bool,
     background: bool,
     process_group: Option<libc::pid_t>,
-    index: usize,
-    jobs: &mut JobTable,
-    run: &mut dyn FnMut(usize, &Cmd, &mut JobTable) -> u8,
+    body: StageBody<'_>,
 ) -> std::io::Result<(libc::pid_t, bool, Option<File>)> {
     use std::io::Write;
 
@@ -411,9 +481,13 @@ fn fork_in_shell(
     // from inheriting it and printing a duplicate.
     let _ = std::io::stdout().flush();
 
-    // SAFETY: fork has no arguments. The child touches only async-signal-safe
-    // syscalls before running the stage, and leaves via `_exit` so no destructor
-    // (notably `JobTable`'s, which signals jobs) runs twice.
+    // SAFETY: fork has no arguments. The child installs its descriptors with
+    // async-signal-safe calls alone, and leaves via `_exit` so no destructor
+    // (notably `JobTable`'s, which signals jobs) runs twice. What follows the
+    // installs — a background stage's own opens, a stage body, a report of a
+    // failed `execvp` — does allocate, which is the same bar a forked builtin
+    // has always run under: mesh only forks from its execution loop, and the
+    // threads that resolve a pipeline's redirections are joined before it.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error());
@@ -425,9 +499,9 @@ fn fork_in_shell(
         unsafe {
             // Rust sets SIGPIPE to SIG_IGN at startup, so a write to a closed
             // pipe would return EPIPE here and the stage would report a failure
-            // instead of dying quietly. `Command` restores the default for an
-            // external child; do the same, so `f | head -3` ends the way the
-            // pipefail rule assumes — killed by SIGPIPE, and not counted.
+            // instead of dying quietly. Restoring the default here is what makes
+            // `f | head -3` end the way the pipefail rule assumes — killed by
+            // SIGPIPE, and not counted.
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             if (interactive || background) && !in_forked_stage() {
                 libc::setpgid(0, process_group.unwrap_or(0));
@@ -439,9 +513,9 @@ fn fork_in_shell(
                 }
             }
             // Every descriptor this stage takes, installed together so none can
-            // overwrite a handle another still needs — the standard three have
-            // no `Stdio` slot here either, this being a fork rather than a
-            // spawn. `install_descriptors` closes each original as it goes,
+            // overwrite a handle another still needs — the standard three
+            // included, this being a fork rather than a spawn.
+            // `install_descriptors` closes each original as it goes,
             // which matters most for a stage that never `exec`s: a second handle
             // on the outgoing pipe would outlive it and keep a reader waiting.
             let mut installs: Vec<(libc::c_int, File)> = Vec::new();
@@ -460,8 +534,12 @@ fn fork_in_shell(
             }
 
             // A background stage's own targets are opened *here*, in the child,
-            // as the external path defers them to its helper — so a FIFO open
-            // cannot block the shell before the job is registered.
+            // rather than in the shell — so a FIFO open cannot block the shell
+            // before the job is registered. Forking ourselves is what makes that
+            // possible for an external stage too: `Command::spawn` waits for the
+            // child to reach `exec`, so a blocking open in a `pre_exec` hook
+            // would block the shell after all, which is why these opens used to
+            // need a re-executed helper process to happen in.
             //
             // Opened after the installs above, not before, because resolution
             // duplicates from the descriptors as they *now* stand: `|&` is a
@@ -493,10 +571,24 @@ fn fork_in_shell(
                 }
             }
         }
-        // From here on this process is not the interactive shell: it owns none of
-        // the shell's jobs and must not take the terminal for anything it runs.
-        mark_forked_stage();
-        let code = run(index, cmd, jobs);
+        let code = match body {
+            StageBody::Exec(program) => {
+                // SAFETY: this is the child of a successful fork, and the only
+                // thing after a failed `execvp` is reporting it and `_exit`.
+                let error = unsafe { program.exec() };
+                // The report goes to *this stage's* stderr, wherever its
+                // redirections put it, which is where bash puts it too:
+                // `nosuchcmd 2> log` leaves nothing on the terminal.
+                spawn_error_code(&cmd.words[0], &error)
+            }
+            StageBody::InShell { index, jobs, run } => {
+                // From here on this process is not the interactive shell: it owns
+                // none of the shell's jobs and must not take the terminal for
+                // anything it runs.
+                mark_forked_stage();
+                run(index, cmd, jobs)
+            }
+        };
         let _ = std::io::stdout().flush();
         // SAFETY: `_exit` ends the child without unwinding or running atexit
         // handlers, which belong to the parent's copy of the shell.
@@ -525,9 +617,8 @@ enum NextIn {
     /// EOF (`/dev/null`): the previous stage sent its stdout elsewhere (a
     /// redirect) or failed to spawn, so there is no producer for this stage.
     Null,
-    /// The previous stage's stdout, piped in. Held as a `File` rather than a
-    /// `Stdio` because an in-shell stage runs in a fork and needs the raw
-    /// descriptor to `dup2`; `Stdio` is one-way.
+    /// The previous stage's stdout, piped in. Held as a `File` because every
+    /// stage runs in a fork and installs the descriptor itself, with `dup2`.
     Pipe(File),
 }
 
@@ -645,7 +736,6 @@ pub fn run_pipeline(
         // one reading `/dev/null` rather than the shell's stdin.
         let incoming = std::mem::replace(&mut next_stdin, NextIn::Null);
 
-        let redirs = staged_redirs(&cmd, is_last);
         let mut sources = match redir_result {
             // A background stage applies its own redirections after the fork and
             // reports its own failure from there, where the redirection actually
@@ -677,8 +767,8 @@ pub fn run_pipeline(
         // that walk reads the descriptors the shell handed it.
         let mut closed: Vec<libc::c_int> = Vec::new();
         let (mut in_file, mut out_file, mut err_file) = (None, None, None);
-        // Anything above the standard three is carried separately and installed
-        // in the child, since only these have a `Stdio` slot to be handed to.
+        // Anything above the standard three is carried separately, only because
+        // the three below are named individually.
         let mut extra_files: Vec<(libc::c_int, File)> = Vec::new();
         if background {
             // The stage redoes this walk for itself, from the descriptors the
@@ -724,257 +814,57 @@ pub fn run_pipeline(
             }
         }
 
-        if cmd.in_shell {
-            match fork_in_shell(
-                &cmd,
-                is_last,
-                incoming,
-                in_file,
-                out_file,
-                err_file,
-                extra_files,
-                extra_pipe_out,
-                stdout_to_pipe,
-                closed.clone(),
-                interactive,
-                background,
-                process_group,
-                idx,
-                jobs,
-                run_in_shell,
-            ) {
-                Ok((pid, piped_out, read_end)) => {
-                    if (interactive || background) && !forked {
-                        let pgid = process_group.unwrap_or(pid);
-                        process_group = Some(pgid);
-                        // Repeat setpgid in the parent to close the race with the
-                        // child's own call, exactly as the spawn path does.
-                        // SAFETY: scalar arguments; `pid` came from a successful fork.
-                        unsafe {
-                            libc::setpgid(pid, pgid);
-                        }
-                    }
-                    if let Some(read) = read_end {
-                        next_stdin = NextIn::Pipe(read);
-                    }
-                    outcomes.push(Outcome::Running { pid, piped_out });
-                }
-                Err(err) => {
-                    note!("mesh: {}: {err}", cmd.words[0]);
-                    outcomes.push(Outcome::Failed(1));
-                }
+        let body = if cmd.in_shell {
+            StageBody::InShell {
+                index: idx,
+                jobs: &mut *jobs,
+                run: &mut *run_in_shell,
             }
-            continue;
-        }
-
-        // The *staged* list, not `cmd.redirs`: a bare `f |& g &` has no
-        // redirections of its own and still has the `2>&1` to apply.
-        let mut command = if background && !redirs.is_empty() {
-            match background_redirect_command(&cmd, &redirs) {
-                Ok(command) => command,
-                Err((path, err)) => {
-                    note!("mesh: {path}: {err}");
-                    outcomes.push(Outcome::Failed(1));
+        } else {
+            match Program::new(&cmd.words) {
+                Ok(program) => StageBody::Exec(program),
+                Err(error) => {
+                    outcomes.push(Outcome::Failed(spawn_error_code(&cmd.words[0], &error)));
                     continue;
                 }
             }
-        } else {
-            let mut command = Command::new(&cmd.words[0]);
-            command.args(&cmd.words[1..]);
-            command
         };
-        if (interactive || background) && !forked {
-            // A zero process group makes the first child a group leader. Later
-            // stages join it, so terminal signals address the entire pipeline.
-            command.process_group(process_group.unwrap_or(0));
-        }
-        if interactive {
-            // The interactive shell ignores terminal-generated signals while
-            // it owns the prompt. Restore them only in children of that mode;
-            // a non-interactive invocation must preserve its caller's choices.
-            // Hand off the terminal before exec so a newly started program
-            // cannot race ahead and receive SIGTTIN.
-            unsafe {
-                if background {
-                    command.pre_exec(restore_job_signals);
-                } else {
-                    command.pre_exec(|| {
-                        restore_job_signals()?;
-                        set_foreground_group(libc::getpgrp());
-                        Ok(())
-                    });
-                }
-            }
-        }
-
-        // stdin: an input redirection wins over the incoming pipe/EOF/terminal.
-        if let Some(file) = in_file {
-            command.stdin(file);
-        } else {
-            match incoming {
-                NextIn::Inherit => {}
-                NextIn::Null => {
-                    command.stdin(Stdio::null());
-                }
-                NextIn::Pipe(prev) => {
-                    command.stdin(Stdio::from(prev));
-                }
-            }
-        }
-
-        // stdout: an output redirection wins over the pipe to the next stage;
-        // otherwise pipe to the next stage; otherwise inherit (only the last).
-        //
-        // stdout is decided *first* because `|&` is `2>&1` appended after the
-        // command's own redirections (`DESIGN.md`), so it copies wherever stdout
-        // finally points: `> out |&` takes stderr to the file and leaves the next
-        // stage empty, and `2> log |&` loses the log to the pipe. Deciding stderr
-        // first — a combined pipe that `2>` then overrode — gave the opposite
-        // answer in both cases, and disagreed with an in-shell stage, which
-        // dup2s in this order.
-        // Stderr ends on this stage's pipe alongside stdout either because `|&`
-        // asked for it or because a duplication resolved it there while stdout was
-        // still the pipe. `2>&1 > f` is the case that is *not* this: stderr took
-        // the pipe and stdout then moved to a file, so only stderr keeps it.
-        let mut piped_out = false;
-        let mut combined_pipe = None;
-        // The write end, kept in hand whenever more than stdout needs a handle
-        // on the pipe. `Stdio::piped()` would make one this loop cannot reach.
-        let mut pipe_write = None;
-        // A descriptor above the standard slots claimed the pipe, so the pipe has
-        // to exist even when stdout went elsewhere.
-        let extras_on_pipe = !is_last && !extra_pipe_out.is_empty();
-        if let Some(file) = out_file {
-            if extras_on_pipe {
-                // `2>&1 > f |`: stdout goes to the file, but another descriptor
-                // already took the pipe, so it still has to exist and feed the
-                // next stage.
-                let (read, write) = match new_pipe() {
-                    Ok(pair) => pair,
-                    Err(error) => {
-                        note!("mesh: pipe: {error}");
-                        outcomes.push(Outcome::Failed(1));
-                        continue;
-                    }
-                };
-                pipe_write = Some(write);
-                combined_pipe = Some(read);
-                piped_out = true;
-            }
-            command.stdout(file);
-        } else if !is_last && stdout_to_pipe {
-            if extras_on_pipe {
-                // Own the pipe rather than letting `Stdio::piped()` make it, so
-                // every descriptor that resolved to it can be given the write end.
-                let (read, write) = match new_pipe().and_then(|(read, write)| {
-                    let clone = write.try_clone()?;
-                    Ok((read, write, clone))
-                }) {
-                    Ok((read, write, clone)) => {
-                        pipe_write = Some(clone);
-                        (read, write)
-                    }
-                    Err(error) => {
-                        note!("mesh: pipe: {error}");
-                        outcomes.push(Outcome::Failed(1));
-                        continue;
-                    }
-                };
-                command.stdout(write);
-                combined_pipe = Some(read);
-            } else {
-                command.stdout(Stdio::piped());
-            }
-            piped_out = true;
-        } else if extras_on_pipe {
-            // Stdout moved off the pipe without becoming a file (`1<&0 3>&1 |`),
-            // yet fd 3 still holds it and the next stage still has to be fed.
-            match new_pipe() {
-                Ok((read, write)) => {
-                    pipe_write = Some(write);
-                    combined_pipe = Some(read);
-                    piped_out = true;
-                }
-                Err(error) => {
-                    note!("mesh: pipe: {error}");
-                    outcomes.push(Outcome::Failed(1));
-                    continue;
-                }
-            }
-        }
-        if let Some(write) = &pipe_write {
-            match extra_pipe_out.handles(write) {
-                Ok(copies) => extra_files.extend(copies),
-                Err(error) => {
-                    note!("mesh: pipe: {error}");
-                    outcomes.push(Outcome::Failed(1));
-                    continue;
-                }
-            }
-        }
-
-        // stderr: whatever resolution said, `|&` included — it is an ordinary
-        // `2>&1` in the list now, so nothing here has to know about it.
-        if let Some(file) = err_file {
-            command.stderr(file);
-        }
-
-        // Descriptors with no `Stdio` slot are installed by the child itself
-        // between fork and exec, which is after the standard three are in place.
-        // The files move into the closure, which is what keeps them open until
-        // then; `dup2` clears `FD_CLOEXEC` on the descriptor it creates, so they
-        // survive the exec that the originals would not.
-        if !extra_files.is_empty() || !closed.is_empty() {
-            // Taken on the first call so the hook owns the handles and can close
-            // each original once it is copied. `pre_exec` runs once.
-            let mut pending = Some(extra_files);
-            let closing = closed.clone();
-            // SAFETY: `install_descriptors` uses only `fcntl`, `dup2` and
-            // `close`, all async-signal-safe, and allocates nothing — the bar
-            // `pre_exec` sets, since the child may fork while another thread
-            // holds the allocator.
-            unsafe {
-                command.pre_exec(move || {
-                    if let Some(files) = pending.take() {
-                        install_descriptors(files, &closing)?;
-                    }
-                    Ok(())
-                });
-            }
-        }
-
-        match command.spawn() {
-            Ok(mut child) => {
+        match fork_stage(
+            &cmd,
+            is_last,
+            incoming,
+            in_file,
+            out_file,
+            err_file,
+            extra_files,
+            extra_pipe_out,
+            stdout_to_pipe,
+            closed,
+            interactive,
+            background,
+            process_group,
+            body,
+        ) {
+            Ok((pid, piped_out, read_end)) => {
                 if (interactive || background) && !forked {
-                    let pgid = process_group.unwrap_or_else(|| child.id() as i32);
+                    let pgid = process_group.unwrap_or(pid);
                     process_group = Some(pgid);
-                    // Repeat setpgid in the parent to close the race between
-                    // spawn and exec; EACCES means the child won that race.
-                    // SAFETY: setpgid has no pointer arguments and these PIDs
-                    // came directly from successful child creation.
+                    // Repeat setpgid in the parent to close the race with the
+                    // child's own call: whichever runs first, the group is set
+                    // before the stage can be signalled.
+                    // SAFETY: scalar arguments; `pid` came from a successful fork.
                     unsafe {
-                        libc::setpgid(child.id() as libc::pid_t, pgid);
+                        libc::setpgid(pid, pgid);
                     }
                 }
-                if let Some(pipe) = combined_pipe {
-                    next_stdin = NextIn::Pipe(pipe);
-                } else if piped_out && let Some(out) = child.stdout.take() {
-                    next_stdin = NextIn::Pipe(File::from(std::os::fd::OwnedFd::from(out)));
+                if let Some(read) = read_end {
+                    next_stdin = NextIn::Pipe(read);
                 }
-                outcomes.push(Outcome::Running {
-                    pid: child.id() as libc::pid_t,
-                    piped_out,
-                });
+                outcomes.push(Outcome::Running { pid, piped_out });
             }
             Err(err) => {
-                // The child hook hands the terminal to the new process group
-                // before exec. If the first stage cannot exec, no successful
-                // child records that group for the normal reclaim path below.
-                if interactive && !background && process_group.is_none() {
-                    // SAFETY: getpgrp takes no arguments and cannot fail.
-                    set_foreground_group(unsafe { libc::getpgrp() });
-                }
-                outcomes.push(Outcome::Failed(spawn_error_code(&cmd.words[0], &err)));
+                note!("mesh: {}: {err}", cmd.words[0]);
+                outcomes.push(Outcome::Failed(1));
             }
         }
     }
@@ -1199,133 +1089,6 @@ fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<WaitResult> {
     (!any_running).then_some(WaitResult::Complete(status))
 }
 
-/// Open background redirects in the child, after `spawn` has returned control
-/// to mesh. This keeps FIFO opens non-blocking for the shell without adding a
-/// PATH-resolved wrapper executable.
-fn background_redirect_command(
-    cmd: &Cmd,
-    redirs: &[Redirection],
-) -> Result<Command, (String, std::io::Error)> {
-    let executable = std::env::current_exe().map_err(|err| (cmd.words[0].clone(), err))?;
-    let mut command = Command::new(executable);
-    command
-        .arg("--mesh-background-redirect")
-        .arg(redirs.len().to_string());
-    // Each redirection travels as `KIND FD PATH`, so the descriptor survives the
-    // hand-off to the helper as well as the direction does.
-    // Each redirection travels as `KIND FD TARGET`, so the descriptor and whether
-    // the target is a path or another descriptor both survive the hand-off.
-    // `|&` travels as the `2>&1` it is, one more entry in the list — the helper
-    // opens the targets, so only it can apply that duplication *after* them,
-    // which is where the spec puts it.
-    for Redirection { fd, kind, target } in redirs {
-        command.arg(match (kind, target) {
-            // A heredoc body cannot cross as argv — it is arbitrary text, and the
-            // helper would have to re-quote it. Backgrounding one is refused
-            // earlier instead.
-            (_, RedirTarget::Heredoc(_)) => "heredoc",
-            (_, RedirTarget::Close) => "close",
-            (_, RedirTarget::Descriptor(_)) => "dup",
-            (RedirKind::In, _) => "in",
-            (RedirKind::Out, _) => "out",
-            (RedirKind::Append, _) => "append",
-        });
-        command.arg(fd.to_string());
-        command.arg(match target {
-            RedirTarget::Path(path) => path.clone(),
-            RedirTarget::Close => "-".to_owned(),
-            RedirTarget::Descriptor(from) => from.to_string(),
-            RedirTarget::Heredoc(body) => body.clone(),
-        });
-    }
-    command.args(&cmd.words);
-    Ok(command)
-}
-
-/// Internal executable mode used to defer potentially blocking opens until
-/// after the background child has completed `exec`.
-pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
-    let Some(count) = args.first().and_then(|arg| arg.parse::<usize>().ok()) else {
-        return std::process::ExitCode::from(1);
-    };
-    let Some(words_start) = count.checked_mul(3).and_then(|count| count.checked_add(1)) else {
-        return std::process::ExitCode::from(1);
-    };
-    if words_start >= args.len() {
-        return std::process::ExitCode::from(1);
-    }
-    let mut redirs = Vec::new();
-    for triple in args[1..words_start].chunks_exact(3) {
-        let Ok(fd) = triple[1].parse::<libc::c_int>() else {
-            return std::process::ExitCode::from(1);
-        };
-        let (kind, target) = match triple[0].as_str() {
-            "in" => (RedirKind::In, RedirTarget::Path(triple[2].clone())),
-            "out" => (RedirKind::Out, RedirTarget::Path(triple[2].clone())),
-            "append" => (RedirKind::Append, RedirTarget::Path(triple[2].clone())),
-            "dup" => {
-                let Ok(from) = triple[2].parse::<libc::c_int>() else {
-                    return std::process::ExitCode::from(1);
-                };
-                (RedirKind::Out, RedirTarget::Descriptor(from))
-            }
-            "close" => (RedirKind::Out, RedirTarget::Close),
-            "heredoc" => (RedirKind::In, RedirTarget::Heredoc(triple[2].clone())),
-            _ => return std::process::ExitCode::from(1),
-        };
-        redirs.push(Redirection { fd, kind, target });
-    }
-    let inherited = live_descriptors(&redirs);
-    let mut closing = Vec::new();
-    let opened = match resolve_redirs(&redirs, &inherited, inherited_seed(), Acquire::Now).and_then(
-        |sources| {
-            closing = sources.closed();
-            sources_to_files(sources)
-        },
-    ) {
-        Ok(files) => files,
-        Err((path, err)) => {
-            note!("mesh: {path}: {err}");
-            return std::process::ExitCode::from(1);
-        }
-    };
-    let words = &args[words_start..];
-    let mut command = Command::new(&words[0]);
-    command.args(&words[1..]);
-    // Anything past the standard three has no `Stdio` slot, so the child puts it
-    // in place itself — the same split the pipeline path makes.
-    let mut extra_files = Vec::new();
-    for (fd, file) in opened {
-        match fd {
-            libc::STDIN_FILENO => {
-                command.stdin(file);
-            }
-            libc::STDOUT_FILENO => {
-                command.stdout(file);
-            }
-            libc::STDERR_FILENO => {
-                command.stderr(file);
-            }
-            other => extra_files.push((other, file)),
-        }
-    }
-    if !extra_files.is_empty() || !closing.is_empty() {
-        let mut pending = Some(extra_files);
-        // SAFETY: `install_descriptors` uses only async-signal-safe calls and
-        // allocates nothing, the bar `pre_exec` sets.
-        unsafe {
-            command.pre_exec(move || {
-                if let Some(files) = pending.take() {
-                    install_descriptors(files, &closing)?;
-                }
-                Ok(())
-            });
-        }
-    }
-    let err = command.exec();
-    std::process::ExitCode::from(spawn_error_code(&words[0], &err))
-}
-
 /// Hang up a job as the shell exits, where a group that is already gone is the
 /// ordinary case rather than something to report. [`JobTable::info`] reaps a
 /// finished job to answer `$sh.jobs` but deliberately leaves it in the table, so
@@ -1425,7 +1188,7 @@ fn restore_job_signals() -> std::io::Result<()> {
         libc::SIGTERM,
     ] {
         // SAFETY: signal is one of the valid constants above, and SIG_DFL is a
-        // valid disposition. This runs after fork in Command's child hook.
+        // valid disposition. This runs in a forked child, before its body.
         if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
             return Err(std::io::Error::last_os_error());
         }
@@ -1813,15 +1576,15 @@ impl Sources {
             .any(|(_, source)| matches!(source, Source::PipeOut))
     }
 
-    /// Descriptors holding the outgoing pipe *besides* stdout and stderr, which
-    /// the caller wires through `Stdio` slots of their own. `3>&1 | g` puts fd 3
-    /// here: no file can stand for it, so the caller hands it the write end.
+    /// Descriptors holding the outgoing pipe *besides* stdout, which the caller
+    /// wires as the stage's standard output. `3>&1 | g` puts fd 3 here: no file
+    /// can stand for a pipe, so the caller hands it the write end.
     fn extra_pipe_out(&self) -> PipeCopies {
         self.extras(
             |source| matches!(source, Source::PipeOut),
-            // Only stdout keeps a slot of its own: the caller needs the read end
-            // back from `Stdio::piped()`. Stderr on the pipe is just another
-            // descriptor holding it.
+            // Only stdout is excluded: the caller wires it as the stage's
+            // standard output. Stderr on the pipe is just another descriptor
+            // holding it.
             &[libc::STDOUT_FILENO],
         )
     }
@@ -1993,8 +1756,8 @@ fn descriptor_limit() -> libc::c_int {
 
 /// Make a pipe as an owned read/write pair.
 ///
-/// Used wherever the shell needs the write end in hand — to give more than one
-/// descriptor a handle on it — rather than letting `Stdio::piped()` hide it.
+/// The shell keeps the write end in hand so that every descriptor which resolved
+/// to the pipe can be given a handle on it.
 fn new_pipe() -> std::io::Result<(File, File)> {
     let mut fds = [0; 2];
     // SAFETY: `pipe` fills the two-element array it is given.
@@ -2166,7 +1929,7 @@ fn resolve_redirs(
 /// worked, `dup2` there really making a new descriptor.
 fn install_descriptor(raw: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
     // SAFETY: both calls take a descriptor this process owns, and both are
-    // async-signal-safe, which is the bar `pre_exec` sets.
+    // async-signal-safe, the bar a forked child sets.
     unsafe {
         if raw == fd {
             let flags = libc::fcntl(fd, libc::F_GETFD);
