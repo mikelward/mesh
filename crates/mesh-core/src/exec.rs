@@ -328,7 +328,7 @@ fn fork_in_shell(
     incoming: NextIn,
     in_file: Option<File>,
     out_file: Option<File>,
-    err_file: Option<File>,
+    mut err_file: Option<File>,
     // Descriptors above the standard three, installed by the child itself since
     // there is no `Stdio` slot to hand them to.
     mut extra_files: Vec<(libc::c_int, File)>,
@@ -350,7 +350,6 @@ fn fork_in_shell(
     run: &mut dyn FnMut(usize, &Cmd, &mut JobTable) -> u8,
 ) -> std::io::Result<(libc::pid_t, bool, Option<File>)> {
     use std::io::Write;
-    use std::os::fd::AsRawFd;
 
     let redirects_stdout = background && stdout_is_redirected(cmd);
 
@@ -375,17 +374,17 @@ fn fork_in_shell(
         extra_files.extend(extra_pipe_out.handles(write)?);
     }
     // Stderr takes its own handle on the pipe, so stdout can still go elsewhere.
-    let child_err_pipe = match (&pipe_write, stderr_to_pipe) {
+    let mut child_err_pipe = match (&pipe_write, stderr_to_pipe) {
         (Some(write), true) => Some(write.try_clone()?),
         _ => None,
     };
-    let child_out = match out_file {
+    let mut child_out = match out_file {
         Some(file) => Some(file),
         None if stdout_to_pipe => pipe_write,
         None => None,
     };
     // stdin: a redirection wins over the incoming pipe; `Null` is the EOF case.
-    let child_in = match (in_file, incoming) {
+    let mut child_in = match (in_file, incoming) {
         (Some(file), _) => Some(file),
         (None, NextIn::Pipe(file)) => Some(file),
         (None, NextIn::Null) => Some(File::open("/dev/null")?),
@@ -442,28 +441,34 @@ fn fork_in_shell(
                     set_foreground_group(libc::getpgrp());
                 }
             }
-            if let Some(file) = &child_in {
-                libc::dup2(file.as_raw_fd(), libc::STDIN_FILENO);
+            // Every descriptor this stage takes, installed together so none can
+            // overwrite a handle another still needs — the standard three have
+            // no `Stdio` slot here either, this being a fork rather than a
+            // spawn. `install_descriptors` closes each original as it goes,
+            // which matters most for a stage that never `exec`s: a second handle
+            // on the outgoing pipe would outlive it and keep a reader waiting.
+            let mut installs: Vec<(libc::c_int, File)> = Vec::new();
+            if let Some(file) = child_in.take() {
+                installs.push((libc::STDIN_FILENO, file));
             }
-            if let Some(file) = &child_out {
-                libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO);
+            if let Some(file) = child_out.take() {
+                installs.push((libc::STDOUT_FILENO, file));
             }
-            if let Some(file) = &err_file {
-                libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+            // `|&`'s copy of the pipe wins over an explicit `2>`, being appended
+            // after it; the loser is dropped here rather than installed and
+            // immediately overwritten.
+            if let Some(file) = child_err_pipe.take().or_else(|| err_file.take()) {
+                installs.push((libc::STDERR_FILENO, file));
             }
-            if let Some(file) = &child_err_pipe {
-                libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
-            }
-            // Descriptors above the standard three, which no `Stdio` slot
-            // covers. Placed before `|&` for the same reason `deferred` is.
-            for (fd, file) in &extra_files {
-                libc::dup2(file.as_raw_fd(), *fd);
-            }
-            // A background stage's own targets, per descriptor, before the `|&`
-            // copy below — a `> out` must move stdout while `|&` can still see
-            // where it went.
-            for (fd, file) in &deferred {
-                libc::dup2(file.as_raw_fd(), *fd);
+            installs.extend(extra_files);
+            // A background stage's own targets, per descriptor, applied after the
+            // above and before the `|&` copy below — a `> out` must move stdout
+            // while `|&` can still see where it went.
+            if install_descriptors(installs)
+                .and_then(|()| install_descriptors(deferred))
+                .is_err()
+            {
+                libc::_exit(1);
             }
             // `|&` *is* `2>&1` appended after the command's redirections
             // (`DESIGN.md`), so it copies wherever stdout finally points and wins
@@ -473,29 +478,6 @@ fn fork_in_shell(
             // `&` must not change where the data goes.
             if cmd.pipe_stderr && !is_last {
                 libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO);
-            }
-            // Only the duplicates above are the stage's descriptors; the originals
-            // are a second open handle on the same pipe or file. `_exit` never
-            // drops them, so everything this stage starts inherits them — and a
-            // stray *write* end keeps the reader from ever seeing EOF: `func f() {
-            // sleep 60 > /dev/null & }; f | cat` left `cat` waiting for the sleep
-            // even though nothing was writing to it. Neither `libc::pipe` nor the
-            // `dup2` targets set close-on-exec, so closing here is what covers a
-            // nested child whether it execs or not.
-            //
-            // A descriptor already at 0/1/2 is the one being kept rather than a
-            // copy of it: `dup2(n, n)` is a no-op, so closing it would take the
-            // stage's own stream away.
-            for fd in child_in
-                .iter()
-                .chain(child_out.iter())
-                .chain(err_file.iter())
-                .map(|file| file.as_raw_fd())
-                .chain(deferred.iter().map(|(_, file)| file.as_raw_fd()))
-            {
-                if fd > libc::STDERR_FILENO {
-                    libc::close(fd);
-                }
             }
         }
         // From here on this process is not the interactive shell: it owns none of
@@ -934,11 +916,17 @@ pub fn run_pipeline(
         // then; `dup2` clears `FD_CLOEXEC` on the descriptor it creates, so they
         // survive the exec that the originals would not.
         if !extra_files.is_empty() {
-            // SAFETY: `dup2` is async-signal-safe, the bar `pre_exec` sets.
+            // Taken on the first call so the hook owns the handles and can close
+            // each original once it is copied. `pre_exec` runs once.
+            let mut pending = Some(extra_files);
+            // SAFETY: `install_descriptors` uses only `fcntl`, `dup2` and
+            // `close`, all async-signal-safe, and allocates nothing — the bar
+            // `pre_exec` sets, since the child may fork while another thread
+            // holds the allocator.
             unsafe {
                 command.pre_exec(move || {
-                    for (fd, file) in &extra_files {
-                        install_descriptor(file, *fd)?;
+                    if let Some(files) = pending.take() {
+                        install_descriptors(files)?;
                     }
                     Ok(())
                 });
@@ -1320,12 +1308,13 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
         }
     }
     if !extra_files.is_empty() {
-        // SAFETY: `install_descriptor` uses only async-signal-safe calls, the
-        // bar `pre_exec` sets.
+        let mut pending = Some(extra_files);
+        // SAFETY: `install_descriptors` uses only async-signal-safe calls and
+        // allocates nothing, the bar `pre_exec` sets.
         unsafe {
             command.pre_exec(move || {
-                for (fd, file) in &extra_files {
-                    install_descriptor(file, *fd)?;
+                if let Some(files) = pending.take() {
+                    install_descriptors(files)?;
                 }
                 Ok(())
             });
@@ -1469,6 +1458,19 @@ pub(crate) fn with_redirections<T>(
 ) -> Result<T, (String, std::io::Error)> {
     use std::io::Write;
 
+    // Which targets the shell already holds, asked **before** anything is
+    // opened. An open takes the lowest free descriptor, so asking afterwards
+    // would find `3> file`'s own freshly opened file sitting on fd 3, save it as
+    // if it had been there all along, and put it back on the way out — leaving
+    // fd 3 open on the shell for good.
+    let already_open: Vec<libc::c_int> = redirs
+        .iter()
+        .map(|redir| redir.fd)
+        // SAFETY: `fcntl(F_GETFD)` only reads a descriptor's flags, and answers
+        // whether it is open at all without disturbing it.
+        .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+        .collect();
+
     let opened = sources_to_files(resolve_sources(
         redirs,
         open_paths(redirs)?,
@@ -1508,14 +1510,43 @@ pub(crate) fn with_redirections<T>(
             }
         }
     };
-    for (target, file) in &opened {
-        match swap_descriptor(file, *target) {
-            Ok(saved) => swapped.push((saved, *target)),
-            Err(err) => {
-                restore(&mut swapped);
-                return Err((path_for(*target), err));
-            }
+    // Save every target that is currently open **before** installing any of
+    // them, and save it clear of every target — otherwise saving fd 4 can land
+    // on fd 3, which the next redirection then overwrites, and the restore puts
+    // back whatever replaced it. A target nothing has open needs no save at all,
+    // which is what keeps `3> file` working with no free descriptor to spare.
+    let clear_of_targets = opened
+        .iter()
+        .map(|(fd, _)| *fd)
+        .max()
+        .unwrap_or(libc::STDERR_FILENO)
+        .max(libc::STDERR_FILENO)
+        .saturating_add(1);
+    for (target, _) in &opened {
+        if !already_open.contains(target) {
+            // Nothing had it: the redirection creates it, so the restore closes
+            // it rather than putting something back.
+            swapped.push((-1, *target));
+            continue;
         }
+        // SAFETY: duplicating a descriptor this process owns onto a free one
+        // above every target, so no later install can overwrite the copy.
+        let saved = unsafe { libc::fcntl(*target, libc::F_DUPFD_CLOEXEC, clear_of_targets) };
+        if saved < 0 {
+            let err = std::io::Error::last_os_error();
+            restore(&mut swapped);
+            return Err((path_for(*target), err));
+        }
+        swapped.push((saved, *target));
+    }
+    // Installing is then the same ordered permutation a child does, so an open
+    // that landed on another redirection's target is copied before it is
+    // overwritten.
+    let targets: Vec<libc::c_int> = opened.iter().map(|(fd, _)| *fd).collect();
+    if let Err(err) = install_descriptors(opened) {
+        let target = targets.first().copied().unwrap_or(libc::STDERR_FILENO);
+        restore(&mut swapped);
+        return Err((path_for(target), err));
     }
 
     // While stdin is swapped to a file, fd 0 no longer says whether this is an
@@ -1539,35 +1570,6 @@ pub(crate) fn with_redirections<T>(
     let _ = std::io::stdout().flush();
     restore(&mut swapped);
     Ok(result)
-}
-
-/// `dup` `target` aside and point it at `file`, returning the saved descriptor —
-/// or `-1` when there was nothing to save.
-///
-/// A redirection may name a descriptor the shell does not have open (`f 3> log`),
-/// which `dup` answers with `EBADF`. That is not a failure: the redirection
-/// *creates* that descriptor, and the restore closes it again rather than putting
-/// something back.
-fn swap_descriptor(file: &File, target: libc::c_int) -> Result<libc::c_int, std::io::Error> {
-    // SAFETY: `fcntl(F_GETFD)` only reads the descriptor's flags, and answers
-    // whether it is open at all without disturbing it.
-    let was_open = unsafe { libc::fcntl(target, libc::F_GETFD) } >= 0;
-    let saved = if was_open {
-        let saved = unsafe { libc::dup(target) };
-        if saved < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        saved
-    } else {
-        -1
-    };
-    if let Err(error) = install_descriptor(file, target) {
-        if saved >= 0 {
-            unsafe { libc::close(saved) };
-        }
-        return Err(error);
-    }
-    Ok(saved)
 }
 
 /// The shell's own stdin while an in-process redirection has fd 0 pointed at a
@@ -1738,57 +1740,33 @@ impl Sources {
     }
 
     fn extras(&self, want: impl Fn(&Source) -> bool, wired: &[libc::c_int]) -> PipeCopies {
-        PipeCopies {
-            fds: self
-                .0
+        PipeCopies(
+            self.0
                 .iter()
                 .filter(|(fd, source)| want(source) && !wired.contains(fd))
                 .map(|(fd, _)| *fd)
                 .collect(),
-            floor: self.install_floor(),
-        }
-    }
-
-    /// The lowest descriptor no redirection of this stage overwrites.
-    ///
-    /// Everything handed to the child is lifted here first, so installing one
-    /// descriptor can never clobber the handle another one still needs.
-    ///
-    /// Saturating, so a redirection naming the largest descriptor a `c_int` can
-    /// hold reports an error from the lift rather than overflowing. Nothing can
-    /// be lifted above such a descriptor, which is the honest answer: no process
-    /// has that many open files.
-    fn install_floor(&self) -> libc::c_int {
-        self.0
-            .iter()
-            .map(|(fd, _)| *fd)
-            .max()
-            .unwrap_or(libc::STDERR_FILENO)
-            .max(libc::STDERR_FILENO)
-            .saturating_add(1)
+        )
     }
 }
 
-/// Descriptors that resolved to a pipe the caller owns, with the floor their
-/// handles are lifted to.
+/// Descriptors that resolved to a pipe the caller owns.
 ///
 /// A pipe cannot become a file, so `sources_to_files` drops these and the caller
 /// hands each one its own handle on the real pipe once it exists.
-struct PipeCopies {
-    fds: Vec<libc::c_int>,
-    floor: libc::c_int,
-}
+struct PipeCopies(Vec<libc::c_int>);
 
 impl PipeCopies {
     fn is_empty(&self) -> bool {
-        self.fds.is_empty()
+        self.0.is_empty()
     }
 
-    /// One handle per descriptor, each clear of every descriptor being installed.
+    /// One handle per descriptor. Where these land is not the caller's problem:
+    /// `install_descriptors` orders the copies so none overwrites another.
     fn handles(&self, pipe: &File) -> std::io::Result<Vec<(libc::c_int, File)>> {
-        self.fds
+        self.0
             .iter()
-            .map(|fd| Ok((*fd, lift_above(pipe, self.floor)?)))
+            .map(|fd| Ok((*fd, pipe.try_clone()?)))
             .collect()
     }
 }
@@ -1821,34 +1799,16 @@ fn inherited_seed() -> Sources {
 fn sources_to_files(
     sources: Sources,
 ) -> Result<Vec<(libc::c_int, File)>, (String, std::io::Error)> {
-    // An open takes the lowest free descriptor, so `4> four 3> three` lands
-    // `four` on fd 3 — the very descriptor the other redirection then
-    // overwrites, losing `four` before anything copies it to fd 4. Both
-    // orderings of a pair collide this way and no installation order avoids it,
-    // so every file is lifted clear of every target before any is installed.
-    let floor = sources.install_floor();
+    // Collisions between these — an open landing on another's target — are
+    // handled at installation, by `install_descriptors`, rather than by moving
+    // anything here.
     let mut files = Vec::new();
     for (fd, source) in sources.0 {
-        let described = || format!("&{fd}");
-        if let Some(file) = source.into_file(fd).map_err(|e| (described(), e))? {
-            files.push((fd, lift_above(&file, floor).map_err(|e| (described(), e))?));
+        if let Some(file) = source.into_file(fd).map_err(|e| (format!("&{fd}"), e))? {
+            files.push((fd, file));
         }
     }
     Ok(files)
-}
-
-/// Copy `file` onto a free descriptor no lower than `lowest`.
-fn lift_above(file: &File, lowest: libc::c_int) -> std::io::Result<File> {
-    use std::os::fd::AsRawFd as _;
-    // SAFETY: `fcntl` takes a descriptor this process owns and returns a fresh
-    // owned one, which `File` takes responsibility for closing. Close-on-exec
-    // matches what Rust sets on every file it opens; `dup2` clears it on the
-    // descriptor the child installs.
-    let duplicated = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, lowest) };
-    if duplicated < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(duplicated) })
 }
 
 /// Spill a heredoc body into a temporary file, rewound and unlinked.
@@ -1893,6 +1853,22 @@ fn heredoc_file(body: &str) -> std::io::Result<File> {
     Ok(file)
 }
 
+/// One past the highest descriptor this process may hold, from `RLIMIT_NOFILE`.
+///
+/// `c_int::MAX` when the limit cannot be read or does not fit, which leaves the
+/// kernel to refuse the descriptor as it would have anyway.
+fn descriptor_limit() -> libc::c_int {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` fills the struct it is given and touches nothing else.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } < 0 {
+        return libc::c_int::MAX;
+    }
+    libc::c_int::try_from(limit.rlim_cur).unwrap_or(libc::c_int::MAX)
+}
+
 /// Make a pipe as an owned read/write pair.
 ///
 /// Used wherever the shell needs the write end in hand — to give more than one
@@ -1926,6 +1902,19 @@ fn dup_shell_fd(fd: libc::c_int) -> std::io::Result<File> {
 /// stays strictly sequential. Every target is opened even when a later
 /// redirection supersedes it, so `> a > b` still truncates `a`, as in bash.
 fn open_paths(redirs: &[Redirection]) -> Result<Vec<Option<File>>, (String, std::io::Error)> {
+    // A descriptor the process could never hold is refused here, before any
+    // target is created or truncated, and named in the error the way bash names
+    // it. Left to `dup2` it would surface as `EBADF` against the *command*, from
+    // a hook that runs after the opens.
+    let limit = descriptor_limit();
+    for redir in redirs {
+        if redir.fd >= limit {
+            return Err((
+                format!("&{}", redir.fd),
+                std::io::Error::from_raw_os_error(libc::EBADF),
+            ));
+        }
+    }
     let mut opened = Vec::with_capacity(redirs.len());
     for Redirection { kind, target, .. } in redirs {
         opened.push(match target {
@@ -1994,21 +1983,84 @@ fn resolve_sources(
     Ok(state)
 }
 
-/// Put `file` on descriptor `fd` in a child, so it survives a following `exec`.
+/// Put the descriptor `raw` on descriptor `fd`, so it survives a following `exec`.
 ///
-/// Every handle reaches here lifted above `fd` (see `install_floor`), which is
-/// what makes a plain `dup2` right. Handed the descriptor it already is, `dup2`
-/// returns success without doing anything — pointedly without clearing
-/// `FD_CLOEXEC`, which Rust sets on every file it opens — so the descriptor
-/// would close at `exec` and the command would see `EBADF` on a redirection that
-/// looked applied. `3< file` hit exactly that whenever the open landed on fd 3,
-/// while a higher one like `9<` worked.
-fn install_descriptor(file: &File, fd: libc::c_int) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    // SAFETY: `dup2` takes descriptors this process owns and is
+/// Not simply `dup2`: handed the descriptor it already is, `dup2` returns success
+/// without doing anything — pointedly without clearing `FD_CLOEXEC`, which Rust
+/// sets on every file it opens — so the descriptor would close at `exec` and the
+/// command would see `EBADF` on a redirection that looked applied. `3< file` hit
+/// exactly that whenever the open landed on fd 3, while a higher one like `9<`
+/// worked, `dup2` there really making a new descriptor.
+fn install_descriptor(raw: libc::c_int, fd: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: both calls take a descriptor this process owns, and both are
     // async-signal-safe, which is the bar `pre_exec` sets.
-    if unsafe { libc::dup2(file.as_raw_fd(), fd) } < 0 {
-        return Err(std::io::Error::last_os_error());
+    unsafe {
+        if raw == fd {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        } else if libc::dup2(raw, fd) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Put every file on its descriptor, in an order where none is overwritten while
+/// another still needs to read it, closing each original once it is copied.
+///
+/// An open takes the lowest free descriptor, so `4> four 3> three` lands `four`
+/// on fd 3 — the descriptor the *other* redirection targets. Installing fd 3
+/// first destroys `four` before anything copies it to fd 4, and the mirror
+/// spelling collides the other way, so no fixed order works. A target is
+/// therefore installed only once no **pending** handle still lives on it, which
+/// drains every arrangement except a true cycle (`3>&4 4>&3`); a cycle is broken
+/// by moving one handle aside, and the descriptor it moves to is free by
+/// definition, so it cannot be another pending target.
+///
+/// Lifting every handle above the highest target would also be collision-safe and
+/// is simpler, but it demands a free descriptor *above every target* — which
+/// `RLIMIT_NOFILE` can refuse for a redirection the kernel would otherwise allow:
+/// at `ulimit -n 4`, `3> file` has nowhere above fd 3 to go, while bash runs it.
+///
+/// Closing the original is not just tidiness. A stage that never `exec`s — a
+/// forked builtin or function — would otherwise hold a second handle on the same
+/// pipe for its whole life, and everything it starts inherits it, so a reader
+/// waits on a write end nothing is writing to.
+fn install_descriptors(mut files: Vec<(libc::c_int, File)>) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    while !files.is_empty() {
+        let ready = (0..files.len()).find(|&index| {
+            let target = files[index].0;
+            !files
+                .iter()
+                .enumerate()
+                .any(|(other, (_, file))| other != index && file.as_raw_fd() == target)
+        });
+        let Some(index) = ready else {
+            // Every remaining target is occupied by another pending handle.
+            // SAFETY: `fcntl` duplicates a descriptor this process owns onto the
+            // lowest free one, which no pending target can be — they are all
+            // occupied, or one of them would have been ready.
+            let moved = unsafe { libc::fcntl(files[0].1.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            if moved < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Assigning drops the old handle, which closes the descriptor the
+            // cycle was waiting on.
+            // SAFETY: `moved` is a fresh descriptor this process now owns.
+            files[0].1 = unsafe { File::from_raw_fd(moved) };
+            continue;
+        };
+        let (target, file) = files.swap_remove(index);
+        let raw = file.as_raw_fd();
+        install_descriptor(raw, target)?;
+        if raw == target {
+            // `install_descriptor` only cleared close-on-exec; this *is* the
+            // stage's descriptor, so dropping the handle would close it.
+            std::mem::forget(file);
+        }
     }
     Ok(())
 }

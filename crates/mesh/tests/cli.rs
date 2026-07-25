@@ -1395,6 +1395,24 @@ fn a_stage_does_not_leak_its_pipe_to_nested_background_work() {
         "the reader waited on a leaked descriptor: {elapsed:?}"
     );
 
+    // A descriptor above the standard three is the same leak by another route:
+    // `3>&1` gives the stage a second handle on the pipe, and installing it left
+    // the original open for the life of a stage that never `exec`s, so the
+    // nested command inherited it however thoroughly it redirected its own.
+    let (high, elapsed) = timed(
+        "func f() { sleep 5 > /dev/null 2> /dev/null 3> /dev/null &\nputs hi }\nf 3>&1 | cat\nputs after\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&high.stdout),
+        "hi\nafter\n",
+        "{:?}",
+        high.stderr
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the reader waited on a leaked high descriptor: {elapsed:?}"
+    );
+
     // The contrast, which is *not* a leak: with stdout left alone the nested
     // command inherits the stage's, so it holds the pipe legitimately and the
     // reader does wait for it. bash agrees — `bash -c 'set -m; f(){ sleep 6 & echo
@@ -2620,14 +2638,48 @@ fn an_eof_stdin_copied_to_a_high_descriptor_still_reads() {
 }
 
 #[test]
-fn the_largest_descriptor_is_refused_rather_than_overflowing() {
-    // Nothing can be lifted above `c_int::MAX`, and the arithmetic that finds
-    // that free descriptor used to overflow — panicking the whole shell in a
-    // debug build rather than failing the one redirection.
+fn a_redirection_needs_no_descriptor_to_spare() {
+    // Installing a descriptor must not require a *free* one above it. Lifting
+    // every handle clear of every target is collision-safe and simple, but it
+    // asks for headroom `RLIMIT_NOFILE` can refuse: at a limit of 4 the only
+    // descriptors that exist are 0-3, so `3> file` had nowhere to go and failed
+    // with `Invalid argument` on a redirection bash performs happily.
+    use std::os::unix::process::CommandExt as _;
+
+    let dir = fresh_dir("fd_limit");
+    let sink = dir.join("out.txt");
+    let mut command = mesh_command();
+    command.arg("-c");
+    command.arg(format!("puts ok 3> {}", sink.to_string_lossy()));
+    // SAFETY: `setrlimit` only lowers this child's own descriptor limit, and is
+    // async-signal-safe, which is the bar `pre_exec` sets.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 4,
+                rlim_max: 4,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = command.output().expect("run mesh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ok\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Past the limit there is no descriptor to install onto, and that is refused
+    // before any target is opened — named the way bash names it, rather than
+    // surfacing later as `EBADF` against the command.
     let out = run_with_input(&format!(
         "echo hi {}> {}\nputs after\n",
         libc::c_int::MAX,
-        fresh_dir("max_fd").join("out.txt").to_string_lossy()
+        dir.join("never.txt").to_string_lossy()
     ));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -2636,6 +2688,10 @@ fn the_largest_descriptor_is_refused_rather_than_overflowing() {
     );
     assert!(stderr.contains(&libc::c_int::MAX.to_string()), "{stderr}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        !dir.join("never.txt").exists(),
+        "the target was created for a redirection that cannot work"
+    );
 }
 
 #[test]
