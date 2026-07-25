@@ -2290,6 +2290,49 @@ fn kill_works_from_a_pipeline_stage() {
 }
 
 #[test]
+fn kill_signals_every_handle_a_spread_produces() {
+    // `kill` takes independent targets, and a list of handles spreads into
+    // several — so a word naming jobs is converted as a whole rather than only
+    // when it happens to produce exactly one value.
+    let out = run_with_input(
+        "a = sleep 30 &\nb = sleep 30 &\nhs = [$a $b]\nkill ...$hs\nputs spread=$sh.status\nwait $a\nputs a=$sh.status\nwait $b\nputs b=$sh.status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "spread=0\na=143\nb=143\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn kill_leaves_the_signal_number_to_the_kernel() {
+    // Which signal numbers exist is the platform's answer, not a table here: a
+    // fixed ceiling rejected valid ones — Linux's `SIGRTMAX` is 64 — and keeping
+    // one right would need a per-platform list. An impossible number comes back
+    // from `kill` as `EINVAL`, reported against the target like any other
+    // failure to signal.
+    //
+    // Asserted as "not refused as a signal" rather than by number, since the
+    // valid range differs per platform and the change is about who decides.
+    let out = run_with_input("sleep 30 &\nkill -64 $sh.jobs[1].pid\nputs rt=$sh.status\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("invalid signal"),
+        "{:?}",
+        out.stderr
+    );
+
+    // An unknown *name* still is: no kernel call can make sense of it.
+    let named = run_with_input("sleep 5 &\nkill -NOPE %1\nputs bad=$sh.status\n");
+    assert!(
+        String::from_utf8_lossy(&named.stderr).contains("kill: NOPE: invalid signal"),
+        "{:?}",
+        named.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&named.stdout), "bad=1\n");
+}
+
+#[test]
 fn kill_reports_what_it_cannot_do() {
     for (line, needle) in [
         ("kill", "kill: expected a job or a pid"),
