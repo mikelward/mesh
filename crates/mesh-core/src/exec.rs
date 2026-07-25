@@ -445,18 +445,21 @@ impl JobTable {
                 );
                 return None;
             }
-            // An id wins over a prefix, so `%1` stays job 1 rather than the most
-            // recent command that happens to begin with "1".
-            Some(rest) => match rest.parse::<usize>() {
-                Ok(id) => self.index_of(id),
-                // A bare `%` names nothing, and `starts_with("")` would match the
-                // newest job rather than say so.
-                Err(_) if rest.is_empty() => None,
-                Err(_) => self
-                    .jobs
-                    .iter()
-                    .rposition(|job| job.command.starts_with(rest)),
-            },
+            // A bare `%` names nothing, and `starts_with("")` would match the
+            // newest job rather than say so.
+            Some("") => None,
+            // All digits is an **id**, decided before the conversion rather than
+            // by whether it succeeds: an id too large for `usize` is a job that
+            // does not exist, not a command prefix. Falling back on a parse
+            // failure let `%18446744073709551616` match a command whose name
+            // began with those digits.
+            Some(rest) if rest.bytes().all(|byte| byte.is_ascii_digit()) => {
+                rest.parse::<usize>().ok().and_then(|id| self.index_of(id))
+            }
+            Some(rest) => self
+                .jobs
+                .iter()
+                .rposition(|job| job.command.starts_with(rest)),
             None => reference
                 .parse::<usize>()
                 .ok()
