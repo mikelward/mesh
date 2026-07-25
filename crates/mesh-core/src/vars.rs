@@ -295,7 +295,7 @@ pub struct Vars {
     /// live borrow, because expansion is handed only the variable store — the
     /// shell refreshes it from the real table on the same funnel that publishes
     /// `$sh.status`, so a read never sees a stale one.
-    jobs: Vec<(String, Value)>,
+    jobs: Vec<(usize, Value)>,
     /// The stack of inputs being evaluated, innermost last, reported as
     /// `$sh.origin` and `$sh.source`. A stack because `source` nests: a file that
     /// sources another must see the *inner* one while it runs and its own again
@@ -437,14 +437,13 @@ impl Vars {
     /// table. Reads the same published snapshot `$sh.jobs` does, so a handle and
     /// the table can never disagree about a job.
     pub(crate) fn job_record(&self, id: usize) -> Option<Value> {
-        let key = id.to_string();
         self.jobs
             .iter()
-            .find(|(candidate, _)| *candidate == key)
+            .find(|(candidate, _)| *candidate == id)
             .map(|(_, record)| record.clone())
     }
 
-    pub(crate) fn set_jobs(&mut self, jobs: Vec<(String, Value)>) {
+    pub(crate) fn set_jobs(&mut self, jobs: Vec<(usize, Value)>) {
         self.jobs = jobs;
     }
 
@@ -509,7 +508,20 @@ impl Vars {
             ("stdin".to_owned(), Value::Stream(0)),
             ("stdout".to_owned(), Value::Stream(1)),
             ("stderr".to_owned(), Value::Stream(2)),
-            ("jobs".to_owned(), Value::Map(self.jobs.clone())),
+            // Handles, not the records themselves. `DESIGN.md` calls
+            // `$sh.jobs[2]` a handle, and it can only behave like one — live,
+            // and usable as a job reference after being stored — if that is what
+            // indexing yields. The records stay private, behind `job_record`,
+            // which is what a handle reads through.
+            (
+                "jobs".to_owned(),
+                Value::Map(
+                    self.jobs
+                        .iter()
+                        .map(|(id, _)| (id.to_string(), Value::Job(*id)))
+                        .collect(),
+                ),
+            ),
             // The innermost input: what is being evaluated *now*, which is the
             // question a sourced file asks about itself.
             (
