@@ -529,17 +529,20 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
             vref.accesses.as_slice(),
         )
     };
-    // A handle is a live *reference*, not a snapshot taken when it was bound:
-    // reading through one looks the job up in the table as it stands now, so
-    // `$j.state` cannot go stale the way a captured record would. A bare `$j`
-    // stays a handle — that is what leaves it with no byte form, and what lets
-    // `kill $j` mean a job where `kill 49001` means a pid.
-    if let Value::Job(id) = value
-        && !accesses.is_empty()
-    {
-        value = vars.job_record(id).ok_or(ExpandError::GoneJob { id })?;
-    }
     for access in accesses {
+        // A handle is a live *reference*, not a snapshot taken when it was
+        // bound: reading through one looks the job up in the table as it stands
+        // now, so `$j.state` cannot go stale the way a captured record would.
+        //
+        // Per access rather than once up front, because a handle can arrive
+        // part-way along a chain: `$sh.jobs[2]` indexes the table *to* one, and
+        // then has to be read through in turn.
+        //
+        // A bare `$j` never reaches here, which is what leaves it with no byte
+        // form and lets `kill $j` mean a job where `kill 49001` means a pid.
+        if let Value::Job(id) = value {
+            value = vars.job_record(id).ok_or(ExpandError::GoneJob { id })?;
+        }
         value = match access {
             Access::Member(key) => map_value_access(value, key, &vref.name)?,
             Access::Subscript(subscript) => {

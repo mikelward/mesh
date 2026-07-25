@@ -102,7 +102,7 @@ impl Shell {
             jobs.into_iter()
                 .map(|job| {
                     (
-                        job.id.to_string(),
+                        job.id,
                         Value::Map(vec![
                             // Carried in the record as well as being the key: a
                             // handle reaches its record without one.
@@ -3894,12 +3894,18 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
             }
         };
     }
-    let argv = match expand::expand(words, &shell.vars) {
-        Ok(argv) => argv,
-        Err(err) => {
+    // A job builtin keeps its arguments typed here too, so a handle reaches it
+    // through a redirection exactly as it does without one.
+    let expanded = match job_builtin_words(&words, &shell.vars) {
+        Some(words) => words,
+        None => expand::expand(words, &shell.vars).map_err(|err| {
             note!("mesh: {err}");
-            return Step::Continue(1);
-        }
+            Step::Continue(1)
+        }),
+    };
+    let argv = match expanded {
+        Ok(argv) => argv,
+        Err(step) => return step,
     };
     if argv.is_empty() {
         note!("mesh: redirection with no command is not supported yet");
@@ -4251,27 +4257,11 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         };
         return dispatch_function_call(&name, args, shell);
     }
-    // A job builtin takes a job *reference*, and a handle is one — so its
-    // arguments keep their values instead of going through the argv rule, which
-    // rightly refuses a handle as bytes. Being able to pass `$j` back is the
-    // point of binding it in the first place.
-    if let Some(name) = command_name(&tokens, &shell.vars)
-        && matches!(name.as_str(), "fg" | "bg" | "wait" | "kill")
-    {
-        let arg_words: Vec<Word> = tokens.into_iter().skip(1).collect();
-        let values = match expand::expand_values(arg_words, &shell.vars) {
-            Ok(values) => values,
-            Err(err) => {
-                note!("mesh: {err}");
-                return Step::Continue(1);
-            }
+    if let Some(words) = job_builtin_words(&tokens, &shell.vars) {
+        return match words {
+            Ok(words) => run_expanded(words, last, shell),
+            Err(step) => step,
         };
-        let mut words = vec![name.clone()];
-        match job_reference_words(values, &name) {
-            Ok(references) => words.extend(references),
-            Err(step) => return step,
-        }
-        return run_expanded(words, last, shell);
     }
     let words = match expand::expand(tokens, &shell.vars) {
         Ok(words) => words,
@@ -4281,6 +4271,34 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         }
     };
     run_expanded(words, last, shell)
+}
+
+/// A job builtin's words, with its arguments expanded as **values** so a handle
+/// survives to name a job rather than meeting the argv rule that refuses it as
+/// bytes. `None` when this is not a job builtin.
+///
+/// Shared by the plain and redirected command paths, which expand separately:
+/// `kill $j 2>/dev/null` has to mean what `kill $j` means, and routing only one
+/// of them through here left the redirected spelling reporting that the handle
+/// had no text form — before even opening the redirect, so the job survived.
+fn job_builtin_words(words: &[Word], vars: &Vars) -> Option<Result<Vec<String>, Step>> {
+    let name = command_name(words, vars)?;
+    if !matches!(name.as_str(), "fg" | "bg" | "wait" | "kill") {
+        return None;
+    }
+    let arguments: Vec<Word> = words.iter().skip(1).cloned().collect();
+    let values = match expand::expand_values(arguments, vars) {
+        Ok(values) => values,
+        Err(err) => {
+            note!("mesh: {err}");
+            return Some(Err(Step::Continue(1)));
+        }
+    };
+    Some(job_reference_words(values, &name).map(|references| {
+        let mut expanded = vec![name];
+        expanded.extend(references);
+        expanded
+    }))
 }
 
 /// The reference words a job builtin understands, from its evaluated arguments.

@@ -2156,6 +2156,45 @@ fn a_handle_to_a_finished_job_says_the_job_is_gone() {
 }
 
 #[test]
+fn a_table_handle_stays_live_once_stored() {
+    // `$sh.jobs[1]` is a handle in its own right, so storing it has to keep it
+    // one. Indexing the table used to yield the record, which froze the moment
+    // it was bound — the stored copy said `running` while the table said `done`,
+    // which is exactly the staleness a handle exists to avoid.
+    let out = run_with_input(
+        "sh -c 'sleep 0.2; exit 7' &\nj = $sh.jobs[1]\nsleep 0.5\nputs stored=$j.state table=$sh.jobs[1].state status=$j.status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "stored=done table=done status=7\n"
+    );
+
+    // And it is still a reference, not just a reader.
+    let waited = run_with_input(
+        "sh -c 'sleep 0.1; exit 5' &\nj = $sh.jobs[1]\nwait $j\nputs status=$sh.status\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&waited.stdout), "status=5\n");
+}
+
+#[test]
+fn a_redirected_job_builtin_still_takes_a_handle() {
+    // A redirection sends the command down a separate path that expands its own
+    // argv, so a handle has to survive that one too. It did not: `kill $j` with
+    // a redirect reported that the handle had no text form — before even opening
+    // the redirect, so the job was left running.
+    let dir = fresh_dir("redirected_kill");
+    let out = run_with_input(&format!(
+        "j = sleep 30 &\nkill $j 2> {}/err\nputs signalled=$sh.status\nwait $j\nputs waited=$sh.status\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "signalled=0\nwaited=143\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn kill_signals_a_job_or_a_pid() {
     // A job means its whole process group; the default signal is TERM, so the
     // job reports `128 + 15`.
