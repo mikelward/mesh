@@ -133,7 +133,9 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
   is a slice, and `$env` / `$sh` keep their own handling. Local-by-default like any
   other assignment: inside a function the write shadows an outer binding rather
   than reaching through to it, and **`global $m.key = value`** is how it writes the
-  outer one instead. Nothing along the path is created — a missing
+  outer one instead. **`unset $m.key`** / **`unset $xs[0]`** remove such a place
+  rather than the binding holding it, under the same rules; a list removal shifts
+  what follows. Nothing along the path is created — a missing
   intermediate key is an error — except a **new map key at the end**, which is how
   a key is added.
 - **`$name` / `${name}`** read a variable; **`$env.KEY` / `${env.KEY}`** read the
