@@ -2045,6 +2045,12 @@ fn unusable_job_references_say_so() {
         // A prefix nothing matches, and a bare `%`, which names no job at all —
         // `starts_with("")` would otherwise quietly match the newest job.
         ("%nope", "%nope: no such job"),
+        // All digits is an id even when it is too large to be one, so it cannot
+        // fall through and match a command whose name starts with those digits.
+        (
+            "%18446744073709551616",
+            "%18446744073709551616: no such job",
+        ),
         ("%", "%: no such job"),
         // `DESIGN.md` keeps `%?string` for a substring match and defers it, so
         // it is refused by name rather than reported as a missing job. It needs
@@ -2054,7 +2060,9 @@ fn unusable_job_references_say_so() {
             "matching a command by substring is not implemented",
         ),
     ] {
-        let out = run_with_input(&format!("sleep 9 &\nwait {reference}\nputs after\n"));
+        let out = run_with_input(&format!(
+            "18446744073709551616 &\nsleep 9 &\nwait {reference}\nputs after\n"
+        ));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains(needle), "{reference}: {stderr}");
         assert_eq!(
