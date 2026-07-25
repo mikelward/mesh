@@ -46,6 +46,7 @@ pub enum NoLiteral {
     Regex,
     Glob,
     Stream,
+    Job,
     Function,
 }
 
@@ -55,6 +56,7 @@ impl std::fmt::Display for NoLiteral {
             NoLiteral::Regex => "a regex has no literal form",
             NoLiteral::Glob => "a glob has no literal form",
             NoLiteral::Stream => "a stream handle has no literal form",
+            NoLiteral::Job => "a job handle has no literal form",
             NoLiteral::Function => "a function has no literal form",
         };
         f.write_str(reason)
@@ -125,6 +127,11 @@ impl Value {
             // (`DESIGN.md` §"Globbing").
             Value::Glob(_) => return Err(NoLiteral::Glob),
             Value::Stream(_) => return Err(NoLiteral::Stream),
+            // A handle names a job in *this* shell's table, so the id is the one
+            // thing about it that could be written and the one thing that means
+            // nothing anywhere else. Round-tripping it would hand back a
+            // reference to whatever job happened to hold that id.
+            Value::Job(_) => return Err(NoLiteral::Job),
             Value::Function(_) => return Err(NoLiteral::Function),
         }
         Ok(())
