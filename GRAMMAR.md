@@ -348,8 +348,36 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
   with **no text form** — a command argument, an interpolation, or `$env.*`
   refuses it — and equality is **identity**, so a copied binding is the same
   function and a separately written twin is not.
+- **`:capture`.** `f(…):capture` runs the call and yields a **record of every
+  channel**: `.value`, `.out`, `.err`, `.status`. It is an *invocation-level*
+  modifier, recognized on the call before the call runs — a value modifier would
+  arrive after the stdout had already streamed away — so it is the one `:` name
+  that is not applied to a value. `:capture` takes no arguments, and on anything
+  but a call it is an error. `.out`/`.err` are the bytes **as written**: no
+  trailing-newline trim, unlike `$(…)`, so the record fixes no split policy.
+  `.status` is the exit int.
+
+  A **command** captures too — `grep(foo):capture`, `puts(x):capture` — and is the
+  single exception to "a command has no return value", since it asks for the record
+  rather than a value. Its record comes back **without `.value`**, so reading it is
+  the usual loud missing-key error. Builtin or external, it goes through the
+  dispatcher command position uses, so `puts(x):capture` runs the *builtin* and
+  `pwd():capture` does not reach `/bin/pwd`; an `exit` still leaves the shell rather
+  than reporting a status into a record. Command captures take **positional
+  arguments only**: a `key: value` option or a map spread has no signature to bind
+  to, and a list positional still needs `...`.
+
+  A background job the call starts inherits the capture's pipes, so the capture
+  waits for it — as bash's command substitution and mesh's own `$(…)` both do;
+  redirecting the child's own streams releases it.
+
+  A statement failing *inside* the body is ordinary — the record is produced and
+  the diagnostic is on `.err`. The **call** failing (a bad argument count, so the
+  body never ran) fails the enclosing statement, as an uncaptured value call
+  does, and its diagnostic is re-reported on the shell's stderr rather than
+  vanishing into a record nobody will read.
 - **Deferred:** a function in the background is rejected (needs the fork-based
-  executor); `func` composing with separators; and `:capture` on a call.
+  executor); and `func` composing with separators.
 
 ## Task 10 — `if` expressions
 

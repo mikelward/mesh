@@ -692,9 +692,53 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
   - **Equality is identity.** A copied binding is the same function; a separately
     written lambda with the same text is a different one.
 
-Not yet supported: `:capture` on a call, and the higher-order modifiers that give
-lambdas their main use (`:map` / `:filter` / `:each`), including a bare `:mod`
-reference as a callable.
+- **Both channels at once — `:capture`.** `f(…):capture` runs the call and returns
+  a **record of every channel**: `.value` (the return value), `.out` and `.err`
+  (its stdout and stderr), and `.status` (the exit int). Read them with ordinary
+  field access.
+
+  ```
+  func build() { puts compiling
+    return ok }
+  r = build():capture
+  puts "$r.value / $r.status"          # ok / 0
+  puts "$r.out"                        # compiling
+  ```
+
+  - **It wraps execution.** `:capture` is an *invocation-level* modifier, not a
+    value modifier: by the time a value modifier saw the return value the stdout
+    would already have streamed away, the same reason `$(…)` is a wrapper rather
+    than a postfix. So it attaches to a **call** — on anything else it is an
+    error — and it takes no arguments.
+  - **`.out` and `.err` are the bytes as written**, with no trailing-newline trim
+    (unlike `$(…)`), so the record fixes no split policy: divide them with
+    `:split` and friends as you need.
+  - **Commands capture too**, and this is the one exception to "a command has no
+    return value": `grep(foo):capture` asks for the record, not a value. It comes
+    back **without `.value`** — reading it is a loud missing-key error — and takes
+    **positional arguments only**, since a command has no signature for a
+    `key: value` option or a map spread to bind to. A nonzero exit is data:
+    `false():capture` reports `.status` 1 rather than failing.
+
+    Builtins are commands here as well: `puts(x):capture` runs the builtin, not a
+    program named `puts`, and `pwd():capture` does not reach `/bin/pwd`. `exit`
+    still leaves the shell rather than reporting a status into a record.
+  - **A background job the call starts holds the record open.** It inherits the
+    capture's pipes as its own stdout and stderr, so the capture waits until it
+    lets go — the same thing bash's command substitution does, and mesh's own
+    `$(…)`. Redirect the child's streams (`sleep 5 > /dev/null 2> /dev/null &`)
+    and the capture returns as soon as the call does.
+  - **Two kinds of failure.** A statement failing *inside* the body is ordinary:
+    the record is produced and the diagnostic is on `.err`. The **call** failing —
+    a bad argument count, so the body never ran — fails the enclosing statement
+    just as an uncaptured value call does, and the diagnostic is reported on the
+    shell's stderr rather than disappearing into a record.
+
+Not yet supported: the higher-order modifiers that give lambdas their main use
+(`:map` / `:filter` / `:each`), including a bare `:mod` reference as a callable;
+and the richer `:capture` fields `DESIGN.md` leaves open (timing, a `pipestatus`
+list). `.out`/`.err` are strings rather than true byte-strings — mesh has no
+byte-string type yet, so a capture that is not valid UTF-8 is a loud error.
 
 ## Not yet implemented
 

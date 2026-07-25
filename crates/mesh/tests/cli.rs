@@ -3512,6 +3512,371 @@ fn two_lambdas_are_equal_only_when_they_are_the_same_function() {
 }
 
 #[test]
+fn capture_returns_a_record_of_every_channel() {
+    // `f(…):capture` runs the call and hands back all four channels at once:
+    // `.value`, `.out`, `.err`, `.status`. It has to wrap *execution* — by the time
+    // a value modifier saw the return value the stdout would already have streamed
+    // away — so nothing the body prints reaches the terminal.
+    let out = run_with_input(
+        "func f() { puts to-out\nnosuchcmd\nreturn 7 }\n\
+         r = f():capture\n\
+         puts \"v=$r.value s=$r.status\"\n\
+         puts \"out=[$r.out]\"\n\
+         puts \"err=[$r.err]\"\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("v=7 s=7"), "{stdout:?}");
+    // Raw, as written: no trailing-newline trim, unlike `$(…)`, so the record bakes
+    // in no split policy.
+    assert!(stdout.contains("out=[to-out\n]"), "{stdout:?}");
+    // A diagnostic the body produced is on the err channel, which is where asking
+    // for it put it — not on the shell's stderr.
+    assert!(
+        stdout.contains("err=[mesh: command not found: nosuchcmd\n]"),
+        "{stdout:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("nosuchcmd"),
+        "the captured diagnostic must not also reach the shell: {:?}",
+        out.stderr
+    );
+    // Neither channel leaked to the terminal on the way past.
+    assert!(!stdout.starts_with("to-out"), "{stdout:?}");
+}
+
+#[test]
+fn capture_works_on_a_lambda_and_reads_a_captured_field() {
+    // The callee is whatever a value call accepts, so a lambda captures too.
+    let out = run_with_input(
+        "g = func(x) { puts side\nreturn $x }\n\
+         r = $g(4):capture\n\
+         puts \"v=$r.value out=[$r.out]\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v=4 out=[side\n]\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn capturing_an_external_gives_every_channel_but_the_value() {
+    // The one case where a value call on a command is allowed: it asks for the
+    // channel record, not a return value the command has not got. A nonzero exit is
+    // the answer, not a failure.
+    let out = run_with_input(
+        "ok = echo(hello):capture\n\
+         bad = false():capture\n\
+         puts \"s=$ok.status out=[$ok.out] bad=$bad.status\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "s=0 out=[hello\n] bad=1\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // `.value` does not exist for an external, so reading it is a loud
+    // no-such-field — and the script recovers.
+    let missing = run_with_input("r = echo(x):capture\nputs $r.value\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("no `value` in this map"),
+        "{:?}",
+        missing.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&missing.stdout), "after\n");
+}
+
+#[test]
+fn capturing_a_builtin_runs_the_builtin() {
+    // "Command" means builtin as well as external. Routing by "not a user function"
+    // alone sent `puts(x):capture` to an exec that cannot find `puts` (status 127),
+    // and `pwd():capture` to whatever `/bin/pwd` happens to be — a *different*
+    // program answering for the builtin. Both go through the same in-shell
+    // dispatcher command position uses.
+    let out = run_with_input(
+        "p = puts(hello):capture\n\
+         w = pwd():capture\n\
+         j = jobs():capture\n\
+         e = echo(hi):capture\n\
+         puts \"p=$p.status/[$p.out] w=$w.status j=$j.status e=$e.status/[$e.out]\"\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("p=0/[hello\n]"), "{stdout:?}");
+    assert!(stdout.contains("w=0"), "{stdout:?}");
+    assert!(stdout.contains("j=0"), "{stdout:?}");
+    // The external path still works alongside it.
+    assert!(stdout.contains("e=0/[hi\n]"), "{stdout:?}");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // `pwd` reports the real directory rather than an empty capture.
+    let cwd = run_with_input("r = pwd():capture\nn = $r.out:len\nputs $n\n");
+    let length: usize = String::from_utf8_lossy(&cwd.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    assert!(
+        length > 1,
+        "pwd should have written its path: {:?}",
+        cwd.stdout
+    );
+
+    // An unknown name is still an external lookup, and its failure is data.
+    let missing = run_with_input("r = nosuchcmd():capture\nputs \"s=$r.status\"\n");
+    assert!(
+        String::from_utf8_lossy(&missing.stdout).contains("s=127"),
+        "{:?}",
+        missing.stdout
+    );
+
+    // `exit` is a builtin that does not report a status into a record: its step
+    // unwinds out of the capture and leaves the shell, descriptors restored on the
+    // way.
+    let exited = run_with_input("r = exit(3):capture\nputs unreachable\n");
+    assert_eq!(exited.status.code(), Some(3));
+    assert!(exited.stdout.is_empty(), "{:?}", exited.stdout);
+}
+
+#[test]
+fn nothing_escapes_a_capture_through_an_inherited_descriptor() {
+    // The capture holds four descriptors besides the standard ones: a backup of the
+    // real stdout and stderr, and each pipe's read end. Left inheritable, they are
+    // simply more open descriptors in any command the capture runs — and the backup
+    // of the real stdout is a way straight past it. All four are close-on-exec, so
+    // only the `dup2`-installed 0/1/2 reach the child. (`dup2` clears the flag on
+    // what it installs, which is why those still cross `exec`.)
+    let escape = run_with_input(
+        "r = sh(-c, \"echo escaped >&5\"):capture\n\
+         puts \"status=$r.status\"\n",
+    );
+    let stdout = String::from_utf8_lossy(&escape.stdout);
+    assert!(
+        !stdout.contains("escaped"),
+        "output reached the shell past the capture: {stdout:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&escape.stderr).contains("escaped"),
+        "{:?}",
+        escape.stderr
+    );
+    // The write failed inside the capture instead, so the record reports it.
+    assert!(!stdout.contains("status=0"), "{stdout:?}");
+
+    // Directly: a captured child sees the standard descriptors and nothing of the
+    // capture's own. (Linux-only listing, so it is a bonus assertion rather than
+    // the one the test rests on; fd 3 is `ls`'s own handle on the directory.)
+    if std::path::Path::new("/proc/self/fd").exists() {
+        let listed =
+            run_with_input("r = sh(-c, \"ls /proc/self/fd\"):capture\nputs \"fds=[$r.out]\"\n");
+        let seen = String::from_utf8_lossy(&listed.stdout);
+        for leaked in ["4", "5", "6", "7"] {
+            assert!(
+                !seen.contains(&format!("\n{leaked}\n")),
+                "fd {leaked} leaked into the child: {seen:?}"
+            );
+        }
+    }
+
+    // `$(…)` has the same shape and had the same hole: it is the function `Diverted`
+    // was generalized from, so it now goes through it and inherits both guarantees.
+    // Fixing one of two parallel paths is the mistake that produced several of the
+    // findings on this branch already.
+    let substitution = run_with_input("x = $(sh -c \"echo escaped >&5\")\nputs \"after\"\n");
+    assert!(
+        !String::from_utf8_lossy(&substitution.stdout).contains("escaped"),
+        "output escaped `$(…)`: {:?}",
+        substitution.stdout
+    );
+    if std::path::Path::new("/proc/self/fd").exists() {
+        let listed = run_with_input("y = $(sh -c \"ls /proc/self/fd\")\nputs \"fds=[$y]\"\n");
+        let seen = String::from_utf8_lossy(&listed.stdout);
+        for leaked in ["4", "5"] {
+            assert!(
+                !seen.contains(&format!("\n{leaked}")),
+                "fd {leaked} leaked into a `$(…)` child: {seen:?}"
+            );
+        }
+    }
+    // Still captures what it should.
+    let plain = run_with_input("z = $(echo hi)\nputs \"[$z]\"\n");
+    assert_eq!(String::from_utf8_lossy(&plain.stdout), "[hi]\n");
+
+    // And an ordinary capture is unaffected by the flag.
+    let normal =
+        run_with_input("r = echo(hi):capture\np = puts(x):capture\nputs \"[$r.out][$p.out]\"\n");
+    assert_eq!(String::from_utf8_lossy(&normal.stdout), "[hi\n][x\n]\n");
+}
+
+#[test]
+fn capture_rejects_what_it_cannot_bind_or_wrap() {
+    for (src, needle) in [
+        // An external has no signature, so a `key:` option has nothing to bind to.
+        (
+            "r = echo(x, color: never):capture\n",
+            "needs a signature to bind to",
+        ),
+        // Nor a map spread, for the same reason.
+        (
+            "opts = [color: never]\nr = echo(x, ...$opts):capture\n",
+            "only a list can be spread",
+        ),
+        // A list positional still needs `...`, as it does for any external.
+        (
+            "xs = [a b]\nr = echo($xs):capture\n",
+            "a list needs `...` to become command arguments",
+        ),
+        // `:capture` wraps a *call*; on anything else it says so and points at the
+        // spelling that does capture output.
+        ("x = 5\ny = $x:capture\n", ":capture applies to a call"),
+        // It takes no arguments of its own.
+        (
+            "func f() { return 1 }\nr = f():capture(2)\n",
+            "does not take arguments",
+        ),
+    ] {
+        let out = run_with_input(&format!("{src}puts after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{src:?}: {stderr:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{src:?}");
+    }
+}
+
+#[test]
+fn a_call_that_fails_outright_under_capture_reports_once_and_yields_nothing() {
+    // Two different failures, told apart on purpose. A statement *inside* the body
+    // failing is ordinary: the call still produces a record and its diagnostic is
+    // on `.err`, tested above. The *call* failing — a bad argument count, so the
+    // body never ran — fails the enclosing statement as an uncaptured value call
+    // would, and its diagnostic is re-reported on the real stderr rather than
+    // disappearing into a record nobody will ever read.
+    let out = run_with_input("func f(a) { return $a }\nr = f():capture\nputs \"r=$r\"\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("expected 1 argument"), "{stderr:?}");
+    assert_eq!(
+        stderr.matches("expected 1 argument").count(),
+        1,
+        "reported exactly once: {stderr:?}"
+    );
+    // No record was bound, so the read fails too — the assignment did not happen.
+    assert!(stderr.contains("r: unbound variable"), "{stderr:?}");
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+}
+
+#[test]
+fn capture_covers_the_whole_invocation_including_its_arguments() {
+    // `:capture` is an *invocation-level* modifier, so everything written while
+    // evaluating the call belongs in the record — including an argument that
+    // prints. The external path used to build its argv before diverting, so a
+    // side-effecting argument went to the terminal and the record held only the
+    // command's own output. A captured mesh call never had that gap; the two agree
+    // now.
+    let external = run_with_input(
+        "func side() { puts from-arg\nreturn x }\n\
+         r = echo(side()):capture\n\
+         puts \"out=[$r.out]\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&external.stdout),
+        "out=[from-arg\nx\n]\n"
+    );
+    assert!(external.stderr.is_empty(), "{:?}", external.stderr);
+
+    let mesh = run_with_input(
+        "func side() { puts from-arg\nreturn x }\nfunc takes(v) { puts $v }\n\
+         r = takes(side()):capture\n\
+         puts \"out=[$r.out]\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&mesh.stdout),
+        "out=[from-arg\nx\n]\n"
+    );
+}
+
+#[test]
+fn a_failed_external_capture_argument_reports_and_restores() {
+    // An argument that fails does so while the descriptors are diverted, so its
+    // diagnostic would vanish with the record — it is re-reported, once, on the
+    // real stderr. And stdout is back, which the following command proves: a
+    // descriptor left on a reader-less pipe would lose it or fail with EPIPE.
+    for (src, needle) in [
+        (
+            "xs = [a b]\nr = echo($xs):capture\n",
+            "a list needs `...` to become command arguments",
+        ),
+        (
+            "opts = [k: v]\nr = echo(...$opts):capture\n",
+            "only a list can be spread",
+        ),
+    ] {
+        let out = run_with_input(&format!("{src}puts after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{src:?}: {stderr:?}");
+        assert_eq!(stderr.matches(needle).count(), 1, "once: {stderr:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{src:?}");
+    }
+}
+
+#[test]
+fn a_capture_waits_for_a_background_child_that_holds_the_channel() {
+    // A background job the call starts inherits the capture's pipes as its own
+    // stdout and stderr, so the record is not complete until it lets go. That is
+    // not a leak and it is not mesh-specific: bash's command substitution does the
+    // same, and so does mesh's own `$(…)`.
+    //
+    //   bash -c 'set -m; f(){ sleep 6 & echo hi; }; r=$(f)'            # waits 6s
+    //   bash -c 'set -m; f(){ sleep 6 >/dev/null 2>&1 & echo hi; }; …' # returns now
+    //
+    // Redirect the child's own streams away and there is nothing holding the pipe,
+    // so the capture returns as soon as the call does.
+    let timed = |script: &str| {
+        let start = std::time::Instant::now();
+        let out = run_with_input(script);
+        (out, start.elapsed())
+    };
+
+    let (freed, quick) = timed(
+        "func f() { sleep 5 > /dev/null 2> /dev/null &\nreturn ok }\n\
+         r = f():capture\n\
+         puts \"v=$r.value\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&freed.stdout), "v=ok\n");
+    assert!(
+        quick < std::time::Duration::from_secs(3),
+        "a child with its own streams should not hold the capture: {quick:?}"
+    );
+
+    // Left inheriting them, the capture waits — the same answer bash gives.
+    let (held, waited) =
+        timed("func f() { sleep 0.5 &\nreturn ok }\nr = f():capture\nputs \"v=$r.value\"\n");
+    assert_eq!(String::from_utf8_lossy(&held.stdout), "v=ok\n");
+    assert!(
+        waited >= std::time::Duration::from_millis(400),
+        "a child inheriting the channels holds the capture: {waited:?}"
+    );
+}
+
+#[test]
+fn capture_survives_more_output_than_a_pipe_buffer_holds() {
+    // Both channels are drained on their own threads. Reading them in sequence
+    // would deadlock the moment a body filled the 64 KiB pipe buffer on the
+    // channel that was not being read yet.
+    let out = run_with_input(
+        "func f() { seq 1 20000\nseq 1 20000 > /dev/stderr\nreturn 0 }\n\
+         r = f():capture\n\
+         a = $r.out:len\n\
+         b = $r.err:len\n\
+         puts \"$a $b\"\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // 1..9 plus 10..99 … — the exact byte count matters less than "both large".
+    let counts: Vec<usize> = stdout
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    assert_eq!(counts.len(), 2, "{stdout:?}");
+    assert!(
+        counts[0] > 100_000 && counts[1] > 100_000,
+        "both channels should be fully drained: {counts:?}"
+    );
+}
+
+#[test]
 fn value_call_errors_recover_and_run_the_next_command() {
     // Each bad value call is a recoverable runtime error; the following command
     // still runs.
@@ -4858,7 +5223,11 @@ fn maps_preserve_order_support_access_spread_and_merge() {
 fn maps_reject_missing_keys_and_non_string_keys() {
     let missing = run_with_input("m = [present: yes]\nputs $m.absent\n");
     assert_eq!(missing.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("map key"));
+    // A permanent error, not an unimplemented feature: it used to render through
+    // `Unsupported`, which appends "not supported yet".
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("$m: no `absent` in this map"), "{stderr:?}");
+    assert!(!stderr.contains("not supported yet"), "{stderr:?}");
 
     let bad_key = run_with_input("keys = [bad]\nm = [$keys: value]\n");
     assert_eq!(bad_key.status.code(), Some(1));

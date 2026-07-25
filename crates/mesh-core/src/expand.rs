@@ -94,6 +94,14 @@ pub enum ExpandError {
     UnsetEnv(String),
     Unsupported(String),
     ListNeedsSpread(String),
+    /// A map has no such key. Its own variant because `Unsupported` renders as
+    /// "… not supported yet", which reads as an unimplemented feature — and a
+    /// missing key is a normal, permanent error, the loud no-such-field
+    /// `f(…):capture` relies on for a `.value` an external cannot have.
+    NoSuchKey {
+        name: String,
+        key: String,
+    },
     /// A function value reached a place that needs bytes — a command argument, an
     /// interpolation, the environment. It is the one value with no text form.
     NoTextForm(String),
@@ -116,6 +124,9 @@ impl std::fmt::Display for ExpandError {
             ExpandError::Unsupported(s) => write!(f, "{s}: not supported yet"),
             ExpandError::ListNeedsSpread(n) => {
                 write!(f, "${n}: list value needs `...` in command arguments")
+            }
+            ExpandError::NoSuchKey { name, key } => {
+                write!(f, "${name}: no `{key}` in this map")
             }
             ExpandError::NoTextForm(n) => {
                 write!(f, "${n}: a function value has no text form")
@@ -493,7 +504,10 @@ fn map_value_access(value: Value, key: &str, name: &str) -> Result<Value, Expand
             .into_iter()
             .find(|(candidate, _)| candidate == key)
             .map(|(_, value)| value)
-            .ok_or_else(|| ExpandError::Unsupported(format!("${name}[{key}]: map key not found"))),
+            .ok_or_else(|| ExpandError::NoSuchKey {
+                name: name.to_string(),
+                key: key.to_string(),
+            }),
         _ => Err(ExpandError::Unsupported(format!(
             "${name}: value is not a map"
         ))),
