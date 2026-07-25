@@ -7044,6 +7044,120 @@ fn command_branch_output_becomes_the_if_expression_value() {
     );
 }
 
+/// A **hard** lexical error inside a body — an invalid escape — does not decide
+/// anything on its own. It sits inside a string, so it cannot change brace
+/// structure, and the only question that matters is still whether the body's `}`
+/// has arrived. Both answers have a way to be wrong:
+///
+/// - `}` present: the definition is **done**, so it dispatches. Waiting for a later
+///   line to repair an invalid escape buffers forever behind a diagnostic that never
+///   arrives — interactively the prompt could only be escaped by cancelling.
+/// - `}` not yet: the definition is **still open**, so it stays quarantined.
+///   Dispatching there ran the body's own later lines as top-level commands.
+#[test]
+fn a_hard_lexical_error_in_a_function_body_reports_without_leaking() {
+    // Closed: the error is reported and the command after the definition runs.
+    for input in [
+        "func f() { puts \"\\z\" }\nputs LATER\n",
+        "func f() {\n  puts \"\\z\"\n}\nputs LATER\n",
+    ] {
+        let out = run_with_input(input);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("syntax error"), "{input:?}: {stderr}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "LATER\n",
+            "{input:?} swallowed the command after it: {stderr}"
+        );
+    }
+
+    // Still open: the body's later lines belong to the quarantined definition and
+    // must not run, whether the `}` eventually arrives or the input just ends.
+    for input in [
+        "func f() {\nputs \"\\z\"\nputs LEAKED\n}\nputs AFTER\n",
+        "func f() { puts \"\\z\"\nputs LEAKED\n",
+    ] {
+        let out = run_with_input(input);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("syntax error") || !String::from_utf8_lossy(&out.stderr).is_empty(),
+            "{input:?} reported nothing"
+        );
+        assert!(
+            !stdout.contains("LEAKED"),
+            "{input:?} leaked a body command to the top level: {stdout}"
+        );
+    }
+
+    // And the definition that *does* close still runs its own commands afterwards.
+    let out = run_with_input("func f() {\nputs \"\\z\"\nputs LEAKED\n}\nputs AFTER\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "AFTER\n");
+
+    // The `}` is found however many errors precede it and whatever shape they take.
+    // A **zero-width** diagnostic (`${}` reports an empty span) and an error count
+    // past any fixed retry budget both defeated span-blanking recovery.
+    let many = "\\z".repeat(200);
+    for input in [
+        "func f() { puts ${} }\nputs LATER\n".to_owned(),
+        format!("func f() {{ puts \"{many}\" }}\nputs LATER\n"),
+    ] {
+        let out = run_with_input(&input);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "LATER\n",
+            "a closed body was not seen past its errors: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The other half of that split: an **open** construct inside a body is one a later
+/// line can still close, so it keeps buffering rather than dispatching mid-string.
+#[test]
+fn an_open_construct_in_a_function_body_keeps_buffering() {
+    // A string that spans physical lines, and a heredoc body — both carry a `}`-free
+    // stretch the reader must not mistake for the end of the definition.
+    let out = run_with_input("func f() {\n  puts \"line one\nline two\"\n}\nf\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "line one\nline two\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_with_input("func f() {\n  cat << END\nhello\nEND\n}\nf\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hello\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And a `}` inside a string is not the body's close.
+    let out = run_with_input("func f() {\n  puts \"a } b\"\n  puts second\n}\nf\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a } b\nsecond\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A tokenize failure *after* the body's `}` says nothing about the body — it has
+/// already closed. Reading it as "still open" buffered a finished definition forever
+/// and swallowed every command after it.
+#[test]
+fn a_close_before_a_tokenize_failure_does_not_swallow_later_commands() {
+    let out = run_with_input("func f() {} puts \"\nputs LATER\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("syntax error"), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "LATER\n",
+        "a finished definition swallowed the command after it: {stderr}"
+    );
+}
+
 #[test]
 fn malformed_function_bodies_remain_quarantined() {
     for input in [
@@ -10825,6 +10939,45 @@ fn bare_export_names_the_spelling_that_works() {
     // follow, so a variable may still be called `export`.
     let out = run_with_input("export = 5\nputs $export\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+}
+
+/// One name rule for reads and writes. The whole-string check behind `export NAME`,
+/// `$env.KEY = …`, and a `${…}` place's root used to come from the compatibility
+/// lexer, whose scan was ASCII-only, while `$name` reads went through the parser's
+/// own — Unicode — scan. So a name could be bound and read but not exported.
+#[test]
+fn a_name_that_reads_can_also_be_exported() {
+    let out = run_with_input(
+        "café = 5\n\
+         puts $café\n\
+         export CAFÉ = x\n\
+         puts $env.CAFÉ\n\
+         $env.naïve = y\n\
+         puts $env.naïve\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "5\nx\ny\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Widening the alphabet does not widen the *shape*: an alphabetic head and
+    // interior-only hyphens still decide, so these stay refusals rather than
+    // becoming exports.
+    for source in [
+        "export 1x = v\n",
+        "export a--b = v\n",
+        "export x- = v\n",
+        "export _x = v\n",
+    ] {
+        let out = run_with_input(source);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+            "{source} was not refused: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

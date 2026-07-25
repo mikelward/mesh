@@ -679,7 +679,7 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
 /// relates to the signature grammar — used by the multi-line reader to decide
 /// buffer-vs-dispatch without a second copy of the grammar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrefixStatus {
+pub(crate) enum PrefixStatus {
     /// A complete, valid parameter list so far (the `)` may still follow).
     Complete,
     /// A valid list that simply ran out of input mid-parameter (a default not yet
@@ -697,7 +697,7 @@ pub enum PrefixStatus {
 /// Caller contract: `list` is the text just past the signature's `(`, with the
 /// closing `)` not yet present, and any final token the user may still be typing
 /// already trimmed (so the parser does not finalize a growing name early).
-pub fn params_prefix_status(list: &str) -> PrefixStatus {
+pub(crate) fn params_prefix_status(list: &str) -> PrefixStatus {
     // A tokenize failure is an unterminated quote/raw string — the same thing that
     // makes `parse()` return an error (it propagates `tokenize(..)?`), so it is a
     // hard error the reader dispatches, not an open construct to buffer.
@@ -2336,7 +2336,7 @@ impl Parser {
             name.strip_prefix("${env.")
                 .and_then(|k| k.strip_suffix('}'))
         })?;
-        if !crate::lexer::is_name(key) {
+        if !valid_name(key) {
             return None;
         }
         let key = key.to_owned();
@@ -2372,7 +2372,7 @@ impl Parser {
             .or_else(|| name.strip_prefix('$'))?;
         let root_end = inner.find(['.', '[', ':'])?;
         let root = &inner[..root_end];
-        if !crate::lexer::is_name(root) || crate::vars::is_reserved_namespace(root) {
+        if !valid_name(root) || crate::vars::is_reserved_namespace(root) {
             return None;
         }
         // Walk the accesses structurally rather than scanning for a `:`: a colon
@@ -3433,7 +3433,7 @@ impl Parser {
         let Some(key) = self.word_text_at(0).map(str::to_owned) else {
             return Err(self.error(ParseErrorKind::Expected("a NAME after `export`")));
         };
-        if !crate::lexer::is_name(&key) {
+        if !valid_name(&key) {
             return Err(self.error(ParseErrorKind::Expected("a valid name after `export`")));
         }
         self.position += 1;
@@ -3571,7 +3571,17 @@ fn value_operator(kind: &TokenKind) -> bool {
     )
 }
 
-fn valid_name(name: &str) -> bool {
+/// Is the whole of `name` a name?
+///
+/// The rule the tokenizer's own `$name` scan applies
+/// ([`variable_end`](variable_end)) — an alphabetic head, then alphanumerics, `_`,
+/// and *interior* `-` — asked of a complete string instead of a prefix of one. Every
+/// caller that validates a name it did not scan itself (an `$env.KEY` target,
+/// `export NAME`, a `${…}` place's root) goes through here, so a name a read accepts
+/// is a name a write accepts. The previous whole-string check was anchored to the
+/// compatibility lexer's ASCII-only scan instead, which is how `café = 5` bound a
+/// variable while `export CAFÉ = x` was refused as an invalid name.
+pub(crate) fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -4153,6 +4163,34 @@ mod tests {
             &tree.statements[1].and_or.first,
             Executable::Function { name, .. } if name == "auto-fetch"
         ));
+    }
+
+    /// One name rule, checked whole. The whole-string check callers use to validate
+    /// a name they did not scan themselves — an `$env.KEY` target, `export NAME`, a
+    /// `${…}` place's root — must accept exactly what a `$name` read accepts, or a
+    /// name can be read and not written. It used to be anchored to the
+    /// compatibility lexer's ASCII-only scan instead, so `café = 5` bound a variable
+    /// that `export CAFÉ = x` then refused as an invalid name.
+    #[test]
+    fn a_name_a_read_accepts_is_a_name_a_write_accepts() {
+        for name in ["x", "MY-VAR", "PATH", "a_b", "a1-b2", "café", "CAFÉ"] {
+            assert!(valid_name(name), "{name} should be a name");
+        }
+        // Interior-only hyphens, an alphabetic head, and nothing else.
+        for name in [
+            "", "-x", "1x", "x-", "a--b", "_x", "a.b", "PATH[0]", "x:dedup",
+        ] {
+            assert!(!valid_name(name), "{name} should not be a name");
+        }
+        // And the read side agrees: each of these is one whole variable token.
+        for name in ["x", "MY-VAR", "a1-b2", "café"] {
+            let source = format!("${name}");
+            assert_eq!(
+                variable_end(&source, 0).unwrap(),
+                source.len(),
+                "${name} did not read as one name"
+            );
+        }
     }
 
     #[test]

@@ -44,7 +44,7 @@ Cargo, as a **workspace** rooted at [`Cargo.toml`](Cargo.toml).
   `libsqlite3-sys` — reached through `reedline`'s `sqlite` history backend —
   whose build script uses the `cfg_select!` macro stabilized in Rust 1.95.
 - **Three members today** — `crates/mesh`, the thin shell executable;
-  `crates/mesh-core`, the reusable lexer, expansion, and runtime library; and
+  `crates/mesh-core`, the reusable parser, expansion, and runtime library; and
   `crates/mesh-platform`, a small crate holding the `libc` constants and types
   whose definitions differ across platforms. The workspace leaves room for more
   satellite crates without restructuring.
@@ -94,7 +94,7 @@ permissive project).
 Two layers, both run by `cargo test --workspace`:
 
 - **Unit tests** — inline `#[cfg(test)] mod tests` next to pure logic (e.g.
-  `lexer::split`). Fast, no process spawning.
+  `parser::tokenize`). Fast, no process spawning.
 - **Integration tests** — `crates/mesh/tests/*.rs` drive the *built binary*
   end-to-end. Cargo exposes its path as `CARGO_BIN_EXE_mesh`, so these use only
   `std::process` — no test-harness crate needed. They pipe a script on stdin and
@@ -156,9 +156,8 @@ mesh/
 │   ├── mesh-core/          # reusable shell implementation
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs      # public run entry point and lexer module
+│   │       ├── lib.rs      # public run entry point and parser module
 │   │       ├── repl.rs     # read / tokenize / dispatch loop
-│   │       ├── lexer.rs    # compatibility lexer used by the current evaluator
 │   │       ├── parser.rs   # span-carrying M3 tokens and command/value AST
 │   │       ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
 │   │       ├── vars.rs     # variable store: global scope + function-local scopes
@@ -179,22 +178,22 @@ mesh/
 ### How the code fits together
 
 `main` calls `mesh_core::run`, which enters the REPL and loops: read a line →
-`lexer::split_line` into
-command segments joined by `;` / `&&` / `||` / `&`, each a list of words of pieces →
-run the segments left to right, each connector deciding from the previous status
-whether its command runs → per command, classify as an assignment or a command →
-for a command, `expand::expand` (resolve `$` interpolation against `vars`, then
-tilde/globs) → job-table dispatch (`jobs`/`fg`/`bg`) or `builtins::dispatch`
-(`cd`/`pwd`/`puts`/`exit`) → a user function from the `funcs` store → else
-`exec::run` launches the external command. A `func name(params) { … }` definition
-is recognized from raw text before `split_line` (its body spans lines the per-line
-lexer would flatten); the reader buffers input until the body braces balance. A
-function call runs the body in a fresh function-local `vars` scope. A session
-`vars` store (global scope plus a stack of function-local scopes) and the `funcs`
-store persist across lines; the loop tracks the last exit status and returns it as
-the process exit code at EOF.
+`parser::parse` into a syntax tree of statements joined by `;` / `&&` / `||` / `&` →
+run the statements left to right, each connector deciding from the previous status
+whether its command runs → per statement, an assignment, a value expression, or a
+pipeline → for a command, `expand::expand` (resolve `$` interpolation against
+`vars`, then tilde/globs) → job-table dispatch (`jobs`/`fg`/`bg`) or
+`builtins::dispatch` (`cd`/`pwd`/`puts`/`exit`) → a user function from the `funcs`
+store → else `exec::run` launches the external command. Input that does not yet form
+a complete unit is buffered rather than dispatched: `parse` reports it as
+incomplete, and a `func` definition whose header is malformed is judged separately
+(`repl::func_definition_is_open`) so its error is reported instead of swallowing the
+lines after it. A function call runs the body in a fresh function-local `vars`
+scope. A session `vars` store (global scope plus a stack of function-local scopes)
+and the `funcs` store persist across lines; the loop tracks the last exit status and
+returns it as the process exit code at EOF.
 
 The shell internals live in the `crates/mesh-core` library; `crates/mesh` is a
-thin executable that calls its public `run` entry point. This keeps lexer and
-future parser logic directly testable and makes the runtime reusable by future
+thin executable that calls its public `run` entry point. This keeps parser and
+runtime logic directly testable and makes the runtime reusable by future
 frontends or satellite binaries. See [`ROADMAP.md`](ROADMAP.md).

@@ -1,4 +1,4 @@
-//! Core lexer, expansion, and runtime for the mesh shell.
+//! Core parser, expansion, and runtime for the mesh shell.
 //!
 //! The [`run`] entry point owns the read/tokenize/dispatch loop. The binary crate
 //! deliberately contains only process startup so other frontends and tests can
@@ -32,7 +32,6 @@ mod environ;
 mod exec;
 mod expand;
 mod funcs;
-pub mod lexer;
 pub mod parser;
 mod repl;
 mod vars;

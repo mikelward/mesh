@@ -1013,33 +1013,16 @@ The escape hatches are the ones any reserved word has — a path or a quoted wor
 **parity** — `not not not $x` is `not $x`, and any even run is the `not not $x` that
 coerces truthiness to a bool without inverting it.
 
-### Redirect or comparison
-
-`<` and `>` spell both a redirection and a comparison, and **attachment** says which
-is meant. `cmd >out` redirects, `$a > $b` compares, and `>>` is only ever a redirect.
-The rule is the same in every position, so a line reads alike inside an `if` and
-outside one:
-
-```mesh
-i = 0
-if $i < 3 { … }      # a comparison
-$i < 3               # the same comparison, as a statement
-grep -q x < file     # a redirect: `grep` is not a value in any spelling
-```
-
-Only an operand with a second, *value* reading is affected — a variable, a quoted
-word, a numeral, or a `:modifier` chain. A bare command word has none, so its
-redirect is a redirect however it is spaced.
-
-A **word operand** is a value only when the value is the whole statement; anything
-continuing the line makes it the command line it looks like:
+The same **whole-statement** rule governs a **word operand** on its own, which is how
+a variable names a command. A word is a *value* only when the value is the whole
+statement; anything continuing the line makes it the command line it looks like, and
+a redirect after the *completed* operand is a redirection rather than a comparison:
 
 ```mesh
 editor = vim
 $editor              # a value — the string "vim"
 $editor notes.txt    # runs vim on notes.txt
-$editor >log         # runs vim, stdout redirected
-$editor > log        # a comparison: "vim" against "log"
+$editor > log        # runs vim, stdout redirected
 $editor ...$files    # runs vim on each of them
 $editor | cat        # a pipeline: a value cannot be a pipeline stage
 $editor || puts oops # a connector: runs vim, branches on its exit status
@@ -1047,7 +1030,7 @@ $editor &            # backgrounds the command
 
 p = "src/main.rs"
 $p:base out          # runs `main.rs` with the argument `out`
-$p:base >log         # runs it, redirected — the command word ends after `:base`
+$p:base > log        # runs it, redirected — the command word ends after `:base`
 ```
 
 A **command word** is a word plus its *attached* argument-free `:modifier` suffixes,
@@ -1061,19 +1044,24 @@ $e:len            # a value: the length of the word "echo"
 $e :len           # runs echo with the argument ":len"
 ```
 
-An operand that cannot be a command word has no redirect reading to reach for, in
-either spelling:
+An operand that cannot be a command word keeps the comparison reading:
 
 ```mesh
 x = 1
 $x + 1 > 1        # a comparison: arithmetic cannot be a command word
 ns = [7 8]
 $ns[0 + 0] > 0    # a comparison: a computed index cannot be one either
-$ns[0] >out.txt   # a command, redirected: a literal index is part of the word
+$ns[0] > out.txt  # a command, redirected: a literal index is part of the word
 ```
 
-A *derived* value is not a place: `$xs:dedup = 9` is a syntax error saying so, never
-an attempt to run a command named by the value.
+A negation is the other kind of operand: `not` is reserved, so it has no command
+reading at all, and `&&` / `||` join the value statement rather than making a command
+of it — `not $b && puts x` negates and then branches.
+
+In a condition a spaced comparison still compares, modifiers and all, so
+`if $xs:len > 5 { … }` asks about the length. And a *derived* value is not a place:
+`$xs:dedup = 9` is a syntax error saying so, never an attempt to run a command named
+by the value.
 
 `~` tests a string against a bare glob or a regex; `!~` negates the result.
 Globs match the whole string, while regexes search for a match unless explicitly

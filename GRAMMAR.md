@@ -1,7 +1,7 @@
 # Legacy incremental grammar notes
 
 This file records the task-by-task grammar that preceded M3. It remains useful
-for the public compatibility lexer and the history of M0–M2 behavior, but it is
+for the history of M0–M2 behavior, but it is
 **not** the current execution grammar: M3 replaced that path with the
 span-carrying clean-break parser described in [`PARSER.md`](PARSER.md). The
 implemented user-facing surface is summarized in
@@ -465,26 +465,22 @@ they would for any reserved word, and `not` as data (`puts not`, `x = "not"`) is
 untouched. A run of `not`s folds to its parity, `not` yielding a bool from its
 operand's truthiness.
 
-**Attachment decides** which of the two readings a `<` / `>` takes, and it decides
-the same way in every position: `cmd >out` redirects, `$a > $b` compares, whether the
-line is a statement or a condition. So `if $i < 3` and `if $xs:len > 5` compare, and
-so do the identical lines outside an `if` — `$p:base > log` has one reading rather
-than two that depend on where it sits. `>>` is only ever a redirect and is never
-spelled spaced. A bare command word has no value reading to lose, so
-`grep -q x < file` is a redirect in either spelling; the rule only bites on operands
-that could be values.
+A `<` / `>` is claimed as a value operator only when what follows looks like a value,
+which leaves `cmd <file` a redirect. Whether one is a redirect is judged after the
+*complete* operand, and **position** decides: a *spaced* `<` / `>` is a comparison in
+a condition and a redirection in a statement, so `if $xs:len > 5` compares while
+`$p:base > log` redirects.
 
-The **whole-statement** rule applies to a bare **word** operand, which is how
-`$editor` names a command: it is a value only when the value is the whole statement,
-so `$editor file`, `$editor ...$files`, `$editor | cat`, `$editor || puts oops`, and
-`$editor &` are command lines — a connector or a backgrounding `&` picks the command,
-since that is the `$cmd || fallback` idiom. A redirect is found by scanning to the end
-of the **command word**, a word plus its *attached* argument-free `:modifier` suffixes
-(a spaced one is the next argument, so `$e :len` runs `echo :len`), which is what
-makes `$p:base >log` a redirection. That bound is why `$x + 1 > 1` and
-`$xs[0 + 0] > 0` stay comparisons: neither can be a command word, since a word cannot
-contain a nested expression. `$xs[0] >f` does redirect, a literal index being part of
-the word.
+That rule applies to a bare **word** operand, which is how `$editor` names a command:
+it is a value only when the value is the whole statement, so `$editor file`,
+`$editor ...$files`, `$editor | cat`, `$editor || puts oops`, and `$editor &` are
+command lines — a connector or a backgrounding `&` picks the command, since that is
+the `$cmd || fallback` idiom. A redirect is found by scanning to the end of the
+**command word**, a word plus its *attached* argument-free `:modifier` suffixes (a
+spaced one is the next argument, so `$e :len` runs `echo :len`). That bound is why
+`$x + 1 > 1` and `$xs[0 + 0] > 0` stay comparisons: neither can be a command word,
+since a word cannot contain a nested expression. `$xs[0] > f` does redirect, a
+literal index being part of the word.
 An assignment operator counts as the end of a value for this purpose, which keeps
 `$xs:dedup = 9` a syntax error about places rather than a command invocation.
 
