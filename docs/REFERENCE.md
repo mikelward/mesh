@@ -294,7 +294,8 @@ cat <<< ...$xs            # error: ambiguous redirect — two words
 
 `<<<` always feeds standard input, so it takes no descriptor prefix (`2<<<` is a
 syntax error). Like a heredoc it travels by an unlinked temporary file, so a long
-one cannot deadlock, and backgrounding it is refused for the same reason.
+one cannot deadlock, and either can be backgrounded — the body reaches the stage
+as memory, and the stage writes the temporary in its own process.
 
 ### Tab completion
 
@@ -1301,6 +1302,5 @@ byte-string type yet, so a capture that is not valid UTF-8 is a loud error.
 Most modifier arguments (beyond `:split` / `:join`), the command-word form of an
 argument-taking modifier, and regex capture modifiers are not yet implemented.
 Of heredocs, the command-redirection form documented under Commands works, as do
-here-strings; backgrounding either, and a value-producing heredoc spelling, do
-not.
+here-strings; a value-producing heredoc spelling does not.
 See [`ROADMAP.md`](../ROADMAP.md).

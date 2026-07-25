@@ -37,5 +37,4 @@ pub mod parser;
 mod repl;
 mod vars;
 
-pub use exec::run_background_redirect;
 pub use repl::run;

@@ -195,10 +195,6 @@ impl Shell {
 /// even when stdout is redirected would need reedline to write to `/dev/tty`;
 /// that refinement is deferred.)
 pub fn run() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("--mesh-background-redirect") {
-        return exec::run_background_redirect(args.collect());
-    }
     let options = match StartupOptions::parse(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(message) => {
@@ -3843,7 +3839,7 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
     // targets apply to the shell's own descriptors around the call, so there is
     // nothing to configure on a child.
     let builtin = builtins::is_builtin(&argv[0]);
-    let opened = match expand_redirs_for(redirs, &shell.vars, background) {
+    let opened = match expand_redirs(redirs, &shell.vars) {
         Ok(redirs) => redirs,
         Err(err) => {
             note!("mesh: {err}");
@@ -3938,7 +3934,7 @@ fn run_multi(stages: Vec<Stage>, background: bool, last: u8, shell: &mut Shell) 
             };
             (argv, body)
         };
-        let opened = match expand_redirs_for(redirs, &shell.vars, background) {
+        let opened = match expand_redirs(redirs, &shell.vars) {
             Ok(redirs) => redirs,
             Err(err) => {
                 note!("mesh: {err}");
@@ -4047,33 +4043,13 @@ fn run_stage_in_shell(body: &StageBody, cmd: &exec::Cmd, last: u8, shell: &mut S
 
 /// Expand each redirection target to exactly one path. Zero or several words is
 /// an ambiguous redirect (a glob/list target is not a single file).
-fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirection>, String> {
-    expand_redirs_for(redirs, vars, false)
-}
-
-/// [`expand_redirs`], told whether the command will be backgrounded.
 ///
-/// A background external defers its opens to a helper process reached through
-/// argv, and input *text* cannot travel that way: it is arbitrary, so a large
-/// body exceeds the argument limit and an embedded NUL cannot be represented at
-/// all. That covers a heredoc and a here-string alike. Refusing is what the
-/// executor already assumed.
-fn expand_redirs_for(
-    redirs: Vec<Redir>,
-    vars: &Vars,
-    background: bool,
-) -> Result<Vec<exec::Redirection>, String> {
-    if background
-        && let Some(redir) = redirs
-            .iter()
-            .find(|redir| matches!(redir.means, Means::Document(_) | Means::Text))
-    {
-        let spelling = match redir.means {
-            Means::Text => "here-string",
-            _ => "heredoc",
-        };
-        return Err(format!("a {spelling} cannot be backgrounded yet"));
-    }
+/// Backgrounding one used to be refused here: a background external deferred
+/// its opens to a helper process reached through argv, and input *text* cannot
+/// travel that way — arbitrary bytes, a body past the argument limit, an
+/// embedded NUL. The stage forks and `execvp`s itself now, so the body reaches
+/// its own process as memory and the temporary is written there.
+fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirection>, String> {
     let mut out = Vec::with_capacity(redirs.len());
     for redir in redirs {
         if let Means::Document(body) = redir.means {
