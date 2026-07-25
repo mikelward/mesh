@@ -6422,6 +6422,63 @@ fn malformed_function_bodies_remain_quarantined() {
     }
 }
 
+/// A **hard** lexical error inside a body is reported and the reader moves on. No
+/// later line repairs an invalid escape, so waiting for one buffers forever behind
+/// a diagnostic that never arrives — interactively the continuation prompt could
+/// only be escaped by cancelling, and here every following command is swallowed
+/// into the same buffer and rejected with the function at EOF.
+#[test]
+fn a_hard_lexical_error_in_a_function_body_does_not_swallow_later_commands() {
+    for input in [
+        // With the body's `}` present and without it: the error is already decided
+        // either way, so both dispatch.
+        "func f() { puts \"\\z\" }\nputs LATER\n",
+        "func f() { puts \"\\z\"\nputs LATER\n",
+        "func f() {\n  puts \"\\z\"\n}\nputs LATER\n",
+    ] {
+        let out = run_with_input(input);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("syntax error"), "{input:?}: {stderr}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "LATER\n",
+            "{input:?} swallowed the command after it: {stderr}"
+        );
+    }
+}
+
+/// The other half of that split: an **open** construct inside a body is one a later
+/// line can still close, so it keeps buffering rather than dispatching mid-string.
+#[test]
+fn an_open_construct_in_a_function_body_keeps_buffering() {
+    // A string that spans physical lines, and a heredoc body — both carry a `}`-free
+    // stretch the reader must not mistake for the end of the definition.
+    let out = run_with_input("func f() {\n  puts \"line one\nline two\"\n}\nf\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "line one\nline two\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_with_input("func f() {\n  cat << END\nhello\nEND\n}\nf\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hello\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And a `}` inside a string is not the body's close.
+    let out = run_with_input("func f() {\n  puts \"a } b\"\n  puts second\n}\nf\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a } b\nsecond\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Written attached, since that is the spelling that makes a `<` after a
 /// value-shaped command word a redirect at all — spaced, `$cmd < f` compares.
 #[test]

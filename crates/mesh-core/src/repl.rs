@@ -5235,7 +5235,7 @@ fn pending_input(text: &str) -> Pending {
 /// The one completeness question [`parse`](parser::parse) cannot answer for the
 /// reader: a *malformed* `func` header must be dispatched so its error is
 /// reported, not buffered until it swallows the commands after it. Once a body has
-/// opened this is **brace-driven** ([`body_closes`]) rather than parse-driven, so
+/// opened this is **brace-driven** ([`body_awaits_close`]) rather than parse-driven, so
 /// `func f(x {` still buffers through to its matching `}` and stays quarantined.
 ///
 /// Before any body `{` appears, the header may still legitimately be incomplete:
@@ -5249,7 +5249,7 @@ fn func_definition_is_open(text: &str) -> bool {
         // A body has opened: buffer until its first matching `}`. Trailing text
         // after the close (or a reopened brace) still dispatches so the parser
         // reports it.
-        Some(open) => !body_closes(&text[open..]),
+        Some(open) => body_awaits_close(&text[open..]),
         // No body has opened yet — the header is still forming, or is malformed.
         None => header_awaits_body(text),
     }
@@ -5509,7 +5509,8 @@ fn strip_growing_tail(list: &str) -> (&str, GrowingTail) {
     }
 }
 
-/// Does the `func` body starting at the `{` in `text` reach its matching `}`?
+/// Is the `func` body starting at the `{` in `text` still waiting for its matching
+/// `}`?
 ///
 /// Asked of the **real tokenizer**, so quoting, raw strings, escapes, comments, and
 /// `${…}` interpolation are resolved exactly as the parser resolves them and there
@@ -5522,12 +5523,25 @@ fn strip_growing_tail(list: &str) -> (&str, GrowingTail) {
 /// definition pending, so it is dispatched and the parser reports the documented
 /// "unexpected text after the closing `}`" error.
 ///
-/// A tokenize failure — an unterminated quote or heredoc — means the rest of the
-/// input is inside that construct, so the body has not closed and the reader keeps
-/// buffering; the syntax error surfaces when the completed definition is parsed.
-fn body_closes(text: &str) -> bool {
-    let Ok(tokens) = parser::tokenize(text) else {
-        return false;
+/// A tokenize failure splits two ways, and conflating them is what makes a reader
+/// hang. An **unterminated** quote or heredoc is an open construct: the rest of the
+/// input is inside it, so the body cannot have closed and a later line may still
+/// close it — keep buffering. Any other lexical error is **hard**: no later line
+/// repairs an invalid escape, so waiting for one buffers forever behind a
+/// diagnostic that never arrives, swallowing every command typed after it. Those
+/// dispatch, and the parser reports the error — which is what the char scanner this
+/// replaced did by never failing at all.
+fn body_awaits_close(text: &str) -> bool {
+    let tokens = match parser::tokenize(text) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            return matches!(
+                error.kind,
+                parser::ParseErrorKind::UnexpectedEnd
+                    | parser::ParseErrorKind::Unterminated(_)
+                    | parser::ParseErrorKind::UnterminatedHeredoc(_)
+            );
+        }
     };
     let mut depth = 0_i32;
     for token in tokens {
@@ -5536,13 +5550,13 @@ fn body_closes(text: &str) -> bool {
             parser::TokenKind::RBrace => {
                 depth -= 1;
                 if depth == 0 {
-                    return true;
+                    return false;
                 }
             }
             _ => {}
         }
     }
-    false
+    true
 }
 
 /// Line-incremental completeness for an input buffer that grows one physical
@@ -6954,12 +6968,13 @@ mod tests {
     use super::{
         ArgumentRecall, CompletionState, HeredocGate, Invocation, MeshPrompt, PromptEvent,
         PromptHook, Shell, StartupOptions, Step, TimestampedHistory, argument_completions,
-        command_position, command_segment_words, command_words, completed_command, eval_binary,
-        expand_history_designators, expansion_word, func_definition_is_open, handle_signal,
-        help_completions, history_designators, history_path_from, input_highlighter,
-        interactive_keybindings, interruptible_task, last_argument, needs_more_input, open_history,
-        path_completions_sync, persist_logical_history, prepare_history_path, run_line,
-        run_prompt_hooks, run_source, variable_completions,
+        body_awaits_close, command_position, command_segment_words, command_words,
+        completed_command, eval_binary, expand_history_designators, expansion_word,
+        func_definition_is_open, handle_signal, help_completions, history_designators,
+        history_path_from, input_highlighter, interactive_keybindings, interruptible_task,
+        last_argument, needs_more_input, open_history, path_completions_sync,
+        persist_logical_history, prepare_history_path, run_line, run_prompt_hooks, run_source,
+        variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
@@ -8873,6 +8888,65 @@ mod tests {
         // A real block brace alongside an interpolation still counts as one.
         assert!(func_definition_is_open("func f() { puts ${x}"));
     }
+
+    /// A tokenize failure means two different things, and conflating them hangs the
+    /// reader. An **unterminated** quote or heredoc is an open construct that a later
+    /// line can still close, so it buffers. A **hard** lexical error — an invalid
+    /// escape — is one no later line repairs, so it must dispatch and let the parser
+    /// report it. Treating every failure as "still open" buffered forever behind a
+    /// diagnostic that never arrived: interactively the continuation prompt could
+    /// only be escaped by cancelling, and on piped input every following command was
+    /// swallowed into the same buffer.
+    #[test]
+    fn a_hard_lexical_error_in_a_body_dispatches_but_an_open_construct_buffers() {
+        // Hard: dispatch whether or not the body's `}` is present, since the error
+        // is already decided and waiting cannot change it.
+        for hard in [
+            r#"func f() { puts "\z" }"#,
+            "func f() { puts \"\\z\"\n",
+            r#"func f() { puts "\u{ZZ}" }"#,
+        ] {
+            assert!(
+                !func_definition_is_open(hard),
+                "a hard lexical error should dispatch: {hard:?}"
+            );
+        }
+
+        // Open: a string or heredoc still being written spans physical lines, so the
+        // body keeps buffering until the construct and then the body close.
+        for open in [
+            "func f() {\n  puts \"line one\n",
+            "func f() {\n  puts 'still going\n",
+            "func f() {\n  cat << END\nhello\n",
+        ] {
+            assert!(
+                func_definition_is_open(open),
+                "an open construct should buffer: {open:?}"
+            );
+        }
+        // And each of those closes once its construct and body do.
+        for closed in [
+            "func f() {\n  puts \"line one\nline two\"\n}\n",
+            "func f() {\n  cat << END\nhello\nEND\n}\n",
+        ] {
+            assert!(
+                !func_definition_is_open(closed),
+                "expected complete: {closed:?}"
+            );
+        }
+    }
+
+    /// The same split stated directly on the helper, since `func_definition_is_open`
+    /// reaches it only after the header has opened a body.
+    #[test]
+    fn body_awaits_close_separates_open_constructs_from_hard_errors() {
+        assert!(!body_awaits_close(r#"{ puts "\z" }"#));
+        assert!(!body_awaits_close(r#"{ puts "\z""#));
+        assert!(body_awaits_close("{ puts \"open\n"));
+        assert!(body_awaits_close("{ puts hi"));
+        assert!(!body_awaits_close("{ puts hi }"));
+    }
+
     #[test]
     fn func_definition_is_open_is_brace_driven() {
         assert!(func_definition_is_open("func f() {"));
