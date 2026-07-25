@@ -297,9 +297,9 @@ impl JobTable {
 impl Drop for JobTable {
     fn drop(&mut self) {
         for job in &self.jobs {
-            let _ = signal_group(job.pgid, libc::SIGHUP, "exit");
+            hangup_group(job.pgid, libc::SIGHUP);
             if job.state == JobState::Stopped {
-                let _ = signal_group(job.pgid, libc::SIGCONT, "exit");
+                hangup_group(job.pgid, libc::SIGCONT);
             }
         }
     }
@@ -1308,6 +1308,23 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
     }
     let err = command.exec();
     std::process::ExitCode::from(spawn_error_code(&words[0], &err))
+}
+
+/// Hang up a job as the shell exits, where a group that is already gone is the
+/// ordinary case rather than something to report. [`JobTable::info`] reaps a
+/// finished job to answer `$sh.jobs` but deliberately leaves it in the table, so
+/// by exit its last member can be long gone; a still-running one can also exit
+/// between this call and the `kill`. Either way `ESRCH` means the hangup had
+/// nothing left to do, which is success — bash exits silently over a finished
+/// job too. Every other failure stays a diagnostic.
+fn hangup_group(pgid: libc::pid_t, signal: libc::c_int) {
+    if unsafe { libc::kill(-pgid, signal) } == 0 {
+        return;
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::ESRCH) {
+        note!("mesh: exit: {err}");
+    }
 }
 
 fn signal_group(pgid: libc::pid_t, signal: libc::c_int, label: &str) -> Result<(), ()> {

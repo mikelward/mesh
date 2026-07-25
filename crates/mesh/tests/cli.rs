@@ -9741,3 +9741,52 @@ fn sh_jobs_reports_a_finished_job_without_reaping_it() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn exiting_over_a_finished_job_reports_nothing() {
+    // The shell hangs up whatever is still in the job table on the way out. A
+    // finished job is still in it: reading the table reaps the pid but keeps the
+    // job, per `sh_jobs_reports_a_finished_job_without_reaping_it` above — so by
+    // exit the group can have no members left and `kill` fails with `ESRCH`.
+    // That is the hangup finding nothing left to do, not a fault to report;
+    // bash exits silently over a finished job too.
+    //
+    // The command *after* the sleep is what makes this deterministic rather than
+    // a coin flip: every executable refreshes `$sh.jobs`, so that refresh is the
+    // poll that reaps `true`, and the sleep has already guaranteed it is dead.
+    // Without it the only poll races `true`'s own exit, and the stray diagnostic
+    // appears in roughly half of runs — which is how it reached `main`.
+    let out = run_with_input("/bin/true &\nsleep 0.3\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("No such process"),
+        "the exit hangup reported an already-finished job: {stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{stderr}");
+
+    // Silence is not the same as skipping the hangup: a job that really is
+    // running must still receive it, so the suppression cannot widen into
+    // leaving jobs behind. The job reports the signal through a file, since it
+    // outlives the shell whose output the harness captures.
+    let dir = fresh_dir("exit_hangup");
+    let flag = dir.join("hupped");
+    let out = run_with_input(&format!(
+        "sh -c 'trap \"echo yes > {} ; exit\" HUP; sleep 5' &\nsleep 0.3\nputs after\n",
+        flag.to_string_lossy()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !flag.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a running job was never hung up on exit"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
