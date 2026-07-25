@@ -1784,7 +1784,11 @@ fn pty_wait_for_marker(master: std::os::fd::RawFd, marker: &[u8]) -> bool {
         revents: 0,
     };
     let mut seen = Vec::new();
-    for _ in 0..40 {
+    // Wall clock rather than a read count, for the reason given on
+    // `pty_read_until_any_prompt`: under load the same output arrives in more
+    // reads, and a count bounds fragmentation instead of time.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         if seen.windows(marker.len()).any(|part| part == marker) {
             return true;
         }
@@ -1804,6 +1808,15 @@ fn pty_wait_for_marker(master: std::os::fd::RawFd, marker: &[u8]) -> bool {
     seen.windows(marker.len()).any(|part| part == marker)
 }
 
+/// Bounded by wall clock rather than by a read count. A prompt costs far more
+/// bytes than it looks: reedline repaints the line, so one `mesh$` arrives
+/// wrapped in cursor saves, clears and color resets, and a loaded machine hands
+/// the same bytes back in more, smaller reads. Counting reads turned that
+/// fragmentation into "no prompt" while the prompt was still arriving — the
+/// budget was eight, and a passing run was observed using all eight. The
+/// per-poll timeouts below are unchanged and still fail fast, so a shell that
+/// has genuinely gone quiet is caught as quickly as before; only a stream that
+/// keeps delivering gets the extra reads.
 fn pty_read_until_any_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
     let mut ready = libc::pollfd {
         fd: master,
@@ -1811,7 +1824,8 @@ fn pty_read_until_any_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
         revents: 0,
     };
     let mut prompt = Vec::new();
-    for _ in 0..8 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         let found = prompt
             .windows(5)
             .any(|part| part == b"mesh$" || part == b"mesh!");
