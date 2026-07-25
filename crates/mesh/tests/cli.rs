@@ -5344,6 +5344,344 @@ fn a_file_modifier_rejects_a_non_path_and_a_missing_type() {
     }
 }
 
+/// A bare `:name` is a **callable value** — the function that applies that
+/// modifier — so a predicate or mapper can be handed the modifier directly instead
+/// of a lambda that only forwards to it (`DESIGN.md`). This is the exact
+/// equivalence `DESIGN.md` states, including its motivating example.
+#[test]
+fn a_bare_modifier_reference_is_a_callable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fresh_dir("modifier_ref");
+    std::fs::write(dir.join("plain.txt"), "x").unwrap();
+    std::fs::write(dir.join("run.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = run_with_input(&format!(
+        "cd {}\n\
+         ps = [\"a/b.txt\" \"c/d.tar.gz\"]\n\
+         stems = $ps:map(:stem)\n\
+         bases = $ps:map(:base)\n\
+         xs = [plain.txt run.sh nowhere]\n\
+         runnable = $xs:filter(:exec)\n\
+         present = $xs:filter(:files)\n\
+         there = $xs:map(:exists)\n\
+         through = :stem\n\
+         one = $through(\"x/y.tar.gz\")\n\
+         spread = $through(...[\"p/q.tar.gz\"])\n\
+         inlist = [:stem]\n\
+         listed = $inlist[0](\"m/n.tar.gz\")\n\
+         still_empty = [:]\n\
+         puts ...$stems\n\
+         puts ...$bases\n\
+         puts ...$runnable\n\
+         puts ...$present\n\
+         puts ...$there\n\
+         puts $one $spread $listed $still_empty:len\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // The last line: a direct call, a spread call (a spread explodes into
+        // arguments before the count is checked, as for a one-parameter lambda), a
+        // reference traveling in a list, and `[:]` still being the empty map — the
+        // two readings of a leading `[:` that have to coexist.
+        "b d.tar\nb.txt d.tar.gz\nrun.sh\nplain.txt run.sh\ntrue true false\ny.tar q.tar n.tar 0\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A modifier reference is a function value like any other: no text form, and
+/// identity — not the name — is what equality means, so `:stem` written twice is
+/// two values, exactly as two identical lambdas are.
+#[test]
+fn a_modifier_reference_behaves_like_any_function_value() {
+    let out = run_with_input(
+        "x = :stem\n\
+         y = :stem\n\
+         if $x == $x { puts self-same }\n\
+         if $x == $y { puts also-same } else { puts distinct }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "self-same\ndistinct\n"
+    );
+
+    let text = run_with_input("x = :stem\nputs $x\n");
+    assert!(!text.status.success());
+    assert!(
+        String::from_utf8_lossy(&text.stderr).contains("a function value has no text form"),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+
+    // Only an *expression* position takes a reference. A command word beginning
+    // with `:` is still the literal text it has always been.
+    let literal = run_with_input("puts :stem\n");
+    assert_eq!(String::from_utf8_lossy(&literal.stdout), ":stem\n");
+}
+
+/// The names a reference cannot denote, and the ones it must not steal.
+#[test]
+fn a_modifier_reference_rejects_what_it_cannot_apply() {
+    for (source, message) in [
+        // `:join` needs a separator and `:map` a callable, so neither is a
+        // one-argument function for a reference to denote.
+        (
+            "xs = [a b]\ny = $xs:map(:join)\n",
+            "`:join` takes arguments, so it is not a one-argument function",
+        ),
+        (
+            "xs = [a b]\ny = $xs:map(:filter)\n",
+            "`:filter` takes arguments, so it is not a one-argument function",
+        ),
+        // A name `DESIGN.md` reserves but the engine cannot apply yet says so,
+        // rather than being quietly dropped.
+        (
+            "xs = [a b]\ny = $xs:map(:sort)\n",
+            "modifier :sort is not implemented yet",
+        ),
+        // The arity is the reference's own, not a signature's — but it is counted
+        // *after* spreads expand, as a lambda's is.
+        (
+            "m = :stem\ny = $m()\n",
+            "`:stem`: expected 1 argument, got 0",
+        ),
+        (
+            "xs = [a/b c/d]\nm = :stem\ny = $m(...$xs)\n",
+            "`:stem`: expected 1 argument, got 2",
+        ),
+        // A modifier has no options, so a flag or a named argument has nothing to
+        // bind to.
+        (
+            "m = :stem\ny = $m(\"--x\")\n",
+            "`:stem`: unknown flag `--x`",
+        ),
+        ("m = :stem\ny = $m(p: 1)\n", "`:stem`: unknown option `p:`"),
+        // Only a **bare** `:name` is a reference. A quoted or escaped name composes
+        // to the same text but must not keep the operator meaning the bare word has,
+        // so there is no expression there at all.
+        ("m = :'stem'\n", "syntax error"),
+        ("m = :\\stem\n", "syntax error"),
+        ("m = :\"stem\"\n", "syntax error"),
+        // A transform reaching a predicate is still the loud error `:filter`
+        // already gives — the footgun `DESIGN.md` raises, unchanged by the
+        // shorter spelling that makes it easy to write.
+        (
+            "xs = [a/b.txt]\ny = $xs:filter(:stem)\n",
+            "predicate must return a boolean",
+        ),
+        // Not a modifier name at all: there is no other reading of a leading `:`
+        // in expression position, so it is a syntax error rather than literal text.
+        ("xs = [a b]\ny = $xs:map(:nope)\n", "syntax error"),
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source} gave {stderr}");
+    }
+
+    // A colon that belongs to a map key or a named argument is untouched: a
+    // reference is written tight against its name, a key's colon is not.
+    let untouched = run_with_input(
+        "m = [stem: 1, dir: 2]\n\
+         puts ...$m:keys\n\
+         a = 1\n\
+         b = 2\n\
+         puts $a:$b\n\
+         puts hi:there\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&untouched.stdout),
+        "stem dir\n1:2\nhi:there\n"
+    );
+    assert!(
+        untouched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&untouched.stderr)
+    );
+}
+
+/// A reference means exactly what the postfix form means — and *which* modifier
+/// `:name` is depends on the value it meets. On a regex the argument-free names are
+/// the flags (`:i`, `:x`), while on a path `:x` is the executable filter. Both go
+/// through one applier so a reference cannot answer differently from the `$r:i` it
+/// is defined to mean.
+#[test]
+fn a_modifier_reference_follows_the_value_type_like_the_postfix_form() {
+    let flags = run_with_input(
+        "rs = [re('^ABC$')]\n\
+         strict = abc ~ $rs[0]\n\
+         loose = $rs:map(:i)\n\
+         by_ref = abc ~ $loose[0]\n\
+         lam = $rs:map(func(r) { $r:i })\n\
+         by_lambda = abc ~ $lam[0]\n\
+         puts $strict $by_ref $by_lambda\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&flags.stdout),
+        // The unmodified pattern does not match; `:i` by reference and by lambda
+        // both make it match, which is the equivalence.
+        "false true true\n"
+    );
+    assert!(
+        flags.status.success(),
+        "{}",
+        String::from_utf8_lossy(&flags.stderr)
+    );
+
+    // `:x` is the sharp case: extended syntax on a regex, the executable-file
+    // filter on a path. Ignoring the pattern's space flips both answers.
+    let extended = run_with_input(
+        "rs = [re('^a b$')]\n\
+         spaced = \"a b\" ~ $rs[0]\n\
+         tight = ab ~ $rs[0]\n\
+         ignored = $rs:map(:x)\n\
+         still_spaced = \"a b\" ~ $ignored[0]\n\
+         now_tight = ab ~ $ignored[0]\n\
+         puts $spaced $tight $still_spaced $now_tight\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&extended.stdout),
+        "true false false true\n"
+    );
+
+    // And a modifier that is not a regex flag reports what the postfix form
+    // reports, rather than the not-implemented message a name-only lookup gives.
+    let wrong = run_with_input("rs = [re('a')]\nbad = $rs:map(:stem)\n");
+    assert!(!wrong.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("modifier :stem is not valid for a regex"),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+}
+
+/// `:capture` wraps an **invocation** rather than transforming a value, so no
+/// one-argument function corresponds to it and a reference cannot denote it.
+///
+/// Refusing it has to happen when the *value* is built, not when it is called: by
+/// the time a call could reject it, the very invocation it was meant to capture has
+/// already run — uncaptured, side effects and all.
+#[test]
+fn capture_is_not_a_modifier_a_reference_can_denote() {
+    let out = run_with_input(
+        "func f() { puts ran\n\
+         return 7 }\n\
+         m = :capture\n\
+         r = $m(f())\n",
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(":capture applies to a call"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The assertion that matters: `f` never ran. Rejecting at the call instead would
+    // leave `ran` here, having executed outside any capture.
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("ran"),
+        "the would-be captured call ran anyway: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // The postfix form is untouched — that is where `:capture` belongs, and there it
+    // does capture, so `ran` lands in the record rather than on stdout.
+    let postfix = run_with_input(
+        "func f() { puts ran\n\
+         return 7 }\n\
+         r = f():capture\n\
+         puts $r.value $r.out:len\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&postfix.stdout), "7 4\n");
+    assert!(
+        postfix.status.success(),
+        "{}",
+        String::from_utf8_lossy(&postfix.stderr)
+    );
+}
+
+/// A reference **call** starts a value, so it can open a condition or a statement —
+/// `if :exists(…) { }` — not just sit on an assignment's right-hand side. Only the
+/// attached `:name(…)` form is claimed, which nothing else can spell, so a command
+/// word beginning with `:` keeps the reading it has always had.
+#[test]
+fn a_modifier_reference_call_can_open_a_condition() {
+    let out = run_with_input(
+        "if :exists(\"/tmp\") { puts there } else { puts missing }\n\
+         if :exists(\"/no/such/path\") { puts there } else { puts missing }\n\
+         if :exists(\"/tmp\") and :dirs(\"/tmp\") { puts both }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "there\nmissing\nboth\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Unattached, the colon is still command-word text — the reading `puts :stem`
+    // and `$host:$port` depend on.
+    let words = run_with_input("puts :stem\na = 1\nb = 2\nputs $a:$b\nputs hi:there\n");
+    assert_eq!(
+        String::from_utf8_lossy(&words.stdout),
+        ":stem\n1:2\nhi:there\n"
+    );
+}
+
+/// An out-of-loop `break` inside a reference call's argument is the caller's
+/// error, and the statement has to recover from it exactly as the lambda call does
+/// — the flag is cleared and the statement fails, rather than left set to stop the
+/// enclosing function.
+#[test]
+fn an_invalid_break_in_a_reference_argument_recovers_like_a_lambda() {
+    let reference = run_with_input(
+        "func g() {\n\
+         m = :stem\n\
+         x = $m(if true { break })\n\
+         puts after }\n\
+         g\n\
+         puts done\n",
+    );
+    let lambda = run_with_input(
+        "func g() {\n\
+         f = func(p) { $p }\n\
+         x = $f(if true { break })\n\
+         puts after }\n\
+         g\n\
+         puts done\n",
+    );
+    // The point: both keep running. Leaving `shell.control` set stops `g` at the
+    // failed statement, so `after` never prints.
+    assert_eq!(String::from_utf8_lossy(&reference.stdout), "after\ndone\n");
+    assert_eq!(
+        String::from_utf8_lossy(&reference.stdout),
+        String::from_utf8_lossy(&lambda.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&reference.stderr).contains("break: not inside a loop"),
+        "{}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+
+    // With a loop to leave, the `break` is honored rather than reported.
+    let in_loop = run_with_input(
+        "for i in [1 2] {\n\
+         m = :stem\n\
+         x = $m(if true { break })\n\
+         puts unreached }\n\
+         puts loop-done\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&in_loop.stdout), "loop-done\n");
+    assert!(in_loop.stderr.is_empty(), "{:?}", in_loop.stderr);
+}
+
 #[test]
 fn join_and_split_modifiers_take_a_separator_argument() {
     // `:join(SEP)` folds a list to a string; `:split(SEP)` is its inverse. Both
