@@ -99,6 +99,8 @@ pub enum TokenKind {
     /// `&>` — send both stdout and stderr to one target.
     AmpGreater,
     Heredoc,
+    /// `<<<` — a here-string: the following word *is* the input text.
+    HereString,
     LParen,
     RParen,
     LBracket,
@@ -404,6 +406,8 @@ pub enum RedirectKind {
     Output,
     Append,
     Heredoc,
+    /// `<<< word` — the target is the input text itself rather than a path.
+    HereString,
     /// `N>&M` — the target names a descriptor, not a path. Output side, so a
     /// missing `N` defaults to stdout.
     DuplicateOut,
@@ -935,6 +939,7 @@ impl<'a> Lexer<'a> {
             ("&&", TokenKind::AndAnd),
             ("||", TokenKind::OrOr),
             (">>", TokenKind::Append),
+            ("<<<", TokenKind::HereString),
             ("<<", TokenKind::Heredoc),
             (">&", TokenKind::GreaterAmp),
             ("<&", TokenKind::LessAmp),
@@ -1585,6 +1590,8 @@ impl Parser {
                 Some(RedirectKind::Append)
             } else if self.eat(&TokenKind::Heredoc).is_some() {
                 Some(RedirectKind::Heredoc)
+            } else if self.eat(&TokenKind::HereString).is_some() {
+                Some(RedirectKind::HereString)
             } else if self.eat(&TokenKind::GreaterAmp).is_some() {
                 // `>&` is two operators wearing one spelling, told apart by the
                 // target: `>&2` names a descriptor and duplicates, `>& file`
@@ -1640,9 +1647,16 @@ impl Parser {
                     }
                     None => None,
                 };
+                // Phrased as "a redirection …" so the `Expected` rendering reads
+                // as a refusal rather than "expected a heredoc".
                 if fd.is_some() && kind == RedirectKind::Heredoc {
                     return Err(self.error(ParseErrorKind::Expected(
-                        "a heredoc on a descriptor other than stdin",
+                        "a redirection with `<<` to feed stdin; it cannot name another descriptor",
+                    )));
+                }
+                if fd.is_some() && kind == RedirectKind::HereString {
+                    return Err(self.error(ParseErrorKind::Expected(
+                        "a redirection with `<<<` to feed stdin; it cannot name another descriptor",
                     )));
                 }
                 if fd.is_some() && kind == RedirectKind::Both {

@@ -1350,11 +1350,24 @@ struct Redir {
     kind: exec::RedirKind,
     /// The descriptor a `N>` prefix named, or `None` for the direction's default.
     fd: Option<u32>,
-    /// True for `N>&M`, where the target names a descriptor rather than a path.
-    duplicate: bool,
-    /// A heredoc body, whose delimiter also decides whether it interpolates.
-    heredoc: Option<parser::HeredocBody>,
+    /// What [`Redir::target`] names — the four readings are mutually exclusive,
+    /// so they are one choice rather than a set of flags to keep consistent.
+    means: Means,
     target: Word,
+}
+
+/// What a redirection's target word names once expanded.
+enum Means {
+    /// A path to open — `> file`, `< file`.
+    Path,
+    /// A descriptor to duplicate — `2>&1`, `<&0`.
+    Descriptor,
+    /// The input text itself — `<<< word`. The word expands like any other, and
+    /// a trailing newline is added, so `cmd <<< hi` feeds `hi\n` as bash does.
+    Text,
+    /// A heredoc body, carried here rather than in `target` because the parser
+    /// already read it; the delimiter's quoting decides whether it interpolates.
+    Document(parser::HeredocBody),
 }
 
 fn run_ast_pipeline(
@@ -1396,15 +1409,13 @@ fn run_ast_pipeline(
                             redirs.push(Redir {
                                 kind: exec::RedirKind::Out,
                                 fd: Some(1),
-                                duplicate: false,
-                                heredoc: None,
+                                means: Means::Path,
                                 target,
                             });
                             redirs.push(Redir {
                                 kind: exec::RedirKind::Out,
                                 fd: Some(2),
-                                duplicate: true,
-                                heredoc: None,
+                                means: Means::Descriptor,
                                 target: one_word("1"),
                             });
                         }
@@ -1416,11 +1427,16 @@ fn run_ast_pipeline(
                             redirs.push(Redir {
                                 kind: exec::RedirKind::In,
                                 fd: Some(0),
-                                duplicate: false,
-                                heredoc: Some(body.value.clone()),
+                                means: Means::Document(body.value.clone()),
                                 target,
                             });
                         }
+                        parser::RedirectKind::HereString => redirs.push(Redir {
+                            kind: exec::RedirKind::In,
+                            fd: Some(0),
+                            means: Means::Text,
+                            target,
+                        }),
                         // The duplication kinds stay split by side so an absent
                         // `N` takes the direction's descriptor: `>&2` retargets
                         // stdout, `<&0` stdin.
@@ -1433,12 +1449,15 @@ fn run_ast_pipeline(
                                 _ => exec::RedirKind::Out,
                             },
                             fd: *fd,
-                            duplicate: matches!(
+                            means: if matches!(
                                 kind,
                                 parser::RedirectKind::DuplicateOut
                                     | parser::RedirectKind::DuplicateIn
-                            ),
-                            heredoc: None,
+                            ) {
+                                Means::Descriptor
+                            } else {
+                                Means::Path
+                            },
                             target,
                         }),
                     }
@@ -3521,20 +3540,29 @@ fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirectio
 /// [`expand_redirs`], told whether the command will be backgrounded.
 ///
 /// A background external defers its opens to a helper process reached through
-/// argv, and a heredoc body cannot travel that way: it is arbitrary text, so a
-/// large one exceeds the argument limit and an embedded NUL cannot be
-/// represented at all. Refusing is what the executor already assumed.
+/// argv, and input *text* cannot travel that way: it is arbitrary, so a large
+/// body exceeds the argument limit and an embedded NUL cannot be represented at
+/// all. That covers a heredoc and a here-string alike. Refusing is what the
+/// executor already assumed.
 fn expand_redirs_for(
     redirs: Vec<Redir>,
     vars: &Vars,
     background: bool,
 ) -> Result<Vec<exec::Redirection>, String> {
-    if background && redirs.iter().any(|redir| redir.heredoc.is_some()) {
-        return Err("a heredoc cannot be backgrounded yet".to_owned());
+    if background
+        && let Some(redir) = redirs
+            .iter()
+            .find(|redir| matches!(redir.means, Means::Document(_) | Means::Text))
+    {
+        let spelling = match redir.means {
+            Means::Text => "here-string",
+            _ => "heredoc",
+        };
+        return Err(format!("a {spelling} cannot be backgrounded yet"));
     }
     let mut out = Vec::with_capacity(redirs.len());
     for redir in redirs {
-        if let Some(body) = redir.heredoc {
+        if let Means::Document(body) = redir.means {
             // The delimiter is *syntactic* — the parser already used it to find
             // the body, and only its quoting reaches here. Expanding it would
             // make `<< $missing` an unbound-variable error and `<< *` an
@@ -3560,19 +3588,25 @@ fn expand_redirs_for(
             ));
         }
         let word = words.pop().unwrap();
-        let target = if redir.duplicate {
-            // `2>&1`: the target names a descriptor, so it must read as one.
-            let from = word.parse::<i32>().map_err(|_| {
-                format!("`>&{word}`: the target of a duplication must be a descriptor")
-            })?;
-            if !(0..=2).contains(&from) {
-                return Err(format!(
-                    "`>&{from}`: only descriptors 0, 1, and 2 can be duplicated"
-                ));
+        let target = match redir.means {
+            Means::Descriptor => {
+                // `2>&1`: the target names a descriptor, so it must read as one.
+                let from = word.parse::<i32>().map_err(|_| {
+                    format!("`>&{word}`: the target of a duplication must be a descriptor")
+                })?;
+                if !(0..=2).contains(&from) {
+                    return Err(format!(
+                        "`>&{from}`: only descriptors 0, 1, and 2 can be duplicated"
+                    ));
+                }
+                exec::RedirTarget::Descriptor(from)
             }
-            exec::RedirTarget::Descriptor(from)
-        } else {
-            exec::RedirTarget::Path(word)
+            // `<<< word` reaches the command the way a heredoc body does — an
+            // unlinked temporary file — so a long one cannot deadlock against a
+            // command that has not started reading. The trailing newline is
+            // bash's, and is what makes `<<< $x | wc -l` say 1.
+            Means::Text => exec::RedirTarget::Heredoc(format!("{word}\n")),
+            Means::Path | Means::Document(_) => exec::RedirTarget::Path(word),
         };
         out.push(exec::Redirection {
             fd: redir.fd.map_or_else(

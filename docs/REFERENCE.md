@@ -131,6 +131,31 @@ nothing is left behind after.
 Backgrounding a command that has a heredoc (`cat << END &`) is refused rather
 than run against empty input.
 
+### Here-strings
+
+`<<< word` feeds a single word, plus a trailing newline, to standard input:
+
+```mesh
+name = world
+cat <<< "hello $name"     # → hello world
+wc -l <<< hi              # → 1, thanks to that trailing newline
+```
+
+The word is an **ordinary argument word**, not a heredoc body: it interpolates,
+quoting suppresses that (`<<< 'raw $name'`), and it must come to **exactly one**
+word — the rule every redirection target follows. So a list is refused rather
+than joined:
+
+```mesh
+xs = [a b]
+cat <<< $xs               # error: a list needs `...`
+cat <<< ...$xs            # error: ambiguous redirect — two words
+```
+
+`<<<` always feeds standard input, so it takes no descriptor prefix (`2<<<` is a
+syntax error). Like a heredoc it travels by an unlinked temporary file, so a long
+one cannot deadlock, and backgrounding it is refused for the same reason.
+
 ### Tab completion
 
 In an interactive shell, Tab completes according to the cursor's current word:
@@ -822,6 +847,6 @@ byte-string type yet, so a capture that is not valid UTF-8 is a loud error.
 
 Most modifier arguments (beyond `:split` / `:join`), the command-word form of an
 argument-taking modifier, and regex capture modifiers are not yet implemented.
-Of heredocs, the command-redirection form below works; here-strings (`<<<`),
-backgrounding a heredoc, and a value-producing spelling do not.
+Of heredocs, the command-redirection form below works, as do here-strings;
+backgrounding either, and a value-producing heredoc spelling, do not.
 See [`ROADMAP.md`](../ROADMAP.md).
