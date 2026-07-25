@@ -179,8 +179,7 @@ file as tasks land.
       value, value-called through the variable it is bound to (`$double(5)`),
       reusing the whole signature grammar. Scope is a `func`'s: parameters and
       globals, with no capture of the enclosing function's locals. A function
-      value has no text form and compares by identity. Deferred: a bare `:mod`
-      reference as a callable.
+      value has no text form and compares by identity.
 - [x] The higher-order modifiers `:map` / `:filter` / `:each`, each taking one
       callable and applying it per element, through the same call machinery a
       written call uses — so `return`, arity, a runtime error, an escaped
@@ -197,6 +196,17 @@ file as tasks land.
       element. All dereference symlinks except `:links` and `:type`, the two that
       exist to ask about the link itself; `:type` is the only one that errors on a
       missing path, since there is no word to report.
+- [x] A bare `:mod` reference as a callable value — `$files:filter(:exec)` for
+      `$files:filter(func(f) { $f:exec })`, the equivalence `DESIGN.md` states.
+      Argument-free **value** modifiers only: `:join` needs a separator, `:map` a
+      callable, and `:capture` wraps an invocation, so none is a one-argument
+      function and naming one is loud — `:capture` at the point the reference is
+      written, or the call it would capture runs first. A
+      reference is a function value like any other (no text form, identity
+      equality), and a leading `:` is a reference only in expression position, so
+      map keys, named arguments, and `$host:$port` are untouched. Applied through
+      the same value-sensitive path as the postfix form, so a regex still gets the
+      flag names (`:i`, and `:x` as extended rather than the executable filter).
 - [x] `f(…):capture` — the channel record (`.value` / `.out` / `.err` /
       `.status`), as an invocation-level modifier that wraps execution, including
       on an external (minus `.value`, positional arguments only). `.out`/`.err`

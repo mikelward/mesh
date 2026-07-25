@@ -27,36 +27,56 @@ pub enum Value {
     Function(FuncValue),
 }
 
-/// A function value: the signature and body of a `func(params) { … }` lambda.
+/// A function value: something callable with one thing to do.
 ///
 /// Shared behind an `Arc` because binding or passing one copies the `Value` and a
-/// body is a whole parsed `Source`; atomic rather than an `Rc` because the
+/// lambda body is a whole parsed `Source`; atomic rather than an `Rc` because the
 /// interactive completer holds shell values across a thread boundary.
 ///
 /// Identity, not structure, is what equality means here — two separately written
 /// lambdas with the same text are different functions, the answer every language
 /// with first-class functions gives — which also keeps `Hash` cheap and
-/// consistent with `Eq`.
+/// consistent with `Eq`. That extends to modifier references: `:stem` written
+/// twice is two values, since they are two references rather than one shared one.
 #[derive(Debug, Clone)]
-pub struct FuncValue(Arc<Lambda>);
+pub struct FuncValue(Arc<Callable>);
 
 #[derive(Debug)]
-struct Lambda {
-    params: Vec<crate::parser::Param>,
-    body: crate::parser::Source,
+enum Callable {
+    /// A written `func(params) { body }`.
+    Lambda {
+        params: Vec<crate::parser::Param>,
+        body: crate::parser::Source,
+    },
+    /// A bare `:name` reference — the function that applies that modifier to its
+    /// one argument. Held as the name rather than a synthesized lambda body: there
+    /// is nothing to parse, and applying a modifier is a direct call.
+    Modifier(String),
 }
 
 impl FuncValue {
-    pub fn new(params: Vec<crate::parser::Param>, body: crate::parser::Source) -> Self {
-        Self(Arc::new(Lambda { params, body }))
+    pub fn lambda(params: Vec<crate::parser::Param>, body: crate::parser::Source) -> Self {
+        Self(Arc::new(Callable::Lambda { params, body }))
     }
 
-    pub fn params(&self) -> &[crate::parser::Param] {
-        &self.0.params
+    pub fn modifier(name: String) -> Self {
+        Self(Arc::new(Callable::Modifier(name)))
     }
 
-    pub fn body(&self) -> &crate::parser::Source {
-        &self.0.body
+    /// The signature and body, when this is a written lambda.
+    pub fn as_lambda(&self) -> Option<(&[crate::parser::Param], &crate::parser::Source)> {
+        match &*self.0 {
+            Callable::Lambda { params, body } => Some((params, body)),
+            Callable::Modifier(_) => None,
+        }
+    }
+
+    /// The modifier name, when this is a bare reference.
+    pub fn modifier_name(&self) -> Option<&str> {
+        match &*self.0 {
+            Callable::Modifier(name) => Some(name),
+            Callable::Lambda { .. } => None,
+        }
     }
 }
 

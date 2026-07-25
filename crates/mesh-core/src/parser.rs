@@ -66,6 +66,22 @@ impl Word {
         }
     }
 
+    /// The text of a word that is a single **unquoted** piece, as `bare_integer`
+    /// requires for the same reason: `:'stem'` and `:\stem` compose to the same
+    /// text as `:stem`, and a quoted word must not keep the operator meaning the
+    /// bare one has. Modifier names elsewhere go through the same rule.
+    fn bare_word(&self) -> Option<&str> {
+        match self.pieces.as_slice() {
+            [
+                WordPiece::Text {
+                    text,
+                    quote: QuoteMode::Bare,
+                },
+            ] => Some(text),
+            _ => None,
+        }
+    }
+
     fn is_bare_text(&self, expected: &str) -> bool {
         matches!(self.pieces.as_slice(), [WordPiece::Text { text, quote: QuoteMode::Bare }] if text == expected)
     }
@@ -518,6 +534,10 @@ pub enum Expr {
         parameters: Vec<Param>,
         body: Source,
     },
+    /// A bare modifier reference — `:stem` — denoting "the function that applies
+    /// `:stem`". Written where a callable is wanted, so `$paths:map(:stem)` says
+    /// what `$paths:map(func(p) { $p:stem })` says (`DESIGN.md`).
+    ModifierRef(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2496,6 +2516,15 @@ impl Parser {
             let body = self.block()?;
             return Ok(Expr::Lambda { parameters, body });
         }
+        // A leading `:name` is a modifier *reference*. A postfix `:name` never
+        // reaches here — it is consumed by the modifier loop after a value — so the
+        // only `:` that starts an expression is this one.
+        if self.same(&TokenKind::Colon)
+            && let Some(name) = self.modifier_ref_name()
+        {
+            self.position += 2;
+            return Ok(Expr::ModifierRef(name));
+        }
         if self.eat(&TokenKind::LParen).is_some() {
             self.newlines();
             let value = self.expression()?;
@@ -2589,8 +2618,16 @@ impl Parser {
         if self.eat(&TokenKind::RBracket).is_some() {
             return Ok(Expr::List(Vec::new()));
         }
-        if self.eat(&TokenKind::Colon).is_some() {
-            self.expect(&TokenKind::RBracket, "`]`")?;
+        // `[:]` is the empty map, but only when the `:` is immediately closed: a list
+        // whose first element is a modifier reference also opens with a colon
+        // (`[:stem]`), so matching on the `:` alone would swallow it.
+        if self.same(&TokenKind::Colon)
+            && matches!(
+                self.tokens.get(self.position + 1).map(|t| &t.value),
+                Some(TokenKind::RBracket)
+            )
+        {
+            self.position += 2;
             return Ok(Expr::Map(Vec::new()));
         }
         let mut values = Vec::new();
@@ -2808,6 +2845,23 @@ impl Parser {
     }
 
     fn value_start_in(&mut self, in_condition: bool) -> bool {
+        // A modifier reference *call* — `:exists("Cargo.toml")` — starts a value, so
+        // a condition or statement beginning with one reaches the expression parser
+        // rather than the command parser. Restricted to the attached call form,
+        // which nothing else can spell: a bare `:name` stays a command word, so
+        // `puts :stem` and `$host:$port` keep the readings they have.
+        if self.same(&TokenKind::Colon)
+            && self.modifier_ref_name().is_some()
+            && self
+                .tokens
+                .get(self.position + 1)
+                .zip(self.tokens.get(self.position + 2))
+                .is_some_and(|(name, next)| {
+                    matches!(next.value, TokenKind::LParen) && name.span.end == next.span.start
+                })
+        {
+            return true;
+        }
         match self.peek().map(|token| &token.value) {
             Some(
                 TokenKind::CaptureStart
@@ -3135,6 +3189,27 @@ fn valid_name(name: &str) -> bool {
         }
     }
     !previous_hyphen
+}
+
+impl Parser {
+    /// The name of a `:name` modifier reference starting at the current `:`, when
+    /// the next token really is a modifier name written tight against it.
+    ///
+    /// The adjacency check is what keeps `[a: 1]` and `f(key: value)` out of this:
+    /// there the colon follows a key and is separated from what comes next, while a
+    /// reference is written `:stem` with nothing between.
+    fn modifier_ref_name(&self) -> Option<String> {
+        let colon = self.peek()?;
+        let next = self.tokens.get(self.position + 1)?;
+        if colon.span.end != next.span.start {
+            return None;
+        }
+        let TokenKind::Word(word) = &next.value else {
+            return None;
+        };
+        let name = word.bare_word()?;
+        modifier_name(name).then(|| name.to_string())
+    }
 }
 
 fn modifier_name(name: &str) -> bool {

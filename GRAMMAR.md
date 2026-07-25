@@ -145,6 +145,13 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
   interpolation form modifiers are argument-free; the parenthesized argument form
   (`:split(SEP)`, `:join(SEP)`) is a value expression — see
   [`PARSER.md`](PARSER.md).
+- A **bare `:name` in expression position** is a *reference* to that modifier —
+  the one-argument function that applies it — so `$paths:map(:stem)` says what
+  `$paths:map(func(p) { $p:stem })` says. Only there: a command word beginning
+  with `:` stays literal text, and the colon of a map key (`[stem: 1]`) or a named
+  argument (`f(k: v)`) is unaffected, since a reference is written tight against
+  its name. The attached call form `:name(…)` also **starts a value**, so it can
+  open a condition or a statement (`if :exists($f) { … }`).
 - **Reads fail loud**: an **unbound** variable is an error (no null / always-on
   `set -u`), and the shell recovers to the next line. Assignment always creates.
   A **malformed `${…}`** (missing `}`, or an invalid name inside) is a syntax
@@ -371,9 +378,10 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
   `break` inside the callable does not escape into the caller's loop.
   `:filter` requires the predicate to answer with a **boolean**, not a truthy
   value: mesh's truthiness is the shell's, where an integer is true when it is
-  *zero*, so a loose reading would keep the zeros (and, once a bare `:mod` is
-  callable, make `:filter(:dir)` keep everything). `:each` yields the empty
-  string — mesh's "nothing produced" — rather than the list, so a chain cannot
+  *zero*, so a loose reading would keep the zeros — and would make
+  `:filter(:dir)`, easy to write now that a bare `:mod` is callable, keep
+  everything. `:each` yields the empty string — mesh's "nothing produced" —
+  rather than the list, so a chain cannot
   read side-effecting code as a transform. The subject must be a **list**; a map
   is a loud error pointing at `:keys` / `:values`.
 - **`:capture`.** `f(…):capture` runs the call and yields a **record of every

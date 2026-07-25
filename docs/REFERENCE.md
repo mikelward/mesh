@@ -995,10 +995,34 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
     so a chain cannot silently read side-effecting code as a transform.
   - **A list subject only.** On a map they are a loud error pointing at `:keys` or
     `:values`; elements keep their types, so a list element arrives as a list.
+  - **A bare `:mod` reference is itself a callable**, so a predicate or mapper can
+    take the modifier directly rather than a lambda that only forwards to it:
+    `$files:filter(:exec)` is `$files:filter(func(f) { $f:exec })`, and
+    `$paths:map(:stem)` is `$paths:map(func(p) { $p:stem })`. Only the
+    argument-free **value** modifiers can be referenced — `:join` needs a separator
+    and `:map` a callable, and `:capture` wraps an invocation rather than a value,
+    so none of them is a one-argument function to denote, and naming one is a loud
+    error. `:capture` is refused where the reference is *written*, since rejecting
+    it at the call would mean the invocation it was meant to capture had already
+    run. A reference **call** starts a value, so it can open a condition or a
+    statement (`if :exists(f) { … }`) as well as sit on an assignment's right-hand
+    side; a command word beginning with `:` is unchanged, since only the attached
+    `:name(…)` form is claimed. The value is a function like any other: no text
+    form, and identity rather than name is what equality means, so `:stem` written
+    twice is two values. A leading `:` is a reference only in **expression**
+    position; a command word starting with `:` is the literal text it always was.
+    Nothing rescues the transform-as-predicate footgun the shorter spelling makes
+    easy to write — `$paths:filter(:dir)` is the same loud "predicate must return a
+    boolean" that the lambda form gives, not a quiet keep-all. A reference is applied through
+    the same value-sensitive path the postfix form uses, so *which* modifier
+    `:name` is still depends on what it meets: `$regexes:map(:i)` sets
+    case-insensitivity, and `:x` is the extended-syntax flag on a regex where it is
+    the executable filter on a path. Only a **bare** name is a reference —
+    `:'stem'` and `:\stem` compose to the same text but are not references — and
+    calling one through a variable takes ordinary call arguments, so a spread
+    expands before the single-argument count is checked.
 
-Not yet supported: a bare `:mod` reference as a callable — `$files:filter(:exec)`
-must be written `$files:filter(func(f) { $f:exec })`, or simply `$files:exec`;
-and the richer `:capture` fields `DESIGN.md` leaves open (timing, a `pipestatus`
+Not yet supported: the richer `:capture` fields `DESIGN.md` leaves open (timing, a `pipestatus`
 list). `.out`/`.err` are strings rather than true byte-strings — mesh has no
 byte-string type yet, so a capture that is not valid UTF-8 is a loud error.
 

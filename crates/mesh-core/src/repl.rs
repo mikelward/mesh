@@ -2031,26 +2031,13 @@ fn eval_expr(
                 };
                 return capture_call(callee, call_arguments, last, in_function, shell);
             }
-            let Some(mut value) = eval_operand(value, last, in_function, shell)? else {
+            let Some(value) = eval_operand(value, last, in_function, shell)? else {
                 return Ok(control_placeholder());
             };
-            if let Value::Regex(regex) = &mut value {
-                if arguments.is_some() {
+            if let Some(arguments) = arguments {
+                if matches!(value, Value::Regex(_)) {
                     return runtime_error(format!("modifier :{name} does not take arguments"));
                 }
-                match name.as_str() {
-                    "i" | "ignorecase" => regex.case_insensitive = true,
-                    "m" | "multiline" => regex.multi_line = true,
-                    "s" | "dotall" => regex.dot_matches_new_line = true,
-                    "x" | "extended" => regex.ignore_whitespace = true,
-                    _ => {
-                        return runtime_error(format!("modifier :{name} is not valid for a regex"));
-                    }
-                }
-                compile_regex(regex).map_err(runtime_message)?;
-                return Ok(value);
-            }
-            if let Some(arguments) = arguments {
                 return eval_modifier_with_arguments(
                     name,
                     value,
@@ -2060,14 +2047,7 @@ fn eval_expr(
                     shell,
                 );
             }
-            let Some(modifier) = expand::Modifier::from_name(name) else {
-                if modifier_takes_arguments(name) {
-                    return runtime_error(format!("modifier :{name} requires an argument"));
-                }
-                return runtime_error(format!("modifier :{name} is not implemented yet"));
-            };
-            expand::apply_modifier(value, modifier)
-                .map_err(|error| runtime_message(error.to_string()))
+            apply_argument_free_modifier(name, value)
         }
         E::If(node) => eval_if_expr(node, last, in_function, shell),
         E::Match(node) => eval_match_expr(node, last, in_function, shell),
@@ -2109,10 +2089,24 @@ fn eval_expr(
         // the globals, the same two levels a named `func` gets (`DESIGN.md`
         // §"Variables and assignment"), so a lambda written inside a function
         // cannot read that function's locals.
-        E::Lambda { parameters, body } => Ok(Value::Function(vars::FuncValue::new(
+        E::Lambda { parameters, body } => Ok(Value::Function(vars::FuncValue::lambda(
             parameters.clone(),
             body.clone(),
         ))),
+        // A bare `:name` is the function that applies that modifier — the value, not
+        // an application, so nothing is applied here. Whether the name is one the
+        // engine can actually apply is checked at the call, where the argument that
+        // would have failed a lambda body is in hand (`apply_modifier_ref`).
+        //
+        // `:capture` is the exception, and it has to be refused *here* rather than at
+        // the call: it wraps an **invocation** rather than transforming a value
+        // (`GRAMMAR.md`), so by the time a call could reject it the very call it was
+        // meant to capture has already run uncaptured. Refusing the value means there
+        // is nothing to call.
+        E::ModifierRef(name) if name == "capture" => runtime_error(
+            ":capture applies to a call — write `f(…):capture`, or `$(…)` for a command's output",
+        ),
+        E::ModifierRef(name) => Ok(Value::Function(vars::FuncValue::modifier(name.clone()))),
     }
 }
 
@@ -2173,10 +2167,19 @@ fn eval_call(
                 callee_description(callee)
             ));
         };
+        // A modifier reference has no signature to match against: it takes exactly
+        // one thing and applies itself to it, so the argument list is checked here
+        // rather than by `bind_arguments`.
+        if let Some(modifier) = function.modifier_name() {
+            return call_modifier_ref(modifier, arguments, last, in_function, shell);
+        }
+        let (params, body) = function
+            .as_lambda()
+            .expect("a callable is a lambda or a modifier reference");
         return call_signature_for_value(
             &callee_description(callee),
-            function.params(),
-            function.body(),
+            params,
+            body,
             arguments,
             last,
             in_function,
@@ -2240,6 +2243,34 @@ fn eval_call(
 /// arguments) rather than the generic "not implemented yet".
 fn modifier_takes_arguments(name: &str) -> bool {
     matches!(name, "join" | "split" | "map" | "filter" | "each")
+}
+
+/// Apply an argument-free modifier to a value.
+///
+/// Which modifier `:name` *is* depends on the value: on a regex the flag names are
+/// its own (`:i`, `:x`, `:extended`), and `:x` in particular is the extended-syntax
+/// flag there and the executable-file filter everywhere else. Shared by the postfix
+/// path and [`apply_modifier_ref`] so a reference cannot answer differently from the
+/// `$r:i` it is defined to mean.
+fn apply_argument_free_modifier(name: &str, mut value: Value) -> Result<Value, Step> {
+    if let Value::Regex(regex) = &mut value {
+        match name {
+            "i" | "ignorecase" => regex.case_insensitive = true,
+            "m" | "multiline" => regex.multi_line = true,
+            "s" | "dotall" => regex.dot_matches_new_line = true,
+            "x" | "extended" => regex.ignore_whitespace = true,
+            _ => return runtime_error(format!("modifier :{name} is not valid for a regex")),
+        }
+        compile_regex(regex).map_err(runtime_message)?;
+        return Ok(value);
+    }
+    let Some(modifier) = expand::Modifier::from_name(name) else {
+        if modifier_takes_arguments(name) {
+            return runtime_error(format!("modifier :{name} requires an argument"));
+        }
+        return runtime_error(format!("modifier :{name} is not implemented yet"));
+    };
+    expand::apply_modifier(value, modifier).map_err(|error| runtime_message(error.to_string()))
 }
 
 /// Evaluate a modifier that carries a parenthesized argument list (`:split(SEP)`,
@@ -4207,23 +4238,101 @@ fn call_callable_for_value(
     argument: Value,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
+    // A modifier reference is applied, not run: there is no body, no scope to push,
+    // and nothing it can do to the caller's result — so none of the save/restore
+    // `run_call_body_for_value` exists for applies.
+    if let Some(modifier) = function.modifier_name() {
+        return apply_modifier_ref(modifier, argument);
+    }
+    let (params, body) = function
+        .as_lambda()
+        .expect("a callable is a lambda or a modifier reference");
     let caller_result = shell.result.clone();
     let caller_produced = shell.produced;
     run_call_body_for_value(
-        function.body(),
+        body,
         caller_result,
         caller_produced,
-        |shell| {
-            bind_arguments(
-                name,
-                function.params(),
-                vec![(argument, false)],
-                false,
-                shell,
-            )
-        },
+        |shell| bind_arguments(name, params, vec![(argument, false)], false, shell),
         shell,
     )
+}
+
+/// Call a modifier reference through the `$m(…)` syntax.
+///
+/// A reference has no signature for [`bind_arguments`] to match, but its arguments
+/// are still ordinary call arguments: they go through [`evaluate_value_arguments`]
+/// so a spread explodes into elements exactly as it does for a one-parameter lambda
+/// (`$m(...$xs)`), and only then is the count checked. The empty parameter list is
+/// the right description rather than a stand-in — a modifier takes one value and has
+/// no options, so a `--flag` argument has nothing to bind to and says so.
+fn call_modifier_ref(
+    modifier: &str,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let label = format!("`:{modifier}`");
+    // Copied and put back on every path below, as `call_signature_for_value` does:
+    // an argument body records results of its own (`$m(if c { a; b })`) that belong
+    // to neither side. There is no callee body here to hand them to, so the restore
+    // is written out rather than left to `run_call_body_for_value`.
+    let caller_result = shell.result.clone();
+    let caller_produced = shell.produced;
+    let scanned = evaluate_value_arguments(&label, &[], arguments, last, in_function, shell);
+    // A `break`/`continue` an argument raised belongs to the caller's loop, and is
+    // answered before the argument outcome — an out-of-loop one arrives as an error
+    // *and* leaves the flag set. Leaving it set stops the enclosing function where
+    // the same call through a lambda recovers and runs on.
+    if shell.control.is_some() {
+        shell.result = caller_result;
+        shell.produced = caller_produced;
+        if shell.loop_depth == 0 {
+            shell.control = None;
+            return Err(Step::Continue(1));
+        }
+        return Ok(Value::String(String::new()));
+    }
+    let (positionals, switches_on, flag_values) = match scanned {
+        Ok(scanned) => scanned,
+        Err(step) => {
+            shell.result = caller_result;
+            shell.produced = caller_produced;
+            return Err(step);
+        }
+    };
+    shell.result = caller_result;
+    shell.produced = caller_produced;
+    debug_assert!(
+        switches_on.is_empty() && flag_values.is_empty(),
+        "no parameters means no option can bind"
+    );
+    let [argument] = <[Value; 1]>::try_from(positionals).map_err(|positionals: Vec<Value>| {
+        runtime_message(format!(
+            "{label}: expected 1 argument, got {}",
+            positionals.len()
+        ))
+    })?;
+    apply_modifier_ref(modifier, argument)
+}
+
+/// Apply the modifier a bare `:name` reference denotes.
+///
+/// Only the argument-free modifiers can be referenced this way: `:join` and
+/// `:split` need a separator and `:map`/`:filter`/`:each` need a callable, so there
+/// is no one-argument function for them to denote. A name the parser recognized but
+/// the engine cannot yet apply reports that rather than being silently dropped.
+fn apply_modifier_ref(name: &str, argument: Value) -> Result<Value, Step> {
+    // Checked here rather than left to the shared path: a reference to `:join` is
+    // wrong whatever it would be applied to, so say that instead of complaining
+    // about the value it met.
+    if modifier_takes_arguments(name) {
+        return runtime_error(format!(
+            "`:{name}` takes arguments, so it is not a one-argument function"
+        ));
+    }
+    apply_argument_free_modifier(name, argument)
 }
 
 /// Match `args` against `params` and bind each parameter in the current (already
