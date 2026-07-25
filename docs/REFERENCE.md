@@ -357,8 +357,14 @@ lost.
 A job that has **already finished** answers from the status its record carries,
 so waiting after the fact reports the same thing as waiting through it. The job
 then leaves the table, and the usual `[1] Done (0) …` notice is not repeated for
-a status you have already been given. Ctrl-C abandons the *wait*, reporting
-`130`, and leaves the job running and listed.
+a status you have already been given.
+
+**Ctrl-C abandons the wait, not the job**: it reports `130` and leaves the job
+running and listed. That applies to an **interactive** shell, which is the only
+one that ignores SIGINT on its own account and so the only one where a wait would
+otherwise be inescapable. A non-interactive shell keeps whatever disposition it
+was given — an inherited ignore, from a parent that meant interrupts not to take
+effect, still holds through a wait.
 
 A job that is **stopped** does not finish on its own, so waiting for one reports
 its `128 + signal` stop status straight away rather than blocking on it; `bg`

@@ -1972,6 +1972,47 @@ fn wait_needs_a_job_to_wait_for() {
 }
 
 #[test]
+fn a_noninteractive_wait_keeps_an_inherited_sigint_ignore() {
+    // A batch parent that ignores SIGINT hands that ignore to mesh, and means it
+    // to hold: interrupts are not to take effect in what it launched. Only the
+    // *interactive* shell ignores SIGINT on its own account, so only there does
+    // a wait need a catcher to stay escapable. Reading the disposition alone
+    // could not tell the two apart, and abandoning the wait here would cut the
+    // job short — the shell hangs it up on the way out.
+    use std::os::unix::process::CommandExt;
+
+    let mut command = mesh_command();
+    command
+        .arg("-c")
+        .arg("sh -c 'sleep 2; echo finished' &\nwait 1\nputs status=$sh.status\n")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: `signal` is async-signal-safe and this runs in the forked child
+    // between fork and exec, where it is the only thread.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+            Ok(())
+        })
+    };
+    let child = command.spawn().expect("spawn mesh");
+
+    // Whenever it lands, the interrupt has to be ignored, so the timing here
+    // decides only *which* part of the wait is covered, never the outcome.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // SAFETY: signalling a live child of this process.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+
+    let out = child.wait_with_output().expect("wait for mesh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "finished\nstatus=0\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn wait_refuses_in_a_pipeline_stage() {
     // A forked stage is not the parent of the shell's jobs, so its `waitpid`
     // would fail with ECHILD rather than wait for anything — the same reason
