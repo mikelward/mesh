@@ -6623,16 +6623,97 @@ fn a_malformed_reference_in_a_heredoc_is_an_error() {
     // A heredoc promises a string's interpolation rules, so `${bad` cannot
     // quietly become literal text when `"${bad"` is a syntax error.
     let out = run_with_input("cat << END\n${bad\nEND\nputs after\n");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("interpolation"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+    // The *same* diagnostic a string gives, only labeled as coming from a
+    // heredoc — the promise is that the two grammars agree, not merely that both
+    // fail somehow.
+    let string_form = run_with_input("puts \"${bad\"\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&string_form.stderr).replace("mesh: ", "mesh: heredoc: "),
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 
     // A quoted delimiter takes no interpolation at all, so the same text is data.
     let out = run_with_input("cat << 'END'\n${bad\nEND\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "${bad\n");
+}
+
+#[test]
+fn a_malformed_unicode_escape_in_a_heredoc_is_an_error() {
+    // `\u` *is* in the escape set, so a malformed one is an error rather than
+    // literal text; only an escape the set does not contain at all stays as
+    // written. Asserted against the string form so the two cannot drift.
+    let out = run_with_input("cat << END\nbad \\u{zz}\nEND\nputs after\n");
+    let string_form = run_with_input("puts \"bad \\u{zz}\"\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&string_form.stderr).replace("mesh: ", "mesh: heredoc: "),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // An unrecognized escape is still ordinary text, and a valid `\u` still decodes.
+    let out = run_with_input("cat << END\nC:\\path \\u{41}\nEND\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "C:\\path A\n");
+
+    // A quoted delimiter takes no escapes at all.
+    let out = run_with_input("cat << 'END'\nbad \\u{zz}\nEND\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bad \\u{zz}\n");
+}
+
+#[test]
+fn a_heredoc_reference_ends_where_the_command_grammar_says_it_does() {
+    // Chained access is one reference, not "first access then literal text":
+    // stopping after `$o.inner` would resolve a map and fail. Each form is
+    // asserted to produce exactly what the double-quoted string produces.
+    for body in [
+        "$o.inner.key",
+        "$o.inner.key:upper",
+        "$xs[0].key",
+        "$xs[0].key:upper trailing",
+        "$o.inner.key.",
+    ] {
+        let setup = "o = [inner: [key: deep]]\nxs = [[key: deep]]\n";
+        let heredoc = run_with_input(&format!("{setup}cat << END\n{body}\nEND\n"));
+        let string = run_with_input(&format!("{setup}puts \"{body}\"\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&heredoc.stdout),
+            String::from_utf8_lossy(&string.stdout),
+            "{body}: {}",
+            String::from_utf8_lossy(&heredoc.stderr)
+        );
+    }
+}
+
+#[test]
+fn a_long_heredoc_body_is_read_in_linear_time() {
+    // Read through a pipe the body arrives a line at a time, and completeness
+    // used to be re-derived by re-parsing the whole buffer after each one —
+    // quadratic in the body's length. The gate now waits for the delimiter line
+    // directly, so doubling the body should roughly double the time, not
+    // quadruple it. Compared as a ratio because absolute times vary by machine.
+    let time = |lines: usize| {
+        let body: String = (0..lines).map(|i| format!("line {i}\n")).collect();
+        let start = std::time::Instant::now();
+        let out = run_with_input(&format!("cat << END\n{body}END\nputs done\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).ends_with("done\n"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        start.elapsed()
+    };
+    // Warm the binary's page cache so the first measurement is not penalized.
+    time(200);
+    let small = time(2_000).as_secs_f64();
+    let large = time(8_000).as_secs_f64();
+    // 4x the lines: linear predicts ~4x, quadratic ~16x. A generous ceiling
+    // keeps this from being flaky on a loaded machine while still failing the
+    // quadratic reading, which measured well past 10x before the fix.
+    assert!(
+        large < small * 9.0 + 0.5,
+        "8,000-line body took {large:.3}s against {small:.3}s for 2,000 — \
+         that is quadratic, not linear"
+    );
 }
 
 #[test]

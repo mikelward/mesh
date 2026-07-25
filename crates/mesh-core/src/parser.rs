@@ -123,6 +123,10 @@ pub enum ParseErrorKind {
     UnexpectedToken,
     UnexpectedEnd,
     Unterminated(char),
+    /// A heredoc body ran to end of input without its closing delimiter line.
+    /// Carries the delimiter so a line-at-a-time reader can wait for exactly that
+    /// line instead of re-parsing the body after every line it reads.
+    UnterminatedHeredoc(String),
     ChainedComparison,
     Expected(&'static str),
     ReservedParameter(String),
@@ -147,6 +151,12 @@ impl std::fmt::Display for ParseError {
             ParseErrorKind::UnexpectedToken => write!(f, "syntax error: unexpected token"),
             ParseErrorKind::UnexpectedEnd => write!(f, "syntax error: unexpected end of input"),
             ParseErrorKind::Unterminated(c) => write!(f, "syntax error: unclosed `{c}`"),
+            ParseErrorKind::UnterminatedHeredoc(delimiter) => {
+                write!(
+                    f,
+                    "syntax error: heredoc missing its `{delimiter}` delimiter"
+                )
+            }
             ParseErrorKind::ChainedComparison => {
                 write!(f, "syntax error: comparisons cannot be chained")
             }
@@ -198,6 +208,12 @@ impl std::error::Error for ParseError {}
 pub enum ParseOutcome {
     Complete(Source),
     Incomplete,
+    /// Incomplete because a heredoc body is still open, awaiting a line equal to
+    /// this delimiter. Distinguished from [`ParseOutcome::Incomplete`] so a
+    /// line-at-a-time reader can wait for that one line directly: re-parsing the
+    /// buffer after each body line is quadratic in the body's length, and a body
+    /// is bulk data rather than syntax.
+    IncompleteHeredoc(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,8 +570,11 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
         // Only the heredoc case. An unterminated quote or `${` is a genuine
         // syntax error even at end of input — those cannot be continued on the
         // next line, and buffering them would swallow the diagnostic.
-        Err(error) if matches!(error.kind, ParseErrorKind::Unterminated('<')) => {
-            return Ok(ParseOutcome::Incomplete);
+        Err(ParseError {
+            kind: ParseErrorKind::UnterminatedHeredoc(delimiter),
+            ..
+        }) => {
+            return Ok(ParseOutcome::IncompleteHeredoc(delimiter));
         }
         Err(error) => return Err(error),
     };
@@ -882,7 +901,7 @@ impl<'a> Lexer<'a> {
             }
             let Some((closing_start, closing_end)) = closing else {
                 return Err(ParseError {
-                    kind: ParseErrorKind::Unterminated('<'),
+                    kind: ParseErrorKind::UnterminatedHeredoc(delimiter.to_owned()),
                     span: body_start..self.source.len(),
                 });
             };
@@ -1005,7 +1024,7 @@ fn push_variable(pieces: &mut Vec<WordPiece>, variable: &str, quote: QuoteMode) 
     });
 }
 
-fn variable_end(source: &str, start: usize) -> Result<usize, ParseError> {
+pub(crate) fn variable_end(source: &str, start: usize) -> Result<usize, ParseError> {
     let rest = &source[start..];
     if let Some(braced) = rest.strip_prefix("${") {
         let Some(close) = braced.find('}') else {
@@ -1165,7 +1184,7 @@ fn quoted_subscript(value: &str) -> bool {
     !escaped
 }
 
-fn decode_unicode_escape(source: &str, start: usize) -> Option<(char, usize)> {
+pub(crate) fn decode_unicode_escape(source: &str, start: usize) -> Option<(char, usize)> {
     let rest = source.get(start..)?;
     let hex = rest.strip_prefix('{')?;
     let close = hex.find('}')?;
@@ -1219,7 +1238,7 @@ fn merge_command_variable_access(pieces: Vec<WordPiece>) -> Vec<WordPiece> {
     output
 }
 
-fn variable_access_prefix(text: &str) -> usize {
+pub(crate) fn variable_access_prefix(text: &str) -> usize {
     let mut consumed = 0;
     loop {
         let rest = &text[consumed..];
@@ -3082,7 +3101,9 @@ mod tests {
     fn complete(source: &str) -> Source {
         match parse(source).unwrap() {
             ParseOutcome::Complete(tree) => tree,
-            ParseOutcome::Incomplete => panic!("unexpected incomplete input"),
+            ParseOutcome::Incomplete | ParseOutcome::IncompleteHeredoc(_) => {
+                panic!("unexpected incomplete input")
+            }
         }
     }
 
