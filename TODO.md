@@ -283,9 +283,15 @@ file as tasks land.
       which differs from bash and holds only because pipefail is always on. A
       forgiven `SIGPIPE` is the one place they diverge from each other, showing
       as `141` in the list while the status stays 0.
-- [ ] The rest of `$sh.*`: `$sh.pid` / `$sh.ppid`, `$sh.version`,
-      `$sh.interactive`, `$sh.options`, the stream handles with their `:tty`
-      test, `$sh.jobs`, and the hook maps.
+- [x] `$sh.pid` / `$sh.ppid`, `$sh.version`, `$sh.interactive`, and the stream
+      handles `$sh.stdin` / `$sh.stdout` / `$sh.stderr` with their `:tty` test.
+      A handle is its own value (`Value::Stream`) with **no byte form**, as
+      `DESIGN.md`'s rendering table requires, so `puts $sh.stdin` is a loud
+      error and the descriptor never reaches argv, arithmetic, or the
+      environment; `:tty` is the question it answers, and a bare integer is
+      refused. `$sh.interactive` is recorded by the loop that runs, not derived
+      from `isatty`, so `mesh -s` on a terminal reports `false`.
+- [ ] The rest of `$sh.*`: `$sh.options`, `$sh.jobs`, and the hook maps.
 
 ## Loose ends
 
