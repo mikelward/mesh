@@ -463,9 +463,18 @@ a command. Both are claimed only when what follows looks like a value, which lea
 `cmd <file` a redirect and `not foo` a command. A bare `true` / `false` counts as a
 value only in that position, so `if not false` negates while `if true` still runs
 the command. A negation must also be the *whole* statement, as a lone integer literal
-must: `not true foo`, `not $x | cat`, and `not false > out.txt` stay commands. Whether a
-`<` / `>` is a redirect is judged after the *complete* operand, so `not [1 2] > out.txt`
-and `not $x:len > out.txt` redirect while a spaced `>` in a condition still compares.
+must: `not true foo`, `not $x | cat`, and `not true >out.txt` stay commands.
+
+**Attachment decides** which of the two readings a `<` / `>` takes, and it decides
+the same way in every position: `cmd >out` redirects, `$a > $b` compares, whether the
+line is a statement or a condition. So `if $i < 3` and `if $xs:len > 5` compare, and
+so do the identical lines outside an `if` — `$p:base > log` has one reading rather
+than two that depend on where it sits. `>>` is only ever a redirect and is never
+spelled spaced. The question is asked of the *complete* operand, since a list literal
+or a `:modifier` suffix stands between the token that starts one and the operator, so
+`not [1 2] >out.txt` and `not $x:len >out.txt` redirect. A bare command word has no
+value reading to lose, so `grep -q x < file` is a redirect in either spelling; the
+rule only bites on operands that could be values.
 
 Both rules apply to a bare **word** operand too, which is how `$editor` names a
 command: it is a value only when the value is the whole statement, so `$editor file`,
@@ -475,9 +484,9 @@ lines — a connector or a backgrounding `&` picks the command, since that is th
 statement `not $b && puts x` — and a redirect found by scanning to the end of the
 **command word**, a word plus its *attached* argument-free `:modifier` suffixes (a
 spaced one is the next argument, so `$e :len` runs `echo :len`), makes
-`$p:base > log` a redirection rather than a comparison. That bound is why `$x + 1 > 1`
+`$p:base >log` a redirection. That bound is why `$x + 1 > 1`
 and `$xs[0 + 0] > 0` stay comparisons: neither can be a command word, since a word
-cannot contain a nested expression. `$xs[0] > f` does redirect, a literal index being
+cannot contain a nested expression. `$xs[0] >f` does redirect, a literal index being
 part of the word.
 An assignment operator counts as the end of a value for this purpose, which keeps
 `$xs:dedup = 9` a syntax error about places rather than a command invocation.

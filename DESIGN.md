@@ -2397,6 +2397,12 @@ Two mesh notes, neither a behavior change:
 - A redirection operator is its **own lexical token**, so it is **exempt from the
   [operators-need-spaces](#globbing) rule** — `cmd 2>&1` and `cmd >file` both
   parse as in bash; the spacing rule is only about word operators like `-`.
+- `<` and `>` also spell **comparisons**, and where a command word could be a value
+  instead — a variable, a quoted word, a numeral, a `:modifier` chain — **attachment**
+  says which is meant: `$cmd >out` redirects, `$a > $b` compares. The same rule in
+  every position, so `$p:base > log` reads alike inside an `if` and outside one. A
+  bare word like `grep` cannot be a value, so its `< file` is a redirect however it
+  is spaced, and `>>` is only ever a redirect.
 - Redirection moves **bytes to/from files and fds** — it does *not* interact with
   the rich value channel. A list or map is not "redirected"; you print it
   (`puts $xs > file`) and the command's stdout is what lands. This is the same

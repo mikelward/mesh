@@ -6421,6 +6421,8 @@ fn malformed_function_bodies_remain_quarantined() {
     }
 }
 
+/// Written attached, since that is the spelling that makes a `<` after a
+/// value-shaped command word a redirect at all — spaced, `$cmd < f` compares.
 #[test]
 fn interpolated_command_allows_multiple_input_redirects() {
     let dir = fresh_dir("multiple_input_redirects");
@@ -6429,7 +6431,7 @@ fn interpolated_command_allows_multiple_input_redirects() {
     std::fs::write(&first, "first\n").unwrap();
     std::fs::write(&second, "second\n").unwrap();
     let out = run_with_input(&format!(
-        "cmd = cat\n$cmd < {} < {}\n",
+        "cmd = cat\n$cmd <{} <{}\n",
         first.display(),
         second.display()
     ));
@@ -8293,11 +8295,13 @@ fn a_while_reports_the_status_of_its_last_pass() {
     assert_eq!(out.status.code(), Some(1));
 }
 
+/// `<` and `>` double as redirect operators, so something has to tell `$i < 3` from
+/// `cmd < file`. **Attachment** does, and it does so in every position: a spaced
+/// operator compares, an attached one redirects, whether the line is a statement or
+/// an `if` / `while` condition. `<=`, `>=`, and `!=` always read as comparisons,
+/// having no second spelling at all.
 #[test]
-fn a_spaced_comparison_in_a_condition_is_not_a_redirection() {
-    // `<` and `>` double as redirect operators, so a condition has to tell
-    // `if $i < 3` from `if cmd < file`. `<=`, `>=`, and `!=` always read as
-    // comparisons here; these two now do too.
+fn a_spaced_comparison_is_not_a_redirection() {
     let out =
         run_with_input("i = 0\nif $i < 3 { puts lt }\nif $i > 9 { puts gt } else { puts le }\n");
     assert_eq!(
@@ -8307,7 +8311,9 @@ fn a_spaced_comparison_in_a_condition_is_not_a_redirection() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // A command condition still redirects.
+    // A bare command word has no value reading to lose, so its redirect is a
+    // redirect in either spelling — this rule is only about operands that could be
+    // values, and `grep` cannot be one.
     let dir = fresh_dir("condition_redirect");
     let input = dir.join("in.txt");
     std::fs::write(&input, "hello\n").unwrap();
@@ -8316,6 +8322,25 @@ fn a_spaced_comparison_in_a_condition_is_not_a_redirection() {
         input.display()
     ));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "found\n");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The same comparison in *statement* position, which used to redirect into a
+    // file named by the right operand instead. Run in a scratch directory because
+    // that is the failure mode: it creates the file.
+    let dir = fresh_dir("statement_comparison");
+    std::fs::write(dir.join("run.mesh"), "i = 0\nx = 5\n$i < 3\n$x > 3\n").unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!dir.join("3").exists(), "a spaced comparison redirected");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -8435,8 +8460,9 @@ fn a_connector_after_a_variable_command_still_runs_the_command() {
 /// The same for an operand carrying **postfix modifiers**, which is where the
 /// one-token lookahead went wrong: in `$p:base arg` the token after the variable is
 /// the `:` of the modifier, so nothing saw the argument that followed the operand.
-/// A redirect after such an operand is a redirect too, in every spelling —
-/// spaced `>`, attached `>out`, and `>>`, none of which reached the command before.
+/// A redirect after such an operand is a redirect too, in the spellings attachment
+/// gives to a redirect — `>out` and `>>` — neither of which reached the command
+/// before. The *spaced* `>` is the comparison it is in a condition, here too.
 #[test]
 fn a_modified_operand_names_a_command_and_takes_a_redirect() {
     let dir = fresh_dir("modified_operand_command");
@@ -8474,9 +8500,11 @@ fn a_modified_operand_names_a_command_and_takes_a_redirect() {
     let (stdout, _, stderr) = run("$p:base arg\n");
     assert_eq!(stdout, "hello ran: arg\n", "{stderr}");
 
-    // A redirect after it, in all three spellings.
+    // A redirect after it, in each spelling that *is* one. `$p:base arg > out.txt`
+    // is a command for a different reason — the argument settles that before the
+    // operator is reached — and the command parser reads its `>` as a redirect
+    // whatever the spacing, the same as it does for `ls > out`.
     for body in [
-        "$p:base > out.txt\n",
         "$p:base >out.txt\n",
         "$p:base >> out.txt\n",
         "$p:base arg > out.txt\n",
@@ -8488,6 +8516,12 @@ fn a_modified_operand_names_a_command_and_takes_a_redirect() {
             "{body} did not redirect the command: {written:?}"
         );
     }
+
+    // And the spaced spelling compares instead, so nothing runs and nothing is
+    // written — the same reading `if $p:base > log` has always had.
+    let (stdout, written, _) = run("$p:base > out.txt\n");
+    assert_eq!(stdout, "", "a spaced `>` ran the command");
+    assert_eq!(written, "", "a spaced `>` redirected");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -8534,9 +8568,10 @@ fn a_comparison_with_arithmetic_on_the_left_is_not_a_redirect() {
         }
     }
 
-    // The literal-index spelling is a word, so it keeps the redirect reading it has on
-    // `main` — the point being that the line between them is what a *word* can hold.
-    std::fs::write(dir.join("run.mesh"), "xs = [7 8]\n$xs[0] > out.txt\n").unwrap();
+    // The literal-index spelling is a word, so it *can* be a command word and an
+    // attached redirect after it is one — the point being that the line between the
+    // two is what a *word* can hold, not how the operator is spelled.
+    std::fs::write(dir.join("run.mesh"), "xs = [7 8]\n$xs[0] >out.txt\n").unwrap();
     let out = mesh_command()
         .arg("run.mesh")
         .current_dir(&dir)
@@ -8704,10 +8739,9 @@ fn a_command_named_not_is_still_reachable() {
 }
 
 /// A redirect after the operand stays a redirect. `>` also spells a comparison, and
-/// the boolean clause originally lacked the guard the other value-shaped clauses
-/// carry, so `not false > out.txt` read as a comparison and failed with "comparison
-/// requires two integers or two strings" instead of running the command and writing
-/// the file.
+/// the guard has to look at the *completed* operand to find the operator at all: a
+/// list literal or a `:mod` suffix both got past a guard placed on the token that
+/// merely starts one, so `not [1 2] >out.txt` compared instead of redirecting.
 #[test]
 fn a_redirect_after_a_negation_operand_is_still_a_redirect() {
     let dir = fresh_dir("leading_not_redirect");
@@ -8737,16 +8771,16 @@ fn a_redirect_after_a_negation_operand_is_still_a_redirect() {
     };
 
     // Every operand shape, since the guard has to see the *completed* operand: a
-    // literal, a list, a variable carrying a postfix modifier, `>>`, and an attached
-    // `>out` with no space. A list and a `:mod` operand are the ones that got through
-    // a guard placed on the token that merely *starts* the operand.
+    // boolean literal, a list, and a variable carrying a postfix modifier, each with
+    // both spellings a redirect has. A list and a `:mod` operand are the ones that got
+    // through a guard placed on the token that merely *starts* the operand.
     for body in [
-        "not false > out.txt\n",
-        "not true > out.txt\n",
-        "not [1 2] > out.txt\n",
-        "x = [a b]\nnot $x:len > out.txt\n",
-        "not [1 2] >> out.txt\n",
+        "not false >out.txt\n",
         "not true >out.txt\n",
+        "not [1 2] >out.txt\n",
+        "x = [a b]\nnot $x:len >out.txt\n",
+        "not [1 2] >> out.txt\n",
+        "not true >> out.txt\n",
     ] {
         let (stderr, written) = run(body);
         assert!(stderr.is_empty(), "{body} errored: {stderr}");
