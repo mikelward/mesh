@@ -986,7 +986,7 @@ fn run_executable(
             parameters,
             body,
         } => {
-            if name == "func" || name == "return" || builtins::is_builtin(name) {
+            if name == "func" || name == "return" || name == "not" || builtins::is_builtin(name) {
                 note!("mesh: func: `{name}` is a reserved name and cannot be a function name");
                 return Step::Continue(2);
             }
