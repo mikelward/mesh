@@ -1157,11 +1157,13 @@ fn restore_terminal_modes(modes: &libc::termios) {
 /// `JobTable`'s, which signals jobs on drop and would otherwise reach the parent's
 /// jobs from a child that never owned them. Buffered output is flushed *before*
 /// forking, since a copy of the buffer would otherwise be printed twice.
-pub(crate) fn fork_and_wait(body: impl FnOnce() -> u8) -> std::io::Result<u8> {
+pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std::io::Result<u8> {
     use std::io::Write;
 
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
+
+    let shell_modes = if interactive { terminal_modes() } else { None };
 
     // SAFETY: fork has no arguments. The child runs `body` and leaves via
     // `_exit`, so it never unwinds back through the parent's stack or runs a
@@ -1177,12 +1179,26 @@ pub(crate) fn fork_and_wait(body: impl FnOnce() -> u8) -> std::io::Result<u8> {
         // and `fg` must not hand them the terminal. The same mark a forked
         // pipeline stage sets, for the same reason.
         mark_forked_stage();
-        // An interactive shell ignores the terminal signals so that Ctrl-C
-        // interrupts the foreground job rather than the shell itself. A child
-        // that goes on to `exec` has those dispositions restored for it; this one
-        // stays in mesh code, so without this a `fork { loop { } }` would ignore
-        // Ctrl-C and leave the session recoverable only by an external kill.
-        let _ = restore_job_signals();
+        // Job control, in the shape a forked pipeline stage uses. All of it is
+        // gated on `interactive`, because a *noninteractive* mesh must pass its
+        // caller's signal dispositions through untouched: a batch runner that
+        // launches a script with `SIGINT` ignored means it to stay ignored, and
+        // entering a `fork` block is not a reason to change the contract.
+        if interactive {
+            // SAFETY: scalar arguments; this is the child, so 0 means itself.
+            unsafe { libc::setpgid(0, 0) };
+            // An interactive shell ignores the terminal signals so Ctrl-C reaches
+            // the foreground job rather than the shell. A child that goes on to
+            // `exec` has these restored for it; this one stays in mesh code, so
+            // without it `fork { loop { } }` ignores Ctrl-C and leaves the
+            // session recoverable only by an external kill.
+            let _ = restore_job_signals();
+            // Its own group, holding the terminal: a stop or an interrupt from
+            // the keyboard then reaches the subshell *and its descendants* as one
+            // unit, which is what makes resuming it able to resume them.
+            // SAFETY: getpgrp takes no arguments and cannot fail.
+            set_foreground_group(unsafe { libc::getpgrp() });
+        }
         let code = body();
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
@@ -1194,15 +1210,31 @@ pub(crate) fn fork_and_wait(body: impl FnOnce() -> u8) -> std::io::Result<u8> {
     // forever, reachable only by an external `kill`. Until backgrounding is
     // wired into the table, continue it and keep waiting — Ctrl-Z on a subshell
     // does nothing rather than losing one.
-    loop {
+    // Set from the parent as well as the child, so neither side races the other
+    // into needing the group that is not there yet.
+    if interactive {
+        // SAFETY: scalar arguments naming this process's own child.
+        unsafe { libc::setpgid(pid, pid) };
+    }
+    let status = loop {
         let (status, stopped) = wait_for_job(pid)?;
         if !stopped {
-            return Ok(status);
+            break status;
         }
         note!("mesh: fork: a subshell cannot be suspended yet");
-        // SAFETY: `pid` is this process's live, stopped child.
-        unsafe { libc::kill(pid, libc::SIGCONT) };
+        // The whole **group**, not just the leader. A stop from the keyboard
+        // reaches every process in the foreground group, so `fork { sleep 100 }`
+        // stops the subshell *and* the sleep; continuing only the leader would
+        // leave the sleep stopped with nothing left to resume it once the
+        // subshell exited.
+        // SAFETY: scalar arguments. Negating a pid names its process group,
+        // which exists only when this fork made one.
+        unsafe { libc::kill(if interactive { -pid } else { pid }, libc::SIGCONT) };
+    };
+    if interactive {
+        reclaim_terminal(shell_modes.as_ref());
     }
+    Ok(status)
 }
 
 /// Wait for a child to exit, be signaled, or stop. `Child::wait` only reports
