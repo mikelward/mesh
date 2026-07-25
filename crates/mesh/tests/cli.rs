@@ -2102,6 +2102,21 @@ fn a_job_handle_reads_the_job_as_it_is_now() {
 }
 
 #[test]
+fn a_job_handle_has_no_literal_form() {
+    // `:repr` writes the source you would have typed for a value, and a handle
+    // has none: the id is the only part of it that could be written, and the
+    // only part that means nothing outside this shell's table. Reading it back
+    // would hand over whatever job held that id by then.
+    let out = run_with_input("j = sleep 9 &\nputs $j:repr\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("a job handle has no literal form"),
+        "{:?}",
+        out.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
 fn a_job_handle_has_no_text_form() {
     // Like a stream handle, and for a reason beyond tidiness: it is what keeps
     // `kill $j` a job where `kill 49001` is a pid, without either guessing.

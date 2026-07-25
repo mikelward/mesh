@@ -46,6 +46,7 @@ pub enum NoLiteral {
     Regex,
     Glob,
     Stream,
+    Job,
     Function,
     /// `i64::MIN`, the one value here that *has* a spelling the writer could
     /// produce and the **reader** cannot take back — see [`Value::write_literal`].
@@ -58,6 +59,7 @@ impl std::fmt::Display for NoLiteral {
             NoLiteral::Regex => "a regex has no literal form",
             NoLiteral::Glob => "a glob has no literal form",
             NoLiteral::Stream => "a stream handle has no literal form",
+            NoLiteral::Job => "a job handle has no literal form",
             NoLiteral::Function => "a function has no literal form",
             NoLiteral::MinInteger => "the smallest integer has no literal the parser reads back",
         };
@@ -138,6 +140,11 @@ impl Value {
             // (`DESIGN.md` §"Globbing").
             Value::Glob(_) => return Err(NoLiteral::Glob),
             Value::Stream(_) => return Err(NoLiteral::Stream),
+            // A handle names a job in *this* shell's table, so the id is the one
+            // thing about it that could be written and the one thing that means
+            // nothing anywhere else. Round-tripping it would hand back a
+            // reference to whatever job happened to hold that id.
+            Value::Job(_) => return Err(NoLiteral::Job),
             Value::Function(_) => return Err(NoLiteral::Function),
         }
         Ok(())
