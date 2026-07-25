@@ -1145,6 +1145,44 @@ fn restore_terminal_modes(modes: &libc::termios) {
     }
 }
 
+/// Fork, run `body` in the child, and wait for it — the machinery behind
+/// `fork { … }`.
+///
+/// The isolation is the process boundary itself: a `cd`, an assignment, an
+/// `export`, a umask change in the child cannot reach the parent, and neither can
+/// an `exit`, which ends the child and becomes this call's status rather than
+/// ending the shell.
+///
+/// The child leaves through `_exit` so no destructor runs a second time — notably
+/// `JobTable`'s, which signals jobs on drop and would otherwise reach the parent's
+/// jobs from a child that never owned them. Buffered output is flushed *before*
+/// forking, since a copy of the buffer would otherwise be printed twice.
+pub(crate) fn fork_and_wait(body: impl FnOnce() -> u8) -> std::io::Result<u8> {
+    use std::io::Write;
+
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+
+    // SAFETY: fork has no arguments. The child runs `body` and leaves via
+    // `_exit`, so it never unwinds back through the parent's stack or runs a
+    // destructor the parent still owns.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if pid == 0 {
+        let code = body();
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        // SAFETY: leaving without unwinding, as above.
+        unsafe { libc::_exit(i32::from(code)) };
+    }
+    // Stops are reported by `wait_for_job` for Ctrl-Z's sake; a stopped subshell
+    // has no job-table entry to resume from yet, so its status is all that is
+    // taken here.
+    wait_for_job(pid).map(|(status, _stopped)| status)
+}
+
 /// Wait for a child to exit, be signaled, or stop. `Child::wait` only reports
 /// termination, which would leave mesh blocked after Ctrl-Z. Reporting a stop
 /// now lets the shell reclaim the terminal; the job-table task will retain the

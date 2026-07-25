@@ -336,6 +336,14 @@ pub enum Executable {
     Loop {
         body: Source,
     },
+    /// `fork { … }` — a subshell. The body runs in a forked child, so the
+    /// process state it changes (cwd, environment, umask) and the bindings it
+    /// makes are its own, and an `exit` inside it ends the child rather than the
+    /// shell. `DESIGN.md` makes isolation explicit in three grades; this is the
+    /// strongest, and the only one that costs a process.
+    Fork {
+        body: Source,
+    },
     Control {
         kind: ControlKind,
         value: Option<Expr>,
@@ -1553,6 +1561,17 @@ impl Parser {
         if self.word("loop") {
             return self.loop_expr();
         }
+        // Contextual, like `global` and `unset`: `fork` leads a statement only
+        // where a subshell can follow, so a command of that name is still
+        // reachable as `fork`, `fork --flag`, or `fork somewhere`.
+        if self.word("fork")
+            && self
+                .tokens
+                .get(self.position + 1)
+                .is_some_and(|token| matches!(token.value, TokenKind::LBrace))
+        {
+            return self.fork_expr();
+        }
         if self.word("return") || self.word("break") || self.word("continue") {
             return self.control();
         }
@@ -2133,6 +2152,13 @@ impl Parser {
         self.newlines();
         let body = self.block()?;
         Ok(Executable::Loop { body })
+    }
+
+    fn fork_expr(&mut self) -> Result<Executable, ParseError> {
+        self.take_word("fork");
+        self.newlines();
+        let body = self.block()?;
+        Ok(Executable::Fork { body })
     }
 
     fn match_expr(&mut self) -> Result<MatchExpr, ParseError> {

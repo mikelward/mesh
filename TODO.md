@@ -388,11 +388,25 @@ of each PR had landed by another route, but these pieces had not.
       BSD-only mistake in `mesh-platform` no longer passes both runners
       unnoticed. It needs no cross compiler — nothing here builds C for FreeBSD,
       and `cargo check` never links — so it is a target install and one command.
-- [ ] **Carry `fork` isolation into the build track.** `DESIGN.md` specifies
-      `fork { … }` and `fork func name(params) { … }` as the explicit isolation
-      forms, but the keyword is absent from `GRAMMAR.md` and `docs/`, is not
-      listed among the deferred syntax there, and does not parse — `fork { pwd }`
-      is a syntax error today.
+- [x] **`fork { … }` — the subshell grade of isolation.** The body runs in a forked
+      child, so its `cd`, environment writes, and bindings stay there, and an `exit`
+      inside ends the child rather than the shell, arriving outside as the block's
+      status. Only bytes cross back, as `DESIGN.md` says of a subshell. Contextual
+      like `global` / `unset` — `fork` leads a statement only when a `{` follows, so
+      a command of that name stays reachable — and the fork/wait itself reuses the
+      status conventions `wait_for_job` already encodes rather than restating them.
+- [ ] **The rest of `fork` isolation.** Two pieces of the `DESIGN.md` cluster are
+      still open. **`fork func name(params) { … }`**, a func whose *body* is a
+      subshell, needs a decision first: a subshell returns only bytes, so what does
+      a **value** call (`f()`) on one mean — an error, or an empty value? That is a
+      grammar-level question rather than a mechanical one. **Backgrounding a
+      subshell** (`fork { … } &`) is refused today, since a backgrounded child needs
+      a job-table entry to be resumable by `fg`; wiring it into the table is the
+      work. **Piping or redirecting a subshell** (`fork { … } | cat`,
+      `fork { … } > log`) is a syntax error today: a `fork` block is a statement
+      rather than a pipeline stage, and bash's `( … ) > log` says people will
+      expect it. `in DIR { … }`, the third and cheapest grade in `DESIGN.md` (scoped cwd,
+      no fork), does not parse yet either.
 - [ ] **A redirect after a non-word value operand.** `[1 2] > out.txt` and
       `(1) > out.txt` read the `>` as a comparison and fail with "comparison requires
       two integers or two strings"; `[1 2] >> out.txt` is a syntax error, since `>>` is

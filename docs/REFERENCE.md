@@ -1037,6 +1037,50 @@ Note that `<` and `>` also spell redirections. In a **condition** a spaced
 comparison wins — `while $i < 3` compares — while an attached or command-position
 form still redirects (`grep -q x < file`, `$cmd > log`).
 
+## `fork` — a subshell
+
+`fork { body }` runs the body in a forked child, so everything it changes about
+the process is its own:
+
+```mesh
+fork { cd build
+  $env.CC = clang
+  make }        # the shell's cwd, environment, and bindings are untouched after
+```
+
+Isolation is **explicit** in mesh — a plain `func` persists a `cd` on purpose, so
+that lifting lines into a helper does not silently change where they run. `fork`
+is the opt-in for the other behavior, and the only grade that costs a process.
+
+What crosses back out is **bytes**: the child shares the shell's stdout, so what
+it prints appears, but no value returns and no binding survives. Its exit status
+becomes the block's, so it composes normally:
+
+```mesh
+fork { false } || puts the-subshell-failed
+```
+
+An **`exit` inside a subshell ends the child, not the shell** — which is the
+property that makes it worth having:
+
+```mesh
+fork { exit 3 }
+puts "still here, status $sh.status"    # still here, status 3
+```
+
+`fork` is contextual, not reserved: it leads a statement only when a `{` follows,
+so a command of that name is still reachable as `fork`, `fork --flag`, or
+`fork somewhere`.
+
+Control flow cannot cross the boundary either, which falls out of the isolation
+rather than being enforced: a `break` inside a subshell ends the *child*, and the
+loop it looks like it is in — the parent's — carries on.
+
+Not yet, and a syntax error rather than a quiet surprise if you write one:
+piping a subshell (`fork { … } | cat`) or redirecting one (`fork { … } > log`);
+backgrounding one (`fork { … } &` is refused, since it has no job-table entry to
+resume from); and the `fork func name() { … }` form `DESIGN.md` also specifies.
+
 ## Match
 
 `match value { pattern { body } ... }` evaluates arms from top to bottom and
