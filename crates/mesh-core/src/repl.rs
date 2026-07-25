@@ -5523,40 +5523,57 @@ fn strip_growing_tail(list: &str) -> (&str, GrowingTail) {
 /// definition pending, so it is dispatched and the parser reports the documented
 /// "unexpected text after the closing `}`" error.
 ///
-/// A tokenize failure splits two ways, and conflating them is what makes a reader
-/// hang. An **unterminated** quote or heredoc is an open construct: the rest of the
-/// input is inside it, so the body cannot have closed and a later line may still
-/// close it — keep buffering. Any other lexical error is **hard**: no later line
-/// repairs an invalid escape, so waiting for one buffers forever behind a
-/// diagnostic that never arrives, swallowing every command typed after it. Those
-/// dispatch, and the parser reports the error — which is what the char scanner this
-/// replaced did by never failing at all.
+/// A tokenize failure is not an answer on its own, because the failure can sit
+/// *after* the `}` that already settled this. `func f() {} puts "` fails on the
+/// quote, but the body closed two tokens earlier and the definition is done — so
+/// the text before the error is scanned first, and a close found there wins. The
+/// char scanner this replaced got that for free by never failing at all.
+///
+/// Only when no close is found before the failure does the kind of failure matter,
+/// and then it splits two ways. An **unterminated** quote or heredoc is an open
+/// construct: the rest of the input is inside it, so a later line may still close
+/// both it and the body — keep buffering. Any other lexical error is **hard**: no
+/// later line repairs an invalid escape, so waiting for one buffers forever behind
+/// a diagnostic that never arrives, swallowing every command typed after it.
 fn body_awaits_close(text: &str) -> bool {
-    let tokens = match parser::tokenize(text) {
-        Ok(tokens) => tokens,
+    match parser::tokenize(text) {
+        Ok(tokens) => first_close_at_depth_zero(&tokens).is_none(),
         Err(error) => {
-            return matches!(
-                error.kind,
-                parser::ParseErrorKind::UnexpectedEnd
-                    | parser::ParseErrorKind::Unterminated(_)
-                    | parser::ParseErrorKind::UnterminatedHeredoc(_)
-            );
+            // The prefix before the error tokenizes on its own — the tokenizer
+            // stops at the first thing it cannot read, so everything earlier was
+            // fine — and a body that closed in there is closed regardless of what
+            // follows it.
+            let settled = text
+                .get(..error.span.start)
+                .and_then(|prefix| parser::tokenize(prefix).ok())
+                .is_some_and(|tokens| first_close_at_depth_zero(&tokens).is_some());
+            !settled
+                && matches!(
+                    error.kind,
+                    parser::ParseErrorKind::UnexpectedEnd
+                        | parser::ParseErrorKind::Unterminated(_)
+                        | parser::ParseErrorKind::UnterminatedHeredoc(_)
+                )
         }
-    };
+    }
+}
+
+/// Index of the first `}` that returns brace depth to zero, if one is reached.
+fn first_close_at_depth_zero(tokens: &[parser::Token]) -> Option<usize> {
     let mut depth = 0_i32;
-    for token in tokens {
+    for (index, token) in tokens.iter().enumerate() {
         match token.value {
             parser::TokenKind::LBrace => depth += 1,
             parser::TokenKind::RBrace => {
                 depth -= 1;
                 if depth == 0 {
-                    return false;
+                    return Some(index);
                 }
             }
             _ => {}
         }
     }
-    true
+    None
 }
 
 /// Line-incremental completeness for an input buffer that grows one physical
@@ -8945,6 +8962,21 @@ mod tests {
         assert!(body_awaits_close("{ puts \"open\n"));
         assert!(body_awaits_close("{ puts hi"));
         assert!(!body_awaits_close("{ puts hi }"));
+    }
+
+    /// A tokenize failure *after* the body's `}` says nothing about the body: it
+    /// already closed. Reading the failure as "still open" made `func f() {} puts "`
+    /// buffer forever even though the definition was two tokens done, swallowing
+    /// every command after it — the char scanner this replaced got the first-close
+    /// answer for free by never failing at all.
+    #[test]
+    fn a_close_before_a_tokenize_failure_still_settles_the_body() {
+        assert!(!body_awaits_close(r#"{} puts ""#));
+        assert!(!body_awaits_close("{} cat << END"));
+        assert!(!body_awaits_close(r#"{ puts hi } puts ""#));
+        // But a failure with no close before it is still the open construct it was.
+        assert!(body_awaits_close(r#"{ puts ""#));
+        assert!(!func_definition_is_open("func f() {} puts \""));
     }
 
     #[test]

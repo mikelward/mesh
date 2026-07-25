@@ -6447,6 +6447,21 @@ fn a_hard_lexical_error_in_a_function_body_does_not_swallow_later_commands() {
     }
 }
 
+/// A tokenize failure *after* the body's `}` says nothing about the body — it has
+/// already closed. Reading it as "still open" buffered a finished definition forever
+/// and swallowed every command after it.
+#[test]
+fn a_close_before_a_tokenize_failure_does_not_swallow_later_commands() {
+    let out = run_with_input("func f() {} puts \"\nputs LATER\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("syntax error"), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "LATER\n",
+        "a finished definition swallowed the command after it: {stderr}"
+    );
+}
+
 /// The other half of that split: an **open** construct inside a body is one a later
 /// line can still close, so it keeps buffering rather than dispatching mid-string.
 #[test]
@@ -8445,6 +8460,29 @@ fn a_spaced_comparison_on_a_numeral_is_not_a_redirection() {
             "a numeral comparison redirected into {name:?}"
         );
     }
+
+    // A **signed** numeral is the same operand: the sign is its own token, so the
+    // word-shaped clauses start one token late and never saw it.
+    std::fs::write(
+        dir.join("run.mesh"),
+        "if -1 < 0 { puts neg-lt } else { puts wrong }\n\
+         if -1 > 0 { puts wrong } else { puts neg-ge }\n\
+         -1 > 0\n",
+    )
+    .unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "neg-lt\nneg-ge\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!dir.join("0").exists(), "a signed comparison redirected");
 
     // And the attached spelling still redirects, so a numeral obeys attachment in
     // both directions rather than simply losing its command reading.
