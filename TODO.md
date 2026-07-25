@@ -466,10 +466,13 @@ reproduced against the built binary and compared with bash.
       ones — `execvp` sets `errno`, so the child reports 126/127 itself and no
       private pipe is involved. Carries process groups, the interactive
       signal/terminal hooks and the `Stdio` wiring with it.
-- [ ] **A backgrounded in-shell stage loses its pipe when stdout is restored.**
-      `func f() { puts low }; f 3>&1 > file 1>&3 | tr a-z A-Z &` prints `low`
-      instead of piping `LOW`, because `stdout_is_redirected` scans `cmd.redirs`
-      for anything targeting fd 1 and so trips on the intermediate `>`, even
+- [ ] **A backgrounded in-shell stage loses its pipe.** Two spellings reach it:
+      `func f() { puts low }; f 3>&1 > file 1>&3 | tr a-z A-Z &`, where stdout is
+      moved away and put back, and `func f() { sh -c 'echo low >&2' };
+      f 2>&1 > file | tr a-z A-Z &`, where the pipe ends up held by stderr alone.
+      Both print `low` directly where bash pipes `LOW`, and both because
+      `stdout_is_redirected` scans `cmd.redirs`
+      for anything targeting fd 1 and so trips on the `>`, even
       though source order puts stdout back on the pipe. It has to be based on
       stdout's *resolved* destination — which for a background stage means
       resolving the redirections without opening anything, since the opens are
@@ -487,6 +490,18 @@ reproduced against the built binary and compared with bash.
       that acquires every descriptor as it reaches it — which is also what the
       previous item wants, and what would make the ordering guarantee structural
       rather than something each new failure mode has to be taught.
+- [ ] **The descriptor-limit check does not run in source order.** It is a
+      pre-pass over the whole list, so `true > existing 16> later` at
+      `ulimit -n 16` reports `&16` without applying the earlier `>` — mesh leaves
+      `existing` intact and never creates `later`, while bash truncates one and
+      creates the other before failing. This is the one case in this list where
+      mesh is *less* destructive than bash, so it is worth deciding deliberately
+      whether to match: everything else here is a bug because mesh destroys
+      something bash spares, and the source-order rule the rest of the
+      redirection code enforces says the earlier redirections should have
+      happened. If it should match, the check moves into the opening walk beside
+      the duplication validation, which is where the two items above are heading
+      anyway.
 - [ ] **`3>&0` with stdin closed.** Reported as accepted-and-destructive with fd 0
       closed by mesh's caller. `live_descriptors` no longer assumes the standard
       three are open — it probes all three — but the reported symptom persists
