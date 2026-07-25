@@ -4164,9 +4164,18 @@ fn a_failed_background_redirect_reports_mesh_status_one() {
     // remainder) and a plain `contains` on a prefix would still pass. Repeat the
     // run because the splice needs the two writers to overlap, which only
     // happens under contention.
+    //
+    // The script waits on the job's own state rather than for a fixed interval:
+    // `jobs` has to run once the job is reapable or there is no `Done` line to
+    // match at all, and `/bin/sleep 0.05` lost that race under load — leaving a
+    // stderr with the launch notice and the helper's error but no `Done (1)`.
+    // `wait` is the wrong tool *here* despite being the right one elsewhere: it
+    // takes the job out of the table, so the `Done (1)` notice this asserts on
+    // would never be printed. The launch notice and the helper's error still
+    // race each other, so the contention the splice needs is untouched.
     for _ in 0..5 {
         let out = run_with_input(&format!(
-            "/bin/echo ok > {} &\n/bin/sleep 0.05\njobs\n",
+            "/bin/echo ok > {} &\nwhile $sh.jobs[1].state == running {{ /bin/sleep 0.02 }}\njobs\n",
             missing.display()
         ));
         let stderr = String::from_utf8_lossy(&out.stderr);
