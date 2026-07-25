@@ -318,9 +318,13 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
             ))),
             // A handle belongs with the function value, not the patterns: what
             // it lacks is a byte form, not a way to be matched against.
-            Value::Stream(_) | Value::Job(_) => Err(ExpandError::NoTextForm {
+            Value::Stream(_) => Err(ExpandError::NoTextForm {
                 name: name.to_string(),
                 kind: "stream handle",
+            }),
+            Value::Job(_) => Err(ExpandError::NoTextForm {
+                name: name.to_string(),
+                kind: "job handle",
             }),
             Value::Function(_) => Err(ExpandError::NoTextForm {
                 name: name.to_string(),

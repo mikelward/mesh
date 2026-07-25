@@ -4299,7 +4299,7 @@ fn job_builtin_words(words: &[Word], vars: &Vars) -> Option<Result<Vec<String>, 
     let mut expanded = vec![name];
     for word in words.iter().skip(1) {
         match job_reference_word(word, vars, &expanded[0]) {
-            Ok(Some(reference)) => expanded.push(reference),
+            Ok(Some(references)) => expanded.extend(references),
             Ok(None) => match expand::expand(vec![word.clone()], vars) {
                 Ok(strings) => expanded.extend(strings),
                 Err(err) => {
@@ -4319,33 +4319,61 @@ fn job_builtin_words(words: &[Word], vars: &Vars) -> Option<Result<Vec<String>, 
 /// A handle becomes **`%id`** rather than a bare id on purpose: `fg 2` and
 /// `fg %2` mean the same job, but for `kill` a bare number is a *pid*, and `$j`
 /// must never be able to arrive as one.
-fn job_reference_word(word: &Word, vars: &Vars, name: &str) -> Result<Option<String>, Step> {
+fn job_reference_word(word: &Word, vars: &Vars, name: &str) -> Result<Option<Vec<String>>, Step> {
     let Ok(values) = expand::expand_values(vec![word.clone()], vars) else {
         // Whatever is wrong with it, ordinary expansion reports it below in the
         // terms the rest of the shell uses.
         return Ok(None);
     };
-    let [value] = values.as_slice() else {
+    // A word can produce several values — `kill ...$handles` spreads a list, and
+    // `kill` takes independent targets — so this is about the word as a whole:
+    // a handle anywhere in it means the word names jobs, and every value it
+    // produced is converted. A word with no handle in it is left alone, which is
+    // what keeps an option like `-0` the text it was written as.
+    // A map is included so a plain one still gets the job builtin's own answer:
+    // "a map is not a job" says what is wrong, where the generic argv message
+    // ("needs `...`") advises a spread that would not help.
+    let names_jobs = values
+        .iter()
+        .any(|value| is_job_handle(value) || matches!(value, Value::Map(_)));
+    if !names_jobs {
         return Ok(None);
-    };
+    }
+    let mut references = Vec::new();
+    for value in &values {
+        match job_id_of(value) {
+            Some(id) => references.push(format!("%{id}")),
+            // Alongside a handle, anything that has a byte form is still a
+            // reference the builtin can read — a `%+` or a pid in the same list.
+            None if !matches!(value, Value::Map(_)) => {
+                references.extend(argv_words(value, name)?);
+            }
+            None => return runtime_error(format!("{name}: a map is not a job")),
+        }
+    }
+    Ok(Some(references))
+}
+
+/// The job id this value names, if it is a handle. `DESIGN.md` makes
+/// `$sh.jobs[2]` a handle as well as `$j`, so a job *record* answers too — its
+/// `id` is what the map key holds for the table's own reads.
+fn job_id_of(value: &Value) -> Option<i64> {
     match value {
-        Value::Job(id) => Ok(Some(format!("%{id}"))),
-        // `DESIGN.md` makes `$sh.jobs[2]` a handle as well; a map that is not a
-        // job record has no business being read for one.
+        Value::Job(id) => Some(*id as i64),
         Value::Map(entries) => {
-            let id = entries
+            entries
                 .iter()
                 .find_map(|(key, value)| match (key.as_str(), value) {
                     ("id", Value::Integer(id)) => Some(*id),
                     _ => None,
-                });
-            match id {
-                Some(id) => Ok(Some(format!("%{id}"))),
-                None => runtime_error(format!("{name}: a map is not a job")),
-            }
+                })
         }
-        _ => Ok(None),
+        _ => None,
     }
+}
+
+fn is_job_handle(value: &Value) -> bool {
+    matches!(value, Value::Job(_)) || job_id_of(value).is_some()
 }
 
 /// Run a command whose words are already expanded: `return`, generated help, the

@@ -435,9 +435,8 @@ its `128 + signal` stop status straight away rather than blocking on it; `bg`
 or `fg` is what a stopped job wants.
 
 Unlike bash, `wait` needs a job: the no-operand form there means "every child,
-with an aggregate status", which is not yet decided here. `wait $j` on a job
-handle, `kill`, and `disown` are likewise not implemented — see
-[`DESIGN.md`](../DESIGN.md#job-control).
+with an aggregate status", which is not yet decided here. `disown` is not
+implemented — see [`DESIGN.md`](../DESIGN.md#job-control).
 
 ### Custom prompts and hooks
 
