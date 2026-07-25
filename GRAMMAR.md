@@ -1,7 +1,7 @@
 # Legacy incremental grammar notes
 
 This file records the task-by-task grammar that preceded M3. It remains useful
-for the public compatibility lexer and the history of M0–M2 behavior, but it is
+for the history of M0–M2 behavior, but it is
 **not** the current execution grammar: M3 replaced that path with the
 span-carrying clean-break parser described in [`PARSER.md`](PARSER.md). The
 implemented user-facing surface is summarized in

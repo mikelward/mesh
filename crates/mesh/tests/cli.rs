@@ -10210,6 +10210,45 @@ fn bare_export_names_the_spelling_that_works() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
 }
 
+/// One name rule for reads and writes. The whole-string check behind `export NAME`,
+/// `$env.KEY = …`, and a `${…}` place's root used to come from the compatibility
+/// lexer, whose scan was ASCII-only, while `$name` reads went through the parser's
+/// own — Unicode — scan. So a name could be bound and read but not exported.
+#[test]
+fn a_name_that_reads_can_also_be_exported() {
+    let out = run_with_input(
+        "café = 5\n\
+         puts $café\n\
+         export CAFÉ = x\n\
+         puts $env.CAFÉ\n\
+         $env.naïve = y\n\
+         puts $env.naïve\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "5\nx\ny\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Widening the alphabet does not widen the *shape*: an alphabetic head and
+    // interior-only hyphens still decide, so these stay refusals rather than
+    // becoming exports.
+    for source in [
+        "export 1x = v\n",
+        "export a--b = v\n",
+        "export x- = v\n",
+        "export _x = v\n",
+    ] {
+        let out = run_with_input(source);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+            "{source} was not refused: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The rest of the read-only runtime $sh.* surface
 // ---------------------------------------------------------------------------
