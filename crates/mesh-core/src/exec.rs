@@ -355,12 +355,15 @@ fn fork_in_shell(
     mut extra_files: Vec<(libc::c_int, File)>,
     // Descriptors that resolved to this stage's outgoing pipe but are not the
     // stdout or stderr that carry it. Each is given its own handle on the write
-    // end below, once the pipe exists.
+    // end below, once the pipe exists. Empty for a background stage, which makes
+    // its own copies after the fork.
     extra_pipe_out: PipeCopies,
     // Did stdout resolve to this stage's outgoing pipe? Passed in rather than
     // re-derived, so a duplication that moved it (`f >&2 | g`) reaches the fork
     // too. Any *other* descriptor holding the pipe — stderr under `|&`
-    // included — arrives in `extra_pipe_out`.
+    // included — arrives in `extra_pipe_out`. For a background stage this is
+    // whether *anything* ends up on the pipe: the child is handed it on fd 1,
+    // the seed its own walk starts from, and moves it from there.
     stdout_to_pipe: bool,
     // Descriptors `n>&-` closed, applied after every file is installed.
     closed: Vec<libc::c_int>,
@@ -373,15 +376,12 @@ fn fork_in_shell(
 ) -> std::io::Result<(libc::pid_t, bool, Option<File>)> {
     use std::io::Write;
 
-    let redirects_stdout = background && stdout_is_redirected(cmd);
-
     // stdout: a redirection wins over the pipe to the next stage; the last stage
     // with neither inherits the shell's stdout.
     let mut piped_out = false;
     // The pipe is needed when either stream resolved to it — `2>&1 > f |` keeps
     // it for stderr alone, and `>&2 |` moves stdout off it so none is made.
-    let wants_pipe =
-        !is_last && !redirects_stdout && (stdout_to_pipe || !extra_pipe_out.is_empty());
+    let wants_pipe = !is_last && (stdout_to_pipe || !extra_pipe_out.is_empty());
     let (pipe_write, read_end) = if wants_pipe {
         let (read, write) = new_pipe()?;
         piped_out = true;
@@ -471,18 +471,18 @@ fn fork_in_shell(
                 let redirs = staged_redirs(cmd, is_last);
                 let inherited = live_descriptors(&redirs);
                 let mut closing = Vec::new();
-                let deferred = match resolve_redirs(&redirs, &inherited, inherited_seed()).and_then(
-                    |sources| {
-                        closing = sources.closed();
-                        sources_to_files(sources)
-                    },
-                ) {
-                    Ok(files) => files,
-                    Err((path, err)) => {
-                        note!("mesh: {path}: {err}");
-                        libc::_exit(1);
-                    }
-                };
+                let deferred =
+                    match resolve_redirs(&redirs, &inherited, inherited_seed(), Acquire::Now)
+                        .and_then(|sources| {
+                            closing = sources.closed();
+                            sources_to_files(sources)
+                        }) {
+                        Ok(files) => files,
+                        Err((path, err)) => {
+                            note!("mesh: {path}: {err}");
+                            libc::_exit(1);
+                        }
+                    };
                 if install_descriptors(deferred, &closing).is_err() {
                     libc::_exit(1);
                 }
@@ -600,36 +600,38 @@ pub fn run_pipeline(
     let seeds: Vec<Sources> = (0..n)
         .map(|idx| stage_seed(idx, n, background, interactive))
         .collect();
-    let resolved: Vec<Result<Sources, (String, std::io::Error)>> = if background {
-        // A background stage resolves nothing here: its targets are opened by
-        // the helper (or by the forked child), so a blocking open cannot hold up
-        // the shell before the job is registered.
-        seeds.into_iter().map(Ok).collect()
+    // A background stage's targets are opened by the stage itself, after the
+    // fork, so a blocking open cannot hold up the shell before the job is
+    // registered. It is still resolved here — without opening anything — because
+    // the shell has to wire the pipes before it forks.
+    let acquire = if background {
+        Acquire::Deferred
     } else {
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = cmds
-                .iter()
-                .enumerate()
-                .zip(seeds)
-                .map(|((idx, cmd), seed)| {
-                    let redirs = staged_redirs(cmd, idx + 1 == n);
-                    let inherited = &inherited;
-                    scope.spawn(move || resolve_redirs(&redirs, inherited, seed))
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle.join().unwrap_or_else(|_| {
-                        Err((
-                            "redirection".to_owned(),
-                            std::io::Error::other("resolving the redirections panicked"),
-                        ))
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
+        Acquire::Now
     };
+    let resolved: Vec<Result<Sources, (String, std::io::Error)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = cmds
+            .iter()
+            .enumerate()
+            .zip(seeds)
+            .map(|((idx, cmd), seed)| {
+                let redirs = staged_redirs(cmd, idx + 1 == n);
+                let inherited = &inherited;
+                scope.spawn(move || resolve_redirs(&redirs, inherited, seed, acquire))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    Err((
+                        "redirection".to_owned(),
+                        std::io::Error::other("resolving the redirections panicked"),
+                    ))
+                })
+            })
+            .collect::<Vec<_>>()
+    });
 
     for ((idx, cmd), redir_result) in cmds.into_iter().enumerate().zip(resolved) {
         let is_last = idx + 1 == n;
@@ -640,6 +642,12 @@ pub fn run_pipeline(
 
         let redirs = staged_redirs(&cmd, is_last);
         let mut sources = match redir_result {
+            // A background stage applies its own redirections after the fork and
+            // reports its own failure from there, where the redirection actually
+            // happens — so `&` still means "started", as it does in bash. All
+            // the shell needs from a plan that cannot happen is that it wants no
+            // pipe.
+            Err(_) if background => Sources::default(),
             Ok(sources) => sources,
             Err((path, err)) => {
                 note!("mesh: {path}: {err}");
@@ -654,44 +662,59 @@ pub fn run_pipeline(
         }
         // A descriptor that resolved to this stage's outgoing pipe cannot become
         // a file here — the pipe is made below — so it is carried as intent.
-        let stdout_to_pipe = sources.is_pipe(libc::STDOUT_FILENO);
+        let mut stdout_to_pipe = sources.is_pipe(libc::STDOUT_FILENO);
         // Descriptors that copied a pipe rather than the standard slot that
         // carries it — `3>&1 | g`, `f | g 3<&0`. No file can stand for a pipe,
         // so each is handed its own handle on the real one below.
-        let extra_pipe_out = sources.extra_pipe_out();
-        let extra_pipe_in = sources.extra_pipe_in();
-        let closed = sources.closed();
-        let files = match sources_to_files(sources) {
-            Ok(files) => files,
-            Err((path, err)) => {
-                note!("mesh: {path}: {err}");
-                outcomes.push(Outcome::Failed(1));
-                continue;
-            }
-        };
+        let mut extra_pipe_out = PipeCopies::default();
+        // The `n>&-` closes, which for a background stage the shell must *not*
+        // apply: the child closes for itself, after the walk it redoes — and
+        // that walk reads the descriptors the shell handed it.
+        let mut closed: Vec<libc::c_int> = Vec::new();
         let (mut in_file, mut out_file, mut err_file) = (None, None, None);
         // Anything above the standard three is carried separately and installed
         // in the child, since only these have a `Stdio` slot to be handed to.
-        let mut extra_files = Vec::new();
-        for (fd, file) in files {
-            match fd {
-                libc::STDIN_FILENO => in_file = Some(file),
-                libc::STDOUT_FILENO => out_file = Some(file),
-                libc::STDERR_FILENO => err_file = Some(file),
-                other => extra_files.push((other, file)),
-            }
-        }
-        // The incoming pipe belongs to the stage before this one, so a
-        // descriptor that copied it takes its own handle rather than a file.
-        if !extra_pipe_in.is_empty()
-            && let NextIn::Pipe(prev) = &incoming
-        {
-            match extra_pipe_in.handles(prev) {
-                Ok(copies) => extra_files.extend(copies),
-                Err(error) => {
-                    note!("mesh: pipe: {error}");
+        let mut extra_files: Vec<(libc::c_int, File)> = Vec::new();
+        if background {
+            // The stage redoes this walk for itself, from the descriptors the
+            // shell hands it, so what it is handed is the *seed*: the incoming
+            // pipe on fd 0 and the outgoing one on fd 1, wherever its own walk
+            // goes on to move them. All the shell takes from the resolution is
+            // whether the pipe is wanted at all — `> file |` leaves nothing on
+            // it, while `3>&1 > file 1>&3 |` and `2>&1 > file |` both do.
+            stdout_to_pipe = sources.holds_pipe_out();
+        } else {
+            extra_pipe_out = sources.extra_pipe_out();
+            closed = sources.closed();
+            let extra_pipe_in = sources.extra_pipe_in();
+            let files = match sources_to_files(sources) {
+                Ok(files) => files,
+                Err((path, err)) => {
+                    note!("mesh: {path}: {err}");
                     outcomes.push(Outcome::Failed(1));
                     continue;
+                }
+            };
+            for (fd, file) in files {
+                match fd {
+                    libc::STDIN_FILENO => in_file = Some(file),
+                    libc::STDOUT_FILENO => out_file = Some(file),
+                    libc::STDERR_FILENO => err_file = Some(file),
+                    other => extra_files.push((other, file)),
+                }
+            }
+            // The incoming pipe belongs to the stage before this one, so a
+            // descriptor that copied it takes its own handle rather than a file.
+            if !extra_pipe_in.is_empty()
+                && let NextIn::Pipe(prev) = &incoming
+            {
+                match extra_pipe_in.handles(prev) {
+                    Ok(copies) => extra_files.extend(copies),
+                    Err(error) => {
+                        note!("mesh: pipe: {error}");
+                        outcomes.push(Outcome::Failed(1));
+                        continue;
+                    }
                 }
             }
         }
@@ -806,12 +829,6 @@ pub fn run_pipeline(
         // asked for it or because a duplication resolved it there while stdout was
         // still the pipe. `2>&1 > f` is the case that is *not* this: stderr took
         // the pipe and stdout then moved to a file, so only stderr keeps it.
-        // A background external defers its opens to the helper, so — exactly as in
-        // `fork_in_shell` — the shell must read fd 1's fate from `cmd.redirs`
-        // rather than from an opened file. Its stdout ends on that file, so a
-        // `SIGPIPE` from the stage is real and `piped_out` must not excuse it,
-        // the way it does for a stage that really writes to the pipe.
-        let defers_stdout = background && stdout_is_redirected(&cmd);
         let mut piped_out = false;
         let mut combined_pipe = None;
         // The write end, kept in hand whenever more than stdout needs a handle
@@ -839,40 +856,29 @@ pub fn run_pipeline(
             }
             command.stdout(file);
         } else if !is_last && stdout_to_pipe {
-            if extras_on_pipe || defers_stdout {
+            if extras_on_pipe {
                 // Own the pipe rather than letting `Stdio::piped()` make it, so
                 // every descriptor that resolved to it can be given the write end.
-                //
-                // A deferred stage needs it for a different reason: the helper
-                // resolves that stage's redirections itself, seeded with whatever
-                // the shell handed it, so `3>&1 > file |` copies the pipe onto
-                // fd 3 there only if fd 1 *is* the pipe when the helper starts.
-                // Handing it `Stdio::piped()` would work, but the read end has to
-                // reach the next stage even though `piped_out` stays false.
-                let (read, write) = match new_pipe() {
-                    Ok(pair) => pair,
+                let (read, write) = match new_pipe().and_then(|(read, write)| {
+                    let clone = write.try_clone()?;
+                    Ok((read, write, clone))
+                }) {
+                    Ok((read, write, clone)) => {
+                        pipe_write = Some(clone);
+                        (read, write)
+                    }
                     Err(error) => {
                         note!("mesh: pipe: {error}");
                         outcomes.push(Outcome::Failed(1));
                         continue;
                     }
                 };
-                if extras_on_pipe {
-                    match write.try_clone() {
-                        Ok(clone) => pipe_write = Some(clone),
-                        Err(error) => {
-                            note!("mesh: pipe: {error}");
-                            outcomes.push(Outcome::Failed(1));
-                            continue;
-                        }
-                    }
-                }
                 command.stdout(write);
                 combined_pipe = Some(read);
             } else {
                 command.stdout(Stdio::piped());
             }
-            piped_out = !defers_stdout;
+            piped_out = true;
         } else if extras_on_pipe {
             // Stdout moved off the pipe without becoming a file (`1<&0 3>&1 |`),
             // yet fd 3 still holds it and the next stage still has to be fed.
@@ -1189,25 +1195,6 @@ fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<WaitResult> {
 /// Open background redirects in the child, after `spawn` has returned control
 /// to mesh. This keeps FIFO opens non-blocking for the shell without adding a
 /// PATH-resolved wrapper executable.
-/// Whether a stage's own redirections will take fd 1 off the pipe.
-///
-/// A **background** stage's targets are opened after the fork — in the forked
-/// child, or in the re-executed helper — so the shell has no opened file to look
-/// at even when one of them moves stdout. That matters beyond where the bytes go:
-/// `piped_out` is what tells the wait logic a SIGPIPE was the ignorable "the
-/// reader went away" case, so it has to describe where fd 1 *ends up*. With a
-/// `> out` a SIGPIPE is a real failure, exactly as it is in the foreground.
-///
-/// The open mode is not consulted, only the descriptor: `1< file` replaces fd 1
-/// just as `> file` does, and the foreground path likewise sorts opened targets by
-/// `fd` alone. `resolve_fds` keeps the last redirection per descriptor, so any
-/// redirection naming fd 1 takes it off the pipe.
-fn stdout_is_redirected(cmd: &Cmd) -> bool {
-    cmd.redirs
-        .iter()
-        .any(|redir| redir.fd == libc::STDOUT_FILENO)
-}
-
 fn background_redirect_command(
     cmd: &Cmd,
     redirs: &[Redirection],
@@ -1283,10 +1270,12 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
     }
     let inherited = live_descriptors(&redirs);
     let mut closing = Vec::new();
-    let opened = match resolve_redirs(&redirs, &inherited, inherited_seed()).and_then(|sources| {
-        closing = sources.closed();
-        sources_to_files(sources)
-    }) {
+    let opened = match resolve_redirs(&redirs, &inherited, inherited_seed(), Acquire::Now).and_then(
+        |sources| {
+            closing = sources.closed();
+            sources_to_files(sources)
+        },
+    ) {
         Ok(files) => files,
         Err((path, err)) => {
             note!("mesh: {path}: {err}");
@@ -1492,6 +1481,7 @@ pub(crate) fn with_redirections<T>(
         // holds, for the save; this is which descriptors a duplication may copy.
         &live_descriptors(redirs),
         inherited_seed(),
+        Acquire::Now,
     )?;
     // `n>&-` closes one of the shell's own descriptors for the body's duration,
     // so it is saved and restored exactly as a redirected one is.
@@ -1684,6 +1674,27 @@ pub(crate) enum Source {
     /// later duplication of it is `EBADF` rather than a copy of whatever the
     /// shell happens to hold, and the child must actively close it.
     Closed,
+    /// A target this stage will open *for itself*, after the fork — a background
+    /// stage's path or heredoc, or a copy of one. It stands for "somewhere that
+    /// is not a pipe", which is all the shell needs from a resolution it makes
+    /// without opening anything. See [`Acquire::Deferred`].
+    Deferred,
+}
+
+/// Whether a walk takes the descriptors it resolves, or only says where they
+/// would land.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Acquire {
+    /// Open each path and perform each duplication as the walk reaches it.
+    Now,
+    /// Open nothing and duplicate nothing: a **background** stage applies its
+    /// own redirections after the fork, so that a blocking open cannot hold up
+    /// the shell before the job is registered. The shell still has to know where
+    /// the stage's descriptors end up — whether fd 1 is still on the pipe after
+    /// `3>&1 > file 1>&3`, and whether anything else took it — and reading that
+    /// off `cmd.redirs` ("does any redirection name fd 1?") answered a different
+    /// question, tripping on the `>` even though source order puts stdout back.
+    Deferred,
 }
 
 impl Source {
@@ -1698,8 +1709,20 @@ impl Source {
     /// point: a later `>` must not have truncated by then.
     ///
     /// A pipe is the exception: it does not exist yet, so it stays intent and
-    /// the caller hands out handles once it has made it.
-    fn copy(&self, fd: libc::c_int) -> std::io::Result<Source> {
+    /// the caller hands out handles once it has made it. Under
+    /// [`Acquire::Deferred`] nothing is taken at all — the copy is the stage's
+    /// to make, once it is a process of its own.
+    fn copy(&self, fd: libc::c_int, acquire: Acquire) -> std::io::Result<Source> {
+        if acquire == Acquire::Deferred {
+            return Ok(match self {
+                Source::Inherit(from) => Source::Inherit(*from),
+                Source::Null => Source::Null,
+                Source::PipeOut => Source::PipeOut,
+                Source::PipeIn => Source::PipeIn,
+                Source::Closed => Source::Closed,
+                Source::File(_) | Source::Deferred => Source::Deferred,
+            });
+        }
         Ok(match self {
             Source::File(file) => Source::File(file.try_clone()?),
             Source::Inherit(from) if *from != fd => Source::File(dup_shell_fd(*from)?),
@@ -1712,6 +1735,9 @@ impl Source {
             // fd of that number, which `resolve_redirs` lets through when it
             // holds one. A copy of a close this stage made is `EBADF` there.
             Source::Closed => Source::Closed,
+            // Only a deferred walk produces one, and a deferred walk never
+            // acquires.
+            Source::Deferred => Source::Deferred,
         })
     }
 
@@ -1731,6 +1757,9 @@ impl Source {
             // Reached when the stage before this one turned out to produce no
             // pipe after all — see [`Sources::no_incoming_pipe`].
             Source::Null if fd != libc::STDIN_FILENO => Some(File::open("/dev/null")?),
+            // `Source::Deferred` is not among them: a deferred resolution is a
+            // plan the *stage* carries out, and the shell never turns one into
+            // files it would have to open.
             _ => None,
         })
     }
@@ -1766,6 +1795,15 @@ impl Sources {
     /// cannot become a file here because the caller makes the pipe.
     fn is_pipe(&self, fd: libc::c_int) -> bool {
         matches!(self.get(fd), Some(Source::PipeOut))
+    }
+
+    /// Whether *any* descriptor ends up on the stage's outgoing pipe, and so
+    /// whether the pipe is wanted at all. `> file |` leaves nothing on it and
+    /// the next stage reads end-of-file; `2>&1 > file |` leaves stderr.
+    fn holds_pipe_out(&self) -> bool {
+        self.0
+            .iter()
+            .any(|(_, source)| matches!(source, Source::PipeOut))
     }
 
     /// Descriptors holding the outgoing pipe *besides* stdout and stderr, which
@@ -1830,6 +1868,7 @@ impl Sources {
 ///
 /// A pipe cannot become a file, so `sources_to_files` drops these and the caller
 /// hands each one its own handle on the real pipe once it exists.
+#[derive(Default)]
 struct PipeCopies(Vec<libc::c_int>);
 
 impl PipeCopies {
@@ -2050,6 +2089,7 @@ fn resolve_redirs(
     redirs: &[Redirection],
     inherited: &[libc::c_int],
     seed: Sources,
+    acquire: Acquire,
 ) -> Result<Sources, (String, std::io::Error)> {
     let limit = descriptor_limit();
     let mut state = seed;
@@ -2077,13 +2117,13 @@ fn resolve_redirs(
                     Some(Source::Closed) | None if !inherited.contains(from) => {
                         return Err(named(std::io::Error::from_raw_os_error(libc::EBADF)));
                     }
-                    Some(source) => source.copy(*fd).map_err(named)?,
+                    Some(source) => source.copy(*fd, acquire).map_err(named)?,
                     // Not one this stage has touched, but one the shell holds —
                     // an enclosing `f 3> out` around a nested `4>&3`. The seed
                     // carries only the standard three, so without this a valid
                     // copy of a real descriptor reads as a copy of nothing.
                     None if inherited.contains(from) => {
-                        Source::Inherit(*from).copy(*fd).map_err(named)?
+                        Source::Inherit(*from).copy(*fd, acquire).map_err(named)?
                     }
                     // Duplicating a descriptor nothing has opened is `EBADF`,
                     // the same answer the kernel gives — a copy of nothing is
@@ -2091,10 +2131,10 @@ fn resolve_redirs(
                     None => return Err(named(std::io::Error::from_raw_os_error(libc::EBADF))),
                 }
             }
-            RedirTarget::Heredoc(body) => {
+            RedirTarget::Heredoc(body) if acquire == Acquire::Now => {
                 Source::File(heredoc_file(body).map_err(|e| ("<<".to_owned(), e))?)
             }
-            RedirTarget::Path(path) => {
+            RedirTarget::Path(path) if acquire == Acquire::Now => {
                 let file = match kind {
                     RedirKind::In => File::open(path),
                     RedirKind::Out => File::create(path),
@@ -2102,6 +2142,7 @@ fn resolve_redirs(
                 };
                 Source::File(file.map_err(|e| (path.clone(), e))?)
             }
+            RedirTarget::Heredoc(_) | RedirTarget::Path(_) => Source::Deferred,
         };
         state.set(*fd, resolved);
     }

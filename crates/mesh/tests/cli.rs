@@ -2053,6 +2053,68 @@ fn a_redirected_stage_still_reports_its_own_sigpipe() {
 }
 
 #[test]
+fn backgrounding_keeps_a_pipe_the_redirections_leave_on_it() {
+    // Where a backgrounded stage's fd 1 ends up used to be read off `cmd.redirs`
+    // — "does anything name fd 1?" — which trips on the `>` in both spellings
+    // below even though source order puts the pipe back afterwards. mesh printed
+    // `low` straight past the pipeline where bash pipes `LOW`. The shell now
+    // resolves the stage's redirections *without opening anything* (the opens
+    // belong to the child) and asks where they leave the pipe.
+    let dir = fresh_dir("background_kept_pipe");
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+    // Both stage kinds: an in-shell function, which opens its targets in its own
+    // fork, and an external, which defers them to the re-executed helper.
+    for (label, low, quiet) in [
+        ("function", "low", "quiet"),
+        ("external", "sh -c 'echo low'", "sh -c 'echo low >&2'"),
+    ] {
+        // `> file` moves stdout off the pipe and `1>&3` puts it back, so the
+        // pipeline gets the output and the file stays empty.
+        let out = run_with_input(&format!(
+            "cd {}\nfunc low() {{ puts low }}\n{low} 3>&1 > moved 1>&3 | tr a-z A-Z &\nsleep 0.4\n",
+            dir.display()
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "LOW\n",
+            "{label}: {:?}",
+            out.stderr
+        );
+        assert_eq!(read("moved"), "", "{label}: the pipe took the file's bytes");
+
+        // The mirror: stdout ends on the file and the pipe is held by stderr
+        // alone, which still has to be fed to the next stage.
+        let out = run_with_input(&format!(
+            "cd {}\nfunc quiet() {{ sh -c 'echo low >&2' }}\n\
+             {quiet} 2>&1 > filed | tr a-z A-Z &\nsleep 0.4\n",
+            dir.display()
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "LOW\n",
+            "{label}: {:?}",
+            out.stderr
+        );
+
+        // And the case the old rule got right, which the new one must keep:
+        // nothing is left on the pipe, so the next stage reads end-of-file.
+        let _ = std::fs::remove_file(dir.join("all"));
+        let out = run_with_input(&format!(
+            "cd {}\nfunc low() {{ puts low }}\n{low} > all | tr a-z A-Z &\nsleep 0.4\n",
+            dir.display()
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "",
+            "{label}: {:?}",
+            out.stderr
+        );
+        assert_eq!(read("all"), "low\n", "{label}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_merged_stderr_follows_stdout_wherever_it_went() {
     // `|&` is `2>&1` appended after the stage's own redirections, so it copies
     // wherever stdout *finally* points. Carried as a flag beside the
