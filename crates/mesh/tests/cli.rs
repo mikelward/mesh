@@ -10212,3 +10212,36 @@ fn control_flow_does_not_escape_a_fork_block() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after-fork-in-fn\n");
 }
+
+/// A subshell inherits the shell's job table but is **not the parent** of the pids
+/// in it. Its `waitpid` would fail with `ECHILD` and report every running job as
+/// finished, so a child must not reap: it lists the snapshot it inherited, the
+/// same rule a forked pipeline stage follows. `fg` and `bg` are refused there for
+/// the stronger reason that they would hand the terminal to a job the parent
+/// still believes it owns.
+#[test]
+fn a_fork_block_does_not_reap_or_resume_the_shells_jobs() {
+    let out = run_with_input("sleep 5 &\nfork { jobs }\njobs\n");
+    let printed = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        printed.matches("Running").count(),
+        2,
+        "the child reaped a job it does not own: {printed}"
+    );
+    assert!(
+        !printed.contains("Done"),
+        "a live job was reported finished: {printed}"
+    );
+
+    let out = run_with_input("sleep 5 &\nfork { fg }\nputs after\njobs\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no job control"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        printed.contains("after") && printed.contains("Running"),
+        "the parent lost its job to the child: {printed}"
+    );
+}

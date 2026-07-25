@@ -1171,16 +1171,38 @@ pub(crate) fn fork_and_wait(body: impl FnOnce() -> u8) -> std::io::Result<u8> {
         return Err(std::io::Error::last_os_error());
     }
     if pid == 0 {
+        // This process is no longer the interactive shell. It owns none of the
+        // jobs in the `JobTable` it inherited — the pids in there are the
+        // parent's children, not its own — so `jobs` must not `waitpid` on them
+        // and `fg` must not hand them the terminal. The same mark a forked
+        // pipeline stage sets, for the same reason.
+        mark_forked_stage();
+        // An interactive shell ignores the terminal signals so that Ctrl-C
+        // interrupts the foreground job rather than the shell itself. A child
+        // that goes on to `exec` has those dispositions restored for it; this one
+        // stays in mesh code, so without this a `fork { loop { } }` would ignore
+        // Ctrl-C and leave the session recoverable only by an external kill.
+        let _ = restore_job_signals();
         let code = body();
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
         // SAFETY: leaving without unwinding, as above.
         unsafe { libc::_exit(i32::from(code)) };
     }
-    // Stops are reported by `wait_for_job` for Ctrl-Z's sake; a stopped subshell
-    // has no job-table entry to resume from yet, so its status is all that is
-    // taken here.
-    wait_for_job(pid).map(|(status, _stopped)| status)
+    // A subshell has no job-table entry to be resumed from, so a stop would
+    // otherwise strand it: the parent would return while the child sat stopped
+    // forever, reachable only by an external `kill`. Until backgrounding is
+    // wired into the table, continue it and keep waiting — Ctrl-Z on a subshell
+    // does nothing rather than losing one.
+    loop {
+        let (status, stopped) = wait_for_job(pid)?;
+        if !stopped {
+            return Ok(status);
+        }
+        note!("mesh: fork: a subshell cannot be suspended yet");
+        // SAFETY: `pid` is this process's live, stopped child.
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+    }
 }
 
 /// Wait for a child to exit, be signaled, or stop. `Child::wait` only reports
