@@ -10246,6 +10246,24 @@ fn a_fork_block_does_not_reap_or_resume_the_shells_jobs() {
     );
 }
 
+/// `$(…)` drains the diverted pipe on a reader thread, so a `fork` inside one is the
+/// shell forking while a thread of its own is running. A forked pipeline stage has
+/// always done that, and the child still has to reach the interpreter and write back
+/// through the captured descriptor rather than stall on the way.
+#[test]
+fn a_fork_block_inside_a_capture_still_captures() {
+    let out = run_with_input(
+        "before = $(pwd)\nout = $(fork { puts inside\ncd /\n })\n\
+         after = $(pwd)\nmoved = $before != $after\n\
+         puts \"captured [$out]\"\nputs \"moved $moved\"\n",
+    );
+    let printed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        printed.contains("captured [inside]") && printed.contains("moved false"),
+        "a captured subshell must return its bytes and keep its `cd`: {printed}"
+    );
+}
+
 /// A subshell is a fresh boundary, so its body starts at status 0 like every other
 /// compound body — `false; fork { }` must not carry the failure from outside it
 /// across the very edge the construct exists to draw.
