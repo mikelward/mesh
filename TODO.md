@@ -450,6 +450,38 @@ of each PR had landed by another route, but these pieces had not.
       and whether it gets a `$sh.options.bold-input` off switch — is written down
       nowhere.
 
+## Redirection: one source-ordered pass
+
+The three items below are the same change seen from three sides, and doing them
+together is much cheaper than one at a time. Sequence: (1) unblocks (2), and (3)
+is independent but touches the same file.
+
+- [ ] **1. Merge `open_paths` and `resolve_sources` into one walk.** Today
+      validation happens in the walk but the duplication's actual `dup` happens
+      after every open, so a duplication can be proved well-formed, a later `>`
+      can truncate, and only then does the duplication turn out to be
+      unaffordable. Make each redirection, as the walk reaches it, do its own
+      limit check and then either open its path or **perform** its duplication.
+      Keep the per-stage thread — the concurrency is across stages, not within
+      one. Closes the `EMFILE` ordering case and the limit pre-pass case below.
+- [ ] **2. Resolve a background stage's destinations without opening.** With (1)
+      in place, replace the syntactic `stdout_is_redirected` scan with stdout's
+      actual resolved destination, which a background stage can compute without
+      opening anything (its opens belong to the child). Closes both spellings of
+      the lost-pipe case below. `piped_out` must keep tracking the *final*
+      destination, or a `SIGPIPE` from a stage whose stdout really ends on a file
+      gets excused when it is real.
+- [ ] **3. Spawn externals with `fork` + `execvp` instead of `Command`.**
+      `Command::spawn` makes a private close-on-exec pipe for the child to report
+      `exec` failures on; it takes a low descriptor, and the hook that installs
+      descriptors above 2 overwrites it, so `mesh_no_such_command 4> out` writes
+      a binary error packet into `out` and exits 1 instead of 127 with no
+      diagnostic. `std` exposes no way to see or reserve that descriptor, and
+      `pre_exec` runs after the pipe already exists. `execvp` sets `errno`, so
+      the child reports 126/127 itself and no private pipe is involved. Carries
+      process groups, `restore_job_signals` / `set_foreground_group`, and the
+      `Stdio` wiring with it.
+
 ## Redirection edge cases
 
 Found by review on the descriptors-above-2 work and deliberately deferred: each
@@ -582,6 +614,11 @@ reproduced against the built binary and compared with bash.
       is expected), `+ * / %` with Rust/bash truncation and dividend-signed
       remainder, `:pow(n)` rather than `**`, and `0x`/`0o`/`0b` literals with
       Python-rule `_` separators. Still open under this direction:
+  - [ ] **Implement it.** The semantics are settled in `DESIGN.md`; no code
+        exists yet — `+=` is still the only operator, `puts ($n + 3)` is a
+        syntax error, and `1_000` / `0xff` parse as strings. Blocked on the two
+        questions below, since binary `-` cannot be deferred past the first
+        `$a - $b` and the literal rule has to be decided before any are parsed.
   - [ ] **How subtraction is spelled.** `*`, `/` and `%` are unclaimed, but a
         spaced infix `-` is already **glob exclusion** (`*.txt - *.bak`), and both
         it and arithmetic want value positions, so `$a - $b` is ambiguous on its
