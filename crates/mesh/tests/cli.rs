@@ -2568,6 +2568,74 @@ fn a_high_descriptor_can_hold_a_pipe() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "filed\n");
+
+    // The same spelling backgrounded. A background stage defers its opens to a
+    // helper that resolves the redirections itself, seeded with what the shell
+    // handed it — so fd 3 copies the pipe only if the shell made one and put it
+    // on the helper's stdout. Without it the stage wrote straight to the
+    // terminal, skipping the rest of the pipeline.
+    let deferred = dir.join("deferred.txt");
+    let out = run_with_input(&format!(
+        "sh -c 'echo low >&3; echo filed' 3>&1 > {} | tr a-z A-Z &\nsleep 0.4\n",
+        deferred.to_string_lossy()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "LOW\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&deferred).unwrap_or_default(),
+        "filed\n"
+    );
+}
+
+#[test]
+fn an_eof_stdin_copied_to_a_high_descriptor_still_reads() {
+    // A stage whose producer redirected its output away has no incoming pipe, so
+    // stdin is `/dev/null`. Only stdin has a slot the shell fills with one, so a
+    // descriptor that copied stdin was left closed and read `EBADF` rather than
+    // end-of-file.
+    let dir = fresh_dir("null_high_fd");
+    let out = run_with_input(&format!(
+        "echo hi > {} | sh -c 'cat <&3; echo done'\n",
+        dir.join("sink.txt").to_string_lossy()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "done\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_with_input(&format!(
+        "echo hi > {} | sh -c 'cat <&3; echo done' 3<&0\n",
+        dir.join("copied.txt").to_string_lossy()
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The `echo done` runs either way, so the read is what has to be checked.
+    assert!(!stderr.contains("Bad file descriptor"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n", "{stderr}");
+}
+
+#[test]
+fn the_largest_descriptor_is_refused_rather_than_overflowing() {
+    // Nothing can be lifted above `c_int::MAX`, and the arithmetic that finds
+    // that free descriptor used to overflow — panicking the whole shell in a
+    // debug build rather than failing the one redirection.
+    let out = run_with_input(&format!(
+        "echo hi {}> {}\nputs after\n",
+        libc::c_int::MAX,
+        fresh_dir("max_fd").join("out.txt").to_string_lossy()
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "the shell died on it: {stderr}"
+    );
+    assert!(stderr.contains(&libc::c_int::MAX.to_string()), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 }
 
 #[test]
