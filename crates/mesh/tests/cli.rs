@@ -8610,6 +8610,65 @@ fn a_connector_after_a_variable_command_still_runs_the_command() {
     );
 }
 
+/// A **comparison** before a connector is not a command in any spelling, so the
+/// connector joins value statements rather than picking a command reading that does
+/// not exist. Both readings have to coexist on the same operand: `$cmd || fallback`
+/// runs the command, `$x > $y && puts yes` compares — the difference is whether the
+/// expression turned out to be the bare command word or something larger.
+///
+/// In a scratch directory because the failure ran `$x` as a command and truncated a
+/// file named by `$y`.
+#[test]
+fn a_comparison_before_a_connector_is_still_a_comparison() {
+    let dir = fresh_dir("comparison_before_connector");
+    std::fs::write(
+        dir.join("run.mesh"),
+        "x = 2\n\
+         y = 1\n\
+         $x > $y && puts gt-and\n\
+         $x < $y || puts lt-or\n\
+         xs = [a b]\n\
+         $xs:len > 1 && puts mod-and\n\
+         1 > 0 && puts num-and\n",
+    )
+    .unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "gt-and\nlt-or\nmod-and\nnum-and\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.join("1").exists(),
+        "a comparison before a connector redirected"
+    );
+
+    // The command reading a connector *does* pick is untouched: a bare variable
+    // still runs, since there the expression is exactly the command word.
+    let out = run_with_input(
+        "cmd = \"false\"\n\
+         $cmd || puts fallback\n\
+         ok = \"true\"\n\
+         $ok && puts ran\n\
+         p = \"src/main.rs\"\n\
+         $p:base || puts modifier-fallback\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "fallback\nran\nmodifier-fallback\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The same for an operand carrying **postfix modifiers**, which is where the
 /// one-token lookahead went wrong: in `$p:base arg` the token after the variable is
 /// the `:` of the modifier, so nothing saw the argument that followed the operand.

@@ -3290,12 +3290,24 @@ impl Parser {
     /// the same reason.
     fn value_is_whole_statement(&mut self) -> bool {
         let saved = self.position;
+        // Where the command reading would end, measured before the parse: a connector
+        // only picks the command when the expression turned out to be *exactly* that
+        // command word. See the clause below.
+        let command_word_end = self.command_word_end();
         let whole = self.expression().is_ok()
             && ((self.at_value_statement_end()
                 // A bare variable has a command reading, so shell-list syntax after it
                 // — an argument, a pipe, a redirect, `&&`, `||`, `&` — picks the
                 // command, and the variable alone is the value.
-                && !self.at_command_list_operator())
+                //
+                // Only when the expression *is* the bare command word, though. A
+                // comparison is not a command in any spelling, so a connector after one
+                // joins value statements: `$x > $y && puts yes` compares and branches.
+                // Asking the question of the operand rather than of what was parsed
+                // sent that line to the command parser, which ran `$x` and truncated a
+                // file named by `$y` — while the identical `1 > 0 && puts yes` worked,
+                // a numeral being claimed by its operator instead of by this rule.
+                && !(self.at_command_list_operator() && Some(self.position) == command_word_end))
                 // An assignment operator counts as the end of it. What follows is a
                 // *place* expression, which the expression side owns whether or not
                 // the place is a legal one, and that is what keeps
