@@ -3836,9 +3836,10 @@ fn only_a_lone_numeral_becomes_a_value() {
     );
     assert_eq!(String::from_utf8_lossy(&args.stdout), "after\n");
 
-    // With a redirection it is still a command, so `42 > file` still tries to run
-    // one — statement position keeps the redirect reading of `>`.
-    let redirect = run_with_input(&format!("cd {}\n42 > out\nputs after\n", dir.display()));
+    // With a redirection it is still a command, so `42 >out` still tries to run one.
+    // Attached, because that is what spells a redirect after an operand that could
+    // be a value: spaced, `42 > out` is the comparison it reads as.
+    let redirect = run_with_input(&format!("cd {}\n42 >out\nputs after\n", dir.display()));
     assert!(
         String::from_utf8_lossy(&redirect.stderr).contains("command not found: 42"),
         "{:?}",
@@ -8341,6 +8342,101 @@ fn a_spaced_comparison_is_not_a_redirection() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!dir.join("3").exists(), "a spaced comparison redirected");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A **numeral** is a value-shaped operand like any other, and needed saying twice:
+/// it is claimed only by a leading operator or by being a lone literal, and `1 > 0`
+/// is neither, so it stayed the command `1` with its output redirected while
+/// `1 == 1` right beside it compared. In a condition that was worse than a stray
+/// file — `if 1 < 2` failed to open a file named `2` and then took the *else*
+/// branch, answering a comparison with its opposite.
+///
+/// In a scratch directory because the failure writes `0` into the working one.
+#[test]
+fn a_spaced_comparison_on_a_numeral_is_not_a_redirection() {
+    let dir = fresh_dir("numeral_comparison");
+    std::fs::write(
+        dir.join("run.mesh"),
+        "if 1 < 2 { puts lt } else { puts wrong }\n\
+         if 1 > 0 { puts gt } else { puts wrong }\n\
+         if 1 == 1 { puts eq } else { puts wrong }\n\
+         1 > 0\n\
+         1 < 2\n",
+    )
+    .unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "lt\ngt\neq\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for name in ["0", "2"] {
+        assert!(
+            !dir.join(name).exists(),
+            "a numeral comparison redirected into {name:?}"
+        );
+    }
+
+    // And the attached spelling still redirects, so a numeral obeys attachment in
+    // both directions rather than simply losing its command reading.
+    std::fs::write(dir.join("run.mesh"), "42 >out.txt\n").unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("command not found: 42"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.join("out.txt").exists(), "and should still redirect");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A numeral in *argument* position is a descriptor prefix, not an operand, so the
+/// comparison reading must not reach it: `echo hi 2> err` still retargets stderr.
+#[test]
+fn a_descriptor_prefix_is_not_a_numeral_comparison() {
+    let dir = fresh_dir("descriptor_not_comparison");
+    std::fs::write(
+        dir.join("run.mesh"),
+        "sh -c \"echo oops >&2\" 2> err.txt\necho one > out.txt\n",
+    )
+    .unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("err.txt")).unwrap(),
+        "oops\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+        "one\n"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

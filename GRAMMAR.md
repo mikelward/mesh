@@ -472,7 +472,10 @@ so do the identical lines outside an `if` — `$p:base > log` has one reading ra
 than two that depend on where it sits. `>>` is only ever a redirect and is never
 spelled spaced. A bare command word has no value reading to lose, so
 `grep -q x < file` is a redirect in either spelling; the rule only bites on operands
-that could be values.
+that could be values — a variable, a quoted word, a numeral, or a `:modifier` chain.
+`if 1 < 2` compares as `if 1 == 1` always did, while `42 >out` stays the command it
+is; a numeral in *argument* position is a descriptor prefix, so `cmd 2> log` is
+untouched.
 
 The **whole-statement** rule applies to a bare **word** operand, which is how
 `$editor` names a command: it is a value only when the value is the whole statement,

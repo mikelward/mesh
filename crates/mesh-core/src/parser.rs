@@ -3088,13 +3088,18 @@ impl Parser {
                     matches!(next.value, TokenKind::LParen)
                         && next.span.start == self.peek().unwrap().span.end
                 });
+                // `value_operator` covers the operators with no second reading to rule
+                // out — `==`, `+`, `..` — so the spacing is all they need. `<` and `>`
+                // also spell a redirect, so they are asked the attachment question the
+                // other value-shaped operands are asked.
                 let followed_by_operator = self
                     .tokens
                     .get(self.position + 1)
                     .zip(self.tokens.get(self.position + 2))
                     .is_some_and(|(operator, right)| {
                         value_operator(&operator.value) && operator.span.end < right.span.start
-                    });
+                    })
+                    || self.word_takes_a_comparison();
                 let numeric = word.text().parse::<i64>().is_ok();
                 // Asked of the *completed* operand rather than of the token after the
                 // one starting it. Only the first token is in hand here, and an operand
@@ -3177,6 +3182,30 @@ impl Parser {
     fn word_takes_a_redirect(&self) -> bool {
         self.command_word_end()
             .is_some_and(|end| self.redirect_operator_at(end))
+    }
+
+    /// Does a **comparison** follow the command word starting here — a `<` or `>`
+    /// that [attachment](Self::redirect_operator_at) says is not a redirect?
+    ///
+    /// The same operator and the same test as
+    /// [`word_takes_a_redirect`](Self::word_takes_a_redirect), asked the other way
+    /// round, for the operand that has to be *claimed* rather than merely
+    /// not-disclaimed: a **numeral**. A variable or a quoted word carries its own
+    /// clause that claims the whole statement once no redirect follows, so ruling the
+    /// redirect out is enough for them. A numeral is claimed only by a leading
+    /// operator or by being a lone literal, and `1 > 0` is neither — so without this
+    /// it stayed the command `1` with its output redirected into a file named `0`,
+    /// while `1 == 1` beside it compared. `<` and `>` are the only operators that
+    /// need asking; every other one reaches [`value_operator`] with no second reading
+    /// to rule out.
+    fn word_takes_a_comparison(&self) -> bool {
+        let Some(end) = self.command_word_end() else {
+            return false;
+        };
+        matches!(
+            self.tokens.get(end).map(|token| &token.value),
+            Some(TokenKind::Less | TokenKind::Greater)
+        ) && !self.redirect_operator_at(end)
     }
 
     /// Is the token at `index` a postfix opener that is **not attached** to what comes
@@ -3985,7 +4014,10 @@ mod tests {
     /// had two readings depending on where it sat.
     #[test]
     fn attachment_decides_redirect_versus_comparison_in_every_position() {
-        for operand in ["$x", "'echo'", "$x:base"] {
+        // Every operand shape with a value reading to lose: a variable, a quoted
+        // word, a `:modifier` chain, and a numeral. The numeral is the one that needs
+        // claiming rather than merely not-disclaiming — see `word_takes_a_comparison`.
+        for operand in ["$x", "'echo'", "$x:base", "42"] {
             for (source, expected_command) in [
                 (format!("{operand} > out"), false),
                 (format!("{operand} >out"), true),

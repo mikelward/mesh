@@ -975,12 +975,16 @@ outside one:
 i = 0
 if $i < 3 { … }      # a comparison
 $i < 3               # the same comparison, as a statement
+if 1 < 2 { … }       # a comparison, as `1 == 1` already was
+1 > 0                # the same comparison, as a statement
+42 >out              # a command named `42`, redirected — attachment, both ways
 grep -q x < file     # a redirect: `grep` is not a value in any spelling
 ```
 
 Only an operand with a second, *value* reading is affected — a variable, a quoted
 word, a numeral, or a `:modifier` chain. A bare command word has none, so its
-redirect is a redirect however it is spaced.
+redirect is a redirect however it is spaced. A numeral in *argument* position is a
+descriptor prefix rather than an operand, so `echo hi 2> err` is untouched.
 
 A **word operand** is a value only when the value is the whole statement; anything
 continuing the line makes it the command line it looks like:
