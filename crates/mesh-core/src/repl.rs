@@ -2361,6 +2361,20 @@ fn eval_expr(
             let Some(value) = eval_operand(value, last, in_function, shell)? else {
                 return Ok(control_placeholder());
             };
+            // A handle reaching here rather than through a variable's own access
+            // chain — `($j).state`, or a function that returned one — is read
+            // through in the same way. Expansion resolves handles on its side of
+            // the language; without this, whether `.state` works depends on how
+            // the handle got here rather than on what it is.
+            let value = match value {
+                Value::Job(id) => match shell.vars.job_record(id) {
+                    Some(record) => record,
+                    None => {
+                        return runtime_error(format!("job {id} is no longer in the job table"));
+                    }
+                },
+                other => other,
+            };
             match value {
                 Value::Map(entries) => map_lookup(&entries, name),
                 _ => runtime_error(format!("member access .{name} requires a map")),

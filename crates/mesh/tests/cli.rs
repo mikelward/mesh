@@ -2102,6 +2102,33 @@ fn a_job_handle_reads_the_job_as_it_is_now() {
 }
 
 #[test]
+fn a_handle_reads_the_same_however_it_arrives() {
+    // Expansion and the expression evaluator resolve members separately, and
+    // only expansion knew about handles. So `$j.state` worked while `($j).state`
+    // and a handle returned from a function did not — whether a handle could be
+    // read depended on how it reached the `.`, not on what it was.
+    let out = run_with_input(
+        "j = sh -c 'sleep 0.2; exit 6' &\na = ($j).state\nputs a=$a\nfunc ident(x) { return $x }\nb = ident($j).state\nputs b=$b\nsleep 0.5\nc = ($j).status\nputs c=$c\nd = ($sh.jobs[1]).state\nputs d=$d\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a=running\nb=running\nc=6\nd=done\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And a job that has left the table says so here too, rather than reporting
+    // that a handle is not a map.
+    let gone = run_with_input("j = sh -c 'exit 3' &\nwait $j\nx = ($j).status\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&gone.stderr).contains("job 1 is no longer in the job table"),
+        "{:?}",
+        gone.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&gone.stdout), "after\n");
+}
+
+#[test]
 fn a_job_handle_has_no_literal_form() {
     // `:repr` writes the source you would have typed for a value, and a handle
     // has none: the id is the only part of it that could be written, and the
