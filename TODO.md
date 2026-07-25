@@ -395,6 +395,18 @@ of each PR had landed by another route, but these pieces had not.
       like `global` / `unset` — `fork` leads a statement only when a `{` follows, so
       a command of that name stays reachable — and the fork/wait itself reuses the
       status conventions `wait_for_job` already encodes rather than restating them.
+- [ ] **Can a subshell return a value?** Written up in `DESIGN.md` beside the
+      isolation grades. Short version: "only bytes cross back" is argv's rule —
+      about *flattening*, where a list fails for want of a canonical separator —
+      borrowed for a boundary whose problem is *reconstruction*, where a list is
+      fine because a structured encoding carries its own delimiters. The appealing
+      form is that mesh's own literal syntax is the encoding: the child writes the
+      value as the text you would have typed, on a pipe of its own, and the parent
+      reads it back with the ordinary expression parser. What crosses is then
+      exactly what has a literal form. Missing: a value → literal writer with exact
+      quoting (`42` must not collide with `"42"`), and the temp-file fallback for a
+      value larger than a pipe buffer. Decide before `fork func`, since a value call
+      on one is the case that needs it.
 - [ ] **The rest of `fork` isolation.** Two pieces of the `DESIGN.md` cluster are
       still open. **`fork func name(params) { … }`**, a func whose *body* is a
       subshell, needs a decision first: a subshell returns only bytes, so what does

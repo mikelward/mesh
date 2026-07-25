@@ -1682,6 +1682,42 @@ stdout); rich list/map values do not survive the process boundary. `in DIR { }`
 does not fork: it is the lightweight "do this over there without stranding me,"
 covering the common `pushd`/`popd` pattern with a block.
 
+*(open — **can a subshell return a value?** "Only bytes cross back" is written
+above as if it were a law of the boundary, but it is really argv's rule borrowed
+for a different problem, and the two have different requirements.*
+
+*The argv rule is about **flattening**: one value has to become bytes that a
+program will read as one or more arguments, and a list fails it because there is
+no canonical separator to pick — that is the table in §"Values and the bytes
+boundary", and it is right. Returning a value across a fork is about
+**reconstruction**: the child has to write something the parent can turn back into
+the same value. A separator problem does not arise, because a structured encoding
+carries its own delimiters. So a list crosses a process boundary perfectly well
+while still — correctly — failing to cross into argv.*
+
+*The appealing form of this is that mesh already has the encoding: its own literal
+syntax. The child writes the value as the text you would have typed for it, on a
+pipe of its own (not stdout, which must keep streaming), and the parent reads it
+back with the ordinary expression parser. No new format, no serialization
+dependency, and a wire form that is debuggable by looking at it. What crosses is
+then exactly the values that **have a literal form** — string, int, bool, list,
+map, Duration — and what does not is exactly the values with no form at all: a
+stream handle (a descriptor means nothing in another process), a function (a
+closure over bindings that did not cross), an Instant or regex until their
+spellings round-trip. That is a rule with a reason rather than a list.*
+
+*Two things are missing before it could be built. The **writer** does not exist:
+mesh can parse `[a "b c"]` but cannot print a value back as a literal, and doing
+so needs the quoting to be exact — `42` and `"42"` must not both come out as `42`.
+And a value larger than a pipe buffer needs the unlinked-temp-file trick heredocs
+already use, or the child blocks writing while the parent blocks waiting.*
+
+*Worth noting what it would cost: `fork` stops being purely "a process boundary"
+and starts being a value channel, which is a bigger promise to keep — every future
+value type has to answer whether it crosses. The alternative is to keep the rule
+as it stands and let `fork func` value calls be an error, which is what they are
+today.)*
+
 *(open, deferred cluster: whether a `func` defined inside a `func` is visible
 only there. Also a **TODO — dynamic scope**: the same "extract a chunk into a
 subfunction" goal that motivates persist would be served further for *variables*
