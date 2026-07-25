@@ -2348,6 +2348,34 @@ fn kill_cont_puts_the_job_back_to_running() {
 }
 
 #[test]
+fn a_stopped_job_is_still_watched() {
+    // A job marked stopped used to be skipped by every poll, so nothing that
+    // happened to it afterwards reached the table. Two ways that shows:
+    //
+    // Killed where it stands — it stayed listed as stopped for good, and `wait`
+    // handed back the stop status (147) rather than how it actually ended.
+    let killed = run_with_input(
+        "sh -c 'kill -STOP $$; sleep 5' &\nsleep 0.3\nkill -KILL %1\nsleep 0.3\nwait 1\nputs waited=$sh.status\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&killed.stdout), "waited=137\n");
+
+    // Continued by something other than this table — here a `kill -CONT` in a
+    // pipeline stage, whose copy of the table dies with the stage. Only asking
+    // for `WCONTINUED` makes the parent able to see it at all.
+    let continued = run_with_input(
+        "sh -c 'kill -STOP $$; sleep 0.3; exit 5' &\nsleep 0.3\nkill -CONT %1 | cat\nsleep 0.5\nwait 1\nputs waited=$sh.status\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&continued.stdout), "waited=5\n");
+
+    // And a job genuinely left stopped still reports its stop rather than
+    // blocking on something that will not finish.
+    let stopped = run_with_input(
+        "sh -c 'kill -STOP $$; sleep 5' &\nsleep 0.3\nwait 1\nputs waited=$sh.status\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&stopped.stdout), "waited=147\n");
+}
+
+#[test]
 fn a_map_cannot_forge_a_job_handle() {
     // `m = [id: 1]` is ordinary data. Reading an `id` out of any map would make a
     // handle forgeable, and signalling a job on the strength of a field name is
