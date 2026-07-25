@@ -260,9 +260,10 @@ stdin defaults to `/dev/null`, preventing a background command from consuming
 later shell input. Quoted or escaped `&` remains literal. An empty `&` is a
 syntax error. Only a command or a pipeline can be backgrounded: `&` on anything
 else — an expression (a value call included), an assignment, an `if`/`match`, a
-loop, or a definition — is refused with `mesh: &: backgrounding … is not
-supported yet`, since those run in the shell itself and there is no child to
-defer them to. A builtin or function *is* a command, and is backgrounded through
+loop, a `fork` block, or a definition — is refused with `mesh: &: backgrounding …
+is not supported yet`. Those run in the shell itself and there is no child to
+defer them to; a `fork` block does make a child, but not one with a job-table
+entry to resume from, so it is refused for now rather than run in the foreground. A builtin or function *is* a command, and is backgrounded through
 the same fork a pipeline stage gets.
 
 Ctrl-Z also registers a stopped foreground pipeline in the same job table.
@@ -481,6 +482,26 @@ value, or a nested `if`. Earlier lines run for effect. A false `if` with no
 `else` yields the empty string. General boolean and comparison expressions, and
 conditional destructuring assignments, arrive with the general expression
 parser.
+
+### `fork` — subshell isolation
+
+```
+fork-block = "fork" ws? block          # contextual: only when `{` follows
+```
+
+`fork { … }` runs the block in a forked child. Process state it changes — cwd,
+environment, umask — and the bindings it makes stay in the child, and an `exit`
+inside ends the child rather than the shell, arriving outside as the block's
+status. Only **bytes** cross back: the child shares the shell's stdout, so what it
+prints appears, but no value returns.
+
+The keyword is contextual, as `global` and `unset` are: `fork` leads a statement
+only when a `{` follows it, so a command of that name is still reachable as
+`fork`, `fork --flag`, or `fork somewhere`. A `break` or `return` inside one ends
+the child, so control flow does not cross the boundary any more than state does.
+Deferred: piping or redirecting a subshell (`fork { … } | cat`, `fork { … } > log`
+are syntax errors), backgrounding one, and the `fork func name(params) { … }`
+form.
 
 ### For loops
 

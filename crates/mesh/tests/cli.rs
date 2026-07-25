@@ -10054,3 +10054,161 @@ fn exiting_over_a_finished_job_reports_nothing() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `fork { … }` is a subshell: the body runs in a forked child, so the process
+/// state it changes is its own. `DESIGN.md` makes isolation explicit in three
+/// grades and this is the strongest — the one that costs a process.
+#[test]
+fn a_fork_block_isolates_process_state() {
+    let dir = fresh_dir("fork_isolation");
+
+    // cwd: the child moves, the shell does not.
+    std::fs::write(dir.join("run.mesh"), "fork { cd /tmp\npwd }\npwd\n").unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    let printed = String::from_utf8_lossy(&out.stdout);
+    let mut lines = printed.lines();
+    assert_eq!(lines.next(), Some("/tmp"), "{printed}");
+    assert_ne!(
+        lines.next(),
+        Some("/tmp"),
+        "the shell followed the child: {printed}"
+    );
+
+    // Bindings and the environment: written inside, unchanged outside.
+    let out = run_with_input(
+        "x = outer\n\
+         fork { x = inner\n\
+         puts inside $x }\n\
+         puts after $x\n\
+         $env.MESH_FORK_TEST = outer\n\
+         fork { $env.MESH_FORK_TEST = inner }\n\
+         puts env $env.MESH_FORK_TEST\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "inside inner\nafter outer\nenv outer\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The property that makes a subshell worth having: a nonzero `exit` inside one
+/// ends the *child*, and arrives outside as an ordinary status. Its stdout still
+/// crosses back, since bytes are the only thing that does.
+#[test]
+fn an_exit_inside_a_fork_block_does_not_end_the_shell() {
+    let out = run_with_input("fork { puts before\nexit 3 }\nputs survived $sh.status\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "before\nsurvived 3\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "the shell exited with the child");
+
+    // The block's own status is the body's, so it composes with `&&` / `||`.
+    let out = run_with_input(
+        "fork { false }\nputs a $sh.status\n\
+         fork { true } && puts and-ran\n\
+         fork { false } || puts or-ran\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a 1\nand-ran\nor-ran\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `fork` is contextual, as `global` and `unset` are: it leads a statement only
+/// where a subshell can follow, so a command of that name is still reachable.
+/// Nothing in `DESIGN.md` reserves it, and reserving a word costs every program
+/// that already has it.
+#[test]
+fn a_command_named_fork_is_still_reachable() {
+    let dir = fresh_dir("fork_command");
+    let program = dir.join("fork");
+    std::fs::write(&program, "#!/bin/sh\necho \"real-fork: $*\"\n").unwrap();
+    let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&program, permissions).unwrap();
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run = |body: &str| {
+        std::fs::write(dir.join("run.mesh"), body).unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .env("PATH", &path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    assert_eq!(run("fork\n"), "real-fork: \n");
+    assert_eq!(run("fork --flag\n"), "real-fork: --flag\n");
+    assert_eq!(run("fork somewhere\n"), "real-fork: somewhere\n");
+    // Only the brace makes it the keyword.
+    assert_eq!(run("fork { puts subshell }\n"), "subshell\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Backgrounding one is refused rather than quietly run in the foreground: a
+/// backgrounded subshell needs a job-table entry of its own to be resumable, and
+/// it does not have one yet.
+#[test]
+fn backgrounding_a_fork_block_is_refused_for_now() {
+    let out = run_with_input("fork { puts hi } &\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("backgrounding a `fork` block"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+/// Control flow cannot cross the process boundary either, which falls out of the
+/// isolation rather than being enforced: a `break` inside a subshell ends the
+/// child, and the loop it appears to be inside — the parent's — keeps going. Same
+/// for a `return` inside a function's `fork`.
+#[test]
+fn control_flow_does_not_escape_a_fork_block() {
+    let out = run_with_input(
+        "for i in [1 2 3] {\n\
+         \x20 fork { if $i == 2 { break }\n\
+         \x20   puts child $i }\n\
+         \x20 puts parent $i\n\
+         }\n\
+         puts done\n",
+    );
+    // No `child 2`: the break ended that child. Every `parent` line is still
+    // there, because the parent's loop never saw it.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "child 1\nparent 1\nparent 2\nchild 3\nparent 3\ndone\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_with_input(
+        "func f() {\n\
+         \x20 fork { return 5 }\n\
+         \x20 puts after-fork-in-fn\n\
+         }\n\
+         f\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after-fork-in-fn\n");
+}

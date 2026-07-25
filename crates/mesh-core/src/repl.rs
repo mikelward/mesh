@@ -1007,6 +1007,7 @@ fn run_executable(
         } => run_ast_for(bindings, iterable, body, last, in_function, shell),
         While { condition, body } => run_ast_while(Some(condition), body, last, in_function, shell),
         Loop { body } => run_ast_while(None, body, last, in_function, shell),
+        Fork { body } => run_forked_block(body, last, in_function, shell),
         Control { kind, value, guard } => {
             match guard_allows(guard.as_ref(), last, in_function, shell) {
                 Ok(true) => {}
@@ -1139,6 +1140,10 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
         For { .. } => "a `for` loop",
         While { .. } => "a `while` loop",
         Loop { .. } => "a `loop`",
+        // A backgrounded subshell is two processes deep and needs a job-table
+        // entry of its own to be resumable; until it has one, refusing says so
+        // rather than silently running it in the foreground.
+        Fork { .. } => "a `fork` block",
         Control { kind, .. } => match kind {
             parser::ControlKind::Return => "`return`",
             parser::ControlKind::Break => "`break`",
@@ -1400,6 +1405,37 @@ fn run_ast_for(
 /// Both are the same machine: test, run the body, repeat. `loop` is the case
 /// whose test always passes, so it can only be left through `break` — or through
 /// a `return` or an error, which unwind past the loop like any other flow.
+/// `fork { … }` — run the body in a forked child and report its status.
+///
+/// The isolation is the process boundary: the child's `cd`, assignments, and
+/// environment writes cannot reach the parent, and an `exit` inside it ends the
+/// child, so its status arrives here as an ordinary result instead of ending the
+/// shell. Only bytes cross back, as `DESIGN.md` says of a subshell — the child's
+/// stdout is the shell's, so what it prints appears, but no value returns.
+fn run_forked_block(body: &parser::Source, last: u8, in_function: bool, shell: &mut Shell) -> Step {
+    // A subshell is a status, never a value: nothing typed survives the process
+    // boundary, so whatever the surrounding code had produced is not passed off
+    // as this block's own.
+    shell.produced = Produced::Status;
+    let status = exec::fork_and_wait(|| match run_source(body, last, in_function, shell) {
+        Step::Continue(code) | Step::Exit(code) => code,
+        // A `return` that reached the top of a subshell body has no caller left
+        // inside it; its value's status is what the child exits with.
+        Step::Return(value) => status_of(&value),
+    });
+    match status {
+        Ok(code) => {
+            shell.result = Value::Integer(i64::from(code));
+            shell.record_status(code, vec![code]);
+            Step::Continue(code)
+        }
+        Err(error) => {
+            note!("mesh: fork: {error}");
+            Step::Continue(1)
+        }
+    }
+}
+
 fn run_ast_while(
     condition: Option<&parser::Executable>,
     body: &parser::Source,
