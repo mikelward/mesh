@@ -182,6 +182,15 @@ file as tasks land.
       **boolean**, which settles the transform-as-predicate footgun `DESIGN.md`
       raises as open; `:each` yields the empty string, not the list. A list
       subject only: a map is a loud error pointing at `:keys` / `:values`.
+- [x] The file modifiers — the scalar **tests** `:exists`, `:type`, `:read`, and
+      `:write` (`test -e` / `find -type` / `-r` / `-w`), which map over a list, and
+      the **filters** `:files`/`:f`, `:dirs`/`:d`, `:links`/`:l`, and `:exec`/`:x`,
+      which keep a list's matching elements and chain for AND (`:f:x` is the
+      executable plain files). On one path a filter is the boolean its `test`
+      operator gives, so a filter doubles as the predicate `:filter` applies per
+      element. All dereference symlinks except `:links` and `:type`, the two that
+      exist to ask about the link itself; `:type` is the only one that errors on a
+      missing path, since there is no word to report.
 - [x] `f(…):capture` — the channel record (`.value` / `.out` / `.err` /
       `.status`), as an invocation-level modifier that wraps execution, including
       on an external (minus `.value`, positional arguments only). `.out`/`.err`

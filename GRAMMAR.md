@@ -136,8 +136,11 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
   left to right. The initial path set is `:dir`, `:base`, `:ext`, `:exts`,
   `:stem`, and `:bare`; strings also support `:upper` and `:lower`; strings and
   lists support `:len`; and lists support `:first`, `:last`, `:rest`, `:init`,
-  and `:dedup`. Path and string modifiers map over lists, while collection
-  modifiers consume the list as a whole. An unrecognized name after `:` remains
+  and `:dedup`. The file tests `:exists`, `:type`, `:read`, and `:write` ask
+  about a path, and the file filters `:files`/`:f`, `:dirs`/`:d`, `:links`/`:l`,
+  and `:exec`/`:x` keep a list's matching elements (or, on a single path, answer
+  the same `test` question). Path, string, and file-test modifiers map over
+  lists, while collection modifiers consume the list as a whole. An unrecognized name after `:` remains
   literal text, preserving constructions such as `$host:$port`. In this
   interpolation form modifiers are argument-free; the parenthesized argument form
   (`:split(SEP)`, `:join(SEP)`) is a value expression — see

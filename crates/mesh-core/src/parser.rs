@@ -3068,6 +3068,7 @@ const MODIFIER_NAMES: &[&str] = &[
     "parents",
     "quotemeta",
     "raw",
+    "read",
     "real",
     "remove",
     "replace",
@@ -3091,6 +3092,7 @@ const MODIFIER_NAMES: &[&str] = &[
     "upper",
     "values",
     "words",
+    "write",
     "x",
 ];
 

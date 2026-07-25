@@ -5238,6 +5238,112 @@ fn collection_modifiers_preserve_typed_list_results() {
     );
 }
 
+/// The scalar file tests: `:exists` is `test -e`, `:type` is the `find -type`
+/// word, `:read`/`:write` are `-r`/`-w`. Like `test` they dereference, so a live
+/// symlink exists and a broken one does not — `:type` is the one that reports on
+/// the link itself.
+#[test]
+fn file_tests_answer_questions_about_one_path() {
+    use std::ffi::CString;
+
+    let dir = fresh_dir("file_tests");
+    std::fs::write(dir.join("plain.txt"), "x").unwrap();
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::os::unix::fs::symlink("plain.txt", dir.join("good.link")).unwrap();
+    std::os::unix::fs::symlink("nowhere", dir.join("broken.link")).unwrap();
+    let fifo = CString::new(dir.join("pipe").into_os_string().into_vec()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+
+    let out = run_with_input(&format!(
+        "cd {}\n\
+         p = plain.txt\n\
+         puts $p:exists $p:type $p:read $p:write\n\
+         d = sub\n\
+         puts $d:exists $d:type\n\
+         good = good.link\n\
+         puts $good:exists $good:type\n\
+         bad = broken.link\n\
+         puts $bad:exists $bad:type\n\
+         f = pipe\n\
+         puts $f:type\n\
+         gone = nowhere\n\
+         puts $gone:exists\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true file true true\ntrue dir\ntrue link\nfalse link\nfifo\nfalse\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The file-type filters keep a list's matching elements and drop the rest, and
+/// chain for AND (`:f:x` is executable files). On a single path each is the bare
+/// `test` predicate instead — which is what makes them usable as the callable a
+/// `:filter` applies element by element, the equivalence `DESIGN.md` states.
+#[test]
+fn file_filters_keep_the_matching_list_elements_and_chain() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fresh_dir("file_filters");
+    std::fs::write(dir.join("plain.txt"), "x").unwrap();
+    std::fs::write(dir.join("run.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::os::unix::fs::symlink("plain.txt", dir.join("good.link")).unwrap();
+
+    let out = run_with_input(&format!(
+        "cd {}\n\
+         xs = [plain.txt sub run.sh good.link nowhere]\n\
+         puts ...$xs:files\n\
+         puts ...$xs:dirs\n\
+         puts ...$xs:links\n\
+         puts ...$xs:f:x\n\
+         one = run.sh\n\
+         puts $one:files $one:exec $one:dirs $one:links\n\
+         same = $xs:filter(func(f) {{ $f:exec }})\n\
+         puts ...$same\n\
+         puts ...$xs:exec\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // `good.link` is a file because the filters dereference; `sub` is `:exec`
+        // because a searchable directory carries the bit, which is why the
+        // executable-files idiom needs `:f:x` rather than `:x` alone. The last two
+        // lines are the modifier and its lambda spelling, and must agree.
+        "plain.txt run.sh good.link\nsub\ngood.link\nrun.sh\ntrue true false false\nsub run.sh\nsub run.sh\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A file modifier asked of something that is not a path fails loud, and `:type`
+/// has no word to report for a path that is not there.
+#[test]
+fn a_file_modifier_rejects_a_non_path_and_a_missing_type() {
+    for (source, message) in [
+        ("m = nowhere\nputs $m:type\n", "no such file: `nowhere`"),
+        ("n = 3\nputs $n:exists\n", ":exists: requires a path"),
+        (
+            "xs = [a 1]\nputs ...$xs:files\n",
+            ":files: requires a list of paths",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source} gave {stderr}");
+    }
+}
+
 #[test]
 fn join_and_split_modifiers_take_a_separator_argument() {
     // `:join(SEP)` folds a list to a string; `:split(SEP)` is its inverse. Both
