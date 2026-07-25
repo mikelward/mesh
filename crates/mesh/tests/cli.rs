@@ -7180,3 +7180,84 @@ fn global_and_unset_are_only_keywords_where_a_statement_can_follow() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// export
+// ---------------------------------------------------------------------------
+
+#[test]
+fn export_writes_the_environment_children_inherit() {
+    let out = run_with_input("export TESTV = child\nprintenv TESTV\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "child\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // It is the same write `$env.NAME =` performs, so the value reads back
+    // through `$env` and `+=` appends.
+    let out = run_with_input("export A = x\nexport A += y\nputs $env.A\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "xy\n");
+
+    // Non-strings that have a byte form still cross.
+    let out = run_with_input("export N = 42\nv = copied\nexport V = $v\nprintenv N\nprintenv V\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\ncopied\n");
+
+    // Environment writes are global by design — a function's export persists,
+    // the one deliberate exception to local-by-default.
+    let out = run_with_input("func f() { export F = set }\nf\nputs $env.F\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "set\n");
+}
+
+#[test]
+fn export_keeps_the_byte_boundary_rules() {
+    // A path-type name is a list in the shell and `:`-joined on the way out,
+    // the one exception to "only byte-strings cross".
+    let out = run_with_input("export MANPATH = [/a /b]\nprintenv MANPATH\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/a:/b\n");
+    let out = run_with_input("export MANPATH = [/a]\nexport MANPATH += /opt\nprintenv MANPATH\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/a:/opt\n");
+
+    // An arbitrary list is still an error rather than a silent join, and an
+    // embedded NUL cannot be represented at all.
+    let out = run_with_input("export X = [a b]\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only strings cross"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    let out = run_with_input("export X = \"a\\u{0}b\"\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("NUL"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn bare_export_names_the_spelling_that_works() {
+    // bash's `export NAME` marks an existing variable exported. mesh keeps shell
+    // bindings and the environment in separate namespaces, so there is nothing
+    // to mark — and the error has to say what to write instead rather than
+    // leaving a reflex to fail obscurely.
+    let out = run_with_input("x = 1\nexport x\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("export NAME = $NAME"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    let out = run_with_input("export\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("a NAME after `export`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And like `global` / `unset`, it leads a statement only where one can
+    // follow, so a variable may still be called `export`.
+    let out = run_with_input("export = 5\nputs $export\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+}
