@@ -470,17 +470,20 @@ fn fork_in_shell(
             if background && !cmd.redirs.is_empty() {
                 let redirs = staged_redirs(cmd, is_last);
                 let inherited = live_descriptors(&redirs);
+                let mut closing = Vec::new();
                 let deferred = match open_paths(&redirs, &inherited)
                     .and_then(|files| resolve_sources(&redirs, files, inherited_seed()))
-                    .and_then(sources_to_files)
-                {
+                    .and_then(|sources| {
+                        closing = sources.closed();
+                        sources_to_files(sources)
+                    }) {
                     Ok(files) => files,
                     Err((path, err)) => {
                         note!("mesh: {path}: {err}");
                         libc::_exit(1);
                     }
                 };
-                if install_descriptors(deferred, &[]).is_err() {
+                if install_descriptors(deferred, &closing).is_err() {
                     libc::_exit(1);
                 }
             }
@@ -1952,9 +1955,11 @@ fn open_paths(
     // target is created or truncated, and named in the error the way bash names
     // it. Left to `dup2` it would surface as `EBADF` against the *command*, from
     // a hook that runs after the opens.
+    // A close needs no descriptor at all, so the limit has nothing to say about
+    // it: `999999>&-` asks for something already true, and bash accepts it.
     let limit = descriptor_limit();
     for redir in redirs {
-        if redir.fd >= limit {
+        if redir.fd >= limit && !matches!(redir.target, RedirTarget::Close) {
             return Err((
                 format!("&{}", redir.fd),
                 std::io::Error::from_raw_os_error(libc::EBADF),
