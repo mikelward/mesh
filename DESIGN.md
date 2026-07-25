@@ -506,6 +506,66 @@ matching nothing in command position **warns but does not error** — it expands
 nothing rather than passing the literal through (bash's footgun). *(TODO —
 interactively, **prompt** on no match instead of only warning.)*
 
+### Arithmetic
+
+Integers are **`i64`**, signed, and every operation is **checked** — overflow is a
+loud error, never a wrap. There is no float and no unsigned type; `Duration` and
+`Instant` carry their own closed arithmetic, defined with the time model.
+
+**Where arithmetic happens** *(decided)*. A bare word is a command, so arithmetic
+needs a context that is unambiguously a value. There are two, following nushell and
+PowerShell:
+
+- **A statement whose first word is a number** is an expression, not a command, so
+  `1 + 2` at the prompt prints `3`. Nothing is given up: no command is named by an
+  integer literal, and the parser already uses "is this word numeric" to tell a
+  value from a command word.
+- **Parentheses**, wherever a value is expected — a command argument included:
+
+  ```
+  puts (1 + 2)
+  puts ($n + 3)
+  retry --sleep ($base * 2)
+  ```
+
+`puts 1 + 2` without the parens is deliberately **not** arithmetic. Making `+` an
+operator between argv words would either refuse `$n` operands — leaving the case
+anyone actually wants unserved — or turn `mycmd $file + $other` into a type error,
+and it would break `find . -exec grep foo {} +`. Every shell draws this line
+somewhere: bash needs `$(( ))`, fish needs `math`, and nushell and PowerShell put it
+exactly where mesh does.
+
+**Operators** *(decided)*. `+`, `*`, `/`, `%`, with the usual precedence. Division
+and remainder follow **Rust and bash**: the quotient truncates toward zero and the
+remainder takes the sign of the **dividend**, so `-7 / 2` is `-3`, `-7 % 2` is `-1`,
+and `(a / b) * b + a % b == a` holds. That also agrees with `:ms` / `:secs`, which
+already truncate toward zero. (Python, Ruby and Perl floor instead, giving `-4` and
+`1` — mesh does not.) Division by zero is a **loud error**.
+
+Exponentiation is a **modifier**, not an operator: `$b:pow(3)`. Rust has no exponent
+operator either; `^` would collide with any future bitwise use, `**` needs a
+precedence rule of its own, and the modifier form matches `$m:int` / `$a:ms` — while
+giving the negative-exponent case somewhere honest to fail, an integer power having
+no answer there.
+
+*(TODO: how binary `-` is spelled — a spaced infix `-` is already glob exclusion.)*
+
+**Literals** *(decided)*. Decimal, plus `0x` / `0o` / `0b` prefixes — `0xff`,
+`0o755`, `0b1011`. Underscores group digits, following **Python's placement rule**:
+exactly one, only between two digits, so `1_000_000` is fine while `_1`, `1_`, and
+`1__0` are errors. Group *size* is deliberately **not** checked, which is what makes
+non-Western grouping work for nothing — `1_00_00_000` (one crore) and `1_0000_0000`
+(一億) are as valid as `1_000_000`. Rust is looser still and accepts `1_` and `1__0`;
+no grouping convention wants those.
+
+*(TODO: whether a leading zero means octal. Today `007` silently parses as `7`,
+which is the one answer that is certainly wrong.)*
+
+**Value positions only.** All of this governs *in-shell* values; the process
+boundary stays bytes. `chmod 0644 f` passes `0644` and `ls 1_000` names the
+directory `1_000` — integer parsing never reaches argv, which is also why a
+C-style octal literal would not buy the `chmod` case anything.
+
 ### Variables and assignment
 
 Assignment is `name=value`, the **bash spelling** — the most ingrained shell
