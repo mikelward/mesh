@@ -2241,33 +2241,6 @@ fn redirections_apply_in_source_order() {
 }
 
 #[test]
-fn descriptor_duplication_is_still_rejected() {
-    // `2>&1`, `&>f`, `>&2`, `<&0` duplicate one descriptor onto another, which is
-    // a different mechanism from retargeting one at a file — still deferred, and
-    // rejected loudly rather than silently reinterpreted.
-    for source in [
-        "ls /nope 2>&1\n",
-        "echo hello &>f\n",
-        "echo hello&>f\n",
-        "echo hi >&2\n",
-        "cat <&0\n",
-    ] {
-        let out = run_with_input(source);
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("descriptor duplication"),
-            "{source:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    // An escaped `\&` is a literal, so `hi\&>f` is an ordinary redirect.
-    let dir = fresh_dir("redir_escaped_amp");
-    let esc = run_with_input(&format!("cd {}\necho hi\\&>f\ncat f\n", dir.display()));
-    assert_eq!(String::from_utf8_lossy(&esc.stdout), "hi&\n");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn stderr_can_be_redirected_to_a_file() {
     let dir = fresh_dir("redir_stderr");
     let err = dir.join("err.txt");
@@ -5581,5 +5554,181 @@ fn a_spaced_comparison_in_a_condition_is_not_a_redirection() {
         input.display()
     ));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "found\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_duplication_sends_one_descriptor_where_another_points() {
+    let dir = fresh_dir("dup_basic");
+    let both = dir.join("both.txt");
+
+    // `> file 2>&1`: stdout moves to the file, then stderr copies where stdout
+    // now points — so both land there.
+    let out = run_with_input(&format!(
+        "sh -c 'echo O; echo E >&2' > {} 2>&1\n",
+        both.display()
+    ));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut lines: Vec<String> = std::fs::read_to_string(&both)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    assert_eq!(lines, ["E", "O"]);
+
+    // `&> file` is defined as exactly that pair.
+    let amp = dir.join("amp.txt");
+    run_with_input(&format!(
+        "sh -c 'echo O; echo E >&2' &> {}\n",
+        amp.display()
+    ));
+    let text = std::fs::read_to_string(&amp).unwrap();
+    assert!(text.contains('O') && text.contains('E'), "{text:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn duplication_order_matters_as_it_does_in_every_shell() {
+    // `2>&1 > file` is the classic gotcha: stderr copies stdout's *original*
+    // destination (the terminal) and only then does stdout move to the file. So
+    // the file gets stdout alone, and stderr comes out on the shell's stdout.
+    let dir = fresh_dir("dup_order");
+    let file = dir.join("out.txt");
+    let out = run_with_input(&format!(
+        "sh -c 'echo O; echo E >&2' 2>&1 > {}\n",
+        file.display()
+    ));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "O\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "E\n",
+        "stderr should have followed stdout's original destination"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_duplication_can_put_stderr_into_a_pipe() {
+    // Uppercasing downstream proves the text really traversed the pipe rather
+    // than reaching the terminal directly.
+    let out = run_with_input("sh -c 'echo out; echo err >&2' 2>&1 | tr a-z A-Z\n");
+    let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    assert_eq!(
+        lines,
+        ["ERR", "OUT"],
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Without it, stderr stays out of the pipe.
+    let out = run_with_input("sh -c 'echo out; echo err >&2' | tr a-z A-Z\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "OUT\n");
+
+    // `|&` is the shorthand and still behaves the same.
+    let out = run_with_input("sh -c 'echo out; echo err >&2' |& tr a-z A-Z\n");
+    let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    assert_eq!(lines, ["ERR", "OUT"]);
+}
+
+#[test]
+fn ordering_holds_when_a_pipe_is_involved_too() {
+    // `2>&1 > file |` inside a pipeline: stderr took the pipe (stdout's
+    // destination at that point), then stdout moved to the file.
+    let dir = fresh_dir("dup_pipe_order");
+    let file = dir.join("out.txt");
+    let out = run_with_input(&format!(
+        "sh -c 'echo out; echo err >&2' 2>&1 > {} | tr a-z A-Z\n",
+        file.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ERR\n");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "out\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_bare_greater_amp_takes_both_streams_to_a_file() {
+    // `>&` is two operators under one spelling, told apart by the target: a
+    // descriptor duplicates, anything else takes both streams to that file. It
+    // is the csh/zsh spelling of `&>`, and reads more consistently than it —
+    // every other redirect leads with its direction.
+    let dir = fresh_dir("dup_greater_amp");
+    let file = dir.join("both.txt");
+    let out = run_with_input(&format!(
+        "sh -c 'echo O; echo E >&2' >& {}\n",
+        file.display()
+    ));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut lines: Vec<String> = std::fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    assert_eq!(lines, ["E", "O"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_duplication_target_must_name_a_usable_descriptor() {
+    // A descriptor-shaped target is a duplication, so an unusable number is an
+    // error rather than a filename.
+    let out = run_with_input("echo hi 2>&9\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("descriptor"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `&>` always means both streams, so a descriptor prefix on it is refused
+    // rather than silently ignored.
+    let out = run_with_input("echo hi 2&> f\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("&>"));
+}
+
+#[test]
+fn a_duplication_uses_the_descriptor_its_direction_names() {
+    // `<&` defaults to stdin, `>&` to stdout. Checked with stdout sent somewhere
+    // observable: at a terminal both descriptors are the same device, so a test
+    // that only looks at the terminal cannot tell the two apart.
+    let dir = fresh_dir("dup_direction");
+    let file = dir.join("out.txt");
+    run_with_input(&format!("echo VISIBLE <&0 > {}\n", file.display()));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "VISIBLE\n");
+
+    let out = run_with_input("echo PIPED <&0 | tr A-Z a-z\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "piped\n");
+
+    // `>&2` moves stdout to stderr, so nothing is left on stdout.
+    let out = run_with_input("echo OUT >&2\n");
+    assert!(
+        out.stdout.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("OUT"));
+}
+
+#[test]
+fn an_escaped_amp_is_still_a_literal_before_a_redirect() {
+    let dir = fresh_dir("redir_escaped_amp");
+    let esc = run_with_input(&format!("cd {}\necho hi\\&>f\ncat f\n", dir.display()));
+    assert_eq!(String::from_utf8_lossy(&esc.stdout), "hi&\n");
     let _ = std::fs::remove_dir_all(&dir);
 }

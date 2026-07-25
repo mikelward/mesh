@@ -1346,6 +1346,8 @@ struct Redir {
     kind: exec::RedirKind,
     /// The descriptor a `N>` prefix named, or `None` for the direction's default.
     fd: Option<u32>,
+    /// True for `N>&M`, where the target names a descriptor rather than a path.
+    duplicate: bool,
     target: Word,
 }
 
@@ -1375,19 +1377,51 @@ fn run_ast_pipeline(
                 parser::CommandItem::Word(word) => words.push(expansion_word(&word.value)),
                 parser::CommandItem::Redirect {
                     kind, fd, target, ..
-                } => redirs.push(Redir {
-                    kind: match kind {
-                        parser::RedirectKind::Input => exec::RedirKind::In,
-                        parser::RedirectKind::Output => exec::RedirKind::Out,
-                        parser::RedirectKind::Append => exec::RedirKind::Append,
+                } => {
+                    let target = expansion_word(&target.value);
+                    match kind {
+                        // `&> file` is defined as `> file 2>&1`, so desugar it
+                        // into exactly that pair rather than carrying a third
+                        // mechanism through the executor.
+                        parser::RedirectKind::Both => {
+                            redirs.push(Redir {
+                                kind: exec::RedirKind::Out,
+                                fd: Some(1),
+                                duplicate: false,
+                                target,
+                            });
+                            redirs.push(Redir {
+                                kind: exec::RedirKind::Out,
+                                fd: Some(2),
+                                duplicate: true,
+                                target: one_word("1"),
+                            });
+                        }
                         parser::RedirectKind::Heredoc => {
                             note!("mesh: heredoc execution is not supported yet");
                             return Step::Continue(1);
                         }
-                    },
-                    fd: *fd,
-                    target: expansion_word(&target.value),
-                }),
+                        // The duplication kinds stay split by side so an absent
+                        // `N` takes the direction's descriptor: `>&2` retargets
+                        // stdout, `<&0` stdin.
+                        _ => redirs.push(Redir {
+                            kind: match kind {
+                                parser::RedirectKind::Input | parser::RedirectKind::DuplicateIn => {
+                                    exec::RedirKind::In
+                                }
+                                parser::RedirectKind::Append => exec::RedirKind::Append,
+                                _ => exec::RedirKind::Out,
+                            },
+                            fd: *fd,
+                            duplicate: matches!(
+                                kind,
+                                parser::RedirectKind::DuplicateOut
+                                    | parser::RedirectKind::DuplicateIn
+                            ),
+                            target,
+                        }),
+                    }
+                }
             }
         }
         stages.push(Stage {
@@ -2761,22 +2795,49 @@ fn run_stage_in_shell(body: &StageBody, cmd: &exec::Cmd, last: u8, shell: &mut S
 fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirection>, String> {
     let mut out = Vec::with_capacity(redirs.len());
     for redir in redirs {
-        let mut paths = expand::expand(vec![redir.target], vars).map_err(|e| e.to_string())?;
-        if paths.len() != 1 {
+        let mut words = expand::expand(vec![redir.target], vars).map_err(|e| e.to_string())?;
+        if words.len() != 1 {
             return Err(format!(
                 "ambiguous redirect: target expanded to {} words",
-                paths.len()
+                words.len()
             ));
         }
+        let word = words.pop().unwrap();
+        let target = if redir.duplicate {
+            // `2>&1`: the target names a descriptor, so it must read as one.
+            let from = word.parse::<i32>().map_err(|_| {
+                format!("`>&{word}`: the target of a duplication must be a descriptor")
+            })?;
+            if !(0..=2).contains(&from) {
+                return Err(format!(
+                    "`>&{from}`: only descriptors 0, 1, and 2 can be duplicated"
+                ));
+            }
+            exec::RedirTarget::Descriptor(from)
+        } else {
+            exec::RedirTarget::Path(word)
+        };
         out.push(exec::Redirection {
-            fd: redir
-                .fd
-                .map_or_else(|| exec::Redirection::default_fd(redir.kind), |fd| fd as i32),
+            fd: redir.fd.map_or_else(
+                || {
+                    // `>&1` with no prefix duplicates onto stdout; `<&0` onto stdin.
+                    exec::Redirection::default_fd(redir.kind)
+                },
+                |fd| fd as i32,
+            ),
             kind: redir.kind,
-            path: paths.pop().unwrap(),
+            target,
         });
     }
     Ok(out)
+}
+
+/// A single bare literal word, for a desugaring that needs one.
+fn one_word(text: &str) -> Word {
+    Word(vec![Piece::Text {
+        text: text.to_owned(),
+        expandable: false,
+    }])
 }
 
 /// Run one command with no redirections: classify it as an assignment or a
