@@ -53,8 +53,9 @@ Positional arguments are a real list — `$sh.args` — not `$1` / `$@` / `$#`:
 | `$sh.name` | The script's name, or `mesh` when no script was named |
 
 Both are read-only, and `sh` is a reserved name: it cannot be assigned, used as
-a function parameter, or bound by a pattern. The rest of the `$sh.*` surface in
-`DESIGN.md` is not implemented yet.
+a function parameter, or bound by a pattern. (Only `sh` itself is reserved — an
+ordinary variable may still be called `status`, `name`, or `args`.) The rest of
+the `$sh.*` surface in `DESIGN.md` is not implemented yet.
 
 ---
 
@@ -285,6 +286,56 @@ A **value** used as a statement reports the status *view* of that value: an
 integer is its own status (masked to 0–255), a boolean inverts (`true` is `0`),
 and anything else is `0`. So `1 == 2 || puts nope` prints, and a function whose
 body ends in a boolean fails when that boolean is false.
+
+### `$sh.status` and `$sh.pipestatus`
+
+`$sh.status` is the last command's status — the readable replacement for `$?`.
+`$sh.pipestatus` breaks the same run down by stage, as a **real list**:
+
+```mesh
+sh -c 'exit 3' | sh -c 'exit 0' | sh -c 'exit 7'
+puts $sh.status ...$sh.pipestatus     # 7  3 0 7
+```
+
+Both are read in **one** command there on purpose. Reading either is itself a
+command, so a first `puts` would replace what a second one reports — see the
+capture rule below.
+
+Being a list rather than bash's magic `PIPESTATUS` array, it indexes, measures,
+and filters like anything else:
+
+```mesh
+p = $sh.pipestatus
+puts $p:len $p[0]
+bad = $p:filter(func(c) { $c != 0 })
+```
+
+That capture-first habit matters: **reading either entry is itself a command**,
+so it replaces what the next read would report. Take a copy when you need more
+than one look — the same care `$?` needs in a POSIX shell.
+
+A command that is not a pipeline reports one entry, so `$sh.pipestatus` is never
+empty. The two always describe the **same run**: a compound's status is its
+body's, so the breakdown stays the body's too.
+
+```mesh
+if true { sh -c 'exit 4' | true }
+puts $sh.status ...$sh.pipestatus     # 4  4 0
+```
+
+That last point differs from bash, where an `if` or a function call resets
+`PIPESTATUS` to its own single status. It holds here because pipefail is always
+on: a compound's status is exactly the pipefail status of the pipeline the list
+describes, so the pair cannot disagree.
+
+Where they *do* differ from each other is a forgiven `SIGPIPE`. The pipefail rule
+ignores an upstream stage killed because a later stage stopped reading, but the
+stage really did die, and the list says so:
+
+```mesh
+yes | head -1 > /dev/null
+puts $sh.status ...$sh.pipestatus     # 0  141 0
+```
 
 ## Expansion
 

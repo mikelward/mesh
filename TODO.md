@@ -262,8 +262,15 @@ file as tasks land.
       `command` / `stdin` / `interactive`) plus `$sh.source` that `DESIGN.md`
       §"Startup and invocation" leaves as a TODO — a file needs to know it is
       being sourced, and where it lives.
-- [ ] The rest of `$sh.*`: `$sh.status`, `$sh.pipestatus`, `$sh.pid`,
-      `$sh.interactive`, the stream handles, `$sh.jobs`, and the hook maps.
+- [x] `$sh.status` (the readable `$?`) and `$sh.pipestatus` (a real list, not
+      bash's magic `PIPESTATUS` array). The two always describe the *same* run:
+      a compound's status is its body's, so the breakdown stays the body's too —
+      which differs from bash and holds only because pipefail is always on. A
+      forgiven `SIGPIPE` is the one place they diverge from each other, showing
+      as `141` in the list while the status stays 0.
+- [ ] The rest of `$sh.*`: `$sh.pid` / `$sh.ppid`, `$sh.version`,
+      `$sh.interactive`, `$sh.options`, the stream handles with their `:tty`
+      test, `$sh.jobs`, and the hook maps.
 
 ## Loose ends
 

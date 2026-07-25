@@ -59,6 +59,23 @@ struct Shell {
     /// has produced one, an expression that failed has not, and a statement a
     /// guard skipped produced nothing at all.
     produced: Produced,
+    /// How many times `$sh.status` has been recorded. Compared across running an
+    /// executable to tell a **leaf** — a command, an assignment — from a
+    /// **compound** whose status is its body's: if the body recorded, the
+    /// compound must not overwrite it, so `if … { false | true }` keeps the
+    /// pipeline's per-stage list rather than flattening it to one entry.
+    /// A counter rather than a list of compound node kinds, so a new kind of
+    /// executable cannot forget to be on it.
+    status_records: u64,
+}
+
+impl Shell {
+    /// Publish the status the next command will see as `$sh.status`, with the
+    /// per-stage breakdown `$sh.pipestatus` reports.
+    fn record_status(&mut self, status: u8, stages: Vec<u8>) {
+        self.vars.set_status(status, stages);
+        self.status_records += 1;
+    }
 }
 
 /// What an executable contributed to the **result so far**.
@@ -117,6 +134,7 @@ impl Shell {
             prompt: PromptConfig::default(),
             result: Value::String(String::new()),
             produced: Produced::Status,
+            status_records: 0,
         }
     }
 }
@@ -546,19 +564,26 @@ fn status_of(value: &Value) -> u8 {
 /// running a function body: there a `return` unwinds; at top level it is a
 /// recoverable error.
 fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
+    // Input the parser rejected never reaches `run_recorded`, so this is the only
+    // place its status can be published. Without it the shell carries 2 to the
+    // next command while `$sh.status` still reports whatever ran before.
+    let reject = |shell: &mut Shell| {
+        shell.record_status(2, vec![2]);
+        Step::Continue(2)
+    };
     let step = match parser::parse(text) {
         Ok(parser::ParseOutcome::Complete(source)) => run_source(&source, last, in_function, shell),
         Ok(parser::ParseOutcome::Incomplete) => {
             note!("mesh: syntax error: unexpected end of input");
-            Step::Continue(2)
+            reject(shell)
         }
         Ok(parser::ParseOutcome::IncompleteHeredoc(delimiter)) => {
             note!("mesh: syntax error: heredoc missing its `{delimiter}` delimiter");
-            Step::Continue(2)
+            reject(shell)
         }
         Err(error) => {
             note!("mesh: {error}");
-            Step::Continue(2)
+            reject(shell)
         }
     };
     if !in_function && shell.loop_depth == 0 {
@@ -662,11 +687,26 @@ fn run_recorded(
     // and a guard that failed left the executable unrun. A nested executable's
     // report carries out, so the branch's value survives the `if` that ran it.
     shell.produced = Produced::Status;
+    let records = shell.status_records;
     let step = run_executable(executable, background, last, in_function, shell);
     if let Step::Continue(code) = step
         && shell.produced == Produced::Status
     {
         shell.result = Value::Integer(i64::from(code));
+    }
+    // Keep a nested breakdown only when it really describes *this* executable's
+    // status. Two ways it may not: nothing nested recorded at all (an assignment,
+    // a builtin, an `if` whose branch never ran), or something did but the
+    // compound went on to report a different code — `func f() { false | true
+    // return 7 }` ends at 7, not at the pipeline's 1. Either way this executable
+    // produced the status itself and is one "stage".
+    //
+    // Stated as an invariant: after this, `$sh.status` is always the code just
+    // returned, and `$sh.pipestatus` always breaks down the run that produced it.
+    if let Step::Continue(code) = step
+        && (shell.status_records == records || shell.vars.status() != code)
+    {
+        shell.record_status(code, vec![code]);
     }
     step
 }
@@ -3500,14 +3540,18 @@ fn run_stages(
     {
         jobs.reap();
     }
-    let status = exec::run_pipeline(cmds, &mut jobs, background, &mut |index, cmd, jobs| {
+    let outcome = exec::run_pipeline(cmds, &mut jobs, background, &mut |index, cmd, jobs| {
         std::mem::swap(&mut shell.jobs, jobs);
         let status = run_stage_in_shell(&bodies[index], cmd, last, shell);
         std::mem::swap(&mut shell.jobs, jobs);
         status
     });
     shell.jobs = jobs;
-    status
+    // The only place that knows each stage's own status, so the only place that
+    // can record `$sh.pipestatus`; `run_recorded` fills in a one-entry list for
+    // everything else that produces a status.
+    shell.record_status(outcome.status, outcome.stages);
+    outcome.status
 }
 
 /// Run a builtin or function that is a pipeline stage. Called in the forked
@@ -3848,9 +3892,15 @@ fn run_prompt_hooks(event: PromptEvent, args: Vec<Value>, shell: &mut Shell) {
     // command line of `--` or `--word` would be read as a terminator or flag and
     // a hook declared `func hook(cmd)` would fail with an arity/unknown-flag error.
     let args: Vec<(Value, bool)> = args.into_iter().map(|value| (value, false)).collect();
+    // A hook runs on the shell's schedule, not the user's, so what it runs must
+    // not become `$sh.status` — the loop already discards the hook's own `Step`
+    // for that reason, and a `preprompt` hook that merely prints would otherwise
+    // report 0 where the user's failed command should still be visible.
+    let saved = shell.vars.status_snapshot();
     for function in hooks {
         let _ = call_func(&function, args.clone(), false, shell);
     }
+    shell.vars.restore_status(saved);
 }
 
 /// Expand just the command word to its name, if it resolves to a single string —
@@ -7021,6 +7071,41 @@ mod tests {
         run_prompt_hooks(PromptEvent::PrePrompt, Vec::new(), &mut shell);
         assert!(marker.exists());
         std::fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn a_lifecycle_hook_does_not_replace_the_users_status() {
+        // The loop already discards a hook's `Step`, keeping the user's `last`.
+        // What the hook *runs* has to be discarded the same way, or a `preprompt`
+        // that merely prints would report 0 where the user's failed command is
+        // still what the prompt and the eventual exit code reflect.
+        let mut shell = Shell::new();
+        assert_eq!(
+            run_line("func h() { puts '' }\n", 0, false, &mut shell),
+            Step::Continue(0)
+        );
+        assert_eq!(
+            run_line("prompt-hook preprompt p h\n", 0, false, &mut shell),
+            Step::Continue(0)
+        );
+        assert_eq!(run_line("false\n", 0, false, &mut shell), Step::Continue(1));
+        assert_eq!(shell.vars.status(), 1);
+        run_prompt_hooks(PromptEvent::PrePrompt, Vec::new(), &mut shell);
+        assert_eq!(shell.vars.status(), 1, "a hook replaced the user's status");
+    }
+
+    #[test]
+    fn input_the_parser_rejects_publishes_its_status() {
+        // A parse failure never reaches `run_recorded`, so without publishing it
+        // here the shell would carry 2 to the next command while `$sh.status`
+        // still reported whatever ran before.
+        let mut shell = Shell::new();
+        assert_eq!(run_line("true\n", 0, false, &mut shell), Step::Continue(0));
+        assert_eq!(
+            run_line("nope (\n", 0, false, &mut shell),
+            Step::Continue(2)
+        );
+        assert_eq!(shell.vars.status(), 2);
     }
 
     #[test]

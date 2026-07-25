@@ -114,6 +114,8 @@ pub struct Vars {
     global: Scope,
     locals: Vec<Scope>,
     shell: Vec<(String, Value)>,
+    status: u8,
+    stages: Vec<u8>,
 }
 
 impl Default for Vars {
@@ -122,6 +124,8 @@ impl Default for Vars {
             global: Scope::new(),
             locals: Vec::new(),
             shell: invocation_entries(DEFAULT_SHELL_NAME.to_owned(), Vec::new()),
+            status: 0,
+            stages: vec![0],
         }
     }
 }
@@ -149,10 +153,53 @@ impl Vars {
         self.shell = invocation_entries(name, args);
     }
 
+    /// Record the status the next command sees as `$sh.status`, and the
+    /// per-stage breakdown `$sh.pipestatus` reports. Kept as one call because
+    /// the two must agree: `$sh.pipestatus` always describes the run that
+    /// produced the current `$sh.status`.
+    pub(crate) fn set_status(&mut self, status: u8, stages: Vec<u8>) {
+        self.status = status;
+        self.stages = stages;
+    }
+
+    /// The currently published `$sh.status`.
+    pub(crate) fn status(&self) -> u8 {
+        self.status
+    }
+
+    /// Take a copy of both runtime entries, to put back with
+    /// [`Vars::restore_status`] after running something that is the shell's own
+    /// bookkeeping rather than the user's command.
+    pub(crate) fn status_snapshot(&self) -> (u8, Vec<u8>) {
+        (self.status, self.stages.clone())
+    }
+
+    pub(crate) fn restore_status(&mut self, (status, stages): (u8, Vec<u8>)) {
+        self.status = status;
+        self.stages = stages;
+    }
+
     /// The read-only `$sh` namespace as an ordered map, so member access,
     /// indexing, and modifiers all work through the usual map and list paths.
+    ///
+    /// The runtime entries are built here rather than stored in `shell`, so
+    /// recording a status after every command is two field writes instead of a
+    /// keyed update of the map.
     pub(crate) fn shell_namespace(&self) -> Value {
-        Value::Map(self.shell.clone())
+        let mut entries = vec![
+            ("status".to_owned(), Value::Integer(i64::from(self.status))),
+            (
+                "pipestatus".to_owned(),
+                Value::List(
+                    self.stages
+                        .iter()
+                        .map(|code| Value::Integer(i64::from(*code)))
+                        .collect(),
+                ),
+            ),
+        ];
+        entries.extend(self.shell.iter().cloned());
+        Value::Map(entries)
     }
 
     /// Enter a fresh function-local scope; balanced by [`pop_scope`].
