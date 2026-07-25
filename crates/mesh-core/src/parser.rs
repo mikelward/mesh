@@ -45,6 +45,27 @@ impl Word {
             .collect()
     }
 
+    /// The `i64` this word spells, when it is a single **bare** run of text.
+    ///
+    /// Concatenated text is not enough to go on: `4"2"`, `42""`, and `4\2` all
+    /// compose to `42`, but expansion keeps the quoted and escaped pieces and
+    /// yields the *string*. Those forms are **already** expressions — the
+    /// quoted-literal arm of [`Parser::value_start_in`] claims any word with a
+    /// quoted or escaped piece — so this is about not *also* claiming them as
+    /// integers. Testing the assembled text would work today only because that arm
+    /// runs first, which is an accident of ordering rather than a rule.
+    fn bare_integer(&self) -> Option<i64> {
+        match self.pieces.as_slice() {
+            [
+                WordPiece::Text {
+                    text,
+                    quote: QuoteMode::Bare,
+                },
+            ] => text.parse().ok(),
+            _ => None,
+        }
+    }
+
     fn is_bare_text(&self, expected: &str) -> bool {
         matches!(self.pieces.as_slice(), [WordPiece::Text { text, quote: QuoteMode::Bare }] if text == expected)
     }
@@ -2668,10 +2689,45 @@ impl Parser {
                     || (quoted && (!redirect_next || comparison_next) && self.viable_expression())
                     || attached_call
                     || (numeric && followed_by_operator)
+                    // A lone numeric literal is a **value**, so a block can yield one:
+                    // `func answer() { 42 }` is 42 rather than "command not found: 42".
+                    // Narrow on purpose — the whole statement must be that literal — so
+                    // `42 foo` and `42 > file` stay the commands they were, and a
+                    // numeral is never a plausible command name anyway (`./42` still
+                    // runs a file called that).
+                    || (numeric
+                        && (!redirect_next || comparison_next)
+                        && self.lone_integer_literal())
             }
             _ => false,
         }
     }
+    /// Is the rest of this statement exactly one integer literal?
+    ///
+    /// The token being peeked is not enough to tell. A word can be assembled from
+    /// several adjacent tokens, and only the *first* is in hand here: `3.5` peeks
+    /// as `3`, which parses as an integer while the word does not. So the check
+    /// parses the statement and looks at what came out, rather than trusting the
+    /// lookahead — and asks [`Word::bare_integer`], since even the assembled text is
+    /// not enough: `4"2"` spells `42` while expanding to the *string*.
+    fn lone_integer_literal(&mut self) -> bool {
+        let saved = self.position;
+        let lone = matches!(
+            self.expression(),
+            Ok(Expr::Scalar(word)) if word.value.bare_integer().is_some()
+        ) && self.at_command_end()
+            // `at_command_end` counts a pipe, but an expression cannot *be* a
+            // pipeline stage: classifying `42 | cat` as one would leave the `|`
+            // unconsumed and turn a command that runs today into a syntax error.
+            // A numeral heading a pipeline stays the command it was.
+            && !matches!(
+                self.peek().map(|token| &token.value),
+                Some(TokenKind::Pipe | TokenKind::PipeBoth)
+            );
+        self.position = saved;
+        lone
+    }
+
     fn viable_expression(&mut self) -> bool {
         let saved = self.position;
         let viable = self.expression().is_ok() && self.at_command_end();
