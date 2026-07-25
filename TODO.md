@@ -307,13 +307,20 @@ file as tasks land.
       top level has no caller, so `return` there stays an error. Missing and
       unreadable files answer `127` / `126`, the statuses `mesh FILE` uses.
       Deferred: arguments for a sourced file, which need `shift` / `set --`.
-- [ ] **A leading `not` is not a value start.** `x = not $b` and
-      `if $a and not $b { … }` both work, but `if not $b { … }` reports
-      `command not found: not` — the condition is handed to the command parser
-      because `value_start_in` does not recognize `not`. `DESIGN.md` writes the
-      idiom that way (`skip $p unless $p:exists`, `if $a:exists and not $b:exists`),
-      so the leading form should start a value like the attached `:name(…)` call
-      does. Pre-existing; found while writing a config-file guard.
+- [x] **A leading `not` starts a value.** `if not $b { … }` and `while not $b { … }`
+      read as conditions rather than a command named `not`, matching the postfix
+      guard and an assignment's right-hand side, which already parsed an expression
+      directly. Claimed only when what follows itself starts a value, so `not foo`
+      is still the command — the same discriminator `if $i < 3` uses against
+      `cmd <file`. A bare `true` / `false` counts as a value only after `not`, so
+      `if not false` negates while `if true` still runs the command; the one cost is
+      reaching a command named `not` as `not true` / `not false`. Claimed only when the
+      negation is the **whole statement**, as a lone integer literal is, so `not true
+      foo`, `not $x | cat`, and `not false > out.txt` stay the commands they were, with
+      the redirect judged after the *complete* operand so a list or a `:mod` operand
+      (`not [1 2] > out.txt`) redirects too.
+      `not -1` remains a command, since `-1` is not a value start anywhere in command
+      position — see the negative-literal item under "Loose ends".
 - [x] `$sh.status` (the readable `$?`) and `$sh.pipestatus` (a real list, not
       bash's magic `PIPESTATUS` array). The two always describe the *same* run:
       a compound's status is its body's, so the breakdown stays the body's too —
@@ -351,6 +358,48 @@ of each PR had landed by another route, but these pieces had not.
       forms, but the keyword is absent from `GRAMMAR.md` and `docs/`, is not
       listed among the deferred syntax there, and does not parse — `fork { pwd }`
       is a syntax error today.
+- [ ] **The parser has no recursion-depth limit.** Deeply nested input aborts the
+      whole shell with `thread 'main' has overflowed its stack` instead of reporting
+      a syntax error. Not new — on `main`, before any of #215, both of these already
+      abort:
+
+      ```
+      x = ((((… 20000 deep … ))))     → stack overflow
+      x = [[[[… 20000 deep … ]]]]     → stack overflow
+      x = not not not … $b            → stack overflow
+      ```
+
+      #215 removed the one case where its own lookahead recursed (a command-shaped
+      run of `not`s, now iterative and covered by a test), but a genuine *value*
+      chain — `if not not not … $b`, around 1000 deep — still reaches the shared
+      expression recursion and dies there, where before #215 that line was
+      command-shaped and merely reported `command not found: not`. The fix is a
+      depth counter in the expression parser that raises a syntax error at some
+      generous limit; it belongs with the general error model rather than with any
+      one operator, since parens and lists get there without `not` at all.
+- [ ] **Math at the prompt.** The goal (mikelward): type `1 + 2` at the prompt and
+      get `3`, so the shell is usable as a calculator without `expr`, `bc`, or
+      `$((…))`. Not supported today, and deliberately not part of #215 — recorded
+      here as the direction. Two things are missing, and only the second is
+      arithmetic at all:
+
+      1. **Display.** `1 + 2` already *evaluates* — the parser reaches it and the
+         result becomes the statement's value — but nothing prints it, and
+         `status_of` folds the integer into the exit status instead, so
+         `1 + 2` then `$sh.status` reports `3` while the terminal stays blank.
+         Deciding what an interactive prompt echoes for a value-producing
+         statement is the real work: it interacts with the bare-literal rule
+         above, with `capture`, and with not printing anything for `ls`.
+      2. **Negative literals in command position.** `-1` lexes as the minus
+         operator plus `1`, and only the expression parser puts them back
+         together, so `x = -1` works while `if -1 { … }`, `while -1`, a bare `-1`,
+         and `if not -1 { … }` all report `command not found: -1`. Decided
+         (#215) that it should eventually *be* an integer literal there, fixing
+         all four at the root rather than widening each lookahead — the
+         bare-literal rule above excludes `-3` for this same reason. The question
+         it must answer is where a literal ends and a flag begins, since `head -1`
+         and `sort -1` stay commands with flags; likely "attached digits after
+         `-` in *value* position," not everywhere.
 - [ ] **Document bold input in `DESIGN.md`.** Interactive input renders bold
       (`repl.rs`, `input_highlighter`), but the *design* — uniform weight rather
       than token-aware color, live as you type, surviving Enter into scrollback,

@@ -7109,6 +7109,246 @@ fn a_spaced_comparison_in_a_condition_is_not_a_redirection() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A leading `not` negates a **value**, so `if not $b { … }` is a condition rather
+/// than a command named `not`. `DESIGN.md` writes the idiom that way, and two of the
+/// three positions already read it so: a postfix guard and an assignment's
+/// right-hand side both parse an expression directly. Only the paths through
+/// `value_start_in` — an `if` or `while` condition, and statement position — were
+/// left out, which made `if not $b` report `command not found: not`.
+#[test]
+fn a_leading_not_negates_a_value_in_every_position() {
+    let out = run_with_input(
+        "b = false\n\
+         if not $b { puts if-form }\n\
+         while not $b { puts while-form\n\
+         b = true }\n\
+         t = true\n\
+         if not $t { puts wrong } else { puts negates-true }\n\
+         if not not $t { puts double } else { puts wrong }\n\
+         f = false\n\
+         puts guard-form if not $f\n\
+         x = not $t\n\
+         puts assigned $x\n\
+         if not false { puts literal-false }\n\
+         if not true { puts wrong } else { puts literal-true }\n\
+         puts guard-literal if not false\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // The literals matter as much as the variables: `x = not false` already
+        // worked, so an `if` that could not say it was the same inconsistency one
+        // level down.
+        "if-form\nwhile-form\nnegates-true\ndouble\nguard-form\nassigned false\n\
+         literal-false\nliteral-true\nguard-literal\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// It is claimed only when what **follows** starts a value, which is what keeps a
+/// command genuinely named `not` reachable — `not foo` has a bare word after it, and
+/// a bare word is not a value start, so it stays the command it always was. Same
+/// discriminator the language already uses for `if $i < 3` versus `cmd <file`.
+#[test]
+fn a_command_named_not_is_still_reachable() {
+    let dir = fresh_dir("leading_not_command");
+    let program = dir.join("not");
+    std::fs::write(&program, "#!/bin/sh\necho \"real-not ran with: $*\"\n").unwrap();
+    let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&program, permissions).unwrap();
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run = |body: &str| {
+        std::fs::write(dir.join("run.mesh"), body).unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .env("PATH", &path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    assert_eq!(run("not foo\n"), "real-not ran with: foo\n");
+    assert_eq!(run("not\n"), "real-not ran with: \n");
+    assert_eq!(run("not --flag\n"), "real-not ran with: --flag\n");
+    // In a condition too: the command runs and its status decides the branch.
+    assert_eq!(
+        run("if not foo { puts took-branch }\n"),
+        "real-not ran with: foo\ntook-branch\n"
+    );
+    // A function of that name wins over the external, as any function does.
+    assert_eq!(
+        run("func not(x) { puts fn-not $x }\nnot hello\n"),
+        "fn-not hello\n"
+    );
+    // And `not` as data is untouched in either spelling.
+    assert_eq!(run("puts not\nx = \"not\"\nputs $x\n"), "not\nnot\n");
+    // A word that merely starts with `not` was never in question, but the check is
+    // on the whole word, so pin it.
+    assert_eq!(run("notes = [a b]\nputs $notes:len\n"), "2\n");
+
+    // The one deliberate cost: a **boolean literal** after `not` is negation, so
+    // `not true` and `not false` no longer reach a command of that name. `if true`
+    // still runs the command, since only the position after `not` changes.
+    assert_eq!(run("not true\nputs after\n"), "after\n");
+    assert_eq!(run("if true { puts cmd-true }\n"), "cmd-true\n");
+
+    // And that cost is *exactly* those two spellings. A negation is claimed only when
+    // it is the whole statement, so anything that continues the line is the command
+    // it always was — an argument after the operand, a pipeline, or a redirect. These
+    // read as command invocations to anyone, and claiming them produced neither
+    // negation nor a command but `expected a statement separator`.
+    assert_eq!(run("not true foo\n"), "real-not ran with: true foo\n");
+    assert_eq!(
+        run("not false --flag\n"),
+        "real-not ran with: false --flag\n"
+    );
+    assert_eq!(run("x = 1\nnot $x foo\n"), "real-not ran with: 1 foo\n");
+    assert_eq!(run("not [1 2] foo\n"), "real-not ran with: [1 2] foo\n");
+    // A value cannot *be* a pipeline stage, so a negation heading one stays a command
+    // rather than leaving the `|` unconsumed.
+    assert_eq!(run("not true | cat\n"), "real-not ran with: true\n");
+    assert_eq!(run("x = 1\nnot $x | cat\n"), "real-not ran with: 1\n");
+}
+
+/// A redirect after the operand stays a redirect. `>` also spells a comparison, and
+/// the boolean clause originally lacked the guard the other value-shaped clauses
+/// carry, so `not false > out.txt` read as a comparison and failed with "comparison
+/// requires two integers or two strings" instead of running the command and writing
+/// the file.
+#[test]
+fn a_redirect_after_a_negation_operand_is_still_a_redirect() {
+    let dir = fresh_dir("leading_not_redirect");
+    let program = dir.join("not");
+    std::fs::write(&program, "#!/bin/sh\necho \"real-not ran with: $*\"\n").unwrap();
+    let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&program, permissions).unwrap();
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run = |body: &str| {
+        std::fs::write(dir.join("run.mesh"), body).unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .env("PATH", &path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        let written = std::fs::read_to_string(dir.join("out.txt")).unwrap_or_default();
+        let _ = std::fs::remove_file(dir.join("out.txt"));
+        (String::from_utf8_lossy(&out.stderr).into_owned(), written)
+    };
+
+    // Every operand shape, since the guard has to see the *completed* operand: a
+    // literal, a list, a variable carrying a postfix modifier, `>>`, and an attached
+    // `>out` with no space. A list and a `:mod` operand are the ones that got through
+    // a guard placed on the token that merely *starts* the operand.
+    for body in [
+        "not false > out.txt\n",
+        "not true > out.txt\n",
+        "not [1 2] > out.txt\n",
+        "x = [a b]\nnot $x:len > out.txt\n",
+        "not [1 2] >> out.txt\n",
+        "not true >out.txt\n",
+    ] {
+        let (stderr, written) = run(body);
+        assert!(stderr.is_empty(), "{body} errored: {stderr}");
+        assert!(
+            written.starts_with("real-not ran with:"),
+            "{body} did not redirect the command: {written:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The guard must leave a genuine comparison alone. A *spaced* `<` / `>` in a
+/// condition is a comparison rather than a redirect, and that holds after `not` too,
+/// so `if not $y > 2 { … }` negates the comparison. Run without a `not` on `PATH` on
+/// purpose: with one present, a command invocation also produces no error, so an
+/// "it did not fail" assertion would pass either way and prove nothing.
+///
+/// In a scratch directory because the failure mode is a *redirect*: if the guard ever
+/// claims these, mesh writes files named `2` and `5` in the working directory, and a
+/// test should not litter the source tree to fail.
+#[test]
+fn a_spaced_comparison_after_not_is_still_a_comparison() {
+    let dir = fresh_dir("leading_not_comparison");
+    std::fs::write(
+        dir.join("run.mesh"),
+        "y = 1\n\
+         if not $y > 2 { puts negated-cmp } else { puts wrong }\n\
+         xs = [a b]\n\
+         if not $xs:len > 5 { puts negated-mod-cmp } else { puts wrong }\n",
+    )
+    .unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "negated-cmp\nnegated-mod-cmp\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Nothing was redirected into a file named after the comparison's operand.
+    assert!(!dir.join("2").exists() && !dir.join("5").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The lookahead walks a run of `not`s in a loop rather than recursing once per
+/// word. Recursing cost a stack frame each, so a long *command-shaped* line —
+/// thousands of `not`s ending in a bare word, which is not a value start — blew the
+/// stack and aborted the process before the parser could conclude "this is a
+/// command." Generated or pasted input must not be able to kill the shell, so the
+/// interesting assertion is that it dies by diagnostic rather than by signal.
+#[test]
+fn a_long_command_shaped_not_chain_does_not_overflow_the_stack() {
+    let body = format!("{}foo\n", "not ".repeat(20_000));
+    let out = run_with_input(&body);
+
+    // `.code()` is `None` when a process is killed by a signal — SIGABRT is how a
+    // stack overflow surfaces — so this is the check that matters.
+    assert!(
+        out.status.code().is_some(),
+        "killed by a signal rather than reporting an error: {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("overflow"),
+        "stack overflow reported: {stderr}"
+    );
+    // It stays a command, as a bare word after `not` always does.
+    assert!(
+        stderr.contains("command not found: not"),
+        "expected command dispatch, got: {stderr}"
+    );
+}
+
 #[test]
 fn a_duplication_sends_one_descriptor_where_another_points() {
     let dir = fresh_dir("dup_basic");

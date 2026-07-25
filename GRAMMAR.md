@@ -446,6 +446,16 @@ label = if test -d .git { "git tree" } else { directory }
 items = if true { [one "two three"] } else { [] }
 ```
 
+A condition may be a **value** instead of a command, which is how `if $i < 3` and
+`if not $b` read — a leading `not` starts a value, so it negates rather than naming
+a command. Both are claimed only when what follows looks like a value, which leaves
+`cmd <file` a redirect and `not foo` a command. A bare `true` / `false` counts as a
+value only in that position, so `if not false` negates while `if true` still runs
+the command. A negation must also be the *whole* statement, as a lone integer literal
+must: `not true foo`, `not $x | cat`, and `not false > out.txt` stay commands. Whether a
+`<` / `>` is a redirect is judged after the *complete* operand, so `not [1 2] > out.txt`
+and `not $x:len > out.txt` redirect while a spaced `>` in a condition still compares.
+
 In statement position, the selected body runs normally and the other body is
 not evaluated. `return` and `exit` in a selected body retain their control-flow
 behavior. In assignment position, the selected branch's final physical line is
