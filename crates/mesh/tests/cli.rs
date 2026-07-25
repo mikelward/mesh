@@ -10245,3 +10245,46 @@ fn a_fork_block_does_not_reap_or_resume_the_shells_jobs() {
         "the parent lost its job to the child: {printed}"
     );
 }
+
+/// A subshell is a fresh boundary, so its body starts at status 0 like every other
+/// compound body — `false; fork { }` must not carry the failure from outside it
+/// across the very edge the construct exists to draw.
+#[test]
+fn a_fork_body_starts_at_a_zero_status() {
+    let out = run_with_input(
+        "false\nfork { }\nputs empty $sh.status\n\
+         false\nfork { true }\nputs ran $sh.status\n\
+         false\nif true { }\nputs if-case $sh.status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "empty 0\nran 0\nif-case 0\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A `fork` inside an already-forked stage must not touch job control: that
+/// process is not the shell, so taking the terminal there would hand it to a
+/// background job's group and leave the real shell without it once that job
+/// exits. Exercised here for its *status* and output, since the terminal half
+/// needs a tty; the guard itself is `in_forked_stage`.
+#[test]
+fn a_fork_nested_in_a_background_stage_still_runs() {
+    let out = run_with_input(
+        "func f() { fork { puts nested }\n  puts stage }\n\
+         f &\n\
+         sleep 0.3\n\
+         puts shell-alive\n",
+    );
+    let printed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        printed.contains("nested") && printed.contains("stage") && printed.contains("shell-alive"),
+        "{printed}"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
