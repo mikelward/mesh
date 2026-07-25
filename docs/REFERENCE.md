@@ -878,6 +878,21 @@ ride on `:` modifiers that are not implemented yet.
 puts $sh.stdin:repr           # mesh: :repr: a stream handle has no literal form
 ```
 
+One integer is refused for the opposite reason — it has a spelling, but the
+*parser* cannot read it back. `-9223372036854775808` parses as a negation applied
+to a magnitude too large for an integer, so `:repr` refuses rather than hand back
+text that fails to read. It is reachable by arithmetic even though you cannot
+type it:
+
+```mesh
+x = -9223372036854775807 - 1
+puts $x                       # -9223372036854775808
+puts $x:repr                  # mesh: :repr: the smallest integer has no literal the parser reads back
+```
+
+The guarantee is worth stating plainly: **whatever `:repr` returns, reading it
+back gives the same value.** Anything that would not is an error instead.
+
 A modifier that takes an argument writes it in parentheses, comma-separated like a
 value call: `$path:split(":")`, `$dirs:join(":")`. `:split(SEP)` turns a string into
 a list on the literal `SEP`, and `:join(SEP)` is the complementary fold — it

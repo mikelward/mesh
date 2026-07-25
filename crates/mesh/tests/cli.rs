@@ -10694,3 +10694,27 @@ fn repr_quotes_text_that_would_otherwise_not_read_back() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `i64::MIN` is reachable by arithmetic even though it cannot be written as a
+/// literal, so `:repr` has to refuse it rather than hand back text that fails to
+/// read back. Without the refusal this is the one input that breaks the
+/// round-trip contract from inside ordinary mesh code.
+#[test]
+fn repr_refuses_the_smallest_integer_it_cannot_write_readably() {
+    let out = run_with_input(
+        "x = -9223372036854775807 - 1\n\
+         puts $x\n\
+         puts $x:repr\n",
+    );
+    // The value itself is fine — it is only its *literal* that does not exist.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "-9223372036854775808\n"
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the smallest integer has no literal the parser reads back"),
+        "got {stderr}"
+    );
+}

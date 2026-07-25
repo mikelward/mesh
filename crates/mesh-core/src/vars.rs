@@ -40,17 +40,21 @@ pub enum NoLiteral {
     Glob,
     Stream,
     Function,
+    /// `i64::MIN`, the one value here that *has* a spelling the writer could
+    /// produce and the **reader** cannot take back — see [`Value::write_literal`].
+    MinInteger,
 }
 
 impl std::fmt::Display for NoLiteral {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let noun = match self {
-            NoLiteral::Regex => "a regex",
-            NoLiteral::Glob => "a glob",
-            NoLiteral::Stream => "a stream handle",
-            NoLiteral::Function => "a function",
+        let reason = match self {
+            NoLiteral::Regex => "a regex has no literal form",
+            NoLiteral::Glob => "a glob has no literal form",
+            NoLiteral::Stream => "a stream handle has no literal form",
+            NoLiteral::Function => "a function has no literal form",
+            NoLiteral::MinInteger => "the smallest integer has no literal the parser reads back",
         };
-        f.write_str(noun)
+        f.write_str(reason)
     }
 }
 
@@ -63,11 +67,12 @@ impl Value {
     /// would lex as a bare word, and the empty map is `[:]` rather than the `[]`
     /// that would read back as the empty list.
     ///
-    /// Not every value has a literal form, and the ones that do not are exactly
-    /// the ones with nothing to write down: `DESIGN.md` §"Isolation and subshells"
-    /// draws the line at values whose spelling round-trips. Those answer `Err`
-    /// with the noun to put in a diagnostic, rather than a lossy approximation
-    /// that would parse back as something else.
+    /// Not every value has a literal form. Mostly those are the ones with nothing
+    /// to write down — `DESIGN.md` §"Isolation and subshells" draws the line at
+    /// values whose spelling round-trips — plus `i64::MIN`, which the *reader*
+    /// cannot take back. Either way the answer is `Err` carrying the reason for a
+    /// diagnostic, never a lossy approximation that would parse back as something
+    /// else. The invariant callers get is the useful one: **every `Ok` round-trips.**
     pub fn to_literal(&self) -> Result<String, NoLiteral> {
         let mut out = String::new();
         self.write_literal(&mut out)?;
@@ -77,6 +82,15 @@ impl Value {
     fn write_literal(&self, out: &mut String) -> Result<(), NoLiteral> {
         match self {
             Value::String(text) => quote_into(text, out),
+            // `-9223372036854775808` is text the writer can produce and the reader
+            // cannot take back: it parses as a negation over the magnitude
+            // `9223372036854775808`, which does not fit an `i64`, so the operand is
+            // already a string by the time the sign would apply. Reachable rather
+            // than theoretical — `-9223372036854775807 - 1` lands here — and the
+            // round-trip contract is only worth anything if every `Ok` honors it,
+            // so this refuses rather than emitting a literal that fails to read.
+            // The parser fix is in `TODO.md`; it deletes this arm.
+            Value::Integer(i64::MIN) => return Err(NoLiteral::MinInteger),
             Value::Integer(number) => out.push_str(&number.to_string()),
             Value::Boolean(flag) => out.push_str(if *flag { "true" } else { "false" }),
             Value::List(values) => {
@@ -796,7 +810,20 @@ mod tests {
             Value::Function(FuncValue::modifier("stem".into())).to_literal(),
             Err(NoLiteral::Function)
         );
-        assert_eq!(NoLiteral::Stream.to_string(), "a stream handle");
+        // Reachable by arithmetic (`-9223372036854775807 - 1`), so refusing it is
+        // what keeps every `Ok` honoring the round-trip contract.
+        assert_eq!(
+            Value::Integer(i64::MIN).to_literal(),
+            Err(NoLiteral::MinInteger)
+        );
+        assert_eq!(
+            Value::Integer(i64::MIN + 1).to_literal().unwrap(),
+            "-9223372036854775807"
+        );
+        assert_eq!(
+            NoLiteral::Stream.to_string(),
+            "a stream handle has no literal form"
+        );
     }
 
     #[test]

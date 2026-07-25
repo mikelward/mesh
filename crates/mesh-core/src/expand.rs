@@ -658,7 +658,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 .map(Value::String)
                 .map_err(|kind| ExpandError::Modifier {
                     name: name.into(),
-                    message: format!("{kind} has no literal form"),
+                    message: kind.to_string(),
                 })
         }
         Keys => match value {

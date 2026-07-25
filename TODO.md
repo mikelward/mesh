@@ -473,8 +473,12 @@ of each PR had landed by another route, but these pieces had not.
       changes how *every* negative literal parses, so it wants its own change
       rather than riding along with one. Found by the `:repr` round-trip tests,
       where it is the one value the writer can spell and the reader cannot take
-      back; pinned by `the_smallest_integer_writes_correctly_but_does_not_read_back_yet`
-      in `repl.rs`, which fails when this is fixed.
+      back. `:repr` **refuses** it meanwhile (`NoLiteral::MinInteger`), because it
+      is reachable by arithmetic — `-9223372036854775807 - 1` — and a round-trip
+      contract with one silent hole is not one the fork value channel could build
+      on. Fixing the parser therefore deletes that arm as well: pinned from both
+      sides by `the_smallest_integer_is_refused_until_the_reader_can_take_it` in
+      `repl.rs`, which fails when this lands.
 - [ ] **Two modifier tables, one of them quietly stale.** `lexer::Modifier`
       (`lexer.rs:36`) and `expand::Modifier` (`expand.rs:27`) are separate enums
       with separate `from_name` tables, and the lexer's has not been extended
