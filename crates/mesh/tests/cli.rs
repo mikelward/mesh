@@ -10162,6 +10162,12 @@ fn a_command_named_fork_is_still_reachable() {
     assert_eq!(run("fork somewhere\n"), "real-fork: somewhere\n");
     // Only the brace makes it the keyword.
     assert_eq!(run("fork { puts subshell }\n"), "subshell\n");
+    // Across a newline too, since `fork_expr` consumes them before the block and
+    // `loop` / `if` both accept the same shape. It is the brace that decides, not
+    // how much whitespace precedes it — and `fork\n` above still runs the command,
+    // which is what keeps this from swallowing the bare invocation.
+    assert_eq!(run("fork\n{ puts subshell }\n"), "subshell\n");
+    assert_eq!(run("fork\n\n  { puts subshell }\n"), "subshell\n");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

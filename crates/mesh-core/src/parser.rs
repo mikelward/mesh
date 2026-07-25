@@ -1564,12 +1564,7 @@ impl Parser {
         // Contextual, like `global` and `unset`: `fork` leads a statement only
         // where a subshell can follow, so a command of that name is still
         // reachable as `fork`, `fork --flag`, or `fork somewhere`.
-        if self.word("fork")
-            && self
-                .tokens
-                .get(self.position + 1)
-                .is_some_and(|token| matches!(token.value, TokenKind::LBrace))
-        {
+        if self.word("fork") && self.block_follows(1) {
             return self.fork_expr();
         }
         if self.word("return") || self.word("break") || self.word("continue") {
@@ -3352,6 +3347,21 @@ impl Parser {
     }
     fn newlines(&mut self) {
         while self.eat(&TokenKind::Newline).is_some() {}
+    }
+    /// Does a block open `offset` ahead, across any newlines in between? A
+    /// contextual keyword has to ask this the way its own parser will read it:
+    /// `fork_expr` consumes newlines before the `{`, so a lookahead at the
+    /// immediate token alone made `fork\n{ … }` a command and then a syntax
+    /// error, while `loop` — an unconditional keyword needing no lookahead —
+    /// accepted the same shape.
+    fn block_follows(&self, offset: usize) -> bool {
+        self.tokens
+            .get(self.position + offset..)
+            .and_then(|rest| {
+                rest.iter()
+                    .find(|token| !matches!(token.value, TokenKind::Newline))
+            })
+            .is_some_and(|token| matches!(token.value, TokenKind::LBrace))
     }
     /// Is the token `offset` ahead an assignment operator? Used to tell a
     /// statement keyword from a variable that happens to share its name.
