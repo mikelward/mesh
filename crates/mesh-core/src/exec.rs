@@ -370,8 +370,8 @@ impl JobTable {
     /// that process. `DESIGN.md` draws exactly that line, and it is why a handle
     /// has no byte form: `$j` cannot arrive here looking like a number.
     ///
-    /// The signal defaults to `TERM` and is named as `-9`, `-KILL`, `-SIGKILL`
-    /// or `-s KILL`. Each target is signalled independently, so one bad name
+    /// The signal defaults to `TERM` and is named as `-9`, `-KILL`, `-SIGKILL`,
+    /// `-s KILL` or `-n 9`. Each target is signalled independently, so one bad name
     /// does not stop the rest; the status is the last failure, or 0.
     pub fn kill(&mut self, args: &[String]) -> u8 {
         let (signal, targets) = match split_signal(args) {
@@ -1782,9 +1782,13 @@ fn split_signal(args: &[String]) -> Result<(libc::c_int, &[String]), &str> {
     let Some(first) = args.first() else {
         return Ok((libc::SIGTERM, args));
     };
-    if first == "-s" {
+    // `-s sigspec` and `-n signum` are both spellings bash documents. They take
+    // the same values here rather than one being restricted to numbers: the
+    // parsing is shared, and refusing `-n TERM` would be a rule with nothing
+    // behind it but the letter chosen.
+    if first == "-s" || first == "-n" {
         let Some(name) = args.get(1) else {
-            return Err("-s");
+            return Err(first.as_str());
         };
         return signal_number(name)
             .map(|signal| (signal, skip_terminator(&args[2..])))

@@ -392,7 +392,7 @@ The status is `wait`'s own result — read it from `$sh.status`.
 
 ```mesh
 kill $j                         # the job's whole process group, with TERM
-kill -9 %+                      # -9, -KILL, -SIGKILL and -s KILL all work
+kill -9 %+                      # -9, -KILL, -SIGKILL, -s KILL, -n 9 all work
 kill 49001                      # a pid — just that process
 ```
 
