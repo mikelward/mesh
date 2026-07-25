@@ -259,6 +259,17 @@ pub enum AndOrOp {
     Or,
 }
 
+/// One thing an `unset` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsetTarget {
+    /// A whole binding, dropped from the scope.
+    Name(Spanned<String>),
+    /// A place inside one — `$m.key`, `$xs[0]` — carried as the raw reference text
+    /// exactly as [`Executable::MemberAssignment`] carries its target, so both go
+    /// through one path parser.
+    Member(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Executable {
     Pipeline(Pipeline),
@@ -272,9 +283,10 @@ pub enum Executable {
         global: bool,
     },
     /// `unset name …` — drop bindings in the current scope, or with `global`, in
-    /// the session-global one.
+    /// the session-global one. A target may instead name a **place inside** a
+    /// binding (`unset $m.key`), which removes that entry rather than the binding.
     Unset {
-        names: Vec<Spanned<String>>,
+        targets: Vec<UnsetTarget>,
         global: bool,
     },
     /// `$env.KEY = value` — a write to the process environment rather than to a
@@ -3164,17 +3176,23 @@ impl Parser {
     }
 
     fn unset(&mut self, global: bool) -> Result<Executable, ParseError> {
-        let mut names = Vec::new();
-        while let Some(text) = self.word_text_at(0) {
-            let name = text.to_owned();
-            let span = self.tokens[self.position].span.clone();
-            self.position += 1;
-            names.push(Spanned { value: name, span });
+        let mut targets = Vec::new();
+        loop {
+            if let Some(text) = self.word_text_at(0) {
+                let name = text.to_owned();
+                let span = self.tokens[self.position].span.clone();
+                self.position += 1;
+                targets.push(UnsetTarget::Name(Spanned { value: name, span }));
+            } else if let Some(target) = self.member_target() {
+                targets.push(UnsetTarget::Member(target));
+            } else {
+                break;
+            }
         }
-        if names.is_empty() {
-            return Err(self.error(ParseErrorKind::Expected("a name to unset")));
+        if targets.is_empty() {
+            return Err(self.error(ParseErrorKind::Expected("a name or place to unset")));
         }
-        Ok(Executable::Unset { names, global })
+        Ok(Executable::Unset { targets, global })
     }
 
     fn word(&self, expected: &str) -> bool {

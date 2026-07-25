@@ -6762,6 +6762,124 @@ fn a_failed_write_leaves_no_local_shadow_behind() {
     );
 }
 
+/// `unset $m.key` and `unset $xs[0]` remove an **entry** rather than the binding
+/// that holds it, the deletion `TODO.md` recorded as waiting on member assignment.
+/// It shares that feature's path walker, so a nested path, a negative index, and a
+/// quoted key all behave as they do on the way in.
+#[test]
+fn unset_removes_a_collection_element() {
+    let out = run_with_input(
+        "m = [a: 1, b: 2, c: 3]\n\
+         unset $m.b\n\
+         puts ...$m:keys\n\
+         xs = [10 20 30]\n\
+         unset $xs[1]\n\
+         puts ...$xs\n\
+         unset $xs[-1]\n\
+         puts ...$xs\n\
+         nested = [outer: [x: 1, y: 2]]\n\
+         unset $nested.outer.x\n\
+         puts ...$nested.outer:keys\n\
+         keyed = [\"a:b\": 1, other: 2]\n\
+         unset $keyed[\"a:b\"]\n\
+         puts ...$keyed:keys\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // Removing from a list shifts what follows, so `unset $xs[1]` drops the
+        // element rather than leaving a hole.
+        "a c\n10 30\n10\ny\nother\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Names and places mix in one statement, each handled its own way.
+    let mixed = run_with_input("p = 1\nq = 2\nm = [k: 9]\nunset p $m.k q\nputs $m:len\nputs $p\n");
+    assert_eq!(String::from_utf8_lossy(&mixed.stdout), "0\n");
+    assert!(
+        String::from_utf8_lossy(&mixed.stderr).contains("p: unbound variable"),
+        "{}",
+        String::from_utf8_lossy(&mixed.stderr)
+    );
+}
+
+/// Removing an element follows the same scope rule writing one does — local by
+/// default, `global` to reach the outer binding — and a **failed** removal leaves
+/// no local shadow behind, both of which come from sharing `Vars::update`.
+#[test]
+fn unsetting_an_element_follows_the_member_assignment_scope_rules() {
+    let out = run_with_input(
+        "m = [a: 1, b: 2]\n\
+         func local() { unset $m.a\n\
+         puts inside $m:len }\n\
+         local\n\
+         puts outside $m:len\n\
+         func through() { global unset $m.a\n\
+         puts g-inside $m:len }\n\
+         through\n\
+         puts g-outside $m:len\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // The local removal shadows; `global unset` carries out of the function.
+        "inside 1\noutside 2\ng-inside 1\ng-outside 1\n"
+    );
+
+    // A failed removal must not shadow either — otherwise the later `global`
+    // write would be read past by a stale copy.
+    let failed = run_with_input(
+        "k = [a: 1]\n\
+         func f() { unset $k.nope\n\
+         global $k.a = 3\n\
+         puts sees $k.a }\n\
+         f\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&failed.stdout), "sees 3\n");
+}
+
+/// The same fail-loud rules the assignment side uses, in `unset`'s own words.
+#[test]
+fn unsetting_a_missing_element_is_a_loud_error() {
+    for (source, message) in [
+        (
+            "m = [a: 1]\nunset $m.nope\n",
+            "$m.nope: no `nope` in this map",
+        ),
+        (
+            "xs = [1 2]\nunset $xs[9]\n",
+            "$xs[9]: list index out of range",
+        ),
+        (
+            "xs = [1 2 3]\nunset $xs[0..2]\n",
+            "$xs[0..2]: cannot unset a slice",
+        ),
+        (
+            "s = \"t\"\nunset $s.k\n",
+            "$s.k: cannot unset from a string",
+        ),
+        (
+            "xs = [1 2]\nunset $xs.k\n",
+            "$xs.k: a list has no `k` member",
+        ),
+        ("unset $nope.k\n", "nope: unbound variable"),
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source} gave {stderr}");
+    }
+
+    // The reserved namespaces are not places here either, so removing an entry
+    // from the environment is still not spelled this way.
+    for source in ["unset $env.PATH\n", "unset $sh.pid\n"] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(2), "{source}");
+    }
+}
+
 /// A colon inside a **subscript** belongs to the key, not to a modifier chain, so
 /// every quoted key that reads also writes. Scanning the target text for a bare `:`
 /// got this wrong: `$m["a:b"]` reads fine but was rejected as an assignment target.
@@ -7921,9 +8039,10 @@ fn global_and_unset_are_only_keywords_where_a_statement_can_follow() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The message names both shapes now that `unset $m.key` is one of them.
     let out = run_with_input("unset\n");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("a name to unset"),
+        String::from_utf8_lossy(&out.stderr).contains("a name or place to unset"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

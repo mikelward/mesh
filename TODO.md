@@ -274,9 +274,14 @@ file as tasks land.
       the session-global binding instead, the escape hatch that lets a function
       modify a caller's collection. A slice is not a place, and a list is written
       in place, so an out-of-range index is an error. `$env.KEY` keeps its own
-      byte-boundary rules and `$sh` stays read-only. Still deferred:
-      deleting a collection element (`unset $m.key`, `unset $xs[i]`), which this
-      unblocks.
+      byte-boundary rules and `$sh` stays read-only.
+- [x] Deleting a collection element — `unset $m.key`, `unset $xs[i]`, and
+      `global unset $m.key` — sharing the assignment's path walker, so a nested
+      path, a negative index, a quoted key, the fail-loud rules, and the
+      no-stale-shadow guarantee all come across unchanged. Removing from a list
+      shifts what follows. Names and places mix in one statement. `$env` and `$sh`
+      are not places here either, so removing an environment entry still has no
+      spelling.
 
 ## Beyond M3 — Invocation
 

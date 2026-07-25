@@ -485,6 +485,16 @@ left alone rather than reached through — matching the rule that makes assignme
 local. **`global unset name`** is how to remove a session-global from inside a
 function, symmetric with `global name = value`.
 
+A target may instead name a **place inside** a binding — `unset $m.key`,
+`unset $xs[0]` — which removes that entry and leaves the binding itself alone. It
+is the mirror of [member assignment](#member-assignment) and follows the same
+rules: the path may mix members and indices, a negative index counts from the end,
+nothing missing along it is forgiven, and the removal is local-by-default with
+`global unset $m.key` to reach the outer binding. Removing from a list **shifts**
+what follows, so `unset $xs[0]` drops the first element rather than leaving a hole.
+Names and places may be mixed in one statement (`unset p $m.k q`), and `$env` /
+`$sh` are no more places here than they are on the assignment side.
+
 ```mesh
 x = outer
 func f() { unset x }
@@ -575,6 +585,8 @@ a run of elements, and a length-changing assignment has no defined meaning yet.
 
 Two rules are worth stating outright, because both are choices:
 
+- **`unset $m.key`** is the matching removal — see
+  [Scope](#scope-global-and-unset).
 - **Local by default**, like every other assignment. Inside a function
   `$m.key = v` shadows an outer `m` rather than reaching through to it — the same
   thing `m += …` and `m = …` already do. **`global $m.key = v`** writes *into* the

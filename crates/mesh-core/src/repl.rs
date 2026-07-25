@@ -806,9 +806,21 @@ fn run_executable(
             }
             Err(step) => step,
         },
-        Unset { names, global } => {
+        Unset { targets, global } => {
             let mut status = 0;
-            for name in names {
+            for target in targets {
+                let name = match target {
+                    // A place inside a binding: remove the entry, leaving the
+                    // binding itself in place.
+                    parser::UnsetTarget::Member(target) => {
+                        if let Err(error) = unset_member(target, *global, shell) {
+                            note!("mesh: unset: {error}");
+                            status = 1;
+                        }
+                        continue;
+                    }
+                    parser::UnsetTarget::Name(name) => name,
+                };
                 if crate::vars::is_reserved_namespace(&name.value) {
                     note!("mesh: unset: `{}` is reserved", name.value);
                     status = 1;
@@ -1755,27 +1767,85 @@ fn assign_into_member(
     global: bool,
     shell: &mut Shell,
 ) -> Result<(), String> {
+    let (root, steps) = resolve_path(target, "assign to", &shell.vars)?;
+    // Through `Vars::update`, so a failed path leaves no local shadow behind: the
+    // write runs on a copy and is installed only once the whole thing succeeds.
+    shell.vars.update(&root, global, |root| {
+        write_at(root, &steps, value, append, target)
+    })
+}
+
+/// Split a target's accesses into steps, resolving subscripts against the variable
+/// store **before** anything is borrowed mutably — that is what lets `$xs[$i]` work
+/// and keeps the borrow of the place uncontested. Returns the root name beside them.
+///
+/// `verb` names the operation in the one error this raises, so `unset` and an
+/// assignment describe a slice in their own words while sharing the walk.
+fn resolve_path(
+    target: &str,
+    verb: &str,
+    vars: &vars::Vars,
+) -> Result<(String, Vec<PathStep>), String> {
     let vref = expansion_variable(target, parser::QuoteMode::Bare);
     let mut steps = Vec::with_capacity(vref.accesses.len());
     for access in &vref.accesses {
         steps.push(match access {
             expand::Access::Member(key) => PathStep::Member(key.clone()),
             expand::Access::Subscript(subscript) => PathStep::Subscript(
-                expand::subscript_key(subscript, &shell.vars).map_err(|error| error.to_string())?,
+                expand::subscript_key(subscript, vars).map_err(|error| error.to_string())?,
             ),
-            // A slice names a copy of a run of elements, not a place. Splicing one
-            // (`$xs[0..2] = [a b c]`) would also have to answer what a
-            // length-changing assignment means, which `DESIGN.md` does not.
+            // A slice names a copy of a run of elements, not a place — and for
+            // either operation it would have to answer what changing a list's
+            // length means, which `DESIGN.md` does not.
             expand::Access::Slice { .. } => {
-                return Err(format!("{target}: cannot assign to a slice"));
+                return Err(format!("{target}: cannot {verb} a slice"));
             }
         });
     }
-    // Through `Vars::update`, so a failed path leaves no local shadow behind: the
-    // write runs on a copy and is installed only once the whole thing succeeds.
-    shell.vars.update(&vref.name, global, |root| {
-        write_at(root, &steps, value, append, target)
-    })
+    Ok((vref.name, steps))
+}
+
+/// `unset $m.key`, `unset $xs[0]` — remove an entry from a bound collection.
+///
+/// Walks to the **parent** of the last step and removes there, so it shares
+/// `descend` with the assignment path rather than repeating it. Removing from a list
+/// shifts what follows, which is what makes `unset $xs[0]` mean "drop the first
+/// element" rather than "leave a hole".
+fn unset_member(target: &str, global: bool, shell: &mut Shell) -> Result<(), String> {
+    let (root, steps) = resolve_path(target, "unset", &shell.vars)?;
+    shell
+        .vars
+        .update(&root, global, |root| remove_at(root, &steps, target))
+}
+
+/// Remove the entry a resolved path's last step names, as the whole effect of the
+/// statement — so a failed removal changes nothing, the same guarantee `write_at`
+/// gives the assignment it shares [`Vars::update`] with.
+fn remove_at(root: &mut Value, steps: &[PathStep], target: &str) -> Result<(), String> {
+    let (last, path) = steps.split_last().expect("the parser required one access");
+    let mut place = root;
+    for step in path {
+        place = descend(place, step, target)?;
+    }
+    match (place, last) {
+        (Value::Map(entries), PathStep::Member(key) | PathStep::Subscript(key)) => {
+            let position = entries
+                .iter()
+                .position(|(candidate, _)| candidate == key)
+                .ok_or_else(|| format!("{target}: no `{key}` in this map"))?;
+            entries.remove(position);
+            Ok(())
+        }
+        (Value::List(values), PathStep::Subscript(index)) => {
+            let offset = list_offset(values.len(), index, target)?;
+            values.remove(offset);
+            Ok(())
+        }
+        (Value::List(_), PathStep::Member(key)) => {
+            Err(format!("{target}: a list has no `{key}` member"))
+        }
+        (other, _) => Err(format!("{target}: cannot unset from {}", value_kind(other))),
+    }
 }
 
 /// Walk a resolved path from `root` to the place its last step names, and write
@@ -1853,18 +1923,26 @@ fn list_slot<'a>(
     index: &str,
     target: &str,
 ) -> Result<&'a mut Value, String> {
+    let offset = list_offset(values.len(), index, target)?;
+    Ok(&mut values[offset])
+}
+
+/// Resolve an index against a list's length, negative counting from the end as a
+/// read does. Shared by the write and the removal so one rule covers both: an
+/// out-of-range index is an error either way, since a write has no value to fill a
+/// gap with and a removal has nothing to drop.
+fn list_offset(len: usize, index: &str, target: &str) -> Result<usize, String> {
     let index: i64 = index
         .parse()
         .map_err(|_| format!("{target}: list index must be an integer"))?;
     let offset = if index < 0 {
-        values.len() as i128 + i128::from(index)
+        len as i128 + i128::from(index)
     } else {
         i128::from(index)
     };
     usize::try_from(offset)
         .ok()
-        .filter(|offset| *offset < values.len())
-        .map(|offset| &mut values[offset])
+        .filter(|offset| *offset < len)
         .ok_or_else(|| format!("{target}: list index out of range"))
 }
 
