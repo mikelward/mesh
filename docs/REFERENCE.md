@@ -54,9 +54,41 @@ Positional arguments are a real list — `$sh.args` — not `$1` / `$@` / `$#`:
 
 Both are read-only, and `sh` is a reserved name: it cannot be assigned, used as
 a function parameter, or bound by a pattern. (Only `sh` itself is reserved — an
-ordinary variable may still be called `status`, `name`, or `args`.) `$sh.status`
-and `$sh.pipestatus` are implemented too — see [Exit status](#exit-status). The
-rest of the `$sh.*` surface in `DESIGN.md` is not.
+ordinary variable may still be called `status`, `name`, or `args`.)
+
+The rest of the read-only runtime surface:
+
+| Read | Value |
+|---|---|
+| `$sh.status` | The last command's exit status — see [Exit status](#exit-status) |
+| `$sh.pipestatus` | That run's per-stage statuses, as a list |
+| `$sh.pid` / `$sh.ppid` | This shell's process id, and its parent's |
+| `$sh.version` | The shell's version |
+| `$sh.interactive` | Whether this is an interactive session |
+| `$sh.stdin` / `$sh.stdout` / `$sh.stderr` | Handles for the shell's own streams |
+
+`$sh.interactive` answers **which loop is running**, not what fd 0 happens to
+be — `mesh -s` on a terminal reads commands without being an interactive session,
+and reports `false`.
+
+For "is *this stream* a terminal", the stream handles take **`:tty`** — the
+`test -t N` replacement:
+
+```mesh
+func confirm(question) {
+  if $sh.stdin:tty and $sh.stderr:tty {
+    …
+  }
+}
+```
+
+A handle has **no byte form**, so it never crosses into argv or a string:
+`puts $sh.stdin` is a loud error, the same way a regex or a list is. It exists to
+be asked questions, and `:tty` is the question — asking it of anything else is
+an error rather than a quiet answer about some unrelated descriptor.
+
+`$sh.options`, `$sh.jobs`, and the hook maps in `DESIGN.md` are not implemented
+yet.
 
 ---
 

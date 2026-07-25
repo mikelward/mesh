@@ -6,6 +6,7 @@
 //! stderr, and the exit code.
 
 use std::io::Write;
+use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -7464,7 +7465,7 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     let out = run_with_input("puts ...$sh:keys\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "status pipestatus name args\n"
+        "status pipestatus pid ppid version interactive stdin stdout stderr name args\n"
     );
 
     // A mistyped key is still a loud error, and `status` is not a reserved
@@ -7716,4 +7717,161 @@ fn bare_export_names_the_spelling_that_works() {
     // follow, so a variable may still be called `export`.
     let out = run_with_input("export = 5\nputs $export\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+}
+
+// ---------------------------------------------------------------------------
+// The rest of the read-only runtime $sh.* surface
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sh_reports_the_shells_own_process_ids() {
+    // Checked against a child's view of its parent rather than against a
+    // plausible-looking number, since any integer would look right.
+    let out = run_with_input("puts $sh.pid\nsh -c 'echo $PPID'\n");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(lines[0], lines[1], "$sh.pid is not the shell's own pid");
+
+    // `$sh.ppid` is the test process, which is this program.
+    let out = run_with_input("puts $sh.ppid\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        std::process::id().to_string()
+    );
+
+    // Both name the *shell*, not whichever process is reading them: bash's `$$`
+    // and `$PPID` do not change inside a subshell, and a forked pipeline stage
+    // is one. Reading them per access would report the stage's own ids here.
+    let out = run_with_input("puts $sh.pid\nfunc f() { puts $sh.pid }\nf | cat\n");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(lines[0], lines[1], "$sh.pid changed inside a forked stage");
+
+    let out = run_with_input("puts $sh.ppid\nfunc f() { puts $sh.ppid }\nf | cat\n");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(lines[0], lines[1], "$sh.ppid changed inside a forked stage");
+}
+
+#[test]
+fn sh_version_is_the_shells_own_version() {
+    let out = run_with_input("puts $sh.version\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+#[test]
+fn sh_interactive_answers_which_loop_is_running() {
+    // Piped input is not an interactive session…
+    let out = run_with_input("puts $sh.interactive\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "false\n");
+
+    // …nor is `-c`, nor a script.
+    let out = run_with_args(&["-c", "puts $sh.interactive"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "false\n");
+    let path = script("sh_interactive", "puts $sh.interactive\n");
+    let out = run_with_args(&[path.to_str().unwrap()]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "false\n");
+}
+
+#[test]
+fn sh_stream_handles_are_descriptors_with_a_tty_test() {
+    // A handle has no canonical byte form, so it never crosses to argv or into
+    // a string — `DESIGN.md` puts it in the same row as a regex. The point of
+    // the type is that this is a loud error rather than a printed `0`.
+    for source in [
+        "puts $sh.stdin\n",
+        "puts \"fd=$sh.stdin\"\n",
+        "export E = $sh.stdin\n",
+    ] {
+        let out = run_with_input(source);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("stream handle"),
+            "{source}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    }
+
+    // Wherever a handle reaches a typed error, it is named as one. Grouping it
+    // with the patterns compiled fine and reported "a glob" / "a pattern",
+    // which is exactly the kind of wrong a new variant is supposed to prevent.
+    for source in [
+        "ys = [1]:map($sh.stdin)\n",
+        "ys = [1]:filter($sh.stdin)\n",
+        "xs = [$sh.stdin]\nputs ...$xs\n",
+        "xs = [$sh.stdin]\ny = $xs:join(\",\")\n",
+    ] {
+        let stderr = String::from_utf8_lossy(&run_with_input(source).stderr).into_owned();
+        assert!(stderr.contains("stream handle"), "{source}: {stderr}");
+        assert!(
+            !stderr.contains("glob") && !stderr.contains("pattern"),
+            "{source}: {stderr}"
+        );
+    }
+
+    // Every stream here is a pipe, so every answer is false.
+    let out = run_with_input("puts $sh.stdin:tty $sh.stdout:tty $sh.stderr:tty\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "false false false\n");
+
+    // A test that can only ever see `false` would pass even if `:tty` always
+    // returned it, so give the shell a real terminal on **one** stream: stdin is
+    // a pty and stdout stays a pipe, an answer a constant could not produce.
+    let (master, slave) = open_pty();
+    let out = mesh_command()
+        .args(["-c", "puts $sh.stdin:tty $sh.stdout:tty"])
+        .stdin(unsafe { Stdio::from(std::os::fd::OwnedFd::from_raw_fd(slave)) })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run mesh");
+    unsafe { libc::close(master) };
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true false\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A scalar question maps element-wise over a list, as the file tests do.
+    let out = run_with_input("fds = [$sh.stdin $sh.stdout]\nt = $fds:tty\nputs ...$t\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "false false\n");
+
+    // `:tty` asks about a handle, so a bare integer is a loud error rather than
+    // a quiet answer about whatever descriptor happens to have that number.
+    for source in ["x = abc\ny = $x:tty\n", "n = 1\ny = $n:tty\n"] {
+        let out = run_with_input(&format!("{source}puts after\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("requires a stream handle"),
+            "{source}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    }
+}
+
+/// A (master, slave) pty pair. The slave is a genuine terminal, which is the
+/// only way to make `isatty` answer true without a controlling tty in CI.
+fn open_pty() -> (RawFd, RawFd) {
+    let mut master = 0;
+    let mut slave = 0;
+    let ok = unsafe {
+        // `null_mut` rather than `null` for the termios/winsize arguments: Apple
+        // declares them `*mut` and Linux `*const`, and `*mut T` coerces to
+        // `*const T` but not the reverse — so only this spelling builds on both.
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(ok, 0, "openpty failed");
+    (master, slave)
 }

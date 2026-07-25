@@ -1963,6 +1963,7 @@ fn eval_expr(
                     | Value::Boolean(_)
                     | Value::Regex(_)
                     | Value::Glob(_)
+                    | Value::Stream(_)
                     | Value::Function(_) => runtime_error("cannot slice a scalar value"),
                     Value::Map(_) => runtime_error("cannot slice a map value"),
                 };
@@ -1992,6 +1993,7 @@ fn eval_expr(
                 | Value::Boolean(_)
                 | Value::Regex(_)
                 | Value::Glob(_)
+                | Value::Stream(_)
                 | Value::Function(_) => runtime_error("cannot index a scalar value"),
                 Value::Map(entries) => {
                     let key = match index_value {
@@ -2412,6 +2414,7 @@ fn value_kind(value: &Value) -> &'static str {
         Value::Map(_) => "a map",
         Value::Regex(_) => "a regex",
         Value::Glob(_) => "a glob",
+        Value::Stream(_) => "a stream handle",
         Value::Function(_) => "a function",
     }
 }
@@ -2949,6 +2952,7 @@ fn argv_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
         Value::Regex(_) | Value::Glob(_) => {
             runtime_error(format!("{name}: a pattern cannot be a command argument"))
         }
+        Value::Stream(_) => runtime_error(format!("{name}: a stream handle has no text form")),
         Value::Function(_) => runtime_error(format!("{name}: a function value has no text form")),
     }
 }
@@ -3229,7 +3233,7 @@ fn truthy(value: &Value) -> bool {
         Value::Boolean(value) => *value,
         Value::List(v) => !v.is_empty(),
         Value::Map(v) => !v.is_empty(),
-        Value::Regex(_) | Value::Glob(_) | Value::Function(_) => true,
+        Value::Regex(_) | Value::Glob(_) | Value::Stream(_) | Value::Function(_) => true,
     }
 }
 
@@ -3328,6 +3332,7 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
             | Value::Boolean(_)
             | Value::Regex(_)
             | Value::Glob(_)
+            | Value::Stream(_)
             | Value::Function(_) => {
                 return Err("right operand of `in` must be a collection or string".into());
             }
@@ -5135,6 +5140,10 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     shell
         .vars
         .set_invocation(options.name.clone(), options.args.clone());
+    // The only loop that is an interactive session. `mesh -s` on a terminal
+    // reads commands but is not one, so this is recorded by the loop rather than
+    // derived from `isatty`.
+    shell.vars.set_interactive(true);
     let mut last = match run_startup_files(options, true, 0, &mut shell) {
         Step::Continue(code) => code,
         Step::Exit(code) => {

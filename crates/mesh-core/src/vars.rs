@@ -21,6 +21,12 @@ pub enum Value {
     Map(Vec<(String, Value)>),
     Regex(RegexValue),
     Glob(String),
+    /// One of the shell's own streams (`$sh.stdin` and friends), carrying the
+    /// descriptor it names. A handle has **no canonical byte form**, so it never
+    /// renders to argv or into a string — `DESIGN.md` §"Values and the bytes
+    /// boundary" lists it beside a regex for exactly that reason. The descriptor
+    /// stays private: the value answers questions (`:tty`) rather than being one.
+    Stream(i32),
     /// An anonymous `func(params) { … }` bound to a name — value-called through
     /// the variable (`$double(5)`). It has no byte form, so unlike every other
     /// value it cannot reach a command argument or an interpolation.
@@ -136,6 +142,13 @@ pub struct Vars {
     shell: Vec<(String, Value)>,
     status: u8,
     stages: Vec<u8>,
+    interactive: bool,
+    /// Captured once rather than read per access, so they stay the *shell's* —
+    /// bash's `$$` / `$PPID`, which do not change inside a subshell. A forked
+    /// pipeline stage inherits this copy, so `$sh.pid` there still names the
+    /// session rather than the short-lived stage.
+    pid: u32,
+    ppid: i32,
 }
 
 impl Default for Vars {
@@ -146,6 +159,10 @@ impl Default for Vars {
             shell: invocation_entries(DEFAULT_SHELL_NAME.to_owned(), Vec::new()),
             status: 0,
             stages: vec![0],
+            interactive: false,
+            pid: std::process::id(),
+            // SAFETY: `getppid` takes no arguments and cannot fail.
+            ppid: unsafe { libc::getppid() },
         }
     }
 }
@@ -180,6 +197,14 @@ impl Vars {
     pub(crate) fn set_status(&mut self, status: u8, stages: Vec<u8>) {
         self.status = status;
         self.stages = stages;
+    }
+
+    /// Record that this session is interactive, which `$sh.interactive` reports.
+    /// Set by the shell rather than derived from `isatty`: the question is which
+    /// loop is running, not what fd 0 happens to be — `mesh -s` on a terminal
+    /// reads commands without being an interactive session.
+    pub fn set_interactive(&mut self, interactive: bool) {
+        self.interactive = interactive;
     }
 
     /// The currently published `$sh.status`.
@@ -217,6 +242,19 @@ impl Vars {
                         .collect(),
                 ),
             ),
+            ("pid".to_owned(), Value::Integer(i64::from(self.pid))),
+            ("ppid".to_owned(), Value::Integer(i64::from(self.ppid))),
+            (
+                "version".to_owned(),
+                Value::String(env!("CARGO_PKG_VERSION").to_owned()),
+            ),
+            ("interactive".to_owned(), Value::Boolean(self.interactive)),
+            // Handles rather than integers: `DESIGN.md` puts a stream handle in
+            // the same row as a regex — no byte form — so `puts $sh.stdin` is a
+            // loud error and `:tty` is the way to ask about one.
+            ("stdin".to_owned(), Value::Stream(0)),
+            ("stdout".to_owned(), Value::Stream(1)),
+            ("stderr".to_owned(), Value::Stream(2)),
         ];
         entries.extend(self.shell.iter().cloned());
         Value::Map(entries)
@@ -394,6 +432,9 @@ impl Vars {
             (Value::Map(_), _) => return Err(format!("{name}: can only merge a map into a map")),
             (Value::Regex(_), _) => return Err(format!("{name}: cannot append to a regex")),
             (Value::Glob(_), _) => return Err(format!("{name}: cannot append to a glob")),
+            (Value::Stream(_), _) => {
+                return Err(format!("{name}: cannot append to a stream handle"));
+            }
             (Value::Function(_), _) => {
                 return Err(format!("{name}: cannot append to a function value"));
             }
@@ -435,6 +476,25 @@ mod tests {
         vars.set("caller-only", "x".into());
         vars.push_scope();
         assert_eq!(vars.get("caller-only"), None);
+    }
+
+    #[test]
+    fn interactive_is_reported_by_the_shell_not_inferred() {
+        // The `true` case needs the interactive loop, which needs a terminal, so
+        // the flag-to-namespace plumbing is checked here and the CLI tests cover
+        // every path that must report `false`.
+        let mut vars = Vars::new();
+        let read = |vars: &Vars| match vars.shell_namespace() {
+            Value::Map(entries) => entries
+                .iter()
+                .find(|(key, _)| key == "interactive")
+                .map(|(_, value)| value.clone())
+                .expect("$sh.interactive"),
+            other => panic!("$sh should be a map, got {other:?}"),
+        };
+        assert_eq!(read(&vars), Value::Boolean(false));
+        vars.set_interactive(true);
+        assert_eq!(read(&vars), Value::Boolean(true));
     }
 
     #[test]

@@ -55,6 +55,10 @@ pub enum Modifier {
     Dirs,
     Links,
     Exec,
+    /// `test -t N`: is this stream a terminal? Asked of a [`Value::Stream`], the
+    /// only value that carries a descriptor — a bare integer is refused so the
+    /// question cannot be pointed at an unrelated one.
+    Tty,
 }
 
 impl Modifier {
@@ -67,6 +71,7 @@ impl Modifier {
             "stem" => Self::Stem,
             "bare" => Self::Bare,
             "len" => Self::Len,
+            "tty" => Self::Tty,
             "first" => Self::First,
             "last" => Self::Last,
             "rest" => Self::Rest,
@@ -125,7 +130,10 @@ pub enum ExpandError {
     },
     /// A function value reached a place that needs bytes — a command argument, an
     /// interpolation, the environment. It is the one value with no text form.
-    NoTextForm(String),
+    NoTextForm {
+        name: String,
+        kind: &'static str,
+    },
     NotAList(String),
     IndexOutOfRange {
         name: String,
@@ -149,8 +157,8 @@ impl std::fmt::Display for ExpandError {
             ExpandError::NoSuchKey { name, key } => {
                 write!(f, "${name}: no `{key}` in this map")
             }
-            ExpandError::NoTextForm(n) => {
-                write!(f, "${n}: a function value has no text form")
+            ExpandError::NoTextForm { name, kind } => {
+                write!(f, "${name}: a {kind} has no text form")
             }
             ExpandError::NotAList(n) => write!(f, "${n}: cannot index a string value"),
             ExpandError::IndexOutOfRange { name, index } => {
@@ -232,10 +240,18 @@ fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> 
         Value::Map(_) => Err(ExpandError::Unsupported(
             "a map cannot be spread here".into(),
         )),
-        Value::Integer(_) | Value::Boolean(_) | Value::Regex(_) | Value::Glob(_) => Err(
-            ExpandError::Unsupported(format!("...${}: value is not a list", vref.name)),
-        ),
-        Value::Function(_) => Err(ExpandError::NoTextForm(vref.name.clone())),
+        Value::Integer(_)
+        | Value::Boolean(_)
+        | Value::Regex(_)
+        | Value::Glob(_)
+        | Value::Stream(_) => Err(ExpandError::Unsupported(format!(
+            "...${}: value is not a list",
+            vref.name
+        ))),
+        Value::Function(_) => Err(ExpandError::NoTextForm {
+            name: vref.name.clone(),
+            kind: "function value",
+        }),
     }
 }
 
@@ -252,10 +268,18 @@ fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError
         Value::Map(_) => Err(ExpandError::Unsupported(
             "a map cannot be spread into argv".into(),
         )),
-        Value::Integer(_) | Value::Boolean(_) | Value::Regex(_) | Value::Glob(_) => Err(
-            ExpandError::Unsupported(format!("...${}: value is not a list", vref.name)),
-        ),
-        Value::Function(_) => Err(ExpandError::NoTextForm(vref.name.clone())),
+        Value::Integer(_)
+        | Value::Boolean(_)
+        | Value::Regex(_)
+        | Value::Glob(_)
+        | Value::Stream(_) => Err(ExpandError::Unsupported(format!(
+            "...${}: value is not a list",
+            vref.name
+        ))),
+        Value::Function(_) => Err(ExpandError::NoTextForm {
+            name: vref.name.clone(),
+            kind: "function value",
+        }),
     }
 }
 
@@ -275,7 +299,16 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
             Value::Regex(_) | Value::Glob(_) => Err(ExpandError::Unsupported(format!(
                 "...${name}: pattern element cannot be a command argument"
             ))),
-            Value::Function(_) => Err(ExpandError::NoTextForm(name.to_string())),
+            // A handle belongs with the function value, not the patterns: what
+            // it lacks is a byte form, not a way to be matched against.
+            Value::Stream(_) => Err(ExpandError::NoTextForm {
+                name: name.to_string(),
+                kind: "stream handle",
+            }),
+            Value::Function(_) => Err(ExpandError::NoTextForm {
+                name: name.to_string(),
+                kind: "function value",
+            }),
         })
         .collect()
 }
@@ -440,7 +473,16 @@ pub(crate) fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError>
         Value::List(_) | Value::Map(_) | Value::Regex(_) | Value::Glob(_) => {
             Err(ExpandError::ListNeedsSpread(vref.name.clone()))
         }
-        Value::Function(_) => Err(ExpandError::NoTextForm(vref.name.clone())),
+        // A stream handle has no byte form at all, so it never crosses to argv
+        // or into a string — `DESIGN.md` puts it in the same row as a regex.
+        Value::Stream(_) => Err(ExpandError::NoTextForm {
+            name: vref.name.clone(),
+            kind: "stream handle",
+        }),
+        Value::Function(_) => Err(ExpandError::NoTextForm {
+            name: vref.name.clone(),
+            kind: "function value",
+        }),
     }
 }
 
@@ -496,6 +538,7 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                     | Value::Boolean(_)
                     | Value::Regex(_)
                     | Value::Glob(_)
+                    | Value::Stream(_)
                     | Value::Function(_) => {
                         return Err(ExpandError::NotAList(vref.name.clone()));
                     }
@@ -594,6 +637,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Boolean(_)
             | Value::Regex(_)
             | Value::Glob(_)
+            | Value::Stream(_)
             | Value::Function(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a string or collection".into(),
@@ -630,6 +674,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Boolean(_)
             | Value::Regex(_)
             | Value::Glob(_)
+            | Value::Stream(_)
             | Value::Function(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
@@ -653,6 +698,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Boolean(_)
             | Value::Regex(_)
             | Value::Glob(_)
+            | Value::Stream(_)
             | Value::Function(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
@@ -677,6 +723,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Boolean(_)
             | Value::Regex(_)
             | Value::Glob(_)
+            | Value::Stream(_)
             | Value::Function(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
@@ -684,6 +731,27 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             Value::Map(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
+            }),
+        },
+        // `$sh.stdin:tty` — the `test -t N` replacement, and the reason a handle
+        // is a value at all: it answers questions rather than being one. The
+        // descriptor stays inside `Value::Stream`, so an integer is refused.
+        Modifier::Tty => match value {
+            Value::Stream(fd) => Ok(Value::Boolean({
+                // SAFETY: `isatty` only inspects the descriptor and cannot fail
+                // in a way that matters here — a bad one answers "no".
+                unsafe { libc::isatty(fd) == 1 }
+            })),
+            // A scalar question maps element-wise over a list, the same way the
+            // file tests below do.
+            Value::List(values) => values
+                .into_iter()
+                .map(|value| apply_modifier(value, modifier))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::List),
+            _ => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a stream handle, such as `$sh.stdin`".into(),
             }),
         },
         Modifier::Int => match value {
@@ -720,6 +788,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Boolean(_)
             | Value::Regex(_)
             | Value::Glob(_)
+            | Value::Stream(_)
             | Value::Function(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a path".into(),
@@ -752,6 +821,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Boolean(_)
             | Value::Regex(_)
             | Value::Glob(_)
+            | Value::Stream(_)
             | Value::Function(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a path or a list of paths".into(),
@@ -768,10 +838,12 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 name: name.into(),
                 message: "cannot map over a map".into(),
             }),
-            Value::Regex(_) | Value::Glob(_) | Value::Function(_) => Err(ExpandError::Modifier {
-                name: name.into(),
-                message: "cannot apply string modifier to this value".into(),
-            }),
+            Value::Regex(_) | Value::Glob(_) | Value::Stream(_) | Value::Function(_) => {
+                Err(ExpandError::Modifier {
+                    name: name.into(),
+                    message: "cannot apply string modifier to this value".into(),
+                })
+            }
             Value::Integer(_) | Value::Boolean(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a string".into(),
@@ -855,6 +927,12 @@ pub(crate) fn join_value(value: Value, separator: &str) -> Result<Value, ExpandE
                     message: "cannot join a pattern element".into(),
                 });
             }
+            Value::Stream(_) => {
+                return Err(ExpandError::Modifier {
+                    name: "join".into(),
+                    message: "cannot join a stream handle".into(),
+                });
+            }
         }
     }
     Ok(Value::String(out))
@@ -887,6 +965,7 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::Dirs => "dirs",
         Modifier::Links => "links",
         Modifier::Exec => "exec",
+        Modifier::Tty => "tty",
     }
 }
 
@@ -1011,7 +1090,8 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         | Modifier::Files
         | Modifier::Dirs
         | Modifier::Links
-        | Modifier::Exec => unreachable!("non-string modifier handled separately"),
+        | Modifier::Exec
+        | Modifier::Tty => unreachable!("non-string modifier handled separately"),
     }
 }
 
