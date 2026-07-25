@@ -7109,6 +7109,278 @@ fn a_spaced_comparison_in_a_condition_is_not_a_redirection() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A variable naming a command runs it, **with arguments**. `$editor > log` already
+/// worked, since a redirect after the variable pushed the line to the command parser,
+/// but `$editor file` reported `expected a statement separator`: the variable was
+/// claimed as a value, the expression parser stopped after it, and the argument was
+/// left unconsumed. A value is only a value when it is the whole statement.
+#[test]
+fn a_variable_naming_a_command_takes_arguments() {
+    let out = run_with_input(
+        "e = \"echo\"\n\
+         $e hi\n\
+         $e hi there\n\
+         $e \"quoted arg\"\n\
+         xs = [a b]\n\
+         $e ...$xs\n\
+         $e one && $e two\n\
+         $e piped | cat\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi\nhi there\nquoted arg\na b\none\ntwo\npiped\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success());
+
+    // An argument that *looks* postfix is still an argument when it is spaced off, the
+    // same way `puts $x :len` prints `:len` rather than a length. Only an **attached**
+    // postfix belongs to the command word, so `$e :len` echoes `:len` instead of
+    // silently evaluating the length of the word `echo`.
+    let out = run_with_input("e = \"echo\"\n$e :len\n$e .x\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        ":len\n.x\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And the attached spelling still applies the modifier to the value.
+    let out = run_with_input("x = \"abcd\"\nputs $x:len\nputs $x :len\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4\nabcd :len\n");
+}
+
+/// A connector after a *bare* variable picks the command too — `$cmd || fallback` is
+/// the shell idiom it looks like. Reading `$cmd` as a string instead skipped running
+/// the command altogether: no output, no side effects, and the branch decided by the
+/// string's truthiness rather than the exit status, so `cmd = "false"` took the `&&`
+/// arm because the *word* "false" is a non-empty string.
+///
+/// Every assertion here needs a command whose running is observable, which is what an
+/// earlier version of this test missed by putting an argument before the connector —
+/// the argument alone already forced the command path.
+#[test]
+fn a_connector_after_a_variable_command_still_runs_the_command() {
+    // `false` fails, so the `||` arm runs and the `&&` arm does not.
+    let out = run_with_input("cmd = \"false\"\n$cmd || puts failed\n$cmd && puts wrong\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "failed\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `true` succeeds, so the arms swap.
+    let out = run_with_input("cmd = \"true\"\n$cmd && puts ran\n$cmd || puts wrong\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
+
+    // The command's own output appears, which is what proves it ran at all: `echo`
+    // with no arguments prints an empty line before the second statement's output.
+    let out = run_with_input("cmd = \"echo\"\n$cmd && puts after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\nafter\n");
+
+    // And `&` backgrounds the command rather than refusing to background a value.
+    let out = run_with_input("cmd = \"true\"\n$cmd &\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("backgrounding an expression"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A postfix guard is *part* of the value statement rather than something
+    // following it, so `$x if $b` stays the guarded value it always was. Getting this
+    // wrong ran a command named by the value: `command not found: 5`.
+    let out = run_with_input(
+        "x = 5\n\
+         $x if true\n\
+         $x unless false\n\
+         $x if false\n\
+         puts done\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("command not found"),
+        "a guarded value ran as a command: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A negation is the other kind of operand: it has no command reading, so `&&`
+    // joins the value statement instead of making one. This is the case that
+    // distinguishes the shape question from the statement question.
+    let out = run_with_input(
+        "b = false\n\
+         not $b && puts negated\n\
+         t = true\n\
+         not $t || puts fellthrough\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "negated\nfellthrough\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The same for an operand carrying **postfix modifiers**, which is where the
+/// one-token lookahead went wrong: in `$p:base arg` the token after the variable is
+/// the `:` of the modifier, so nothing saw the argument that followed the operand.
+/// A redirect after such an operand is a redirect too, in every spelling —
+/// spaced `>`, attached `>out`, and `>>`, none of which reached the command before.
+#[test]
+fn a_modified_operand_names_a_command_and_takes_a_redirect() {
+    let dir = fresh_dir("modified_operand_command");
+    let program = dir.join("hello");
+    std::fs::write(&program, "#!/bin/sh\necho \"hello ran: $*\"\n").unwrap();
+    let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&program, permissions).unwrap();
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // `:base` of "sub/hello" is "hello", so each of these runs that program.
+    let run = |body: &str| {
+        std::fs::write(dir.join("run.mesh"), format!("p = \"sub/hello\"\n{body}")).unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .env("PATH", &path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        let written = std::fs::read_to_string(dir.join("out.txt")).unwrap_or_default();
+        let _ = std::fs::remove_file(dir.join("out.txt"));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            written,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // An argument after the modified operand.
+    let (stdout, _, stderr) = run("$p:base arg\n");
+    assert_eq!(stdout, "hello ran: arg\n", "{stderr}");
+
+    // A redirect after it, in all three spellings.
+    for body in [
+        "$p:base > out.txt\n",
+        "$p:base >out.txt\n",
+        "$p:base >> out.txt\n",
+        "$p:base arg > out.txt\n",
+    ] {
+        let (_, written, stderr) = run(body);
+        assert!(stderr.is_empty(), "{body} errored: {stderr}");
+        assert!(
+            written.starts_with("hello ran:"),
+            "{body} did not redirect the command: {written:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The redirect lookahead parses only the operand a **command word** can be — a
+/// primary with its accesses, calls, and modifiers — and stops there. Going wider
+/// absorbs operators that belong to the value: parsing through arithmetic took the
+/// `+ 1` in `$x + 1 > 1`, decided the `>` was a redirect, and turned a boolean value
+/// statement into a command that also truncated a file named `1`.
+///
+/// In a scratch directory because that is the failure: it creates the file.
+#[test]
+fn a_comparison_with_arithmetic_on_the_left_is_not_a_redirect() {
+    let dir = fresh_dir("arithmetic_before_comparison");
+    let run = |body: &str| {
+        std::fs::write(dir.join("run.mesh"), body).unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    for body in [
+        "x = 1\n$x + 1 > 1\n",
+        "x = 5\n$x - 1 > 1\n",
+        "x = 5\n$x * 2 > 1\n",
+        "x = 1\n$x + 1 < 1\n",
+        // A *computed* index is a nested expression too, and a command word cannot
+        // hold one — `$xs[0]` with a literal index is a single word and does redirect,
+        // but `$xs[0 + 0]` is a word plus a subscript the expression parser owns.
+        "xs = [7 8]\n$xs[0 + 0] > 0\n",
+        "xs = [7 8]\n$xs[1 - 1] > 0\n",
+    ] {
+        let stderr = run(body);
+        assert!(stderr.is_empty(), "{body} errored: {stderr}");
+        for name in ["0", "1"] {
+            assert!(
+                !dir.join(name).exists(),
+                "{body} redirected into a file named {name:?} after the operand"
+            );
+        }
+    }
+
+    // The literal-index spelling is a word, so it keeps the redirect reading it has on
+    // `main` — the point being that the line between them is what a *word* can hold.
+    std::fs::write(dir.join("run.mesh"), "xs = [7 8]\n$xs[0] > out.txt\n").unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("command not found: 7"),
+        "a literal index should still name a command: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.join("out.txt").exists(), "and should still redirect");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The readings this must not disturb: an operand that *is* the whole statement stays
+/// a value, a spaced comparison in a condition stays a comparison even with a modifier
+/// on the left, and a non-place assignment target stays a syntax error about places
+/// rather than becoming a command nobody asked to run.
+#[test]
+fn a_value_that_is_the_whole_statement_is_still_a_value() {
+    // Silent: these are values, not commands, and a value statement prints nothing.
+    let out = run_with_input("xs = [a b]\n$xs\n$xs:len\nm = [k: v]\n$m.k\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("command not found"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Comparisons in a condition, including with a modifier on the left.
+    let out = run_with_input(
+        "xs = [a b]\n\
+         if $xs:len > 1 { puts gt }\n\
+         if $xs:len < 5 { puts lt }\n\
+         if $xs:len == 2 { puts eq }\n\
+         puts guard if $xs:len > 1\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "gt\nlt\neq\nguard\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A derived value is not a place, and saying so is a *syntax* error — not an
+    // attempt to run a command named by the value.
+    for source in ["xs = [1 2]\n$xs:dedup = 9\n", "$env.PATH[0] = x\n"] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(2), "{source}");
+    }
+}
+
 /// A leading `not` negates a **value**, so `if not $b { … }` is a condition rather
 /// than a command named `not`. `DESIGN.md` writes the idiom that way, and two of the
 /// three positions already read it so: a postfix guard and an assignment's

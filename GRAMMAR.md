@@ -456,6 +456,21 @@ must: `not true foo`, `not $x | cat`, and `not false > out.txt` stay commands. W
 `<` / `>` is a redirect is judged after the *complete* operand, so `not [1 2] > out.txt`
 and `not $x:len > out.txt` redirect while a spaced `>` in a condition still compares.
 
+Both rules apply to a bare **word** operand too, which is how `$editor` names a
+command: it is a value only when the value is the whole statement, so `$editor file`,
+`$editor ...$files`, `$editor | cat`, `$editor || puts oops`, and `$editor &` are command
+lines — a connector or a backgrounding `&` picks the command, since that is the
+`$cmd || fallback` idiom, while a negation has no command reading and keeps the value
+statement `not $b && puts x` — and a redirect found by scanning to the end of the
+**command word**, a word plus its *attached* argument-free `:modifier` suffixes (a
+spaced one is the next argument, so `$e :len` runs `echo :len`), makes
+`$p:base > log` a redirection rather than a comparison. That bound is why `$x + 1 > 1`
+and `$xs[0 + 0] > 0` stay comparisons: neither can be a command word, since a word
+cannot contain a nested expression. `$xs[0] > f` does redirect, a literal index being
+part of the word.
+An assignment operator counts as the end of a value for this purpose, which keeps
+`$xs:dedup = 9` a syntax error about places rather than a command invocation.
+
 In statement position, the selected body runs normally and the other body is
 not evaluated. `return` and `exit` in a selected body retain their control-flow
 behavior. In assignment position, the selected branch's final physical line is
