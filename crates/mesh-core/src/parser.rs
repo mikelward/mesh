@@ -278,13 +278,28 @@ pub enum Executable {
         global: bool,
     },
     /// `$env.KEY = value` — a write to the process environment rather than to a
-    /// mesh binding. Separate from [`Executable::Assignment`] because `$env` is
-    /// a reserved namespace whose entries are bytes, not typed values; general
-    /// member assignment (`$m.key = v`) is a later, wider change.
+    /// mesh binding. Separate from [`Executable::MemberAssignment`] because `$env`
+    /// is a reserved namespace whose entries are bytes, not typed values: only
+    /// strings cross, and the write reaches the real environment so children
+    /// inherit it.
     EnvAssignment {
         key: String,
         append: bool,
         value: Expr,
+    },
+    /// `$m.key = value`, `$xs[0] = value`, `$m.a[1].b += value` — a write *into* a
+    /// bound collection rather than a rebinding of the name. `target` is the raw
+    /// reference text, split into a root and accesses by the expansion layer, so
+    /// one path parser serves reads and writes alike.
+    MemberAssignment {
+        target: String,
+        append: bool,
+        value: Expr,
+        /// `global $m.key = …` — write into the session-global binding rather than
+        /// the active one. A member write is local-by-default like every other
+        /// assignment, so this is how a function reaches a caller's collection
+        /// instead of shadowing it.
+        global: bool,
     },
     Function {
         name: String,
@@ -1554,6 +1569,25 @@ impl Parser {
             }
             self.position = assignment_start;
         }
+        if let Some(target) = self.member_target() {
+            if matches!(
+                self.peek().map(|token| &token.value),
+                Some(TokenKind::Equal | TokenKind::PlusEqual)
+            ) {
+                let append = self.eat(&TokenKind::PlusEqual).is_some();
+                if !append {
+                    self.expect(&TokenKind::Equal, "`=`")?;
+                }
+                let value = self.expression()?;
+                return Ok(Executable::MemberAssignment {
+                    target,
+                    append,
+                    value,
+                    global: false,
+                });
+            }
+            self.position = assignment_start;
+        }
         if self.word_text_at(0).is_some() || self.same(&TokenKind::LBracket) {
             if let Ok(pattern) = self.binding_pattern()
                 && matches!(
@@ -2237,6 +2271,58 @@ impl Parser {
         let key = key.to_owned();
         self.next();
         Some(key)
+    }
+
+    /// A `$name.member` / `$name[index]` **place** for an assignment, handed on as
+    /// the raw reference text for the expansion layer to split.
+    ///
+    /// Requires at least one access: a place is what `$m.key` names, while a bare
+    /// `$m` on the left of `=` is not how mesh spells a rebinding (`m = …` is).
+    /// Refuses a trailing modifier, since `$xs:dedup` describes a derived value and
+    /// not somewhere to store one. `$env` and `$sh` are excluded — `$env.KEY` has
+    /// its own byte-boundary rules above, and `$sh` is read-only — so both keep the
+    /// diagnostics they already had.
+    fn member_target(&mut self) -> Option<String> {
+        let TokenKind::Word(word) = &self.peek()?.value else {
+            return None;
+        };
+        let [
+            WordPiece::Variable {
+                name,
+                quote: QuoteMode::Bare,
+            },
+        ] = word.pieces.as_slice()
+        else {
+            return None;
+        };
+        let inner = name
+            .strip_prefix("${")
+            .and_then(|value| value.strip_suffix('}'))
+            .or_else(|| name.strip_prefix('$'))?;
+        let root_end = inner.find(['.', '[', ':'])?;
+        let root = &inner[..root_end];
+        if !crate::lexer::is_name(root) || crate::vars::is_reserved_namespace(root) {
+            return None;
+        }
+        // Walk the accesses structurally rather than scanning for a `:`: a colon
+        // *inside* a subscript belongs to the key (`$m["a:b"]`, which reads fine),
+        // so brackets are skipped whole and only a `:` between accesses is the
+        // modifier that disqualifies a place.
+        let mut rest = &inner[root_end..];
+        while !rest.is_empty() {
+            if rest.starts_with('[') {
+                rest = &rest[subscript_end(rest)?..];
+                continue;
+            }
+            // A `:` here is a modifier, and a modifier names a derived value rather
+            // than a place; anything else is not a shape this recognizes.
+            let member = rest.strip_prefix('.')?;
+            let end = member.find(['.', '[', ':']).unwrap_or(member.len());
+            rest = &member[end..];
+        }
+        let target = name.clone();
+        self.next();
+        Some(target)
     }
 
     fn binding_pattern(&mut self) -> Result<BindingPattern, ParseError> {
@@ -2999,6 +3085,26 @@ impl Parser {
         }
         if !global {
             unreachable!("only `global` or `unset` reaches here, and `unset` was taken");
+        }
+        // `global $m.key = …` writes *into* the global binding rather than rebinding
+        // the name — the escape hatch a local-by-default member write needs, so a
+        // function can modify a caller's collection instead of shadowing it.
+        let member_start = self.position;
+        if let Some(target) = self.member_target() {
+            if self.assignment_follows(0) {
+                let append = self.eat(&TokenKind::PlusEqual).is_some();
+                if !append {
+                    self.expect(&TokenKind::Equal, "`=`")?;
+                }
+                let value = self.expression()?;
+                return Ok(Executable::MemberAssignment {
+                    target,
+                    append,
+                    value,
+                    global: true,
+                });
+            }
+            self.position = member_start;
         }
         // `global` on its own governs an assignment; anything else is a mistake
         // worth naming, since `global f` reads like a call but cannot be one.

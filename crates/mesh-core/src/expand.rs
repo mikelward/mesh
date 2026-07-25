@@ -578,7 +578,7 @@ fn map_value_access(value: Value, key: &str, name: &str) -> Result<Value, Expand
     }
 }
 
-fn subscript_key(subscript: &str, vars: &Vars) -> Result<String, ExpandError> {
+pub(crate) fn subscript_key(subscript: &str, vars: &Vars) -> Result<String, ExpandError> {
     if let Some(variable) = subscript.strip_prefix('$') {
         return match vars.get(variable) {
             Some(Value::String(value)) => Ok(value.clone()),

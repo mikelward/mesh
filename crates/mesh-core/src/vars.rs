@@ -383,64 +383,102 @@ impl Vars {
     /// target, so an unbound name is simply an error rather than something to
     /// copy inward.
     pub fn append_global(&mut self, name: &str, value: Value) -> Result<(), String> {
-        if !self.global.contains_key(name) {
-            return Err(format!("{name}: unbound variable"));
-        }
-        let saved = std::mem::take(&mut self.locals);
-        let result = self.append(name, value);
-        self.locals = saved;
-        result
+        self.update(name, true, |current| append_into(current, value, name))
     }
 
     pub fn append(&mut self, name: &str, value: Value) -> Result<(), String> {
-        if !self.active_has(name) {
-            let seed = self
-                .get(name)
-                .cloned()
+        self.update(name, false, |current| append_into(current, value, name))
+    }
+
+    /// A **mutable place** for `name` in the active scope, for a write that reads
+    /// the old value first (`+=`, or a member assignment reaching into it).
+    ///
+    /// Copies an outer binding inward before handing it over, the local-by-default
+    /// rule assignment already follows: `$m.key = v` inside a function shadows the
+    /// global rather than reaching through to it, exactly as `$m = …` would. An
+    /// unbound name is an error — there is nothing to modify.
+    /// Apply `write` to the place `name` names, in the global scope when `global`
+    /// or the active one otherwise.
+    ///
+    /// A **failed write leaves no trace**. Where the name is only bound further
+    /// out, the write runs on a copy and the local shadow is installed only once it
+    /// succeeds — otherwise a statement that errored would still have changed scope
+    /// state, and a later `global $m.… = …` would be written past by a stale local
+    /// nobody asked for. Where the binding is already in the target scope there is
+    /// nothing to shadow, so it is modified in place.
+    ///
+    /// `global` never seeds: that scope *is* the target, so an unbound name is an
+    /// error rather than something to copy inward.
+    pub fn update<T>(
+        &mut self,
+        name: &str,
+        global: bool,
+        write: impl FnOnce(&mut Value) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if global {
+            let place = self
+                .global
+                .get_mut(name)
                 .ok_or_else(|| format!("{name}: unbound variable"))?;
-            self.active_mut().insert(name.to_string(), seed);
+            return write(place);
         }
-        let current = self.active_mut().get_mut(name).expect("seeded above");
-        match (current, value) {
-            (Value::String(left), Value::String(right)) => left.push_str(&right),
-            (Value::Integer(left), Value::Integer(right)) => {
-                *left = left
-                    .checked_add(right)
-                    .ok_or_else(|| format!("{name}: numeric overflow"))?;
-            }
-            (Value::List(left), Value::List(mut right)) => left.append(&mut right),
-            (Value::List(left), right) => left.push(right),
-            (Value::Map(left), Value::Map(right)) => {
-                for (key, value) in right {
-                    if let Some((_, old)) = left.iter_mut().find(|(old, _)| old == &key) {
-                        *old = value;
-                    } else {
-                        left.push((key, value));
-                    }
+        if self.active_has(name) {
+            let place = self.active_mut().get_mut(name).expect("checked just above");
+            return write(place);
+        }
+        let mut copy = self
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("{name}: unbound variable"))?;
+        let produced = write(&mut copy)?;
+        self.active_mut().insert(name.to_string(), copy);
+        Ok(produced)
+    }
+}
+
+/// Combine `value` into an existing place, the `+=` rule. Free-standing so a
+/// member assignment (`$m.key += v`) and a whole-variable one go through the same
+/// table rather than two that can drift; `name` labels the target in errors.
+pub fn append_into(current: &mut Value, value: Value, name: &str) -> Result<(), String> {
+    match (current, value) {
+        (Value::String(left), Value::String(right)) => left.push_str(&right),
+        (Value::Integer(left), Value::Integer(right)) => {
+            *left = left
+                .checked_add(right)
+                .ok_or_else(|| format!("{name}: numeric overflow"))?;
+        }
+        (Value::List(left), Value::List(mut right)) => left.append(&mut right),
+        (Value::List(left), right) => left.push(right),
+        (Value::Map(left), Value::Map(right)) => {
+            for (key, value) in right {
+                if let Some((_, old)) = left.iter_mut().find(|(old, _)| old == &key) {
+                    *old = value;
+                } else {
+                    left.push((key, value));
                 }
             }
-            (Value::String(_), Value::List(_) | Value::Map(_)) => {
-                return Err(format!("{name}: cannot append a list to a string"));
-            }
-            (Value::String(_), _) => {
-                return Err(format!("{name}: can only append a string to a string"));
-            }
-            (Value::Integer(_), _) => {
-                return Err(format!("{name}: can only add an integer to an integer"));
-            }
-            (Value::Boolean(_), _) => return Err(format!("{name}: cannot append to a boolean")),
-            (Value::Map(_), _) => return Err(format!("{name}: can only merge a map into a map")),
-            (Value::Regex(_), _) => return Err(format!("{name}: cannot append to a regex")),
-            (Value::Glob(_), _) => return Err(format!("{name}: cannot append to a glob")),
-            (Value::Stream(_), _) => {
-                return Err(format!("{name}: cannot append to a stream handle"));
-            }
-            (Value::Function(_), _) => {
-                return Err(format!("{name}: cannot append to a function value"));
-            }
         }
-        Ok(())
+        (Value::String(_), Value::List(_) | Value::Map(_)) => {
+            return Err(format!("{name}: cannot append a list to a string"));
+        }
+        (Value::String(_), _) => {
+            return Err(format!("{name}: can only append a string to a string"));
+        }
+        (Value::Integer(_), _) => {
+            return Err(format!("{name}: can only add an integer to an integer"));
+        }
+        (Value::Boolean(_), _) => return Err(format!("{name}: cannot append to a boolean")),
+        (Value::Map(_), _) => return Err(format!("{name}: can only merge a map into a map")),
+        (Value::Regex(_), _) => return Err(format!("{name}: cannot append to a regex")),
+        (Value::Glob(_), _) => return Err(format!("{name}: cannot append to a glob")),
+        (Value::Stream(_), _) => {
+            return Err(format!("{name}: cannot append to a stream handle"));
+        }
+        (Value::Function(_), _) => {
+            return Err(format!("{name}: cannot append to a function value"));
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
