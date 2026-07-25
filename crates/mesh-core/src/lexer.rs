@@ -590,7 +590,9 @@ fn lex_raw(
 /// than a silent literal — a literal `$` in a string is spelled `\$`.
 ///
 /// Both braced and unbraced forms parse member access and integer indexing.
-fn parse_var(chars: &[char], at: usize) -> Result<Option<(VarRef, usize)>, LexError> {
+/// Parse a `$…` reference starting at `at`. Exposed so heredoc interpolation
+/// reads variables exactly as a double-quoted string does.
+pub(crate) fn parse_var(chars: &[char], at: usize) -> Result<Option<(VarRef, usize)>, LexError> {
     if chars.get(at) == Some(&'{') {
         let start = at + 1;
         let mut j = start;
@@ -749,7 +751,7 @@ pub(crate) fn is_name(name: &str) -> bool {
 
 /// Parse the `{HEX}` body of a `\u` escape (from just past the `u`). Returns the
 /// decoded char and how many chars were consumed (including the braces).
-fn parse_unicode_escape(rest: &[char]) -> Option<(char, usize)> {
+pub(crate) fn parse_unicode_escape(rest: &[char]) -> Option<(char, usize)> {
     if rest.first() != Some(&'{') {
         return None;
     }
