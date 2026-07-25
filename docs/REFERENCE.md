@@ -268,8 +268,9 @@ size is fine — it reaches the command as a temporary file that is unlinked as
 soon as it is opened, so nothing is reachable by name while the command runs and
 nothing is left behind after.
 
-Backgrounding a command that has a heredoc (`cat << END &`) is refused rather
-than run against empty input.
+Backgrounding a command that has a heredoc (`cat << END &`) works: the body
+reaches the stage as memory, and the stage writes the temporary in its own
+process.
 
 ### Here-strings
 

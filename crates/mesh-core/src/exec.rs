@@ -739,9 +739,16 @@ pub fn run_pipeline(
         let mut sources = match redir_result {
             // A background stage applies its own redirections after the fork and
             // reports its own failure from there, where the redirection actually
-            // happens — so `&` still means "started", as it does in bash. All
-            // the shell needs from a plan that cannot happen is that it wants no
-            // pipe.
+            // happens — so `&` still means "started", as it does in bash.
+            //
+            // The plan is dropped rather than kept up to the failure because the
+            // stage never reaches its command: nothing is written to a pipe the
+            // earlier redirections would have claimed. What bash *does* put
+            // there is the diagnostic itself — `2>&1 4>&9 | cat` pipes `Bad file
+            // descriptor` — and mesh does not, in the foreground either, because
+            // it resolves a stage completely before installing any of it. That
+            // is a standing divergence with a cost to closing; it is written up
+            // in TODO.md rather than papered over here.
             Err(_) if background => Sources::default(),
             Ok(sources) => sources,
             Err((path, err)) => {
@@ -1881,10 +1888,14 @@ fn resolve_redirs(
             RedirTarget::Descriptor(from) => {
                 let named = |error| (format!("&{from}"), error);
                 match state.get(*from) {
-                    // Closed by an earlier `n>&-`, and gone: copying it
-                    // afterwards is `EBADF`, unless the shell itself still holds
-                    // a descriptor of that number for the copy to reach.
-                    Some(Source::Closed) | None if !inherited.contains(from) => {
+                    // Closed by an earlier `n>&-`, and gone. The walk's own
+                    // answer settles it: the shell may still physically hold a
+                    // descriptor of that number — from an enclosing `f 3> out`
+                    // around a nested `3>&- 4>&3` — but source order says this
+                    // stage took it away, so the copy is `EBADF`. Falling
+                    // through to `inherited` there reached past the close to the
+                    // enclosing redirection's file, and the command ran.
+                    Some(Source::Closed) => {
                         return Err(named(std::io::Error::from_raw_os_error(libc::EBADF)));
                     }
                     Some(source) => source.copy(*fd, acquire).map_err(named)?,

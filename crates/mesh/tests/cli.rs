@@ -2932,6 +2932,35 @@ fn a_descriptor_can_be_closed_for_a_command() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // And it decides *over* what the shell happens to hold. With an enclosing
+    // `f 3> out` the shell really does have a descriptor 3, and asking whether
+    // it does let the copy reach past the close to that file — the command ran,
+    // where bash refuses it. What the walk itself did to fd 3 settles it.
+    let out = run_with_input(&format!(
+        "cd {}\nfunc f() {{ sh -c 'echo RAN' 3>&- 4>&3 }}\nf 3> enclosing\nputs after\n",
+        dir.display()
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Bad file descriptor"), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after\n",
+        "the copy reached past the close: {stderr}"
+    );
+
+    // The copy that has no close before it still works, which is the rule this
+    // must not erode: the shell's own fd 3 is a real descriptor to copy.
+    let out = run_with_input(&format!(
+        "cd {}\nfunc g() {{ sh -c 'echo nested >&4' 4>&3 }}\ng 3> inherited\n",
+        dir.display()
+    ));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("inherited")).unwrap_or_default(),
+        "nested\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
