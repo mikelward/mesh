@@ -1308,6 +1308,168 @@ fn sigcont_harness(exec: &MeshExec) -> i32 {
     0
 }
 
+#[test]
+fn an_interrupt_abandons_a_wait_and_leaves_the_job_alone() {
+    let exec = MeshExec::new(isolated_config_home());
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(wait_interrupt_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// A wait blocks on a job that does *not* hold the terminal, so the SIGINT a
+/// Ctrl-C generates reaches the shell rather than the job. The shell ignores
+/// SIGINT at the prompt, which would leave nothing to end the wait: without a
+/// catcher installed around it this hangs until the job finishes on its own.
+///
+/// The signal is delivered directly rather than typed. What is under test is
+/// what mesh does with a SIGINT during a wait, and driving that through the line
+/// discipline instead only adds a race against reedline's raw mode, in which the
+/// same keystroke means "cancel this line" rather than "interrupt".
+fn wait_interrupt_harness(exec: &MeshExec) -> i32 {
+    let mut master = -1;
+    let mut slave = -1;
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } != 0
+    {
+        return 40;
+    }
+    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    let mesh = unsafe { libc::fork() };
+    if mesh < 0 {
+        return 41;
+    }
+    // mesh takes the session and the terminal itself, rather than being placed
+    // in one by the harness: the point of the test is a signal the *terminal*
+    // generates, so mesh has to be the foreground group of its own controlling
+    // terminal exactly as it is under a real one.
+    if mesh == 0 {
+        unsafe {
+            libc::setsid();
+            libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0);
+            libc::dup2(slave, libc::STDIN_FILENO);
+            libc::dup2(slave, libc::STDOUT_FILENO);
+            libc::dup2(slave, libc::STDERR_FILENO);
+            libc::close(master);
+            libc::close(slave);
+        }
+        unsafe { libc::_exit(exec_mesh(exec)) };
+    }
+    unsafe { libc::close(slave) };
+    if !pty_wait_for_prompt(master) {
+        return 43;
+    }
+
+    let job = "sleep 30 &\n";
+    if unsafe { libc::write(master, job.as_ptr().cast(), job.len()) } != job.len() as isize
+        || pty_read_until_prompt(master).is_none()
+    {
+        return 44;
+    }
+    let waiting = "wait 1\n";
+    if unsafe { libc::write(master, waiting.as_ptr().cast(), waiting.len()) }
+        != waiting.len() as isize
+    {
+        return 45;
+    }
+
+    let mut ready = libc::pollfd {
+        fd: master,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut seen = Vec::new();
+    // Let the line reach the shell before interrupting anything. Until reedline
+    // hands the terminal back, Ctrl-C is a keystroke that cancels the line
+    // rather than a signal, so an eager one would interrupt nothing and leave
+    // the wait unstarted. The repaint stops once the line is submitted, so
+    // silence is the evidence that it has been.
+    loop {
+        if unsafe { libc::poll(&mut ready, 1, 400) } <= 0 {
+            break;
+        }
+        let mut chunk = [0_u8; 256];
+        let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if count <= 0 {
+            return 53;
+        }
+        seen.extend_from_slice(&chunk[..count as usize]);
+        if seen.windows(4).any(|part| part == b"\x1b[6n") {
+            unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
+        }
+    }
+    seen.clear();
+
+    // One SIGINT, delivered the way the terminal would deliver it. Nothing is
+    // printed on entering the wait, so the *failed* prompt is the evidence that
+    // the wait came back non-zero — `mesh$` would be repainted on any keystroke,
+    // wait or no wait.
+    if unsafe { libc::kill(mesh, libc::SIGINT) } != 0 {
+        return 46;
+    }
+    let mut abandoned = false;
+    for _ in 0..20 {
+        if unsafe { libc::poll(&mut ready, 1, 500) } > 0 {
+            let mut chunk = [0_u8; 256];
+            let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
+            if count <= 0 {
+                return 47;
+            }
+            seen.extend_from_slice(&chunk[..count as usize]);
+            if seen.windows(4).any(|part| part == b"\x1b[6n") {
+                unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
+            }
+        }
+        if seen.windows(5).any(|part| part == b"mesh!") {
+            abandoned = true;
+            break;
+        }
+    }
+    if !abandoned {
+        return 48;
+    }
+
+    // The wait reports the interruption, and the wait is all that was abandoned:
+    // `sleep 30` is still running and still listed, so nothing was taken out
+    // from under a later `fg`.
+    let probe = "puts s=$sh.status\n";
+    if unsafe { libc::write(master, probe.as_ptr().cast(), probe.len()) } != probe.len() as isize
+        || !pty_wait_for_marker(master, b"s=130")
+    {
+        return 49;
+    }
+    let listing = "jobs\n";
+    if unsafe { libc::write(master, listing.as_ptr().cast(), listing.len()) }
+        != listing.len() as isize
+        || !pty_wait_for_marker(master, b"Running sleep 30")
+    {
+        return 52;
+    }
+    if unsafe { libc::write(master, b"exit\n".as_ptr().cast(), 5) } != 5 {
+        return 50;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(mesh, &mut status, 0) } != mesh || !libc::WIFEXITED(status) {
+        return 51;
+    }
+    unsafe { libc::close(master) };
+    0
+}
+
 fn background_startup_harness(exec: &MeshExec) -> i32 {
     use std::os::fd::RawFd;
 
@@ -1728,6 +1890,116 @@ fn background_pipeline_retains_statuses_reaped_on_earlier_prompts() {
 fn foreground_pipeline_retains_statuses_reaped_on_earlier_prompts() {
     let out = run_with_input("sh -c 'exit 7' | sleep 0.2 &\nsleep 0.05\njobs\nfg\nexit\n");
     assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn wait_lets_a_background_job_finish_before_the_shell_exits() {
+    // The shell hangs its jobs up on the way out, so without a wait the work a
+    // background job had left to do is simply lost.
+    let dir = fresh_dir("wait_background");
+    let job = format!(
+        "sh -c 'sleep 0.2; echo finished > {}/result' &\n",
+        dir.display()
+    );
+    let hung_up = run_with_input(&job);
+    assert_eq!(hung_up.status.code(), Some(0));
+    assert!(!dir.join("result").exists());
+
+    let waited = run_with_input(&format!("{job}wait 1\n"));
+    assert_eq!(waited.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("result")).unwrap(),
+        "finished\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wait_reports_the_jobs_own_status() {
+    for reference in ["1", "%1"] {
+        let out = run_with_input(&format!(
+            "sh -c 'sleep 0.05; exit 7' &\nwait {reference}\nputs $sh.status\n"
+        ));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n", "{reference}");
+    }
+}
+
+#[test]
+fn wait_answers_from_a_finished_jobs_record() {
+    // Reading `$sh.jobs` polls the job and reaps its pid while keeping the
+    // record, so by the time `wait` runs there is no child left to wait for.
+    // The status the record already carries is the answer — waiting after the
+    // fact reports what waiting through it would have.
+    let out = run_with_input(
+        "sh -c 'exit 3' &\nsleep 0.2\nputs state=$sh.jobs[1].state\nwait 1\nputs status=$sh.status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "state=done\nstatus=3\n"
+    );
+}
+
+#[test]
+fn a_waited_job_leaves_the_table() {
+    // Its status has already been handed to the caller, so the prompt-time reap
+    // must not announce it a second time.
+    let out = run_with_input("sh -c 'exit 5' &\nwait 1\njobs\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("Done"), "{stderr}");
+}
+
+#[test]
+fn wait_needs_a_job_to_wait_for() {
+    // Bare `wait` is bash's "every child"; `fg`'s no-operand "the most recent
+    // one" would read the same and mean something else, so it is refused until
+    // the aggregate form is settled rather than quietly picking one meaning.
+    let bare = run_with_input("sleep 0.05 &\nwait\nputs $sh.status\n");
+    assert!(
+        String::from_utf8_lossy(&bare.stderr).contains("wait: expected a job"),
+        "{:?}",
+        bare.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&bare.stdout), "1\n");
+
+    let unknown = run_with_input("sleep 0.05 &\nwait 9\nputs $sh.status\n");
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("wait: 9: no such job"),
+        "{:?}",
+        unknown.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&unknown.stdout), "1\n");
+}
+
+#[test]
+fn wait_refuses_in_a_pipeline_stage() {
+    // A forked stage is not the parent of the shell's jobs, so its `waitpid`
+    // would fail with ECHILD rather than wait for anything — the same reason
+    // `fg` and `bg` refuse there.
+    let out = run_with_input("sleep 0.05 &\nwait 1 | cat\nputs $sh.status\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("wait: no job control in a pipeline stage"),
+        "{:?}",
+        out.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+}
+
+#[test]
+fn fg_hands_back_a_finished_jobs_status() {
+    // A finished job has no process group left to continue, so `fg` used to
+    // signal into the void and fail with ESRCH. Since reading `$sh.jobs` is
+    // enough to get here, an observation of the table decided what `fg` did.
+    let out = run_with_input(
+        "sh -c 'exit 6' &\nsleep 0.2\nputs state=$sh.jobs[1].state\nfg\nputs status=$sh.status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "state=done\nstatus=6\n"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("[1] Done (6)"), "{stderr}");
+    assert!(!stderr.contains("No such process"), "{stderr}");
 }
 
 #[test]
@@ -5052,7 +5324,7 @@ fn a_bare_return_at_top_level_is_reported_and_recoverable() {
 
 #[test]
 fn a_reserved_name_cannot_be_a_function() {
-    for name in ["cd", "exit", "func", "return", "jobs"] {
+    for name in ["cd", "exit", "func", "return", "jobs", "wait"] {
         let out = run_with_input(&format!("func {name}() {{ puts x }}\n"));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("reserved name"), "{name}: {stderr}");

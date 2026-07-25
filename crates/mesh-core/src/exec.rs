@@ -104,7 +104,11 @@ struct Job {
 #[derive(Clone, Copy, PartialEq)]
 enum JobState {
     Running,
-    Stopped,
+    /// Carries the `128 + signal` the stop reported, so `wait` can answer for a
+    /// job that is already stopped when it is asked. The stop cannot be read
+    /// back from the process later: `WUNTRACED` reports a stop once, and a
+    /// second `waitpid` on a process that is still stopped simply blocks.
+    Stopped(u8),
 }
 
 /// One live job as `$sh.jobs` reports it — the shell's own view, without the
@@ -143,7 +147,7 @@ impl JobTable {
                 if job.state == JobState::Running {
                     match poll_outcomes(&mut job.outcomes) {
                         Some(WaitResult::Complete(code)) => status = Some(code),
-                        Some(WaitResult::Stopped(_)) => job.state = JobState::Stopped,
+                        Some(WaitResult::Stopped(code)) => job.state = JobState::Stopped(code),
                         None => {}
                     }
                 }
@@ -154,7 +158,7 @@ impl JobTable {
                     state: match (status, job.state) {
                         (Some(_), _) => "done",
                         (None, JobState::Running) => "running",
-                        (None, JobState::Stopped) => "stopped",
+                        (None, JobState::Stopped(_)) => "stopped",
                     },
                     status,
                 }
@@ -175,6 +179,18 @@ impl JobTable {
         let Some(index) = self.resolve(args, "fg") else {
             return 1;
         };
+        // A finished job has nothing left to continue, and signaling its empty
+        // process group only fails with `ESRCH`. Hand back the status the record
+        // carries — the reason a completed job is kept in the table at all — and
+        // report it the way the prompt-time reap would have. Since every command
+        // refreshes `$sh.jobs`, this is not a rare race: running anything at all
+        // between the job finishing and the `fg` used to be enough to turn a
+        // usable status into `mesh: fg: No such process`.
+        if let Some(WaitResult::Complete(status)) = poll_outcomes(&mut self.jobs[index].outcomes) {
+            let job = self.jobs.remove(index);
+            note!("[{}] Done ({status}) {}", job.id, job.command);
+            return status;
+        }
         let mut job = self.jobs.remove(index);
         set_foreground_group(job.pgid);
         if let Some(modes) = &job.job_modes {
@@ -194,11 +210,60 @@ impl JobTable {
             WaitResult::Complete(status) => status,
             WaitResult::Stopped(status) => {
                 job.job_modes = stopped_modes;
-                job.state = JobState::Stopped;
+                job.state = JobState::Stopped(status);
                 note!("[{}] Stopped {}", job.id, job.command);
                 self.jobs.push(job);
                 status
             }
+        }
+    }
+
+    /// Wait for a job to finish and report its status, leaving it where it is.
+    ///
+    /// This is [`JobTable::foreground`] without the foreground: no `SIGCONT`,
+    /// and the terminal stays with the shell, so a background job keeps running
+    /// as a background job and only its status comes back. A job that already
+    /// finished answers from the status its record carries, so waiting after the
+    /// fact reports the same thing as waiting through it.
+    ///
+    /// The job leaves the table once it is waited for, which is what keeps the
+    /// prompt from also announcing `[1] Done (0) …` for a status the caller has
+    /// already been given.
+    pub fn wait(&mut self, args: &[String]) -> u8 {
+        // Bare `wait` means "every child, with an aggregate status" in bash,
+        // while `fg`'s no-operand default means "the most recent one". The two
+        // read alike and differ in what they do, so the operand is required
+        // until `DESIGN.md` settles the aggregate rather than guessing here.
+        if args.is_empty() {
+            note!("mesh: wait: expected a job");
+            return 1;
+        }
+        let Some(index) = self.resolve(args, "wait") else {
+            return 1;
+        };
+        // A stopped job does not finish on its own, so waiting for one would
+        // block until something else continued it — from a prompt this shell is
+        // no longer reading. Report the stop instead, as bash does.
+        if let JobState::Stopped(status) = self.jobs[index].state {
+            let job = &self.jobs[index];
+            note!("[{}] Stopped {}", job.id, job.command);
+            return status;
+        }
+        let result = wait_outcomes_until(&mut self.jobs[index].outcomes, OnInterrupt::Abandon);
+        match result {
+            Some(WaitResult::Complete(status)) => {
+                self.jobs.remove(index);
+                status
+            }
+            Some(WaitResult::Stopped(status)) => {
+                let job = &mut self.jobs[index];
+                job.state = JobState::Stopped(status);
+                note!("[{}] Stopped {}", job.id, job.command);
+                status
+            }
+            // Ctrl-C gives up on the wait, not on the job: it keeps running and
+            // keeps its place in the table.
+            None => INTERRUPT_CODE,
         }
     }
 
@@ -229,7 +294,7 @@ impl JobTable {
         }
         let mut status = 0;
         for job in &self.jobs {
-            let state = if job.state == JobState::Stopped {
+            let state = if matches!(job.state, JobState::Stopped(_)) {
                 "Stopped"
             } else {
                 "Running"
@@ -255,7 +320,9 @@ impl JobTable {
                         note!("[{}] Done ({status}) {}", job.id, job.command);
                         continue;
                     }
-                    Some(WaitResult::Stopped(_)) => self.jobs[index].state = JobState::Stopped,
+                    Some(WaitResult::Stopped(code)) => {
+                        self.jobs[index].state = JobState::Stopped(code);
+                    }
                     None => {}
                 }
             }
@@ -296,7 +363,7 @@ impl Drop for JobTable {
     fn drop(&mut self) {
         for job in &self.jobs {
             hangup_group(job.pgid, libc::SIGHUP);
-            if job.state == JobState::Stopped {
+            if matches!(job.state, JobState::Stopped(_)) {
                 hangup_group(job.pgid, libc::SIGCONT);
             }
         }
@@ -306,6 +373,10 @@ impl Drop for JobTable {
 /// `128 + SIGPIPE(13)` — an upstream stage killed because a later stage closed
 /// the pipe early. Under our pipefail rule this does not count as a failure.
 const SIGPIPE_CODE: u8 = 128 + 13;
+
+/// `128 + SIGINT(2)` — the status a wait reports when Ctrl-C ended the wait
+/// rather than the job, matching what an interrupted command itself reports.
+const INTERRUPT_CODE: u8 = 128 + 2;
 
 /// Run `words[0]` with `words[1..]` as arguments and return its exit status.
 ///
@@ -948,7 +1019,7 @@ pub fn run_pipeline(
                     outcomes,
                     shell_modes,
                     job_modes,
-                    state: JobState::Stopped,
+                    state: JobState::Stopped(status),
                 });
             }
             status
@@ -1034,14 +1105,40 @@ fn stage_codes(outcomes: &[Outcome]) -> Vec<u8> {
         .collect()
 }
 
+/// What a wait does about a SIGINT that arrives while it blocks.
+#[derive(Clone, Copy, PartialEq)]
+enum OnInterrupt {
+    /// Keep waiting. The job holds the terminal, so the keystroke went to the
+    /// job itself and the wait is about to end on its own.
+    Resume,
+    /// Stop waiting and leave the job running. A background job never receives
+    /// the keystroke, so without this the shell has no way out of the wait.
+    Abandon,
+}
+
 fn wait_outcomes(outcomes: &mut [Outcome]) -> WaitResult {
+    wait_outcomes_until(outcomes, OnInterrupt::Resume).expect("a resuming wait is never abandoned")
+}
+
+/// Wait for every process behind a job. `None` is a wait abandoned by SIGINT
+/// under [`OnInterrupt::Abandon`]; the processes it had not reached are still
+/// running, and their outcomes still say so.
+fn wait_outcomes_until(outcomes: &mut [Outcome], on_interrupt: OnInterrupt) -> Option<WaitResult> {
+    let _catcher = (on_interrupt == OnInterrupt::Abandon)
+        .then(SigintCatcher::install)
+        .flatten();
     let mut status = 0;
     let mut stopped = None;
     for outcome in &mut *outcomes {
         let (code, piped_out, did_stop, completed) = match outcome {
             Outcome::Running { pid, piped_out } => {
-                let (code, stopped) = wait_for_job(*pid).unwrap_or((1, false));
-                (code, *piped_out, stopped, !stopped)
+                match wait_for_job(*pid, on_interrupt) {
+                    Ok((code, stopped)) => (code, *piped_out, stopped, !stopped),
+                    Err(err) if err.kind() == ErrorKind::Interrupted => return None,
+                    // Anything else is a wait that cannot be completed, which
+                    // the caller has to be able to move past.
+                    Err(_) => (1, *piped_out, false, true),
+                }
             }
             Outcome::Completed { code, piped_out } => (*code, *piped_out, false, false),
             Outcome::Failed(code) => (*code, false, false, false),
@@ -1056,7 +1153,7 @@ fn wait_outcomes(outcomes: &mut [Outcome]) -> WaitResult {
             status = code;
         }
     }
-    stopped.map_or(WaitResult::Complete(status), WaitResult::Stopped)
+    Some(stopped.map_or(WaitResult::Complete(status), WaitResult::Stopped))
 }
 
 fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<WaitResult> {
@@ -1238,7 +1335,10 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
     // wait then fails for a subshell that exited perfectly well. `JobTable::foreground`
     // already reclaims on every path out, including its error return; this matches it.
     let outcome = loop {
-        let (status, stopped) = match wait_for_job(pid) {
+        // `Resume`: the subshell holds the terminal, so a Ctrl-C goes to it and
+        // this wait has nothing to give up on — the same reading a foreground
+        // job's wait takes.
+        let (status, stopped) = match wait_for_job(pid, OnInterrupt::Resume) {
             Ok(waited) => waited,
             Err(error) => break Err(error),
         };
@@ -1265,8 +1365,19 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
 /// termination, which would leave mesh blocked after Ctrl-Z. Reporting a stop
 /// now lets the shell reclaim the terminal; the job-table task will retain the
 /// process and make it available to `fg` / `bg`.
-fn wait_for_job(pid: libc::pid_t) -> std::io::Result<(u8, bool)> {
+///
+/// `on_interrupt` decides what a SIGINT arriving mid-wait means: for a job that
+/// holds the terminal the signal went to the job, so the wait resumes, while a
+/// wait on a *background* job reports the interruption as `ErrorKind::Interrupted`
+/// for the caller to give up on.
+fn wait_for_job(pid: libc::pid_t, on_interrupt: OnInterrupt) -> std::io::Result<(u8, bool)> {
     loop {
+        // Checked before blocking as well as after, since a SIGINT that lands
+        // between installing the handler and entering `waitpid` sets the flag
+        // and is then gone — there is no `EINTR` left for it to cause.
+        if on_interrupt == OnInterrupt::Abandon && SIGINT_SEEN.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::from(ErrorKind::Interrupted));
+        }
         let mut status = 0;
         // SAFETY: `pid` is a live child PID and status points to writable
         // storage. WUNTRACED requests the state transition needed for Ctrl-Z.
@@ -1274,6 +1385,12 @@ fn wait_for_job(pid: libc::pid_t) -> std::io::Result<(u8, bool)> {
         if result < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == ErrorKind::Interrupted {
+                // Some other signal (a resized window, say) also lands here, so
+                // the flag rather than the `EINTR` is what says to give up.
+                if on_interrupt == OnInterrupt::Abandon && SIGINT_SEEN.swap(false, Ordering::SeqCst)
+                {
+                    return Err(err);
+                }
                 continue;
             }
             return Err(err);
@@ -1297,6 +1414,66 @@ fn wait_status(status: libc::c_int) -> u8 {
         128u8.wrapping_add(libc::WTERMSIG(status) as u8)
     } else {
         1
+    }
+}
+
+/// Set by [`SigintCatcher`]'s handler; read by the wait that installed it.
+static SIGINT_SEEN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn note_interrupt(_signal: libc::c_int) {
+    SIGINT_SEEN.store(true, Ordering::SeqCst);
+}
+
+/// Make SIGINT interrupt a blocking wait, putting the previous disposition back
+/// when the wait ends.
+///
+/// The interactive shell ignores SIGINT, which is the right answer while a
+/// foreground job runs: that job holds the terminal, so the keystroke reaches
+/// *it* and the shell has nothing to do. A background job never receives it, so
+/// an ignored SIGINT would leave `wait` blocked in `waitpid` with no way out —
+/// Ctrl-C would do nothing at all until the job finished on its own.
+///
+/// Installing a handler is not enough by itself. `signal(3)` sets `SA_RESTART`
+/// here, which would resume the `waitpid` rather than fail it, so this goes
+/// through `sigaction` with no flags.
+struct SigintCatcher {
+    previous: libc::sigaction,
+}
+
+impl SigintCatcher {
+    /// `None` when SIGINT is not currently ignored. A non-interactive shell
+    /// keeps the default disposition, under which Ctrl-C ends the shell the way
+    /// it does during any other command; a wait is not the place to change that.
+    fn install() -> Option<Self> {
+        // SAFETY: a zeroed `sigaction` is the documented starting point, and
+        // every field is written before the struct is used. The handler only
+        // stores to an atomic, which is async-signal-safe. Single-threaded here.
+        unsafe {
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(libc::SIGINT, std::ptr::null(), &mut previous) != 0
+                || previous.sa_sigaction != libc::SIG_IGN
+            {
+                return None;
+            }
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction =
+                note_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = 0;
+            SIGINT_SEEN.store(false, Ordering::SeqCst);
+            (libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) == 0)
+                .then_some(Self { previous })
+        }
+    }
+}
+
+impl Drop for SigintCatcher {
+    fn drop(&mut self) {
+        // SAFETY: `previous` was filled in by `sigaction` for this same signal.
+        unsafe {
+            libc::sigaction(libc::SIGINT, &self.previous, std::ptr::null_mut());
+        }
+        SIGINT_SEEN.store(false, Ordering::SeqCst);
     }
 }
 
