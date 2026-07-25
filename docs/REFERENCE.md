@@ -149,9 +149,12 @@ puts $sh.jobs[1].state         # running
 running = $sh.jobs:values:filter(func(j) { $j.state == running })
 ```
 
-Each record holds `pid` (the process group leader, which is what the launch
+Each record holds `id`, `pid` (the process group leader, which is what the launch
 notice reports and what a signal needs), `cmd`, `state` — `running`, `stopped`,
 or `done` — and `status`, empty until the job finishes and then its exit code.
+
+Indexing yields a **handle** rather than a copy of the record, so `$sh.jobs[2]`
+can be stored and stays current — see [Job control](#job-control).
 
 Reading it **polls but does not reap**: a finished job reports `done` with its
 status and stays in the table, so a later `fg` or `wait` still finds it and hands
@@ -340,15 +343,20 @@ one-MiB output cap.
 
 ### Job control
 
-`fg`, `bg` and `wait` all take the same job reference. Since they only ever take
-a job, a **bare id** is unambiguous — `fg 2` — and the `%` sigil covers the rest:
+`fg`, `bg`, `wait` and `kill` all take the same job references:
 
 | Reference | Names |
 |---|---|
-| `2` / `%2` | Job 2 |
+| `%2` | Job 2 |
 | `%%` / `%+` | The **current** job |
 | `%-` | The **previous** job |
 | `%prefix` | The most recent job whose command starts with `prefix` |
+| `$j` / `$sh.jobs[2]` | The job a handle names — see below |
+
+`fg`, `bg` and `wait` only ever take a job, so a **bare id** is unambiguous
+there: `fg 2` is `fg %2`. **`kill` is the exception** — a bare number is a *pid*,
+as it is in every shell, so `kill 2` signals process 2 rather than job 2. That
+distinction is the reason a handle has no byte form.
 
 A job becomes **current** when it is registered, when it stops, and when `bg`
 starts it again — the events that make it the one you most likely mean. The job
