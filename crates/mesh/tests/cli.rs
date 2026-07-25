@@ -6470,6 +6470,23 @@ fn a_hard_lexical_error_in_a_function_body_reports_without_leaking() {
     // And the definition that *does* close still runs its own commands afterwards.
     let out = run_with_input("func f() {\nputs \"\\z\"\nputs LEAKED\n}\nputs AFTER\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "AFTER\n");
+
+    // The `}` is found however many errors precede it and whatever shape they take.
+    // A **zero-width** diagnostic (`${}` reports an empty span) and an error count
+    // past any fixed retry budget both defeated span-blanking recovery.
+    let many = "\\z".repeat(200);
+    for input in [
+        "func f() { puts ${} }\nputs LATER\n".to_owned(),
+        format!("func f() {{ puts \"{many}\" }}\nputs LATER\n"),
+    ] {
+        let out = run_with_input(&input);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "LATER\n",
+            "a closed body was not seen past its errors: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 /// A tokenize failure *after* the body's `}` says nothing about the body — it has

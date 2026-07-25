@@ -5512,77 +5512,184 @@ fn strip_growing_tail(list: &str) -> (&str, GrowingTail) {
 /// Is the `func` body starting at the `{` in `text` still waiting for its matching
 /// `}`?
 ///
-/// Asked of the **real tokenizer**, so quoting, raw strings, escapes, comments, and
-/// `${…}` interpolation are resolved exactly as the parser resolves them and there
-/// is no second set of quote rules to keep in step. A brace inside a string
-/// (`puts "{"`), behind a backslash (`puts \\{`), or belonging to an interpolation
-/// (`puts ${x}`) is not a `LBrace` token at all, so it cannot count.
+/// One question, and the reader's quarantine depends on it: until the `}` arrives,
+/// every line belongs to the definition rather than to the top level.
+///
+/// Asked of the **real tokenizer** whenever the buffer lexes, so quoting, raw
+/// strings, escapes, comments, and `${…}` interpolation are resolved exactly as the
+/// parser resolves them, with no second set of rules to keep in step. A brace inside
+/// a string (`puts "{"`), behind a backslash (`puts \\{`), or belonging to an
+/// interpolation (`puts ${x}`) is not an `LBrace` token at all, so it cannot count.
 ///
 /// The **first** `}` that returns the depth to zero settles it, not the final net
 /// depth: trailing text that reopens a brace (`func f() {} {`) must not keep the
 /// definition pending, so it is dispatched and the parser reports the documented
 /// "unexpected text after the closing `}`" error.
 ///
-/// There is exactly one question — *is the matching `}` in the buffer yet?* — and a
-/// tokenize failure must not be mistaken for an answer to it. A **hard** lexical
-/// error such as an invalid escape sits inside a string, so it cannot change brace
-/// structure: the braces after it are still there to be counted, and whether the
-/// body closed is still knowable. Blanking the offending span and asking the
-/// tokenizer again recovers that view, which is what the char scanner this replaced
-/// got for free by never failing at all — without a second copy of the quote rules
-/// to keep in step.
-///
-/// Both failure modes then fall out of the one question, which is why they are no
-/// longer separate cases:
-///
-/// - `func f() { puts "\z" }` — the `}` is there behind the error, so the
-///   definition is **done**. Waiting for a later line to repair an invalid escape
-///   buffers forever behind a diagnostic that never arrives.
-/// - `func f() {`⏎`puts "\z"`⏎`puts LEAKED` — no `}` yet, so it is **still open**
-///   and stays quarantined. Dispatching here ran `puts LEAKED` at the top level.
-///
-/// An **unterminated** quote or heredoc is different in kind and stops the scan: the
-/// rest of the input is genuinely inside that construct, so any `}` in there belongs
-/// to the string rather than to block structure, and only a later line can close it.
+/// When the buffer does **not** lex, the tokenizer cannot answer at all — it is
+/// all-or-nothing, so one bad escape hides every brace after it — and both ways of
+/// guessing are wrong in practice: assuming "still open" hangs on
+/// `func f() { puts "\z" }`, whose `}` is right there, while assuming "closed" runs
+/// the body's own later lines at the top level. The offending text is inside a
+/// string, so it cannot move a brace; the braces are still there to be counted, and
+/// [`scan_braces`] counts them without ever failing. Deciding by error *kind*, or by
+/// blanking spans and retokenizing, both looked cheaper and both produced a string of
+/// wrong answers — a zero-width diagnostic (`${}`) has nothing to blank, and errors
+/// past a retry bound silently reverted to "open".
 fn body_awaits_close(text: &str) -> bool {
-    // Each pass either answers the question or neutralizes one hard error and looks
-    // again. Bounded because a pathological buffer should not spin: reaching the cap
-    // keeps the definition open, which is the quarantining answer.
-    let mut source = text.to_owned();
-    for _ in 0..MAX_LEXICAL_RECOVERIES {
-        let error = match parser::tokenize(&source) {
-            Ok(tokens) => return first_close_at_depth_zero(&tokens).is_none(),
-            Err(error) => error,
-        };
-        if matches!(
-            error.kind,
-            parser::ParseErrorKind::UnexpectedEnd
-                | parser::ParseErrorKind::Unterminated(_)
-                | parser::ParseErrorKind::UnterminatedHeredoc(_)
-        ) {
-            // The tail is inside an open construct, so only what precedes it counts.
-            return !source
-                .get(..error.span.start)
-                .and_then(|prefix| parser::tokenize(prefix).ok())
-                .is_some_and(|tokens| first_close_at_depth_zero(&tokens).is_some());
-        }
-        // A hard error: blank it and look again. Spans are char boundaries and a
-        // space is one byte, so the replacement keeps every later span valid.
-        let Some(span) = source.get(error.span.clone()) else {
-            return true;
-        };
-        let blanked = " ".repeat(span.len());
-        if blanked.is_empty() {
-            return true;
-        }
-        source.replace_range(error.span.clone(), &blanked);
+    match parser::tokenize(text) {
+        Ok(tokens) => first_close_at_depth_zero(&tokens).is_none(),
+        Err(_) => scan_braces(text, 0).close.is_none(),
     }
-    true
 }
 
-/// How many hard lexical errors [`body_awaits_close`] will look past before giving
-/// up and keeping the definition quarantined.
-const MAX_LEXICAL_RECOVERIES: usize = 64;
+/// The result of a bare-level brace scan (see [`scan_braces`]).
+struct BraceScan {
+    /// Byte offset of the `}` that first returned the depth to 0, if one was
+    /// reached — used to split a `func` body from whatever follows its `}`.
+    close: Option<usize>,
+    /// Net `{` minus `}` at the bare (unquoted) level over the whole input.
+    #[allow(dead_code)]
+    depth: i32,
+}
+
+/// Count bare-level `{` / `}` in `text`, honoring the same quote, raw, escape, and
+/// interpolation rules the tokenizer applies.
+///
+/// The **fallback** for [`body_awaits_close`] when `tokenize` fails, and the reason
+/// it exists: the tokenizer is all-or-nothing, so a single bad escape hides every
+/// brace after it, and a reader that cannot see the body's `}` either hangs on a
+/// finished definition or leaks the body's own lines to the top level. This never
+/// fails, which is the property that question needs.
+///
+/// An unterminated quote ends the scan at the line boundary (the rest of the input
+/// is inside that string), so no `}` inside it is counted and buffering continues.
+///
+/// Counting starts from `start_depth` (0 for a whole-line check, 1 for a body
+/// whose opening `{` has already been consumed).
+fn scan_braces(text: &str, start_depth: i32) -> BraceScan {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut depth = start_depth;
+    let mut close = None;
+    // Raw-string eligibility: a raw prefix `r'`/`r"` is recognized only at a word
+    // start or right after a bare `=`, as the tokenizer does.
+    let mut word_start = true;
+    let mut after_equals = false;
+    let mut k = 0;
+    while k < chars.len() {
+        let (byte, c) = chars[k];
+        let raw_eligible = word_start || after_equals;
+        // Default: an ordinary bare-word char. Boundary arms below re-enable
+        // raw eligibility exactly where the lexer would start a fresh word.
+        word_start = false;
+        after_equals = false;
+        match c {
+            _ if c.is_whitespace() => {
+                word_start = true;
+                k += 1;
+            }
+            // A backslash escapes the next char, so `\{` / `\}` are literal. A
+            // `\`-newline is a line boundary, though: a function body runs line by
+            // line, so the next word starts fresh there (a following raw prefix is
+            // raw), exactly as an unescaped newline would reset it.
+            '\\' => {
+                if chars.get(k + 1).map(|&(_, c)| c) == Some('\n') {
+                    word_start = true;
+                }
+                k += 2;
+            }
+            '\'' | '"' => match skip_quote(&chars, k + 1, c, true) {
+                Some(next) => k = next,
+                None => return BraceScan { close, depth },
+            },
+            'r' if raw_eligible
+                && matches!(chars.get(k + 1).map(|&(_, c)| c), Some('\'') | Some('"')) =>
+            {
+                match skip_quote(&chars, k + 2, chars[k + 1].1, false) {
+                    Some(next) => k = next,
+                    None => return BraceScan { close, depth },
+                }
+            }
+            // A bare `${…}` interpolation: its braces belong to the interpolation,
+            // not to block structure, so skip to its close (as `parse_var` does)
+            // without counting them. An unterminated `${` is a line-local error, so
+            // it ends at the line boundary and leaves no dangling `{`.
+            '$' if chars.get(k + 1).map(|&(_, c)| c) == Some('{') => {
+                k = skip_interpolation(&chars, k + 2);
+            }
+            // A bare `{`/`}` is a block delimiter and a word boundary: the body's
+            // first word begins right after the opening `{` (so a `func f(){r'…'}`
+            // raw prefix is raw), and a fresh word follows the closing `}`.
+            '{' => {
+                depth += 1;
+                word_start = true;
+                k += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 && close.is_none() {
+                    close = Some(byte);
+                }
+                word_start = true;
+                k += 1;
+            }
+            // Operators a fresh word starts after (so a following
+            // `r'…'` is raw): `;`, `|`/`||`, `<`, `>`/`>>`.
+            ';' | '|' | '<' | '>' => {
+                word_start = true;
+                k += 1;
+            }
+            // Both `&&` (a separator) and a lone `&` (the background operator)
+            // start a fresh word after them — so a
+            // raw prefix that immediately follows (`true&r'…'`) is recognized as
+            // raw here too, and the scan cannot mis-read it as a plain quote and
+            // swallow the block's closing `}`.
+            '&' => {
+                word_start = true;
+                if chars.get(k + 1).map(|&(_, c)| c) == Some('&') {
+                    k += 2;
+                } else {
+                    k += 1;
+                }
+            }
+            // A bare `=` lets a raw prefix begin the value (`k=r'v'`).
+            '=' => {
+                after_equals = true;
+                k += 1;
+            }
+            _ => k += 1,
+        }
+    }
+    BraceScan { close, depth }
+}
+
+/// Skip a quoted string from just past the opening `quote`. With `escapes`, a
+/// backslash escapes the next char (matching `"…"`/`'…'`); without it (raw
+/// `r'…'`/`r"…"`) no escape applies. An unterminated quote ends at the next line
+/// break, so a brace after it is not miscounted. Returns the index past the
+/// close (or the line boundary), or `None` at end of input with no close.
+fn skip_quote(chars: &[(usize, char)], start: usize, quote: char, escapes: bool) -> Option<usize> {
+    let mut k = start;
+    while k < chars.len() {
+        let c = chars[k].1;
+        if c == '\n' {
+            return Some(k); // unterminated quote ends at the line boundary
+        }
+        if escapes && c == '\\' {
+            // A backslash escapes the next char, but never across a line break.
+            if chars.get(k + 1).map(|&(_, c)| c) == Some('\n') {
+                return Some(k + 1);
+            }
+            k += 2;
+            continue;
+        }
+        if c == quote {
+            return Some(k + 1);
+        }
+        k += 1;
+    }
+    None
+}
 
 /// Index of the first `}` that returns brace depth to zero, if one is reached.
 fn first_close_at_depth_zero(tokens: &[parser::Token]) -> Option<usize> {
@@ -9000,8 +9107,15 @@ mod tests {
         assert!(!body_awaits_close(r#"{ puts "\z" }"#));
         assert!(body_awaits_close(r#"{ puts "\z""#));
         assert!(body_awaits_close("{ puts \"\\z\"\nputs more\n"));
-        // Several hard errors in one buffer are looked past in turn.
+        // Any number of hard errors, with no recovery budget to run out of: a
+        // bounded retry loop silently reverted to "open" past its cap.
         assert!(!body_awaits_close("{ puts \"\\z\"\nputs \"\\q\"\n}"));
+        let many = format!("{{ puts \"{}\" }}", "\\z".repeat(200));
+        assert!(!body_awaits_close(&many));
+        // A **zero-width** diagnostic — `${}` reports an empty span — has nothing to
+        // blank, so a span-blanking recovery could not advance past it at all.
+        assert!(!body_awaits_close("{ puts ${} }"));
+        assert!(body_awaits_close("{ puts ${}"));
         // An unterminated construct is different in kind: the rest of the input is
         // inside it, so a `}` in there is string content, not block structure.
         assert!(body_awaits_close("{ puts \"open\n"));
