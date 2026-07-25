@@ -328,10 +328,11 @@ file as tasks land.
 Small items rescued from pull requests that were closed as superseded — the bulk
 of each PR had landed by another route, but these pieces had not.
 
-- [ ] **FreeBSD compile-check in CI.** `mesh-platform` normalizes the `TIOCSCTTY`
-      ioctl request type for the BSD ABI, but nothing verifies it still compiles
-      there; only Linux and macOS are checked. A `cargo check --target
-      x86_64-unknown-freebsd` job would keep the shim honest.
+- [x] **FreeBSD compile-check in CI.** `cargo check --workspace --all-targets
+      --target x86_64-unknown-freebsd` runs alongside the macOS cross-check, so a
+      BSD-only mistake in `mesh-platform` no longer passes both runners
+      unnoticed. It needs no cross compiler — nothing here builds C for FreeBSD,
+      and `cargo check` never links — so it is a target install and one command.
 - [ ] **Carry `fork` isolation into the build track.** `DESIGN.md` specifies
       `fork { … }` and `fork func name(params) { … }` as the explicit isolation
       forms, but the keyword is absent from `GRAMMAR.md` and `docs/`, is not

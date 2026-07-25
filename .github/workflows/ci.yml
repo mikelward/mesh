@@ -27,6 +27,20 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # FreeBSD needs no cross compiler: nothing in the tree builds C for it
+      # (`rusqlite` links a system SQLite rather than bundling one), and `cargo
+      # check` never reaches the link step where that library would be needed.
+      # So this runs before the Zig install rather than depending on it.
+      - name: Install FreeBSD target
+        run: rustup target add x86_64-unknown-freebsd
+
+      # `mesh-platform` picks the `ioctl` request type per platform, and FreeBSD
+      # takes the same branch as Linux by way of `not(macos)` — an arrangement
+      # nothing verified until this job, since a BSD-only mistake compiles fine
+      # on both runners.
+      - name: Check FreeBSD
+        run: cargo check --workspace --all-targets --target x86_64-unknown-freebsd
+
       - name: Install macOS target
         run: rustup target add x86_64-apple-darwin
 
