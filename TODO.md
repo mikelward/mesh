@@ -477,8 +477,8 @@ needs a descriptor above 2, a resource limit, or a failed `exec` to reach, so
 none affects a redirection that worked before that change. Every one below was
 reproduced against the built binary and compared with bash.
 
-All but the last are now fixed; the fixed entries are kept for the reasoning,
-and the open one is at the bottom.
+All but the last two are now fixed; the fixed entries are kept for the
+reasoning, and the open ones are at the bottom.
 
 - [x] **A failed `exec` writes into the redirection target** — *fixed*.
       `Command::spawn`'s private close-on-exec error pipe took a low descriptor
@@ -521,6 +521,24 @@ and the open one is at the bottom.
       deliberately — everything else in this list was a bug because mesh
       destroyed something bash spares, and this is the one place mesh spares
       something bash destroys.
+- [ ] **A redirection failure is reported by the shell, not through the
+      redirections that already applied.** `sh -c 'echo nope' 2>&1 4>&9 | cat`
+      puts `Bad file descriptor` into the pipe in bash, because `2>&1` applied
+      before the `4>&9` that failed; mesh writes it to the shell's stderr, in the
+      foreground and backgrounded alike. Raised by review on the fork/execvp PR
+      and checked against the commit before it — the behavior is the same there,
+      so it is a standing divergence rather than something that change caused.
+      The cause is that mesh resolves a stage's redirections **completely**
+      before installing any of them, so at the moment it reports there is no
+      partially-applied stderr to report through: bash applies each redirection
+      as it reaches it and is therefore already inside the new stderr when the
+      next one fails. Closing it means installing what the walk reached before
+      reporting — which the forked child could do for itself, but which a
+      foreground stage cannot without moving resolution after the fork and giving
+      up the concurrent opens that keep `cat < fifo | cmd > fifo` from
+      deadlocking. Worth deciding deliberately, because the tidy answer (every
+      stage resolves and installs in its own child) trades a real property for
+      message placement.
 - [ ] **`3>&0` with stdin closed.** Reported as accepted-and-destructive with fd 0
       closed by mesh's caller. `live_descriptors` no longer assumes the standard
       three are open — it probes all three — but the reported symptom persists
