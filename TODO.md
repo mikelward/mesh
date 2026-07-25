@@ -639,6 +639,22 @@ reproduced against the built binary and compared with bash.
         parse as integers, so `chmod 0644 f` is unaffected either way — the octal
         reading would only ever govern `n = 007`, where nobody is writing a mode,
         while `n = 09` breaking is a real cost.
+- [ ] **What `fg` does with a job that has already finished.** `JobTable::info`
+      polls with `waitpid(WNOHANG)` to answer `$sh.jobs` and reaps the pid, but
+      deliberately keeps the job so a completed one stays available to a later
+      `fg` (`exec.rs:134-146`). `fg` then signals a process group with no members
+      left and fails — `printf '/bin/true &\nsleep 0.3\nfg\n' | mesh` prints
+      `mesh: fg: No such process (os error 3)` and returns 1, every time. Since
+      *every* executable refreshes `$sh.jobs`, merely running a command between
+      the job finishing and the `fg` is enough, so reading the table changes what
+      `fg` does — the one thing keeping the job was meant to prevent. Options:
+      hand back the status the job already carries (the reason it was kept at
+      all); reap and report first, so `fg` says `no such job` the way bash does
+      after its own prompt-time reap; or keep the failure but give it a message
+      that names the real situation. The exit-time hangup hit this same `ESRCH`
+      and was fixed by ignoring it (`hangup_group`), which is *not* the answer
+      here: `fg` has a status to return, and silence would make a finished job
+      indistinguishable from a successful resume.
 - [x] **Choose a repo license** — *decided: `MIT OR Apache-2.0`* (the
       Rust-ecosystem norm, as used by Rust itself). Nothing constrained the choice:
       all current/planned deps are permissive (`reedline`/`nix`/`crossterm` MIT)
