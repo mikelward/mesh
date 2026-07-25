@@ -301,7 +301,13 @@ file as tasks land.
       environment; `:tty` is the question it answers, and a bare integer is
       refused. `$sh.interactive` is recorded by the loop that runs, not derived
       from `isatty`, so `mesh -s` on a terminal reports `false`.
-- [ ] The rest of `$sh.*`: `$sh.options`, `$sh.jobs`, and the hook maps.
+- [x] `$sh.jobs`: the live table as an insertion-ordered map of `pid` / `cmd` /
+      `state` / `status` records, keyed by job id. Reading polls so a finished
+      job reports `done` with its status rather than a stale `running`, but does
+      **not** reap — a completed job stays available to `fg`, and reaping still
+      reports and removes it at its own time. Deferred: `j = cmd &` binding a
+      handle, `kill $j` / `wait $j`, and the `%n` sigil.
+- [ ] The rest of `$sh.*`: `$sh.options` and the hook maps.
 
 ## Loose ends
 

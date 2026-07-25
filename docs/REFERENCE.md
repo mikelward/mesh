@@ -66,6 +66,7 @@ The rest of the read-only runtime surface:
 | `$sh.version` | The shell's version |
 | `$sh.interactive` | Whether this is an interactive session |
 | `$sh.stdin` / `$sh.stdout` / `$sh.stderr` | Handles for the shell's own streams |
+| `$sh.jobs` | The live background jobs, as a map of records |
 
 `$sh.interactive` answers **which loop is running**, not what fd 0 happens to
 be — `mesh -s` on a terminal reads commands without being an interactive session,
@@ -87,8 +88,26 @@ A handle has **no byte form**, so it never crosses into argv or a string:
 be asked questions, and `:tty` is the question — asking it of anything else is
 an error rather than a quiet answer about some unrelated descriptor.
 
-`$sh.options`, `$sh.jobs`, and the hook maps in `DESIGN.md` are not implemented
-yet.
+**`$sh.jobs`** is an insertion-ordered map keyed by job id, so job control is a
+value you can query rather than text to scrape:
+
+```mesh
+sleep 30 &
+puts $sh.jobs:len              # 1 — one word for a prompt segment
+puts $sh.jobs[1].state         # running
+running = $sh.jobs:values:filter(func(j) { $j.state == running })
+```
+
+Each record holds `pid` (the process group leader, which is what the launch
+notice reports and what a signal needs), `cmd`, `state` — `running`, `stopped`,
+or `done` — and `status`, empty until the job finishes and then its exit code.
+
+Reading it **polls but does not reap**: a finished job reports `done` with its
+status and stays in the table, so a later `fg` still finds it and the usual
+`[1] Done (0) …` notice still arrives at its own time. Looking at the table never
+changes what the shell does.
+
+`$sh.options` and the hook maps in `DESIGN.md` are not implemented yet.
 
 ---
 

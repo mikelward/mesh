@@ -149,6 +149,11 @@ pub struct Vars {
     /// session rather than the short-lived stage.
     pid: u32,
     ppid: i32,
+    /// The live job table as `$sh.jobs` reports it. A snapshot rather than a
+    /// live borrow, because expansion is handed only the variable store — the
+    /// shell refreshes it from the real table on the same funnel that publishes
+    /// `$sh.status`, so a read never sees a stale one.
+    jobs: Vec<(String, Value)>,
 }
 
 impl Default for Vars {
@@ -163,6 +168,7 @@ impl Default for Vars {
             pid: std::process::id(),
             // SAFETY: `getppid` takes no arguments and cannot fail.
             ppid: unsafe { libc::getppid() },
+            jobs: Vec::new(),
         }
     }
 }
@@ -205,6 +211,11 @@ impl Vars {
     /// reads commands without being an interactive session.
     pub fn set_interactive(&mut self, interactive: bool) {
         self.interactive = interactive;
+    }
+
+    /// Publish the live jobs, keyed by job id in registration order.
+    pub(crate) fn set_jobs(&mut self, jobs: Vec<(String, Value)>) {
+        self.jobs = jobs;
     }
 
     /// The currently published `$sh.status`.
@@ -255,6 +266,7 @@ impl Vars {
             ("stdin".to_owned(), Value::Stream(0)),
             ("stdout".to_owned(), Value::Stream(1)),
             ("stderr".to_owned(), Value::Stream(2)),
+            ("jobs".to_owned(), Value::Map(self.jobs.clone())),
         ];
         entries.extend(self.shell.iter().cloned());
         Value::Map(entries)
