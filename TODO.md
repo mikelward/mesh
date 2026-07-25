@@ -448,6 +448,54 @@ of each PR had landed by another route, but these pieces had not.
       and whether it gets a `$sh.options.bold-input` off switch — is written down
       nowhere.
 
+## Redirection edge cases
+
+Found by review on the descriptors-above-2 work and deliberately deferred: each
+needs a descriptor above 2, a resource limit, or a failed `exec` to reach, so
+none affects a redirection that worked before that change. Every one below was
+reproduced against the built binary and compared with bash.
+
+- [ ] **A failed `exec` writes into the redirection target.** `mesh_no_such_command
+      4> out` puts Rust's binary `NOEX` packet into `out` and exits 1 instead of
+      127, with no `command not found`. `Command::spawn` makes a private
+      close-on-exec pipe for the child to report `exec` failures on, it takes a
+      low descriptor, and the hook that installs descriptors above 2 overwrites
+      it; `std` exposes no way to see or reserve that descriptor, and `pre_exec`
+      runs after the pipe already exists. The fix is to `fork` and `execvp`
+      directly for these stages, as `fork_in_shell` already does for in-shell
+      ones — `execvp` sets `errno`, so the child reports 126/127 itself and no
+      private pipe is involved. Carries process groups, the interactive
+      signal/terminal hooks and the `Stdio` wiring with it.
+- [ ] **A backgrounded in-shell stage loses its pipe when stdout is restored.**
+      `func f() { puts low }; f 3>&1 > file 1>&3 | tr a-z A-Z &` prints `low`
+      instead of piping `LOW`, because `stdout_is_redirected` scans `cmd.redirs`
+      for anything targeting fd 1 and so trips on the intermediate `>`, even
+      though source order puts stdout back on the pipe. It has to be based on
+      stdout's *resolved* destination — which for a background stage means
+      resolving the redirections without opening anything, since the opens are
+      deferred to the child. `piped_out` must keep tracking the final
+      destination too: if stdout really ends on a file, a `SIGPIPE` is real.
+- [ ] **A duplication that cannot be afforded still lets later targets be
+      opened.** At `ulimit -n 5`, `true 3> foo 4>&3 > existing` truncates
+      `existing` and then fails with `EMFILE`; bash fails while applying `4>&3`
+      and leaves the file alone. Validation moved into the source-ordered
+      opening walk, but the duplication's actual `dup` still happens afterwards
+      in `resolve_sources`, so a duplication can be proved well-formed, a later
+      `>` can truncate, and only then does the duplication turn out to be
+      unaffordable. The fix is to **perform** each duplication during the walk,
+      collapsing `open_paths` and `resolve_sources` into one source-ordered pass
+      that acquires every descriptor as it reaches it — which is also what the
+      previous item wants, and what would make the ordering guarantee structural
+      rather than something each new failure mode has to be taught.
+- [ ] **`3>&0` with stdin closed.** Reported as accepted-and-destructive with fd 0
+      closed by mesh's caller. `live_descriptors` no longer assumes the standard
+      three are open — it probes all three — but the reported symptom persists
+      (`existing` is still truncated, with no error), which suggests mesh has
+      something on fd 0 by then, plausibly reopened at startup. Establish what
+      fd 0 actually is at that point before deciding whether there is a bug here
+      or whether the real question is what mesh should do with a closed
+      inherited stdin.
+
 ## Decisions made
 
 - **Merge method:** rebase. **Toolchain:** floating `stable`. **Loop autonomy:**
