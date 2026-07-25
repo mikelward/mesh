@@ -2935,7 +2935,12 @@ impl Parser {
     /// `global name = …`, `global name += …`, `global unset …`, or `unset …`.
     fn scoped(&mut self) -> Result<Executable, ParseError> {
         let global = self.take_word("global");
-        if self.take_word("unset") {
+        // `unset` is contextual *here* too, not only at the start of a statement:
+        // in `global unset = 9` the assignment operator says `unset` is the name
+        // being bound, so consuming it as the operation would deny the global
+        // scope a variable the local scope is allowed to have.
+        if self.word("unset") && !self.assignment_follows(1) {
+            self.take_word("unset");
             return self.unset(global);
         }
         if !global {

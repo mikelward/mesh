@@ -54,8 +54,9 @@ Positional arguments are a real list — `$sh.args` — not `$1` / `$@` / `$#`:
 
 Both are read-only, and `sh` is a reserved name: it cannot be assigned, used as
 a function parameter, or bound by a pattern. (Only `sh` itself is reserved — an
-ordinary variable may still be called `status`, `name`, or `args`.) The rest of
-the `$sh.*` surface in `DESIGN.md` is not implemented yet.
+ordinary variable may still be called `status`, `name`, or `args`.) `$sh.status`
+and `$sh.pipestatus` are implemented too — see [Exit status](#exit-status). The
+rest of the `$sh.*` surface in `DESIGN.md` is not.
 
 ---
 
@@ -548,8 +549,8 @@ split/join round trip is byte-faithful.
 Only a plain `$env.KEY` is an assignment target — any name you can read you can
 also assign, including a kebab name like `$env.MY-VAR`. `$env.PATH[0] = …` and
 `$env.PATH:dedup = …` describe derived values rather than places, so they are
-syntax errors. `export NAME = value`, `export --list NAME`, and `unset` are not
-implemented yet.
+syntax errors. Of the other spellings, only `export --list NAME` is still
+unimplemented.
 
 `+=` works on the raw bytes already in the environment, so a value that is not
 valid UTF-8 survives being appended to. Reading such a value into mesh still
@@ -983,6 +984,7 @@ byte-string type yet, so a capture that is not valid UTF-8 is a loud error.
 
 Most modifier arguments (beyond `:split` / `:join`), the command-word form of an
 argument-taking modifier, and regex capture modifiers are not yet implemented.
-Of heredocs, the command-redirection form below works, as do here-strings;
-backgrounding either, and a value-producing heredoc spelling, do not.
+Of heredocs, the command-redirection form documented under Commands works, as do
+here-strings; backgrounding either, and a value-producing heredoc spelling, do
+not.
 See [`ROADMAP.md`](../ROADMAP.md).
