@@ -2759,6 +2759,27 @@ fn a_descriptor_can_be_closed_for_a_command() {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    // A backgrounded builtin or function opens its targets in its own fork, so
+    // the closes have to travel with them — that path converted the resolved
+    // destinations to files and then passed no closes at all, and `puts` wrote
+    // to a descriptor the redirection had taken away.
+    let out = run_with_input("puts leaked 1>&- &\nsleep 0.4\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("leaked"),
+        "the close did not reach the backgrounded stage: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Closing needs no descriptor, so the process limit has nothing to say about
+    // it: this asks for something already true, and bash accepts it.
+    let out = run_with_input("true 999999>&-\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     // Source order decides here too: a descriptor closed earlier is gone, so
     // copying it afterwards is `EBADF` — the same answer bash gives.
     let out = run_with_input("sh -c 'echo x' 3>&- 4>&3\nputs after\n");
