@@ -8665,12 +8665,18 @@ fn a_leading_not_negates_a_value_in_every_position() {
     );
 }
 
-/// It is claimed only when what **follows** starts a value, which is what keeps a
-/// command genuinely named `not` reachable — `not foo` has a bare word after it, and
-/// a bare word is not a value start, so it stays the command it always was. Same
-/// discriminator the language already uses for `if $i < 3` versus `cmd <file`.
+/// `not` is a **reserved word**, so it never names a command however the line
+/// continues. Keeping a command of that name reachable is what the old
+/// "only when what follows is value-shaped" test was for, and paying for it meant
+/// three lookahead questions — is the operand value-shaped, does a redirect follow
+/// the *completed* operand, is the negation the whole statement — one of them a
+/// trial parse. `env` and `sh` are already reserved, and `func` and `return` already
+/// cannot be function names; this word joins them.
+///
+/// The escape hatches are the ones any reserved word has: a path (`./not`) and a
+/// quoted word (`"not" arg`).
 #[test]
-fn a_command_named_not_is_still_reachable() {
+fn not_is_reserved_and_never_names_a_command() {
     let dir = fresh_dir("leading_not_command");
     let program = dir.join("not");
     std::fs::write(&program, "#!/bin/sh\necho \"real-not ran with: $*\"\n").unwrap();
@@ -8692,115 +8698,64 @@ fn a_command_named_not_is_still_reachable() {
             .stdin(Stdio::null())
             .output()
             .expect("run");
-        String::from_utf8_lossy(&out.stdout).into_owned()
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     };
 
-    assert_eq!(run("not foo\n"), "real-not ran with: foo\n");
-    assert_eq!(run("not\n"), "real-not ran with: \n");
-    assert_eq!(run("not --flag\n"), "real-not ran with: --flag\n");
-    // In a condition too: the command runs and its status decides the branch.
-    assert_eq!(
-        run("if not foo { puts took-branch }\n"),
-        "real-not ran with: foo\ntook-branch\n"
-    );
-    // A function of that name wins over the external, as any function does.
-    assert_eq!(
-        run("func not(x) { puts fn-not $x }\nnot hello\n"),
-        "fn-not hello\n"
-    );
-    // And `not` as data is untouched in either spelling.
-    assert_eq!(run("puts not\nx = \"not\"\nputs $x\n"), "not\nnot\n");
-    // A word that merely starts with `not` was never in question, but the check is
-    // on the whole word, so pin it.
-    assert_eq!(run("notes = [a b]\nputs $notes:len\n"), "2\n");
-
-    // The one deliberate cost: a **boolean literal** after `not` is negation, so
-    // `not true` and `not false` no longer reach a command of that name. `if true`
-    // still runs the command, since only the position after `not` changes.
-    assert_eq!(run("not true\nputs after\n"), "after\n");
-    assert_eq!(run("if true { puts cmd-true }\n"), "cmd-true\n");
-
-    // And that cost is *exactly* those two spellings. A negation is claimed only when
-    // it is the whole statement, so anything that continues the line is the command
-    // it always was — an argument after the operand, a pipeline, or a redirect. These
-    // read as command invocations to anyone, and claiming them produced neither
-    // negation nor a command but `expected a statement separator`.
-    assert_eq!(run("not true foo\n"), "real-not ran with: true foo\n");
-    assert_eq!(
-        run("not false --flag\n"),
-        "real-not ran with: false --flag\n"
-    );
-    assert_eq!(run("x = 1\nnot $x foo\n"), "real-not ran with: 1 foo\n");
-    assert_eq!(run("not [1 2] foo\n"), "real-not ran with: [1 2] foo\n");
-    // A value cannot *be* a pipeline stage, so a negation heading one stays a command
-    // rather than leaving the `|` unconsumed.
-    assert_eq!(run("not true | cat\n"), "real-not ran with: true\n");
-    assert_eq!(run("x = 1\nnot $x | cat\n"), "real-not ran with: 1\n");
-}
-
-/// A redirect after the operand stays a redirect. `>` also spells a comparison, and
-/// the guard has to look at the *completed* operand to find the operator at all: a
-/// list literal or a `:mod` suffix both got past a guard placed on the token that
-/// merely starts one, so `not [1 2] >out.txt` compared instead of redirecting.
-#[test]
-fn a_redirect_after_a_negation_operand_is_still_a_redirect() {
-    let dir = fresh_dir("leading_not_redirect");
-    let program = dir.join("not");
-    std::fs::write(&program, "#!/bin/sh\necho \"real-not ran with: $*\"\n").unwrap();
-    let mut permissions = std::fs::metadata(&program).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&program, permissions).unwrap();
-    let path = format!(
-        "{}:{}",
-        dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    let run = |body: &str| {
-        std::fs::write(dir.join("run.mesh"), body).unwrap();
-        let out = mesh_command()
-            .arg("run.mesh")
-            .current_dir(&dir)
-            .env("PATH", &path)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run");
-        let written = std::fs::read_to_string(dir.join("out.txt")).unwrap_or_default();
-        let _ = std::fs::remove_file(dir.join("out.txt"));
-        (String::from_utf8_lossy(&out.stderr).into_owned(), written)
-    };
-
-    // Every operand shape, since the guard has to see the *completed* operand: a
-    // boolean literal, a list, and a variable carrying a postfix modifier, each with
-    // both spellings a redirect has. A list and a `:mod` operand are the ones that got
-    // through a guard placed on the token that merely *starts* the operand.
+    // A `not` on `PATH` is on `PATH` for every one of these, so anything other than
+    // "real-not ran with: …" is the word being read as the operator it now is.
     for body in [
-        "not false >out.txt\n",
-        "not true >out.txt\n",
-        "not [1 2] >out.txt\n",
-        "x = [a b]\nnot $x:len >out.txt\n",
-        "not [1 2] >> out.txt\n",
-        "not true >> out.txt\n",
+        "not foo\n",
+        "not --flag\n",
+        "not true\n",
+        "if not foo { puts took-branch }\n",
+        "not true foo\n",
+        "not true | cat\n",
+        "x = 1\nnot $x foo\n",
     ] {
-        let (stderr, written) = run(body);
-        assert!(stderr.is_empty(), "{body} errored: {stderr}");
+        let (stdout, _) = run(body);
         assert!(
-            written.starts_with("real-not ran with:"),
-            "{body} did not redirect the command: {written:?}"
+            !stdout.contains("real-not ran with"),
+            "{body} still reached a command named `not`: {stdout}"
         );
     }
+
+    // A path and a quoted word are the escape hatches, and they still reach it.
+    assert_eq!(run("./not foo\n").0, "real-not ran with: foo\n");
+    assert_eq!(run("\"not\" foo\n").0, "real-not ran with: foo\n");
+
+    // A function of that name is refused rather than defined-but-unreachable, the
+    // way `func func` and `func return` already are.
+    let (stdout, stderr) = run("func not(x) { puts fn-not $x }\n");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("reserved name and cannot be a function name"),
+        "{stderr}"
+    );
+
+    // Nor does it name a binding — `func = 5` and `return = 6` are already syntax
+    // errors, and a variable spelled `not` could never be read back in command
+    // position anyway.
+    let (stdout, stderr) = run("not = 5\nputs after\n");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("syntax error"), "{stderr}");
+
+    // `not` as *data* is untouched — it is only the command-word position that is
+    // reserved — and so is a word that merely starts with those three letters.
+    assert_eq!(run("puts not\nx = \"not\"\nputs $x\n").0, "not\nnot\n");
+    assert_eq!(run("notes = [a b]\nputs $notes:len\n").0, "2\n");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The guard must leave a genuine comparison alone. A *spaced* `<` / `>` in a
-/// condition is a comparison rather than a redirect, and that holds after `not` too,
-/// so `if not $y > 2 { … }` negates the comparison. Run without a `not` on `PATH` on
-/// purpose: with one present, a command invocation also produces no error, so an
-/// "it did not fail" assertion would pass either way and prove nothing.
+/// A *spaced* `<` / `>` is a comparison rather than a redirect, and that holds after
+/// `not` too, so `if not $y > 2 { … }` negates the comparison rather than negating
+/// `$y` and redirecting into a file named `2`.
 ///
-/// In a scratch directory because the failure mode is a *redirect*: if the guard ever
-/// claims these, mesh writes files named `2` and `5` in the working directory, and a
+/// In a scratch directory because that is the failure mode: if the reading ever goes
+/// the other way, mesh writes files named `2` and `5` in the working directory, and a
 /// test should not litter the source tree to fail.
 #[test]
 fn a_spaced_comparison_after_not_is_still_a_comparison() {
@@ -8835,33 +8790,58 @@ fn a_spaced_comparison_after_not_is_still_a_comparison() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The lookahead walks a run of `not`s in a loop rather than recursing once per
-/// word. Recursing cost a stack frame each, so a long *command-shaped* line —
-/// thousands of `not`s ending in a bare word, which is not a value start — blew the
-/// stack and aborted the process before the parser could conclude "this is a
-/// command." Generated or pasted input must not be able to kill the shell, so the
-/// interesting assertion is that it dies by diagnostic rather than by signal.
+/// A run of `not`s is stepped over in a loop and folded to its **parity**, rather
+/// than recursing once per word and stacking one AST node each. A word of `not`
+/// otherwise costs a parse frame, an eval frame, and a `Drop` frame, so thousands of
+/// them — generated or pasted — aborted the shell by signal before it had an answer.
+/// Reserving the word is what made this reachable: the chain used to be walked by a
+/// lookahead that concluded such a line was a *command* and never built it.
 #[test]
-fn a_long_command_shaped_not_chain_does_not_overflow_the_stack() {
-    let body = format!("{}foo\n", "not ".repeat(20_000));
-    let out = run_with_input(&body);
+fn a_long_not_chain_does_not_overflow_the_stack() {
+    for tail in ["foo", "true", "$b"] {
+        let body = format!("b = false\n{}{tail}\n", "not ".repeat(20_000));
+        let out = run_with_input(&body);
 
-    // `.code()` is `None` when a process is killed by a signal — SIGABRT is how a
-    // stack overflow surfaces — so this is the check that matters.
-    assert!(
-        out.status.code().is_some(),
-        "killed by a signal rather than reporting an error: {:?}",
-        out.status
+        // `.code()` is `None` when a process is killed by a signal — SIGABRT is how a
+        // stack overflow surfaces — so this is the check that matters.
+        assert!(
+            out.status.code().is_some(),
+            "`not`×20000 {tail} was killed by a signal: {:?}",
+            out.status
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("overflow"),
+            "stack overflow reported for {tail}: {stderr}"
+        );
+    }
+}
+
+/// Folding a run of `not`s to its parity is not an optimization the reader can see:
+/// `not` yields a bool from its operand's truthiness, so every one past the second
+/// only flips a bool that is already there. An odd run is `not $x`, an even one the
+/// `not not $x` that coerces without inverting — for a bool operand and for a
+/// non-bool alike.
+#[test]
+fn a_run_of_nots_keeps_its_parity() {
+    let out = run_with_input(
+        "x = true\n\
+         a = not $x\n\
+         b = not not $x\n\
+         c = not not not $x\n\
+         d = not not not not $x\n\
+         puts $a $b $c $d\n\
+         y = \"abc\"\n\
+         e = not $y\n\
+         f = not not $y\n\
+         g = not not not $y\n\
+         puts $e $f $g\n",
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("overflow"),
-        "stack overflow reported: {stderr}"
-    );
-    // It stays a command, as a bare word after `not` always does.
-    assert!(
-        stderr.contains("command not found: not"),
-        "expected command dispatch, got: {stderr}"
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "false true false true\nfalse true false\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

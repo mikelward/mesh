@@ -1647,7 +1647,8 @@ impl Parser {
             }
             self.position = assignment_start;
         }
-        if self.word_text_at(0).is_some() || self.same(&TokenKind::LBracket) {
+        if !self.word("not") && (self.word_text_at(0).is_some() || self.same(&TokenKind::LBracket))
+        {
             if let Ok(pattern) = self.binding_pattern()
                 && matches!(
                     self.peek().map(|token| &token.value),
@@ -2484,19 +2485,42 @@ impl Parser {
         Ok(left)
     }
 
+    /// Steps over the run of `not`s in a loop and folds it to its **parity** rather
+    /// than recursing once per word and stacking one node each.
+    ///
+    /// `not` yields a bool from the operand's truthiness, so every `not` past the
+    /// second only flips a bool that is already there: `not not not $x` is `not $x`,
+    /// and any even run is the `not not $x` that coerces without inverting. Two nodes
+    /// carry both readings, so the fold is the same tree to any observer.
+    ///
+    /// Depth is the reason. A word of `not` costs a parse frame, an eval frame, and a
+    /// `Drop` frame, so a generated or pasted line of thousands of them aborted the
+    /// shell — by signal, before it could report anything. It survived only while a
+    /// lookahead concluded such lines were *commands* and never built the chain;
+    /// reserving the word took that away, and folding replaces it with something that
+    /// does not depend on where the line sits.
     fn not_expression(&mut self) -> Result<Expr, ParseError> {
-        if self.take_word("not") {
-            return Ok(Expr::Unary {
-                op: UnaryOp::Not,
-                expression: Box::new(self.not_expression()?),
-            });
+        let mut negations = 0_usize;
+        while self.take_word("not") {
+            negations += 1;
         }
-        self.binary(4)
+        let mut expression = self.binary(4)?;
+        for _ in 0..negations.min(2 - negations % 2) {
+            expression = Expr::Unary {
+                op: UnaryOp::Not,
+                expression: Box::new(expression),
+            };
+        }
+        Ok(expression)
     }
 
     fn condition(&mut self) -> Result<Executable, ParseError> {
         let start = self.position;
-        if self.word_text_at(0).is_some() || self.same(&TokenKind::LBracket) {
+        // `not` never opens a binding, since it is reserved — see `value_start`. Left
+        // out, `if not = 5` would bind a variable whose name can never be spoken in
+        // command position again, the way `func = 5` and `return = 6` already refuse to.
+        if !self.word("not") && (self.word_text_at(0).is_some() || self.same(&TokenKind::LBracket))
+        {
             if let Ok(pattern) = self.binding_pattern()
                 && self.eat(&TokenKind::Equal).is_some()
             {
@@ -3007,63 +3031,19 @@ impl Parser {
     }
 
     /// Does a value start here?
-    ///
-    /// `operand_only` picks which question is being asked. A caller dispatching a
-    /// *statement* wants the statement-level answer, where a bare variable yields to
-    /// the shell-list syntax around it. A caller checking the **shape** of an operand
-    /// — the `not` branch below — wants only "is this value-shaped", because it
-    /// applies the statement-level tests to the whole negation itself. Conflating the
-    /// two made `not $b && puts x` report `command not found: not`: the variable
-    /// clause answered the statement question about `$b` alone.
     fn value_start(&mut self) -> bool {
-        self.value_start_shaped(false)
-    }
-
-    fn value_start_shaped(&mut self, operand_only: bool) -> bool {
-        // A leading `not` negates a value, so `if not $b { … }` is a condition and
-        // not a command named `not`. `DESIGN.md` writes the idiom that way, and the
-        // other two positions already read it as one: a postfix guard
-        // (`puts x if not $b`) and an assignment's right-hand side both parse an
-        // expression directly, so only the paths through here were left out.
+        // `not` is a **reserved word**, so a leading one always negates a value and
+        // never names a command. `DESIGN.md` writes the idiom that way, and the other
+        // two positions already read it so: a postfix guard (`puts x if not $b`) and
+        // an assignment's right-hand side both parse an expression directly.
         //
-        // Claimed only when what *follows* starts a value, which is what keeps a
-        // command actually named `not` reachable: `not foo` has a bare word after
-        // it, which is not a value start, so it stays the command it was.
+        // Reserving it is what makes this one line. Keeping a command literally named
+        // `not` reachable meant asking whether the *operand* was value-shaped, whether
+        // a redirect followed the completed operand, and whether the negation was the
+        // whole statement — three tests, one of them a trial parse, that existed only
+        // for a command nobody writes. `./not` and `"not" arg` still reach one.
         if self.word("not") {
-            let saved = self.position;
-            // Skip the whole run of `not`s in a loop rather than recursing per word.
-            // Recursing cost one frame each, so a command-shaped line of ~20k `not`s
-            // overflowed the stack and aborted the shell before it could decide the
-            // line was a command. Iterating is the same test: every frame did
-            // nothing but step over one `not`.
-            while self.word("not") {
-                self.position += 1;
-            }
-            // A bare `true` / `false` is not a value start on its own — `if true`
-            // runs the *command*, and that stays — but after `not` there is no
-            // second reading worth keeping: `not false` is negation to any reader,
-            // and leaving it out made `if not false` disagree with the `x = not
-            // false` that already worked.
-            //
-            let boolean_literal = self.word("true") || self.word("false");
-            let negates_a_value = self.value_start_shaped(true) || boolean_literal;
-            // A redirect after the operand is still a redirect. The guard has to look
-            // at the *completed* operand rather than the token that starts one: an
-            // operand can be a list literal or carry postfix modifiers, so only a
-            // parse of the whole thing knows where the `>` sits. `not [1 2] >
-            // out.txt` and `not $x:len > out.txt` are the command with its output
-            // redirected, as they were before `not` became a value start.
-            let redirect_follows = negates_a_value && self.takes_a_redirect();
-            self.position = saved;
-            // Claimed only when the negation is the *whole* statement, the same
-            // narrowness a lone integer literal has. Without it, an operand that
-            // starts a value was enough to claim a line that then failed to parse:
-            // `not $b foo` and `not true foo` are plainly command invocations, but
-            // the expression stopped after the operand and left the rest, so a
-            // command that ran before became `expected a statement separator`.
-            if negates_a_value && !redirect_follows && self.value_is_whole_statement(true) {
-                return true;
-            }
+            return true;
         }
         // A modifier reference *call* — `:exists("Cargo.toml")` — starts a value, so
         // a condition or statement beginning with one reaches the expression parser
@@ -3137,7 +3117,7 @@ impl Parser {
                 (variable
                     && !redirect_follows
                     && !argument_follows
-                    && (operand_only || self.value_is_whole_statement(false)))
+                    && self.value_is_whole_statement())
                     || (quoted && !redirect_follows && self.viable_expression())
                     || attached_call
                     || (numeric && followed_by_operator)
@@ -3224,25 +3204,6 @@ impl Parser {
             .is_some_and(|previous| previous.span.end < token.span.start)
     }
 
-    /// Does a **redirect** follow a *negation's* operand?
-    ///
-    /// The `not` branch's counterpart to
-    /// [`word_takes_a_redirect`](Self::word_takes_a_redirect), and a different question:
-    /// there the operand is itself the command word, so only word-shaped operands can
-    /// take a redirect. Here `not` is the command word and the operand is an argument,
-    /// so any value shape can precede one — `not [1 2] > out.txt` is the command with
-    /// its output redirected, list literal and all.
-    ///
-    /// That is why this one parses rather than scanning: it has to step over an operand
-    /// of any shape to reach the operator. [`postfix`](Self::postfix) is as wide as it
-    /// goes, which keeps a comparison's own operands out of it.
-    fn takes_a_redirect(&mut self) -> bool {
-        let saved = self.position;
-        let redirect = self.postfix().is_ok() && self.redirect_operator_at(self.position);
-        self.position = saved;
-        redirect
-    }
-
     /// Is the rest of this statement exactly one integer literal?
     ///
     /// The token being peeked is not enough to tell. A word can be assembled from
@@ -3292,22 +3253,20 @@ impl Parser {
 
     /// Does a value expression starting here span the whole statement?
     ///
-    /// An operand that *starts* a value is not enough on its own. `$editor file`,
-    /// `not $b foo`, and `$p:base arg` are command invocations, but the expression
-    /// parser stops after the operand, so claiming them left the trailing words
-    /// unconsumed and reported `expected a statement separator` for lines that should
-    /// run. Parsing the statement and looking at where it stopped is the same trial
-    /// the lone-integer rule runs, for the same reason.
-    fn value_is_whole_statement(&mut self, connectors_end_it: bool) -> bool {
+    /// An operand that *starts* a value is not enough on its own. `$editor file` and
+    /// `$p:base arg` are command invocations, but the expression parser stops after the
+    /// operand, so claiming them left the trailing words unconsumed and reported
+    /// `expected a statement separator` for lines that should run. Parsing the statement
+    /// and looking at where it stopped is the same trial the lone-integer rule runs, for
+    /// the same reason.
+    fn value_is_whole_statement(&mut self) -> bool {
         let saved = self.position;
         let whole = self.expression().is_ok()
             && ((self.at_value_statement_end()
-                // `connectors_end_it` separates the two kinds of operand. A negation
-                // has no command reading, so `not $b && puts x` is a value statement
-                // joined by `&&` and stays one. A bare variable *does* have one, so
-                // shell-list syntax after it — an argument, a pipe, a redirect, `&&`,
-                // `||`, `&` — picks the command, and the variable alone is the value.
-                && (connectors_end_it || !self.at_command_list_operator()))
+                // A bare variable has a command reading, so shell-list syntax after it
+                // — an argument, a pipe, a redirect, `&&`, `||`, `&` — picks the
+                // command, and the variable alone is the value.
+                && !self.at_command_list_operator())
                 // An assignment operator counts as the end of it. What follows is a
                 // *place* expression, which the expression side owns whether or not
                 // the place is a legal one, and that is what keeps
