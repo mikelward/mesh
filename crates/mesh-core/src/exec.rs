@@ -375,7 +375,22 @@ impl JobTable {
                 }
             } else {
                 match self.resolve(std::slice::from_ref(target), "kill") {
-                    Some(index) => signal_group(self.jobs[index].pgid, signal, "kill").is_err(),
+                    Some(index) => {
+                        let failed = signal_group(self.jobs[index].pgid, signal, "kill").is_err();
+                        // Continuing a job by hand is `bg` by another spelling,
+                        // so the table has to agree it is running again. Nothing
+                        // else will notice: `poll_outcomes` watches for exits and
+                        // stops (`WUNTRACED`) and never for a continue, so a job
+                        // left marked stopped stays that way — `jobs` keeps
+                        // reporting `Stopped`, and `wait` hands back its cached
+                        // stop status while the job runs on.
+                        if !failed && signal == libc::SIGCONT {
+                            self.jobs[index].state = JobState::Running;
+                            let id = self.jobs[index].id;
+                            self.mark_current(id);
+                        }
+                        failed
+                    }
                     None => true,
                 }
             };
@@ -1739,6 +1754,10 @@ fn split_signal(args: &[String]) -> Result<(libc::c_int, &[String]), &str> {
 
 /// A signal by number (`9`) or name, with or without the `SIG` prefix and in
 /// any case — the spellings every shell's `kill` accepts.
+///
+/// The names are the POSIX set, which is every signal all of mesh's platforms
+/// have. A platform-specific name — Linux's `PWR`, say — is not here, but its
+/// *number* still works: a number is handed to `kill` rather than looked up.
 fn signal_number(name: &str) -> Option<libc::c_int> {
     if let Ok(number) = name.parse::<libc::c_int>() {
         // Any non-negative number is handed to `kill`, which is the authority on
@@ -1769,6 +1788,16 @@ fn signal_number(name: &str) -> Option<libc::c_int> {
         "USR2" => libc::SIGUSR2,
         "CHLD" => libc::SIGCHLD,
         "CONT" => libc::SIGCONT,
+        "TRAP" => libc::SIGTRAP,
+        "BUS" => libc::SIGBUS,
+        "URG" => libc::SIGURG,
+        "XCPU" => libc::SIGXCPU,
+        "XFSZ" => libc::SIGXFSZ,
+        "VTALRM" => libc::SIGVTALRM,
+        "PROF" => libc::SIGPROF,
+        "SYS" => libc::SIGSYS,
+        // `POLL` is the older name for the same signal where both exist.
+        "IO" | "POLL" => libc::SIGIO,
         "STOP" => libc::SIGSTOP,
         "TSTP" => libc::SIGTSTP,
         "TTIN" => libc::SIGTTIN,

@@ -4335,7 +4335,7 @@ fn job_reference_word(word: &Word, vars: &Vars, name: &str) -> Result<Option<Vec
     // ("needs `...`") advises a spread that would not help.
     let names_jobs = values
         .iter()
-        .any(|value| is_job_handle(value) || matches!(value, Value::Map(_)));
+        .any(|value| job_id_of(value).is_some() || matches!(value, Value::Map(_)));
     if !names_jobs {
         return Ok(None);
     }
@@ -4354,26 +4354,18 @@ fn job_reference_word(word: &Word, vars: &Vars, name: &str) -> Result<Option<Vec
     Ok(Some(references))
 }
 
-/// The job id this value names, if it is a handle. `DESIGN.md` makes
-/// `$sh.jobs[2]` a handle as well as `$j`, so a job *record* answers too — its
-/// `id` is what the map key holds for the table's own reads.
-fn job_id_of(value: &Value) -> Option<i64> {
+/// The job id this value names, if it is a handle — and **only** a handle.
+///
+/// Reading an `id` out of any map would make a handle forgeable: `m = [id: 1]`
+/// is ordinary data, and `kill $m` must not signal job 1 on the strength of a
+/// field name. Not being forgeable is the point of the handle being its own
+/// value. `$sh.jobs[2]` is still a reference, because the table publishes
+/// handles rather than records.
+fn job_id_of(value: &Value) -> Option<usize> {
     match value {
-        Value::Job(id) => Some(*id as i64),
-        Value::Map(entries) => {
-            entries
-                .iter()
-                .find_map(|(key, value)| match (key.as_str(), value) {
-                    ("id", Value::Integer(id)) => Some(*id),
-                    _ => None,
-                })
-        }
+        Value::Job(id) => Some(*id),
         _ => None,
     }
-}
-
-fn is_job_handle(value: &Value) -> bool {
-    matches!(value, Value::Job(_)) || job_id_of(value).is_some()
 }
 
 /// Run a command whose words are already expanded: `return`, generated help, the

@@ -374,8 +374,9 @@ file as tasks land.
       `state` / `status` records, keyed by job id. Reading polls so a finished
       job reports `done` with its status rather than a stale `running`, but does
       **not** reap — a completed job stays available to `fg`, and reaping still
-      reports and removes it at its own time. Deferred: `j = cmd &` binding a
-      handle, `kill $j` / `wait $j`, and the `%n` sigil.
+      reports and removes it at its own time. The handle binding, `kill`, and the
+      `%` sigils it deferred have since landed; indexing the table now yields a
+      handle rather than a copy of the record.
 - [x] `wait JOB`, taking the same `N` / `%N` reference `fg` and `bg` take. It is
       `fg` without the foreground — no `SIGCONT`, and the terminal stays with the
       shell — so a background job goes on being one and only its status comes
@@ -466,12 +467,7 @@ file as tasks land.
       with an aggregate status" — is refused rather than guessed at, since `fg`'s
       no-operand default means "the most recent one" and the two would read
       alike. `DESIGN.md` defers the aggregate; deciding it is what unblocks the
-      bare form, along with multiple operands (`wait 1 2`). `wait $j` on a job
-      handle waits on `j = cmd &`, deferred above.
-- [ ] **A `kill` builtin.** `DESIGN.md` lists it among the job builtins, so that
-      `kill $j` / `kill %2` signal a *job* while `kill 49001` stays a pid. It
-      needs the same job-reference resolution `wait` uses (`JobTable::resolve`),
-      which is why the two belong together.
+      bare form, along with multiple operands (`wait 1 2`).
 - [ ] The rest of `$sh.*`: `$sh.options` and the hook maps.
 
 ## Loose ends
