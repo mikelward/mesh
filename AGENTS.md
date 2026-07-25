@@ -79,6 +79,10 @@ apply throughout.
 
 - **Do not use `apt-get` / `apt`** to install tools. Use direct binary downloads
   (e.g. from GitHub releases) or `cargo install`.
+- **Do not use Claude's `AskUserQuestion` tool** — its multiple-choice prompt is
+  broken on mobile, so the question never becomes answerable. Ask in plain
+  message text instead, then end the turn and wait for the answer; do not pick a
+  default and carry on.
 
 ## Code style and tests
 
