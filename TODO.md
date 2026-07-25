@@ -456,14 +456,11 @@ The three items below are the same change seen from three sides, and doing them
 together is much cheaper than one at a time. Sequence: (1) unblocks (2), and (3)
 is independent but touches the same file.
 
-- [ ] **1. Merge `open_paths` and `resolve_sources` into one walk.** Today
-      validation happens in the walk but the duplication's actual `dup` happens
-      after every open, so a duplication can be proved well-formed, a later `>`
-      can truncate, and only then does the duplication turn out to be
-      unaffordable. Make each redirection, as the walk reaches it, do its own
-      limit check and then either open its path or **perform** its duplication.
-      Keep the per-stage thread — the concurrency is across stages, not within
-      one. Closes the `EMFILE` ordering case and the limit pre-pass case below.
+- [x] **1. Merge `open_paths` and `resolve_sources` into one walk** — *done*, as
+      `resolve_redirs`: each redirection, as the walk reaches it, does its own
+      limit check and then opens its path or **performs** its duplication. The
+      per-stage thread is kept, so the seed each stage starts from is built up
+      front. Closed the `EMFILE` ordering case and the limit pre-pass case below.
 - [ ] **2. Resolve a background stage's destinations without opening.** With (1)
       in place, replace the syntactic `stdout_is_redirected` scan with stdout's
       actual resolved destination, which a background stage can compute without
@@ -512,30 +509,24 @@ reproduced against the built binary and compared with bash.
       resolving the redirections without opening anything, since the opens are
       deferred to the child. `piped_out` must keep tracking the final
       destination too: if stdout really ends on a file, a `SIGPIPE` is real.
-- [ ] **A duplication that cannot be afforded still lets later targets be
-      opened.** At `ulimit -n 5`, `true 3> foo 4>&3 > existing` truncates
-      `existing` and then fails with `EMFILE`; bash fails while applying `4>&3`
-      and leaves the file alone. Validation moved into the source-ordered
-      opening walk, but the duplication's actual `dup` still happens afterwards
-      in `resolve_sources`, so a duplication can be proved well-formed, a later
-      `>` can truncate, and only then does the duplication turn out to be
-      unaffordable. The fix is to **perform** each duplication during the walk,
-      collapsing `open_paths` and `resolve_sources` into one source-ordered pass
-      that acquires every descriptor as it reaches it — which is also what the
-      previous item wants, and what would make the ordering guarantee structural
-      rather than something each new failure mode has to be taught.
-- [ ] **The descriptor-limit check does not run in source order.** It is a
-      pre-pass over the whole list, so `true > existing 16> later` at
-      `ulimit -n 16` reports `&16` without applying the earlier `>` — mesh leaves
-      `existing` intact and never creates `later`, while bash truncates one and
-      creates the other before failing. This is the one case in this list where
-      mesh is *less* destructive than bash, so it is worth deciding deliberately
-      whether to match: everything else here is a bug because mesh destroys
-      something bash spares, and the source-order rule the rest of the
-      redirection code enforces says the earlier redirections should have
-      happened. If it should match, the check moves into the opening walk beside
-      the duplication validation, which is where the two items above are heading
-      anyway.
+- [x] **A duplication that cannot be afforded still lets later targets be
+      opened** — *fixed*. `open_paths` and `resolve_sources` are now one
+      source-ordered walk (`resolve_redirs`) that acquires every descriptor as it
+      reaches it: the limit is checked, then the path is opened or the
+      duplication *performed*. At `ulimit -n 5`, `true 3> foo 4>&3 > existing`
+      now fails on the `>` it cannot afford and leaves `existing` alone, as bash
+      does. The ordering guarantee is structural rather than something each new
+      failure mode has to be taught.
+- [x] **The descriptor-limit check does not run in source order** — *fixed, and
+      the residual difference from bash decided deliberately*. The check moved
+      into the walk, so `true > existing 4> later` at `ulimit -n 4` truncates
+      `existing` and only then reports `&4`; the earlier redirections happen, as
+      the source-order rule says they should. mesh still does **not** create
+      `later`: it refuses a descriptor it could never install onto before opening
+      a target for it, where bash opens first and fails on the `dup2`. Kept
+      deliberately — everything else in this list was a bug because mesh
+      destroyed something bash spares, and this is the one place mesh spares
+      something bash destroys.
 - [ ] **`3>&0` with stdin closed.** Reported as accepted-and-destructive with fd 0
       closed by mesh's caller. `live_descriptors` no longer assumes the standard
       three are open — it probes all three — but the reported symptom persists
