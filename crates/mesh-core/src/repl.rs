@@ -8167,30 +8167,32 @@ mod tests {
         }
     }
 
-    /// The one integer the writer can spell but mesh cannot read back.
+    /// The one integer the writer refuses, because the **reader** cannot take it
+    /// back: `-9223372036854775808` parses as a negation applied to
+    /// `9223372036854775808`, a magnitude that does not fit an `i64`, so the
+    /// operand is a string by the time the sign would apply and the negation
+    /// reports "expected integer". `i64::MIN + 1` and `i64::MAX` both round-trip,
+    /// which places the fault at the reader rather than in the writer.
     ///
-    /// This is a **reader** gap, not a writer one: `-9223372036854775808` lexes as
-    /// a negation applied to `9223372036854775808`, a magnitude that does not fit
-    /// an `i64`, so the operand is a string by the time the sign would apply and
-    /// the negation reports "expected integer". `i64::MIN + 1` and `i64::MAX` both
-    /// round-trip, which is what places the fault at the boundary rather than in
-    /// the writer.
+    /// The writer refuses anyway. Emitting text that does not read back would
+    /// break the round-trip contract for a **reachable** value — `x =
+    /// -9223372036854775807 - 1` lands on it — and a contract with one silent hole
+    /// is not one the fork value channel could build on.
     ///
-    /// Pinned rather than fixed: folding the sign into the literal changes how
-    /// *every* negative number parses, which is a wider change than this writer
-    /// warrants. Recorded in `TODO.md`; when it lands, this test fails and the
-    /// value moves into the round-trip list above.
+    /// Both halves are pinned so the follow-up cannot half-land: when the parser
+    /// folds the sign into the literal, the second assertion fails, and the fix is
+    /// to delete the refusal and move `i64::MIN` into the round-trip cases above.
     #[test]
-    fn the_smallest_integer_writes_correctly_but_does_not_read_back_yet() {
+    fn the_smallest_integer_is_refused_until_the_reader_can_take_it() {
         assert_eq!(
-            Value::Integer(i64::MIN).to_literal().unwrap(),
-            "-9223372036854775808"
+            Value::Integer(i64::MIN).to_literal(),
+            Err(crate::vars::NoLiteral::MinInteger)
         );
         let mut shell = Shell::new();
         assert_eq!(
             run_line("x = -9223372036854775808", 0, false, &mut shell),
             Step::Continue(1),
-            "the reader now takes i64::MIN — move it into the round-trip cases"
+            "the reader now takes i64::MIN — drop the refusal and move it into the round-trip cases"
         );
     }
 }
