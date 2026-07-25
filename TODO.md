@@ -395,6 +395,25 @@ file as tasks land.
       job leaves the previous is promoted and the job behind it fills `%-`. An
       id still wins over a prefix, so `%1` is job 1. Deferred with a message that
       names it: `%?string`, the substring match `DESIGN.md` also defers.
+- [ ] **Stops noticed together are ordered by the table, not by when they
+      happened.** `info` and `reap` learn about stops by *polling*: a pass finds
+      "these jobs are stopped now" and marks each current, in the order the table
+      holds them. When two jobs stop between one poll and the next, the later
+      stop can therefore end up behind the earlier one in recency. Reproduced
+      with two `sleep 30 &` jobs, stopping job 2 and then job 1 from outside:
+      `%+` names job 2, though job 1 was the most recent stop.
+      The order is genuinely unavailable to a poll — `waitpid` reports *that* a
+      job stopped, never when, and no portable per-process stop timestamp
+      exists. Getting it right means learning of each stop as it happens, i.e. a
+      SIGCHLD-driven notification path feeding the table, which is what bash
+      does and a real change to a runtime that deliberately polls. A cheaper
+      half-step is draining `waitpid(-1, WNOHANG | WUNTRACED)` centrally, since
+      the kernel queues those notifications in event order — but a central drain
+      can consume a notification a foreground `wait_outcomes` is about to want,
+      so it needs care rather than a swap. Until then the limitation is only
+      visible in `fg` / `bg` / `%+` with no operand, and picking the wrong one of
+      two simultaneously stopped jobs is recoverable with an explicit id.
+      *(Raised by Codex review on #222.)*
 - [ ] **The rest of `wait`.** `wait` with **no operand** — bash's "every child,
       with an aggregate status" — is refused rather than guessed at, since `fg`'s
       no-operand default means "the most recent one" and the two would read
