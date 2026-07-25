@@ -1875,8 +1875,11 @@ fn a_three_stage_pipeline_works() {
 #[test]
 fn a_pipeline_can_run_in_the_background() {
     let dir = fresh_dir("background_pipeline");
+    // `wait` rather than an interval chosen to outlast the job: the `cat` below
+    // reads what the pipeline wrote, so the pipeline has to be finished, and no
+    // fixed sleep is long enough on a machine that is busy enough.
     let out = run_with_input(&format!(
-        "sh -c 'sleep 0.05; echo background > {0}/result' | cat & puts foreground\nsleep 0.15\ncat {0}/result\n",
+        "sh -c 'sleep 0.05; echo background > {0}/result' | cat & puts foreground\nwait 1\ncat {0}/result\n",
         dir.display()
     ));
     assert_eq!(
@@ -1896,7 +1899,15 @@ fn a_background_command_does_not_consume_shell_input() {
 
 #[test]
 fn background_pipeline_retains_statuses_reaped_on_earlier_prompts() {
-    let out = run_with_input("sh -c 'exit 7' | sleep 0.2 &\nsleep 0.05\njobs\nsleep 0.25\njobs\n");
+    // The first `jobs` needs the pipeline still running and the second needs it
+    // finished, so neither end can be a guessed interval. The first needs no
+    // wait at all — `&` registers the job before the next command runs, and the
+    // pipeline's own `sleep 0.2` keeps it alive far longer than that — and the
+    // second polls the job's state. `wait` is not usable here: it takes the job
+    // out of the table, so the `Done (7)` this asserts on would never print.
+    let out = run_with_input(
+        "sh -c 'exit 7' | sleep 0.2 &\njobs\nwhile $sh.jobs[1].state == running { sleep 0.02 }\njobs\n",
+    );
     assert!(String::from_utf8_lossy(&out.stderr).contains("Done (7)"));
 }
 
@@ -3197,7 +3208,7 @@ fn a_function_stage_keeps_its_typed_arguments() {
     let dir = fresh_dir("stage_typed_args");
     let out = run_with_input(&format!(
         "cd {}\nfunc show(xs) {{ puts \"len=$xs:len first=$xs[0]\" }}\nys = [a b]\n\
-         show $ys | tr a-z A-Z\nshow $ys > out\nsleep 0.1\ncat out\n",
+         show $ys | tr a-z A-Z\nshow $ys > out\ncat out\n",
         dir.display()
     ));
     assert_eq!(
@@ -4109,8 +4120,12 @@ fn a_background_fifo_redirect_does_not_block_the_shell() {
         let _ = std::fs::remove_dir_all(&dir);
         return;
     }
+    // `wait` for the reader rather than sleeping at it. The shell hangs up its
+    // jobs on the way out, so an exit that beat the `cat` killed the very job
+    // whose output is being asserted on — 50ms was the whole margin, and the
+    // failure is a missing "payload" rather than a late one.
     let out = run_with_input(&format!(
-        "cd {}\ncat < f &\nputs ready\necho payload > f\nsleep 0.05\n",
+        "cd {}\ncat < f &\nputs ready\necho payload > f\nwait 1\n",
         dir.display()
     ));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ready\npayload\n");

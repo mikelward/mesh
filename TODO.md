@@ -627,6 +627,29 @@ of each PR had landed by another route, but these pieces had not.
       than token-aware color, live as you type, surviving Enter into scrollback,
       and whether it gets a `$sh.options.bold-input` off switch — is written down
       nowhere.
+- [ ] **Finish moving the job-synchronizing tests onto `wait`.** A good number of
+      tests need to say "the background job has finished". Sleeping at it is a
+      live flake source, since no interval is long enough on a machine that is
+      busy enough, and the failure is not merely a late result: the shell hangs
+      up its jobs on the way out, so a shell that exits first *kills* the job it
+      was waiting for. Now that `wait` exists the tightest cases use it, and the
+      rest — the scattered `sleep 0.2`–`sleep 0.4` in the job-control and
+      redirection tests, all with margins of 250ms or more — are still on a
+      guessed interval. Three details decide what each one can use:
+  - [ ] `wait` **removes the job from the table**, so any test asserting on the
+        `[N] Done (…)` notice cannot use it and needs `while $sh.jobs[N].state
+        == running` instead. `background_pipeline_retains_statuses_reaped_on_
+        earlier_prompts` and `a_failed_background_redirect_reports_mesh_status_
+        one` are both in this class.
+  - [ ] `wait` **takes an explicit job reference**, and the no-operand form is
+        refused on purpose rather than merely unimplemented (`exec.rs:283`):
+        bash's bare `wait` means every child with an aggregate status, which
+        reads like `fg`'s "most recent" default but does something else. So
+        `wait 1` is the spelling, not a stopgap.
+  - [ ] Some sleeps guard nothing at all — `a_function_stage_keeps_its_typed_
+        arguments` slept 0.1s for a *foreground* stage the shell already waits
+        for. Check whether there is a job to wait for before reaching for a
+        primitive.
 
 ## Redirection: one source-ordered pass ✅ (done)
 
