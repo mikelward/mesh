@@ -2457,6 +2457,120 @@ fn a_high_descriptor_reaches_every_kind_of_command() {
 }
 
 #[test]
+fn two_high_descriptors_keep_their_own_targets() {
+    // An open takes the lowest free descriptor, so the file for fd 4 lands *on*
+    // fd 3 — and installing fd 3 first overwrote it before anything copied it to
+    // fd 4, sending both streams to the first file. Both orderings collide, so
+    // each is checked.
+    let dir = fresh_dir("high_fd_pair");
+    for (first, second) in [("4", "3"), ("3", "4")] {
+        let three = dir.join(format!("three-{first}.txt"));
+        let four = dir.join(format!("four-{first}.txt"));
+        let target = |fd: &str| if fd == "3" { &three } else { &four };
+        let out = run_with_input(&format!(
+            "sh -c 'echo three >&3; echo four >&4' {first}> {} {second}> {}\n",
+            target(first).to_string_lossy(),
+            target(second).to_string_lossy()
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&three).unwrap_or_default(),
+            "three\n",
+            "{first} first: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&four).unwrap_or_default(),
+            "four\n",
+            "{first} first: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The same collision through a function, whose stage installs descriptors
+    // itself rather than through `Command`.
+    let three = dir.join("fn-three.txt");
+    let four = dir.join("fn-four.txt");
+    let out = run_with_input(&format!(
+        "func f() {{ sh -c 'echo three >&3; echo four >&4' }}\nf 4> {} 3> {}\n",
+        four.to_string_lossy(),
+        three.to_string_lossy()
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&three).unwrap_or_default(),
+        "three\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&four).unwrap_or_default(),
+        "four\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_high_descriptor_can_hold_a_pipe() {
+    // A pipe is not a file, so the resolution that turns destinations into files
+    // has nothing to hand fd 3 — it was simply dropped, and the command found
+    // `EBADF` on a descriptor the redirection said it had opened. Only stdout
+    // and stderr were carried to the pipe by name.
+    let out = run_with_input("sh -c 'echo hi >&3' 3>&1 | cat\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The incoming pipe is a different pipe, and a copy of stdin has to reach
+    // that one rather than the outgoing one.
+    let out = run_with_input("puts fed | sh -c 'cat <&3' 3<&0\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "fed\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Both at once, in one stage: fd 3 is the pipe feeding it and fd 4 the pipe
+    // it feeds.
+    let out = run_with_input("puts both | sh -c 'cat <&3 >&4' 3<&0 4>&1 | cat\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "both\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And through a function, which makes its own pipe rather than letting
+    // `Command` make one.
+    let out = run_with_input("func f() { sh -c 'echo deep >&3' }\nf 3>&1 | cat\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "deep\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A stage that also redirects stdout still owes the next stage the pipe,
+    // since fd 3 took it before `> file` moved stdout away.
+    let dir = fresh_dir("high_fd_pipe");
+    let log = dir.join("log.txt");
+    let out = run_with_input(&format!(
+        "sh -c 'echo piped >&3; echo filed' 3>&1 > {} | cat\n",
+        log.to_string_lossy()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "piped\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "filed\n");
+}
+
+#[test]
 fn duplicating_an_unopened_descriptor_is_an_error() {
     // A copy of nothing is not an inheritance of the shell's own descriptor of
     // that number, so this is `EBADF` — the answer the kernel itself gives.

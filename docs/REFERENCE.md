@@ -158,6 +158,14 @@ sh -c 'read line <&3; echo $line' 3< input.txt
 sh -c 'echo detail >&3' 3> trace.log
 ```
 
+A duplication reaches a pipe as readily as a file, so a stage can hand a
+descriptor either end of one:
+
+```mesh
+sh -c 'echo aside >&3' 3>&1 | cat      # fd 3 is the pipe onward
+puts fed | sh -c 'cat <&3' 3<&0        # fd 3 is the pipe feeding this stage
+```
+
 Redirections apply **in source order**, so a duplication copies where a
 descriptor points *at that moment* — `> out 2>&1` sends both to the file, while
 `2>&1 > out` copies stdout's original destination onto stderr and only then
