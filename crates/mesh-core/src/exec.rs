@@ -1445,14 +1445,30 @@ impl SigintCatcher {
     /// keeps the default disposition, under which Ctrl-C ends the shell the way
     /// it does during any other command; a wait is not the place to change that.
     fn install() -> Option<Self> {
-        // SAFETY: a zeroed `sigaction` is the documented starting point, and
-        // every field is written before the struct is used. The handler only
-        // stores to an atomic, which is async-signal-safe. Single-threaded here.
+        // SAFETY: a zeroed `sigaction`/`sigset_t` is the documented starting
+        // point, and every field is written before the struct is used. The
+        // handler only stores to an atomic, which is async-signal-safe.
         unsafe {
+            // SIGINT is blocked across the swap so one arriving mid-swap is held
+            // pending instead of meeting the ignore that is on its way out —
+            // where it would be discarded, setting no flag and leaving the wait
+            // blocked until the job finished on its own. Unblocking below
+            // delivers anything held to the handler that is by then installed.
+            let mut blocked: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGINT);
+            let mut unblocked: libc::sigset_t = std::mem::zeroed();
+            if libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut unblocked) != 0 {
+                return None;
+            }
+            let restore_mask =
+                || libc::pthread_sigmask(libc::SIG_SETMASK, &unblocked, std::ptr::null_mut());
+
             let mut previous: libc::sigaction = std::mem::zeroed();
             if libc::sigaction(libc::SIGINT, std::ptr::null(), &mut previous) != 0
                 || previous.sa_sigaction != libc::SIG_IGN
             {
+                restore_mask();
                 return None;
             }
             let mut action: libc::sigaction = std::mem::zeroed();
@@ -1460,9 +1476,12 @@ impl SigintCatcher {
                 note_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
             libc::sigemptyset(&mut action.sa_mask);
             action.sa_flags = 0;
+            // Cleared while still blocked, so unblocking cannot deliver a SIGINT
+            // whose flag this then wipes.
             SIGINT_SEEN.store(false, Ordering::SeqCst);
-            (libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) == 0)
-                .then_some(Self { previous })
+            let installed = libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) == 0;
+            restore_mask();
+            installed.then_some(Self { previous })
         }
     }
 }
