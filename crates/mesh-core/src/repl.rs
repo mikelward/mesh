@@ -8,7 +8,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -2319,145 +2319,328 @@ fn runtime_error<T>(message: impl std::fmt::Display) -> Result<T, Step> {
     Err(runtime_message(message))
 }
 
-/// One descriptor diverted to a pipe for the duration of a capture: the pipe's
-/// read end, and the `dup` of the original to put back afterwards.
-struct Diverted {
-    reader: File,
-    /// The `dup` of the original descriptor, or `-1` once put back. A `Cell` so
-    /// restoring takes `&self`: the pipe's read end is borrowed by the draining
-    /// thread at the moment the descriptor has to go back.
-    saved: std::cell::Cell<i32>,
-    fd: i32,
-}
+/// Capturing the shell's own output descriptors.
+///
+/// The invariant: **every `thread::scope` around a [`Diverted`] holds a
+/// [`RestoreOnUnwind`]**, or a panic inside the scope hangs the shell — the join
+/// waits on a reader that waits on an EOF the still-diverted write end will never
+/// send. `Diverted` is private to this module and only the two `with_*_captured`
+/// helpers own a scope, so a new capture path cannot skip the guard.
+mod capture {
+    use std::fs::File;
+    use std::io::{self, Read, Write};
+    use std::os::fd::FromRawFd;
 
-impl Diverted {
-    /// Point `fd` at a fresh pipe, keeping a copy of what was there.
-    ///
-    /// Everything this holds is **close-on-exec**, so a command the capture runs
-    /// inherits only the standard descriptors `dup2` installs. Without that, the
-    /// backup of the real stdout is just another open descriptor in the child, and
-    /// `sh -c 'echo escaped >&5'` writes straight past the capture to the terminal;
-    /// the pipe's own read end leaks the same way. `dup2` clears the flag on the
-    /// descriptor it installs, so 0/1/2 still cross `exec` as they must.
-    fn new(fd: i32) -> io::Result<Self> {
-        let mut fds = [0; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-            return Err(io::Error::last_os_error());
+    use super::{Shell, Step, runtime_error, runtime_message};
+
+    /// One descriptor diverted to a pipe for the duration of a capture: the pipe's
+    /// read end, and the `dup` of the original to put back afterwards.
+    struct Diverted {
+        reader: File,
+        /// The `dup` of the original descriptor, or `-1` once put back. A `Cell` so
+        /// restoring takes `&self`: the pipe's read end is borrowed by the draining
+        /// thread at the moment the descriptor has to go back.
+        saved: std::cell::Cell<i32>,
+        fd: i32,
+    }
+
+    impl Diverted {
+        /// Point `fd` at a fresh pipe, keeping a copy of what was there.
+        ///
+        /// Everything this holds is **close-on-exec**, so a command the capture runs
+        /// inherits only the standard descriptors `dup2` installs. Without that, the
+        /// backup of the real stdout is just another open descriptor in the child, and
+        /// `sh -c 'echo escaped >&5'` writes straight past the capture to the terminal;
+        /// the pipe's own read end leaks the same way. `dup2` clears the flag on the
+        /// descriptor it installs, so 0/1/2 still cross `exec` as they must.
+        fn new(fd: i32) -> io::Result<Self> {
+            let mut fds = [0; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // `F_DUPFD_CLOEXEC` rather than `dup` + a second `fcntl`: one call, and no
+            // window where a concurrent `exec` could inherit the backup.
+            let saved = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+            let read_cloexec = unsafe { libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) };
+            if saved < 0 || read_cloexec < 0 || unsafe { libc::dup2(fds[1], fd) } < 0 {
+                let error = io::Error::last_os_error();
+                unsafe {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                    if saved >= 0 {
+                        libc::close(saved);
+                    }
+                }
+                return Err(error);
+            }
+            // The write end lives on only as `fd` itself; keeping this copy open would
+            // stop the reader from ever seeing EOF.
+            unsafe { libc::close(fds[1]) };
+            Ok(Self {
+                reader: unsafe { File::from_raw_fd(fds[0]) },
+                saved: std::cell::Cell::new(saved),
+                fd,
+            })
         }
-        // `F_DUPFD_CLOEXEC` rather than `dup` + a second `fcntl`: one call, and no
-        // window where a concurrent `exec` could inherit the backup.
-        let saved = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-        let read_cloexec = unsafe { libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) };
-        if saved < 0 || read_cloexec < 0 || unsafe { libc::dup2(fds[1], fd) } < 0 {
-            let error = io::Error::last_os_error();
+
+        /// Put the original descriptor back. Called explicitly before the pipe is
+        /// drained, so a diagnostic raised while reading still reaches the real stderr;
+        /// `Drop` covers every path that leaves before reaching that point.
+        ///
+        /// Idempotent: `saved` is cleared, so the later `Drop` does nothing rather than
+        /// `dup2`-ing a descriptor that has already been closed.
+        fn restore(&self) {
+            let saved = self.saved.replace(-1);
+            if saved < 0 {
+                return;
+            }
             unsafe {
-                libc::close(fds[0]);
-                libc::close(fds[1]);
-                if saved >= 0 {
-                    libc::close(saved);
+                libc::dup2(saved, self.fd);
+                libc::close(saved);
+            }
+        }
+    }
+
+    impl Drop for Diverted {
+        /// A capture must never leave the shell's own descriptor pointing at a pipe
+        /// with no reader — later output would be lost or fail with `EPIPE`, and the
+        /// `dup` would leak. Diverting the *second* descriptor can fail (a process near
+        /// `RLIMIT_NOFILE`), and an argument can raise control flow mid-capture, so the
+        /// restore cannot rely on reaching the end of the function.
+        fn drop(&mut self) {
+            self.restore();
+        }
+    }
+
+    /// Puts diverted descriptors back if the scope they were diverted for **unwinds**.
+    ///
+    /// Must be a **closure local**, so it drops before `thread::scope` joins. It
+    /// borrows rather than owns because the reader threads borrow the same
+    /// descriptors, which would keep their own `Drop` from running here (`E0713`).
+    /// The second is optional: `$(…)` diverts stdout alone, `:capture` both.
+    struct RestoreOnUnwind<'a>(&'a Diverted, Option<&'a Diverted>);
+
+    impl Drop for RestoreOnUnwind<'_> {
+        fn drop(&mut self) {
+            self.0.restore();
+            if let Some(second) = self.1 {
+                second.restore();
+            }
+        }
+    }
+
+    /// Divert both of the shell's output descriptors to pipes, run `body`, and return
+    /// what it produced beside the two captured streams.
+    ///
+    /// Both pipes are drained on their own threads, which is load-bearing rather than
+    /// tidy: reading them in sequence deadlocks as soon as `body` fills the 64 KiB
+    /// buffer on the channel that is not being read yet.
+    ///
+    /// The descriptors go back *before* the pipes are drained, so a diagnostic raised
+    /// while reading still reaches the real stderr — and `Diverted::drop` covers the
+    /// paths that leave early, including a failure to divert the second descriptor.
+    pub(super) fn with_channels_captured<T>(
+        shell: &mut Shell,
+        body: impl FnOnce(&mut Shell) -> T,
+    ) -> Result<(T, String, String), Step> {
+        let out = Diverted::new(libc::STDOUT_FILENO).map_err(runtime_message)?;
+        // Should this one fail, `out` is dropped on the way out and stdout goes back;
+        // leaving it on a pipe with no reader would lose every later write.
+        let err = Diverted::new(libc::STDERR_FILENO).map_err(runtime_message)?;
+        let mut out_reader = &out.reader;
+        let mut err_reader = &err.reader;
+        let (produced, out_read, err_read) = std::thread::scope(|scope| {
+            let _restore = RestoreOnUnwind(&out, Some(&err));
+            let read_out = scope.spawn(move || {
+                let mut text = String::new();
+                out_reader.read_to_string(&mut text).map(|_| text)
+            });
+            let read_err = scope.spawn(move || {
+                let mut text = String::new();
+                err_reader.read_to_string(&mut text).map(|_| text)
+            });
+            let produced = body(shell);
+            let _ = io::stdout().flush();
+            out.restore();
+            err.restore();
+            (produced, read_out.join(), read_err.join())
+        });
+        let captured = |joined: std::thread::Result<io::Result<String>>| match joined {
+            Ok(Ok(text)) => Ok(text),
+            Ok(Err(error)) => runtime_error(error),
+            Err(_) => runtime_error("capture reader panicked"),
+        };
+        Ok((produced, captured(out_read)?, captured(err_read)?))
+    }
+
+    /// Divert **stdout only** — what `$(…)` captures — run `body`, and return what it
+    /// produced beside the captured text.
+    ///
+    /// Separate from [`with_channels_captured`] because `$(…)` deliberately leaves
+    /// stderr alone, but built the same way and under the module's invariant.
+    pub(super) fn with_stdout_captured<T>(
+        shell: &mut Shell,
+        body: impl FnOnce(&mut Shell) -> T,
+    ) -> Result<(T, String), Step> {
+        let diverted = Diverted::new(libc::STDOUT_FILENO).map_err(runtime_message)?;
+        let mut reader = &diverted.reader;
+        let (produced, read) = std::thread::scope(|scope| {
+            let _restore = RestoreOnUnwind(&diverted, None);
+            let read = scope.spawn(move || {
+                let mut output = String::new();
+                reader.read_to_string(&mut output).map(|_| output)
+            });
+            let produced = body(shell);
+            let _ = io::stdout().flush();
+            diverted.restore();
+            (produced, read.join())
+        });
+        match read {
+            Ok(Ok(output)) => Ok((produced, output)),
+            Ok(Err(error)) => runtime_error(error),
+            Err(_) => runtime_error("capture reader panicked"),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Diverted, with_channels_captured, with_stdout_captured};
+        use crate::repl::Shell;
+        use std::sync::{Mutex, MutexGuard};
+
+        /// These tests hijack the **process-wide** stdout, so they cannot run
+        /// concurrently with each other: two overlapping diversions interleave their
+        /// save and restore, and one ends up handing the other's pipe back as "the
+        /// original" — stranding a reader that then waits for an EOF nobody will
+        /// send. libtest runs tests in parallel by default, so they take this lock.
+        fn exclusive() -> MutexGuard<'static, ()> {
+            static LOCK: Mutex<()> = Mutex::new(());
+            LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        #[test]
+        fn a_diverted_descriptor_goes_back_when_it_is_dropped() {
+            let _exclusive = exclusive();
+            use std::io::{Read, Write};
+            use std::os::fd::{AsRawFd, FromRawFd};
+
+            // Stand in for "the shell's stdout": a pipe whose read end we can inspect.
+            let mut original = [0; 2];
+            assert!(unsafe { libc::pipe(original.as_mut_ptr()) } >= 0);
+            let mut original_read = unsafe { std::fs::File::from_raw_fd(original[0]) };
+            let mut target = unsafe { std::fs::File::from_raw_fd(original[1]) };
+            let fd = target.as_raw_fd();
+
+            {
+                let diverted = Diverted::new(fd).expect("divert");
+                let mut writer = unsafe { std::fs::File::from_raw_fd(libc::dup(fd)) };
+                writeln!(writer, "captured").unwrap();
+                drop(writer);
+                // Left without an explicit restore, exactly as an early return would.
+                drop(diverted);
+            }
+
+            writeln!(target, "after").unwrap();
+            drop(target);
+            let mut landed = String::new();
+            original_read.read_to_string(&mut landed).unwrap();
+            assert_eq!(
+                landed, "after\n",
+                "the descriptor should be back, and only post-restore writes should land"
+            );
+        }
+
+        /// A panic inside the capture must not hang the shell. `thread::scope` joins the
+        /// readers while unwinding, and a reader waiting for EOF on a live write end
+        /// would wait forever — so the descriptors have to go back *before* that join.
+        /// A panicking body is the reachable version of `Scope::spawn` failing when the
+        /// OS refuses a thread; both unwind through the same path.
+        #[test]
+        fn a_panic_inside_a_capture_does_not_hang() {
+            let _exclusive = exclusive();
+            // Written straight to the descriptor: this test runs under libtest, which
+            // intercepts `print!` above the fd layer, so a `print!` would never reach
+            // the pipe being tested.
+            fn write_fd(fd: i32, text: &str) {
+                unsafe {
+                    libc::write(fd, text.as_ptr().cast(), text.len());
                 }
             }
-            return Err(error);
-        }
-        // The write end lives on only as `fd` itself; keeping this copy open would
-        // stop the reader from ever seeing EOF.
-        unsafe { libc::close(fds[1]) };
-        Ok(Self {
-            reader: unsafe { File::from_raw_fd(fds[0]) },
-            saved: std::cell::Cell::new(saved),
-            fd,
-        })
-    }
 
-    /// Put the original descriptor back. Called explicitly before the pipe is
-    /// drained, so a diagnostic raised while reading still reaches the real stderr;
-    /// `Drop` covers every path that leaves before reaching that point.
-    ///
-    /// Idempotent: `saved` is cleared, so the later `Drop` does nothing rather than
-    /// `dup2`-ing a descriptor that has already been closed.
-    fn restore(&self) {
-        let saved = self.saved.replace(-1);
-        if saved < 0 {
-            return;
-        }
-        unsafe {
-            libc::dup2(saved, self.fd);
-            libc::close(saved);
-        }
-    }
-}
+            let mut shell = Shell::new();
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = with_channels_captured(&mut shell, |_| {
+                    write_fd(libc::STDOUT_FILENO, "before the panic");
+                    panic!("body blew up");
+                });
+            }));
+            assert!(
+                unwound.is_err(),
+                "the panic should propagate, not be swallowed"
+            );
 
-impl Drop for Diverted {
-    /// A capture must never leave the shell's own descriptor pointing at a pipe
-    /// with no reader — later output would be lost or fail with `EPIPE`, and the
-    /// `dup` would leak. Diverting the *second* descriptor can fail (a process near
-    /// `RLIMIT_NOFILE`), and an argument can raise control flow mid-capture, so the
-    /// restore cannot rely on reaching the end of the function.
-    fn drop(&mut self) {
-        self.restore();
-    }
-}
+            // Reaching here at all is the point — a hang is the failure this guards
+            // against. That the next capture still carries a write through proves the
+            // descriptors went back: one left on a reader-less pipe would lose it.
+            //
+            // `contains`, not `==`: this diverts the *process-wide* stdout while libtest
+            // runs other tests on other threads, so anything they write lands in the
+            // capture too. Asserting equality passed locally and failed in CI on a
+            // neighbour's progress line. The exact bytes are pinned by
+            // `a_diverted_descriptor_goes_back_when_it_is_dropped`, which owns its
+            // descriptor and cannot race.
+            let mut shell = Shell::new();
+            let (_, out, err) = with_channels_captured(&mut shell, |_| {
+                write_fd(libc::STDOUT_FILENO, "after-the-panic");
+                write_fd(libc::STDERR_FILENO, "err-after-the-panic");
+            })
+            .expect("capture again");
+            assert!(out.contains("after-the-panic"), "{out:?}");
+            assert!(err.contains("err-after-the-panic"), "{err:?}");
+        }
 
-/// Divert both of the shell's output descriptors to pipes, run `body`, and return
-/// what it produced beside the two captured streams.
-///
-/// Both pipes are drained on their own threads, which is load-bearing rather than
-/// tidy: reading them in sequence deadlocks as soon as `body` fills the 64 KiB
-/// buffer on the channel that is not being read yet.
-///
-/// The descriptors go back *before* the pipes are drained, so a diagnostic raised
-/// while reading still reaches the real stderr — and `Diverted::drop` covers the
-/// paths that leave early, including a failure to divert the second descriptor.
-fn with_channels_captured<T>(
-    shell: &mut Shell,
-    body: impl FnOnce(&mut Shell) -> T,
-) -> Result<(T, String, String), Step> {
-    let out = Diverted::new(libc::STDOUT_FILENO).map_err(runtime_message)?;
-    // Should this one fail, `out` is dropped on the way out and stdout goes back;
-    // leaving it on a pipe with no reader would lose every later write.
-    let err = Diverted::new(libc::STDERR_FILENO).map_err(runtime_message)?;
-    let mut out_reader = &out.reader;
-    let mut err_reader = &err.reader;
-    let (produced, out_read, err_read) = std::thread::scope(|scope| {
-        // A panic inside this closure — `Scope::spawn` failing when the OS refuses a
-        // thread, or the body itself — unwinds, and `thread::scope` then *joins*
-        // whichever reader already started. A reader waiting for EOF on a still-live
-        // write end would wait forever, hanging the shell. This guard is a closure
-        // local, so it drops while unwinding out of the closure, which is before
-        // that join: restoring closes the write ends and lets the join finish.
-        //
-        // The descriptors themselves cannot simply be moved in here — the readers
-        // borrow them, so their destructors may not run inside the closure — which
-        // is why the guard borrows instead. `restore` is idempotent, so this
-        // composes with the explicit call on the normal path below.
-        struct RestoreOnUnwind<'a>(&'a Diverted, &'a Diverted);
-        impl Drop for RestoreOnUnwind<'_> {
-            fn drop(&mut self) {
-                self.0.restore();
-                self.1.restore();
+        /// `$(…)` diverts one descriptor where `:capture` diverts two, but the hazard is
+        /// the same and so is the guard: `thread::scope` joins the reader while
+        /// unwinding, so the descriptor has to go back first or the join waits for an EOF
+        /// that cannot come.
+        ///
+        /// This is the case that was missed once. `capture_source` was moved onto
+        /// [`Diverted`] for the close-on-exec and always-restore guarantees and kept the
+        /// original hang-on-panic shape, because the guard lived inside the *other*
+        /// capture's closure. Both now go through a helper that owns the scope, so the
+        /// guard is not something a caller can forget.
+        #[test]
+        fn a_panic_inside_a_single_descriptor_capture_does_not_hang() {
+            let _exclusive = exclusive();
+            fn write_fd(fd: i32, text: &str) {
+                unsafe {
+                    libc::write(fd, text.as_ptr().cast(), text.len());
+                }
             }
+
+            let mut shell = Shell::new();
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = with_stdout_captured(&mut shell, |_| {
+                    write_fd(libc::STDOUT_FILENO, "before the panic");
+                    panic!("body blew up");
+                });
+            }));
+            assert!(
+                unwound.is_err(),
+                "the panic should propagate, not be swallowed"
+            );
+
+            // Reaching here is the assertion — the failure this guards against is a hang.
+            // `contains` rather than `==`: this diverts process-wide stdout while libtest
+            // runs other tests on other threads, so their output lands here too.
+            let mut shell = Shell::new();
+            let (_, out) = with_stdout_captured(&mut shell, |_| {
+                write_fd(libc::STDOUT_FILENO, "after-the-panic")
+            })
+            .expect("capture again");
+            assert!(out.contains("after-the-panic"), "{out:?}");
         }
-        let _restore = RestoreOnUnwind(&out, &err);
-        let read_out = scope.spawn(move || {
-            let mut text = String::new();
-            out_reader.read_to_string(&mut text).map(|_| text)
-        });
-        let read_err = scope.spawn(move || {
-            let mut text = String::new();
-            err_reader.read_to_string(&mut text).map(|_| text)
-        });
-        let produced = body(shell);
-        let _ = io::stdout().flush();
-        out.restore();
-        err.restore();
-        (produced, read_out.join(), read_err.join())
-    });
-    let captured = |joined: std::thread::Result<io::Result<String>>| match joined {
-        Ok(Ok(text)) => Ok(text),
-        Ok(Err(error)) => runtime_error(error),
-        Err(_) => runtime_error("capture reader panicked"),
-    };
-    Ok((produced, captured(out_read)?, captured(err_read)?))
+    }
 }
 
 /// `f(…):capture` — run the call and return a **record of every channel**:
@@ -2493,7 +2676,7 @@ fn capture_call(
         return capture_command(&name, arguments, last, in_function, shell);
     }
 
-    let (outcome, out_text, err_text) = with_channels_captured(shell, |shell| {
+    let (outcome, out_text, err_text) = capture::with_channels_captured(shell, |shell| {
         eval_call(callee, arguments, last, in_function, shell)
     })?;
     // A runtime error in the call fails the enclosing statement, as it does for a
@@ -2544,7 +2727,7 @@ fn capture_command(
     // record. Doing it first would put that output on the terminal and leave the
     // record holding only the command's own, which is not what the same argument
     // does in a captured mesh call.
-    let (outcome, out_text, err_text) = with_channels_captured(shell, |shell| {
+    let (outcome, out_text, err_text) = capture::with_channels_captured(shell, |shell| {
         let mut words = vec![name.to_string()];
         for argument in arguments {
             match argument {
@@ -2645,27 +2828,8 @@ fn capture_source(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    // Diverted through the same type `:capture` uses, so the close-on-exec and
-    // always-restore guarantees hold here too: `$(sh -c 'echo escaped >&5')` wrote
-    // past the capture to the terminal while the backup of the real stdout was an
-    // inheritable descriptor.
-    let diverted = Diverted::new(libc::STDOUT_FILENO).map_err(runtime_message)?;
-    let mut reader = &diverted.reader;
-    let (step, read_result) = std::thread::scope(|scope| {
-        let read = scope.spawn(move || {
-            let mut output = String::new();
-            reader.read_to_string(&mut output).map(|_| output)
-        });
-        let step = run_source(source, last, in_function, shell);
-        let _ = io::stdout().flush();
-        diverted.restore();
-        (step, read.join())
-    });
-    let output = match read_result {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => return runtime_error(error),
-        Err(_) => return runtime_error("capture reader panicked"),
-    };
+    let (step, output) =
+        capture::with_stdout_captured(shell, |shell| run_source(source, last, in_function, shell))?;
     match step {
         Step::Continue(0) => Ok(Value::String(output.trim_end_matches('\n').to_string())),
         Step::Continue(code) => Err(Step::Continue(code)),
@@ -5555,14 +5719,14 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgumentRecall, CompletionState, Diverted, HeredocGate, Invocation, MeshPrompt,
-        PromptEvent, PromptHook, Shell, StartupOptions, Step, TimestampedHistory,
-        argument_completions, command_position, command_segment_words, command_words,
-        completed_command, eval_binary, expand_history_designators, expansion_word, handle_signal,
-        help_completions, history_path_from, input_highlighter, interactive_keybindings,
-        interruptible_task, last_argument, needs_more_input, open_history, path_completions_sync,
+        ArgumentRecall, CompletionState, HeredocGate, Invocation, MeshPrompt, PromptEvent,
+        PromptHook, Shell, StartupOptions, Step, TimestampedHistory, argument_completions,
+        command_position, command_segment_words, command_words, completed_command, eval_binary,
+        expand_history_designators, expansion_word, handle_signal, help_completions,
+        history_path_from, input_highlighter, interactive_keybindings, interruptible_task,
+        last_argument, needs_more_input, open_history, path_completions_sync,
         persist_logical_history, prepare_history_path, run_line, run_prompt_hooks, run_source,
-        variable_completions, with_channels_captured,
+        variable_completions,
     };
     use crate::parser;
     use crate::vars::Value;
@@ -7223,89 +7387,5 @@ mod tests {
         );
         assert_eq!(run_line("setx", 0, false, &mut shell), Step::Continue(0));
         assert_eq!(shell.vars.get("x"), None);
-    }
-
-    /// A capture must never leave the shell's descriptor on a pipe with no reader:
-    /// later writes would be lost or fail with `EPIPE`, and the `dup` would leak.
-    /// Diverting the *second* descriptor can fail on its own (a process near
-    /// `RLIMIT_NOFILE`), so the restore cannot depend on reaching the end of the
-    /// capture — `Drop` has to do it.
-    #[test]
-    fn a_diverted_descriptor_goes_back_when_it_is_dropped() {
-        use std::io::{Read, Write};
-        use std::os::fd::{AsRawFd, FromRawFd};
-
-        // Stand in for "the shell's stdout": a pipe whose read end we can inspect.
-        let mut original = [0; 2];
-        assert!(unsafe { libc::pipe(original.as_mut_ptr()) } >= 0);
-        let mut original_read = unsafe { std::fs::File::from_raw_fd(original[0]) };
-        let mut target = unsafe { std::fs::File::from_raw_fd(original[1]) };
-        let fd = target.as_raw_fd();
-
-        {
-            let diverted = Diverted::new(fd).expect("divert");
-            let mut writer = unsafe { std::fs::File::from_raw_fd(libc::dup(fd)) };
-            writeln!(writer, "captured").unwrap();
-            drop(writer);
-            // Left without an explicit restore, exactly as an early return would.
-            drop(diverted);
-        }
-
-        writeln!(target, "after").unwrap();
-        drop(target);
-        let mut landed = String::new();
-        original_read.read_to_string(&mut landed).unwrap();
-        assert_eq!(
-            landed, "after\n",
-            "the descriptor should be back, and only post-restore writes should land"
-        );
-    }
-
-    /// A panic inside the capture must not hang the shell. `thread::scope` joins the
-    /// readers while unwinding, and a reader waiting for EOF on a live write end
-    /// would wait forever — so the descriptors have to go back *before* that join.
-    /// A panicking body is the reachable version of `Scope::spawn` failing when the
-    /// OS refuses a thread; both unwind through the same path.
-    #[test]
-    fn a_panic_inside_a_capture_does_not_hang() {
-        // Written straight to the descriptor: this test runs under libtest, which
-        // intercepts `print!` above the fd layer, so a `print!` would never reach
-        // the pipe being tested.
-        fn write_fd(fd: i32, text: &str) {
-            unsafe {
-                libc::write(fd, text.as_ptr().cast(), text.len());
-            }
-        }
-
-        let mut shell = Shell::new();
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = with_channels_captured(&mut shell, |_| {
-                write_fd(libc::STDOUT_FILENO, "before the panic");
-                panic!("body blew up");
-            });
-        }));
-        assert!(
-            unwound.is_err(),
-            "the panic should propagate, not be swallowed"
-        );
-
-        // Reaching here at all is the point — a hang is the failure this guards
-        // against. That the next capture still carries a write through proves the
-        // descriptors went back: one left on a reader-less pipe would lose it.
-        //
-        // `contains`, not `==`: this diverts the *process-wide* stdout while libtest
-        // runs other tests on other threads, so anything they write lands in the
-        // capture too. Asserting equality passed locally and failed in CI on a
-        // neighbour's progress line. The exact bytes are pinned by
-        // `a_diverted_descriptor_goes_back_when_it_is_dropped`, which owns its
-        // descriptor and cannot race.
-        let mut shell = Shell::new();
-        let (_, out, err) = with_channels_captured(&mut shell, |_| {
-            write_fd(libc::STDOUT_FILENO, "after-the-panic");
-            write_fd(libc::STDERR_FILENO, "err-after-the-panic");
-        })
-        .expect("capture again");
-        assert!(out.contains("after-the-panic"), "{out:?}");
-        assert!(err.contains("err-after-the-panic"), "{err:?}");
     }
 }
