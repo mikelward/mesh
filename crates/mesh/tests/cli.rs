@@ -4131,12 +4131,23 @@ fn a_background_redirect_does_not_require_sh_on_path() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    writeln!(
-        child.stdin.take().expect("stdin"),
-        "/bin/echo ok > {} &\n/bin/sleep 0.05\njobs",
-        output.display()
-    )
-    .expect("write commands");
+    // Wait for the job's own output rather than guessing at how long it needs.
+    // A fixed sleep raced it two ways: the shell hangs up its jobs on the way
+    // out, so an exit that beat the job killed it, and the redirect creates the
+    // file before the command writes — so a slow `/bin/echo` left an empty file
+    // rather than a missing one, and the assertion read back "".
+    let mut stdin = child.stdin.take().expect("stdin");
+    writeln!(stdin, "/bin/echo ok > {} &", output.display()).expect("write commands");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::read_to_string(&output).unwrap_or_default() != "ok\n" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the backgrounded redirect never wrote its output"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    writeln!(stdin, "jobs").expect("write jobs");
+    drop(stdin);
     let result = child.wait_with_output().expect("wait for mesh");
     assert_eq!(std::fs::read_to_string(&output).unwrap(), "ok\n");
     assert!(!String::from_utf8_lossy(&result.stderr).contains("command not found"));
