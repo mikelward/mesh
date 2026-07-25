@@ -169,16 +169,25 @@ impl JobTable {
             .jobs
             .iter_mut()
             .map(|job| {
+                // Polled whatever the job's state, because a *stopped* job can
+                // still change: killed where it stands, or continued by
+                // something other than this table's own `bg`. Skipping them left
+                // a job that had died reported as stopped for good, and `wait`
+                // handing back its stop status instead of how it ended.
                 let mut status = None;
-                if job.state == JobState::Running {
-                    match poll_outcomes(&mut job.outcomes) {
-                        Some(WaitResult::Complete(code)) => status = Some(code),
-                        Some(WaitResult::Stopped(code)) => {
-                            job.state = JobState::Stopped(code);
-                            newly_stopped.push(job.id);
-                        }
-                        None => {}
+                match poll_outcomes(&mut job.outcomes) {
+                    Some(WaitResult::Complete(code)) => {
+                        status = Some(code);
+                        // Reported as `done` below; the stopped mark would
+                        // otherwise outlive the stop and mislead a later `wait`.
+                        job.state = JobState::Running;
                     }
+                    Some(WaitResult::Stopped(code)) => {
+                        job.state = JobState::Stopped(code);
+                        newly_stopped.push(job.id);
+                    }
+                    Some(WaitResult::Continued) => job.state = JobState::Running,
+                    None => {}
                 }
                 JobInfo {
                     id: job.id,
@@ -249,6 +258,10 @@ impl JobTable {
             .flatten();
         reclaim_terminal(job.shell_modes.as_ref());
         match result {
+            // `wait_outcomes` does not ask for `WCONTINUED`, so a continue never
+            // arrives here — the job is in the foreground and this call is what
+            // resumed it.
+            WaitResult::Continued => 0,
             WaitResult::Complete(status) => {
                 self.forget(job.id);
                 status
@@ -301,6 +314,18 @@ impl JobTable {
         let Some(index) = self.resolve(args, "wait") else {
             return 1;
         };
+        // Checked before the cached stop status is trusted: the job may have
+        // been killed where it stood, or continued by something other than this
+        // table, and either way the poll is what notices.
+        match poll_outcomes(&mut self.jobs[index].outcomes) {
+            Some(WaitResult::Continued) => self.jobs[index].state = JobState::Running,
+            Some(WaitResult::Stopped(code)) => self.jobs[index].state = JobState::Stopped(code),
+            // Finished. Whatever it was before, it is not *stopped* now, and
+            // leaving the mark on would send this down the branch below and
+            // report the stop it was killed out of rather than how it ended.
+            Some(WaitResult::Complete(_)) => self.jobs[index].state = JobState::Running,
+            None => {}
+        }
         // A stopped job does not finish on its own, so waiting for one would
         // block until something else continued it — from a prompt this shell is
         // no longer reading. Report the stop instead, as bash does.
@@ -329,6 +354,8 @@ impl JobTable {
                 self.mark_current(id);
                 status
             }
+            // As in `foreground`: this wait does not ask for `WCONTINUED`.
+            Some(WaitResult::Continued) => 0,
             // Ctrl-C gives up on the wait, not on the job: it keeps running and
             // keeps its place in the table.
             None => INTERRUPT_CODE,
@@ -449,21 +476,23 @@ impl JobTable {
     pub fn reap(&mut self) {
         let mut index = 0;
         while index < self.jobs.len() {
-            if self.jobs[index].state == JobState::Running {
-                match poll_outcomes(&mut self.jobs[index].outcomes) {
-                    Some(WaitResult::Complete(status)) => {
-                        let job = self.jobs.remove(index);
-                        self.forget(job.id);
-                        note!("[{}] Done ({status}) {}", job.id, job.command);
-                        continue;
-                    }
-                    Some(WaitResult::Stopped(code)) => {
-                        self.jobs[index].state = JobState::Stopped(code);
-                        let id = self.jobs[index].id;
-                        self.mark_current(id);
-                    }
-                    None => {}
+            // Every job, stopped ones included — see `info`.
+            match poll_outcomes(&mut self.jobs[index].outcomes) {
+                Some(WaitResult::Complete(status)) => {
+                    let job = self.jobs.remove(index);
+                    self.forget(job.id);
+                    note!("[{}] Done ({status}) {}", job.id, job.command);
+                    continue;
                 }
+                Some(WaitResult::Stopped(code)) => {
+                    self.jobs[index].state = JobState::Stopped(code);
+                    let id = self.jobs[index].id;
+                    self.mark_current(id);
+                }
+                Some(WaitResult::Continued) => {
+                    self.jobs[index].state = JobState::Running;
+                }
+                None => {}
             }
             index += 1;
         }
@@ -1175,7 +1204,11 @@ pub fn run_pipeline(
         }
         let result = wait_outcomes(&mut outcomes);
         let stages = stage_codes(&outcomes);
-        let (WaitResult::Complete(status) | WaitResult::Stopped(status)) = result;
+        // A foreground wait does not ask for `WCONTINUED`, so only these two
+        // arrive; `Continued` carries no status of its own.
+        let (WaitResult::Complete(status) | WaitResult::Stopped(status)) = result else {
+            return PipelineStatus::whole(0);
+        };
         return PipelineStatus { status, stages };
     }
 
@@ -1201,6 +1234,8 @@ pub fn run_pipeline(
         }
     }
     let status = match result {
+        // As above: a foreground wait never sees a continue.
+        WaitResult::Continued => 0,
         WaitResult::Complete(status) => status,
         WaitResult::Stopped(status) => {
             if let Some(pgid) = foreground {
@@ -1264,6 +1299,10 @@ fn stage_seed(idx: usize, n: usize, background: bool, interactive: bool) -> Sour
 enum WaitResult {
     Complete(u8),
     Stopped(u8),
+    /// The job was continued by something other than this table's own `bg` —
+    /// a `kill -CONT` from a pipeline stage, whose copy of the table dies with
+    /// it, or anything outside the shell entirely.
+    Continued,
 }
 
 /// What a finished pipeline reports.
@@ -1362,11 +1401,22 @@ fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<WaitResult> {
         let pid = *pid;
         let piped_out = *piped_out;
         let mut raw = 0;
-        let result = unsafe { libc::waitpid(pid, &mut raw, libc::WNOHANG | libc::WUNTRACED) };
+        // `WCONTINUED` as well as `WUNTRACED`: without it a continue is simply
+        // invisible, and a job that something else restarted stays marked
+        // stopped for the rest of its life.
+        let result = unsafe {
+            libc::waitpid(
+                pid,
+                &mut raw,
+                libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED,
+            )
+        };
         if result == 0 {
             any_running = true;
         } else if result > 0 && libc::WIFSTOPPED(raw) {
             return Some(WaitResult::Stopped(128 + libc::WSTOPSIG(raw) as u8));
+        } else if result > 0 && libc::WIFCONTINUED(raw) {
+            return Some(WaitResult::Continued);
         } else if result > 0 {
             let code = wait_status(raw);
             *outcome = Outcome::Completed { code, piped_out };
