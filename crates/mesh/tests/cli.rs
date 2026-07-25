@@ -2216,8 +2216,9 @@ fn kill_signals_a_job_or_a_pid() {
     let job = run_with_input("j = sleep 30 &\nkill $j\nwait $j\nputs status=$sh.status\n");
     assert_eq!(String::from_utf8_lossy(&job.stdout), "status=143\n");
 
-    // Every spelling of a signal a shell's `kill` takes.
-    for signal in ["-9", "-KILL", "-SIGKILL", "-s KILL"] {
+    // Every spelling of a signal a shell's `kill` takes. `-s sigspec` and
+    // `-n signum` are the two option forms bash documents beside `-sigspec`.
+    for signal in ["-9", "-KILL", "-SIGKILL", "-s KILL", "-n 9", "-n KILL"] {
         let out = run_with_input(&format!(
             "sleep 30 &\nkill {signal} %+\nwait %+\nputs status=$sh.status\n"
         ));
@@ -2419,7 +2420,7 @@ fn kill_takes_the_option_terminator_after_a_signal() {
     // combined form. Left in place it became a target of its own: the signal
     // still landed, but `kill` reported `--: no such job` and returned 1, so a
     // script checking the status saw a failure that had not happened.
-    for options in ["-s TERM --", "-9 --", "--"] {
+    for options in ["-s TERM --", "-9 --", "-n 15 --", "--"] {
         let out = run_with_input(&format!(
             "sleep 30 &\nkill {options} %1\nputs signalled=$sh.status\n"
         ));
