@@ -492,21 +492,6 @@ of each PR had landed by another route, but these pieces had not.
       length-prefixing so a grandchild holding the write end open cannot hang the
       read. Decide before `fork func`, since a value call on one is the case that
       needs it.
-- [ ] **`i64::MIN` has no readable literal.** `x = -9223372036854775808` fails
-      with "expected integer" while `i64::MIN + 1` and `i64::MAX` both work: the
-      parser builds a negation over the magnitude `9223372036854775808`, which does
-      not fit an `i64`, so the operand is already a string by the time the sign
-      would apply (`parser.rs` `prefix`, `expand.rs` `typed_scalar`). The fix is to
-      fold the sign into the literal at parse time, as Rust itself does — which
-      changes how *every* negative literal parses, so it wants its own change
-      rather than riding along with one. Found by the `:repr` round-trip tests,
-      where it is the one value the writer can spell and the reader cannot take
-      back. `:repr` **refuses** it meanwhile (`NoLiteral::MinInteger`), because it
-      is reachable by arithmetic — `-9223372036854775807 - 1` — and a round-trip
-      contract with one silent hole is not one the fork value channel could build
-      on. Fixing the parser therefore deletes that arm as well: pinned from both
-      sides by `the_smallest_integer_is_refused_until_the_reader_can_take_it` in
-      `repl.rs`, which fails when this lands.
 - [ ] **Two modifier tables, one of them quietly stale.** `lexer::Modifier`
       (`lexer.rs:36`) and `expand::Modifier` (`expand.rs:27`) are separate enums
       with separate `from_name` tables, and the lexer's has not been extended

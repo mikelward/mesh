@@ -712,6 +712,52 @@ pub fn params_prefix_status(list: &str) -> PrefixStatus {
     .parameters_prefix()
 }
 
+/// Fold a leading `-` into the integer literal it applies to, rather than
+/// negating that literal at runtime.
+///
+/// The magnitudes are not symmetric: `i64::MIN` is one further from zero than
+/// `i64::MAX`, so `-9223372036854775808` has no positive counterpart to negate.
+/// Parsed as a negation it read `9223372036854775808` first, which does not fit
+/// an `i64`, so the operand was already a *string* by the time the sign would
+/// apply and the negation reported "expected integer" — while `i64::MIN + 1` and
+/// `i64::MAX` both worked. Folding the sign into the literal is what languages
+/// with two's-complement integers do, Rust included.
+///
+/// Deliberately narrow. Only a single **bare** word folds, and only when the
+/// signed text actually parses:
+///
+/// - A quoted or interpolated word (`-"5"`, `-$n`) stays a `Negate`, since those
+///   are strings and variables rather than literals, and the runtime negation is
+///   what type-checks them.
+/// - A magnitude too large even with the sign stays a `Negate` too, so it keeps
+///   reporting "expected integer" instead of quietly becoming the string
+///   `-99999999999999999999`.
+/// - Double negation folds only the inner `-`: in `- -5` and `-(-5)` the outer
+///   operand then starts with `-` rather than a digit, so it negates the literal
+///   `-5` at runtime and gives `5`, as it did before. (`--5` is not this case at
+///   all — it lexes as one flag-shaped bare word and never reaches here.)
+fn negative_literal(minus: &Span, operand: &Expr) -> Option<Expr> {
+    let Expr::Scalar(word) = operand else {
+        return None;
+    };
+    // Whether the signed text parses is the whole test, and it is exact: it
+    // rejects a non-numeric word (`-abc`), a magnitude past the range
+    // (`-99999999999999999999`), and an already-signed one (the `-5` an inner
+    // fold just produced) without a separate shape check to keep in step.
+    let text = format!("-{}", word.value.bare_word()?);
+    text.parse::<i64>().ok()?;
+    Some(Expr::Scalar(Spanned {
+        value: Word {
+            pieces: vec![WordPiece::Text {
+                text,
+                quote: QuoteMode::Bare,
+            }],
+        },
+        // The sign is part of the literal now, so the span covers it.
+        span: minus.start..word.span.end,
+    }))
+}
+
 /// A parse error that only means "the input ran out" — the reader buffers on it
 /// rather than dispatching, matching how [`parse`] maps these to `Incomplete`.
 fn is_incomplete(kind: &ParseErrorKind) -> bool {
@@ -2536,10 +2582,15 @@ impl Parser {
 
     fn prefix(&mut self) -> Result<Expr, ParseError> {
         if self.operator("-") {
+            let minus = self.peek().expect("the operator just peeked").span.clone();
             self.position += 1;
+            let operand = self.prefix()?;
+            if let Some(literal) = negative_literal(&minus, &operand) {
+                return Ok(literal);
+            }
             return Ok(Expr::Unary {
                 op: UnaryOp::Negate,
-                expression: Box::new(self.prefix()?),
+                expression: Box::new(operand),
             });
         }
         if self.eat(&TokenKind::Spread).is_some() {
