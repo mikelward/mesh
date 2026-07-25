@@ -75,11 +75,12 @@ argument; `false || echo ok` prints `ok`.
 makes a shell a shell.
 
 **Scope**
-- Pipelines (`a | b | c`) and basic redirection (`>`, `>>`, `<`) ✅ landed.
-  Descriptor/stderr redirection (`2>`) remains planned.
+- Pipelines (`a | b | c`) and redirection (`>`, `>>`, `<`), including the
+  descriptor forms (`2>`, `2>>`, `2>&1`) ✅ landed.
 - Process groups, `tcsetpgrp`, foreground signal handling, stopped-job tracking,
-  `&` background launch, and `jobs` / `fg` / `bg` / `wait` ✅ landed. `wait`
-  takes a job reference; the no-operand "every child" form and `kill` remain
+  `&` background launch, and `jobs` / `fg` / `bg` / `wait` / `kill` ✅ landed.
+  `j = cmd &` binds a job handle, and `fg` / `bg` / `wait` / `kill` take it or a
+  `%` reference. `wait`'s no-operand "every child" form and `disown` remain
   planned.
 - **Ctrl-C returns to the prompt** with status `130` (child gets SIGINT, shell
   survives) ✅ landed.

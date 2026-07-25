@@ -161,10 +161,10 @@ impl JobTable {
     /// observation change behavior. Reaping still reports and removes it at its
     /// own time.
     pub fn info(&mut self) -> Vec<JobInfo> {
-        // Noting a stop here rather than inside the walk, which holds the table
-        // borrowed: a job found stopped becomes the current one, exactly as it
-        // would have had `reap` been the one to notice.
-        let mut newly_stopped = Vec::new();
+        // Noted here rather than inside the walk, which holds the table
+        // borrowed: a job found stopped or continued becomes the current one,
+        // exactly as it would have had `reap` been the one to notice.
+        let mut newly_current = Vec::new();
         let info = self
             .jobs
             .iter_mut()
@@ -184,9 +184,15 @@ impl JobTable {
                     }
                     Some(WaitResult::Stopped(code)) => {
                         job.state = JobState::Stopped(code);
-                        newly_stopped.push(job.id);
+                        newly_current.push(job.id);
                     }
-                    Some(WaitResult::Continued) => job.state = JobState::Running,
+                    // A continue makes a job current wherever it is noticed —
+                    // `bg` and a direct `kill -CONT` do it themselves, and a
+                    // continue from a forked stage reaches the parent only here.
+                    Some(WaitResult::Continued) => {
+                        job.state = JobState::Running;
+                        newly_current.push(job.id);
+                    }
                     None => {}
                 }
                 JobInfo {
@@ -202,7 +208,7 @@ impl JobTable {
                 }
             })
             .collect();
-        for id in newly_stopped {
+        for id in newly_current {
             self.mark_current(id);
         }
         info
@@ -318,7 +324,11 @@ impl JobTable {
         // been killed where it stood, or continued by something other than this
         // table, and either way the poll is what notices.
         match poll_outcomes(&mut self.jobs[index].outcomes) {
-            Some(WaitResult::Continued) => self.jobs[index].state = JobState::Running,
+            Some(WaitResult::Continued) => {
+                self.jobs[index].state = JobState::Running;
+                let id = self.jobs[index].id;
+                self.mark_current(id);
+            }
             Some(WaitResult::Stopped(code)) => self.jobs[index].state = JobState::Stopped(code),
             // Finished. Whatever it was before, it is not *stopped* now, and
             // leaving the mark on would send this down the branch below and
@@ -491,6 +501,8 @@ impl JobTable {
                 }
                 Some(WaitResult::Continued) => {
                     self.jobs[index].state = JobState::Running;
+                    let id = self.jobs[index].id;
+                    self.mark_current(id);
                 }
                 None => {}
             }
