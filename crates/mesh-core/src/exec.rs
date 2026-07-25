@@ -568,8 +568,11 @@ pub fn run_pipeline(
     // own in source order, but different stages open at the same time, so a FIFO
     // opened by one stage does not block a peer opened by another stage of the
     // same pipeline (`cat < fifo | cmd > fifo`) before the writer is spawned.
-    let opened = if background {
-        (0..n).map(|_| Ok(Vec::new())).collect()
+    let opened: Vec<Result<Opened, (String, std::io::Error)>> = if background {
+        // A background stage opens nothing here: its targets are opened by the
+        // helper (or by the forked child), so a blocking open cannot hold up the
+        // shell before the job is registered.
+        (0..n).map(|_| Ok(Opened::none())).collect()
     } else {
         std::thread::scope(|scope| {
             let handles: Vec<_> = cmds
@@ -578,7 +581,7 @@ pub fn run_pipeline(
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| Ok(Vec::new())))
+                .map(|h| h.join().unwrap_or_else(|_| Ok(Opened::none())))
                 .collect::<Vec<_>>()
         })
     };
@@ -1901,8 +1904,15 @@ fn dup_shell_fd(fd: libc::c_int) -> std::io::Result<File> {
 /// opened by one stage must not block a peer — while the order-sensitive part
 /// stays strictly sequential. Every target is opened even when a later
 /// redirection supersedes it, so `> a > b` still truncates `a`, as in bash.
-fn open_paths(redirs: &[Redirection]) -> Result<Vec<Option<File>>, (String, std::io::Error)> {
-    // A descriptor the process could never hold is refused here, before any
+///
+/// A **duplication is validated as the walk reaches it**, so a bad one stops the
+/// walk before any later target is created. `true 2>&7 > existing` must fail
+/// without emptying `existing`, exactly as bash leaves it alone: redirections
+/// apply in source order, and an order that has already destroyed a file by the
+/// time it reports the failure is not that order. Validation needs no files, only
+/// which descriptors *exist* at each point, so it costs nothing to do here.
+fn open_paths(redirs: &[Redirection]) -> Result<Opened, (String, std::io::Error)> {
+    // A descriptor the process could never hold is refused first, before any
     // target is created or truncated, and named in the error the way bash names
     // it. Left to `dup2` it would surface as `EBADF` against the *command*, from
     // a hook that runs after the opens.
@@ -1915,10 +1925,20 @@ fn open_paths(redirs: &[Redirection]) -> Result<Vec<Option<File>>, (String, std:
             ));
         }
     }
+    let inherited = live_descriptors(redirs);
+    let mut live = inherited.clone();
     let mut opened = Vec::with_capacity(redirs.len());
-    for Redirection { kind, target, .. } in redirs {
+    for Redirection { fd, kind, target } in redirs {
         opened.push(match target {
-            RedirTarget::Descriptor(_) => None,
+            RedirTarget::Descriptor(from) => {
+                if !live.contains(from) {
+                    return Err((
+                        format!("&{from}"),
+                        std::io::Error::from_raw_os_error(libc::EBADF),
+                    ));
+                }
+                None
+            }
             RedirTarget::Heredoc(body) => {
                 Some(heredoc_file(body).map_err(|e| ("<<".to_owned(), e))?)
             }
@@ -1931,8 +1951,64 @@ fn open_paths(redirs: &[Redirection]) -> Result<Vec<Option<File>>, (String, std:
                 Some(file.map_err(|e| (path.clone(), e))?)
             }
         });
+        // Whatever it was, this redirection gives `fd` a destination, so a later
+        // duplication may copy it.
+        if !live.contains(fd) {
+            live.push(*fd);
+        }
     }
-    Ok(opened)
+    Ok(Opened {
+        files: opened,
+        inherited,
+    })
+}
+
+/// What one stage's opening pass produced: a file per path target, and the
+/// descriptors the shell already held when the pass began.
+struct Opened {
+    files: Vec<Option<File>>,
+    /// Carried rather than re-probed, because probing again after the opens
+    /// would find this stage's own files on the low descriptors.
+    inherited: Vec<libc::c_int>,
+}
+
+impl Opened {
+    /// Nothing opened and nothing inherited — a stage that defers its opens.
+    fn none() -> Self {
+        Self {
+            files: Vec::new(),
+            inherited: Vec::new(),
+        }
+    }
+}
+
+/// The descriptors a duplication may copy before any redirection has been
+/// applied: the standard three, plus any *other* descriptor this stage names
+/// that the shell already holds.
+///
+/// The second part is what makes a nested redirection work — in
+/// `func f() { sh -c '…' 4>&3 }` run as `f 3> out`, the outer redirection has put
+/// fd 3 on the shell, so `4>&3` is a copy of something real rather than the
+/// `EBADF` a bare "only 0, 1 and 2 are inherited" rule would give.
+///
+/// Asked **before** any of this stage's own targets are opened, since an open
+/// takes the lowest free descriptor and would otherwise be mistaken for a
+/// descriptor that had been there all along — `2>&3 3> log` would silently copy
+/// its own `log` instead of failing, and only when the open happened to land on
+/// fd 3.
+fn live_descriptors(redirs: &[Redirection]) -> Vec<libc::c_int> {
+    let mut live = vec![libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO];
+    for candidate in redirs.iter().flat_map(|redir| match &redir.target {
+        RedirTarget::Descriptor(from) => Some(*from),
+        _ => None,
+    }) {
+        // SAFETY: `fcntl(F_GETFD)` only reads a descriptor's flags, and answers
+        // whether it is open at all without disturbing it.
+        if !live.contains(&candidate) && unsafe { libc::fcntl(candidate, libc::F_GETFD) } >= 0 {
+            live.push(candidate);
+        }
+    }
+    live
 }
 
 /// Resolve one stage's redirections into where stdin, stdout, and stderr end up,
@@ -1945,11 +2021,12 @@ fn open_paths(redirs: &[Redirection]) -> Result<Vec<Option<File>>, (String, std:
 /// stage — which is what makes `f 2>&1 | g` put both streams into it.
 fn resolve_sources(
     redirs: &[Redirection],
-    opened: Vec<Option<File>>,
+    opened: Opened,
     seed: Sources,
 ) -> Result<Sources, (String, std::io::Error)> {
+    let Opened { files, inherited } = opened;
     let mut state = seed;
-    for (redir, file) in redirs.iter().zip(opened) {
+    for (redir, file) in redirs.iter().zip(files) {
         let resolved = match (&redir.target, file) {
             (RedirTarget::Path(_) | RedirTarget::Heredoc(_), Some(file)) => Source::File(file),
             (RedirTarget::Path(path), None) => {
@@ -1967,16 +2044,20 @@ fn resolve_sources(
             // Duplicating a descriptor nothing has opened is `EBADF`, the same
             // answer the kernel gives — a copy of nothing is not an inheritance
             // of the shell's own fd of that number.
-            (RedirTarget::Descriptor(from), _) => state
-                .get(*from)
-                .ok_or_else(|| {
-                    (
+            (RedirTarget::Descriptor(from), _) => match state.get(*from) {
+                Some(source) => source.duplicate().map_err(|e| (format!("&{from}"), e))?,
+                // Not one this stage has touched, but one the shell holds — an
+                // enclosing `f 3> out` around a nested `4>&3`. The seed carries
+                // only the standard three, so without this a valid copy of a
+                // real descriptor reads as a copy of nothing.
+                None if inherited.contains(from) => Source::Inherit(*from),
+                None => {
+                    return Err((
                         format!("&{from}"),
                         std::io::Error::from_raw_os_error(libc::EBADF),
-                    )
-                })?
-                .duplicate()
-                .map_err(|e| (format!("&{from}"), e))?,
+                    ));
+                }
+            },
         };
         state.set(redir.fd, resolved);
     }

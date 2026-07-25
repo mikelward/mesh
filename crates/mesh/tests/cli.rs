@@ -2721,6 +2721,57 @@ fn duplicating_an_unopened_descriptor_is_an_error() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        !log.exists(),
+        "a target after the failed duplication was opened anyway"
+    );
+
+    // And source order means the failure stops the sequence *there*: a later
+    // `>` must not have already emptied an existing file by the time the bad
+    // duplication is reported. bash leaves it alone; opening every target up
+    // front and only then resolving did not.
+    let kept = dir.join("kept.txt");
+    std::fs::write(&kept, "keepme\n").expect("seed the file");
+    let out = run_with_input(&format!("true 2>&7 > {}\n", kept.to_string_lossy()));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Bad file descriptor"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&kept).unwrap_or_default(),
+        "keepme\n",
+        "the failed redirection truncated the later target"
+    );
+}
+
+#[test]
+fn a_duplication_can_copy_a_descriptor_the_shell_already_holds() {
+    // The seed carries only the standard three, so a copy of anything higher
+    // read as a copy of nothing even when the shell genuinely held it — and an
+    // enclosing redirection is exactly how a high descriptor comes to be held.
+    // bash writes `nested`; mesh reported `&3: Bad file descriptor`.
+    let dir = fresh_dir("inherited_descriptor");
+    let out = run_with_input(&format!(
+        "func f() {{ sh -c 'echo nested >&4' 4>&3 }}\nf 3> {}\n",
+        dir.join("out.txt").to_string_lossy()
+    ));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.txt")).unwrap_or_default(),
+        "nested\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Still `EBADF` when nothing holds it, which is the rule this must not
+    // erode: the fallback asks the process, not a guess.
+    let out = run_with_input("sh -c 'echo x >&4' 4>&3\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Bad file descriptor"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 }
 
 #[test]
