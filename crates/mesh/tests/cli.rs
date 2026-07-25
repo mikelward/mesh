@@ -7260,6 +7260,18 @@ fn global_and_unset_are_only_keywords_where_a_statement_can_follow() {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    // `unset` stays contextual *after* `global` too, not only at the start of a
+    // statement: in `global unset = 9` the assignment operator says `unset` is
+    // the name being bound. Consuming it as the operation would deny the global
+    // scope a variable the local scope is allowed to have.
+    let out = run_with_input("unset = 1\nglobal unset = 9\nputs $unset\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "9\n");
+    let out = run_with_input("unset = 1\nglobal unset += 1\nputs $unset\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+    // …while `global unset NAME` still removes, since no operator follows.
+    let out = run_with_input("x = outer\nfunc f() { global unset x }\nf\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
     // The reserved namespaces cannot be unset.
     for name in ["env", "sh"] {
         let out = run_with_input(&format!("unset {name}\nputs after\n"));
