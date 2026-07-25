@@ -1,9 +1,12 @@
 //! Platform portability shims.
 //!
 //! A single home for the `libc` constants and types whose definitions differ
-//! across mesh's supported platforms (Linux and macOS). Centralizing them here
-//! keeps each cfg-gated cast in one reviewed place instead of copied into every
-//! call site — historically the source of repeated macOS-only build breaks.
+//! across the platforms mesh builds for. Centralizing them here keeps each
+//! cfg-gated cast in one reviewed place instead of copied into every call site —
+//! historically the source of repeated macOS-only build breaks.
+//!
+//! Linux and macOS are built and tested; FreeBSD is compile-checked in CI, which
+//! is what keeps the `not(macos)` branches below honest for it.
 //!
 //! Add new shims here as they come up rather than reintroducing a `#[cfg]` dance
 //! at the call site.
