@@ -7756,7 +7756,7 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     let out = run_with_input("puts ...$sh:keys\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "status pipestatus pid ppid version interactive stdin stdout stderr name args\n"
+        "status pipestatus pid ppid version interactive stdin stdout stderr jobs name args\n"
     );
 
     // A mistyped key is still a loud error, and `status` is not a reserved
@@ -8165,4 +8165,94 @@ fn open_pty() -> (RawFd, RawFd) {
     };
     assert_eq!(ok, 0, "openpty failed");
     (master, slave)
+}
+
+// ---------------------------------------------------------------------------
+// $sh.jobs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sh_jobs_is_a_map_of_job_records() {
+    // Empty until something is backgrounded, and a real map rather than text to
+    // scrape — `:len` is the prompt-segment case `DESIGN.md` calls out.
+    let out = run_with_input("puts $sh.jobs:len\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+
+    let out = run_with_input("sleep 5 &\nputs $sh.jobs:len $sh.jobs[1].state $sh.jobs[1].cmd\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1 running sleep 5\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Keyed by job id in registration order, and indexable by that id — an
+    // integer key reads the same as its string form, as for any map.
+    let out = run_with_input("sleep 5 &\nsleep 6 &\nputs ...$sh.jobs:keys\nputs $sh.jobs[2].cmd\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1 2\nsleep 6\n");
+
+    // `pid` is the group leader, which is what the launch notice reports and
+    // what a signal would need.
+    let out = run_with_input("sleep 5 &\nputs $sh.jobs[1].pid\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let announced = stderr
+        .split_whitespace()
+        .last()
+        .expect("a `[1] <pgid>` launch notice");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), announced);
+
+    // A missing id is a loud error, like any absent map key.
+    let out = run_with_input("puts $sh.jobs[9].cmd\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no `9` in this map"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // The records are values, so the filter from `DESIGN.md` works verbatim.
+    let out = run_with_input(
+        "sleep 5 &\nrunning = $sh.jobs:values:filter(func(j) { $j.state == running })\n\
+         puts $running:len\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+}
+
+#[test]
+fn sh_jobs_reports_a_finished_job_without_reaping_it() {
+    // A finished process must not still read as `running` — the table only drops
+    // a job when something asks, so the snapshot polls.
+    let out =
+        run_with_input("sh -c 'exit 7' &\nsleep 0.3\nputs $sh.jobs[1].state $sh.jobs[1].status\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "done 7\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `status` is empty while a job runs rather than standing in with a 0 that
+    // would be indistinguishable from success.
+    let out = run_with_input("sleep 5 &\nputs \"[$sh.jobs[1].status]\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[]\n");
+
+    // Reading must not *remove* the job: reaping reports and drops it at its own
+    // time, and a completed job stays available to `fg` until then. Observing
+    // the table cannot be allowed to change what the shell does.
+    let out = run_with_input("sleep 0 &\nsleep 0.3\nputs $sh.jobs[1].state\njobs\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("] Done (0) sleep 0"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\nafter\n");
+
+    // A forked stage cannot poll — it is not the parent of the pids it
+    // inherited — so it keeps the snapshot it was forked with rather than
+    // reporting an empty table it has no grounds to claim.
+    let out =
+        run_with_input("sleep 5 &\nfunc f() { puts $sh.jobs:len }\nf | cat\nputs $sh.jobs:len\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1\n1\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

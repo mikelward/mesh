@@ -76,6 +76,51 @@ impl Shell {
         self.vars.set_status(status, stages);
         self.status_records += 1;
     }
+
+    /// Copy the live job table into the variable store, where `$sh.jobs` reads
+    /// it. Expansion is handed only the store, so the alternative is refreshing
+    /// at every site that touches the table — a launch, a reap, `fg`, `bg` — and
+    /// one missed site would serve a stale answer. Doing it on the executable
+    /// funnel instead means the sync cannot be forgotten: everything that could
+    /// read `$sh.jobs` is an executable, and every executable passes here.
+    fn sync_jobs(&mut self) {
+        // A fork may not ask the table anything: it is not the parent of the
+        // pids it inherited, so `waitpid` fails with `ECHILD` and every job
+        // would look finished. It keeps the snapshot it inherited instead —
+        // what the shell knew when it forked, which is the most a stage can
+        // truthfully say, and better than the empty map that overwriting gives.
+        if self.forked {
+            return;
+        }
+        // No jobs means no syscall, which is the common case.
+        let jobs = if self.jobs.has_jobs() {
+            self.jobs.info()
+        } else {
+            Vec::new()
+        };
+        self.vars.set_jobs(
+            jobs.into_iter()
+                .map(|job| {
+                    (
+                        job.id.to_string(),
+                        Value::Map(vec![
+                            ("pid".to_owned(), Value::Integer(i64::from(job.pid))),
+                            ("cmd".to_owned(), Value::String(job.command)),
+                            ("state".to_owned(), Value::String(job.state.to_owned())),
+                            // Empty while a job runs, filling in when it
+                            // finishes — the 8-bit view `$sh.status` gives.
+                            (
+                                "status".to_owned(),
+                                Value::String(
+                                    job.status.map(|code| code.to_string()).unwrap_or_default(),
+                                ),
+                            ),
+                        ]),
+                    )
+                })
+                .collect(),
+        );
+    }
 }
 
 /// What an executable contributed to the **result so far**.
@@ -686,6 +731,9 @@ fn run_recorded(
     // produced nothing, an `if` whose branch yielded a value has produced one,
     // and a guard that failed left the executable unrun. A nested executable's
     // report carries out, so the branch's value survives the `if` that ran it.
+    // Before the executable expands its words, so `$sh.jobs` reflects anything
+    // the previous one launched or reaped.
+    shell.sync_jobs();
     shell.produced = Produced::Status;
     let records = shell.status_records;
     let step = run_executable(executable, background, last, in_function, shell);

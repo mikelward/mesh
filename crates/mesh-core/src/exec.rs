@@ -88,7 +88,61 @@ enum JobState {
     Stopped,
 }
 
+/// One live job as `$sh.jobs` reports it — the shell's own view, without the
+/// terminal modes and wait state the table keeps for its own use.
+pub struct JobInfo {
+    pub id: usize,
+    /// The process group leader. For a single command that is the command's own
+    /// pid; for a pipeline it is the leader, which is what a signal wants.
+    pub pid: libc::pid_t,
+    pub command: String,
+    pub state: &'static str,
+    /// The exit status, once the job has finished.
+    pub status: Option<u8>,
+}
+
 impl JobTable {
+    /// Whether any job is registered, so a caller can skip work when none is.
+    pub fn has_jobs(&self) -> bool {
+        !self.jobs.is_empty()
+    }
+
+    /// The live jobs, in registration order — the order `$sh.jobs` preserves.
+    ///
+    /// Polls rather than reads, so a process that has already exited reports
+    /// `done` with its status instead of a stale `running`. It deliberately does
+    /// **not** remove the finished job the way [`JobTable::reap`] does: a
+    /// completed job stays available to a later `fg`, and taking it out from
+    /// under one merely because something read `$sh.jobs` would make an
+    /// observation change behavior. Reaping still reports and removes it at its
+    /// own time.
+    pub fn info(&mut self) -> Vec<JobInfo> {
+        self.jobs
+            .iter_mut()
+            .map(|job| {
+                let mut status = None;
+                if job.state == JobState::Running {
+                    match poll_outcomes(&mut job.outcomes) {
+                        Some(WaitResult::Complete(code)) => status = Some(code),
+                        Some(WaitResult::Stopped(_)) => job.state = JobState::Stopped,
+                        None => {}
+                    }
+                }
+                JobInfo {
+                    id: job.id,
+                    pid: job.pgid,
+                    command: job.command.clone(),
+                    state: match (status, job.state) {
+                        (Some(_), _) => "done",
+                        (None, JobState::Running) => "running",
+                        (None, JobState::Stopped) => "stopped",
+                    },
+                    status,
+                }
+            })
+            .collect()
+    }
+
     pub fn new() -> Self {
         Self {
             jobs: Vec::new(),
