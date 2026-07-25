@@ -807,6 +807,35 @@ membership (`in`), and boolean `not`, `and`, and `or`. Ordered comparisons
 require two integers or two strings; arithmetic never implicitly parses a
 string (use `:int` explicitly). Comparisons cannot be chained.
 
+A **leading `not`** starts a value, so `if not $b { … }` and `while not $b { … }`
+are conditions rather than a command of that name — as are a postfix guard
+(`puts x if not $b`) and an assignment (`x = not $b`). It is read that way only
+when what follows itself starts a value, which leaves a command genuinely named
+`not` reachable: `not foo` has a bare word after it and stays the command. That is
+the same discriminator that separates the comparison in `if $i < 3` from the
+redirect in `cmd <file`.
+
+A bare `true` / `false` counts as a value **after `not`**, so `if not false { … }`
+negates rather than running a command. Elsewhere it is unchanged — `if true { … }`
+still runs the command `true` — so the only thing given up is reaching a command
+named `not` as `not true` or `not false`.
+
+The negation is claimed only when it is the **whole statement**, the same narrowness
+a lone integer literal has. Anything that continues the line is the command it always
+was, since these read as invocations rather than negations:
+
+```
+not true foo         # command: an argument after the operand
+not $x foo           # command
+not true | cat       # command: a value cannot be a pipeline stage
+not false > out.txt  # command, with its output redirected
+not [1 2] > out.txt  # command: the redirect is judged after the whole operand
+not $x:len >> out.txt  # command
+```
+
+A *spaced* `<` / `>` in a condition is a comparison rather than a redirect, there as
+anywhere, so `if not $y > 2 { … }` negates the comparison.
+
 `~` tests a string against a bare glob or a regex; `!~` negates the result.
 Globs match the whole string, while regexes search for a match unless explicitly
 anchored:

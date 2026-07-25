@@ -2929,20 +2929,93 @@ impl Parser {
     /// Is the next token a `<` or `>` with whitespace on both sides — the shape
     /// a comparison takes and an attached redirect (`cmd >out`) does not?
     fn spaced_comparison(&self) -> bool {
-        let Some(left) = self.peek() else {
+        self.spaced_operator_at(self.position + 1)
+    }
+
+    /// The same question about the token at `index`, for a caller that has already
+    /// consumed the left operand and so is standing on the operator rather than in
+    /// front of it — a negated operand can be a list literal or carry postfix
+    /// modifiers, and only a parse of the whole operand says where the `>` is.
+    fn spaced_operator_at(&self, index: usize) -> bool {
+        let Some(operator) = self.tokens.get(index) else {
             return false;
         };
-        self.tokens
-            .get(self.position + 1)
-            .zip(self.tokens.get(self.position + 2))
-            .is_some_and(|(operator, right)| {
-                matches!(operator.value, TokenKind::Less | TokenKind::Greater)
-                    && left.span.end < operator.span.start
-                    && operator.span.end < right.span.start
-            })
+        if !matches!(operator.value, TokenKind::Less | TokenKind::Greater) {
+            return false;
+        }
+        let Some(left) = index
+            .checked_sub(1)
+            .and_then(|before| self.tokens.get(before))
+        else {
+            return false;
+        };
+        self.tokens.get(index + 1).is_some_and(|right| {
+            left.span.end < operator.span.start && operator.span.end < right.span.start
+        })
     }
 
     fn value_start_in(&mut self, in_condition: bool) -> bool {
+        // A leading `not` negates a value, so `if not $b { … }` is a condition and
+        // not a command named `not`. `DESIGN.md` writes the idiom that way, and the
+        // other two positions already read it as one: a postfix guard
+        // (`puts x if not $b`) and an assignment's right-hand side both parse an
+        // expression directly, so only the paths through here were left out.
+        //
+        // Claimed only when what *follows* starts a value, which is what keeps a
+        // command actually named `not` reachable: `not foo` has a bare word after
+        // it, which is not a value start, so it stays the command it was.
+        if self.word("not") {
+            let saved = self.position;
+            // Skip the whole run of `not`s in a loop rather than recursing per word.
+            // Recursing cost one frame each, so a command-shaped line of ~20k `not`s
+            // overflowed the stack and aborted the shell before it could decide the
+            // line was a command. Iterating is the same test: every frame did
+            // nothing but step over one `not`.
+            while self.word("not") {
+                self.position += 1;
+            }
+            // A bare `true` / `false` is not a value start on its own — `if true`
+            // runs the *command*, and that stays — but after `not` there is no
+            // second reading worth keeping: `not false` is negation to any reader,
+            // and leaving it out made `if not false` disagree with the `x = not
+            // false` that already worked.
+            //
+            let boolean_literal = self.word("true") || self.word("false");
+            let negates_a_value = self.value_start_in(in_condition) || boolean_literal;
+            // A redirect after the operand is still a redirect. The guard has to look
+            // at the *completed* operand rather than the token that starts one: an
+            // operand can be a list literal or carry postfix modifiers, so only a
+            // parse of the whole thing knows where the `>` sits. `not [1 2] >
+            // out.txt` and `not $x:len > out.txt` are the command with its output
+            // redirected, as they were before `not` became a value start.
+            let redirect_follows = negates_a_value && {
+                let operand = self.position;
+                // Parsed tighter than a comparison (precedence 4), so a trailing
+                // `<` / `>` is left unconsumed for this check instead of being
+                // swallowed as the comparison it is not.
+                let takes_a_redirect = self.binary(5).is_ok()
+                    && matches!(
+                        self.peek().map(|token| &token.value),
+                        Some(TokenKind::Less | TokenKind::Greater | TokenKind::Append)
+                    )
+                    // In a condition a *spaced* `<` / `>` is the comparison it is
+                    // elsewhere, which is the case this must leave alone. `>>` is
+                    // only ever a redirect, and is never spelled spaced.
+                    && !(in_condition && self.spaced_operator_at(self.position));
+                self.position = operand;
+                takes_a_redirect
+            };
+            self.position = saved;
+            // Claimed only when the negation is the *whole* statement, the same
+            // narrowness a lone integer literal has. Without it, an operand that
+            // starts a value was enough to claim a line that then failed to parse:
+            // `not $b foo` and `not true foo` are plainly command invocations, but
+            // the expression stopped after the operand and left the rest, so a
+            // command that ran before became `expected a statement separator`.
+            if negates_a_value && !redirect_follows && self.negation_is_whole_statement() {
+                return true;
+            }
+        }
         // A modifier reference *call* — `:exists("Cargo.toml")` — starts a value, so
         // a condition or statement beginning with one reaches the expression parser
         // rather than the command parser. Restricted to the attached call form,
@@ -3026,17 +3099,38 @@ impl Parser {
         let lone = matches!(
             self.expression(),
             Ok(Expr::Scalar(word)) if word.value.bare_integer().is_some()
-        ) && self.at_command_end()
-            // `at_command_end` counts a pipe, but an expression cannot *be* a
-            // pipeline stage: classifying `42 | cat` as one would leave the `|`
-            // unconsumed and turn a command that runs today into a syntax error.
-            // A numeral heading a pipeline stays the command it was.
+        ) && self.at_value_statement_end();
+        self.position = saved;
+        lone
+    }
+
+    /// Does the statement end here, for a statement that *is* a value?
+    ///
+    /// [`at_command_end`](Self::at_command_end) counts a pipe, but an expression
+    /// cannot *be* a pipeline stage: classifying `42 | cat` or `not $b | cat` as one
+    /// would leave the `|` unconsumed and turn a command that runs today into a
+    /// syntax error. A value heading a pipeline stays the command it was.
+    fn at_value_statement_end(&self) -> bool {
+        self.at_command_end()
             && !matches!(
                 self.peek().map(|token| &token.value),
                 Some(TokenKind::Pipe | TokenKind::PipeBoth)
-            );
+            )
+    }
+
+    /// Is the rest of this statement exactly one negation?
+    ///
+    /// An operand that starts a value is not enough on its own. `not $b foo` and
+    /// `not true foo` are command invocations, but the expression parser stops after
+    /// the operand, so claiming them left the trailing words unconsumed and reported
+    /// `expected a statement separator` for lines that ran before. Parsing the
+    /// statement and looking at where it stopped is the same trial the lone-integer
+    /// rule runs, for the same reason.
+    fn negation_is_whole_statement(&mut self) -> bool {
+        let saved = self.position;
+        let whole = self.expression().is_ok() && self.at_value_statement_end();
         self.position = saved;
-        lone
+        whole
     }
 
     fn viable_expression(&mut self) -> bool {
