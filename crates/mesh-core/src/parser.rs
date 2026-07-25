@@ -1516,6 +1516,9 @@ impl Parser {
         if (self.word("global") || self.word("unset")) && !self.assignment_follows(1) {
             return self.scoped();
         }
+        if self.word("export") && !self.assignment_follows(1) {
+            return self.export();
+        }
         let assignment_start = self.position;
         if let Some(key) = self.env_target() {
             if matches!(
@@ -2960,6 +2963,39 @@ impl Parser {
             value,
             global: true,
         })
+    }
+
+    /// `export NAME = value` / `export NAME += value`.
+    ///
+    /// Desugars to the `$env.NAME` write, which already carries the boundary
+    /// rules: only byte-strings cross, path-type names `:`-join, and an embedded
+    /// NUL is refused. `export` exists because it is the ingrained spelling, not
+    /// because it means anything else.
+    fn export(&mut self) -> Result<Executable, ParseError> {
+        self.take_word("export");
+        let Some(key) = self.word_text_at(0).map(str::to_owned) else {
+            return Err(self.error(ParseErrorKind::Expected("a NAME after `export`")));
+        };
+        if !crate::lexer::is_name(&key) {
+            return Err(self.error(ParseErrorKind::Expected("a valid name after `export`")));
+        }
+        self.position += 1;
+        if !self.assignment_follows(0) {
+            // Bare `export NAME` is bash's "mark this variable exported", which
+            // has no meaning here: mesh keeps shell bindings and the environment
+            // in separate namespaces, so there is nothing to mark. Name the
+            // spelling that does what the user meant.
+            return Err(self.error(ParseErrorKind::Expected(
+                "a value: `export NAME = …`. mesh keeps shell variables and the environment \
+                 separate, so to copy one in write `export NAME = $NAME`",
+            )));
+        }
+        let append = self.eat(&TokenKind::PlusEqual).is_some();
+        if !append {
+            self.expect(&TokenKind::Equal, "`=`")?;
+        }
+        let value = self.expression()?;
+        Ok(Executable::EnvAssignment { key, append, value })
     }
 
     fn unset(&mut self, global: bool) -> Result<Executable, ParseError> {

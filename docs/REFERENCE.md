@@ -501,15 +501,27 @@ words and `"…"`, never in `'…'` or `r'…'`.
 
 ### The environment
 
-`$env.KEY = value` writes the process environment, so children inherit it:
+`$env.KEY = value` writes the process environment, so children inherit it, and
+**`export KEY = value` is the same write** in the spelling every shell user
+already has:
 
 ```mesh
 $env.EDITOR = vim
 $env.EDITOR += " -u NONE"     # += concatenates
+export EDITOR = vim           # identical to the first line
 ```
 
 An environment write is **global on purpose**, even inside a function: changing
 what children inherit is the point, so it persists after the function returns.
+
+Bare `export NAME` — bash's "mark this existing variable exported" — does **not**
+work, because mesh keeps shell bindings and the environment in separate
+namespaces, so there is nothing to mark. To copy a binding across, name it:
+
+```mesh
+editor = vim
+export EDITOR = $editor
+```
 
 Only strings cross the boundary — the environment is a flat `KEY=bytes` table,
 so a list or map is a loud error telling you to join it first
@@ -527,7 +539,8 @@ puts $env.PATH:len
 ```
 
 The set is fixed for now: `PATH`, `MANPATH`, `CDPATH`, `INFOPATH`,
-`LD_LIBRARY_PATH`, and `PYTHONPATH`. Because these read as lists, `puts
+`LD_LIBRARY_PATH`, and `PYTHONPATH`. (`export --list NAME`, which would opt an
+arbitrary name in, is not implemented.) Because these read as lists, `puts
 $env.PATH` needs a spread or a join like any other list. Splitting is **exact** —
 every empty component is kept, since `PATH=/usr/bin:` means "…and the cwd", and a
 split/join round trip is byte-faithful.

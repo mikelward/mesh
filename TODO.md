@@ -237,10 +237,16 @@ file as tasks land.
       `LD_LIBRARY_PATH`, `PYTHONPATH`) are lists — split on read, `:`-joined on
       write, exactly, so every empty component survives a round trip. This is
       what makes `$env.PATH += /opt/bin` and `$env.PATH:dedup` work.
-- [ ] `export NAME = value` as the other spelling, plus `export --list NAME` to
-      opt an arbitrary name into the path-type set.
-- [ ] `unset` and `global`, deferred alongside `export` in `DESIGN.md`
-      §"Built-ins".
+- [x] `export NAME = value` / `+=` as the other spelling, desugaring to the
+      `$env.NAME` write so both carry one set of boundary rules. Bare
+      `export NAME` is refused with the spelling that works, since mesh keeps
+      shell bindings and the environment in separate namespaces. Deferred:
+      `export --list NAME` to opt an arbitrary name into the path-type set.
+- [x] `unset name …` (current scope), `global name = value` / `+=`, and
+      `global unset name`. All three are contextual keywords, so a variable may
+      still be called `global`, `unset`, or `export`. Deferred: deleting a
+      collection element (`unset $m.key`, `unset $xs[i]`), which waits on
+      general member assignment.
 - [ ] General member assignment (`$m.key = v`), of which the `$env.KEY` form
       here is a special case with its own byte-boundary rules.
 
