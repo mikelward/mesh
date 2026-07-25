@@ -1230,10 +1230,20 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
         // SAFETY: scalar arguments naming this process's own child.
         unsafe { libc::setpgid(pid, pid) };
     }
-    let status = loop {
-        let (status, stopped) = wait_for_job(pid)?;
+    // The wait's *outcome* rather than its status, because a failure has to leave
+    // by the same door: the child took the terminal, so returning early on an error
+    // would leave the foreground group naming a process that is gone and the next
+    // prompt unable to read. `ECHILD` makes that reachable rather than theoretical
+    // — a mesh started with `SIGCHLD` ignored has its children auto-reaped, and the
+    // wait then fails for a subshell that exited perfectly well. `JobTable::foreground`
+    // already reclaims on every path out, including its error return; this matches it.
+    let outcome = loop {
+        let (status, stopped) = match wait_for_job(pid) {
+            Ok(waited) => waited,
+            Err(error) => break Err(error),
+        };
         if !stopped {
-            break status;
+            break Ok(status);
         }
         note!("mesh: fork: a subshell cannot be suspended yet");
         // The whole **group**, not just the leader. A stop from the keyboard
@@ -1248,7 +1258,7 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
     if job_control {
         reclaim_terminal(shell_modes.as_ref());
     }
-    Ok(status)
+    outcome
 }
 
 /// Wait for a child to exit, be signaled, or stop. `Child::wait` only reports
