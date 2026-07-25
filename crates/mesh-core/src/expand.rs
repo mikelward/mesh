@@ -42,6 +42,19 @@ pub enum Modifier {
     Upper,
     Lower,
     Int,
+    // File tests: `-e`, `find -type`, `-r`, `-w`. Scalar questions about one path,
+    // mapping element-wise over a list like the transforms above.
+    Exists,
+    Type,
+    Read,
+    Write,
+    // File-type filters: `-f`, `-d`, `-L`, `-x`. On a list they keep the matching
+    // elements and drop the rest — a subset, not a transform — and chain for AND
+    // (`:f:x` is executable files); on one path they are the bare test.
+    Files,
+    Dirs,
+    Links,
+    Exec,
 }
 
 impl Modifier {
@@ -64,6 +77,14 @@ impl Modifier {
             "upper" => Self::Upper,
             "lower" => Self::Lower,
             "int" => Self::Int,
+            "exists" => Self::Exists,
+            "type" => Self::Type,
+            "read" => Self::Read,
+            "write" => Self::Write,
+            "files" | "f" => Self::Files,
+            "dirs" | "d" => Self::Dirs,
+            "links" | "l" => Self::Links,
+            "exec" | "x" => Self::Exec,
             _ => return None,
         })
     }
@@ -680,6 +701,62 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 message: "requires a string".into(),
             }),
         },
+        // A file test asks one question of one path, so on a list it maps
+        // element-wise like any other value modifier.
+        Modifier::Exists | Modifier::Type | Modifier::Read | Modifier::Write => match value {
+            Value::String(path) => {
+                file_test(&path, modifier).ok_or_else(|| ExpandError::Modifier {
+                    name: name.into(),
+                    message: format!("no such file: `{path}`"),
+                })
+            }
+            Value::List(values) => values
+                .into_iter()
+                .map(|value| apply_modifier(value, modifier))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::List),
+            Value::Map(_)
+            | Value::Integer(_)
+            | Value::Boolean(_)
+            | Value::Regex(_)
+            | Value::Glob(_)
+            | Value::Function(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a path".into(),
+            }),
+        },
+        // A filter keeps the matching elements of a list and drops the rest. On a
+        // single path it is the scalar predicate the matching `test` operator asks
+        // (`:f` is `-f`, `:d` is `-d`, `:l` is `-L`, `:x` is `-x`) — which is also
+        // what makes `$paths:filter(:x)` work, since `:filter` hands it one element
+        // at a time.
+        Modifier::Files | Modifier::Dirs | Modifier::Links | Modifier::Exec => match value {
+            Value::String(path) => Ok(Value::Boolean(matches_file_filter(&path, modifier))),
+            Value::List(values) => {
+                let mut kept = Vec::with_capacity(values.len());
+                for value in values {
+                    let Value::String(path) = &value else {
+                        return Err(ExpandError::Modifier {
+                            name: name.into(),
+                            message: "requires a list of paths".into(),
+                        });
+                    };
+                    if matches_file_filter(path, modifier) {
+                        kept.push(value);
+                    }
+                }
+                Ok(Value::List(kept))
+            }
+            Value::Map(_)
+            | Value::Integer(_)
+            | Value::Boolean(_)
+            | Value::Regex(_)
+            | Value::Glob(_)
+            | Value::Function(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a path or a list of paths".into(),
+            }),
+        },
         _ => match value {
             Value::String(value) => Ok(Value::String(modify_string(value, modifier))),
             Value::List(values) => values
@@ -802,6 +879,91 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::Upper => "upper",
         Modifier::Lower => "lower",
         Modifier::Int => "int",
+        Modifier::Exists => "exists",
+        Modifier::Type => "type",
+        Modifier::Read => "read",
+        Modifier::Write => "write",
+        Modifier::Files => "files",
+        Modifier::Dirs => "dirs",
+        Modifier::Links => "links",
+        Modifier::Exec => "exec",
+    }
+}
+
+/// Ask the kernel, rather than reinterpreting permission bits by hand — bits alone
+/// get root and ACLs wrong.
+///
+/// `AT_EACCESS` is load-bearing: plain `access(2)` answers for the **real** UID/GID,
+/// so a process that has dropped its effective privileges while keeping a saved ID
+/// would be told it can read a file that an `open` then refuses. This is the
+/// question `test -r` answers (coreutils reaches for `euidaccess` for the same
+/// reason), and the one that predicts what the shell can actually do.
+fn accessible(path: &str, mode: libc::c_int) -> bool {
+    let Ok(c_path) = std::ffi::CString::new(path) else {
+        // An interior NUL cannot name a file, so nothing is accessible.
+        return false;
+    };
+    accessible_c(&c_path, mode)
+}
+
+/// The syscall itself, split out so a caller that must not allocate — the forked
+/// child in the effective-user test — can reach it with a string built beforehand.
+fn accessible_c(path: &std::ffi::CStr, mode: libc::c_int) -> bool {
+    // SAFETY: `path` is a valid NUL-terminated string for the duration of the call.
+    // No `AT_SYMLINK_NOFOLLOW`, so this dereferences like every other file test.
+    unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, libc::AT_EACCESS) == 0 }
+}
+
+/// The `find -type` word for a path, or `None` when it does not exist.
+///
+/// Read with `symlink_metadata`, so a symlink reports `link` rather than its
+/// target's type — `:type == link` is how you ask about the link itself, while every
+/// other test dereferences (`DESIGN.md`).
+fn file_type_word(path: &str) -> Option<&'static str> {
+    use std::os::unix::fs::FileTypeExt;
+    let kind = std::fs::symlink_metadata(path).ok()?.file_type();
+    Some(if kind.is_symlink() {
+        "link"
+    } else if kind.is_dir() {
+        "dir"
+    } else if kind.is_file() {
+        "file"
+    } else if kind.is_fifo() {
+        "fifo"
+    } else if kind.is_socket() {
+        "socket"
+    } else if kind.is_block_device() {
+        "block"
+    } else if kind.is_char_device() {
+        "char"
+    } else {
+        "unknown"
+    })
+}
+
+/// Answer a file test for one path. `None` only for `:type` on a path that does not
+/// exist, which has no word to report.
+fn file_test(path: &str, modifier: Modifier) -> Option<Value> {
+    Some(match modifier {
+        // `metadata` follows symlinks, so a broken link does not exist — the answer
+        // `test -e` gives.
+        Modifier::Exists => Value::Boolean(std::fs::metadata(path).is_ok()),
+        Modifier::Type => Value::String(file_type_word(path)?.to_string()),
+        Modifier::Read => Value::Boolean(accessible(path, libc::R_OK)),
+        Modifier::Write => Value::Boolean(accessible(path, libc::W_OK)),
+        _ => return None,
+    })
+}
+
+/// Does this path match a file-type filter? Everything but `:links` dereferences,
+/// as `test -f` and `test -d` do.
+fn matches_file_filter(path: &str, modifier: Modifier) -> bool {
+    match modifier {
+        Modifier::Files => std::fs::metadata(path).is_ok_and(|m| m.is_file()),
+        Modifier::Dirs => std::fs::metadata(path).is_ok_and(|m| m.is_dir()),
+        Modifier::Links => std::fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()),
+        Modifier::Exec => accessible(path, libc::X_OK),
+        _ => false,
     }
 }
 
@@ -841,7 +1003,15 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         | Modifier::Init
         | Modifier::Dedup
         | Modifier::Keys
-        | Modifier::Values => unreachable!("non-string modifier handled separately"),
+        | Modifier::Values
+        | Modifier::Exists
+        | Modifier::Type
+        | Modifier::Read
+        | Modifier::Write
+        | Modifier::Files
+        | Modifier::Dirs
+        | Modifier::Links
+        | Modifier::Exec => unreachable!("non-string modifier handled separately"),
     }
 }
 
@@ -919,8 +1089,8 @@ fn has_glob_meta(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Access, ExpandError, Modifier, VarRef, apply_tilde, has_glob_meta, join_value,
-        resolve_value, split_value,
+        Access, ExpandError, Modifier, VarRef, accessible_c, apply_tilde, has_glob_meta,
+        join_value, resolve_value, split_value,
     };
     use crate::vars::{Value, Vars};
 
@@ -1064,4 +1234,59 @@ mod tests {
         // SAFETY: the test owns this process-specific key.
         unsafe { std::env::remove_var(key) };
     }
+
+    /// `accessible` must answer for the **effective** user. Plain `access(2)` uses
+    /// the *real* UID/GID, so a process that has dropped effective privileges while
+    /// keeping a saved ID is told it can read a file `open` then refuses — the state
+    /// this reproduces. `AT_EACCESS` is what makes the answer match reality.
+    ///
+    /// Creating that split requires privileges, so where the suite cannot the test
+    /// has nothing to observe: the two answers only differ once they do.
+    #[test]
+    fn accessible_answers_for_the_effective_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("mesh_eaccess_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("root-only");
+        std::fs::write(&path, "x").expect("write fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict fixture");
+        // Built before the fork: allocating in a forked child of a threaded process
+        // can deadlock on a malloc lock the parent held.
+        let c_path = std::ffi::CString::new(path.to_str().expect("utf-8 path")).unwrap();
+
+        assert!(
+            accessible_c(&c_path, libc::R_OK),
+            "root should read its own file"
+        );
+
+        // A child, so the dropped privileges cannot reach the rest of the suite.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // The real UID stays 0 while the effective one drops, which is exactly
+            // the state `access(2)` answers wrongly. `setreuid` rather than
+            // `setresuid` because only the former is in libc's portable surface;
+            // the saved ID it also moves does not matter to a child that exits here.
+            let dropped = unsafe { libc::setreuid(0, NOBODY) };
+            let correct = dropped == 0 && !accessible_c(&c_path, libc::R_OK);
+            unsafe { libc::_exit(i32::from(!correct)) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "a file readable only by root must not be `:read` once euid is dropped \
+             (child status {status})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The conventional unprivileged UID, and the one this test only ever *drops* to.
+    const NOBODY: libc::uid_t = 65534;
 }

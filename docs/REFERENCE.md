@@ -585,13 +585,34 @@ is literal text, so `$host:$port` is not mistaken for a modifier chain.
 | `:first` / `:last` | list | First or last element; an empty list is an error. |
 | `:rest` / `:init` | list | All but the first or last element; empty and one-element lists yield `[]` where appropriate. |
 | `:dedup` | list | Remove later duplicates, preserving first occurrence order. |
+| `:exists` | path or list | Does the path exist? (`test -e`; a broken symlink does not.) |
+| `:type` | path or list | The `find -type` word — `file`, `dir`, `link`, `fifo`, `socket`, `block`, `char`. |
+| `:read` / `:write` | path or list | Is the path readable / writable by this process, as its effective user? (`test -r` / `-w`.) |
+| `:files` / `:f` | list or path | Keep the plain files (`test -f`). |
+| `:dirs` / `:d` | list or path | Keep the directories (`test -d`). |
+| `:links` / `:l` | list or path | Keep the symlinks (`test -L`) — the one file modifier that does *not* dereference. |
+| `:exec` / `:x` | list or path | Keep the executables (`test -x`). |
 | `:keys` | map | Keys as an insertion-ordered list. |
 | `:values` | map | Values as an insertion-ordered list. |
 | `:split(SEP)` | string | Split on the literal separator into a list. |
 | `:join(SEP)` | list | Fold the list into a string, `SEP` between elements. |
 
 Path and case modifiers map over lists. Collection modifiers consume a list or
-map as a whole. List results retain their type: use `...$xs:rest` in command position,
+map as a whole. The **file tests** (`:exists`, `:type`, `:read`, `:write`)
+map over a list like the path modifiers, while the **file filters** (`:files`,
+`:dirs`, `:links`, `:exec`) keep a list's matching elements and drop the rest —
+a subset, not a transform — and chain for AND, so `$paths:f:x` is the executable
+plain files. Applied to a single path a filter is instead the boolean its `test`
+operator gives, which is what lets `:filter` apply one element at a time
+(`$paths:filter(func(p) { $p:exec })` and `$paths:exec` agree).
+
+Every file modifier **dereferences symlinks**, as `test` does, so a live link is
+`:files` when its target is and a broken link does not `:exist`. The exceptions
+are the two that exist to ask about the link itself: `:links`, and `:type`, which
+reports `link`. `:type` is the only file modifier that **errors** on a path that
+is not there — the others answer `false`, but a missing file has no type word.
+Note that a searchable directory carries the execute bit, so `:exec` alone keeps
+directories; `:f:x` is the executable-files idiom. List results retain their type: use `...$xs:rest` in command position,
 or bind them directly with `ys = $xs:rest`.
 
 A modifier that takes an argument writes it in parentheses, comma-separated like a
@@ -974,7 +995,8 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
   - **A list subject only.** On a map they are a loud error pointing at `:keys` or
     `:values`; elements keep their types, so a list element arrives as a list.
 
-Not yet supported: a bare `:mod` reference as a callable (`$files:filter(:exec)`);
+Not yet supported: a bare `:mod` reference as a callable — `$files:filter(:exec)`
+must be written `$files:filter(func(f) { $f:exec })`, or simply `$files:exec`;
 and the richer `:capture` fields `DESIGN.md` leaves open (timing, a `pipestatus`
 list). `.out`/`.err` are strings rather than true byte-strings — mesh has no
 byte-string type yet, so a capture that is not valid UTF-8 is a loud error.
