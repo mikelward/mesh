@@ -2435,6 +2435,39 @@ fn a_stopped_job_is_still_watched() {
 }
 
 #[test]
+fn a_continued_job_becomes_current_however_it_is_noticed() {
+    // A continue makes a job current, and it must not matter whether the table
+    // did it itself or found out by polling. `bg %2` moves job 2 to the front,
+    // then continuing job 1 has to move it back — otherwise `%+` still names 2.
+    //
+    // Each job exits distinctly, so the status says which one `%+` reached: 5 is
+    // job 1, 7 is job 2. Both spellings must agree.
+    // Job 2 outlives the wait, so reaching it is a wrong answer that arrives
+    // late rather than one that cannot be told from job 1 finishing.
+    let script = |cont: &str| {
+        format!(
+            "sh -c 'kill -STOP $$; sleep 0.4; exit 5' &\n\
+             sh -c 'kill -STOP $$; sleep 3; exit 7' &\n\
+             sleep 0.3\nbg %2\n{cont}\nsleep 0.6\nwait %+\nputs current=$sh.status\n"
+        )
+    };
+
+    // The direct form always worked: `JobTable::kill` marks it itself.
+    let direct = run_with_input(&script("kill -CONT %1"));
+    assert_eq!(String::from_utf8_lossy(&direct.stdout), "current=5\n");
+
+    // From a pipeline stage the fork's table dies with the stage, so the parent
+    // only learns of the continue through its own poll. That poll restored
+    // `Running` but dropped the recency update, leaving `%+` naming job 2.
+    let forked = run_with_input(&script("kill -CONT %1 | cat"));
+    assert_eq!(
+        String::from_utf8_lossy(&forked.stdout),
+        "current=5\n",
+        "a continue noticed by polling did not make the job current"
+    );
+}
+
+#[test]
 fn a_map_cannot_forge_a_job_handle() {
     // `m = [id: 1]` is ordinary data. Reading an `id` out of any map would make a
     // handle forgeable, and signalling a job on the strength of a field name is
