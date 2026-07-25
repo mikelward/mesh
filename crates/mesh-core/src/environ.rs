@@ -116,6 +116,11 @@ fn serialize(key: &str, value: Value) -> Result<String, String> {
                 "$env.{key}: only strings cross into the environment, not a map"
             ));
         }
+        Value::Function(_) => {
+            return Err(format!(
+                "$env.{key}: only strings cross into the environment, not a function"
+            ));
+        }
         Value::Regex(_) | Value::Glob(_) => {
             return Err(format!(
                 "$env.{key}: only strings cross into the environment, not a pattern"

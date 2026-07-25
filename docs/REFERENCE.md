@@ -663,7 +663,38 @@ call changes stays in that process: a `cd` or an assignment inside `f | cat` doe
 not outlive it. Its arguments keep their types, so `f $xs` still passes one list.
 The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
 
-Not yet supported: `:capture` on a call, and lambdas.
+- **Lambdas.** `func(params) { body }` with no name is an expression that yields
+  a **function value** — an anonymous function, using the same signature grammar
+  as a declaration. Bind it, then value-call it through the variable:
+
+  ```
+  double = func(x) { $x * 2 }
+  y = $double(5)                      # y is 10
+
+  func apply(f, x) { $f($x) }
+  z = apply($double, 21)              # z is 42 — a lambda is just a value
+  ```
+
+  - **The `$` is required.** A bare `double(5)` looks for a *declared* function
+    called `double`, because a bare word is a literal string everywhere else.
+  - **Any expression can be the callee** once it produces a function value:
+    `$fs[0]()`, `$m.go()`. One that produces anything else is a loud
+    `value is not callable`.
+  - **Scope is a function's scope** — fresh locals, the parameters, the globals.
+    A lambda does *not* close over the scope it was written in, so one inside a
+    function cannot read that function's locals; the read fails loud. (mesh has
+    exactly two variable scopes; see [Variables](#variables-and-assignment).)
+  - **A global binding is visible to the body**, which is what lets a lambda
+    recurse: `fact = func(n) { if $n == 0 { return 1 }\n return $n * $fact($n - 1) }`.
+  - **No text form.** A function value is the one value that cannot be bytes, so a
+    command argument, an interpolation, a spread element, and `$env.*` all refuse
+    it rather than invent a rendering.
+  - **Equality is identity.** A copied binding is the same function; a separately
+    written lambda with the same text is a different one.
+
+Not yet supported: `:capture` on a call, and the higher-order modifiers that give
+lambdas their main use (`:map` / `:filter` / `:each`), including a bare `:mod`
+reference as a callable.
 
 ## Not yet implemented
 

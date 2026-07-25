@@ -10,6 +10,7 @@
 //! see `DESIGN.md` §"Variables and assignment".
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
@@ -20,6 +21,57 @@ pub enum Value {
     Map(Vec<(String, Value)>),
     Regex(RegexValue),
     Glob(String),
+    /// An anonymous `func(params) { … }` bound to a name — value-called through
+    /// the variable (`$double(5)`). It has no byte form, so unlike every other
+    /// value it cannot reach a command argument or an interpolation.
+    Function(FuncValue),
+}
+
+/// A function value: the signature and body of a `func(params) { … }` lambda.
+///
+/// Shared behind an `Arc` because binding or passing one copies the `Value` and a
+/// body is a whole parsed `Source`; atomic rather than an `Rc` because the
+/// interactive completer holds shell values across a thread boundary.
+///
+/// Identity, not structure, is what equality means here — two separately written
+/// lambdas with the same text are different functions, the answer every language
+/// with first-class functions gives — which also keeps `Hash` cheap and
+/// consistent with `Eq`.
+#[derive(Debug, Clone)]
+pub struct FuncValue(Arc<Lambda>);
+
+#[derive(Debug)]
+struct Lambda {
+    params: Vec<crate::parser::Param>,
+    body: crate::parser::Source,
+}
+
+impl FuncValue {
+    pub fn new(params: Vec<crate::parser::Param>, body: crate::parser::Source) -> Self {
+        Self(Arc::new(Lambda { params, body }))
+    }
+
+    pub fn params(&self) -> &[crate::parser::Param] {
+        &self.0.params
+    }
+
+    pub fn body(&self) -> &crate::parser::Source {
+        &self.0.body
+    }
+}
+
+impl PartialEq for FuncValue {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for FuncValue {}
+
+impl std::hash::Hash for FuncValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -234,6 +286,9 @@ impl Vars {
             (Value::Map(_), _) => return Err(format!("{name}: can only merge a map into a map")),
             (Value::Regex(_), _) => return Err(format!("{name}: cannot append to a regex")),
             (Value::Glob(_), _) => return Err(format!("{name}: cannot append to a glob")),
+            (Value::Function(_), _) => {
+                return Err(format!("{name}: cannot append to a function value"));
+            }
         }
         Ok(())
     }
