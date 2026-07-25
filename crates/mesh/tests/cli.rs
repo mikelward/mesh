@@ -2414,6 +2414,34 @@ fn kill_knows_the_posix_signal_names() {
 }
 
 #[test]
+fn kill_takes_the_option_terminator_after_a_signal() {
+    // `--` ends the options wherever it sits among them, and bash documents the
+    // combined form. Left in place it became a target of its own: the signal
+    // still landed, but `kill` reported `--: no such job` and returned 1, so a
+    // script checking the status saw a failure that had not happened.
+    for options in ["-s TERM --", "-9 --", "--"] {
+        let out = run_with_input(&format!(
+            "sleep 30 &\nkill {options} %1\nputs signalled=$sh.status\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "signalled=0\n",
+            "{options}: stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A terminator with nothing after it still names no target.
+    let empty = run_with_input("kill --\nputs only=$sh.status\n");
+    assert!(
+        String::from_utf8_lossy(&empty.stderr).contains("expected a job or a pid"),
+        "{:?}",
+        empty.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&empty.stdout), "only=1\n");
+}
+
+#[test]
 fn kill_reports_what_it_cannot_do() {
     for (line, needle) in [
         ("kill", "kill: expected a job or a pid"),

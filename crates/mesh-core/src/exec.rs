@@ -1787,18 +1787,28 @@ fn split_signal(args: &[String]) -> Result<(libc::c_int, &[String]), &str> {
             return Err("-s");
         };
         return signal_number(name)
-            .map(|signal| (signal, &args[2..]))
+            .map(|signal| (signal, skip_terminator(&args[2..])))
             .ok_or(name.as_str());
     }
-    // `--` ends the options, so a target that looks like one can still be named.
     if first == "--" {
         return Ok((libc::SIGTERM, &args[1..]));
     }
     match first.strip_prefix('-').filter(|rest| !rest.is_empty()) {
         Some(rest) => signal_number(rest)
-            .map(|signal| (signal, &args[1..]))
+            .map(|signal| (signal, skip_terminator(&args[1..])))
             .ok_or(rest),
         None => Ok((libc::SIGTERM, args)),
+    }
+}
+
+/// Drop the `--` that ends `kill`'s options, so a target that looks like one can
+/// still be named. It follows the signal as readily as it opens the arguments —
+/// `kill -s TERM -- %1` is the spelling bash documents — and left in place it
+/// became a target of its own, reported as a job that does not exist.
+fn skip_terminator(args: &[String]) -> &[String] {
+    match args.first() {
+        Some(word) if word == "--" => &args[1..],
+        _ => args,
     }
 }
 
