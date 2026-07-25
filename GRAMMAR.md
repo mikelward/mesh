@@ -497,8 +497,18 @@ prints appears, but no value returns.
 
 The keyword is contextual, as `global` and `unset` are: `fork` leads a statement
 only when a `{` follows it, so a command of that name is still reachable as
-`fork`, `fork --flag`, or `fork somewhere`. A `break` or `return` inside one ends
-the child, so control flow does not cross the boundary any more than state does.
+`fork`, `fork --flag`, or `fork somewhere`. The `ws?` includes newlines, so
+`fork\n{ … }` is the block form too — the lookahead reads ahead the way the rule
+is written rather than stopping at the immediate token. A `break` or `return`
+inside one ends the child, so control flow does not cross the boundary any more
+than state does.
+
+The newline form needs the whole source at once, so it holds in a script or a
+`source`d file but not at the prompt, where input is read a line at a time. A
+line of `fork` on its own is a *complete* command — that is what being
+contextual means — so it runs rather than waiting for a `{`, where `if cond`
+waits because it cannot be a statement by itself. Opening the brace on the same
+line is the interactive spelling.
 Deferred: piping or redirecting a subshell (`fork { … } | cat`, `fork { … } > log`
 are syntax errors), backgrounding one, and the `fork func name(params) { … }`
 form.
