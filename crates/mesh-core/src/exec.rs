@@ -331,7 +331,11 @@ fn fork_in_shell(
     err_file: Option<File>,
     // Descriptors above the standard three, installed by the child itself since
     // there is no `Stdio` slot to hand them to.
-    extra_files: Vec<(libc::c_int, File)>,
+    mut extra_files: Vec<(libc::c_int, File)>,
+    // Descriptors that resolved to this stage's outgoing pipe but are not the
+    // stdout or stderr that carry it. Each is given its own handle on the write
+    // end below, once the pipe exists.
+    extra_pipe_out: PipeCopies,
     // `stdout_to_pipe` / `stderr_to_pipe`: did each stream resolve to this
     // stage's outgoing pipe? Passed in rather than re-derived from `pipe_stderr`,
     // so a duplication that put stderr on the pipe (`f 2>&1 | g`) reaches the
@@ -355,23 +359,21 @@ fn fork_in_shell(
     let mut piped_out = false;
     // The pipe is needed when either stream resolved to it — `2>&1 > f |` keeps
     // it for stderr alone, and `>&2 |` moves stdout off it so none is made.
-    let wants_pipe = !is_last && !redirects_stdout && (stdout_to_pipe || stderr_to_pipe);
+    let wants_pipe = !is_last
+        && !redirects_stdout
+        && (stdout_to_pipe || stderr_to_pipe || !extra_pipe_out.is_empty());
     let (pipe_write, read_end) = if wants_pipe {
-        let mut fds = [0; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        let (read, write) = new_pipe()?;
         piped_out = true;
-        // SAFETY: both descriptors come from a successful `pipe`.
-        unsafe {
-            (
-                Some(File::from_raw_fd(fds[1])),
-                Some(File::from_raw_fd(fds[0])),
-            )
-        }
+        (Some(write), Some(read))
     } else {
         (None, None)
     };
+    // Descriptors holding the pipe without a slot of their own join the list the
+    // child installs by hand.
+    if let Some(write) = &pipe_write {
+        extra_files.extend(extra_pipe_out.handles(write)?);
+    }
     // Stderr takes its own handle on the pipe, so stdout can still go elsewhere.
     let child_err_pipe = match (&pipe_write, stderr_to_pipe) {
         (Some(write), true) => Some(write.try_clone()?),
@@ -615,7 +617,7 @@ pub fn run_pipeline(
                 match &incoming {
                     NextIn::Inherit => Source::Inherit(libc::STDIN_FILENO),
                     NextIn::Null => Source::Null,
-                    NextIn::Pipe(_) => Source::Pipe,
+                    NextIn::Pipe(_) => Source::PipeIn,
                 },
             ),
             (
@@ -623,7 +625,7 @@ pub fn run_pipeline(
                 if is_last {
                     Source::Inherit(libc::STDOUT_FILENO)
                 } else {
-                    Source::Pipe
+                    Source::PipeOut
                 },
             ),
             (libc::STDERR_FILENO, Source::Inherit(libc::STDERR_FILENO)),
@@ -643,6 +645,11 @@ pub fn run_pipeline(
         // a file here — the pipe is made below — so it is carried as intent.
         let stdout_to_pipe = sources.is_pipe(libc::STDOUT_FILENO);
         let stderr_to_pipe = sources.is_pipe(libc::STDERR_FILENO);
+        // Descriptors that copied a pipe rather than the standard slot that
+        // carries it — `3>&1 | g`, `f | g 3<&0`. No file can stand for a pipe,
+        // so each is handed its own handle on the real one below.
+        let extra_pipe_out = sources.extra_pipe_out();
+        let extra_pipe_in = sources.extra_pipe_in();
         let files = match sources_to_files(sources) {
             Ok(files) => files,
             Err((path, err)) => {
@@ -663,6 +670,20 @@ pub fn run_pipeline(
                 other => extra_files.push((other, file)),
             }
         }
+        // The incoming pipe belongs to the stage before this one, so a
+        // descriptor that copied it takes its own handle rather than a file.
+        if !extra_pipe_in.is_empty()
+            && let NextIn::Pipe(prev) = &incoming
+        {
+            match extra_pipe_in.handles(prev) {
+                Ok(copies) => extra_files.extend(copies),
+                Err(error) => {
+                    note!("mesh: pipe: {error}");
+                    outcomes.push(Outcome::Failed(1));
+                    continue;
+                }
+            }
+        }
 
         if cmd.in_shell {
             match fork_in_shell(
@@ -673,6 +694,7 @@ pub fn run_pipeline(
                 out_file,
                 err_file,
                 extra_files,
+                extra_pipe_out,
                 stdout_to_pipe,
                 stderr_to_pipe,
                 interactive,
@@ -744,23 +766,6 @@ pub fn run_pipeline(
             }
         }
 
-        // Descriptors above the standard three have no `Stdio` slot, so the
-        // child installs them itself between fork and exec. The files move into
-        // the closure, which is what keeps them open until then; `dup2` clears
-        // `FD_CLOEXEC` on the descriptor it creates, so they survive the exec
-        // that the originals would not.
-        if !extra_files.is_empty() {
-            // SAFETY: `dup2` is async-signal-safe, the bar `pre_exec` sets.
-            unsafe {
-                command.pre_exec(move || {
-                    for (fd, file) in &extra_files {
-                        install_descriptor(file, *fd)?;
-                    }
-                    Ok(())
-                });
-            }
-        }
-
         // stdin: an input redirection wins over the incoming pipe/EOF/terminal.
         if let Some(file) = in_file {
             command.stdin(file);
@@ -801,6 +806,12 @@ pub fn run_pipeline(
         let mut piped_out = false;
         let mut combined_pipe = None;
         let mut merged_stderr = None;
+        // The write end, kept in hand whenever more than stdout needs a handle
+        // on the pipe. `Stdio::piped()` would make one this loop cannot reach.
+        let mut pipe_write = None;
+        // A descriptor above the standard slots claimed the pipe, so the pipe has
+        // to exist even when stdout went elsewhere.
+        let extras_on_pipe = !is_last && !defers_stdout && !extra_pipe_out.is_empty();
         if let Some(file) = out_file {
             if merge_stderr {
                 match file.try_clone() {
@@ -811,38 +822,62 @@ pub fn run_pipeline(
                         continue;
                     }
                 }
-            } else if stderr_alone_on_pipe && !is_last {
+            } else if (stderr_alone_on_pipe && !is_last) || extras_on_pipe {
                 // `2>&1 > f |`: stdout goes to the file, but stderr already took
                 // the pipe, so the pipe still has to exist and feed the next stage.
-                let mut fds = [0; 2];
-                if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-                    note!("mesh: pipe: {}", std::io::Error::last_os_error());
-                    outcomes.push(Outcome::Failed(1));
-                    continue;
-                }
-                merged_stderr = Some(unsafe { File::from_raw_fd(fds[1]) });
-                combined_pipe = Some(unsafe { File::from_raw_fd(fds[0]) });
-                piped_out = true;
-            }
-            command.stdout(file);
-        } else if !is_last && !defers_stdout && stdout_to_pipe {
-            if merge_stderr {
-                // Own the pipe rather than letting `Stdio::piped()` make it, so
-                // both descriptors can be given its write end.
-                let mut fds = [0; 2];
-                if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-                    note!("mesh: pipe: {}", std::io::Error::last_os_error());
-                    outcomes.push(Outcome::Failed(1));
-                    continue;
-                }
-                let read = unsafe { File::from_raw_fd(fds[0]) };
-                let write = unsafe { File::from_raw_fd(fds[1]) };
-                match write.try_clone() {
-                    Ok(clone) => merged_stderr = Some(clone),
+                let (read, write) = match new_pipe() {
+                    Ok(pair) => pair,
                     Err(error) => {
                         note!("mesh: pipe: {error}");
                         outcomes.push(Outcome::Failed(1));
                         continue;
+                    }
+                };
+                if stderr_alone_on_pipe {
+                    match write.try_clone() {
+                        Ok(clone) => merged_stderr = Some(clone),
+                        Err(error) => {
+                            note!("mesh: pipe: {error}");
+                            outcomes.push(Outcome::Failed(1));
+                            continue;
+                        }
+                    }
+                }
+                pipe_write = Some(write);
+                combined_pipe = Some(read);
+                piped_out = true;
+            }
+            command.stdout(file);
+        } else if !is_last && !defers_stdout && stdout_to_pipe {
+            if merge_stderr || extras_on_pipe {
+                // Own the pipe rather than letting `Stdio::piped()` make it, so
+                // every descriptor that resolved to it can be given the write end.
+                let (read, write) = match new_pipe() {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        note!("mesh: pipe: {error}");
+                        outcomes.push(Outcome::Failed(1));
+                        continue;
+                    }
+                };
+                if merge_stderr {
+                    match write.try_clone() {
+                        Ok(clone) => merged_stderr = Some(clone),
+                        Err(error) => {
+                            note!("mesh: pipe: {error}");
+                            outcomes.push(Outcome::Failed(1));
+                            continue;
+                        }
+                    }
+                }
+                if extras_on_pipe {
+                    match write.try_clone() {
+                        Ok(clone) => pipe_write = Some(clone),
+                        Err(error) => {
+                            note!("mesh: pipe: {error}");
+                            outcomes.push(Outcome::Failed(1));
+                            continue;
+                        }
                     }
                 }
                 command.stdout(write);
@@ -851,6 +886,31 @@ pub fn run_pipeline(
                 command.stdout(Stdio::piped());
             }
             piped_out = true;
+        } else if extras_on_pipe {
+            // Stdout moved off the pipe without becoming a file (`1<&0 3>&1 |`),
+            // yet fd 3 still holds it and the next stage still has to be fed.
+            match new_pipe() {
+                Ok((read, write)) => {
+                    pipe_write = Some(write);
+                    combined_pipe = Some(read);
+                    piped_out = true;
+                }
+                Err(error) => {
+                    note!("mesh: pipe: {error}");
+                    outcomes.push(Outcome::Failed(1));
+                    continue;
+                }
+            }
+        }
+        if let Some(write) = &pipe_write {
+            match extra_pipe_out.handles(write) {
+                Ok(copies) => extra_files.extend(copies),
+                Err(error) => {
+                    note!("mesh: pipe: {error}");
+                    outcomes.push(Outcome::Failed(1));
+                    continue;
+                }
+            }
         }
 
         // stderr: `|&`'s copy of the final stdout wins over an explicit `2>`,
@@ -859,6 +919,23 @@ pub fn run_pipeline(
             command.stderr(file);
         } else if let Some(file) = err_file {
             command.stderr(file);
+        }
+
+        // Descriptors with no `Stdio` slot are installed by the child itself
+        // between fork and exec, which is after the standard three are in place.
+        // The files move into the closure, which is what keeps them open until
+        // then; `dup2` clears `FD_CLOEXEC` on the descriptor it creates, so they
+        // survive the exec that the originals would not.
+        if !extra_files.is_empty() {
+            // SAFETY: `dup2` is async-signal-safe, the bar `pre_exec` sets.
+            unsafe {
+                command.pre_exec(move || {
+                    for (fd, file) in &extra_files {
+                        install_descriptor(file, *fd)?;
+                    }
+                    Ok(())
+                });
+            }
         }
 
         match command.spawn() {
@@ -1560,7 +1637,11 @@ pub(crate) enum Source {
     /// EOF: `/dev/null`, for a stage with no producer.
     Null,
     /// This stage's outgoing pipe.
-    Pipe,
+    PipeOut,
+    /// The pipe feeding this stage from the one before it. Distinct from
+    /// `PipeOut` because a duplication can copy either onto any descriptor, and
+    /// the two are different pipes: `f | g 3<&0 4>&1` wants both at once.
+    PipeIn,
     /// An opened file.
     File(File),
 }
@@ -1572,7 +1653,8 @@ impl Source {
         Ok(match self {
             Source::Inherit(fd) => Source::Inherit(*fd),
             Source::Null => Source::Null,
-            Source::Pipe => Source::Pipe,
+            Source::PipeOut => Source::PipeOut,
+            Source::PipeIn => Source::PipeIn,
             Source::File(file) => Source::File(file.try_clone()?),
         })
     }
@@ -1622,7 +1704,76 @@ impl Sources {
     /// Whether this descriptor's destination is the stage's outgoing pipe, which
     /// cannot become a file here because the caller makes the pipe.
     fn is_pipe(&self, fd: libc::c_int) -> bool {
-        matches!(self.get(fd), Some(Source::Pipe))
+        matches!(self.get(fd), Some(Source::PipeOut))
+    }
+
+    /// Descriptors holding the outgoing pipe *besides* stdout and stderr, which
+    /// the caller wires through `Stdio` slots of their own. `3>&1 | g` puts fd 3
+    /// here: no file can stand for it, so the caller hands it the write end.
+    fn extra_pipe_out(&self) -> PipeCopies {
+        self.extras(
+            |source| matches!(source, Source::PipeOut),
+            &[libc::STDOUT_FILENO, libc::STDERR_FILENO],
+        )
+    }
+
+    /// Descriptors holding the incoming pipe besides stdin, which the caller
+    /// wires as the stage's standard input.
+    fn extra_pipe_in(&self) -> PipeCopies {
+        self.extras(
+            |source| matches!(source, Source::PipeIn),
+            &[libc::STDIN_FILENO],
+        )
+    }
+
+    fn extras(&self, want: impl Fn(&Source) -> bool, wired: &[libc::c_int]) -> PipeCopies {
+        PipeCopies {
+            fds: self
+                .0
+                .iter()
+                .filter(|(fd, source)| want(source) && !wired.contains(fd))
+                .map(|(fd, _)| *fd)
+                .collect(),
+            floor: self.install_floor(),
+        }
+    }
+
+    /// The lowest descriptor no redirection of this stage overwrites.
+    ///
+    /// Everything handed to the child is lifted here first, so installing one
+    /// descriptor can never clobber the handle another one still needs.
+    fn install_floor(&self) -> libc::c_int {
+        self.0
+            .iter()
+            .map(|(fd, _)| *fd)
+            .max()
+            .unwrap_or(libc::STDERR_FILENO)
+            .max(libc::STDERR_FILENO)
+            + 1
+    }
+}
+
+/// Descriptors that resolved to a pipe the caller owns, with the floor their
+/// handles are lifted to.
+///
+/// A pipe cannot become a file, so `sources_to_files` drops these and the caller
+/// hands each one its own handle on the real pipe once it exists.
+struct PipeCopies {
+    fds: Vec<libc::c_int>,
+    floor: libc::c_int,
+}
+
+impl PipeCopies {
+    fn is_empty(&self) -> bool {
+        self.fds.is_empty()
+    }
+
+    /// One handle per descriptor, each clear of every descriptor being installed.
+    fn handles(&self, pipe: &File) -> std::io::Result<Vec<(libc::c_int, File)>> {
+        self.fds
+            .iter()
+            .map(|fd| Ok((*fd, lift_above(pipe, self.floor)?)))
+            .collect()
     }
 }
 
@@ -1650,18 +1801,38 @@ fn inherited_seed() -> Sources {
 }
 
 /// Turn resolved sources into the files each descriptor should be given.
-/// `Source::Pipe` yields nothing: the pipe is created by the caller that owns it.
+/// A pipe yields nothing: it is created by the caller that owns it.
 fn sources_to_files(
     sources: Sources,
 ) -> Result<Vec<(libc::c_int, File)>, (String, std::io::Error)> {
+    // An open takes the lowest free descriptor, so `4> four 3> three` lands
+    // `four` on fd 3 — the very descriptor the other redirection then
+    // overwrites, losing `four` before anything copies it to fd 4. Both
+    // orderings of a pair collide this way and no installation order avoids it,
+    // so every file is lifted clear of every target before any is installed.
+    let floor = sources.install_floor();
     let mut files = Vec::new();
     for (fd, source) in sources.0 {
-        let described = format!("&{fd}");
-        if let Some(file) = source.into_file(fd).map_err(|e| (described, e))? {
-            files.push((fd, file));
+        let described = || format!("&{fd}");
+        if let Some(file) = source.into_file(fd).map_err(|e| (described(), e))? {
+            files.push((fd, lift_above(&file, floor).map_err(|e| (described(), e))?));
         }
     }
     Ok(files)
+}
+
+/// Copy `file` onto a free descriptor no lower than `lowest`.
+fn lift_above(file: &File, lowest: libc::c_int) -> std::io::Result<File> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: `fcntl` takes a descriptor this process owns and returns a fresh
+    // owned one, which `File` takes responsibility for closing. Close-on-exec
+    // matches what Rust sets on every file it opens; `dup2` clears it on the
+    // descriptor the child installs.
+    let duplicated = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, lowest) };
+    if duplicated < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(duplicated) })
 }
 
 /// Spill a heredoc body into a temporary file, rewound and unlinked.
@@ -1704,6 +1875,20 @@ fn heredoc_file(body: &str) -> std::io::Result<File> {
     file.write_all(body.as_bytes())?;
     file.seek(SeekFrom::Start(0))?;
     Ok(file)
+}
+
+/// Make a pipe as an owned read/write pair.
+///
+/// Used wherever the shell needs the write end in hand — to give more than one
+/// descriptor a handle on it — rather than letting `Stdio::piped()` hide it.
+fn new_pipe() -> std::io::Result<(File, File)> {
+    let mut fds = [0; 2];
+    // SAFETY: `pipe` fills the two-element array it is given.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors come from a successful `pipe`.
+    Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
 }
 
 /// Duplicate one of the shell's own descriptors into an owned `File`.
@@ -1795,27 +1980,19 @@ fn resolve_sources(
 
 /// Put `file` on descriptor `fd` in a child, so it survives a following `exec`.
 ///
-/// Not simply `dup2`: when the file already *is* that descriptor, `dup2` returns
-/// success without doing anything — and pointedly without clearing
-/// `FD_CLOEXEC`, which Rust sets on every file it opens. The descriptor would
-/// then close at `exec` and the command would see `EBADF` on a redirection that
-/// looked applied. `3< file` hit this whenever the open landed on fd 3, while a
-/// higher one like `9<` worked, since there `dup2` really did make a new
-/// descriptor and new descriptors do not inherit the flag.
+/// Every handle reaches here lifted above `fd` (see `install_floor`), which is
+/// what makes a plain `dup2` right. Handed the descriptor it already is, `dup2`
+/// returns success without doing anything — pointedly without clearing
+/// `FD_CLOEXEC`, which Rust sets on every file it opens — so the descriptor
+/// would close at `exec` and the command would see `EBADF` on a redirection that
+/// looked applied. `3< file` hit exactly that whenever the open landed on fd 3,
+/// while a higher one like `9<` worked.
 fn install_descriptor(file: &File, fd: libc::c_int) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
-    let raw = file.as_raw_fd();
-    // SAFETY: both calls take a descriptor this process owns, and both are
+    // SAFETY: `dup2` takes descriptors this process owns and is
     // async-signal-safe, which is the bar `pre_exec` sets.
-    unsafe {
-        if raw == fd {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        } else if libc::dup2(raw, fd) < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+    if unsafe { libc::dup2(file.as_raw_fd(), fd) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
