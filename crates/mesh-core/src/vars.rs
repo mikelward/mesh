@@ -154,6 +154,53 @@ pub struct Vars {
     /// shell refreshes it from the real table on the same funnel that publishes
     /// `$sh.status`, so a read never sees a stale one.
     jobs: Vec<(String, Value)>,
+    /// The stack of inputs being evaluated, innermost last, reported as
+    /// `$sh.origin` and `$sh.source`. A stack because `source` nests: a file that
+    /// sources another must see the *inner* one while it runs and its own again
+    /// afterwards, which is what `${BASH_SOURCE[0]}` is used for.
+    ///
+    /// `DESIGN.md` leaves the nesting question open and asks for the two axes to
+    /// stay orthogonal: this reports the **innermost** frame, so "where am I" has
+    /// one answer, and interactivity stays separately in `interactive`.
+    inputs: Vec<Input>,
+}
+
+/// One level of input: where it came from, and its path when it has one.
+#[derive(Debug, Clone)]
+struct Input {
+    origin: Origin,
+    /// The file's path, empty for the origins that are not files.
+    source: String,
+}
+
+/// Where the source being evaluated came from — `DESIGN.md`'s input **origin**,
+/// deliberately not the same question as interactivity (`mesh -i script.mesh` is
+/// both interactive and a script).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// A script path operand.
+    Script,
+    /// A file pulled in by `source`, including the startup files.
+    Sourced,
+    /// `-c TEXT`.
+    Command,
+    /// `-s`, or piped input.
+    Stdin,
+    /// Typed at a prompt.
+    Interactive,
+}
+
+impl Origin {
+    /// The word `$sh.origin` reports.
+    fn word(self) -> &'static str {
+        match self {
+            Origin::Script => "script",
+            Origin::Sourced => "sourced",
+            Origin::Command => "command",
+            Origin::Stdin => "stdin",
+            Origin::Interactive => "interactive",
+        }
+    }
 }
 
 impl Default for Vars {
@@ -169,6 +216,12 @@ impl Default for Vars {
             // SAFETY: `getppid` takes no arguments and cannot fail.
             ppid: unsafe { libc::getppid() },
             jobs: Vec::new(),
+            // A shell with nothing said about it reads commands from stdin, which
+            // is what `Invocation::Default` falls back to.
+            inputs: vec![Input {
+                origin: Origin::Stdin,
+                source: String::new(),
+            }],
         }
     }
 }
@@ -213,6 +266,25 @@ impl Vars {
         self.interactive = interactive;
     }
 
+    /// Replace the outermost input — the one the invocation itself established.
+    pub fn set_origin(&mut self, origin: Origin, source: String) {
+        self.inputs = vec![Input { origin, source }];
+    }
+
+    /// Enter a nested input for the duration of a `source`, so `$sh.origin` reads
+    /// `sourced` and `$sh.source` names *that* file while it runs.
+    pub(crate) fn push_input(&mut self, origin: Origin, source: String) {
+        self.inputs.push(Input { origin, source });
+    }
+
+    /// Leave it again. The outermost frame is never popped: something is always
+    /// being evaluated, so there is always an origin to report.
+    pub(crate) fn pop_input(&mut self) {
+        if self.inputs.len() > 1 {
+            self.inputs.pop();
+        }
+    }
+
     /// Publish the live jobs, keyed by job id in registration order.
     pub(crate) fn set_jobs(&mut self, jobs: Vec<(String, Value)>) {
         self.jobs = jobs;
@@ -241,6 +313,19 @@ impl Vars {
     /// The runtime entries are built here rather than stored in `shell`, so
     /// recording a status after every command is two field writes instead of a
     /// keyed update of the map.
+    /// Is the innermost input a **sourced file**? That is the one top level a
+    /// `return` may leave, because it is the only one with an invoker to return to
+    /// — the `source` command, whose status becomes the returned value's.
+    pub(crate) fn in_sourced_file(&self) -> bool {
+        self.input().origin == Origin::Sourced
+    }
+
+    fn input(&self) -> &Input {
+        self.inputs
+            .last()
+            .expect("the outermost input is never popped")
+    }
+
     pub(crate) fn shell_namespace(&self) -> Value {
         let mut entries = vec![
             ("status".to_owned(), Value::Integer(i64::from(self.status))),
@@ -267,6 +352,16 @@ impl Vars {
             ("stdout".to_owned(), Value::Stream(1)),
             ("stderr".to_owned(), Value::Stream(2)),
             ("jobs".to_owned(), Value::Map(self.jobs.clone())),
+            // The innermost input: what is being evaluated *now*, which is the
+            // question a sourced file asks about itself.
+            (
+                "origin".to_owned(),
+                Value::String(self.input().origin.word().to_owned()),
+            ),
+            (
+                "source".to_owned(),
+                Value::String(self.input().source.clone()),
+            ),
         ];
         entries.extend(self.shell.iter().cloned());
         Value::Map(entries)

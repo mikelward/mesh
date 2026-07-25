@@ -2459,21 +2459,29 @@ for the count, `$sh.args[0]` for the first — none of `$1` / `$@` / `$#`), and
 **`$sh.name`** is the shell-or-script name (bash's `$0`). Both are read-only
 runtime entries.
 
-*(TODO: **am-I-sourced, and the current source file.** A file needs to know both
-that it is being **`source`d** (vs run as a script, a `-c` command string, `-s`
-stdin, or typed interactively) and the **path of the file currently being
-sourced** — bash's `${BASH_SOURCE[0]}` and the `[[ "${BASH_SOURCE[0]}" != "$0" ]]`
-idiom, which real rc files use to locate sibling files and to guard "only when
-executed directly" blocks. Model the two axes **orthogonally**: an input **origin**
-— `script` / `sourced` / `command` (`-c`) / `stdin` (`-s`) / `interactive` — kept
-separate from **interactivity**, since `mesh -i script.mesh` is interactive *and* a
-script; interactivity is already [`$sh.interactive`](#variables-and-assignment).
-Then a read-only **`$sh.source`** carries the path of the file being evaluated,
-defined only for the **file** origins (`script` / `sourced`) and empty for
-`command` / `stdin` / `interactive`. `$sh.name` (bash's `$0`) is not enough — it
-doesn't change on `source` and can't locate the sourced file. Decide whether
-`$sh.source` nests (a stack, for a file that sources another) or reports only the
-innermost.)*
+Two read-only entries describe **what is being evaluated**, which `$sh.name`
+(bash's `$0`) cannot answer because it never changes on `source`. **`$sh.origin`**
+is the input's origin — `script` / `sourced` / `command` (`-c`) / `stdin` (`-s`) /
+`interactive` — kept **orthogonal to interactivity**, since `mesh -i script.mesh`
+is interactive *and* a script and that stays [`$sh.interactive`](#variables-and-assignment).
+**`$sh.source`** is the path of the file being evaluated, defined for the file
+origins (`script` / `sourced`) and empty for the rest. Together they replace bash's
+`${BASH_SOURCE[0]}` and its `[[ "${BASH_SOURCE[0]}" != "$0" ]]` idiom, which
+becomes the direct `if $sh.origin == script { … }`.
+
+*(decided) `$sh.source` reports the **innermost** file rather than a stack.* "Where
+am I" has one answer, which is what locating a sibling needs; a startup file is a
+sourced file and reports itself the same way. A stack, if it is ever wanted, is a
+separate `$sh.sources` and not a reinterpretation of this one.
+
+*(decided) `return` leaves a sourced file; `exit` leaves the shell.* A `return`
+ends the innermost unit with an **invoker to return to** — a function, or a sourced
+file, whose `source` then reports the returned value's status; a bare `return`
+carries the last status, as a bare `exit` does. A script, a `-c` string, and a
+typed line have no caller, so `return` there stays an error. `exit` always ends the
+shell, from a sourced file included, because `source` runs in *this* shell. Without
+the `return` half there is no way to leave a sourced file early — `exit` would take
+the session with it — which is exactly what a config-file guard needs.
 
 *(deferred: system-wide `/etc/mesh/*` files; mutating positional args
 (`shift` / `set --`); and whether a non-login, non-interactive script should skip
