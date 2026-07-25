@@ -465,7 +465,8 @@ fn fork_in_shell(
             // stdout rather than the shell's.
             if background && !cmd.redirs.is_empty() {
                 let redirs = staged_redirs(cmd, is_last);
-                let deferred = match open_paths(&redirs)
+                let inherited = live_descriptors(&redirs);
+                let deferred = match open_paths(&redirs, &inherited)
                     .and_then(|files| resolve_sources(&redirs, files, inherited_seed()))
                     .and_then(sources_to_files)
                 {
@@ -576,6 +577,18 @@ pub fn run_pipeline(
     // own in source order, but different stages open at the same time, so a FIFO
     // opened by one stage does not block a peer opened by another stage of the
     // same pipeline (`cat < fifo | cmd > fifo`) before the writer is spawned.
+    // Which descriptors the shell holds, asked **once, on this thread, before
+    // any stage opens anything**. The opening threads share one descriptor
+    // table, so a probe inside them could see a sibling's freshly opened target
+    // as inherited — and then `4>&3` in one stage would copy another stage's
+    // `9> victim` instead of failing, non-deterministically.
+    let inherited = live_descriptors(
+        &cmds
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, cmd)| staged_redirs(cmd, idx + 1 == n))
+            .collect::<Vec<_>>(),
+    );
     let opened: Vec<Result<Opened, (String, std::io::Error)>> = if background {
         // A background stage opens nothing here: its targets are opened by the
         // helper (or by the forked child), so a blocking open cannot hold up the
@@ -588,7 +601,8 @@ pub fn run_pipeline(
                 .enumerate()
                 .map(|(idx, cmd)| {
                     let redirs = staged_redirs(cmd, idx + 1 == n);
-                    scope.spawn(move || open_paths(&redirs))
+                    let inherited = &inherited;
+                    scope.spawn(move || open_paths(&redirs, inherited))
                 })
                 .collect();
             handles
@@ -1232,7 +1246,8 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
         };
         redirs.push(Redirection { fd, kind, target });
     }
-    let opened = match open_paths(&redirs)
+    let inherited = live_descriptors(&redirs);
+    let opened = match open_paths(&redirs, &inherited)
         .and_then(|files| resolve_sources(&redirs, files, inherited_seed()))
         .and_then(sources_to_files)
     {
@@ -1425,7 +1440,9 @@ pub(crate) fn with_redirections<T>(
 
     let opened = sources_to_files(resolve_sources(
         redirs,
-        open_paths(redirs)?,
+        // Distinct from `already_open` above: that is which *targets* the shell
+        // holds, for the save; this is which descriptors a duplication may copy.
+        open_paths(redirs, &live_descriptors(redirs))?,
         inherited_seed(),
     )?)?;
     // Anything already buffered belongs to the *previous* stdout.
@@ -1834,8 +1851,34 @@ fn new_pipe() -> std::io::Result<(File, File)> {
     if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: both descriptors come from a successful `pipe`.
-    Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+    // SAFETY: both descriptors come from a successful `pipe`, and `File` takes
+    // responsibility for closing them from here.
+    let ends = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    // `pipe` does not set close-on-exec, and `dup2` clears it on the descriptor
+    // it creates — so the copy a stage is given survives `exec` while these
+    // originals do not. Without this the raw ends stay inheritable, and anything
+    // the stage `exec`s passes them to its own detached children: `sh -c 'sleep 5
+    // >/dev/null 2>/dev/null 3>/dev/null & echo hi' 3>&1 | cat` left `cat`
+    // waiting five seconds on a write end nothing was writing to.
+    for end in [&ends.0, &ends.1] {
+        set_cloexec(end)?;
+    }
+    Ok(ends)
+}
+
+/// Mark a descriptor close-on-exec, matching what Rust sets on every file it
+/// opens. `pipe2` would fold this into the creation, but it is not portable.
+fn set_cloexec(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let raw = file.as_raw_fd();
+    // SAFETY: both calls take a descriptor this process owns.
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFD);
+        if flags < 0 || libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Duplicate one of the shell's own descriptors into an owned `File`.
@@ -1863,7 +1906,10 @@ fn dup_shell_fd(fd: libc::c_int) -> std::io::Result<File> {
 /// apply in source order, and an order that has already destroyed a file by the
 /// time it reports the failure is not that order. Validation needs no files, only
 /// which descriptors *exist* at each point, so it costs nothing to do here.
-fn open_paths(redirs: &[Redirection]) -> Result<Opened, (String, std::io::Error)> {
+fn open_paths(
+    redirs: &[Redirection],
+    inherited: &[libc::c_int],
+) -> Result<Opened, (String, std::io::Error)> {
     // A descriptor the process could never hold is refused first, before any
     // target is created or truncated, and named in the error the way bash names
     // it. Left to `dup2` it would surface as `EBADF` against the *command*, from
@@ -1877,8 +1923,7 @@ fn open_paths(redirs: &[Redirection]) -> Result<Opened, (String, std::io::Error)
             ));
         }
     }
-    let inherited = live_descriptors(redirs);
-    let mut live = inherited.clone();
+    let mut live = inherited.to_vec();
     let mut opened = Vec::with_capacity(redirs.len());
     for Redirection { fd, kind, target } in redirs {
         opened.push(match target {
@@ -1911,7 +1956,7 @@ fn open_paths(redirs: &[Redirection]) -> Result<Opened, (String, std::io::Error)
     }
     Ok(Opened {
         files: opened,
-        inherited,
+        inherited: inherited.to_vec(),
     })
 }
 
