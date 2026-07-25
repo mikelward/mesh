@@ -250,6 +250,16 @@ pub enum Executable {
         pattern: BindingPattern,
         append: bool,
         value: Expr,
+        /// `global name = …` — bind in the session-global scope rather than the
+        /// active one. Assignment is local-by-default inside a function, so this
+        /// is how a function writes a global on purpose.
+        global: bool,
+    },
+    /// `unset name …` — drop bindings in the current scope, or with `global`, in
+    /// the session-global one.
+    Unset {
+        names: Vec<Spanned<String>>,
+        global: bool,
     },
     /// `$env.KEY = value` — a write to the process environment rather than to a
     /// mesh binding. Separate from [`Executable::Assignment`] because `$env` is
@@ -1499,6 +1509,13 @@ impl Parser {
         if self.word("return") || self.word("break") || self.word("continue") {
             return self.control();
         }
+        // `global` and `unset` lead a statement, but only where one can follow —
+        // `global = 5` still binds a variable of that name, the way any other
+        // lowercase word may be one. Contextual because neither is reserved in
+        // `DESIGN.md`; only `env` and `sh` are.
+        if (self.word("global") || self.word("unset")) && !self.assignment_follows(1) {
+            return self.scoped();
+        }
         let assignment_start = self.position;
         if let Some(key) = self.env_target() {
             if matches!(
@@ -1536,6 +1553,7 @@ impl Parser {
                     self.expression()?
                 };
                 return Ok(Executable::Assignment {
+                    global: false,
                     pattern,
                     append,
                     value,
@@ -2304,6 +2322,7 @@ impl Parser {
                 && self.eat(&TokenKind::Equal).is_some()
             {
                 return Ok(Executable::Assignment {
+                    global: false,
                     pattern,
                     append: false,
                     value: self.expression()?,
@@ -2901,6 +2920,62 @@ impl Parser {
     fn newlines(&mut self) {
         while self.eat(&TokenKind::Newline).is_some() {}
     }
+    /// Is the token `offset` ahead an assignment operator? Used to tell a
+    /// statement keyword from a variable that happens to share its name.
+    fn assignment_follows(&self, offset: usize) -> bool {
+        matches!(
+            self.tokens.get(self.position + offset).map(|t| &t.value),
+            Some(TokenKind::Equal | TokenKind::PlusEqual)
+        )
+    }
+
+    /// `global name = …`, `global name += …`, `global unset …`, or `unset …`.
+    fn scoped(&mut self) -> Result<Executable, ParseError> {
+        let global = self.take_word("global");
+        if self.take_word("unset") {
+            return self.unset(global);
+        }
+        if !global {
+            unreachable!("only `global` or `unset` reaches here, and `unset` was taken");
+        }
+        // `global` on its own governs an assignment; anything else is a mistake
+        // worth naming, since `global f` reads like a call but cannot be one.
+        let pattern = self.binding_pattern()?;
+        if !self.assignment_follows(0) {
+            return Err(self.error(ParseErrorKind::Expected(
+                "`=` or `unset` after `global`; it governs an assignment, not a command",
+            )));
+        }
+        let append = self.eat(&TokenKind::PlusEqual).is_some();
+        if !append {
+            self.expect(&TokenKind::Equal, "`=`")?;
+        }
+        if append && !matches!(pattern, BindingPattern::Name(_)) {
+            return Err(self.error(ParseErrorKind::Expected("a name before `+=`")));
+        }
+        let value = self.expression()?;
+        Ok(Executable::Assignment {
+            pattern,
+            append,
+            value,
+            global: true,
+        })
+    }
+
+    fn unset(&mut self, global: bool) -> Result<Executable, ParseError> {
+        let mut names = Vec::new();
+        while let Some(text) = self.word_text_at(0) {
+            let name = text.to_owned();
+            let span = self.tokens[self.position].span.clone();
+            self.position += 1;
+            names.push(Spanned { value: name, span });
+        }
+        if names.is_empty() {
+            return Err(self.error(ParseErrorKind::Expected("a name to unset")));
+        }
+        Ok(Executable::Unset { names, global })
+    }
+
     fn word(&self, expected: &str) -> bool {
         matches!(self.peek().map(|t| &t.value), Some(TokenKind::Word(word)) if word.is_bare_text(expected))
     }

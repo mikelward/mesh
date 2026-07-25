@@ -259,6 +259,33 @@ impl Vars {
         self.active_mut().insert(name.to_string(), value);
     }
 
+    /// Bind in the **session-global** scope, whatever scope is active — what
+    /// `global name = value` says explicitly, since a plain assignment inside a
+    /// function is local by default (`DESIGN.md` §"Scope — two levels").
+    pub fn set_value_global(&mut self, name: &str, value: Value) {
+        self.global.insert(name.to_string(), value);
+    }
+
+    /// Remove `name` from the active scope, reporting whether it was bound
+    /// there. Inside a function this drops the local only: a global it was
+    /// shadowing becomes visible again, because plain `unset` never reaches
+    /// through to a global — the same rule that makes assignment local.
+    pub fn unset(&mut self, name: &str) -> bool {
+        self.active_mut().remove(name).is_some()
+    }
+
+    /// Remove `name` from the session-global scope — `global unset name`,
+    /// symmetric with `global name = value`.
+    pub fn unset_global(&mut self, name: &str) -> bool {
+        self.global.remove(name).is_some()
+    }
+
+    /// Is `name` bound in any visible scope? A read errors only when it is
+    /// bound in none, so `unset` uses this to tell "removed" from "never there".
+    pub fn is_bound(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
     /// Read `name`: the innermost function-local binding, else the global one.
     /// Returns `None` if unbound — the caller turns that into a loud error, per
     /// the no-null / fail-loud rule.
@@ -293,6 +320,20 @@ impl Vars {
     /// outward: local → global) is copied into the active scope first, then
     /// appended there — leaving any shadowed global untouched. At top level the
     /// active scope *is* the global, so this stays an in-place append there.
+    /// `global name += value`: append in the session-global scope. Unlike
+    /// [`Vars::append`] there is no seeding step — the global scope *is* the
+    /// target, so an unbound name is simply an error rather than something to
+    /// copy inward.
+    pub fn append_global(&mut self, name: &str, value: Value) -> Result<(), String> {
+        if !self.global.contains_key(name) {
+            return Err(format!("{name}: unbound variable"));
+        }
+        let saved = std::mem::take(&mut self.locals);
+        let result = self.append(name, value);
+        self.locals = saved;
+        result
+    }
+
     pub fn append(&mut self, name: &str, value: Value) -> Result<(), String> {
         if !self.active_has(name) {
             let seed = self

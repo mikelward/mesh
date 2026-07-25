@@ -729,6 +729,7 @@ fn run_executable(
             pattern,
             append,
             value,
+            global,
         } => match eval_operand_of(value, last, in_function, shell) {
             // A right-hand side that raised `break`/`continue` produced no value to
             // bind — the loop is unwinding, so leave the target as it was rather
@@ -739,9 +740,13 @@ fn run_executable(
                     let parser::BindingPattern::Name(name) = pattern else {
                         unreachable!("the parser restricts += to names")
                     };
-                    shell.vars.append(name, value)
+                    if *global {
+                        shell.vars.append_global(name, value)
+                    } else {
+                        shell.vars.append(name, value)
+                    }
                 } else {
-                    bind_pattern(pattern, &value, &mut shell.vars)
+                    bind_pattern(pattern, &value, &mut shell.vars, *global)
                 };
                 result.map_or_else(
                     |error| {
@@ -753,6 +758,30 @@ fn run_executable(
             }
             Err(step) => step,
         },
+        Unset { names, global } => {
+            let mut status = 0;
+            for name in names {
+                if crate::vars::is_reserved_namespace(&name.value) {
+                    note!("mesh: unset: `{}` is reserved", name.value);
+                    status = 1;
+                    continue;
+                }
+                // Unsetting what was never bound anywhere is the error; removing
+                // nothing *here* while an outer scope still has it is not, since
+                // `unset` is defined on the current scope only.
+                let bound = shell.vars.is_bound(&name.value);
+                if *global {
+                    shell.vars.unset_global(&name.value);
+                } else {
+                    shell.vars.unset(&name.value);
+                }
+                if !bound {
+                    note!("mesh: unset: {}: unbound variable", name.value);
+                    status = 1;
+                }
+            }
+            Step::Continue(status)
+        }
         // An environment write is global by design: it changes what children
         // inherit, so a function-local scope would defeat the point
         // (`DESIGN.md` §"Variables and assignment").
@@ -919,6 +948,7 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
         Expression { expression, .. } if runs_as_command(expression) => return None,
         Expression { .. } => "an expression",
         Assignment { .. } => "an assignment",
+        Unset { .. } => "an `unset`",
         EnvAssignment { .. } => "an environment assignment",
         Function { .. } => "a function definition",
         If(_) => "an `if`",
@@ -1080,6 +1110,7 @@ fn condition_status(
         pattern,
         append: false,
         value,
+        ..
     } = condition
         && matches!(pattern, parser::BindingPattern::List(_))
     {
@@ -1277,15 +1308,25 @@ fn bind_iteration(
     Ok(())
 }
 
+/// Bind every name a pattern names, in one scope: `global` chooses the
+/// session-global one, so `global [a b] = $pair` puts both there rather than
+/// splitting them across scopes.
 fn bind_pattern(
     pattern: &parser::BindingPattern,
     value: &Value,
     vars: &mut Vars,
+    global: bool,
 ) -> Result<(), String> {
     let bindings = pattern_bindings(pattern, value)?
         .ok_or_else(|| "value does not match binding pattern".to_string())?;
     validate_bindings(&bindings)?;
-    commit_bindings(bindings, vars);
+    for (name, value) in bindings {
+        if global {
+            vars.set_value_global(&name, value);
+        } else {
+            vars.set_value(&name, value);
+        }
+    }
     Ok(())
 }
 
