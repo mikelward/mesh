@@ -334,9 +334,22 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
   value — its last expression, or the value carried by `return` — while `f arg`
   runs the function for its status. `key: value` binds the parameter its `--key`
   flag would.
+- **Lambdas.** `func(params) { body }` — the declaration with the name left off —
+  is an expression yielding a **function value**. It reuses the signature grammar
+  above in full (defaults, `--flags`, `...rest`). Bind it and value-call it
+  through the variable: `double = func(x) { $x * 2 }` then `$double(5)`. The `$`
+  is required, because a bare `double(5)` names the *function store* — a bare word
+  is a literal string everywhere else. A callee that is any other expression
+  (`$fs[0]()`, `$m.go()`) is called the same way once it produces a function
+  value; one that produces anything else is a loud "value is not callable".
+  Scope is a `func`'s scope: fresh locals, the parameters, and the globals. A
+  lambda does **not** capture the scope it was written in, so one inside a
+  function cannot read that function's locals. A function value is the one value
+  with **no text form** — a command argument, an interpolation, or `$env.*`
+  refuses it — and equality is **identity**, so a copied binding is the same
+  function and a separately written twin is not.
 - **Deferred:** a function in the background is rejected (needs the fork-based
-  executor); `func` composing with separators; `:capture` on a call; and
-  lambdas.
+  executor); `func` composing with separators; and `:capture` on a call.
 
 ## Task 10 — `if` expressions
 

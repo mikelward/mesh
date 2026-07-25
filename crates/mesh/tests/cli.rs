@@ -3376,6 +3376,142 @@ fn a_value_call_streams_stdout_independently_of_its_value() {
 }
 
 #[test]
+fn a_lambda_is_a_value_called_through_its_variable() {
+    // `func(params) { … }` with the name left off is an anonymous function *value*:
+    // bind it, then value-call it through the variable. The whole signature grammar
+    // comes along — defaults, `key:` options, `...rest` — since it is the same
+    // parser and the same binding as a named `func`.
+    let out = run_with_input(
+        "double = func(x) { $x * 2 }\n\
+         greet = func(who = world) { \"hello $who\" }\n\
+         twice = func(x, --loud) { if $loud { return \"$x!\" }\n return $x }\n\
+         count = func(...xs) { $xs:len }\n\
+         a = $double(5)\n\
+         b = $greet()\n\
+         c = $greet(mesh)\n\
+         d = $twice(hi, loud: true)\n\
+         e = $count(1, 2, 3)\n\
+         puts \"$a | $b | $c | $d | $e\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "10 | hello world | hello mesh | hi! | 3\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_lambda_travels_as_a_value() {
+    // Being a value is the point: a lambda passes to a function, which calls it
+    // through the parameter it arrived in; it survives inside a list or a map and
+    // is called straight out of the element; and a global binding is visible to the
+    // lambda's own body, which is what makes recursion work without a name.
+    let out = run_with_input(
+        "func apply(f, x) { $f($x) }\n\
+         double = func(n) { $n * 2 }\n\
+         fact = func(n) { if $n == 0 { return 1 }\n return $n * $fact($n - 1) }\n\
+         fs = [func() { return seven }]\n\
+         m = [go: func() { return nine }]\n\
+         a = apply($double, 5)\n\
+         b = $fact(5)\n\
+         c = $fs[0]()\n\
+         d = $m.go()\n\
+         puts \"$a | $b | $c | $d\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "10 | 120 | seven | nine\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_lambda_sees_the_globals_and_not_the_enclosing_locals() {
+    // A lambda is an anonymous `func`, so it gets what a `func` gets: a fresh
+    // function-local scope, its parameters, and the session globals — the two
+    // levels `DESIGN.md` §"Variables and assignment" defines. It does *not* close
+    // over the scope it was written in, so a lambda inside a function cannot read
+    // that function's locals; the read fails loud rather than resolving to
+    // something surprising.
+    let sees = run_with_input("factor = 10\nf = func(x) { $x * $factor }\nv = $f(3)\nputs $v\n");
+    assert_eq!(String::from_utf8_lossy(&sees.stdout), "30\n");
+    assert!(sees.stderr.is_empty(), "{:?}", sees.stderr);
+
+    let hidden = run_with_input(
+        "func outer() { n = 2\n inner = func(x) { $x * $n }\n return $inner(3) }\nv = outer()\nputs done\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&hidden.stderr).contains("n: unbound variable"),
+        "{:?}",
+        hidden.stderr
+    );
+    // Loud, and recoverable: the script goes on.
+    assert_eq!(String::from_utf8_lossy(&hidden.stdout), "done\n");
+}
+
+#[test]
+fn a_function_value_has_no_text_form() {
+    // Every other value can be bytes somewhere. A function cannot, so each place
+    // that needs bytes refuses it by name rather than inventing a rendering.
+    for (src, needle) in [
+        // A command argument.
+        (
+            "f = func() { return 1 }\nputs $f\n",
+            "$f: a function value has no text form",
+        ),
+        // An element of a spread.
+        (
+            "f = func() { return 1 }\nxs = [$f]\nputs ...$xs\n",
+            "$xs: a function value has no text form",
+        ),
+        // The environment, which is bytes by definition.
+        (
+            "f = func() { return 1 }\n$env.MESH_TEST_FN = $f\n",
+            "only strings cross into the environment, not a function",
+        ),
+    ] {
+        let out = run_with_input(&format!("{src}puts after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{src:?}: {stderr:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{src:?}");
+    }
+}
+
+#[test]
+fn calling_a_value_that_is_not_a_function_is_a_loud_error() {
+    // `$x(…)` on a non-function says so, and an unbound name reports the read
+    // rather than the call. Both recover.
+    for (src, needle) in [
+        ("x = 5\ny = $x(1)\n", "x: value is not callable"),
+        ("y = $nope(1)\n", "nope: unbound variable"),
+        // A *bare* name still means the function store, not a variable: a lambda
+        // needs the `$`, since a bare word is a literal string everywhere else.
+        (
+            "double = func(x) { $x * 2 }\ny = double(5)\n",
+            "double: a command has no return value",
+        ),
+    ] {
+        let out = run_with_input(&format!("{src}puts after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{src:?}: {stderr:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{src:?}");
+    }
+}
+
+#[test]
+fn two_lambdas_are_equal_only_when_they_are_the_same_function() {
+    // Function equality is identity, as in every language with first-class
+    // functions: a copied binding is the same function, a separately written one
+    // with the same text is not.
+    let out = run_with_input(
+        "a = func() { return 1 }\nb = $a\nc = func() { return 1 }\n\
+         same = $a == $b\nother = $a == $c\nputs \"$same $other\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true false\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
 fn value_call_errors_recover_and_run_the_next_command() {
     // Each bad value call is a recoverable runtime error; the following command
     // still runs.

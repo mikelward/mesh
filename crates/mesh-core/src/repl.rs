@@ -1723,7 +1723,8 @@ fn eval_expr(
                     | Value::Integer(_)
                     | Value::Boolean(_)
                     | Value::Regex(_)
-                    | Value::Glob(_) => runtime_error("cannot slice a scalar value"),
+                    | Value::Glob(_)
+                    | Value::Function(_) => runtime_error("cannot slice a scalar value"),
                     Value::Map(_) => runtime_error("cannot slice a map value"),
                 };
             }
@@ -1751,7 +1752,8 @@ fn eval_expr(
                 | Value::Integer(_)
                 | Value::Boolean(_)
                 | Value::Regex(_)
-                | Value::Glob(_) => runtime_error("cannot index a scalar value"),
+                | Value::Glob(_)
+                | Value::Function(_) => runtime_error("cannot index a scalar value"),
                 Value::Map(entries) => {
                     let key = match index_value {
                         Value::String(key) => key,
@@ -1841,7 +1843,15 @@ fn eval_expr(
             Ok(Value::List((start..stop).map(Value::Integer).collect()))
         }
         E::Call { callee, arguments } => eval_call(callee, arguments, last, in_function, shell),
-        E::Lambda { .. } => runtime_error("lambda expressions are not implemented yet"),
+        // A lambda evaluates to a function value, carrying its signature and body.
+        // Nothing else is captured: a call gets a fresh function-local scope and
+        // the globals, the same two levels a named `func` gets (`DESIGN.md`
+        // §"Variables and assignment"), so a lambda written inside a function
+        // cannot read that function's locals.
+        E::Lambda { parameters, body } => Ok(Value::Function(vars::FuncValue::new(
+            parameters.clone(),
+            body.clone(),
+        ))),
     }
 }
 
@@ -1866,6 +1876,16 @@ fn range_endpoint(
     }
 }
 
+/// How to name a computed callee in a diagnostic. A variable is the readable
+/// case and the only one reachable today; anything else is described by shape
+/// rather than spelled back, since the parser keeps no source text for it.
+fn callee_description(callee: &parser::Expr) -> String {
+    match callee {
+        parser::Expr::Variable(name) => name.value.trim_start_matches('$').to_string(),
+        _ => "call target".to_string(),
+    }
+}
+
 fn eval_call(
     callee: &parser::Expr,
     arguments: &[parser::Argument],
@@ -1873,8 +1893,34 @@ fn eval_call(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
+    // A bare name names the function store (`f(...)`) or the `re(...)` builder.
+    // Anything else has to *produce* a function value — today a lambda reached
+    // through the variable it was bound to, `$double(5)`. Reaching a lambda needs
+    // the `$` because a bare word is a literal string everywhere else, so
+    // `double(5)` would look for a *declared* `double`.
     let parser::Expr::Scalar(word) = callee else {
-        return runtime_error("call target is not callable");
+        // The callee is the call's operand, not its result, so its own
+        // bookkeeping is put back — the same treatment a condition or an
+        // assignment's right-hand side gets.
+        let target = eval_operand_of(callee, last, in_function, shell)?;
+        if shell.control.is_some() {
+            return Ok(control_placeholder());
+        }
+        let Value::Function(function) = target else {
+            return runtime_error(format!(
+                "{}: value is not callable",
+                callee_description(callee)
+            ));
+        };
+        return call_signature_for_value(
+            &callee_description(callee),
+            function.params(),
+            function.body(),
+            arguments,
+            last,
+            in_function,
+            shell,
+        );
     };
     let name = word.value.text();
     if name != "re" {
@@ -2296,7 +2342,7 @@ fn truthy(value: &Value) -> bool {
         Value::Boolean(value) => *value,
         Value::List(v) => !v.is_empty(),
         Value::Map(v) => !v.is_empty(),
-        Value::Regex(_) | Value::Glob(_) => true,
+        Value::Regex(_) | Value::Glob(_) | Value::Function(_) => true,
     }
 }
 
@@ -2391,7 +2437,11 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
                 Value::String(needle) => bool_value(text.contains(&needle)),
                 _ => return Err("left operand of `in` must be a string".into()),
             },
-            Value::Integer(_) | Value::Boolean(_) | Value::Regex(_) | Value::Glob(_) => {
+            Value::Integer(_)
+            | Value::Boolean(_)
+            | Value::Regex(_)
+            | Value::Glob(_)
+            | Value::Function(_) => {
                 return Err("right operand of `in` must be a collection or string".into());
             }
         },
@@ -3072,7 +3122,25 @@ fn call_func_for_value(
     else {
         unreachable!("call_func_for_value is only reached for a declared function");
     };
+    call_signature_for_value(name, &params, &body, arguments, last, in_function, shell)
+}
 
+/// The body of [`call_func_for_value`], over a signature and body rather than a
+/// name in the function store — a lambda has the same two, reached through the
+/// variable it is bound to (`$double(5)`), and calls identically.
+///
+/// `name` names the callee in diagnostics only: the declared name for a `func`,
+/// the variable read for a lambda.
+#[allow(clippy::too_many_arguments)]
+fn call_signature_for_value(
+    name: &str,
+    params: &[parser::Param],
+    body: &parser::Source,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
     // Copied, not taken: an argument body records results of its own
     // (`f(if c { a; b })`), and those belong to neither the caller nor the callee,
     // so the copy is put back on every path below. The caller's own result stays
@@ -3088,7 +3156,7 @@ fn call_func_for_value(
     // rather than entering the callee cleanup below, which would normalize a
     // `return` into this call's value. Loop state stays the caller's until the
     // call itself begins, so an argument's `break` belongs to the caller's loop.
-    let scanned = evaluate_value_arguments(name, &params, arguments, last, in_function, shell);
+    let scanned = evaluate_value_arguments(name, params, arguments, last, in_function, shell);
     // A `break`/`continue` an argument raised belongs to the caller's loop, so it
     // is checked before the argument outcome — an out-of-loop one arrives as an
     // error *and* leaves the flag set, and both need answering together.
@@ -3120,13 +3188,13 @@ fn call_func_for_value(
     shell.result = Value::String(String::new());
     shell.produced = Produced::Status;
     shell.vars.push_scope();
-    let outcome = match bind_scanned(name, &params, positionals, switches_on, flag_values, shell) {
+    let outcome = match bind_scanned(name, params, positionals, switches_on, flag_values, shell) {
         Ok(()) => {
             // A default body may itself have produced a result; that belongs to
             // the setup, so the body starts from nothing too.
             shell.result = Value::String(String::new());
             shell.produced = Produced::Status;
-            eval_body(&body, 0, true, shell)
+            eval_body(body, 0, true, shell)
         }
         Err(step) => Err(step),
     };
