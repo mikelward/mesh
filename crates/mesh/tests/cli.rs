@@ -1982,6 +1982,26 @@ fn a_job_that_leaves_promotes_the_one_behind_it() {
 }
 
 #[test]
+fn recency_survives_the_current_job_leaving() {
+    // Promoting `%-` needs a *third* job to fill the slot it vacates, and once
+    // `bg` has moved jobs forward the table's own order no longer says which.
+    // Four jobs resumed as 2, 1, 3 leave recency `3 1 2 4`: after job 3 is
+    // waited for, `%+` is 1 and `%-` is 2 — while reading the third-most-recent
+    // back off registration order picked job 4, which nothing had touched.
+    //
+    // The jobs outlive the `bg` calls so their process groups are still there
+    // to signal, and each carries its own status so the statuses say which job
+    // every sigil actually picked.
+    let out = run_with_input(
+        "sh -c 'sleep 0.4; exit 1' &\nsh -c 'sleep 0.4; exit 2' &\nsh -c 'sleep 0.4; exit 3' &\nsh -c 'sleep 0.4; exit 4' &\nbg 2\nbg 1\nbg 3\nwait %+\nputs head=$sh.status\nwait %-\nputs behind=$sh.status\nwait %+\nputs promoted=$sh.status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "head=3\nbehind=2\npromoted=1\n"
+    );
+}
+
+#[test]
 fn a_percent_prefix_names_the_most_recent_matching_command() {
     // The most recent match, not the first: two jobs start with `sh`, and the
     // later one is what `%sh` means.
