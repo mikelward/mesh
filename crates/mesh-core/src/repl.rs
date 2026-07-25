@@ -1348,6 +1348,8 @@ struct Redir {
     fd: Option<u32>,
     /// True for `N>&M`, where the target names a descriptor rather than a path.
     duplicate: bool,
+    /// A heredoc body, whose delimiter also decides whether it interpolates.
+    heredoc: Option<parser::HeredocBody>,
     target: Word,
 }
 
@@ -1376,7 +1378,10 @@ fn run_ast_pipeline(
             match item {
                 parser::CommandItem::Word(word) => words.push(expansion_word(&word.value)),
                 parser::CommandItem::Redirect {
-                    kind, fd, target, ..
+                    kind,
+                    fd,
+                    target,
+                    body,
                 } => {
                     let target = expansion_word(&target.value);
                     match kind {
@@ -1388,18 +1393,29 @@ fn run_ast_pipeline(
                                 kind: exec::RedirKind::Out,
                                 fd: Some(1),
                                 duplicate: false,
+                                heredoc: None,
                                 target,
                             });
                             redirs.push(Redir {
                                 kind: exec::RedirKind::Out,
                                 fd: Some(2),
                                 duplicate: true,
+                                heredoc: None,
                                 target: one_word("1"),
                             });
                         }
                         parser::RedirectKind::Heredoc => {
-                            note!("mesh: heredoc execution is not supported yet");
-                            return Step::Continue(1);
+                            let Some(body) = body else {
+                                note!("mesh: heredoc: missing body");
+                                return Step::Continue(1);
+                            };
+                            redirs.push(Redir {
+                                kind: exec::RedirKind::In,
+                                fd: Some(0),
+                                duplicate: false,
+                                heredoc: Some(body.value.clone()),
+                                target,
+                            });
                         }
                         // The duplication kinds stay split by side so an absent
                         // `N` takes the direction's descriptor: `>&2` retargets
@@ -1418,6 +1434,7 @@ fn run_ast_pipeline(
                                 parser::RedirectKind::DuplicateOut
                                     | parser::RedirectKind::DuplicateIn
                             ),
+                            heredoc: None,
                             target,
                         }),
                     }
@@ -1436,6 +1453,76 @@ fn run_ast_pipeline(
 /// Adapt a parser word at the expansion boundary without recreating source text.
 /// Quote modes map directly to the expansion layer's literal/expandable bit, so
 /// escaped and quoted pieces can never acquire syntax in a second lexer pass.
+/// Interpolate a heredoc body: `$…` references resolve and the double-quote
+/// escape set applies, and nothing else does.
+///
+/// Deliberately *not* `expand_word`: a body is data, so it is never tilde
+/// expanded, globbed, or word-split. Only the variable and escape rules a `"…"`
+/// string uses carry over, which is what an unquoted `<< END` promises in
+/// `DESIGN.md`.
+fn interpolate_heredoc(text: &str, vars: &Vars) -> Result<String, String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+            let simple = match next {
+                'n' => Some('\n'),
+                't' => Some('\t'),
+                'r' => Some('\r'),
+                'e' => Some('\u{1b}'),
+                '\\' => Some('\\'),
+                '"' => Some('"'),
+                '$' => Some('$'),
+                _ => None,
+            };
+            if let Some(decoded) = simple {
+                out.push(decoded);
+                i += 2;
+                continue;
+            }
+            if next == 'u'
+                && let Some((decoded, used)) = crate::lexer::parse_unicode_escape(&chars[i + 2..])
+            {
+                out.push(decoded);
+                i += 2 + used;
+                continue;
+            }
+            // An unknown escape stays as written. A body carries data — shell
+            // snippets, JSON, Windows paths — where a stray backslash is
+            // ordinary text, so rejecting it the way a `"…"` literal does would
+            // make the common case unusable.
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '$' {
+            // A malformed reference is a syntax error here exactly as it is in a
+            // `"…"` string — heredocs promise the same interpolation rules, so
+            // `${bad` cannot quietly become literal text.
+            let parsed = crate::lexer::parse_var(&chars, i + 1)
+                .map_err(|error| format!("heredoc: {error}"))?;
+            if let Some((_, next)) = parsed
+                && next > i + 1
+            {
+                // `parse_var` finds where the reference ends; the reference itself is
+                // built by the same path a double-quoted `$…` takes, so a heredoc and
+                // a string agree on what `$m.key[0]:upper` means.
+                let source: String = chars[i..next].iter().collect();
+                let reference = expansion_variable(&source, parser::QuoteMode::Double);
+                out.push_str(&expand::resolve(&reference, vars).map_err(|e| e.to_string())?);
+                i = next;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    Ok(out)
+}
+
 fn expansion_word(word: &parser::Word) -> Word {
     Word(
         word.pieces
@@ -3045,7 +3132,7 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
     // targets apply to the shell's own descriptors around the call, so there is
     // nothing to configure on a child.
     let builtin = builtins::is_builtin(&argv[0]);
-    let opened = match expand_redirs(redirs, &shell.vars) {
+    let opened = match expand_redirs_for(redirs, &shell.vars, background) {
         Ok(redirs) => redirs,
         Err(err) => {
             note!("mesh: {err}");
@@ -3140,7 +3227,7 @@ fn run_multi(stages: Vec<Stage>, background: bool, last: u8, shell: &mut Shell) 
             };
             (argv, body)
         };
-        let opened = match expand_redirs(redirs, &shell.vars) {
+        let opened = match expand_redirs_for(redirs, &shell.vars, background) {
             Ok(redirs) => redirs,
             Err(err) => {
                 note!("mesh: {err}");
@@ -3246,8 +3333,43 @@ fn run_stage_in_shell(body: &StageBody, cmd: &exec::Cmd, last: u8, shell: &mut S
 /// Expand each redirection target to exactly one path. Zero or several words is
 /// an ambiguous redirect (a glob/list target is not a single file).
 fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirection>, String> {
+    expand_redirs_for(redirs, vars, false)
+}
+
+/// [`expand_redirs`], told whether the command will be backgrounded.
+///
+/// A background external defers its opens to a helper process reached through
+/// argv, and a heredoc body cannot travel that way: it is arbitrary text, so a
+/// large one exceeds the argument limit and an embedded NUL cannot be
+/// represented at all. Refusing is what the executor already assumed.
+fn expand_redirs_for(
+    redirs: Vec<Redir>,
+    vars: &Vars,
+    background: bool,
+) -> Result<Vec<exec::Redirection>, String> {
+    if background && redirs.iter().any(|redir| redir.heredoc.is_some()) {
+        return Err("a heredoc cannot be backgrounded yet".to_owned());
+    }
     let mut out = Vec::with_capacity(redirs.len());
     for redir in redirs {
+        if let Some(body) = redir.heredoc {
+            // The delimiter is *syntactic* — the parser already used it to find
+            // the body, and only its quoting reaches here. Expanding it would
+            // make `<< $missing` an unbound-variable error and `<< *` an
+            // ambiguous redirect depending on the directory, for a word whose
+            // expansion is then thrown away.
+            let text = if body.raw {
+                body.text
+            } else {
+                interpolate_heredoc(&body.text, vars)?
+            };
+            out.push(exec::Redirection {
+                fd: libc::STDIN_FILENO,
+                kind: exec::RedirKind::In,
+                target: exec::RedirTarget::Heredoc(text),
+            });
+            continue;
+        }
         let mut words = expand::expand(vec![redir.target], vars).map_err(|e| e.to_string())?;
         if words.len() != 1 {
             return Err(format!(

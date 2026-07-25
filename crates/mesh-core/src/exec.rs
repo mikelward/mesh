@@ -11,7 +11,7 @@ use std::io::IsTerminal;
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirKind {
@@ -28,6 +28,10 @@ pub enum RedirTarget {
     /// Another descriptor, whose destination *at this point in the sequence* is
     /// copied — `2>&1` takes wherever stdout goes by then.
     Descriptor(libc::c_int),
+    /// A heredoc body, already interpolated. It becomes an unlinked temporary
+    /// file rather than a pipe, so a body larger than the pipe buffer cannot
+    /// deadlock the shell against a command that has not started reading.
+    Heredoc(String),
 }
 
 /// One redirection: which descriptor it retargets, in which direction, and what
@@ -992,6 +996,10 @@ fn background_redirect_command(
     // the target is a path or another descriptor both survive the hand-off.
     for Redirection { fd, kind, target } in &cmd.redirs {
         command.arg(match (kind, target) {
+            // A heredoc body cannot cross as argv — it is arbitrary text, and the
+            // helper would have to re-quote it. Backgrounding one is refused
+            // earlier instead.
+            (_, RedirTarget::Heredoc(_)) => "heredoc",
             (_, RedirTarget::Descriptor(_)) => "dup",
             (RedirKind::In, _) => "in",
             (RedirKind::Out, _) => "out",
@@ -1001,6 +1009,7 @@ fn background_redirect_command(
         command.arg(match target {
             RedirTarget::Path(path) => path.clone(),
             RedirTarget::Descriptor(from) => from.to_string(),
+            RedirTarget::Heredoc(body) => body.clone(),
         });
     }
     command.args(&cmd.words);
@@ -1039,6 +1048,7 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
                 };
                 (RedirKind::Out, RedirTarget::Descriptor(from))
             }
+            "heredoc" => (RedirKind::In, RedirTarget::Heredoc(triple[2].clone())),
             _ => return std::process::ExitCode::from(1),
         };
         redirs.push(Redirection { fd, kind, target });
@@ -1239,6 +1249,7 @@ pub(crate) fn with_redirections<T>(
             .map(|redir| match &redir.target {
                 RedirTarget::Path(path) => path.clone(),
                 RedirTarget::Descriptor(from) => format!("&{from}"),
+                RedirTarget::Heredoc(_) => "<<".to_owned(),
             })
             .unwrap_or_default()
     };
@@ -1436,6 +1447,48 @@ fn sources_to_files(
     Ok(files)
 }
 
+/// Spill a heredoc body into a temporary file, rewound and unlinked.
+///
+/// Unlinking immediately means the file has no name for anything else to reach,
+/// and disappears when the last descriptor closes — so a command that outlives
+/// the shell still reads its input, and nothing is left behind if it does not.
+fn heredoc_file(body: &str) -> std::io::Result<File> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    // The pid keeps concurrent shells apart and the counter keeps heredocs
+    // within one shell apart, including the concurrent opens of one pipeline's
+    // stages. An address would not: two empty bodies share one sentinel pointer,
+    // so `cat << A | cat << B` with empty bodies raced for a single name.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let mut file = loop {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mesh-heredoc-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                // Unlink at once: nothing can reach it by name while it is in
+                // use, and it disappears when the last descriptor closes.
+                let _ = std::fs::remove_file(&path);
+                break file;
+            }
+            // A leftover from an earlier shell with the same pid; take the next.
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    file.write_all(body.as_bytes())?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
+}
+
 /// Duplicate one of the shell's own descriptors into an owned `File`.
 fn dup_shell_fd(fd: libc::c_int) -> std::io::Result<File> {
     // SAFETY: `fd` is one of the standard descriptors, and `dup` returns a fresh
@@ -1459,6 +1512,9 @@ fn open_paths(redirs: &[Redirection]) -> Result<Vec<Option<File>>, (String, std:
     for Redirection { kind, target, .. } in redirs {
         opened.push(match target {
             RedirTarget::Descriptor(_) => None,
+            RedirTarget::Heredoc(body) => {
+                Some(heredoc_file(body).map_err(|e| ("<<".to_owned(), e))?)
+            }
             RedirTarget::Path(path) => {
                 let file = match kind {
                     RedirKind::In => File::open(path),
@@ -1488,11 +1544,17 @@ fn resolve_sources(
     let mut state = seed;
     for (redir, file) in redirs.iter().zip(opened) {
         state[redir.fd as usize] = match (&redir.target, file) {
-            (RedirTarget::Path(_), Some(file)) => Source::File(file),
+            (RedirTarget::Path(_) | RedirTarget::Heredoc(_), Some(file)) => Source::File(file),
             (RedirTarget::Path(path), None) => {
                 return Err((
                     path.clone(),
                     std::io::Error::other("redirection target was not opened"),
+                ));
+            }
+            (RedirTarget::Heredoc(_), None) => {
+                return Err((
+                    "<<".to_owned(),
+                    std::io::Error::other("heredoc body was not opened"),
                 ));
             }
             (RedirTarget::Descriptor(from), _) => state[*from as usize]

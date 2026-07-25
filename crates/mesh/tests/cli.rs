@@ -6494,3 +6494,182 @@ fn quoting_a_greater_amp_target_makes_it_a_filename() {
     assert!(text.contains('O') && text.contains('E'), "{text:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Heredocs (`<< END … END`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unquoted_heredoc_interpolates_its_body() {
+    let out = run_with_input("name = world\ncat << END\nhello $name\nEND\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hello world\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The same reference forms a double-quoted string takes, so the two cannot
+    // disagree about what a reference means.
+    let out = run_with_input("m = [k: v]\nxs = [a b]\ncat << END\n$m.k $xs[1] $xs:len\nEND\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v b 2\n");
+}
+
+#[test]
+fn a_quoted_delimiter_makes_the_body_raw() {
+    // The bash convention, kept in DESIGN.md: quoting the delimiter turns off
+    // interpolation *and* escapes, which is what makes a heredoc usable for
+    // shell snippets and regexes.
+    let out = run_with_input("name = world\ncat << 'END'\nhello $name and \\n\nEND\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hello $name and \\n\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn an_unquoted_body_takes_the_double_quote_escapes() {
+    let out = run_with_input("cat << END\na\\tb\nEND\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\tb\n");
+
+    // An unknown escape stays literal rather than erroring: a body carries data
+    // — regexes, Windows paths — where a stray backslash is ordinary text.
+    let out = run_with_input("cat << END\n\\d+ C:\\path\nEND\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\\d+ C:\\path\n");
+}
+
+#[test]
+fn a_heredoc_is_buffered_until_its_delimiter_arrives() {
+    // The reader takes one line at a time, so an open heredoc has to report
+    // "incomplete" rather than failing on sight — every interactive and piped
+    // use depends on it. A following command still runs.
+    let out = run_with_input("cat << END\nbody\nEND\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "body\nafter\n");
+
+    // An unterminated *quote* is still a hard error at end of input, since it
+    // cannot be continued on the next line.
+    let out = run_with_input("puts 'unterminated\nputs after\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("syntax error"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_heredoc_body_can_exceed_a_pipe_buffer() {
+    // Bodies become a temporary file rather than a pipe, so one larger than the
+    // 64 KiB pipe buffer cannot deadlock the shell against a command that has
+    // not started reading yet.
+    let mut source = String::from("wc -l << END\n");
+    for i in 0..20_000 {
+        source.push_str(&format!("line {i}\n"));
+    }
+    source.push_str("END\n");
+    let out = run_with_input(&source);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "20000",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_heredoc_leaves_no_file_behind() {
+    // The temporary is unlinked as soon as it is opened, so nothing survives the
+    // command and nothing is reachable by name while it runs.
+    let before = std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("mesh-heredoc-")
+        })
+        .count();
+    let out = run_with_input("cat << END\nbody\nEND\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "body\n");
+    let after = std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("mesh-heredoc-")
+        })
+        .count();
+    assert_eq!(before, after, "a heredoc temporary was left behind");
+}
+
+#[test]
+fn a_heredoc_delimiter_is_never_expanded() {
+    // The parser has already used the delimiter to find the body, and only its
+    // quoting reaches execution — so expanding it would turn a perfectly good
+    // `<< $missing` into an unbound-variable error for a word whose expansion is
+    // then discarded.
+    let out = run_with_input("cat << $missing\nbody\n$missing\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "body\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_malformed_reference_in_a_heredoc_is_an_error() {
+    // A heredoc promises a string's interpolation rules, so `${bad` cannot
+    // quietly become literal text when `"${bad"` is a syntax error.
+    let out = run_with_input("cat << END\n${bad\nEND\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("interpolation"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // A quoted delimiter takes no interpolation at all, so the same text is data.
+    let out = run_with_input("cat << 'END'\n${bad\nEND\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "${bad\n");
+}
+
+#[test]
+fn backgrounding_a_heredoc_is_refused_rather_than_truncated() {
+    // A background external defers its opens to a helper reached through argv,
+    // and a body cannot travel that way: a large one exceeds the argument limit
+    // and an embedded NUL cannot be represented at all.
+    let out = run_with_input("cat << END &\nbody\nEND\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("backgrounded"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn concurrent_heredocs_get_distinct_temporary_files() {
+    // Stages open their redirections concurrently, and empty bodies gave no
+    // distinguishing information of their own, so the names have to be unique by
+    // construction rather than by content.
+    let mut source = String::new();
+    let stages: Vec<String> = (0..40).map(|i| format!("cat << D{i}")).collect();
+    source.push_str(&stages.join(" | "));
+    source.push('\n');
+    for i in 0..40 {
+        source.push_str(&format!("D{i}\n"));
+    }
+    let out = run_with_input(&source);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("File exists"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -544,7 +544,21 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
 /// Parse a buffered input unit. An open delimiter or trailing operator returns
 /// [`ParseOutcome::Incomplete`]; malformed complete input returns an error.
 pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
-    let tokens = tokenize(source)?;
+    // A heredoc whose delimiter has not arrived yet is reported by the
+    // *tokenizer*, before parsing begins, so it needs the same
+    // buffer-rather-than-fail reading an open brace gets from the arm below.
+    // Without this the line-at-a-time reader rejects `cat << END` on sight,
+    // which is every interactive and piped use of a heredoc.
+    let tokens = match tokenize(source) {
+        Ok(tokens) => tokens,
+        // Only the heredoc case. An unterminated quote or `${` is a genuine
+        // syntax error even at end of input — those cannot be continued on the
+        // next line, and buffering them would swallow the diagnostic.
+        Err(error) if matches!(error.kind, ParseErrorKind::Unterminated('<')) => {
+            return Ok(ParseOutcome::Incomplete);
+        }
+        Err(error) => return Err(error),
+    };
     let open_block = tokens
         .iter()
         .fold(0_usize, |depth, token| match token.value {

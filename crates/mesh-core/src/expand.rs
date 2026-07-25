@@ -411,7 +411,7 @@ fn glob_pattern(pieces: &Pieces) -> String {
 /// access, indexing, and modifiers work through the usual paths. `$name` reads
 /// the variable store (unbound is an error). Member access on any namespace
 /// other than `env` and `sh`, and a bare `$env`, are not supported yet.
-fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
+pub(crate) fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
     match resolve_value(vref, vars)? {
         Value::String(value) => Ok(value),
         Value::Integer(value) => Ok(value.to_string()),
