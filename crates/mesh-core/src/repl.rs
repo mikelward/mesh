@@ -1417,7 +1417,7 @@ fn run_forked_block(body: &parser::Source, last: u8, in_function: bool, shell: &
     // boundary, so whatever the surrounding code had produced is not passed off
     // as this block's own.
     shell.produced = Produced::Status;
-    let status = exec::fork_and_wait(|| {
+    let status = exec::fork_and_wait(shell.vars.interactive(), || {
         // Runs after the fork, so this marks the *child's* copy of the shell:
         // it is not the parent of the pids in the job table it inherited, so
         // `jobs` must not `waitpid` on them — that fails with `ECHILD` and

@@ -266,6 +266,11 @@ impl Vars {
         self.interactive = interactive;
     }
 
+    /// Whether this session is interactive, as recorded above.
+    pub fn interactive(&self) -> bool {
+        self.interactive
+    }
+
     /// Replace the outermost input — the one the invocation itself established.
     pub fn set_origin(&mut self, origin: Origin, source: String) {
         self.inputs = vec![Input { origin, source }];
