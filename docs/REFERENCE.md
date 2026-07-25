@@ -336,6 +336,7 @@ one-MiB output cap.
 | `fg [job]` | Resume a job in the foreground and wait for it. No argument takes the most recent job. |
 | `bg [job]` | Resume a stopped job in the background. No argument takes the most recent job. |
 | `wait job` | Wait for a job to finish and report its status — see [Job control](#job-control). |
+| `kill [-signal] job\|pid …` | Signal a job's process group, or a pid. Default `TERM`. |
 
 ### Job control
 
@@ -355,6 +356,42 @@ it displaces becomes the previous one. When the current job leaves the table the
 previous is promoted, and the job behind that fills the `%-` it vacated, so both
 sigils keep meaning something without being repointed by hand. `fg` and `bg` take
 the current job when given none.
+
+**A job handle is a reference you can hold.** `j = cmd &` binds the job itself
+rather than the status of launching it, so `$j.pid` is mesh's replacement for
+bash's `$!`:
+
+```mesh
+j = make -j8 &
+puts $j.pid                     # the process group leader
+puts $j.state                   # running … and later, done
+wait $j                         # the handle is a job reference
+```
+
+Reading a member resolves the handle against the **live** table, so `$j.state`
+moves on with the job instead of freezing as it was when bound. `$sh.jobs[2]` is
+a handle in the same sense, and both reach `fg`, `bg`, `wait` and `kill`.
+
+A handle has **no byte form** — `puts $j` is a loud error, the same way a stream
+handle or a regex is. That is not tidiness: it is what makes `kill $j` a job and
+`kill 49001` a pid, with nothing left to guess between them.
+
+Waiting for a job takes it out of the table, so a handle can outlive what it
+names; `$j.status` then reports that the job is gone rather than a stale record.
+The status is `wait`'s own result — read it from `$sh.status`.
+
+**`kill`** takes any of these references, or a bare pid:
+
+```mesh
+kill $j                         # the job's whole process group, with TERM
+kill -9 %+                      # -9, -KILL, -SIGKILL and -s KILL all work
+kill 49001                      # a pid — just that process
+```
+
+A **job** signals its whole process group, since a pipeline is several processes
+and signalling only the leader leaves the rest running. A **pid** signals only
+that process. Each target is signalled independently, so one bad name does not
+stop the rest.
 
 An **id wins over a prefix**, so `%1` is job 1 rather than a command that happens
 to start with `1`. A bare `%` names no job, and neither does a prefix nothing

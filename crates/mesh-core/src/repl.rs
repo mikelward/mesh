@@ -104,6 +104,9 @@ impl Shell {
                     (
                         job.id.to_string(),
                         Value::Map(vec![
+                            // Carried in the record as well as being the key: a
+                            // handle reaches its record without one.
+                            ("id".to_owned(), Value::Integer(job.id as i64)),
                             ("pid".to_owned(), Value::Integer(i64::from(job.pid))),
                             ("cmd".to_owned(), Value::String(job.command)),
                             ("state".to_owned(), Value::String(job.state.to_owned())),
@@ -2400,6 +2403,7 @@ fn eval_expr(
                     | Value::Regex(_)
                     | Value::Glob(_)
                     | Value::Stream(_)
+                    | Value::Job(_)
                     | Value::Function(_) => runtime_error("cannot slice a scalar value"),
                     Value::Map(_) => runtime_error("cannot slice a map value"),
                 };
@@ -2430,6 +2434,7 @@ fn eval_expr(
                 | Value::Regex(_)
                 | Value::Glob(_)
                 | Value::Stream(_)
+                | Value::Job(_)
                 | Value::Function(_) => runtime_error("cannot index a scalar value"),
                 Value::Map(entries) => {
                     let key = match index_value {
@@ -2494,10 +2499,24 @@ fn eval_expr(
             iterable,
             body,
         } => eval_for_expr(bindings, iterable, body, last, in_function, shell),
-        E::BackgroundJob(pipeline) => match run_ast_pipeline(pipeline, true, last, shell) {
-            Step::Continue(code) => Ok(Value::Integer(i64::from(code))),
-            step => Err(step),
-        },
+        E::BackgroundJob(pipeline) => {
+            // The handle is the whole point of `j = cmd &`: `$j.pid` is mesh's
+            // replacement for bash's `$!`, and `$j` is what `fg` / `wait` /
+            // `kill` take. Which job the launch created is read off the table
+            // rather than threaded back through the pipeline's status.
+            let launched = shell.jobs.next_id();
+            match run_ast_pipeline(pipeline, true, last, shell) {
+                // A launch that registered nothing — inside a forked stage, or
+                // one that failed before it had a process group — has no handle
+                // to give, so the status stands in as it did before.
+                Step::Continue(code) => Ok(if shell.jobs.holds(launched) {
+                    Value::Job(launched)
+                } else {
+                    Value::Integer(i64::from(code))
+                }),
+                step => Err(step),
+            }
+        }
         E::Capture(source) => capture_source(source, last, in_function, shell),
         E::Range {
             start,
@@ -2850,7 +2869,7 @@ fn value_kind(value: &Value) -> &'static str {
         Value::Map(_) => "a map",
         Value::Regex(_) => "a regex",
         Value::Glob(_) => "a glob",
-        Value::Stream(_) => "a stream handle",
+        Value::Stream(_) | Value::Job(_) => "a stream handle",
         Value::Function(_) => "a function",
     }
 }
@@ -3389,6 +3408,10 @@ fn argv_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
             runtime_error(format!("{name}: a pattern cannot be a command argument"))
         }
         Value::Stream(_) => runtime_error(format!("{name}: a stream handle has no text form")),
+        // The handle is the *reference*: `kill` and the job builtins take one
+        // directly, which is exactly why it never becomes bytes for anything
+        // else — `kill $j` is a job where `kill 49001` is a pid.
+        Value::Job(_) => runtime_error(format!("{name}: a job handle has no text form")),
         Value::Function(_) => runtime_error(format!("{name}: a function value has no text form")),
     }
 }
@@ -3669,7 +3692,13 @@ fn truthy(value: &Value) -> bool {
         Value::Boolean(value) => *value,
         Value::List(v) => !v.is_empty(),
         Value::Map(v) => !v.is_empty(),
-        Value::Regex(_) | Value::Glob(_) | Value::Stream(_) | Value::Function(_) => true,
+        // A handle exists, which is all truthiness asks; `$j.state` is the
+        // question to ask about a job, not whether the handle is "set".
+        Value::Regex(_)
+        | Value::Glob(_)
+        | Value::Stream(_)
+        | Value::Job(_)
+        | Value::Function(_) => true,
     }
 }
 
@@ -3769,6 +3798,7 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
+            | Value::Job(_)
             | Value::Function(_) => {
                 return Err("right operand of `in` must be a collection or string".into());
             }
@@ -4221,6 +4251,28 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         };
         return dispatch_function_call(&name, args, shell);
     }
+    // A job builtin takes a job *reference*, and a handle is one — so its
+    // arguments keep their values instead of going through the argv rule, which
+    // rightly refuses a handle as bytes. Being able to pass `$j` back is the
+    // point of binding it in the first place.
+    if let Some(name) = command_name(&tokens, &shell.vars)
+        && matches!(name.as_str(), "fg" | "bg" | "wait" | "kill")
+    {
+        let arg_words: Vec<Word> = tokens.into_iter().skip(1).collect();
+        let values = match expand::expand_values(arg_words, &shell.vars) {
+            Ok(values) => values,
+            Err(err) => {
+                note!("mesh: {err}");
+                return Step::Continue(1);
+            }
+        };
+        let mut words = vec![name.clone()];
+        match job_reference_words(values, &name) {
+            Ok(references) => words.extend(references),
+            Err(step) => return step,
+        }
+        return run_expanded(words, last, shell);
+    }
     let words = match expand::expand(tokens, &shell.vars) {
         Ok(words) => words,
         Err(err) => {
@@ -4229,6 +4281,39 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         }
     };
     run_expanded(words, last, shell)
+}
+
+/// The reference words a job builtin understands, from its evaluated arguments.
+///
+/// A handle becomes **`%id`** rather than a bare id on purpose: `fg 2` and
+/// `fg %2` mean the same job, but for `kill` a bare number is a *pid*, and `$j`
+/// must never be able to arrive as one. Everything else takes the ordinary argv
+/// rule, so `%+`, `-9` and a literal pid pass straight through.
+fn job_reference_words(values: Vec<Value>, name: &str) -> Result<Vec<String>, Step> {
+    let mut words = Vec::new();
+    for value in values {
+        match value {
+            Value::Job(id) => words.push(format!("%{id}")),
+            // `DESIGN.md` makes `$sh.jobs[2]` a handle as well. Its record
+            // carries the id that the map key holds for the table's own reads.
+            Value::Map(entries) => {
+                let id = entries
+                    .iter()
+                    .find_map(|(key, value)| match (key.as_str(), value) {
+                        ("id", Value::Integer(id)) => Some(*id),
+                        _ => None,
+                    });
+                match id {
+                    Some(id) => words.push(format!("%{id}")),
+                    None => {
+                        return runtime_error(format!("{name}: a map is not a job"));
+                    }
+                }
+            }
+            other => words.extend(argv_words(&other, name)?),
+        }
+    }
+    Ok(words)
 }
 
 /// Run a command whose words are already expanded: `return`, generated help, the
@@ -4262,7 +4347,7 @@ fn run_expanded(words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     // on them or hand them the terminal — the same answer bash gives in a
     // subshell.
     let job_status = match words[0].as_str() {
-        "fg" | "bg" | "wait" if shell.forked => {
+        "fg" | "bg" | "wait" | "kill" if shell.forked => {
             note!("mesh: {}: no job control in a pipeline stage", words[0]);
             Some(1)
         }
@@ -4272,6 +4357,7 @@ fn run_expanded(words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
             let interactive = shell.vars.interactive();
             Some(shell.jobs.wait(&words[1..], interactive))
         }
+        "kill" => Some(shell.jobs.kill(&words[1..])),
         "jobs" => Some(shell.jobs.list(&words[1..], !shell.forked)),
         _ => None,
     };

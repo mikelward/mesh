@@ -2074,6 +2074,127 @@ fn unusable_job_references_say_so() {
 }
 
 #[test]
+fn a_background_assignment_binds_a_job_handle() {
+    // `j = cmd &` binds the job, not the status of launching it: `$j.pid` is
+    // mesh's replacement for bash's `$!`.
+    let out = run_with_input(
+        "j = sh -c 'sleep 0.3; exit 7' &\nputs id=$j.id\nputs same=$sh.jobs[1].pid/$j.pid\nputs cmd=$j.cmd\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("id=1\n"), "{stdout}");
+    let pids = stdout.lines().nth(1).expect("same= line");
+    let (left, right) = pids["same=".len()..].split_once('/').expect("two pids");
+    assert_eq!(left, right, "the handle and the table disagree: {stdout}");
+    assert!(stdout.contains("cmd=sh -c sleep 0.3; exit 7"), "{stdout}");
+}
+
+#[test]
+fn a_job_handle_reads_the_job_as_it_is_now() {
+    // The whole point of a handle over a captured record: `$j.state` is answered
+    // from the table at the moment it is read, so it moves on with the job.
+    let out = run_with_input(
+        "j = sh -c 'sleep 0.2; exit 7' &\nputs first=$j.state\nsleep 0.5\nputs then=$j.state status=$j.status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first=running\nthen=done status=7\n"
+    );
+}
+
+#[test]
+fn a_job_handle_has_no_text_form() {
+    // Like a stream handle, and for a reason beyond tidiness: it is what keeps
+    // `kill $j` a job where `kill 49001` is a pid, without either guessing.
+    let out = run_with_input("j = sleep 9 &\nputs $j\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("a job handle has no text form"),
+        "{:?}",
+        out.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_handle_is_a_job_reference() {
+    // `DESIGN.md` makes both spellings a handle, and both have to reach the job
+    // builtins as one — a handle is refused as an argument everywhere else.
+    for reference in ["$j", "$sh.jobs[1]"] {
+        let out = run_with_input(&format!(
+            "j = sh -c 'sleep 0.1; exit 6' &\nwait {reference}\nputs status=$sh.status\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "status=6\n",
+            "{reference}"
+        );
+    }
+
+    // A map that is not a job record says so rather than being read for a pid.
+    let other = run_with_input("m = [a: 1]\nwait $m\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&other.stderr).contains("wait: a map is not a job"),
+        "{:?}",
+        other.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&other.stdout), "after\n");
+}
+
+#[test]
+fn a_handle_to_a_finished_job_says_the_job_is_gone() {
+    // Waiting takes the job out of the table, so the handle outlives what it
+    // names. That is reported rather than answered with a stale record — the
+    // status is `wait`'s own result, which is where to read it.
+    let out = run_with_input(
+        "j = sh -c 'exit 3' &\nwait $j\nputs waited=$sh.status\nputs $j.status\nputs after\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("job 1 is no longer in the job table"),
+        "{:?}",
+        out.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "waited=3\nafter\n");
+}
+
+#[test]
+fn kill_signals_a_job_or_a_pid() {
+    // A job means its whole process group; the default signal is TERM, so the
+    // job reports `128 + 15`.
+    let job = run_with_input("j = sleep 30 &\nkill $j\nwait $j\nputs status=$sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&job.stdout), "status=143\n");
+
+    // Every spelling of a signal a shell's `kill` takes.
+    for signal in ["-9", "-KILL", "-SIGKILL", "-s KILL"] {
+        let out = run_with_input(&format!(
+            "sleep 30 &\nkill {signal} %+\nwait %+\nputs status=$sh.status\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "status=137\n",
+            "{signal}"
+        );
+    }
+
+    // A bare number is a pid, which is the distinction the handle exists to
+    // keep: `kill 49001` never means a job.
+    let pid = run_with_input("sleep 30 &\nkill $sh.jobs[1].pid\nwait 1\nputs status=$sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&pid.stdout), "status=143\n");
+}
+
+#[test]
+fn kill_reports_what_it_cannot_do() {
+    for (line, needle) in [
+        ("kill", "kill: expected a job or a pid"),
+        ("sleep 9 &\nkill -NOPE %1", "kill: NOPE: invalid signal"),
+        ("sleep 9 &\nkill %9", "kill: %9: no such job"),
+    ] {
+        let out = run_with_input(&format!("{line}\nputs after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{line:?}: {stderr}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{line:?}");
+    }
+}
+
+#[test]
 fn wait_needs_a_job_to_wait_for() {
     // Bare `wait` is bash's "every child"; `fg`'s no-operand "the most recent
     // one" would read the same and mean something else, so it is refused until

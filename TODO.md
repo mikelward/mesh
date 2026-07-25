@@ -414,6 +414,34 @@ file as tasks land.
       visible in `fg` / `bg` / `%+` with no operand, and picking the wrong one of
       two simultaneously stopped jobs is recoverable with an explicit id.
       *(Raised by Codex review on #222.)*
+- [x] **Job handles.** `j = cmd &` binds the job rather than the status of
+      launching it, as a distinct `Value::Job` carrying the id. Reading a member
+      resolves it against the live table, so `$j.state` moves on with the job
+      instead of freezing as a record captured at bind time would; a bare `$j`
+      has **no byte form**, which is what keeps `kill $j` a job where
+      `kill 49001` is a pid. `$sh.jobs[2]` is a handle too, per `DESIGN.md`, so
+      the published record carries its `id`. The job builtins take either
+      spelling by expanding their arguments as *values*, with a handle arriving
+      as `%id` — the sigil form rather than a bare id, so it can never be read
+      as a pid.
+- [x] **`kill`**, taking the same job references `fg` / `bg` / `wait` take plus a
+      bare pid. A job signals its whole **process group**, since a pipeline is
+      several processes and signalling only the leader leaves the rest running; a
+      pid signals just that process. `-9`, `-KILL`, `-SIGKILL` and `-s KILL` all
+      name a signal, defaulting to `TERM`, and each target is signalled
+      independently so one bad name does not stop the rest.
+- [ ] **What a handle means once its job has left the table.** Waiting for a job
+      removes it, so `$j.status` afterwards reports `job 1 is no longer in the
+      job table` rather than the status it exited with — and `wait $j` is exactly
+      when you would want to ask. `wait`'s own result carries it (`$sh.status`),
+      so nothing is unreachable, but the handle going blind at the moment the job
+      finishes is a sharp edge on the `$!` replacement.
+      Retaining the final record is the obvious answer and needs three decisions:
+      **which** jobs to keep (only those a handle still names is unknowable, so
+      it is a cap or nothing), **how many** before the oldest is dropped, and
+      **where the record comes from** — the last published snapshot is not it,
+      since `wait` removes a job without publishing a `done` record first, so a
+      naive retain-on-disappearance would keep a stale `running`.
 - [ ] **The rest of `wait`.** `wait` with **no operand** — bash's "every child,
       with an aggregate status" — is refused rather than guessed at, since `fg`'s
       no-operand default means "the most recent one" and the two would read
