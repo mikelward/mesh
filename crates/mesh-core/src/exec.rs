@@ -32,6 +32,8 @@ pub enum RedirTarget {
     /// file rather than a pipe, so a body larger than the pipe buffer cannot
     /// deadlock the shell against a command that has not started reading.
     Heredoc(String),
+    /// `n>&-`: close the descriptor rather than pointing it anywhere.
+    Close,
 }
 
 /// One redirection: which descriptor it retargets, in which direction, and what
@@ -360,6 +362,8 @@ fn fork_in_shell(
     // too. Any *other* descriptor holding the pipe — stderr under `|&`
     // included — arrives in `extra_pipe_out`.
     stdout_to_pipe: bool,
+    // Descriptors `n>&-` closed, applied after every file is installed.
+    closed: Vec<libc::c_int>,
     interactive: bool,
     background: bool,
     process_group: Option<libc::pid_t>,
@@ -451,7 +455,7 @@ fn fork_in_shell(
                 installs.push((libc::STDERR_FILENO, file));
             }
             installs.extend(extra_files);
-            if install_descriptors(installs).is_err() {
+            if install_descriptors(installs, &closed).is_err() {
                 libc::_exit(1);
             }
 
@@ -476,7 +480,7 @@ fn fork_in_shell(
                         libc::_exit(1);
                     }
                 };
-                if install_descriptors(deferred).is_err() {
+                if install_descriptors(deferred, &[]).is_err() {
                     libc::_exit(1);
                 }
             }
@@ -660,6 +664,7 @@ pub fn run_pipeline(
         // so each is handed its own handle on the real one below.
         let extra_pipe_out = sources.extra_pipe_out();
         let extra_pipe_in = sources.extra_pipe_in();
+        let closed = sources.closed();
         let files = match sources_to_files(sources) {
             Ok(files) => files,
             Err((path, err)) => {
@@ -706,6 +711,7 @@ pub fn run_pipeline(
                 extra_files,
                 extra_pipe_out,
                 stdout_to_pipe,
+                closed.clone(),
                 interactive,
                 background,
                 process_group,
@@ -909,10 +915,11 @@ pub fn run_pipeline(
         // The files move into the closure, which is what keeps them open until
         // then; `dup2` clears `FD_CLOEXEC` on the descriptor it creates, so they
         // survive the exec that the originals would not.
-        if !extra_files.is_empty() {
+        if !extra_files.is_empty() || !closed.is_empty() {
             // Taken on the first call so the hook owns the handles and can close
             // each original once it is copied. `pre_exec` runs once.
             let mut pending = Some(extra_files);
+            let closing = closed.clone();
             // SAFETY: `install_descriptors` uses only `fcntl`, `dup2` and
             // `close`, all async-signal-safe, and allocates nothing — the bar
             // `pre_exec` sets, since the child may fork while another thread
@@ -920,7 +927,7 @@ pub fn run_pipeline(
             unsafe {
                 command.pre_exec(move || {
                     if let Some(files) = pending.take() {
-                        install_descriptors(files)?;
+                        install_descriptors(files, &closing)?;
                     }
                     Ok(())
                 });
@@ -1198,6 +1205,7 @@ fn background_redirect_command(
             // helper would have to re-quote it. Backgrounding one is refused
             // earlier instead.
             (_, RedirTarget::Heredoc(_)) => "heredoc",
+            (_, RedirTarget::Close) => "close",
             (_, RedirTarget::Descriptor(_)) => "dup",
             (RedirKind::In, _) => "in",
             (RedirKind::Out, _) => "out",
@@ -1206,6 +1214,7 @@ fn background_redirect_command(
         command.arg(fd.to_string());
         command.arg(match target {
             RedirTarget::Path(path) => path.clone(),
+            RedirTarget::Close => "-".to_owned(),
             RedirTarget::Descriptor(from) => from.to_string(),
             RedirTarget::Heredoc(body) => body.clone(),
         });
@@ -1241,16 +1250,20 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
                 };
                 (RedirKind::Out, RedirTarget::Descriptor(from))
             }
+            "close" => (RedirKind::Out, RedirTarget::Close),
             "heredoc" => (RedirKind::In, RedirTarget::Heredoc(triple[2].clone())),
             _ => return std::process::ExitCode::from(1),
         };
         redirs.push(Redirection { fd, kind, target });
     }
     let inherited = live_descriptors(&redirs);
+    let mut closing = Vec::new();
     let opened = match open_paths(&redirs, &inherited)
         .and_then(|files| resolve_sources(&redirs, files, inherited_seed()))
-        .and_then(sources_to_files)
-    {
+        .and_then(|sources| {
+            closing = sources.closed();
+            sources_to_files(sources)
+        }) {
         Ok(files) => files,
         Err((path, err)) => {
             note!("mesh: {path}: {err}");
@@ -1277,14 +1290,14 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
             other => extra_files.push((other, file)),
         }
     }
-    if !extra_files.is_empty() {
+    if !extra_files.is_empty() || !closing.is_empty() {
         let mut pending = Some(extra_files);
         // SAFETY: `install_descriptors` uses only async-signal-safe calls and
         // allocates nothing, the bar `pre_exec` sets.
         unsafe {
             command.pre_exec(move || {
                 if let Some(files) = pending.take() {
-                    install_descriptors(files)?;
+                    install_descriptors(files, &closing)?;
                 }
                 Ok(())
             });
@@ -1438,13 +1451,17 @@ pub(crate) fn with_redirections<T>(
         .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
         .collect();
 
-    let opened = sources_to_files(resolve_sources(
+    let sources = resolve_sources(
         redirs,
         // Distinct from `already_open` above: that is which *targets* the shell
         // holds, for the save; this is which descriptors a duplication may copy.
         open_paths(redirs, &live_descriptors(redirs))?,
         inherited_seed(),
-    )?)?;
+    )?;
+    // `n>&-` closes one of the shell's own descriptors for the body's duration,
+    // so it is saved and restored exactly as a redirected one is.
+    let closed = sources.closed();
+    let opened = sources_to_files(sources)?;
     // Anything already buffered belongs to the *previous* stdout.
     let _ = std::io::stdout().flush();
 
@@ -1458,6 +1475,7 @@ pub(crate) fn with_redirections<T>(
             .map(|redir| match &redir.target {
                 RedirTarget::Path(path) => path.clone(),
                 RedirTarget::Descriptor(from) => format!("&{from}"),
+                RedirTarget::Close => "&-".to_owned(),
                 RedirTarget::Heredoc(_) => "<<".to_owned(),
             })
             .unwrap_or_default()
@@ -1491,7 +1509,12 @@ pub(crate) fn with_redirections<T>(
         .unwrap_or(libc::STDERR_FILENO)
         .max(libc::STDERR_FILENO)
         .saturating_add(1);
-    for (target, _) in &opened {
+    for target in opened
+        .iter()
+        .map(|(fd, _)| *fd)
+        .chain(closed.iter().copied())
+    {
+        let target = &target;
         if !already_open.contains(target) {
             // Nothing had it: the redirection creates it, so the restore closes
             // it rather than putting something back.
@@ -1512,7 +1535,7 @@ pub(crate) fn with_redirections<T>(
     // that landed on another redirection's target is copied before it is
     // overwritten.
     let targets: Vec<libc::c_int> = opened.iter().map(|(fd, _)| *fd).collect();
-    if let Err(err) = install_descriptors(opened) {
+    if let Err(err) = install_descriptors(opened, &closed) {
         let target = targets.first().copied().unwrap_or(libc::STDERR_FILENO);
         restore(&mut swapped);
         return Err((path_for(target), err));
@@ -1622,6 +1645,10 @@ pub(crate) enum Source {
     PipeIn,
     /// An opened file.
     File(File),
+    /// Closed by `n>&-`. Distinct from "absent": the descriptor was named, so a
+    /// later duplication of it is `EBADF` rather than a copy of whatever the
+    /// shell happens to hold, and the child must actively close it.
+    Closed,
 }
 
 impl Source {
@@ -1633,6 +1660,7 @@ impl Source {
             Source::Null => Source::Null,
             Source::PipeOut => Source::PipeOut,
             Source::PipeIn => Source::PipeIn,
+            Source::Closed => Source::Closed,
             Source::File(file) => Source::File(file.try_clone()?),
         })
     }
@@ -1700,6 +1728,16 @@ impl Sources {
             // descriptor holding it.
             &[libc::STDOUT_FILENO],
         )
+    }
+
+    /// Descriptors `n>&-` closed, which the caller closes once the files it does
+    /// install are in place.
+    fn closed(&self) -> Vec<libc::c_int> {
+        self.0
+            .iter()
+            .filter(|(_, source)| matches!(source, Source::Closed))
+            .map(|(fd, _)| *fd)
+            .collect()
     }
 
     /// Descriptors holding the incoming pipe besides stdin, which the caller
@@ -1936,6 +1974,7 @@ fn open_paths(
                 }
                 None
             }
+            RedirTarget::Close => None,
             RedirTarget::Heredoc(body) => {
                 Some(heredoc_file(body).map_err(|e| ("<<".to_owned(), e))?)
             }
@@ -1948,9 +1987,12 @@ fn open_paths(
                 Some(file.map_err(|e| (path.clone(), e))?)
             }
         });
-        // Whatever it was, this redirection gives `fd` a destination, so a later
-        // duplication may copy it.
-        if !live.contains(fd) {
+        if matches!(target, RedirTarget::Close) {
+            // `n>&-` takes the descriptor away, so a later `m>&n` is `EBADF`.
+            live.retain(|live| live != fd);
+        } else if !live.contains(fd) {
+            // Whatever it was, this redirection gives `fd` a destination, so a
+            // later duplication may copy it.
             live.push(*fd);
         }
     }
@@ -2041,7 +2083,14 @@ fn resolve_sources(
             // Duplicating a descriptor nothing has opened is `EBADF`, the same
             // answer the kernel gives — a copy of nothing is not an inheritance
             // of the shell's own fd of that number.
+            (RedirTarget::Close, _) => Source::Closed,
             (RedirTarget::Descriptor(from), _) => match state.get(*from) {
+                Some(Source::Closed) | None if !inherited.contains(from) => {
+                    return Err((
+                        format!("&{from}"),
+                        std::io::Error::from_raw_os_error(libc::EBADF),
+                    ));
+                }
                 Some(source) => source.duplicate().map_err(|e| (format!("&{from}"), e))?,
                 // Not one this stage has touched, but one the shell holds — an
                 // enclosing `f 3> out` around a nested `4>&3`. The seed carries
@@ -2106,7 +2155,10 @@ fn install_descriptor(raw: libc::c_int, fd: libc::c_int) -> std::io::Result<()> 
 /// forked builtin or function — would otherwise hold a second handle on the same
 /// pipe for its whole life, and everything it starts inherits it, so a reader
 /// waits on a write end nothing is writing to.
-fn install_descriptors(mut files: Vec<(libc::c_int, File)>) -> std::io::Result<()> {
+fn install_descriptors(
+    mut files: Vec<(libc::c_int, File)>,
+    closed: &[libc::c_int],
+) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
     while !files.is_empty() {
         let ready = (0..files.len()).find(|&index| {
@@ -2139,6 +2191,15 @@ fn install_descriptors(mut files: Vec<(libc::c_int, File)>) -> std::io::Result<(
             // stage's descriptor, so dropping the handle would close it.
             std::mem::forget(file);
         }
+    }
+    // `n>&-`, applied last: a descriptor closed earlier could still have been a
+    // source another install had to read, and source order has already decided
+    // that nothing later copies this one.
+    for fd in closed {
+        // SAFETY: `close` takes a descriptor this process owns and is
+        // async-signal-safe. A descriptor that was not open is `EBADF`, which is
+        // the same nothing the redirection asked for.
+        unsafe { libc::close(*fd) };
     }
     Ok(())
 }

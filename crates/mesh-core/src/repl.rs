@@ -4103,6 +4103,10 @@ fn expand_redirs_for(
         }
         let word = words.pop().unwrap();
         let target = match redir.means {
+            // `2>&-` closes the descriptor rather than pointing it anywhere.
+            // Spelled out here rather than left to the number parse, so `-` is a
+            // meaning of its own and not a descriptor that failed to parse.
+            Means::Descriptor if word == "-" => exec::RedirTarget::Close,
             Means::Descriptor => {
                 // `2>&1`: the target names a descriptor, so it must read as one.
                 let from = word.parse::<i32>().map_err(|_| {

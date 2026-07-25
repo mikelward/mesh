@@ -2713,6 +2713,64 @@ fn a_redirection_needs_no_descriptor_to_spare() {
 }
 
 #[test]
+fn a_descriptor_can_be_closed_for_a_command() {
+    // `n>&-` takes the descriptor away rather than pointing it anywhere. Every
+    // route has to honour it, since each installs descriptors its own way — and
+    // the in-shell one must put the shell's own descriptor back afterwards, the
+    // way it does for a redirected one.
+    let dir = fresh_dir("close_descriptor");
+    let both = "sh -c 'echo out; echo err >&2'";
+
+    let out = run_with_input(&format!("{both} 2>&-\n"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("err"),
+        "stderr survived the close: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A function, whose redirections apply to the shell's own descriptors.
+    let out = run_with_input(&format!(
+        "func f() {{ {both} }}\nf 2>&-\nsh -c 'echo back >&2'\n"
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("err"), "{stderr}");
+    assert!(
+        stderr.contains("back"),
+        "fd 2 stayed closed after the redirection: {stderr}"
+    );
+
+    // A pipeline stage and a background command, the two routes that install
+    // descriptors somewhere other than the spawning shell.
+    let out = run_with_input(&format!("{both} 2>&- | cat\n"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("err"));
+
+    let sink = dir.join("bg.txt");
+    let out = run_with_input(&format!(
+        "sh -c 'echo out > {}; echo err >&2' 2>&- &\nsleep 0.4\n",
+        sink.to_string_lossy()
+    ));
+    assert_eq!(std::fs::read_to_string(&sink).unwrap_or_default(), "out\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("err"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Source order decides here too: a descriptor closed earlier is gone, so
+    // copying it afterwards is `EBADF` — the same answer bash gives.
+    let out = run_with_input("sh -c 'echo x' 3>&- 4>&3\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Bad file descriptor"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
 fn duplicating_an_unopened_descriptor_is_an_error() {
     // A copy of nothing is not an inheritance of the shell's own descriptor of
     // that number, so this is `EBADF` — the answer the kernel itself gives.

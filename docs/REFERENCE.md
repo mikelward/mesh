@@ -217,11 +217,21 @@ sh -c 'echo aside >&3' 3>&1 | cat      # fd 3 is the pipe onward
 puts fed | sh -c 'cat <&3' 3<&0        # fd 3 is the pipe feeding this stage
 ```
 
+**`n>&-` closes a descriptor** rather than pointing it anywhere, and it is
+restored when the redirection's scope ends:
+
+```mesh
+noisy 2>&-                             # discard stderr by taking it away
+func f() { helper 3>&- }               # the helper does not inherit fd 3
+f 3> trace.log
+```
+
 Redirections apply **in source order**, so a duplication copies where a
 descriptor points *at that moment* — `> out 2>&1` sends both to the file, while
 `2>&1 > out` copies stdout's original destination onto stderr and only then
 moves stdout. For the same reason, duplicating a descriptor nothing has opened
-yet is an error (`EBADF`), even if a later redirection would have opened it.
+yet is an error (`EBADF`), even if a later redirection would have opened it — and
+so is copying one that an earlier `n>&-` has closed.
 
 ### Heredocs
 
