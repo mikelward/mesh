@@ -93,6 +93,44 @@ command arg1 arg2 …
 
 An unknown command prints `command not found` and sets a failing status.
 
+### Heredocs
+
+`<< DELIM` feeds the following lines to a command's standard input, up to a line
+that is exactly `DELIM`:
+
+```mesh
+name = world
+cat << END
+hello $name
+END
+```
+
+An **unquoted** delimiter interpolates the body: `$…` references and the `"…"`
+escape set apply. Interpolation goes through the same grammar a double-quoted
+string uses, so `$m.key[0]:upper` means the same thing in both, and a malformed
+reference (`${bad`) or a malformed `\u{…}` escape is the same error in both. One
+difference from a string, on purpose: an escape that is not in the set at all —
+`\d`, `\p` — stays as written rather than erroring, because bodies carry regexes,
+JSON, and Windows paths where a stray backslash is ordinary text.
+
+A body is **data**, so it is never tilde-expanded, globbed, or word-split.
+
+A **quoted** delimiter makes the body raw — no interpolation, no escapes:
+
+```mesh
+cat << 'END'
+hello $name and \n stay literal
+END
+```
+
+The delimiter itself is never expanded; it is matched as written. A body of any
+size is fine — it reaches the command as a temporary file that is unlinked as
+soon as it is opened, so nothing is reachable by name while the command runs and
+nothing is left behind after.
+
+Backgrounding a command that has a heredoc (`cat << END &`) is refused rather
+than run against empty input.
+
 ### Tab completion
 
 In an interactive shell, Tab completes according to the cursor's current word:
@@ -783,5 +821,7 @@ byte-string type yet, so a capture that is not valid UTF-8 is a loud error.
 ## Not yet implemented
 
 Most modifier arguments (beyond `:split` / `:join`), the command-word form of an
-argument-taking modifier, regex capture modifiers, and heredocs are not yet
-implemented. See [`ROADMAP.md`](../ROADMAP.md).
+argument-taking modifier, and regex capture modifiers are not yet implemented.
+Of heredocs, the command-redirection form below works; here-strings (`<<<`),
+backgrounding a heredoc, and a value-producing spelling do not.
+See [`ROADMAP.md`](../ROADMAP.md).

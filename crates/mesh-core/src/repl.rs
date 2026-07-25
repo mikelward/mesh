@@ -552,6 +552,10 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
             note!("mesh: syntax error: unexpected end of input");
             Step::Continue(2)
         }
+        Ok(parser::ParseOutcome::IncompleteHeredoc(delimiter)) => {
+            note!("mesh: syntax error: heredoc missing its `{delimiter}` delimiter");
+            Step::Continue(2)
+        }
         Err(error) => {
             note!("mesh: {error}");
             Step::Continue(2)
@@ -1461,13 +1465,13 @@ fn run_ast_pipeline(
 /// string uses carry over, which is what an unquoted `<< END` promises in
 /// `DESIGN.md`.
 fn interpolate_heredoc(text: &str, vars: &Vars) -> Result<String, String> {
-    let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\\' && i + 1 < chars.len() {
-            let next = chars[i + 1];
+    while i < text.len() {
+        let c = text[i..].chars().next().expect("i is a char boundary");
+        if c == '\\'
+            && let Some(next) = text[i + 1..].chars().next()
+        {
             let simple = match next {
                 'n' => Some('\n'),
                 't' => Some('\t'),
@@ -1480,14 +1484,18 @@ fn interpolate_heredoc(text: &str, vars: &Vars) -> Result<String, String> {
             };
             if let Some(decoded) = simple {
                 out.push(decoded);
-                i += 2;
+                i += 1 + next.len_utf8();
                 continue;
             }
-            if next == 'u'
-                && let Some((decoded, used)) = crate::lexer::parse_unicode_escape(&chars[i + 2..])
-            {
+            if next == 'u' {
+                // `\u` *is* a recognized escape, so a malformed one is an error
+                // rather than literal text — `"\u{zz}"` is a syntax error and a
+                // heredoc promises the same escape set. Only an escape the set
+                // does not contain at all falls through to the rule below.
+                let (decoded, end) = parser::decode_unicode_escape(text, i + 2)
+                    .ok_or("heredoc: syntax error: invalid \\u{…} escape")?;
                 out.push(decoded);
-                i += 2 + used;
+                i = end;
                 continue;
             }
             // An unknown escape stays as written. A body carries data — shell
@@ -1499,26 +1507,36 @@ fn interpolate_heredoc(text: &str, vars: &Vars) -> Result<String, String> {
             continue;
         }
         if c == '$' {
-            // A malformed reference is a syntax error here exactly as it is in a
-            // `"…"` string — heredocs promise the same interpolation rules, so
+            // Extent comes from the command grammar itself — `variable_end` plus
+            // the `variable_access_prefix` continuation the tokenizer applies to
+            // the text after a reference — so a heredoc and a `"…"` string agree
+            // on where `$outer.inner.key` or `$m.key[0]:upper` ends. A malformed
+            // reference is a syntax error here exactly as it is in a string, so
             // `${bad` cannot quietly become literal text.
-            let parsed = crate::lexer::parse_var(&chars, i + 1)
-                .map_err(|error| format!("heredoc: {error}"))?;
-            if let Some((_, next)) = parsed
-                && next > i + 1
-            {
-                // `parse_var` finds where the reference ends; the reference itself is
-                // built by the same path a double-quoted `$…` takes, so a heredoc and
-                // a string agree on what `$m.key[0]:upper` means.
-                let source: String = chars[i..next].iter().collect();
-                let reference = expansion_variable(&source, parser::QuoteMode::Double);
+            let end = parser::variable_end(text, i).map_err(|error| format!("heredoc: {error}"))?;
+            if end > i + 1 {
+                // A braced `${…}` is already delimited and absorbs no following
+                // access, the same exception the tokenizer's merge step makes.
+                // Otherwise the continuation runs over the *word* after the
+                // reference, which is what the tokenizer hands it: in a command
+                // the following text piece is already split at whitespace, while
+                // a body is one long run, so `$xs:len` at end of line would
+                // otherwise offer `len\n…` as the modifier name and be rejected.
+                let end = if text[i..end].ends_with('}') {
+                    end
+                } else {
+                    let tail = &text[end..];
+                    let word = tail.find(char::is_whitespace).unwrap_or(tail.len());
+                    end + parser::variable_access_prefix(&tail[..word])
+                };
+                let reference = expansion_variable(&text[i..end], parser::QuoteMode::Double);
                 out.push_str(&expand::resolve(&reference, vars).map_err(|e| e.to_string())?);
-                i = next;
+                i = end;
                 continue;
             }
         }
         out.push(c);
-        i += 1;
+        i += c.len_utf8();
     }
     Ok(out)
 }
@@ -4346,15 +4364,98 @@ fn evaluate_default(
 
 /// Return whether the parser needs another physical line to complete the input.
 fn needs_more_input(text: &str) -> bool {
+    !matches!(pending_input(text), Pending::Complete)
+}
+
+/// Why buffered input still needs another physical line, if it does.
+enum Pending {
+    /// A complete unit: run it.
+    Complete,
+    /// Inside a heredoc body, waiting for a line equal to this delimiter — the
+    /// one case a reader can settle without re-parsing.
+    Heredoc(String),
+    /// Open for some other reason: a `func` body, a trailing `|`. Only a fresh
+    /// parse of the whole buffer can tell when that closes.
+    Other,
+}
+
+fn pending_input(text: &str) -> Pending {
     let trimmed = text.trim_start();
     let func_header = trimmed.strip_prefix("func").is_some_and(|rest| {
         rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
     });
+    // A `func` header is judged by the brace scanner rather than the parser, so
+    // that a malformed one is dispatched (and diagnosed) instead of buffering.
+    let by_braces = || {
+        if crate::lexer::needs_more_input(text) {
+            Pending::Other
+        } else {
+            Pending::Complete
+        }
+    };
     match parser::parse(text) {
-        Ok(parser::ParseOutcome::Incomplete) if func_header => crate::lexer::needs_more_input(text),
-        Ok(parser::ParseOutcome::Incomplete) => true,
-        Err(_) if func_header => crate::lexer::needs_more_input(text),
-        Ok(parser::ParseOutcome::Complete(_)) | Err(_) => false,
+        Ok(parser::ParseOutcome::IncompleteHeredoc(delimiter)) => Pending::Heredoc(delimiter),
+        Ok(parser::ParseOutcome::Incomplete) if func_header => by_braces(),
+        Ok(parser::ParseOutcome::Incomplete) => Pending::Other,
+        Err(_) if func_header => by_braces(),
+        Ok(parser::ParseOutcome::Complete(_)) | Err(_) => Pending::Complete,
+    }
+}
+
+/// Line-incremental completeness for an input buffer that grows one physical
+/// line at a time.
+///
+/// Completeness normally has to be re-derived from the whole buffer, because any
+/// line can close the unit — a `func` body's `}` can sit anywhere. A heredoc body
+/// is different: it is bulk data, and the only line that can end it is one equal
+/// to the delimiter. Re-parsing after every body line therefore costs a full
+/// tokenize of an ever-growing buffer, making ingestion quadratic in the body's
+/// length — a 20,000-line heredoc read through a pipe took seconds, and larger
+/// ones far worse. While a heredoc is open this answers from the newest line
+/// alone and re-parses only once its delimiter finally arrives.
+#[derive(Default)]
+struct HeredocGate {
+    awaiting: Option<String>,
+}
+
+impl HeredocGate {
+    /// Would `line` leave an already-open heredoc body still open? Read-only and
+    /// free of any parse, so a caller that only needs the answer (not the state
+    /// update) can ask cheaply too.
+    fn still_open(&self, line: &str) -> bool {
+        self.awaiting
+            .as_deref()
+            .is_some_and(|delimiter| line.trim_end_matches(['\n', '\r']) != delimiter)
+    }
+
+    /// Does `text` — whose newest physical line is `line` — need more input?
+    /// Records whichever heredoc is left open afterwards, so a second heredoc
+    /// queued on the same command line is waited for in turn.
+    fn needs_more_input(&mut self, text: &str, line: &str) -> bool {
+        if self.still_open(line) {
+            return true;
+        }
+        // The delimiter arrived (or none was open): re-derive from the whole
+        // buffer, which is one full parse per heredoc rather than one per line.
+        match pending_input(text) {
+            Pending::Heredoc(delimiter) => {
+                self.awaiting = Some(delimiter);
+                true
+            }
+            Pending::Other => {
+                self.awaiting = None;
+                true
+            }
+            Pending::Complete => {
+                self.awaiting = None;
+                false
+            }
+        }
+    }
+
+    /// Forget any open heredoc: the buffer it belonged to was abandoned.
+    fn reset(&mut self) {
+        self.awaiting = None;
     }
 }
 
@@ -4442,6 +4543,7 @@ fn persist_logical_history(
     session: Option<HistorySessionId>,
     signal: &Signal,
     pending: &str,
+    gate: &HeredocGate,
     saved_submissions: usize,
     rewritten: bool,
 ) -> reedline::Result<()> {
@@ -4451,7 +4553,7 @@ fn persist_logical_history(
     if pending.is_empty() && !rewritten {
         return Ok(());
     }
-    let completed = completed_command(signal, pending);
+    let completed = completed_command(signal, pending, gate);
     if completed.is_none() && !matches!(signal, Signal::CtrlC | Signal::CtrlD) {
         return Ok(());
     }
@@ -4645,6 +4747,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         }
     };
     let mut pending = String::new();
+    let mut gate = HeredocGate::default();
     let mut pending_history_rows = 0;
     loop {
         shell.jobs.reap();
@@ -4705,20 +4808,21 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                 if history_session.is_some() && raw_saved {
                     pending_history_rows += 1;
                 }
-                let completed_command = completed_command(&signal, &pending);
+                let completed_command = completed_command(&signal, &pending, &gate);
                 if let Some(session) = history_session
                     && let Err(err) = persist_logical_history(
                         editor.history_mut(),
                         Some(session),
                         &signal,
                         &pending,
+                        &gate,
                         pending_history_rows,
                         rewritten,
                     )
                 {
                     note!("mesh: could not update history database: {err}");
                 }
-                match handle_signal(signal, last, &mut shell, &mut pending) {
+                match handle_signal(signal, last, &mut shell, &mut pending, &mut gate) {
                     None => continue, // an unfinished `func` body: read the next line
                     Some(Step::Exit(code)) => {
                         run_prompt_hooks(
@@ -4780,10 +4884,16 @@ fn completion_menu() -> ColumnarMenu {
         .with_selected_match_text_style(selected.underline())
 }
 
-fn completed_command(signal: &Signal, pending: &str) -> Option<String> {
+fn completed_command(signal: &Signal, pending: &str, gate: &HeredocGate) -> Option<String> {
     let Signal::Success(line) = signal else {
         return None;
     };
+    // Asking the gate first keeps a heredoc body from being re-parsed here as
+    // well as in `handle_signal`, which would restore the quadratic cost the
+    // gate exists to remove.
+    if gate.still_open(line) {
+        return None;
+    }
     let mut command = String::with_capacity(pending.len() + line.len() + 1);
     command.push_str(pending);
     command.push_str(line);
@@ -5195,12 +5305,13 @@ fn handle_signal(
     last: u8,
     shell: &mut Shell,
     pending: &mut String,
+    gate: &mut HeredocGate,
 ) -> Option<Step> {
     match signal {
         Signal::Success(line) => {
             pending.push_str(&line);
             pending.push('\n');
-            if needs_more_input(pending) {
+            if gate.needs_more_input(pending, &line) {
                 return None;
             }
             let text = std::mem::take(pending);
@@ -5233,6 +5344,7 @@ fn handle_signal(
             // Ctrl-C: cancel the current line (and any buffered `func` body) and
             // re-prompt, keeping the status.
             pending.clear();
+            gate.reset();
             Some(Step::Continue(last))
         }
     }
@@ -5258,6 +5370,7 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
         }
     };
     let mut pending = String::new();
+    let mut gate = HeredocGate::default();
     // Discard a buffered input unit if any of its physical lines was invalid
     // UTF-8, while still using the parser to find the unit's end.
     let mut poisoned = false;
@@ -5290,7 +5403,7 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
             }
         };
         pending.push_str(text);
-        if needs_more_input(&pending) {
+        if gate.needs_more_input(&pending, text) {
             continue;
         }
         let full = std::mem::take(&mut pending);
@@ -5442,12 +5555,12 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgumentRecall, CompletionState, Diverted, Invocation, MeshPrompt, PromptEvent, PromptHook,
-        Shell, StartupOptions, Step, TimestampedHistory, argument_completions, command_position,
-        command_segment_words, command_words, completed_command, eval_binary,
-        expand_history_designators, expansion_word, handle_signal, help_completions,
-        history_path_from, input_highlighter, interactive_keybindings, interruptible_task,
-        last_argument, needs_more_input, open_history, path_completions_sync,
+        ArgumentRecall, CompletionState, Diverted, HeredocGate, Invocation, MeshPrompt,
+        PromptEvent, PromptHook, Shell, StartupOptions, Step, TimestampedHistory,
+        argument_completions, command_position, command_segment_words, command_words,
+        completed_command, eval_binary, expand_history_designators, expansion_word, handle_signal,
+        help_completions, history_path_from, input_highlighter, interactive_keybindings,
+        interruptible_task, last_argument, needs_more_input, open_history, path_completions_sync,
         persist_logical_history, prepare_history_path, run_line, run_prompt_hooks, run_source,
         variable_completions, with_channels_captured,
     };
@@ -5698,15 +5811,18 @@ mod tests {
     #[test]
     fn completed_command_assembles_multiline_argument_recall_input() {
         let first = Signal::Success("puts first |".into());
-        assert_eq!(completed_command(&first, ""), None);
+        assert_eq!(completed_command(&first, "", &HeredocGate::default()), None);
 
         let second = Signal::Success("puts followed-by-words".into());
         assert_eq!(
-            completed_command(&second, "puts first |\n").as_deref(),
+            completed_command(&second, "puts first |\n", &HeredocGate::default()).as_deref(),
             Some("puts first |\nputs followed-by-words")
         );
         assert_eq!(
-            last_argument(&completed_command(&second, "puts first |\n").unwrap()).as_deref(),
+            last_argument(
+                &completed_command(&second, "puts first |\n", &HeredocGate::default()).unwrap()
+            )
+            .as_deref(),
             Some("followed-by-words")
         );
     }
@@ -5962,6 +6078,7 @@ mod tests {
             saved_session,
             &Signal::Success("}".into()),
             &pending,
+            &HeredocGate::default(),
             3,
             false,
         )
@@ -6006,6 +6123,7 @@ mod tests {
             saved_session,
             &Signal::Success("followed by last\"".into()),
             "puts \"first\n",
+            &HeredocGate::default(),
             2,
             false,
         )
@@ -6048,6 +6166,7 @@ mod tests {
             saved_session,
             &Signal::CtrlC,
             "func f() {\n",
+            &HeredocGate::default(),
             1,
             false,
         )
@@ -6095,6 +6214,7 @@ mod tests {
             saved_session,
             &Signal::Success("}".into()),
             "func f() {\n\n",
+            &HeredocGate::default(),
             2,
             false,
         )
@@ -6135,6 +6255,7 @@ mod tests {
             session,
             &Signal::Success("cd foo".into()),
             "",
+            &HeredocGate::default(),
             1,
             true,
         )
@@ -6170,6 +6291,7 @@ mod tests {
             session,
             &Signal::Success("  ".to_owned()),
             "",
+            &HeredocGate::default(),
             1,
             true,
         )
@@ -6201,6 +6323,7 @@ mod tests {
             session,
             &Signal::Success("ls -l".into()),
             "",
+            &HeredocGate::default(),
             1,
             false,
         )
@@ -6715,8 +6838,15 @@ mod tests {
             Step::Continue(0)
         );
         let mut pending = String::new();
+        let mut gate = HeredocGate::default();
         assert_eq!(
-            handle_signal(Signal::Success("true".into()), 0, &mut shell, &mut pending,),
+            handle_signal(
+                Signal::Success("true".into()),
+                0,
+                &mut shell,
+                &mut pending,
+                &mut gate
+            ),
             Some(Step::Continue(0))
         );
         assert_eq!(shell.prompt.hooks.len(), 2);
@@ -6814,8 +6944,9 @@ mod tests {
     fn ctrl_d_exits_with_the_last_status() {
         let mut shell = Shell::new();
         let mut pending = String::new();
+        let mut gate = HeredocGate::default();
         assert_eq!(
-            handle_signal(Signal::CtrlD, 7, &mut shell, &mut pending),
+            handle_signal(Signal::CtrlD, 7, &mut shell, &mut pending, &mut gate),
             Some(Step::Exit(7))
         );
     }
@@ -6825,8 +6956,9 @@ mod tests {
         // With a `func` body still buffered, Ctrl-D still exits (abandoning it).
         let mut shell = Shell::new();
         let mut pending = String::from("func f() {\n");
+        let mut gate = HeredocGate::default();
         assert_eq!(
-            handle_signal(Signal::CtrlD, 4, &mut shell, &mut pending),
+            handle_signal(Signal::CtrlD, 4, &mut shell, &mut pending, &mut gate),
             Some(Step::Exit(4))
         );
     }
@@ -6835,8 +6967,9 @@ mod tests {
     fn ctrl_c_re_prompts_keeping_status() {
         let mut shell = Shell::new();
         let mut pending = String::new();
+        let mut gate = HeredocGate::default();
         assert_eq!(
-            handle_signal(Signal::CtrlC, 7, &mut shell, &mut pending),
+            handle_signal(Signal::CtrlC, 7, &mut shell, &mut pending, &mut gate),
             Some(Step::Continue(7))
         );
     }
@@ -6845,9 +6978,10 @@ mod tests {
     fn a_submitted_exit_line_exits() {
         let mut shell = Shell::new();
         let mut pending = String::new();
+        let mut gate = HeredocGate::default();
         let signal = Signal::Success("exit 5".to_string());
         assert_eq!(
-            handle_signal(signal, 0, &mut shell, &mut pending),
+            handle_signal(signal, 0, &mut shell, &mut pending, &mut gate),
             Some(Step::Exit(5))
         );
     }
@@ -7000,13 +7134,15 @@ mod tests {
     fn a_multi_line_func_buffers_until_the_brace_closes() {
         let mut shell = Shell::new();
         let mut pending = String::new();
+        let mut gate = HeredocGate::default();
         // The opening line leaves the body open — no step yet.
         assert_eq!(
             handle_signal(
                 Signal::Success("func greet(who) {".into()),
                 0,
                 &mut shell,
-                &mut pending
+                &mut pending,
+                &mut gate
             ),
             None
         );
@@ -7015,13 +7151,20 @@ mod tests {
                 Signal::Success("  puts \"hi $who\"".into()),
                 0,
                 &mut shell,
-                &mut pending
+                &mut pending,
+                &mut gate
             ),
             None
         );
         // The closing brace completes and defines the function.
         assert_eq!(
-            handle_signal(Signal::Success("}".into()), 0, &mut shell, &mut pending),
+            handle_signal(
+                Signal::Success("}".into()),
+                0,
+                &mut shell,
+                &mut pending,
+                &mut gate
+            ),
             Some(Step::Continue(0))
         );
         assert!(pending.is_empty());
@@ -7038,12 +7181,14 @@ mod tests {
         // incomplete; the reader does not reinterpret its physical lines.
         let mut shell = Shell::new();
         let mut pending = String::new();
+        let mut gate = HeredocGate::default();
         assert_eq!(
             handle_signal(
                 Signal::Success("func f()".into()),
                 0,
                 &mut shell,
-                &mut pending
+                &mut pending,
+                &mut gate
             ),
             None
         );
@@ -7052,6 +7197,7 @@ mod tests {
             0,
             &mut shell,
             &mut pending,
+            &mut gate,
         );
         assert_eq!(step, Some(Step::Continue(2)));
         assert!(pending.is_empty());
