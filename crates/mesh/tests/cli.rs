@@ -6898,3 +6898,139 @@ fn a_long_here_string_does_not_deadlock() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// $sh.status and $sh.pipestatus
+// ---------------------------------------------------------------------------
+
+/// Read both runtime entries in a *single* command, since reading one is itself
+/// a command that would replace what the other reports.
+fn status_line(source: &str) -> String {
+    let out = run_with_input(&format!(
+        "{source}\nputs \"$sh.status |\" ...$sh.pipestatus\n"
+    ));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn sh_status_is_the_last_commands_exit_status() {
+    assert_eq!(status_line("true"), "0 | 0");
+    assert_eq!(status_line("false"), "1 | 1");
+    assert_eq!(status_line("sh -c 'exit 42'"), "42 | 42");
+
+    // Before anything has run it is 0, not an error or an unbound read.
+    let out = run_with_input("puts $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+
+    // Readable everywhere a value is: interpolation, comparison, a guard.
+    let out = run_with_input("false\nputs \"code $sh.status\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "code 1\n");
+    let out = run_with_input("false\nif $sh.status == 1 { puts caught }\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "caught\n");
+    let out = run_with_input("false\nputs guarded if $sh.status != 0\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "guarded\n");
+}
+
+#[test]
+fn sh_pipestatus_breaks_a_pipeline_down_by_stage() {
+    // A real list, not bash's magic array: indexable, measurable, filterable.
+    assert_eq!(
+        status_line("sh -c 'exit 3' | sh -c 'exit 0' | sh -c 'exit 7'"),
+        "7 | 3 0 7"
+    );
+
+    // Capture it once and work from the copy: each read is itself a command, so
+    // a second read would report *that* command's status instead. Same care
+    // `$?` needs in a POSIX shell, and the reason a real list helps — one
+    // capture keeps everything.
+    let out = run_with_input(
+        "sh -c 'exit 3' | sh -c 'exit 0' | sh -c 'exit 7'\n\
+         p = $sh.pipestatus\nputs $p:len $p[0] $p[2]\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3 3 7\n");
+
+    // Reading it twice really does see the intervening command, which is
+    // behavior worth pinning rather than a wart to hide.
+    let out = run_with_input(
+        "sh -c 'exit 3' | sh -c 'exit 7'\n\
+         n = $sh.pipestatus:len\nputs $n ...$sh.pipestatus\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2 0\n");
+
+    let out = run_with_input(
+        "sh -c 'exit 3' | sh -c 'exit 0' | sh -c 'exit 7'\n\
+         bad = $sh.pipestatus:filter(func(c) { $c != 0 })\nputs ...$bad\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3 7\n");
+
+    // A command that is not a pipeline still reports one entry.
+    assert_eq!(status_line("sh -c 'exit 5'"), "5 | 5");
+    assert_eq!(status_line("x = 1"), "0 | 0");
+}
+
+#[test]
+fn sh_pipestatus_shows_a_sigpipe_that_pipefail_forgives() {
+    // The pipefail rule ignores an upstream SIGPIPE, so `$sh.status` is 0 — but
+    // the stage really did die of signal 13, and saying so is the whole point of
+    // keeping a per-stage list rather than repeating the overall status.
+    assert_eq!(status_line("yes | head -1 > /dev/null"), "0 | 141 0");
+}
+
+#[test]
+fn sh_status_and_pipestatus_always_describe_the_same_run() {
+    // The invariant worth pinning: a compound's status *is* its body's, so the
+    // breakdown must stay the body's too rather than flattening to one entry.
+    // This is a deliberate difference from bash, where a function call or an
+    // `if` resets PIPESTATUS to its own single status. It holds here because
+    // pipefail is always on, so a compound's status is exactly the pipefail
+    // status of the pipeline the list describes.
+    for source in [
+        "if true { sh -c 'exit 4' | true }",
+        "for i in [1 2] { sh -c 'exit 4' | true }",
+        "func g() { sh -c 'exit 4' | true }\ng",
+        "func g() { if true { sh -c 'exit 4' | true } }\ng",
+        "match 1 { 1 { sh -c 'exit 4' | true } }",
+        "true && sh -c 'exit 4' | true",
+    ] {
+        assert_eq!(status_line(source), "4 | 4 0", "for: {source}");
+    }
+
+    // A compound whose body never ran produces its own status, one entry.
+    assert_eq!(status_line("if false { sh -c 'exit 4' | true }"), "0 | 0");
+
+    // And a compound that runs a pipeline but then reports something *else* is
+    // no longer described by that pipeline, so the breakdown must not survive:
+    // `return 7` ends the function at 7, not at the pipeline's 4.
+    assert_eq!(
+        status_line("func g() { sh -c 'exit 4' | true\n  return 7 }\ng"),
+        "7 | 7"
+    );
+
+    // And a later command replaces both together, never one of them.
+    assert_eq!(status_line("sh -c 'exit 4' | true\nz = 1"), "0 | 0");
+}
+
+#[test]
+fn the_sh_namespace_lists_its_runtime_entries() {
+    let out = run_with_input("puts ...$sh:keys\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "status pipestatus name args\n"
+    );
+
+    // A mistyped key is still a loud error, and `status` is not a reserved
+    // name — only `sh` is, so an ordinary variable may be called that.
+    let out = run_with_input("puts $sh.nope\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no `nope` in this map"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_with_input("status = mine\nputs $status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "mine\n");
+}

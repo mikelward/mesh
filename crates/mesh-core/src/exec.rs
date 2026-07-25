@@ -252,6 +252,7 @@ pub fn run(words: &[String], jobs: &mut JobTable) -> u8 {
         false,
         &mut |_, _, _| unreachable!("an external command is never an in-shell stage"),
     )
+    .status
 }
 
 /// Run one in-shell stage — a builtin or a function — in a forked child.
@@ -499,7 +500,7 @@ pub fn run_pipeline(
     jobs: &mut JobTable,
     background: bool,
     run_in_shell: &mut dyn FnMut(usize, &Cmd, &mut JobTable) -> u8,
-) -> u8 {
+) -> PipelineStatus {
     let command_text = cmds
         .iter()
         .map(|cmd| cmd.words.join(" "))
@@ -818,7 +819,7 @@ pub fn run_pipeline(
         // falling through to `wait_outcomes`; the job then completes while the
         // nested child runs on, exactly as it does in a POSIX shell.
         if forked {
-            return 0;
+            return PipelineStatus::whole(0);
         }
         if let Some(pgid) = process_group {
             let id = jobs.next_id;
@@ -833,16 +834,19 @@ pub fn run_pipeline(
                 job_modes: None,
                 state: JobState::Running,
             });
-            return 0;
+            return PipelineStatus::whole(0);
         }
-        return match wait_outcomes(&mut outcomes) {
-            WaitResult::Complete(status) | WaitResult::Stopped(status) => status,
-        };
+        let result = wait_outcomes(&mut outcomes);
+        let stages = stage_codes(&outcomes);
+        let (WaitResult::Complete(status) | WaitResult::Stopped(status)) = result;
+        return PipelineStatus { status, stages };
     }
 
     // pipefail: the last stage to fail wins. A SIGPIPE is ignored only for a
     // stage whose stdout fed a pipe (a downstream stage could have closed it).
     let result = wait_outcomes(&mut outcomes);
+    // Read before `outcomes` can move into a stopped job's record.
+    let stages = stage_codes(&outcomes);
     let job_modes = matches!(result, WaitResult::Stopped(_))
         .then(terminal_modes)
         .flatten();
@@ -859,7 +863,7 @@ pub fn run_pipeline(
             restore_terminal_modes(&modes);
         }
     }
-    match result {
+    let status = match result {
         WaitResult::Complete(status) => status,
         WaitResult::Stopped(status) => {
             if let Some(pgid) = foreground {
@@ -878,7 +882,8 @@ pub fn run_pipeline(
             }
             status
         }
-    }
+    };
+    PipelineStatus { status, stages }
 }
 
 fn initial_stdin(background: bool, interactive: bool) -> NextIn {
@@ -892,6 +897,41 @@ fn initial_stdin(background: bool, interactive: bool) -> NextIn {
 enum WaitResult {
     Complete(u8),
     Stopped(u8),
+}
+
+/// What a finished pipeline reports.
+pub struct PipelineStatus {
+    /// The pipefail status the shell adopts: the last stage that failed, with an
+    /// upstream `SIGPIPE` forgiven, else 0.
+    pub status: u8,
+    /// One entry per stage, in pipeline order, as each actually exited — a
+    /// forgiven `SIGPIPE` shows here as `141`, because the point of the list is
+    /// to say what happened rather than to repeat `status`.
+    pub stages: Vec<u8>,
+}
+
+impl PipelineStatus {
+    /// A pipeline whose stages are not individually known — a backgrounded
+    /// launch, where the shell reports only that starting it succeeded.
+    fn whole(status: u8) -> Self {
+        Self {
+            status,
+            stages: vec![status],
+        }
+    }
+}
+
+/// Each stage's own status, read after waiting. A stage still `Running` is one
+/// that was backgrounded rather than waited for; it has produced no status yet,
+/// so it reports the 0 that launching it did.
+fn stage_codes(outcomes: &[Outcome]) -> Vec<u8> {
+    outcomes
+        .iter()
+        .map(|outcome| match outcome {
+            Outcome::Running { .. } => 0,
+            Outcome::Completed { code, .. } | Outcome::Failed(code) => *code,
+        })
+        .collect()
 }
 
 fn wait_outcomes(outcomes: &mut [Outcome]) -> WaitResult {
