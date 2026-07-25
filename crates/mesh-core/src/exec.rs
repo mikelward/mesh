@@ -467,8 +467,13 @@ fn fork_in_shell(
             // duplicates from the descriptors as they *now* stand: `|&` is a
             // `2>&1` in this list, and copying fd 1 has to copy the stage's
             // stdout rather than the shell's.
-            if background && !cmd.redirs.is_empty() {
-                let redirs = staged_redirs(cmd, is_last);
+            //
+            // The list to ask about emptiness is therefore the *staged* one, not
+            // `cmd.redirs`: a bare `f |& g &` has no redirections of its own and
+            // still has a duplication to apply, which asking `cmd.redirs` skipped
+            // — stderr stayed on the shell's.
+            let redirs = staged_redirs(cmd, is_last);
+            if background && !redirs.is_empty() {
                 let inherited = live_descriptors(&redirs);
                 let mut closing = Vec::new();
                 let deferred =
@@ -762,7 +767,9 @@ pub fn run_pipeline(
             continue;
         }
 
-        let mut command = if background && !cmd.redirs.is_empty() {
+        // The *staged* list, not `cmd.redirs`: a bare `f |& g &` has no
+        // redirections of its own and still has the `2>&1` to apply.
+        let mut command = if background && !redirs.is_empty() {
             match background_redirect_command(&cmd, &redirs) {
                 Ok(command) => command,
                 Err((path, err)) => {

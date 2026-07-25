@@ -2184,6 +2184,27 @@ fn backgrounding_a_stage_does_not_move_its_piped_stderr() {
         assert_eq!(read("fg-pipe"), "out\nerr\n", "{label}");
         assert_eq!(read("bg-pipe"), read("fg-pipe"), "{label}");
     }
+
+    // And a bare `|&`, with no redirection of the stage's own. Whether a
+    // backgrounded stage had anything to apply after the fork was asked of
+    // `cmd.redirs`, which does not carry the `2>&1` that `|&` *is*, so this one
+    // spelling was skipped and stderr stayed on the shell's.
+    for (label, stage) in [("function", "erring"), ("external", "sh -c 'echo err >&2'")] {
+        let out = run_with_input(&format!(
+            "func erring() {{ sh -c 'echo err >&2' }}\n{stage} |& tr a-z A-Z &\nsleep 0.4\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "ERR\n",
+            "{label}: the merged stderr never reached the next stage: {:?}",
+            out.stderr
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("err"),
+            "{label}: it escaped to the shell's stderr: {:?}",
+            out.stderr
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
