@@ -1417,11 +1417,19 @@ fn run_forked_block(body: &parser::Source, last: u8, in_function: bool, shell: &
     // boundary, so whatever the surrounding code had produced is not passed off
     // as this block's own.
     shell.produced = Produced::Status;
-    let status = exec::fork_and_wait(|| match run_source(body, last, in_function, shell) {
-        Step::Continue(code) | Step::Exit(code) => code,
-        // A `return` that reached the top of a subshell body has no caller left
-        // inside it; its value's status is what the child exits with.
-        Step::Return(value) => status_of(&value),
+    let status = exec::fork_and_wait(|| {
+        // Runs after the fork, so this marks the *child's* copy of the shell:
+        // it is not the parent of the pids in the job table it inherited, so
+        // `jobs` must not `waitpid` on them — that fails with `ECHILD` and
+        // reports every running job as finished — and `$sh.jobs` keeps the
+        // snapshot it inherited. The same flag a forked pipeline stage sets.
+        shell.forked = true;
+        match run_source(body, last, in_function, shell) {
+            Step::Continue(code) | Step::Exit(code) => code,
+            // A `return` that reached the top of a subshell body has no caller
+            // left inside it; its value's status is what the child exits with.
+            Step::Return(value) => status_of(&value),
+        }
     });
     match status {
         Ok(code) => {

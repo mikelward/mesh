@@ -402,7 +402,9 @@ of each PR had landed by another route, but these pieces had not.
       grammar-level question rather than a mechanical one. **Backgrounding a
       subshell** (`fork { … } &`) is refused today, since a backgrounded child needs
       a job-table entry to be resumable by `fg`; wiring it into the table is the
-      work. **Piping or redirecting a subshell** (`fork { … } | cat`,
+      work, and it is also what a *stopped* descendant of a subshell needs — with
+      nowhere to record one, Ctrl-Z on a subshell is answered by continuing it
+      rather than stranding it. **Piping or redirecting a subshell** (`fork { … } | cat`,
       `fork { … } > log`) is a syntax error today: a `fork` block is a statement
       rather than a pipeline stage, and bash's `( … ) > log` says people will
       expect it. `in DIR { … }`, the third and cheapest grade in `DESIGN.md` (scoped cwd,
