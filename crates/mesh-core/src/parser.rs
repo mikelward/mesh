@@ -3226,7 +3226,14 @@ impl Parser {
         let TokenKind::Word(word) = &number.value else {
             return false;
         };
-        if sign.span.end != number.span.start || word.text().parse::<i64>().is_err() {
+        // The **signed** text is what has to parse, not the magnitude, and the
+        // difference is a real literal: `i64::MIN` is one further from zero than
+        // `i64::MAX`, so `9223372036854775808` overflows on its own while
+        // `-9223372036854775808` is fine. Asking about the magnitude sent exactly that
+        // literal to the command parser. Same text [`negative_literal`] folds, so the
+        // two agree on which signed literals exist.
+        if sign.span.end != number.span.start || format!("-{}", word.text()).parse::<i64>().is_err()
+        {
             return false;
         }
         let after = self.position + 2;
@@ -4076,7 +4083,17 @@ mod tests {
         // Every operand shape with a value reading to lose: a variable, a quoted
         // word, a `:modifier` chain, and a numeral. The numeral is the one that needs
         // claiming rather than merely not-disclaiming — see `word_takes_a_comparison`.
-        for operand in ["$x", "'echo'", "$x:base", "42", "-1"] {
+        // `-9223372036854775808` is in the matrix on purpose: its *magnitude* does
+        // not fit an `i64`, so a check on the unsigned text rejects the one signed
+        // literal that most needs accepting.
+        for operand in [
+            "$x",
+            "'echo'",
+            "$x:base",
+            "42",
+            "-1",
+            "-9223372036854775808",
+        ] {
             for (source, expected_command) in [
                 (format!("{operand} > out"), false),
                 (format!("{operand} >out"), true),

@@ -8484,6 +8484,30 @@ fn a_spaced_comparison_on_a_numeral_is_not_a_redirection() {
     );
     assert!(!dir.join("0").exists(), "a signed comparison redirected");
 
+    // The boundary literal, whose *magnitude* does not fit an `i64` — `i64::MIN` is
+    // one further from zero than `i64::MAX`. Checking the unsigned text rejects the
+    // one signed literal that most needs accepting, which is the same asymmetry
+    // `negative_literal` exists to handle.
+    std::fs::write(
+        dir.join("run.mesh"),
+        "if -9223372036854775808 < 0 { puts min-lt } else { puts wrong }\n\
+         if -9223372036854775807 < 0 { puts near-lt } else { puts wrong }\n",
+    )
+    .unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "min-lt\nnear-lt\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!dir.join("0").exists(), "a boundary comparison redirected");
+
     // And the attached spelling still redirects, so a numeral obeys attachment in
     // both directions rather than simply losing its command reading.
     std::fs::write(dir.join("run.mesh"), "42 >out.txt\n").unwrap();
