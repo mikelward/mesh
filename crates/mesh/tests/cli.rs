@@ -6754,3 +6754,147 @@ fn concurrent_heredocs_get_distinct_temporary_files() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Here-strings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_here_string_feeds_its_word_as_input() {
+    let out = run_with_input("cat <<< hello\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hello\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // bash's trailing newline, which is what makes this one line rather than a
+    // partial one — worth pinning because `cat` alone would not show it.
+    let out = run_with_input("wc -l <<< hi\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+
+    // The target is an ordinary word: it interpolates, and quoting suppresses
+    // that exactly as it does in an argument.
+    let out = run_with_input("n = world\ncat <<< \"hello $n\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello world\n");
+    let out = run_with_input("n = world\ncat <<< 'hello $n'\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello $n\n");
+
+    // A quoted word stays one word — no splitting on the way in.
+    let out = run_with_input("cat <<< \"a b c\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a b c\n");
+}
+
+#[test]
+fn a_here_string_works_wherever_a_redirection_does() {
+    // A pipeline stage, alongside another redirection, and on a function.
+    let out = run_with_input("tr a-z A-Z <<< hey | cat\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "HEY\n");
+
+    let dir = fresh_dir("here_string_file");
+    let path = dir.join("out.txt");
+    let out = run_with_input(&format!(
+        "tr a-z A-Z <<< mix > {}\n",
+        path.to_string_lossy()
+    ));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "MIX\n");
+
+    let out = run_with_input("func f() { cat }\nf <<< viafunc\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "viafunc\n");
+}
+
+#[test]
+fn a_here_string_is_told_apart_from_a_heredoc_and_a_comparison() {
+    // `<<<` must not be read as `<<` plus `<`: it takes no delimiter, so the
+    // next line is an ordinary command rather than body text.
+    let out = run_with_input("cat <<< onlyline\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "onlyline\nafter\n");
+
+    // And `<<` is still a heredoc, buffering until its delimiter arrives.
+    let out = run_with_input("cat << END\na\nb\nEND\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\nafter\n");
+
+    // A spaced `<` in a condition is still a comparison, not a redirection.
+    let out = run_with_input("i = 1\nif $i < 3 { puts less }\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "less\n");
+}
+
+#[test]
+fn a_here_string_target_must_be_one_word() {
+    // The same rule every redirection target follows: a list would silently
+    // pick one of several meanings, so it is refused and `cat` never runs.
+    // (The shell's own status is `puts after`'s, so the evidence is that the
+    // command produced no output, not the exit code.)
+    let out = run_with_input("xs = [a b]\ncat <<< $xs\nputs after\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).is_empty(),
+        "a list target should be refused"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // A spread is the spelling that says "several words", and a redirection
+    // still takes exactly one, so it is refused too rather than joining them.
+    let out = run_with_input("xs = [a b]\ncat <<< ...$xs\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ambiguous redirect"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_here_string_cannot_name_another_descriptor() {
+    // `<<<` feeds stdin by definition, so a descriptor prefix has no meaning.
+    // The message must read as a refusal, not as "expected a here-string".
+    let out = run_with_input("cat 2<<< hi\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot name another descriptor"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("expected a here-string"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn backgrounding_a_here_string_is_refused_rather_than_truncated() {
+    // Same reason as a heredoc: a background external's redirections are opened
+    // by a helper reached through argv, which arbitrary text cannot travel
+    // through. The message names the spelling the user actually wrote.
+    let out = run_with_input("cat <<< body &\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("here-string cannot be backgrounded"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // The heredoc wording is still its own, not swallowed by the shared check.
+    let out = run_with_input("cat << END &\nbody\nEND\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("heredoc cannot be backgrounded"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_long_here_string_does_not_deadlock() {
+    // Fed through the same unlinked temporary file a heredoc uses, so a body
+    // past the pipe buffer cannot block the shell against a command that has
+    // not started reading.
+    let out = run_with_input("x = ''\nfor i in 1..=20000 { x += 'abcdefghij' }\nwc -c <<< $x\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "200001",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

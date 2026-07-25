@@ -223,10 +223,11 @@ ordinary argument plus a stdout redirect.
 A redirected **builtin** applies the targets to the current shell's descriptors
 around the call, as a redirected function does, so no child is involved.
 
-Deferred: **descriptor duplication** (`2>&1`, `&>`, `>&`, `<&`) and descriptors
-**above 2** — each rejected with a message naming what is missing rather than
-silently reinterpreted. Also deferred: here-strings and a redirection with no
-command (`> f`).
+**Descriptor duplication** (`2>&1`, `>&2`, `<&0`) and the both-streams forms
+(`&> file`, `>& file`) are implemented, as are heredocs (`<< END`) and
+here-strings (`<<< word`). Deferred: descriptors **above 2** and closing one
+(`n>&-`) — each rejected with a message naming what is missing rather than
+silently reinterpreted. Also deferred: a redirection with no command (`> f`).
 
 ## M2 job builtins
 

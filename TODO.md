@@ -61,8 +61,14 @@ file as tasks land.
       temporary file rather than a pipe, so a body larger than the pipe buffer
       cannot deadlock the shell, and a line-at-a-time reader waits for the
       delimiter directly rather than re-parsing the body per line. Deferred:
-      here-strings (`<<<`), backgrounding a heredoc, and the value-producing
-      spelling (still unspecified — see the design entry below).
+      backgrounding a heredoc, and the value-producing spelling (still
+      unspecified — see the design entry below).
+- [x] Here-strings: `cmd <<< word` feeds the expanded word plus a trailing
+      newline, bash's behavior. The word expands like any other argument and
+      must come to exactly one, the rule every redirection target follows; it
+      travels by the same unlinked temporary file a heredoc body uses. `<<<`
+      names no descriptor, and backgrounding one is refused for the reason a
+      heredoc's is.
 - [x] Fork-based executor and process groups (`fork`/`exec`, `setpgid`,
       `tcsetpgrp`) so mesh can own the terminal and manage foreground jobs.
 - [x] Signal handling: terminal signals target the foreground process group;
