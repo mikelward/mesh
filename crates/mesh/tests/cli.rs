@@ -6253,3 +6253,67 @@ fn an_escaped_amp_is_still_a_literal_before_a_redirect() {
     assert_eq!(String::from_utf8_lossy(&esc.stdout), "hi&\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_computed_target_on_greater_amp_is_refused_as_ambiguous() {
+    // `>&` chooses between duplicating and naming a file by reading the token as
+    // written, so a computed target has no honest answer: `>&$fd` reads as
+    // "duplicate onto $fd" but would quietly create a file named `2`. Refusing
+    // beats guessing, and both meanings have an unambiguous spelling.
+    let dir = fresh_dir("dup_ambiguous");
+    let out = run_with_input(&format!("cd {}\nfd = 2\necho HI >&$fd\n", dir.display()));
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("1>&$fd"), "{stderr}");
+    assert!(stderr.contains("&> $file"), "{stderr}");
+    // Nothing was created by the reading it did not take.
+    assert!(!dir.join("2").exists());
+
+    // The two spellings it points at both work.
+    let out = run_with_input("fd = 2\necho HI 1>&$fd\n");
+    assert!(
+        out.stdout.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("HI"));
+
+    let file = dir.join("both.log");
+    run_with_input(&format!(
+        "f = {}\nsh -c 'echo O; echo E >&2' &> $f\n",
+        file.display()
+    ));
+    let mut lines: Vec<String> = std::fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    assert_eq!(lines, ["E", "O"]);
+
+    // `<&` is only ever duplication, so a computed target is unambiguous there
+    // and stays allowed.
+    let seen = dir.join("seen.txt");
+    run_with_input(&format!("n = 0\necho VISIBLE <&$n > {}\n", seen.display()));
+    assert_eq!(std::fs::read_to_string(&seen).unwrap(), "VISIBLE\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn quoting_a_greater_amp_target_makes_it_a_filename() {
+    // Quotes are the user saying "this is text", so `>& "2"` names a file rather
+    // than duplicating onto descriptor 2.
+    let dir = fresh_dir("dup_quoted_target");
+    let out = run_with_input(&format!(
+        "cd {}\nsh -c 'echo O; echo E >&2' >& \"2\"\n",
+        dir.display()
+    ));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(dir.join("2")).unwrap();
+    assert!(text.contains('O') && text.contains('E'), "{text:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
