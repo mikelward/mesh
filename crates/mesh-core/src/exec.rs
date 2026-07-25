@@ -1176,6 +1176,12 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
     // SAFETY: fork has no arguments. The child runs `body` and leaves via
     // `_exit`, so it never unwinds back through the parent's stack or runs a
     // destructor the parent still owns.
+    //
+    // Running the interpreter in the child is what a forked pipeline stage does
+    // too, and it carries the same caveat: inside `$(…)` the capture readers are
+    // live threads, and forking away from a thread that holds a lock strands it.
+    // Latent rather than fixed — the readers own no Rust-level lock — and the fix
+    // belongs to the capture side for every fork at once. See `TODO.md`.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error());

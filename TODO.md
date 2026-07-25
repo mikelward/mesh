@@ -395,6 +395,25 @@ of each PR had landed by another route, but these pieces had not.
       like `global` / `unset` — `fork` leads a statement only when a `{` follows, so
       a command of that name stays reachable — and the fork/wait itself reuses the
       status conventions `wait_for_job` already encodes rather than restating them.
+- [ ] **Forking while the capture readers are running.** Every fork in the shell
+      runs interpreter code in the child before any `exec` — a pipeline or background
+      stage at `exec.rs:413`, a `fork` block at `exec.rs:1360` — and under `$(…)` or
+      `:capture` the shell is multithreaded for the whole body, since both capture
+      helpers drain the diverted pipes on scoped reader threads (`repl.rs:3026`,
+      `repl.rs:3061`). POSIX allows only async-signal-safe calls between fork and exec
+      in that state: a lock held by a thread that does not exist in the child is held
+      forever. It is not specific to `fork { … }` — `out = $(f | cat)` on a mesh `f`
+      has forked a stage that runs the interpreter since stages were forked at all,
+      and `expand.rs:1339` already names the hazard in a test. What keeps it latent is
+      narrow: a reader holds no Rust-level lock, reading a raw `File` into a `String`,
+      so the only lock it can own is the allocator's, and glibc and musl both
+      reinitialize theirs across fork. Anything a reader gains later that takes a
+      Rust-level lock — `std`'s stdout lock, the env lock — removes that. The fix
+      belongs to the capture side rather than to each fork: drain both pipes from the
+      forking thread with `poll` and no thread survives to strand a lock, which clears
+      the precondition everywhere at once. The comment at `repl.rs:3009` rules out
+      *sequential* reads, which deadlock on the unread channel's buffer; polling both
+      descriptors is not that.
 - [ ] **Can a subshell return a value?** Written up in `DESIGN.md` beside the
       isolation grades. Short version: "only bytes cross back" is argv's rule —
       about *flattening*, where a list fails for want of a canonical separator —
