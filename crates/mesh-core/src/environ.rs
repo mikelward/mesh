@@ -126,7 +126,7 @@ fn serialize(key: &str, value: Value) -> Result<String, String> {
                 "$env.{key}: only strings cross into the environment, not a pattern"
             ));
         }
-        Value::Stream(_) => {
+        Value::Stream(_) | Value::Job(_) => {
             return Err(format!(
                 "$env.{key}: only strings cross into the environment, not a stream handle"
             ));

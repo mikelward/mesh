@@ -140,6 +140,12 @@ pub enum ExpandError {
         name: String,
         kind: &'static str,
     },
+    /// A handle whose job has left the table. Its own variant because the handle
+    /// is perfectly valid — the job it names is simply finished and reaped, which
+    /// is a different thing from an unbound variable or a missing key.
+    GoneJob {
+        id: usize,
+    },
     NotAList(String),
     IndexOutOfRange {
         name: String,
@@ -165,6 +171,9 @@ impl std::fmt::Display for ExpandError {
             }
             ExpandError::NoTextForm { name, kind } => {
                 write!(f, "${name}: a {kind} has no text form")
+            }
+            ExpandError::GoneJob { id } => {
+                write!(f, "job {id} is no longer in the job table")
             }
             ExpandError::NotAList(n) => write!(f, "${n}: cannot index a string value"),
             ExpandError::IndexOutOfRange { name, index } => {
@@ -250,7 +259,8 @@ fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> 
         | Value::Boolean(_)
         | Value::Regex(_)
         | Value::Glob(_)
-        | Value::Stream(_) => Err(ExpandError::Unsupported(format!(
+        | Value::Stream(_)
+        | Value::Job(_) => Err(ExpandError::Unsupported(format!(
             "...${}: value is not a list",
             vref.name
         ))),
@@ -278,7 +288,8 @@ fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError
         | Value::Boolean(_)
         | Value::Regex(_)
         | Value::Glob(_)
-        | Value::Stream(_) => Err(ExpandError::Unsupported(format!(
+        | Value::Stream(_)
+        | Value::Job(_) => Err(ExpandError::Unsupported(format!(
             "...${}: value is not a list",
             vref.name
         ))),
@@ -307,7 +318,7 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
             ))),
             // A handle belongs with the function value, not the patterns: what
             // it lacks is a byte form, not a way to be matched against.
-            Value::Stream(_) => Err(ExpandError::NoTextForm {
+            Value::Stream(_) | Value::Job(_) => Err(ExpandError::NoTextForm {
                 name: name.to_string(),
                 kind: "stream handle",
             }),
@@ -485,6 +496,10 @@ pub(crate) fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError>
             name: vref.name.clone(),
             kind: "stream handle",
         }),
+        Value::Job(_) => Err(ExpandError::NoTextForm {
+            name: vref.name.clone(),
+            kind: "job handle",
+        }),
         Value::Function(_) => Err(ExpandError::NoTextForm {
             name: vref.name.clone(),
             kind: "function value",
@@ -514,6 +529,16 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
             vref.accesses.as_slice(),
         )
     };
+    // A handle is a live *reference*, not a snapshot taken when it was bound:
+    // reading through one looks the job up in the table as it stands now, so
+    // `$j.state` cannot go stale the way a captured record would. A bare `$j`
+    // stays a handle — that is what leaves it with no byte form, and what lets
+    // `kill $j` mean a job where `kill 49001` means a pid.
+    if let Value::Job(id) = value
+        && !accesses.is_empty()
+    {
+        value = vars.job_record(id).ok_or(ExpandError::GoneJob { id })?;
+    }
     for access in accesses {
         value = match access {
             Access::Member(key) => map_value_access(value, key, &vref.name)?,
@@ -545,6 +570,7 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                     | Value::Regex(_)
                     | Value::Glob(_)
                     | Value::Stream(_)
+                    | Value::Job(_)
                     | Value::Function(_) => {
                         return Err(ExpandError::NotAList(vref.name.clone()));
                     }
@@ -644,6 +670,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
+            | Value::Job(_)
             | Value::Function(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a string or collection".into(),
@@ -693,6 +720,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
+            | Value::Job(_)
             | Value::Function(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
@@ -717,6 +745,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
+            | Value::Job(_)
             | Value::Function(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
@@ -742,6 +771,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
+            | Value::Job(_)
             | Value::Function(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
@@ -807,6 +837,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
+            | Value::Job(_)
             | Value::Function(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a path".into(),
@@ -840,6 +871,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
+            | Value::Job(_)
             | Value::Function(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a path or a list of paths".into(),
@@ -856,12 +888,14 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 name: name.into(),
                 message: "cannot map over a map".into(),
             }),
-            Value::Regex(_) | Value::Glob(_) | Value::Stream(_) | Value::Function(_) => {
-                Err(ExpandError::Modifier {
-                    name: name.into(),
-                    message: "cannot apply string modifier to this value".into(),
-                })
-            }
+            Value::Regex(_)
+            | Value::Glob(_)
+            | Value::Stream(_)
+            | Value::Job(_)
+            | Value::Function(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "cannot apply string modifier to this value".into(),
+            }),
             Value::Integer(_) | Value::Boolean(_) => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a string".into(),
@@ -945,7 +979,7 @@ pub(crate) fn join_value(value: Value, separator: &str) -> Result<Value, ExpandE
                     message: "cannot join a pattern element".into(),
                 });
             }
-            Value::Stream(_) => {
+            Value::Stream(_) | Value::Job(_) => {
                 return Err(ExpandError::Modifier {
                     name: "join".into(),
                     message: "cannot join a stream handle".into(),

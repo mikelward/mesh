@@ -134,6 +134,18 @@ pub struct JobInfo {
 }
 
 impl JobTable {
+    /// The id the next registered job will take. Read before a background
+    /// launch and looked for afterwards, it names the job that launch created
+    /// without a pipeline having to thread an id back out through its result.
+    pub fn next_id(&self) -> usize {
+        self.next_id
+    }
+
+    /// Whether the table still holds this job.
+    pub fn holds(&self, id: usize) -> bool {
+        self.index_of(id).is_some()
+    }
+
     /// Whether any job is registered, so a caller can skip work when none is.
     pub fn has_jobs(&self) -> bool {
         !self.jobs.is_empty()
@@ -321,6 +333,57 @@ impl JobTable {
             // keeps its place in the table.
             None => INTERRUPT_CODE,
         }
+    }
+
+    /// Signal a job or a pid.
+    ///
+    /// `kill %2` and `kill $j` name a **job**, and signal its whole process
+    /// group — a pipeline is several processes, and signalling only the leader
+    /// leaves the rest running. A bare number is a **pid**, and signals just
+    /// that process. `DESIGN.md` draws exactly that line, and it is why a handle
+    /// has no byte form: `$j` cannot arrive here looking like a number.
+    ///
+    /// The signal defaults to `TERM` and is named as `-9`, `-KILL`, `-SIGKILL`
+    /// or `-s KILL`. Each target is signalled independently, so one bad name
+    /// does not stop the rest; the status is the last failure, or 0.
+    pub fn kill(&mut self, args: &[String]) -> u8 {
+        let (signal, targets) = match split_signal(args) {
+            Ok(split) => split,
+            Err(word) => {
+                note!("mesh: kill: {word}: invalid signal");
+                return 1;
+            }
+        };
+        if targets.is_empty() {
+            note!("mesh: kill: expected a job or a pid");
+            return 1;
+        }
+        let mut status = 0;
+        for target in targets {
+            // A job reference is anything the other job builtins take; only a
+            // bare number is a pid, which is what keeps `kill 49001` meaning the
+            // process bash means by it.
+            let failed = if target.parse::<libc::pid_t>().is_ok() {
+                let pid = target.parse::<libc::pid_t>().expect("just parsed");
+                // SAFETY: scalar arguments; an unknown pid reports `ESRCH`
+                // rather than doing anything.
+                if unsafe { libc::kill(pid, signal) } < 0 {
+                    note!("mesh: kill: {target}: {}", std::io::Error::last_os_error());
+                    true
+                } else {
+                    false
+                }
+            } else {
+                match self.resolve(std::slice::from_ref(target), "kill") {
+                    Some(index) => signal_group(self.jobs[index].pgid, signal, "kill").is_err(),
+                    None => true,
+                }
+            };
+            if failed {
+                status = 1;
+            }
+        }
+        status
     }
 
     /// Continue a stopped job without giving it the terminal.
@@ -1646,6 +1709,64 @@ impl Drop for SigintCatcher {
         }
         SIGINT_SEEN.store(false, Ordering::SeqCst);
     }
+}
+
+/// Split `kill`'s leading signal option off its targets, defaulting to `TERM`.
+/// `Err` carries the word that did not name a signal.
+fn split_signal(args: &[String]) -> Result<(libc::c_int, &[String]), &str> {
+    let Some(first) = args.first() else {
+        return Ok((libc::SIGTERM, args));
+    };
+    if first == "-s" {
+        let Some(name) = args.get(1) else {
+            return Err("-s");
+        };
+        return signal_number(name)
+            .map(|signal| (signal, &args[2..]))
+            .ok_or(name.as_str());
+    }
+    // `--` ends the options, so a target that looks like one can still be named.
+    if first == "--" {
+        return Ok((libc::SIGTERM, &args[1..]));
+    }
+    match first.strip_prefix('-').filter(|rest| !rest.is_empty()) {
+        Some(rest) => signal_number(rest)
+            .map(|signal| (signal, &args[1..]))
+            .ok_or(rest),
+        None => Ok((libc::SIGTERM, args)),
+    }
+}
+
+/// A signal by number (`9`) or name, with or without the `SIG` prefix and in
+/// any case — the spellings every shell's `kill` accepts.
+fn signal_number(name: &str) -> Option<libc::c_int> {
+    if let Ok(number) = name.parse::<libc::c_int>() {
+        return (number > 0 && number < 64).then_some(number);
+    }
+    let upper = name.to_ascii_uppercase();
+    Some(match upper.strip_prefix("SIG").unwrap_or(&upper) {
+        "HUP" => libc::SIGHUP,
+        "INT" => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "ILL" => libc::SIGILL,
+        "ABRT" => libc::SIGABRT,
+        "FPE" => libc::SIGFPE,
+        "KILL" => libc::SIGKILL,
+        "SEGV" => libc::SIGSEGV,
+        "PIPE" => libc::SIGPIPE,
+        "ALRM" => libc::SIGALRM,
+        "TERM" => libc::SIGTERM,
+        "USR1" => libc::SIGUSR1,
+        "USR2" => libc::SIGUSR2,
+        "CHLD" => libc::SIGCHLD,
+        "CONT" => libc::SIGCONT,
+        "STOP" => libc::SIGSTOP,
+        "TSTP" => libc::SIGTSTP,
+        "TTIN" => libc::SIGTTIN,
+        "TTOU" => libc::SIGTTOU,
+        "WINCH" => libc::SIGWINCH,
+        _ => return None,
+    })
 }
 
 /// Restore signals whose interactive-shell dispositions must not cross exec.

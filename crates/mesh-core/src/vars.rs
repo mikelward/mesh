@@ -27,6 +27,13 @@ pub enum Value {
     /// boundary" lists it beside a regex for exactly that reason. The descriptor
     /// stays private: the value answers questions (`:tty`) rather than being one.
     Stream(i32),
+    /// A **job handle** — `$j` from `j = cmd &`, or `$sh.jobs[2]`. It carries
+    /// the job id and nothing else: reading a member resolves it against the
+    /// live table, so `$j.state` answers for the job as it is now rather than as
+    /// it was when the handle was bound. Like a stream handle it has **no byte
+    /// form**, which is what makes `kill $j` a job and `kill 49001` a pid
+    /// without either having to guess.
+    Job(usize),
     /// An anonymous `func(params) { … }` bound to a name — value-called through
     /// the variable (`$double(5)`). It has no byte form, so unlike every other
     /// value it cannot reach a command argument or an interpolation.
@@ -426,6 +433,17 @@ impl Vars {
     }
 
     /// Publish the live jobs, keyed by job id in registration order.
+    /// The record a job handle resolves to, or `None` once the job has left the
+    /// table. Reads the same published snapshot `$sh.jobs` does, so a handle and
+    /// the table can never disagree about a job.
+    pub(crate) fn job_record(&self, id: usize) -> Option<Value> {
+        let key = id.to_string();
+        self.jobs
+            .iter()
+            .find(|(candidate, _)| *candidate == key)
+            .map(|(_, record)| record.clone())
+    }
+
     pub(crate) fn set_jobs(&mut self, jobs: Vec<(String, Value)>) {
         self.jobs = jobs;
     }
@@ -720,6 +738,9 @@ pub fn append_into(current: &mut Value, value: Value, name: &str) -> Result<(), 
         (Value::Glob(_), _) => return Err(format!("{name}: cannot append to a glob")),
         (Value::Stream(_), _) => {
             return Err(format!("{name}: cannot append to a stream handle"));
+        }
+        (Value::Job(_), _) => {
+            return Err(format!("{name}: cannot append to a job handle"));
         }
         (Value::Function(_), _) => {
             return Err(format!("{name}: cannot append to a function value"));
