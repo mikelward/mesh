@@ -3075,6 +3075,13 @@ impl Parser {
                 | TokenKind::Range
                 | TokenKind::RangeInclusive,
             ) => true,
+            // A **signed** numeral is the same operand as an unsigned one — `-1 < 0`
+            // compares exactly as `1 < 0` does — but it arrives as two tokens, an
+            // `Operator("-")` and the numeral, so the word-shaped clauses below never
+            // see it. [`negative_literal`] folds the pair back into a single literal
+            // once the expression parser has it; this only has to agree about where
+            // the operand starts.
+            Some(TokenKind::Operator(sign)) if sign == "-" => self.signed_numeral_is_a_value(),
             Some(TokenKind::Word(word)) => {
                 let variable = matches!(
                     word.pieces.as_slice(),
@@ -3198,6 +3205,46 @@ impl Parser {
     /// while `1 == 1` beside it compared. `<` and `>` are the only operators that
     /// need asking; every other one reaches [`value_operator`] with no second reading
     /// to rule out.
+    /// Is a leading `-` the **sign** on a numeral that an operator then makes a value?
+    ///
+    /// The signed counterpart to the numeric clause in [`value_start`], which cannot
+    /// see this operand: a sign is its own token, so the word-shaped clauses start one
+    /// token too late and `-1 < 0` reached the command parser, which ran `-1` and
+    /// redirected from a file named `0`.
+    ///
+    /// Narrow in the same two ways the unsigned case is. The sign must **abut** its
+    /// numeral, since a spaced `-` is the infix operator (glob exclusion) rather than a
+    /// sign; and an operator must follow, so `-1 foo` and `-1 >out` stay the command
+    /// lines they were.
+    fn signed_numeral_is_a_value(&self) -> bool {
+        let (Some(sign), Some(number)) = (
+            self.tokens.get(self.position),
+            self.tokens.get(self.position + 1),
+        ) else {
+            return false;
+        };
+        let TokenKind::Word(word) = &number.value else {
+            return false;
+        };
+        if sign.span.end != number.span.start || word.text().parse::<i64>().is_err() {
+            return false;
+        }
+        let after = self.position + 2;
+        match self.tokens.get(after).map(|token| &token.value) {
+            // `<` / `>` spell a redirect too, so attachment decides, exactly as it does
+            // for an unsigned numeral.
+            Some(TokenKind::Less | TokenKind::Greater) => !self.redirect_operator_at(after),
+            // Every other value operator has no second reading; it only has to be
+            // spaced off its right operand, the test the unsigned clause applies.
+            Some(kind) if value_operator(kind) => self
+                .tokens
+                .get(after)
+                .zip(self.tokens.get(after + 1))
+                .is_some_and(|(operator, right)| operator.span.end < right.span.start),
+            _ => false,
+        }
+    }
+
     fn word_takes_a_comparison(&self) -> bool {
         let Some(end) = self.command_word_end() else {
             return false;
@@ -4029,7 +4076,7 @@ mod tests {
         // Every operand shape with a value reading to lose: a variable, a quoted
         // word, a `:modifier` chain, and a numeral. The numeral is the one that needs
         // claiming rather than merely not-disclaiming — see `word_takes_a_comparison`.
-        for operand in ["$x", "'echo'", "$x:base", "42"] {
+        for operand in ["$x", "'echo'", "$x:base", "42", "-1"] {
             for (source, expected_command) in [
                 (format!("{operand} > out"), false),
                 (format!("{operand} >out"), true),
