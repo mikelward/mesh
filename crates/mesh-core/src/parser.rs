@@ -1724,9 +1724,13 @@ impl Parser {
                         let descriptor = text.parse::<u32>().map_err(|_| {
                             self.error(ParseErrorKind::Expected("a descriptor mesh can redirect"))
                         })?;
-                        if descriptor > 2 {
+                        // Bounded by what a descriptor can be rather than by
+                        // what mesh happens to support: the kernel's own limit
+                        // is the process's open-file cap, and a number past
+                        // `c_int` could not name one at all.
+                        if libc::c_int::try_from(descriptor).is_err() {
                             return Err(self.error(ParseErrorKind::Expected(
-                                "a descriptor of 0, 1, or 2; higher descriptors are not supported yet",
+                                "a descriptor small enough to name one",
                             )));
                         }
                         items.pop();

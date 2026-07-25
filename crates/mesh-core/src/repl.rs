@@ -4003,10 +4003,8 @@ fn expand_redirs_for(
                 let from = word.parse::<i32>().map_err(|_| {
                     format!("`>&{word}`: the target of a duplication must be a descriptor")
                 })?;
-                if !(0..=2).contains(&from) {
-                    return Err(format!(
-                        "`>&{from}`: only descriptors 0, 1, and 2 can be duplicated"
-                    ));
+                if from < 0 {
+                    return Err(format!("`>&{from}`: a descriptor cannot be negative"));
                 }
                 exec::RedirTarget::Descriptor(from)
             }

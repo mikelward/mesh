@@ -2343,10 +2343,142 @@ fn a_background_command_can_redirect_stderr() {
 }
 
 #[test]
-fn a_descriptor_above_two_is_rejected_with_a_specific_message() {
-    let out = run_with_input("cat 3< f\nputs after\n");
+fn a_descriptor_above_two_can_be_redirected() {
+    let dir = fresh_dir("high_descriptors");
+    let source = dir.join("in.txt");
+    std::fs::write(&source, "from-three\n").unwrap();
+    let sink = dir.join("out.txt");
+    let ninth = dir.join("nine.txt");
+
+    // Reading and writing through a descriptor the command names itself. `3` is
+    // the interesting number: a freshly opened file often *lands* on fd 3, and
+    // `dup2` onto the descriptor a file already occupies is a no-op that leaves
+    // `FD_CLOEXEC` set — so this passed through the shell and then vanished at
+    // `exec`, while a higher descriptor worked.
+    let out = run_with_input(&format!(
+        "sh -c 'read line <&3; echo $line' 3< {}\n",
+        source.to_string_lossy()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "from-three\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_with_input(&format!(
+        "sh -c 'echo out-via-3 >&3' 3> {}\n",
+        sink.to_string_lossy()
+    ));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("higher descriptors"),
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&sink).unwrap(), "out-via-3\n");
+
+    // Well clear of the standard three, so the fix is not just about fd 3.
+    let out = run_with_input(&format!(
+        "sh -c 'echo nine >&9' 9> {}\n",
+        ninth.to_string_lossy()
+    ));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&ninth).unwrap(), "nine\n");
+}
+
+#[test]
+fn a_high_descriptor_reaches_every_kind_of_command() {
+    // The external pipeline stage is only one of four routes a redirection can
+    // take, and each installs descriptors its own way. Testing just that one is
+    // what let a redirected function and a backgrounded command keep failing on
+    // fd 3 after the first three worked.
+    let dir = fresh_dir("high_fd_routes");
+
+    // A function: redirections are applied to the shell's own descriptors and
+    // restored afterwards. `dup`-ing fd 3 aside fails with `EBADF` when nothing
+    // has it open, which is not a failure — the redirection creates it.
+    let via_function = dir.join("fn.txt");
+    let out = run_with_input(&format!(
+        "func f() {{ sh -c 'echo fn >&3' }}\nf 3> {}\n",
+        via_function.to_string_lossy()
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&via_function).unwrap_or_default(),
+        "fn\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And the descriptor goes away again with the redirection, rather than being
+    // left open on the shell.
+    let out = run_with_input(&format!(
+        "func f() {{ puts x }}\nf 3> {}\nsh -c 'echo late >&3' 2>/dev/null || puts closed\n",
+        dir.join("restore.txt").to_string_lossy()
+    ));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("closed"),
+        "fd 3 outlived its redirection: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // A backgrounded command, whose targets are opened by a helper reached
+    // through argv — which split the opened files with a catch-all that put
+    // anything above stderr *onto* stderr.
+    let via_background = dir.join("bg.txt");
+    let out = run_with_input(&format!(
+        "sh -c 'echo bg >&3' 3> {} &\nsleep 0.4\n",
+        via_background.to_string_lossy()
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&via_background).unwrap_or_default(),
+        "bg\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A pipeline stage, and a builtin that simply ignores the descriptor.
+    let via_stage = dir.join("stage.txt");
+    let out = run_with_input(&format!(
+        "sh -c 'echo staged >&3' 3> {} | cat\nputs hi 3> {}\n",
+        via_stage.to_string_lossy(),
+        dir.join("builtin.txt").to_string_lossy()
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&via_stage).unwrap_or_default(),
+        "staged\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+}
+
+#[test]
+fn duplicating_an_unopened_descriptor_is_an_error() {
+    // A copy of nothing is not an inheritance of the shell's own descriptor of
+    // that number, so this is `EBADF` — the answer the kernel itself gives.
+    let out = run_with_input("cat 2>&7\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Bad file descriptor"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // Order still decides, as it does for the standard three: the duplication
+    // reads the descriptor as it stands at that point, so opening it afterwards
+    // is too late.
+    let dir = fresh_dir("late_descriptor");
+    let log = dir.join("log.txt");
+    let out = run_with_input(&format!(
+        "sh -c 'echo x 1>&2' 2>&3 3> {}\nputs after\n",
+        log.to_string_lossy()
+    ));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Bad file descriptor"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

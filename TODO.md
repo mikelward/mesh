@@ -49,8 +49,12 @@ file as tasks land.
 - [x] Descriptor redirection to a file: `2>`, `2>>`, and `1>` alongside the
       defaults, on external commands, functions, forked pipeline stages, and
       background commands. The digits must abut the operator, so `echo 2 > f`
-      still writes "2". Deferred: descriptors above 2, and redirection without a
-      command.
+      still writes "2". Deferred: redirection without a command.
+- [x] Descriptors above 2 (`3< file`, `3> file`, `2>&3`). Redirection state is
+      keyed by descriptor rather than a fixed `[Source; 3]`, and anything past
+      the standard three is installed by the child itself, since only those have
+      a `Stdio` slot. Duplicating an unopened descriptor is `EBADF`. Deferred:
+      closing one (`n>&-`).
 - [x] Descriptor duplication: `2>&1`, `>&2`, `<&0`, and the both-streams forms
       `>& file` and `&> file`. A bare `>&` picks its meaning from the token as
       written, so a computed target (`>&$fd`) is refused rather than guessed at.

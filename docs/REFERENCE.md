@@ -146,6 +146,24 @@ command arg1 arg2 …
 
 An unknown command prints `command not found` and sets a failing status.
 
+### Redirection
+
+The bash operators, and they mean what they do there: `>`, `>>`, `<`, `2>`,
+`2>>`, `2>&1`, `>&2`, `<&0`, and `&> file` / `>& file` for both streams.
+
+**Any descriptor**, not just the standard three:
+
+```mesh
+sh -c 'read line <&3; echo $line' 3< input.txt
+sh -c 'echo detail >&3' 3> trace.log
+```
+
+Redirections apply **in source order**, so a duplication copies where a
+descriptor points *at that moment* — `> out 2>&1` sends both to the file, while
+`2>&1 > out` copies stdout's original destination onto stderr and only then
+moves stdout. For the same reason, duplicating a descriptor nothing has opened
+yet is an error (`EBADF`), even if a later redirection would have opened it.
+
 ### Heredocs
 
 `<< DELIM` feeds the following lines to a command's standard input, up to a line
