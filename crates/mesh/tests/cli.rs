@@ -6422,18 +6422,21 @@ fn malformed_function_bodies_remain_quarantined() {
     }
 }
 
-/// A **hard** lexical error inside a body is reported and the reader moves on. No
-/// later line repairs an invalid escape, so waiting for one buffers forever behind
-/// a diagnostic that never arrives — interactively the continuation prompt could
-/// only be escaped by cancelling, and here every following command is swallowed
-/// into the same buffer and rejected with the function at EOF.
+/// A **hard** lexical error inside a body — an invalid escape — does not decide
+/// anything on its own. It sits inside a string, so it cannot change brace
+/// structure, and the only question that matters is still whether the body's `}`
+/// has arrived. Both answers have a way to be wrong:
+///
+/// - `}` present: the definition is **done**, so it dispatches. Waiting for a later
+///   line to repair an invalid escape buffers forever behind a diagnostic that never
+///   arrives — interactively the prompt could only be escaped by cancelling.
+/// - `}` not yet: the definition is **still open**, so it stays quarantined.
+///   Dispatching there ran the body's own later lines as top-level commands.
 #[test]
-fn a_hard_lexical_error_in_a_function_body_does_not_swallow_later_commands() {
+fn a_hard_lexical_error_in_a_function_body_reports_without_leaking() {
+    // Closed: the error is reported and the command after the definition runs.
     for input in [
-        // With the body's `}` present and without it: the error is already decided
-        // either way, so both dispatch.
         "func f() { puts \"\\z\" }\nputs LATER\n",
-        "func f() { puts \"\\z\"\nputs LATER\n",
         "func f() {\n  puts \"\\z\"\n}\nputs LATER\n",
     ] {
         let out = run_with_input(input);
@@ -6445,6 +6448,28 @@ fn a_hard_lexical_error_in_a_function_body_does_not_swallow_later_commands() {
             "{input:?} swallowed the command after it: {stderr}"
         );
     }
+
+    // Still open: the body's later lines belong to the quarantined definition and
+    // must not run, whether the `}` eventually arrives or the input just ends.
+    for input in [
+        "func f() {\nputs \"\\z\"\nputs LEAKED\n}\nputs AFTER\n",
+        "func f() { puts \"\\z\"\nputs LEAKED\n",
+    ] {
+        let out = run_with_input(input);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("syntax error") || !String::from_utf8_lossy(&out.stderr).is_empty(),
+            "{input:?} reported nothing"
+        );
+        assert!(
+            !stdout.contains("LEAKED"),
+            "{input:?} leaked a body command to the top level: {stdout}"
+        );
+    }
+
+    // And the definition that *does* close still runs its own commands afterwards.
+    let out = run_with_input("func f() {\nputs \"\\z\"\nputs LEAKED\n}\nputs AFTER\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "AFTER\n");
 }
 
 /// A tokenize failure *after* the body's `}` says nothing about the body — it has

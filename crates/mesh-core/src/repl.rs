@@ -5523,40 +5523,66 @@ fn strip_growing_tail(list: &str) -> (&str, GrowingTail) {
 /// definition pending, so it is dispatched and the parser reports the documented
 /// "unexpected text after the closing `}`" error.
 ///
-/// A tokenize failure is not an answer on its own, because the failure can sit
-/// *after* the `}` that already settled this. `func f() {} puts "` fails on the
-/// quote, but the body closed two tokens earlier and the definition is done — so
-/// the text before the error is scanned first, and a close found there wins. The
-/// char scanner this replaced got that for free by never failing at all.
+/// There is exactly one question — *is the matching `}` in the buffer yet?* — and a
+/// tokenize failure must not be mistaken for an answer to it. A **hard** lexical
+/// error such as an invalid escape sits inside a string, so it cannot change brace
+/// structure: the braces after it are still there to be counted, and whether the
+/// body closed is still knowable. Blanking the offending span and asking the
+/// tokenizer again recovers that view, which is what the char scanner this replaced
+/// got for free by never failing at all — without a second copy of the quote rules
+/// to keep in step.
 ///
-/// Only when no close is found before the failure does the kind of failure matter,
-/// and then it splits two ways. An **unterminated** quote or heredoc is an open
-/// construct: the rest of the input is inside it, so a later line may still close
-/// both it and the body — keep buffering. Any other lexical error is **hard**: no
-/// later line repairs an invalid escape, so waiting for one buffers forever behind
-/// a diagnostic that never arrives, swallowing every command typed after it.
+/// Both failure modes then fall out of the one question, which is why they are no
+/// longer separate cases:
+///
+/// - `func f() { puts "\z" }` — the `}` is there behind the error, so the
+///   definition is **done**. Waiting for a later line to repair an invalid escape
+///   buffers forever behind a diagnostic that never arrives.
+/// - `func f() {`⏎`puts "\z"`⏎`puts LEAKED` — no `}` yet, so it is **still open**
+///   and stays quarantined. Dispatching here ran `puts LEAKED` at the top level.
+///
+/// An **unterminated** quote or heredoc is different in kind and stops the scan: the
+/// rest of the input is genuinely inside that construct, so any `}` in there belongs
+/// to the string rather than to block structure, and only a later line can close it.
 fn body_awaits_close(text: &str) -> bool {
-    match parser::tokenize(text) {
-        Ok(tokens) => first_close_at_depth_zero(&tokens).is_none(),
-        Err(error) => {
-            // The prefix before the error tokenizes on its own — the tokenizer
-            // stops at the first thing it cannot read, so everything earlier was
-            // fine — and a body that closed in there is closed regardless of what
-            // follows it.
-            let settled = text
+    // Each pass either answers the question or neutralizes one hard error and looks
+    // again. Bounded because a pathological buffer should not spin: reaching the cap
+    // keeps the definition open, which is the quarantining answer.
+    let mut source = text.to_owned();
+    for _ in 0..MAX_LEXICAL_RECOVERIES {
+        let error = match parser::tokenize(&source) {
+            Ok(tokens) => return first_close_at_depth_zero(&tokens).is_none(),
+            Err(error) => error,
+        };
+        if matches!(
+            error.kind,
+            parser::ParseErrorKind::UnexpectedEnd
+                | parser::ParseErrorKind::Unterminated(_)
+                | parser::ParseErrorKind::UnterminatedHeredoc(_)
+        ) {
+            // The tail is inside an open construct, so only what precedes it counts.
+            return !source
                 .get(..error.span.start)
                 .and_then(|prefix| parser::tokenize(prefix).ok())
                 .is_some_and(|tokens| first_close_at_depth_zero(&tokens).is_some());
-            !settled
-                && matches!(
-                    error.kind,
-                    parser::ParseErrorKind::UnexpectedEnd
-                        | parser::ParseErrorKind::Unterminated(_)
-                        | parser::ParseErrorKind::UnterminatedHeredoc(_)
-                )
         }
+        // A hard error: blank it and look again. Spans are char boundaries and a
+        // space is one byte, so the replacement keeps every later span valid.
+        let Some(span) = source.get(error.span.clone()) else {
+            return true;
+        };
+        let blanked = " ".repeat(span.len());
+        if blanked.is_empty() {
+            return true;
+        }
+        source.replace_range(error.span.clone(), &blanked);
     }
+    true
 }
+
+/// How many hard lexical errors [`body_awaits_close`] will look past before giving
+/// up and keeping the definition quarantined.
+const MAX_LEXICAL_RECOVERIES: usize = 64;
 
 /// Index of the first `}` that returns brace depth to zero, if one is reached.
 fn first_close_at_depth_zero(tokens: &[parser::Token]) -> Option<usize> {
@@ -8916,16 +8942,28 @@ mod tests {
     /// swallowed into the same buffer.
     #[test]
     fn a_hard_lexical_error_in_a_body_dispatches_but_an_open_construct_buffers() {
-        // Hard: dispatch whether or not the body's `}` is present, since the error
-        // is already decided and waiting cannot change it.
+        // Hard error with the `}` present: the definition is done, so it dispatches
+        // rather than waiting for a repair that can never come.
         for hard in [
             r#"func f() { puts "\z" }"#,
-            "func f() { puts \"\\z\"\n",
             r#"func f() { puts "\u{ZZ}" }"#,
+            "func f() {\n  puts \"\\z\"\n}\n",
         ] {
             assert!(
                 !func_definition_is_open(hard),
-                "a hard lexical error should dispatch: {hard:?}"
+                "a closed body should dispatch: {hard:?}"
+            );
+        }
+
+        // The same error with no `}` yet: still open, so the body's later lines stay
+        // quarantined instead of leaking to the top level.
+        for hard in [
+            "func f() { puts \"\\z\"\n",
+            "func f() {\nputs \"\\z\"\nputs LEAKED\n",
+        ] {
+            assert!(
+                func_definition_is_open(hard),
+                "an unclosed body should stay quarantined: {hard:?}"
             );
         }
 
@@ -8956,10 +8994,19 @@ mod tests {
     /// The same split stated directly on the helper, since `func_definition_is_open`
     /// reaches it only after the header has opened a body.
     #[test]
-    fn body_awaits_close_separates_open_constructs_from_hard_errors() {
+    fn body_awaits_close_answers_only_whether_the_brace_arrived() {
+        // A hard error sits inside a string and cannot move a brace, so the `}`
+        // behind it still closes the body and its absence still leaves it open.
         assert!(!body_awaits_close(r#"{ puts "\z" }"#));
-        assert!(!body_awaits_close(r#"{ puts "\z""#));
+        assert!(body_awaits_close(r#"{ puts "\z""#));
+        assert!(body_awaits_close("{ puts \"\\z\"\nputs more\n"));
+        // Several hard errors in one buffer are looked past in turn.
+        assert!(!body_awaits_close("{ puts \"\\z\"\nputs \"\\q\"\n}"));
+        // An unterminated construct is different in kind: the rest of the input is
+        // inside it, so a `}` in there is string content, not block structure.
         assert!(body_awaits_close("{ puts \"open\n"));
+        assert!(body_awaits_close("{ puts \"open } still open\n"));
+        // And the plain cases are unchanged.
         assert!(body_awaits_close("{ puts hi"));
         assert!(!body_awaits_close("{ puts hi }"));
     }
