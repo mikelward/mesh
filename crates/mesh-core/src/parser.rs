@@ -1555,14 +1555,31 @@ impl Parser {
             } else if self.eat(&TokenKind::GreaterAmp).is_some() {
                 // `>&` is two operators wearing one spelling, told apart by the
                 // target: `>&2` names a descriptor and duplicates, `>& file`
-                // names a path and takes both streams there. Decided on the
-                // token as written rather than after expansion, so the meaning
-                // of a line never depends on a variable's contents.
-                Some(if self.at_descriptor_word() {
-                    RedirectKind::DuplicateOut
+                // names a path and takes both streams there.
+                //
+                // The choice is made on the token as written, never after
+                // expansion, so a line's meaning cannot depend on a variable's
+                // contents. That leaves a computed target genuinely ambiguous —
+                // `>&$fd` reads as "duplicate onto $fd" but would silently create
+                // a file named `2` — so it is refused rather than guessed. Both
+                // meanings have an unambiguous spelling to say instead.
+                //
+                // Only the *bare* `>&` is ambiguous. An explicit source
+                // descriptor (`1>&…`) can only mean duplication, so a computed
+                // target is fine there — which is what the message below points
+                // at.
+                let operator_start = self.tokens[self.position - 1].span.start;
+                if self.descriptor_prefix(&items, operator_start).is_some()
+                    || self.at_descriptor_word()
+                {
+                    Some(RedirectKind::DuplicateOut)
+                } else if self.at_literal_word() {
+                    Some(RedirectKind::Both)
                 } else {
-                    RedirectKind::Both
-                })
+                    return Err(self.error(ParseErrorKind::Expected(
+                        "a written-out target: `1>&$fd` to duplicate, or `&> $file` for both streams",
+                    )));
+                }
             } else if self.eat(&TokenKind::LessAmp).is_some() {
                 Some(RedirectKind::DuplicateIn)
             } else if self.eat(&TokenKind::AmpGreater).is_some() {
@@ -1575,16 +1592,8 @@ impl Parser {
                 // `2> file`: a bare run of digits *abutting* the operator names
                 // the descriptor and is not an argument. Spacing decides —
                 // `echo 2 > f` writes "2" to f, exactly as in bash.
-                let fd = match items.last() {
-                    Some(CommandItem::Word(word))
-                        if word.span.end == operator_start
-                            && matches!(word.value.pieces.as_slice(),
-                                [WordPiece::Text { text, quote: QuoteMode::Bare }]
-                                    if text.chars().all(|c| c.is_ascii_digit())) =>
-                    {
-                        let WordPiece::Text { text, .. } = &word.value.pieces[0] else {
-                            unreachable!("matched a bare text piece")
-                        };
+                let fd = match self.descriptor_prefix(&items, operator_start) {
+                    Some(text) => {
                         let descriptor = text.parse::<u32>().map_err(|_| {
                             self.error(ParseErrorKind::Expected("a descriptor mesh can redirect"))
                         })?;
@@ -1596,7 +1605,7 @@ impl Parser {
                         items.pop();
                         Some(descriptor)
                     }
-                    _ => None,
+                    None => None,
                 };
                 if fd.is_some() && kind == RedirectKind::Heredoc {
                     return Err(self.error(ParseErrorKind::Expected(
@@ -2053,6 +2062,48 @@ impl Parser {
     }
 
     /// Is the next token a bare run of digits — the shape a descriptor takes?
+    /// The bare run of digits abutting the operator, if the last item is one —
+    /// the `2` in `2> file`. Shared so the `>&` reading and the descriptor prefix
+    /// itself agree on what counts.
+    fn descriptor_prefix<'a>(
+        &self,
+        items: &'a [CommandItem],
+        operator_start: usize,
+    ) -> Option<&'a str> {
+        match items.last() {
+            Some(CommandItem::Word(word)) if word.span.end == operator_start => {
+                match word.value.pieces.as_slice() {
+                    [
+                        WordPiece::Text {
+                            text,
+                            quote: QuoteMode::Bare,
+                        },
+                    ] if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) => Some(text),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Is the next token spelled out in full — text only, with nothing that has
+    /// to be expanded to know what it says?
+    ///
+    /// Quoting counts as literal: `>& "2"` names a file, because the quotes are
+    /// the user saying so.
+    fn at_literal_word(&self) -> bool {
+        self.peek().is_some_and(|token| match &token.value {
+            TokenKind::Word(word) => {
+                !word.pieces.is_empty()
+                    && word
+                        .pieces
+                        .iter()
+                        .all(|piece| matches!(piece, WordPiece::Text { .. }))
+            }
+            _ => false,
+        })
+    }
+
     fn at_descriptor_word(&self) -> bool {
         self.peek().is_some_and(|token| match &token.value {
             TokenKind::Word(word) => matches!(
