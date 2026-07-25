@@ -471,12 +471,12 @@ fn fork_in_shell(
                 let redirs = staged_redirs(cmd, is_last);
                 let inherited = live_descriptors(&redirs);
                 let mut closing = Vec::new();
-                let deferred = match open_paths(&redirs, &inherited)
-                    .and_then(|files| resolve_sources(&redirs, files, inherited_seed()))
-                    .and_then(|sources| {
+                let deferred = match resolve_redirs(&redirs, &inherited, inherited_seed()).and_then(
+                    |sources| {
                         closing = sources.closed();
                         sources_to_files(sources)
-                    }) {
+                    },
+                ) {
                     Ok(files) => files,
                     Err((path, err)) => {
                         note!("mesh: {path}: {err}");
@@ -580,12 +580,13 @@ pub fn run_pipeline(
     let mut process_group = None;
     let shell_modes = interactive.then(terminal_modes).flatten();
 
-    // Open each stage's redirections concurrently — each stage still opens its
-    // own in source order, but different stages open at the same time, so a FIFO
-    // opened by one stage does not block a peer opened by another stage of the
-    // same pipeline (`cat < fifo | cmd > fifo`) before the writer is spawned.
+    // Resolve each stage's redirections concurrently — each stage still walks
+    // its own in source order, acquiring every descriptor as it reaches it, but
+    // different stages walk at the same time, so a FIFO opened by one stage does
+    // not block a peer opened by another stage of the same pipeline
+    // (`cat < fifo | cmd > fifo`) before the writer is spawned.
     // Which descriptors the shell holds, asked **once, on this thread, before
-    // any stage opens anything**. The opening threads share one descriptor
+    // any stage opens anything**. The resolving threads share one descriptor
     // table, so a probe inside them could see a sibling's freshly opened target
     // as inherited — and then `4>&3` in one stage would copy another stage's
     // `9> victim` instead of failing, non-deterministically.
@@ -596,62 +597,49 @@ pub fn run_pipeline(
             .flat_map(|(idx, cmd)| staged_redirs(cmd, idx + 1 == n))
             .collect::<Vec<_>>(),
     );
-    let opened: Vec<Result<Opened, (String, std::io::Error)>> = if background {
-        // A background stage opens nothing here: its targets are opened by the
-        // helper (or by the forked child), so a blocking open cannot hold up the
-        // shell before the job is registered.
-        (0..n).map(|_| Ok(Opened::none())).collect()
+    let seeds: Vec<Sources> = (0..n)
+        .map(|idx| stage_seed(idx, n, background, interactive))
+        .collect();
+    let resolved: Vec<Result<Sources, (String, std::io::Error)>> = if background {
+        // A background stage resolves nothing here: its targets are opened by
+        // the helper (or by the forked child), so a blocking open cannot hold up
+        // the shell before the job is registered.
+        seeds.into_iter().map(Ok).collect()
     } else {
         std::thread::scope(|scope| {
             let handles: Vec<_> = cmds
                 .iter()
                 .enumerate()
-                .map(|(idx, cmd)| {
+                .zip(seeds)
+                .map(|((idx, cmd), seed)| {
                     let redirs = staged_redirs(cmd, idx + 1 == n);
                     let inherited = &inherited;
-                    scope.spawn(move || open_paths(&redirs, inherited))
+                    scope.spawn(move || resolve_redirs(&redirs, inherited, seed))
                 })
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| Ok(Opened::none())))
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err((
+                            "redirection".to_owned(),
+                            std::io::Error::other("resolving the redirections panicked"),
+                        ))
+                    })
+                })
                 .collect::<Vec<_>>()
         })
     };
 
-    for ((idx, cmd), redir_result) in cmds.into_iter().enumerate().zip(opened) {
+    for ((idx, cmd), redir_result) in cmds.into_iter().enumerate().zip(resolved) {
         let is_last = idx + 1 == n;
         // Default the following stage to EOF; a successful piped spawn upgrades
         // it to the real pipe. So a redirected or failed stage leaves the next
         // one reading `/dev/null` rather than the shell's stdin.
         let incoming = std::mem::replace(&mut next_stdin, NextIn::Null);
 
-        // Seed each descriptor with where it points *before* any redirection, so
-        // a duplication copies the pipe or the terminal as it stands at that
-        // point in the sequence.
-        let seed: Sources = [
-            (
-                libc::STDIN_FILENO,
-                match &incoming {
-                    NextIn::Inherit => Source::Inherit(libc::STDIN_FILENO),
-                    NextIn::Null => Source::Null,
-                    NextIn::Pipe(_) => Source::PipeIn,
-                },
-            ),
-            (
-                libc::STDOUT_FILENO,
-                if is_last {
-                    Source::Inherit(libc::STDOUT_FILENO)
-                } else {
-                    Source::PipeOut
-                },
-            ),
-            (libc::STDERR_FILENO, Source::Inherit(libc::STDERR_FILENO)),
-        ]
-        .into_iter()
-        .collect();
         let redirs = staged_redirs(&cmd, is_last);
-        let sources = match redir_result.and_then(|files| resolve_sources(&redirs, files, seed)) {
+        let mut sources = match redir_result {
             Ok(sources) => sources,
             Err((path, err)) => {
                 note!("mesh: {path}: {err}");
@@ -659,6 +647,11 @@ pub fn run_pipeline(
                 continue;
             }
         };
+        // The seed assumed a pipe from the stage before this one, which is only
+        // now known.
+        if !matches!(incoming, NextIn::Pipe(_)) {
+            sources.no_incoming_pipe();
+        }
         // A descriptor that resolved to this stage's outgoing pipe cannot become
         // a file here — the pipe is made below — so it is carried as intent.
         let stdout_to_pipe = sources.is_pipe(libc::STDOUT_FILENO);
@@ -1062,6 +1055,35 @@ fn initial_stdin(background: bool, interactive: bool) -> NextIn {
     }
 }
 
+/// Where stage `idx` of an `n`-stage pipeline points *before* its own
+/// redirections, so a duplication copies the pipe or the terminal as it stands
+/// at that point in the sequence.
+///
+/// Built for every stage up front, because resolution runs on the stage's own
+/// thread and so cannot wait for the stage before it to be spawned. That is why
+/// stdin is the incoming pipe for every stage but the first even though the one
+/// before it may yet send its stdout elsewhere; [`Sources::no_incoming_pipe`]
+/// corrects the guess once the answer is known.
+fn stage_seed(idx: usize, n: usize, background: bool, interactive: bool) -> Sources {
+    let stdin = match (idx, initial_stdin(background, interactive)) {
+        (0, NextIn::Null) => Source::Null,
+        (0, _) => Source::Inherit(libc::STDIN_FILENO),
+        _ => Source::PipeIn,
+    };
+    let stdout = if idx + 1 == n {
+        Source::Inherit(libc::STDOUT_FILENO)
+    } else {
+        Source::PipeOut
+    };
+    [
+        (libc::STDIN_FILENO, stdin),
+        (libc::STDOUT_FILENO, stdout),
+        (libc::STDERR_FILENO, Source::Inherit(libc::STDERR_FILENO)),
+    ]
+    .into_iter()
+    .collect()
+}
+
 enum WaitResult {
     Complete(u8),
     Stopped(u8),
@@ -1261,12 +1283,10 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
     }
     let inherited = live_descriptors(&redirs);
     let mut closing = Vec::new();
-    let opened = match open_paths(&redirs, &inherited)
-        .and_then(|files| resolve_sources(&redirs, files, inherited_seed()))
-        .and_then(|sources| {
-            closing = sources.closed();
-            sources_to_files(sources)
-        }) {
+    let opened = match resolve_redirs(&redirs, &inherited, inherited_seed()).and_then(|sources| {
+        closing = sources.closed();
+        sources_to_files(sources)
+    }) {
         Ok(files) => files,
         Err((path, err)) => {
             note!("mesh: {path}: {err}");
@@ -1433,11 +1453,6 @@ fn set_foreground_group(pgid: libc::pid_t) {
     }
 }
 
-/// Open every redirection in source order so each file's create/truncate side
-/// effect and any error happens in order, as POSIX shells do (`> a > b` opens
-/// both). Returns the final stdin/stdout target — the last redirection of each
-/// direction wins. On the first failure, returns the offending path and error.
-#[allow(clippy::type_complexity)]
 /// Apply `redirs` to **this** process's stdin/stdout for the duration of `body`,
 /// restoring the original descriptors afterward, and return `body`'s result.
 ///
@@ -1471,11 +1486,11 @@ pub(crate) fn with_redirections<T>(
         .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
         .collect();
 
-    let sources = resolve_sources(
+    let sources = resolve_redirs(
         redirs,
         // Distinct from `already_open` above: that is which *targets* the shell
         // holds, for the save; this is which descriptors a duplication may copy.
-        open_paths(redirs, &live_descriptors(redirs))?,
+        &live_descriptors(redirs),
         inherited_seed(),
     )?;
     // `n>&-` closes one of the shell's own descriptors for the body's duration,
@@ -1652,8 +1667,8 @@ fn shell_stdin_is_terminal() -> bool {
 /// carries this state per descriptor rather than reducing to "last file wins".
 #[derive(Debug)]
 pub(crate) enum Source {
-    /// Inherit the shell's descriptor — remembering *which*, since stderr
-    /// following an inherited stdout means the shell's fd 1, not fd 2.
+    /// Inherit the shell's descriptor — remembering *which*, since a `2>&1`
+    /// that reaches it has to duplicate the shell's fd 1, not fd 2.
     Inherit(libc::c_int),
     /// EOF: `/dev/null`, for a stage with no producer.
     Null,
@@ -1672,33 +1687,49 @@ pub(crate) enum Source {
 }
 
 impl Source {
-    /// Copy this destination for a duplication. A file needs a second handle on
-    /// the same open file description, which is what `dup2` would have given.
-    fn duplicate(&self) -> std::io::Result<Source> {
+    /// Copy this destination onto `fd` for a duplication, **taking the
+    /// descriptor here** rather than at installation.
+    ///
+    /// A file gets a second handle on the same open file description, which is
+    /// what `dup2` would have given; the shell's own descriptor is duplicated;
+    /// an EOF stdin becomes a `/dev/null` of its own, since only stdin has a
+    /// slot the caller fills with one. Each of those can fail — `EMFILE` at the
+    /// descriptor limit — and failing *where the redirection stands* is the
+    /// point: a later `>` must not have truncated by then.
+    ///
+    /// A pipe is the exception: it does not exist yet, so it stays intent and
+    /// the caller hands out handles once it has made it.
+    fn copy(&self, fd: libc::c_int) -> std::io::Result<Source> {
         Ok(match self {
-            Source::Inherit(fd) => Source::Inherit(*fd),
+            Source::File(file) => Source::File(file.try_clone()?),
+            Source::Inherit(from) if *from != fd => Source::File(dup_shell_fd(*from)?),
+            Source::Inherit(from) => Source::Inherit(*from),
+            Source::Null if fd != libc::STDIN_FILENO => Source::File(File::open("/dev/null")?),
             Source::Null => Source::Null,
             Source::PipeOut => Source::PipeOut,
             Source::PipeIn => Source::PipeIn,
+            // A copy of a closed descriptor is closed too — for the shell's own
+            // fd of that number, which `resolve_redirs` lets through when it
+            // holds one. A copy of a close this stage made is `EBADF` there.
             Source::Closed => Source::Closed,
-            Source::File(file) => Source::File(file.try_clone()?),
         })
     }
 
     /// The file this descriptor should be given, or `None` when it already
     /// points where it needs to.
     ///
-    /// An `Inherit` of a *different* descriptor is the whole point of `2>&1`:
-    /// `Stdio::inherit()` would hand the child its own fd 2, so the shell's fd 1
-    /// has to be duplicated into an owned handle instead. Applied uniformly to
-    /// all three descriptors, so `>&2` moves stdout just as `2>&1` moves stderr.
+    /// [`Source::copy`] took every descriptor a duplication needed as the walk
+    /// reached it, so what is left here is the seed's own destinations — which
+    /// each already sit on the descriptor they name — and the pipes the caller
+    /// makes for itself.
     fn into_file(self, fd: libc::c_int) -> std::io::Result<Option<File>> {
         Ok(match self {
             Source::File(file) => Some(file),
-            Source::Inherit(from) if from != fd => Some(dup_shell_fd(from)?),
             // A descriptor that copied an EOF stdin needs a `/dev/null` of its
             // own: only stdin has a slot the caller fills with one, so anything
             // else would be left closed and read `EBADF` instead of end-of-file.
+            // Reached when the stage before this one turned out to produce no
+            // pipe after all — see [`Sources::no_incoming_pipe`].
             Source::Null if fd != libc::STDIN_FILENO => Some(File::open("/dev/null")?),
             _ => None,
         })
@@ -1767,6 +1798,21 @@ impl Sources {
             |source| matches!(source, Source::PipeIn),
             &[libc::STDIN_FILENO],
         )
+    }
+
+    /// The stage before this one produced no pipe after all — it sent its stdout
+    /// elsewhere, or failed to start — so every descriptor that copied the
+    /// incoming pipe reads end-of-file instead.
+    ///
+    /// Resolution seeds stdin with the pipe because the seed is built *before*
+    /// the previous stage is spawned, which is what lets every stage resolve on
+    /// its own thread. This is where that guess is corrected.
+    fn no_incoming_pipe(&mut self) {
+        for (_, source) in &mut self.0 {
+            if matches!(source, Source::PipeIn) {
+                *source = Source::Null;
+            }
+        }
     }
 
     fn extras(&self, want: impl Fn(&Source) -> bool, wired: &[libc::c_int]) -> PipeCopies {
@@ -1950,99 +1996,6 @@ fn dup_shell_fd(fd: libc::c_int) -> std::io::Result<File> {
     Ok(unsafe { File::from_raw_fd(duplicated) })
 }
 
-/// Open every **path** target, in source order, leaving a hole where a
-/// redirection duplicates a descriptor instead.
-///
-/// Opening is split from applying so stages can still open concurrently — a FIFO
-/// opened by one stage must not block a peer — while the order-sensitive part
-/// stays strictly sequential. Every target is opened even when a later
-/// redirection supersedes it, so `> a > b` still truncates `a`, as in bash.
-///
-/// A **duplication is validated as the walk reaches it**, so a bad one stops the
-/// walk before any later target is created. `true 2>&7 > existing` must fail
-/// without emptying `existing`, exactly as bash leaves it alone: redirections
-/// apply in source order, and an order that has already destroyed a file by the
-/// time it reports the failure is not that order. Validation needs no files, only
-/// which descriptors *exist* at each point, so it costs nothing to do here.
-fn open_paths(
-    redirs: &[Redirection],
-    inherited: &[libc::c_int],
-) -> Result<Opened, (String, std::io::Error)> {
-    // A descriptor the process could never hold is refused first, before any
-    // target is created or truncated, and named in the error the way bash names
-    // it. Left to `dup2` it would surface as `EBADF` against the *command*, from
-    // a hook that runs after the opens.
-    // A close needs no descriptor at all, so the limit has nothing to say about
-    // it: `999999>&-` asks for something already true, and bash accepts it.
-    let limit = descriptor_limit();
-    for redir in redirs {
-        if redir.fd >= limit && !matches!(redir.target, RedirTarget::Close) {
-            return Err((
-                format!("&{}", redir.fd),
-                std::io::Error::from_raw_os_error(libc::EBADF),
-            ));
-        }
-    }
-    let mut live = inherited.to_vec();
-    let mut opened = Vec::with_capacity(redirs.len());
-    for Redirection { fd, kind, target } in redirs {
-        opened.push(match target {
-            RedirTarget::Descriptor(from) => {
-                if !live.contains(from) {
-                    return Err((
-                        format!("&{from}"),
-                        std::io::Error::from_raw_os_error(libc::EBADF),
-                    ));
-                }
-                None
-            }
-            RedirTarget::Close => None,
-            RedirTarget::Heredoc(body) => {
-                Some(heredoc_file(body).map_err(|e| ("<<".to_owned(), e))?)
-            }
-            RedirTarget::Path(path) => {
-                let file = match kind {
-                    RedirKind::In => File::open(path),
-                    RedirKind::Out => File::create(path),
-                    RedirKind::Append => OpenOptions::new().create(true).append(true).open(path),
-                };
-                Some(file.map_err(|e| (path.clone(), e))?)
-            }
-        });
-        if matches!(target, RedirTarget::Close) {
-            // `n>&-` takes the descriptor away, so a later `m>&n` is `EBADF`.
-            live.retain(|live| live != fd);
-        } else if !live.contains(fd) {
-            // Whatever it was, this redirection gives `fd` a destination, so a
-            // later duplication may copy it.
-            live.push(*fd);
-        }
-    }
-    Ok(Opened {
-        files: opened,
-        inherited: inherited.to_vec(),
-    })
-}
-
-/// What one stage's opening pass produced: a file per path target, and the
-/// descriptors the shell already held when the pass began.
-struct Opened {
-    files: Vec<Option<File>>,
-    /// Carried rather than re-probed, because probing again after the opens
-    /// would find this stage's own files on the low descriptors.
-    inherited: Vec<libc::c_int>,
-}
-
-impl Opened {
-    /// Nothing opened and nothing inherited — a stage that defers its opens.
-    fn none() -> Self {
-        Self {
-            files: Vec::new(),
-            inherited: Vec::new(),
-        }
-    }
-}
-
 /// The descriptors a duplication may copy before any redirection has been
 /// applied: the standard three, plus any *other* descriptor this stage names
 /// that the shell already holds.
@@ -2077,57 +2030,80 @@ fn live_descriptors(redirs: &[Redirection]) -> Vec<libc::c_int> {
 /// way they do in every other shell: the first sends both to the file, the second
 /// copies stdout's *original* destination onto stderr and only then moves stdout.
 ///
+/// Each destination is **acquired where the walk reaches it** — the descriptor
+/// limit is checked, then the path is opened or the duplication performed — so
+/// the source-order guarantee is structural rather than something each new
+/// failure mode has to be taught. `> a > b` truncates both, `true 2>&7 >
+/// existing` fails without emptying `existing`, and `true 3> foo 4>&3 >
+/// existing` fails on the duplication it cannot afford instead of after the `>`
+/// has already truncated. Opening every target up front and only then applying
+/// the duplications let a duplication be proved well-formed, a later `>`
+/// truncate, and only then turn out to be unaffordable.
+///
 /// `seed` supplies the destinations before any redirection — the incoming pipe or
 /// terminal for stdin, and the outgoing pipe for stdout when this is not the last
 /// stage — which is what makes `f 2>&1 | g` put both streams into it.
-fn resolve_sources(
+/// `inherited` is which descriptors the process held *before* the walk; the
+/// caller asks, because an open takes the lowest free descriptor and a probe from
+/// inside the walk would find the walk's own files.
+fn resolve_redirs(
     redirs: &[Redirection],
-    opened: Opened,
+    inherited: &[libc::c_int],
     seed: Sources,
 ) -> Result<Sources, (String, std::io::Error)> {
-    let Opened { files, inherited } = opened;
+    let limit = descriptor_limit();
     let mut state = seed;
-    for (redir, file) in redirs.iter().zip(files) {
-        let resolved = match (&redir.target, file) {
-            (RedirTarget::Path(_) | RedirTarget::Heredoc(_), Some(file)) => Source::File(file),
-            (RedirTarget::Path(path), None) => {
-                return Err((
-                    path.clone(),
-                    std::io::Error::other("redirection target was not opened"),
-                ));
-            }
-            (RedirTarget::Heredoc(_), None) => {
-                return Err((
-                    "<<".to_owned(),
-                    std::io::Error::other("heredoc body was not opened"),
-                ));
-            }
-            // Duplicating a descriptor nothing has opened is `EBADF`, the same
-            // answer the kernel gives — a copy of nothing is not an inheritance
-            // of the shell's own fd of that number.
-            (RedirTarget::Close, _) => Source::Closed,
-            (RedirTarget::Descriptor(from), _) => match state.get(*from) {
-                Some(Source::Closed) | None if !inherited.contains(from) => {
-                    return Err((
-                        format!("&{from}"),
-                        std::io::Error::from_raw_os_error(libc::EBADF),
-                    ));
+    for Redirection { fd, kind, target } in redirs {
+        // A descriptor the process could never hold is refused where it stands,
+        // named in the error the way bash names it. Left to `dup2` it would
+        // surface as `EBADF` against the *command*, from a hook that runs after
+        // every open. A close needs no descriptor at all, so the limit has
+        // nothing to say about it: `999999>&-` asks for something already true,
+        // and bash accepts it.
+        if *fd >= limit && !matches!(target, RedirTarget::Close) {
+            return Err((
+                format!("&{fd}"),
+                std::io::Error::from_raw_os_error(libc::EBADF),
+            ));
+        }
+        let resolved = match target {
+            RedirTarget::Close => Source::Closed,
+            RedirTarget::Descriptor(from) => {
+                let named = |error| (format!("&{from}"), error);
+                match state.get(*from) {
+                    // Closed by an earlier `n>&-`, and gone: copying it
+                    // afterwards is `EBADF`, unless the shell itself still holds
+                    // a descriptor of that number for the copy to reach.
+                    Some(Source::Closed) | None if !inherited.contains(from) => {
+                        return Err(named(std::io::Error::from_raw_os_error(libc::EBADF)));
+                    }
+                    Some(source) => source.copy(*fd).map_err(named)?,
+                    // Not one this stage has touched, but one the shell holds —
+                    // an enclosing `f 3> out` around a nested `4>&3`. The seed
+                    // carries only the standard three, so without this a valid
+                    // copy of a real descriptor reads as a copy of nothing.
+                    None if inherited.contains(from) => {
+                        Source::Inherit(*from).copy(*fd).map_err(named)?
+                    }
+                    // Duplicating a descriptor nothing has opened is `EBADF`,
+                    // the same answer the kernel gives — a copy of nothing is
+                    // not an inheritance of the shell's own fd of that number.
+                    None => return Err(named(std::io::Error::from_raw_os_error(libc::EBADF))),
                 }
-                Some(source) => source.duplicate().map_err(|e| (format!("&{from}"), e))?,
-                // Not one this stage has touched, but one the shell holds — an
-                // enclosing `f 3> out` around a nested `4>&3`. The seed carries
-                // only the standard three, so without this a valid copy of a
-                // real descriptor reads as a copy of nothing.
-                None if inherited.contains(from) => Source::Inherit(*from),
-                None => {
-                    return Err((
-                        format!("&{from}"),
-                        std::io::Error::from_raw_os_error(libc::EBADF),
-                    ));
-                }
-            },
+            }
+            RedirTarget::Heredoc(body) => {
+                Source::File(heredoc_file(body).map_err(|e| ("<<".to_owned(), e))?)
+            }
+            RedirTarget::Path(path) => {
+                let file = match kind {
+                    RedirKind::In => File::open(path),
+                    RedirKind::Out => File::create(path),
+                    RedirKind::Append => OpenOptions::new().create(true).append(true).open(path),
+                };
+                Source::File(file.map_err(|e| (path.clone(), e))?)
+            }
         };
-        state.set(redir.fd, resolved);
+        state.set(*fd, resolved);
     }
     Ok(state)
 }

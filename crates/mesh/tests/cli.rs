@@ -2655,27 +2655,21 @@ fn an_eof_stdin_copied_to_a_high_descriptor_still_reads() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n", "{stderr}");
 }
 
-#[test]
-fn a_redirection_needs_no_descriptor_to_spare() {
-    // Installing a descriptor must not require a *free* one above it. Lifting
-    // every handle clear of every target is collision-safe and simple, but it
-    // asks for headroom `RLIMIT_NOFILE` can refuse: at a limit of 4 the only
-    // descriptors that exist are 0-3, so `3> file` had nowhere to go and failed
-    // with `Invalid argument` on a redirection bash performs happily.
+/// Run one command in a mesh whose own `RLIMIT_NOFILE` is `limit`, so a
+/// redirection can be pushed past the descriptors the process may hold. In `-c`
+/// mode mesh holds only the standard three, so the next free descriptor is 3.
+fn run_at_descriptor_limit(limit: libc::rlim_t, command_line: &str) -> Output {
     use std::os::unix::process::CommandExt as _;
 
-    let dir = fresh_dir("fd_limit");
-    let sink = dir.join("out.txt");
     let mut command = mesh_command();
-    command.arg("-c");
-    command.arg(format!("puts ok 3> {}", sink.to_string_lossy()));
+    command.arg("-c").arg(command_line);
     // SAFETY: `setrlimit` only lowers this child's own descriptor limit, and is
     // async-signal-safe, which is the bar `pre_exec` sets.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             let limit = libc::rlimit {
-                rlim_cur: 4,
-                rlim_max: 4,
+                rlim_cur: limit,
+                rlim_max: limit,
             };
             if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
                 return Err(std::io::Error::last_os_error());
@@ -2683,7 +2677,19 @@ fn a_redirection_needs_no_descriptor_to_spare() {
             Ok(())
         });
     }
-    let out = command.output().expect("run mesh");
+    command.output().expect("run mesh")
+}
+
+#[test]
+fn a_redirection_needs_no_descriptor_to_spare() {
+    // Installing a descriptor must not require a *free* one above it. Lifting
+    // every handle clear of every target is collision-safe and simple, but it
+    // asks for headroom `RLIMIT_NOFILE` can refuse: at a limit of 4 the only
+    // descriptors that exist are 0-3, so `3> file` had nowhere to go and failed
+    // with `Invalid argument` on a redirection bash performs happily.
+    let dir = fresh_dir("fd_limit");
+    let sink = dir.join("out.txt");
+    let out = run_at_descriptor_limit(4, &format!("puts ok 3> {}", sink.to_string_lossy()));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "ok\n",
@@ -2692,8 +2698,8 @@ fn a_redirection_needs_no_descriptor_to_spare() {
     );
 
     // Past the limit there is no descriptor to install onto, and that is refused
-    // before any target is opened — named the way bash names it, rather than
-    // surfacing later as `EBADF` against the command.
+    // before *this* redirection's own target is opened — named the way bash
+    // names it, rather than surfacing later as `EBADF` against the command.
     let out = run_with_input(&format!(
         "echo hi {}> {}\nputs after\n",
         libc::c_int::MAX,
@@ -2794,6 +2800,79 @@ fn a_descriptor_can_be_closed_for_a_command() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn the_descriptor_limit_is_checked_in_source_order() {
+    // The check used to be a pre-pass over the whole list, so a redirection the
+    // process cannot hold cancelled the ones *before* it as well. Source order
+    // says the earlier ones have already happened: at a limit of 4, `> existing`
+    // truncates and only then is `4>` refused.
+    //
+    // bash goes one step further and creates `later` too — it opens the target
+    // and fails on the `dup2` — so mesh stays the less destructive of the two by
+    // refusing a descriptor it could never install onto before creating a file
+    // for it. That difference is deliberate; the ordering one was not.
+    let dir = fresh_dir("fd_limit_order");
+    let existing = dir.join("existing.txt");
+    let later = dir.join("later.txt");
+    std::fs::write(&existing, "keepme\n").expect("seed the file");
+    let out = run_at_descriptor_limit(
+        4,
+        &format!(
+            "puts hi > {} 4> {}",
+            existing.to_string_lossy(),
+            later.to_string_lossy()
+        ),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("&4"),
+        "the failure did not name it: {stderr}"
+    );
+    assert!(stderr.contains("Bad file descriptor"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&existing).unwrap_or_default(),
+        "",
+        "the redirection before the refused one was skipped"
+    );
+    assert!(
+        !later.exists(),
+        "a target was created for a descriptor that cannot be installed onto"
+    );
+}
+
+#[test]
+fn a_duplication_that_cannot_be_afforded_stops_the_walk() {
+    // A duplication takes a descriptor, and taking it can fail — `EMFILE` at the
+    // limit. Proving it well-formed during the walk but performing it afterwards
+    // meant a later `>` had already truncated by the time the failure surfaced.
+    //
+    // At a limit of 5 the standard three leave two: `3> foo` takes one, `4>&3`
+    // takes the other, and `> existing` is the one that cannot be afforded — so
+    // `existing` keeps its contents, exactly as bash leaves it.
+    let dir = fresh_dir("fd_limit_dup");
+    let foo = dir.join("foo.txt");
+    let existing = dir.join("existing.txt");
+    std::fs::write(&existing, "keepme\n").expect("seed the file");
+    let out = run_at_descriptor_limit(
+        5,
+        &format!(
+            "puts hi 3> {} 4>&3 > {}",
+            foo.to_string_lossy(),
+            existing.to_string_lossy()
+        ),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Too many open files"),
+        "expected the descriptor limit to be reached: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&existing).unwrap_or_default(),
+        "keepme\n",
+        "the unaffordable duplication truncated the target after it"
+    );
 }
 
 #[test]
