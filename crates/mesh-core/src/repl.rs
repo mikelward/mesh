@@ -8095,4 +8095,102 @@ mod tests {
         assert_eq!(run_line("setx", 0, false, &mut shell), Step::Continue(0));
         assert_eq!(shell.vars.get("x"), None);
     }
+
+    /// Write `value` as a literal, run that text back through the shell, and
+    /// return what the reader made of it.
+    ///
+    /// The writer's own unit tests pin the text it emits, which only proves it
+    /// agrees with itself. This is the assertion that matters: the reader is the
+    /// ordinary parser, so a literal that reads back as a different value is a
+    /// writer bug no amount of expected-string checking would catch.
+    fn round_trip(value: &Value) -> Value {
+        let literal = value.to_literal().expect("this value has a literal form");
+        let mut shell = Shell::new();
+        assert_eq!(
+            run_line(&format!("x = {literal}"), 0, false, &mut shell),
+            Step::Continue(0),
+            "the literal {literal} did not run cleanly"
+        );
+        shell.vars.get("x").expect("x is bound").clone()
+    }
+
+    #[test]
+    fn a_written_literal_reads_back_as_the_same_value() {
+        let cases = vec![
+            Value::Integer(0),
+            Value::Integer(42),
+            Value::Integer(-5),
+            Value::Integer(i64::MAX),
+            // `i64::MIN` is deliberately absent — see the test below, where the
+            // gap is on the reader's side rather than the writer's.
+            Value::Boolean(true),
+            Value::Boolean(false),
+            // Strings whose text is another type's literal: these fail the trip
+            // unless the writer quotes unconditionally.
+            Value::String("42".into()),
+            Value::String("true".into()),
+            Value::String("-5".into()),
+            Value::String("foo".into()),
+            Value::String(String::new()),
+            // Text that has to survive the quoting rather than the type rule.
+            Value::String("a b".into()),
+            Value::String("a$b".into()),
+            Value::String("it's".into()),
+            Value::String("back\\slash".into()),
+            Value::String("new\nline\ttab".into()),
+            Value::String("\u{7}bell".into()),
+            Value::String("[not, a, list]".into()),
+            Value::String("#comment | pipe > redirect".into()),
+            Value::List(Vec::new()),
+            Value::Map(Vec::new()),
+            Value::List(vec![Value::Integer(1), Value::String("a b".into())]),
+            Value::Map(vec![("k".into(), Value::Integer(1))]),
+            // Awkward keys: a space and a `:` both break an unquoted key.
+            Value::Map(vec![
+                ("a b".into(), Value::String("x".into())),
+                ("with:colon".into(), Value::Boolean(false)),
+            ]),
+            // Nesting, and the two empty collections nested where their spellings
+            // have to stay apart.
+            Value::List(vec![
+                Value::List(vec![Value::Integer(1)]),
+                Value::Map(vec![("k".into(), Value::List(Vec::new()))]),
+                Value::Map(Vec::new()),
+            ]),
+        ];
+        for value in cases {
+            assert_eq!(
+                round_trip(&value),
+                value,
+                "{value:?} did not survive the round trip"
+            );
+        }
+    }
+
+    /// The one integer the writer can spell but mesh cannot read back.
+    ///
+    /// This is a **reader** gap, not a writer one: `-9223372036854775808` lexes as
+    /// a negation applied to `9223372036854775808`, a magnitude that does not fit
+    /// an `i64`, so the operand is a string by the time the sign would apply and
+    /// the negation reports "expected integer". `i64::MIN + 1` and `i64::MAX` both
+    /// round-trip, which is what places the fault at the boundary rather than in
+    /// the writer.
+    ///
+    /// Pinned rather than fixed: folding the sign into the literal changes how
+    /// *every* negative number parses, which is a wider change than this writer
+    /// warrants. Recorded in `TODO.md`; when it lands, this test fails and the
+    /// value moves into the round-trip list above.
+    #[test]
+    fn the_smallest_integer_writes_correctly_but_does_not_read_back_yet() {
+        assert_eq!(
+            Value::Integer(i64::MIN).to_literal().unwrap(),
+            "-9223372036854775808"
+        );
+        let mut shell = Shell::new();
+        assert_eq!(
+            run_line("x = -9223372036854775808", 0, false, &mut shell),
+            Step::Continue(1),
+            "the reader now takes i64::MIN — move it into the round-trip cases"
+        );
+    }
 }

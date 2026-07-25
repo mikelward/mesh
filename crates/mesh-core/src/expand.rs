@@ -42,6 +42,11 @@ pub enum Modifier {
     Upper,
     Lower,
     Int,
+    /// This value written as the mesh source you would have typed for it, as a
+    /// string. The inverse of reading a literal, so `$x:repr` on a value that
+    /// has no literal form is an error rather than an approximation — see
+    /// [`Value::to_literal`](crate::vars::Value::to_literal).
+    Repr,
     // File tests: `-e`, `find -type`, `-r`, `-w`. Scalar questions about one path,
     // mapping element-wise over a list like the transforms above.
     Exists,
@@ -82,6 +87,7 @@ impl Modifier {
             "upper" => Self::Upper,
             "lower" => Self::Lower,
             "int" => Self::Int,
+            "repr" => Self::Repr,
             "exists" => Self::Exists,
             "type" => Self::Type,
             "read" => Self::Read,
@@ -643,6 +649,18 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 message: "requires a string or collection".into(),
             }),
         },
+        // Every value is welcome here — the ones without a literal form are
+        // refused by the writer itself, naming what it could not write, so this
+        // does not restate the list and cannot drift from it.
+        Modifier::Repr => {
+            value
+                .to_literal()
+                .map(Value::String)
+                .map_err(|kind| ExpandError::Modifier {
+                    name: name.into(),
+                    message: format!("{kind} has no literal form"),
+                })
+        }
         Keys => match value {
             Value::Map(values) => Ok(Value::List(
                 values.into_iter().map(|(k, _)| Value::String(k)).collect(),
@@ -957,6 +975,7 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::Upper => "upper",
         Modifier::Lower => "lower",
         Modifier::Int => "int",
+        Modifier::Repr => "repr",
         Modifier::Exists => "exists",
         Modifier::Type => "type",
         Modifier::Read => "read",
@@ -1091,6 +1110,9 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         | Modifier::Dirs
         | Modifier::Links
         | Modifier::Exec
+        // `:repr` answers for every type, so it is applied to the whole value
+        // rather than routed through the string path like `:upper`.
+        | Modifier::Repr
         | Modifier::Tty => unreachable!("non-string modifier handled separately"),
     }
 }

@@ -33,6 +33,127 @@ pub enum Value {
     Function(FuncValue),
 }
 
+/// Why a value cannot be written as a literal, in the words a diagnostic wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoLiteral {
+    Regex,
+    Glob,
+    Stream,
+    Function,
+}
+
+impl std::fmt::Display for NoLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let noun = match self {
+            NoLiteral::Regex => "a regex",
+            NoLiteral::Glob => "a glob",
+            NoLiteral::Stream => "a stream handle",
+            NoLiteral::Function => "a function",
+        };
+        f.write_str(noun)
+    }
+}
+
+impl Value {
+    /// This value written as the mesh source you would have typed for it.
+    ///
+    /// The contract is **round-trip, not display**: parsing the result back has to
+    /// yield an equal value. That is what forces the quoting to be exact — `42`
+    /// and `"42"` are different values, so a string is always quoted even when it
+    /// would lex as a bare word, and the empty map is `[:]` rather than the `[]`
+    /// that would read back as the empty list.
+    ///
+    /// Not every value has a literal form, and the ones that do not are exactly
+    /// the ones with nothing to write down: `DESIGN.md` §"Isolation and subshells"
+    /// draws the line at values whose spelling round-trips. Those answer `Err`
+    /// with the noun to put in a diagnostic, rather than a lossy approximation
+    /// that would parse back as something else.
+    pub fn to_literal(&self) -> Result<String, NoLiteral> {
+        let mut out = String::new();
+        self.write_literal(&mut out)?;
+        Ok(out)
+    }
+
+    fn write_literal(&self, out: &mut String) -> Result<(), NoLiteral> {
+        match self {
+            Value::String(text) => quote_into(text, out),
+            Value::Integer(number) => out.push_str(&number.to_string()),
+            Value::Boolean(flag) => out.push_str(if *flag { "true" } else { "false" }),
+            Value::List(values) => {
+                out.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    value.write_literal(out)?;
+                }
+                out.push(']');
+            }
+            // `[]` is the empty *list*, so the empty map needs its own spelling or
+            // the two collapse into one text (`DESIGN.md:1078`).
+            Value::Map(entries) if entries.is_empty() => out.push_str("[:]"),
+            Value::Map(entries) => {
+                out.push('[');
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    // Quoted rather than bare: a key is an arbitrary string, and
+                    // one holding a space or a `:` would otherwise not read back.
+                    quote_into(key, out);
+                    out.push_str(": ");
+                    value.write_literal(out)?;
+                }
+                out.push(']');
+            }
+            // A regex has a `/…/` spelling, but not one that survives this trip.
+            // Its flags ride on `:` modifiers that are not implemented yet, so a
+            // case-insensitive regex would come back case-sensitive; and a bare
+            // `/…/` in value position is read under the path/glob rule rather than
+            // as a regex. Writing it would be silently wrong, so it is refused.
+            Value::Regex(_) => return Err(NoLiteral::Regex),
+            // Globbing is eager: writing the pattern back would re-glob it in the
+            // reader, against the rule that a value never re-globs
+            // (`DESIGN.md` §"Globbing").
+            Value::Glob(_) => return Err(NoLiteral::Glob),
+            Value::Stream(_) => return Err(NoLiteral::Stream),
+            Value::Function(_) => return Err(NoLiteral::Function),
+        }
+        Ok(())
+    }
+}
+
+/// Write `text` as a single-quoted mesh string.
+///
+/// `'…'` rather than `"…"` because it does not interpolate: a `$` in the value
+/// stays a `$` in the literal with nothing to escape and no chance of the reader
+/// expanding it. The escape set is exactly the one `lex_escaped` decodes for this
+/// quote — `\n \t \r \e \\ \'` plus `\u{…}` — so this is its inverse.
+fn quote_into(text: &str, out: &mut String) {
+    use std::fmt::Write;
+
+    out.push('\'');
+    for character in text.chars() {
+        match character {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\x1b' => out.push_str("\\e"),
+            // The rest of the control characters have no escape of their own, and
+            // writing one raw would put a real control byte in the text — invisible
+            // to read and, on the value channel this exists for, a byte the reader
+            // would have to carry verbatim.
+            other if other.is_control() => {
+                let _ = write!(out, "\\u{{{:x}}}", other as u32);
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('\'');
+}
+
 /// A function value: something callable with one thing to do.
 ///
 /// Shared behind an `Arc` because binding or passing one copies the `Value` and a
@@ -595,7 +716,99 @@ pub fn append_into(current: &mut Value, value: Value, name: &str) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::{Value, Vars};
+    use super::{FuncValue, NoLiteral, RegexValue, Value, Vars};
+
+    #[test]
+    fn a_scalar_writes_the_literal_you_would_have_typed() {
+        assert_eq!(Value::Integer(42).to_literal().unwrap(), "42");
+        assert_eq!(Value::Integer(-5).to_literal().unwrap(), "-5");
+        assert_eq!(Value::Boolean(true).to_literal().unwrap(), "true");
+        assert_eq!(Value::Boolean(false).to_literal().unwrap(), "false");
+    }
+
+    #[test]
+    fn a_string_is_always_quoted_so_it_cannot_read_back_as_another_type() {
+        // The case the exactness rule exists for: unquoted, these three would come
+        // back as an integer, a boolean, and a bare word.
+        assert_eq!(Value::String("42".into()).to_literal().unwrap(), "'42'");
+        assert_eq!(Value::String("true".into()).to_literal().unwrap(), "'true'");
+        assert_eq!(Value::String("foo".into()).to_literal().unwrap(), "'foo'");
+        assert_eq!(Value::String(String::new()).to_literal().unwrap(), "''");
+    }
+
+    #[test]
+    fn quoting_escapes_exactly_what_the_lexer_decodes() {
+        // `'…'` does not interpolate, so a `$` needs no escape — that is the reason
+        // for choosing it over `"…"`.
+        assert_eq!(Value::String("a$b".into()).to_literal().unwrap(), "'a$b'");
+        assert_eq!(
+            Value::String("a'b\\c".into()).to_literal().unwrap(),
+            r"'a\'b\\c'"
+        );
+        assert_eq!(
+            Value::String("\n\t\r\x1b".into()).to_literal().unwrap(),
+            r"'\n\t\r\e'"
+        );
+        // A control character with no escape of its own falls back to `\u{…}`
+        // rather than going onto the wire raw.
+        assert_eq!(
+            Value::String("\u{7}".into()).to_literal().unwrap(),
+            r"'\u{7}'"
+        );
+    }
+
+    #[test]
+    fn a_list_and_a_map_keep_their_two_empty_spellings_apart() {
+        // `[]` and `[:]` are the whole reason the writer cannot treat an empty
+        // collection generically.
+        assert_eq!(Value::List(Vec::new()).to_literal().unwrap(), "[]");
+        assert_eq!(Value::Map(Vec::new()).to_literal().unwrap(), "[:]");
+    }
+
+    #[test]
+    fn a_collection_writes_its_elements_and_nests() {
+        let list = Value::List(vec![
+            Value::Integer(1),
+            Value::String("a b".into()),
+            Value::Boolean(true),
+        ]);
+        assert_eq!(list.to_literal().unwrap(), "[1, 'a b', true]");
+
+        let map = Value::Map(vec![
+            ("k".into(), Value::Integer(1)),
+            ("a b".into(), Value::List(vec![Value::String("x".into())])),
+        ]);
+        assert_eq!(map.to_literal().unwrap(), "['k': 1, 'a b': ['x']]");
+    }
+
+    #[test]
+    fn a_value_with_no_literal_form_is_refused_by_name() {
+        assert_eq!(Value::Stream(1).to_literal(), Err(NoLiteral::Stream));
+        assert_eq!(
+            Value::Glob("*.txt".into()).to_literal(),
+            Err(NoLiteral::Glob)
+        );
+        assert_eq!(
+            Value::Regex(RegexValue::new("ab".into())).to_literal(),
+            Err(NoLiteral::Regex)
+        );
+        assert_eq!(
+            Value::Function(FuncValue::modifier("stem".into())).to_literal(),
+            Err(NoLiteral::Function)
+        );
+        assert_eq!(NoLiteral::Stream.to_string(), "a stream handle");
+    }
+
+    #[test]
+    fn a_nested_value_with_no_literal_form_refuses_the_whole_write() {
+        // The refusal has to travel outward: the caller holds the list and cannot
+        // see the handle buried in it.
+        let list = Value::List(vec![Value::Integer(1), Value::Stream(2)]);
+        assert_eq!(list.to_literal(), Err(NoLiteral::Stream));
+
+        let map = Value::Map(vec![("k".into(), Value::Glob("*.rs".into()))]);
+        assert_eq!(map.to_literal(), Err(NoLiteral::Glob));
+    }
 
     #[test]
     fn a_local_shadows_the_global_and_is_dropped_on_pop() {

@@ -151,7 +151,10 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
   about a path, and the file filters `:files`/`:f`, `:dirs`/`:d`, `:links`/`:l`,
   and `:exec`/`:x` keep a list's matching elements (or, on a single path, answer
   the same `test` question). Path, string, and file-test modifiers map over
-  lists, while collection modifiers consume the list as a whole. An unrecognized name after `:` remains
+  lists, while collection modifiers consume the list as a whole. `:repr` accepts
+  any value that has a literal form and yields the mesh source for it as a
+  string; the values without one (a stream handle, a function, a glob, and for
+  now a regex) are a loud error. An unrecognized name after `:` remains
   literal text, preserving constructions such as `$host:$port`. In this
   interpolation form modifiers are argument-free; the parenthesized argument form
   (`:split(SEP)`, `:join(SEP)`) is a value expression — see
@@ -285,6 +288,11 @@ spread      = "...$" name
 index       = "$" name "[" signed-integer "]"
 slice       = "$" name "[" signed-integer? (".." signed-integer? | "..=" signed-integer) "]"
 ```
+
+The **empty map is written `[:]`** — a bare `[]` is the empty *list*, so the two
+have distinct spellings rather than one ambiguous one (`DESIGN.md` §"Maps
+(associative arrays)"). That distinction is what lets `:repr` write an empty
+collection back as the same type it started as.
 
 Each scalar element uses the existing word expansion rules, so a glob can
 contribute zero or more elements. Inside a list, `$name` inserts its value as one

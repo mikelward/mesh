@@ -173,6 +173,18 @@ There are four kinds of modifier, and the difference matters:
   *non-adjacent* duplicates and needs no prior sort. It is **pure** (returns a new
   list — `$env.PATH = $env.PATH:dedup` to store) and lists-only. The full list/map
   surface is in [Arrays](#arrays-lists) and [Maps](#maps-associative-arrays).
+- **`:repr`** stands apart from all of these: it does not transform a value, it
+  **writes one down** — the mesh source you would have typed to get it back, as a
+  string. It takes *any* type rather than a category, and its contract is
+  **round-trip, not display**: parsing the result yields an equal value, which is
+  what forces a string to be quoted even when it would read as a bare word (`42`
+  vs `'42'`) and keeps `[]` and `[:]` apart. That makes it the honest way to look
+  at a collection, since `puts $m` on a map or list is an error — a collection has
+  no argv form. The types with **no** literal form are refused by name rather than
+  approximated (a stream handle, a function, a glob — writing the pattern back
+  would re-glob it — and, until its flags round-trip, a regex); an approximation
+  would read back as a different value, which is the one thing `:repr` must not
+  do. It is the writer half of the [subshell value channel](#isolation-and-subshells).
 - **Filter modifiers** (`:files`/`:f`, `:dirs`/`:d`, `:links`/`:l`,
   `:exec`/`:x`) keep the list elements matching a **file-type predicate** and
   drop the rest — a subset, not a transform. They **chain for AND** (`:f:x` =
@@ -1706,11 +1718,24 @@ stream handle (a descriptor means nothing in another process), a function (a
 closure over bindings that did not cross), an Instant or regex until their
 spellings round-trip. That is a rule with a reason rather than a list.*
 
-*Two things are missing before it could be built. The **writer** does not exist:
-mesh can parse `[a "b c"]` but cannot print a value back as a literal, and doing
-so needs the quoting to be exact — `42` and `"42"` must not both come out as `42`.
-And a value larger than a pipe buffer needs the unlinked-temp-file trick heredocs
-already use, or the child blocks writing while the parent blocks waiting.*
+*The **writer** now exists, and is [`:repr`](docs/REFERENCE.md): a value written
+as the source you would have typed for it, with the quoting exact — `42` and
+`"42"` do not both come out as `42`, and `[]` and `[:]` stay apart. It refuses
+the values with no literal form by name rather than approximating them, so the
+"what crosses" rule above is enforced in one place rather than restated at the
+boundary. What crosses is therefore settled; what remains for the channel is the
+plumbing.*
+
+*One thing recorded here as missing turned out not to be. A value larger than a
+pipe buffer was said to need the unlinked-temp-file trick heredocs use, or the
+child blocks writing while the parent blocks waiting — but that is `$( … )`'s
+problem, where **two** pipes are drained and reading them in sequence deadlocks
+on whichever is not being read. A value channel is **one** pipe: the parent
+drains it to the end and only then waits, so no temp file and no reader thread
+are involved. The hazard that does remain is a grandchild inheriting the write
+end and holding it open past the child's exit — bash's `$(sleep 10 &)` hang —
+which length-prefixing the payload answers directly, since the parent then stops
+at the value's end instead of waiting for EOF.*
 
 *Worth noting what it would cost: `fork` stops being purely "a process boundary"
 and starts being a value channel, which is a bigger promise to keep — every future
