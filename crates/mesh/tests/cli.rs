@@ -2053,6 +2053,24 @@ fn a_redirected_stage_still_reports_its_own_sigpipe() {
 }
 
 #[test]
+fn a_merged_stderr_follows_stdout_wherever_it_went() {
+    // `|&` is `2>&1` appended after the stage's own redirections, so it copies
+    // wherever stdout *finally* points. Carried as a flag beside the
+    // redirections rather than as the duplication it is, every destination
+    // stdout could have needed an arm of its own — and the incoming pipe was the
+    // arm nobody wrote, so `ERR` went to the shell's stderr instead of into the
+    // pipeline. bash emits nothing here: `1<&0` puts stdout on a read end, and
+    // the copy puts stderr there too, so neither write goes anywhere.
+    let out = run_with_input("printf x | sh -c 'printf ERR >&2' 1<&0 |& cat\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("ERR"),
+        "the merged stderr escaped the pipeline: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn backgrounding_a_stage_does_not_move_its_piped_stderr() {
     // `|&` is `2>&1` appended after the command's own redirections, so a `> out`
     // takes stdout *and* the copy `|&` makes of it — the next stage receives

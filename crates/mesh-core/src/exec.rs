@@ -45,6 +45,25 @@ pub struct Redirection {
 }
 
 impl Redirection {
+    /// `|&`, spelled out: `2>&1` appended after a stage's own redirections.
+    ///
+    /// `DESIGN.md` defines `|&` as exactly that, so it is represented as exactly
+    /// that. Carried instead as a flag beside the redirections, it became a
+    /// question every destination had to be asked about separately — "and where
+    /// did stdout end up?" — and each new answer stdout could have needed
+    /// another arm. Stdout resolving to the *incoming* pipe (`1<&0 |&`) was
+    /// simply the arm nobody wrote, and `ERR` leaked to the shell's stderr.
+    /// Resolved in source order like any other duplication, stderr follows
+    /// wherever stdout went for free, and `> out |&` differs from `2> log |&`
+    /// because the order says so rather than because a branch restates it.
+    fn merge_stderr() -> Self {
+        Self {
+            fd: libc::STDERR_FILENO,
+            kind: RedirKind::Out,
+            target: RedirTarget::Descriptor(libc::STDOUT_FILENO),
+        }
+    }
+
     /// The descriptor a direction retargets when no `N` prefix named one.
     pub fn default_fd(kind: RedirKind) -> libc::c_int {
         match kind {
@@ -336,12 +355,11 @@ fn fork_in_shell(
     // stdout or stderr that carry it. Each is given its own handle on the write
     // end below, once the pipe exists.
     extra_pipe_out: PipeCopies,
-    // `stdout_to_pipe` / `stderr_to_pipe`: did each stream resolve to this
-    // stage's outgoing pipe? Passed in rather than re-derived from `pipe_stderr`,
-    // so a duplication that put stderr on the pipe (`f 2>&1 | g`) reaches the
-    // fork too.
+    // Did stdout resolve to this stage's outgoing pipe? Passed in rather than
+    // re-derived, so a duplication that moved it (`f >&2 | g`) reaches the fork
+    // too. Any *other* descriptor holding the pipe — stderr under `|&`
+    // included — arrives in `extra_pipe_out`.
     stdout_to_pipe: bool,
-    stderr_to_pipe: bool,
     interactive: bool,
     background: bool,
     process_group: Option<libc::pid_t>,
@@ -358,9 +376,8 @@ fn fork_in_shell(
     let mut piped_out = false;
     // The pipe is needed when either stream resolved to it — `2>&1 > f |` keeps
     // it for stderr alone, and `>&2 |` moves stdout off it so none is made.
-    let wants_pipe = !is_last
-        && !redirects_stdout
-        && (stdout_to_pipe || stderr_to_pipe || !extra_pipe_out.is_empty());
+    let wants_pipe =
+        !is_last && !redirects_stdout && (stdout_to_pipe || !extra_pipe_out.is_empty());
     let (pipe_write, read_end) = if wants_pipe {
         let (read, write) = new_pipe()?;
         piped_out = true;
@@ -373,11 +390,6 @@ fn fork_in_shell(
     if let Some(write) = &pipe_write {
         extra_files.extend(extra_pipe_out.handles(write)?);
     }
-    // Stderr takes its own handle on the pipe, so stdout can still go elsewhere.
-    let mut child_err_pipe = match (&pipe_write, stderr_to_pipe) {
-        (Some(write), true) => Some(write.try_clone()?),
-        _ => None,
-    };
     let mut child_out = match out_file {
         Some(file) => Some(file),
         None if stdout_to_pipe => pipe_write,
@@ -406,25 +418,6 @@ fn fork_in_shell(
         // The child never reads from the pipe it writes to; holding the read end
         // open would keep the next stage from ever seeing EOF.
         drop(read_end);
-        // A background stage's redirections are opened *here*, in the child, as
-        // the external path defers them to its helper process — so a FIFO open
-        // cannot block the shell before the job is registered.
-        let deferred = if background && !cmd.redirs.is_empty() {
-            match open_paths(&cmd.redirs)
-                .and_then(|files| resolve_sources(&cmd.redirs, files, inherited_seed()))
-                .and_then(sources_to_files)
-            {
-                Ok(files) => files,
-                Err((path, err)) => {
-                    note!("mesh: {path}: {err}");
-                    // SAFETY: `_exit` ends the child without running the parent's
-                    // destructors, exactly as the success path below does.
-                    unsafe { libc::_exit(1) };
-                }
-            }
-        } else {
-            Vec::new()
-        };
         unsafe {
             // Rust sets SIGPIPE to SIG_IGN at startup, so a write to a closed
             // pipe would return EPIPE here and the stage would report a failure
@@ -454,30 +447,37 @@ fn fork_in_shell(
             if let Some(file) = child_out.take() {
                 installs.push((libc::STDOUT_FILENO, file));
             }
-            // `|&`'s copy of the pipe wins over an explicit `2>`, being appended
-            // after it; the loser is dropped here rather than installed and
-            // immediately overwritten.
-            if let Some(file) = child_err_pipe.take().or_else(|| err_file.take()) {
+            if let Some(file) = err_file.take() {
                 installs.push((libc::STDERR_FILENO, file));
             }
             installs.extend(extra_files);
-            // A background stage's own targets, per descriptor, applied after the
-            // above and before the `|&` copy below — a `> out` must move stdout
-            // while `|&` can still see where it went.
-            if install_descriptors(installs)
-                .and_then(|()| install_descriptors(deferred))
-                .is_err()
-            {
+            if install_descriptors(installs).is_err() {
                 libc::_exit(1);
             }
-            // `|&` *is* `2>&1` appended after the command's redirections
-            // (`DESIGN.md`), so it copies wherever stdout finally points and wins
-            // over an explicit `2>`. Duplicating from the live descriptor rather
-            // than from the pipe is what makes `f > out |& next` send both
-            // streams to `out` whether or not the stage is backgrounded — adding
-            // `&` must not change where the data goes.
-            if cmd.pipe_stderr && !is_last {
-                libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO);
+
+            // A background stage's own targets are opened *here*, in the child,
+            // as the external path defers them to its helper — so a FIFO open
+            // cannot block the shell before the job is registered.
+            //
+            // Opened after the installs above, not before, because resolution
+            // duplicates from the descriptors as they *now* stand: `|&` is a
+            // `2>&1` in this list, and copying fd 1 has to copy the stage's
+            // stdout rather than the shell's.
+            if background && !cmd.redirs.is_empty() {
+                let redirs = staged_redirs(cmd, is_last);
+                let deferred = match open_paths(&redirs)
+                    .and_then(|files| resolve_sources(&redirs, files, inherited_seed()))
+                    .and_then(sources_to_files)
+                {
+                    Ok(files) => files,
+                    Err((path, err)) => {
+                        note!("mesh: {path}: {err}");
+                        libc::_exit(1);
+                    }
+                };
+                if install_descriptors(deferred).is_err() {
+                    libc::_exit(1);
+                }
             }
         }
         // From here on this process is not the interactive shell: it owns none of
@@ -492,9 +492,17 @@ fn fork_in_shell(
     // The parent must release the write end, or the reader never sees EOF.
     drop(child_out);
     drop(child_in);
-    drop(child_err_pipe);
     drop(err_file);
     Ok((pid, piped_out, read_end))
+}
+
+/// One stage's redirections with `|&` spelled out as the `2>&1` it is.
+fn staged_redirs(cmd: &Cmd, is_last: bool) -> Vec<Redirection> {
+    let mut redirs = cmd.redirs.clone();
+    if cmd.pipe_stderr && !is_last {
+        redirs.push(Redirection::merge_stderr());
+    }
+    redirs
 }
 
 /// How the next stage receives its stdin.
@@ -577,7 +585,11 @@ pub fn run_pipeline(
         std::thread::scope(|scope| {
             let handles: Vec<_> = cmds
                 .iter()
-                .map(|cmd| scope.spawn(move || open_paths(&cmd.redirs)))
+                .enumerate()
+                .map(|(idx, cmd)| {
+                    let redirs = staged_redirs(cmd, idx + 1 == n);
+                    scope.spawn(move || open_paths(&redirs))
+                })
                 .collect();
             handles
                 .into_iter()
@@ -617,8 +629,8 @@ pub fn run_pipeline(
         ]
         .into_iter()
         .collect();
-        let sources = match redir_result.and_then(|files| resolve_sources(&cmd.redirs, files, seed))
-        {
+        let redirs = staged_redirs(&cmd, is_last);
+        let sources = match redir_result.and_then(|files| resolve_sources(&redirs, files, seed)) {
             Ok(sources) => sources,
             Err((path, err)) => {
                 note!("mesh: {path}: {err}");
@@ -629,7 +641,6 @@ pub fn run_pipeline(
         // A descriptor that resolved to this stage's outgoing pipe cannot become
         // a file here — the pipe is made below — so it is carried as intent.
         let stdout_to_pipe = sources.is_pipe(libc::STDOUT_FILENO);
-        let stderr_to_pipe = sources.is_pipe(libc::STDERR_FILENO);
         // Descriptors that copied a pipe rather than the standard slot that
         // carries it — `3>&1 | g`, `f | g 3<&0`. No file can stand for a pipe,
         // so each is handed its own handle on the real one below.
@@ -681,7 +692,6 @@ pub fn run_pipeline(
                 extra_files,
                 extra_pipe_out,
                 stdout_to_pipe,
-                stderr_to_pipe,
                 interactive,
                 background,
                 process_group,
@@ -714,7 +724,7 @@ pub fn run_pipeline(
         }
 
         let mut command = if background && !cmd.redirs.is_empty() {
-            match background_redirect_command(&cmd, cmd.pipe_stderr && !is_last) {
+            match background_redirect_command(&cmd, &redirs) {
                 Ok(command) => command,
                 Err((path, err)) => {
                     note!("mesh: {path}: {err}");
@@ -780,8 +790,6 @@ pub fn run_pipeline(
         // asked for it or because a duplication resolved it there while stdout was
         // still the pipe. `2>&1 > f` is the case that is *not* this: stderr took
         // the pipe and stdout then moved to a file, so only stderr keeps it.
-        let merge_stderr = (cmd.pipe_stderr && !is_last) || (stderr_to_pipe && stdout_to_pipe);
-        let stderr_alone_on_pipe = stderr_to_pipe && !stdout_to_pipe;
         // A background external defers its opens to the helper, so — exactly as in
         // `fork_in_shell` — the shell must read fd 1's fate from `cmd.redirs`
         // rather than from an opened file. Its stdout ends on that file, so a
@@ -790,7 +798,6 @@ pub fn run_pipeline(
         let defers_stdout = background && stdout_is_redirected(&cmd);
         let mut piped_out = false;
         let mut combined_pipe = None;
-        let mut merged_stderr = None;
         // The write end, kept in hand whenever more than stdout needs a handle
         // on the pipe. `Stdio::piped()` would make one this loop cannot reach.
         let mut pipe_write = None;
@@ -798,18 +805,10 @@ pub fn run_pipeline(
         // to exist even when stdout went elsewhere.
         let extras_on_pipe = !is_last && !extra_pipe_out.is_empty();
         if let Some(file) = out_file {
-            if merge_stderr {
-                match file.try_clone() {
-                    Ok(clone) => merged_stderr = Some(clone),
-                    Err(error) => {
-                        note!("mesh: {}: {error}", cmd.words[0]);
-                        outcomes.push(Outcome::Failed(1));
-                        continue;
-                    }
-                }
-            } else if (stderr_alone_on_pipe && !is_last) || extras_on_pipe {
-                // `2>&1 > f |`: stdout goes to the file, but stderr already took
-                // the pipe, so the pipe still has to exist and feed the next stage.
+            if extras_on_pipe {
+                // `2>&1 > f |`: stdout goes to the file, but another descriptor
+                // already took the pipe, so it still has to exist and feed the
+                // next stage.
                 let (read, write) = match new_pipe() {
                     Ok(pair) => pair,
                     Err(error) => {
@@ -818,23 +817,13 @@ pub fn run_pipeline(
                         continue;
                     }
                 };
-                if stderr_alone_on_pipe {
-                    match write.try_clone() {
-                        Ok(clone) => merged_stderr = Some(clone),
-                        Err(error) => {
-                            note!("mesh: pipe: {error}");
-                            outcomes.push(Outcome::Failed(1));
-                            continue;
-                        }
-                    }
-                }
                 pipe_write = Some(write);
                 combined_pipe = Some(read);
                 piped_out = true;
             }
             command.stdout(file);
         } else if !is_last && stdout_to_pipe {
-            if merge_stderr || extras_on_pipe || defers_stdout {
+            if extras_on_pipe || defers_stdout {
                 // Own the pipe rather than letting `Stdio::piped()` make it, so
                 // every descriptor that resolved to it can be given the write end.
                 //
@@ -852,16 +841,6 @@ pub fn run_pipeline(
                         continue;
                     }
                 };
-                if merge_stderr {
-                    match write.try_clone() {
-                        Ok(clone) => merged_stderr = Some(clone),
-                        Err(error) => {
-                            note!("mesh: pipe: {error}");
-                            outcomes.push(Outcome::Failed(1));
-                            continue;
-                        }
-                    }
-                }
                 if extras_on_pipe {
                     match write.try_clone() {
                         Ok(clone) => pipe_write = Some(clone),
@@ -905,11 +884,9 @@ pub fn run_pipeline(
             }
         }
 
-        // stderr: `|&`'s copy of the final stdout wins over an explicit `2>`,
-        // being appended after it; otherwise the explicit target applies.
-        if let Some(file) = merged_stderr {
-            command.stderr(file);
-        } else if let Some(file) = err_file {
+        // stderr: whatever resolution said, `|&` included — it is an ordinary
+        // `2>&1` in the list now, so nothing here has to know about it.
+        if let Some(file) = err_file {
             command.stderr(file);
         }
 
@@ -1187,21 +1164,21 @@ fn stdout_is_redirected(cmd: &Cmd) -> bool {
 
 fn background_redirect_command(
     cmd: &Cmd,
-    merge_stderr: bool,
+    redirs: &[Redirection],
 ) -> Result<Command, (String, std::io::Error)> {
     let executable = std::env::current_exe().map_err(|err| (cmd.words[0].clone(), err))?;
     let mut command = Command::new(executable);
     command
         .arg("--mesh-background-redirect")
-        // `|&` travels too: the helper opens the targets, so only it can apply the
-        // implicit `2>&1` *after* them, which is where it belongs.
-        .arg(if merge_stderr { "merge" } else { "plain" })
-        .arg(cmd.redirs.len().to_string());
+        .arg(redirs.len().to_string());
     // Each redirection travels as `KIND FD PATH`, so the descriptor survives the
     // hand-off to the helper as well as the direction does.
     // Each redirection travels as `KIND FD TARGET`, so the descriptor and whether
     // the target is a path or another descriptor both survive the hand-off.
-    for Redirection { fd, kind, target } in &cmd.redirs {
+    // `|&` travels as the `2>&1` it is, one more entry in the list — the helper
+    // opens the targets, so only it can apply that duplication *after* them,
+    // which is where the spec puts it.
+    for Redirection { fd, kind, target } in redirs {
         command.arg(match (kind, target) {
             // A heredoc body cannot cross as argv — it is arbitrary text, and the
             // helper would have to re-quote it. Backgrounding one is refused
@@ -1226,22 +1203,17 @@ fn background_redirect_command(
 /// Internal executable mode used to defer potentially blocking opens until
 /// after the background child has completed `exec`.
 pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
-    let merge_stderr = match args.first().map(String::as_str) {
-        Some("merge") => true,
-        Some("plain") => false,
-        _ => return std::process::ExitCode::from(1),
-    };
-    let Some(count) = args.get(1).and_then(|arg| arg.parse::<usize>().ok()) else {
+    let Some(count) = args.first().and_then(|arg| arg.parse::<usize>().ok()) else {
         return std::process::ExitCode::from(1);
     };
-    let Some(words_start) = count.checked_mul(3).and_then(|count| count.checked_add(2)) else {
+    let Some(words_start) = count.checked_mul(3).and_then(|count| count.checked_add(1)) else {
         return std::process::ExitCode::from(1);
     };
     if words_start >= args.len() {
         return std::process::ExitCode::from(1);
     }
     let mut redirs = Vec::new();
-    for triple in args[2..words_start].chunks_exact(3) {
+    for triple in args[1..words_start].chunks_exact(3) {
         let Ok(fd) = triple[1].parse::<libc::c_int>() else {
             return std::process::ExitCode::from(1);
         };
@@ -1273,26 +1245,6 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
     let words = &args[words_start..];
     let mut command = Command::new(&words[0]);
     command.args(&words[1..]);
-    // `|&` is `2>&1` appended *after* the command's own redirections, so stderr
-    // follows wherever stdout finally points and an explicit `2>` loses to it.
-    // Taken before the targets are handed over, since `stdout` consumes its file.
-    let merged_stderr = if merge_stderr {
-        match opened.iter().find(|(fd, _)| *fd == libc::STDOUT_FILENO) {
-            Some((_, file)) => match file.try_clone() {
-                Ok(clone) => Some(Stdio::from(clone)),
-                Err(err) => {
-                    note!("mesh: {}: {err}", words[0]);
-                    return std::process::ExitCode::from(1);
-                }
-            },
-            // No `>` moved stdout, so it is still the pipe the shell connected.
-            // Inheriting names it explicitly, which is what overrides an
-            // explicit `2>` that this loop is about to apply.
-            None => Some(Stdio::inherit()),
-        }
-    } else {
-        None
-    };
     // Anything past the standard three has no `Stdio` slot, so the child puts it
     // in place itself — the same split the pipeline path makes.
     let mut extra_files = Vec::new();
@@ -1322,9 +1274,6 @@ pub fn run_background_redirect(args: Vec<String>) -> std::process::ExitCode {
                 Ok(())
             });
         }
-    }
-    if let Some(stderr) = merged_stderr {
-        command.stderr(stderr);
     }
     let err = command.exec();
     std::process::ExitCode::from(spawn_error_code(&words[0], &err))
@@ -1729,7 +1678,10 @@ impl Sources {
     fn extra_pipe_out(&self) -> PipeCopies {
         self.extras(
             |source| matches!(source, Source::PipeOut),
-            &[libc::STDOUT_FILENO, libc::STDERR_FILENO],
+            // Only stdout keeps a slot of its own: the caller needs the read end
+            // back from `Stdio::piped()`. Stderr on the pipe is just another
+            // descriptor holding it.
+            &[libc::STDOUT_FILENO],
         )
     }
 
