@@ -801,6 +801,27 @@ fn run_executable(
                 Err(step) => step,
             }
         }
+        MemberAssignment {
+            target,
+            append,
+            value,
+            global,
+        } => {
+            match eval_operand_of(value, last, in_function, shell) {
+                // As for an ordinary assignment: a right-hand side that raised
+                // `break`/`continue` produced no value, so leave the place alone.
+                Ok(_) if shell.control.is_some() => Step::Continue(last),
+                Ok(value) => assign_into_member(target, value, *append, *global, shell)
+                    .map_or_else(
+                        |error| {
+                            note!("mesh: {error}");
+                            Step::Continue(1)
+                        },
+                        |()| Step::Continue(0),
+                    ),
+                Err(step) => step,
+            }
+        }
         Function {
             name,
             parameters,
@@ -950,6 +971,7 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
         Assignment { .. } => "an assignment",
         Unset { .. } => "an `unset`",
         EnvAssignment { .. } => "an environment assignment",
+        MemberAssignment { .. } => "an assignment",
         Function { .. } => "a function definition",
         If(_) => "an `if`",
         Match(_) => "a `match`",
@@ -1656,6 +1678,146 @@ fn expansion_word(word: &parser::Word) -> Word {
             })
             .collect(),
     )
+}
+
+/// One resolved step of an assignment path. A subscript stays text because which
+/// it *is* depends on the value it lands on — a list index or a map key — the same
+/// decision [`expand::resolve_value`] makes on the way in.
+enum PathStep {
+    Member(String),
+    Subscript(String),
+}
+
+/// `$m.key = v`, `$xs[0] += v` — write *into* a bound collection.
+///
+/// Subscripts resolve against the variable store first, before anything is
+/// borrowed mutably, so `$xs[$i] = v` works and the borrow of the place stays
+/// uncontested. Then the path is walked to the last step and the write happens
+/// there.
+///
+/// Nothing is auto-created along the way: a missing intermediate key is an error,
+/// not an empty map conjured to hold the write. That is the fail-loud rule the rest
+/// of the language follows — `$m.typo.key = v` should say so rather than silently
+/// build a structure nobody asked for. The **last** step is the one exception for a
+/// map, where assigning a new key is the ordinary way to add one.
+fn assign_into_member(
+    target: &str,
+    value: Value,
+    append: bool,
+    global: bool,
+    shell: &mut Shell,
+) -> Result<(), String> {
+    let vref = expansion_variable(target, parser::QuoteMode::Bare);
+    let mut steps = Vec::with_capacity(vref.accesses.len());
+    for access in &vref.accesses {
+        steps.push(match access {
+            expand::Access::Member(key) => PathStep::Member(key.clone()),
+            expand::Access::Subscript(subscript) => PathStep::Subscript(
+                expand::subscript_key(subscript, &shell.vars).map_err(|error| error.to_string())?,
+            ),
+            // A slice names a copy of a run of elements, not a place. Splicing one
+            // (`$xs[0..2] = [a b c]`) would also have to answer what a
+            // length-changing assignment means, which `DESIGN.md` does not.
+            expand::Access::Slice { .. } => {
+                return Err(format!("{target}: cannot assign to a slice"));
+            }
+        });
+    }
+    // Through `Vars::update`, so a failed path leaves no local shadow behind: the
+    // write runs on a copy and is installed only once the whole thing succeeds.
+    shell.vars.update(&vref.name, global, |root| {
+        write_at(root, &steps, value, append, target)
+    })
+}
+
+/// Walk a resolved path from `root` to the place its last step names, and write
+/// there. Split out so it is the *whole* effect of an assignment — either all of it
+/// happens or none of it does, which is what lets the caller apply it to a copy.
+fn write_at(
+    root: &mut Value,
+    steps: &[PathStep],
+    value: Value,
+    append: bool,
+    target: &str,
+) -> Result<(), String> {
+    let (last, path) = steps.split_last().expect("the parser required one access");
+    let mut place = root;
+    for step in path {
+        place = descend(place, step, target)?;
+    }
+    let destination = match (&mut *place, last) {
+        (Value::Map(entries), PathStep::Member(key) | PathStep::Subscript(key)) => {
+            if let Some(position) = entries.iter().position(|(candidate, _)| candidate == key) {
+                &mut entries[position].1
+            } else if append {
+                // Nothing to append *to*. Naming the absent key beats silently
+                // treating `+=` as a first write.
+                return Err(format!("{target}: no `{key}` in this map"));
+            } else {
+                entries.push((key.clone(), value));
+                return Ok(());
+            }
+        }
+        (Value::List(values), PathStep::Subscript(index)) => list_slot(values, index, target)?,
+        (Value::List(_), PathStep::Member(key)) => {
+            return Err(format!("{target}: a list has no `{key}` member"));
+        }
+        (other, _) => {
+            return Err(format!(
+                "{target}: cannot assign into {}",
+                value_kind(other)
+            ));
+        }
+    };
+    if append {
+        vars::append_into(destination, value, target)
+    } else {
+        *destination = value;
+        Ok(())
+    }
+}
+
+/// Follow one intermediate step to the place it names, which must already exist.
+fn descend<'a>(
+    place: &'a mut Value,
+    step: &PathStep,
+    target: &str,
+) -> Result<&'a mut Value, String> {
+    match (place, step) {
+        (Value::Map(entries), PathStep::Member(key) | PathStep::Subscript(key)) => entries
+            .iter_mut()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value)
+            .ok_or_else(|| format!("{target}: no `{key}` in this map")),
+        (Value::List(values), PathStep::Subscript(index)) => list_slot(values, index, target),
+        (Value::List(_), PathStep::Member(key)) => {
+            Err(format!("{target}: a list has no `{key}` member"))
+        }
+        (other, _) => Err(format!("{target}: cannot index into {}", value_kind(other))),
+    }
+}
+
+/// The slot an index names, negative counting from the end as a read does. A list
+/// is only ever written *in place*: an out-of-range index is an error rather than a
+/// grow, since there is no value to fill the gap with.
+fn list_slot<'a>(
+    values: &'a mut [Value],
+    index: &str,
+    target: &str,
+) -> Result<&'a mut Value, String> {
+    let index: i64 = index
+        .parse()
+        .map_err(|_| format!("{target}: list index must be an integer"))?;
+    let offset = if index < 0 {
+        values.len() as i128 + i128::from(index)
+    } else {
+        i128::from(index)
+    };
+    usize::try_from(offset)
+        .ok()
+        .filter(|offset| *offset < values.len())
+        .map(|offset| &mut values[offset])
+        .ok_or_else(|| format!("{target}: list index out of range"))
 }
 
 fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {

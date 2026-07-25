@@ -125,8 +125,17 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
   `env FOO=1 cmd` are commands, not bindings.
 - **`$env.KEY = value`** (and `+=`) writes the process environment rather than a
   mesh binding, and is global even inside a function. Only a plain member is a
-  place: an index or modifier (`$env.PATH[0] =`, `$env.PATH:dedup =`) is a syntax
-  error.
+  place *there*: an index or modifier (`$env.PATH[0] =`, `$env.PATH:dedup =`) is a
+  syntax error, since `$env` holds bytes rather than typed values.
+- **`$m.key = value`**, **`$xs[0] = value`** (and `+=`) write **into** a bound
+  collection instead of rebinding the name, along a path that mixes members and
+  indices (`$m.rows[1].name = …`). A modifier is not a place (`$xs:dedup = …`), nor
+  is a slice, and `$env` / `$sh` keep their own handling. Local-by-default like any
+  other assignment: inside a function the write shadows an outer binding rather
+  than reaching through to it, and **`global $m.key = value`** is how it writes the
+  outer one instead. Nothing along the path is created — a missing
+  intermediate key is an error — except a **new map key at the end**, which is how
+  a key is added.
 - **`$name` / `${name}`** read a variable; **`$env.KEY` / `${env.KEY}`** read the
   environment (strict), and **`$xs[N]` / `${xs[N]}`** read an exact list element.
   These forms have the same meaning in bare words and `"…"`; braces delimit a

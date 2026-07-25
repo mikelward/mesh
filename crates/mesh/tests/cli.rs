@@ -6505,6 +6505,297 @@ fn only_a_plain_env_member_is_an_assignment_target() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
+/// `$m.key = v` and `$xs[i] = v` write *into* a bound collection, generalizing the
+/// `$env.KEY` form that was until now the only member assignment there was. Nested
+/// paths mix members and indices, `+=` combines rather than replaces, and a
+/// subscript may itself be a variable.
+#[test]
+fn a_member_assignment_writes_into_a_map_or_list() {
+    let out = run_with_input(
+        "m = [a: 1, b: 2]\n\
+         $m.a = 9\n\
+         $m.c = 3\n\
+         $m.a += 5\n\
+         puts $m.a $m.b $m.c\n\
+         puts ...$m:keys\n\
+         xs = [10 20 30]\n\
+         $xs[0] = 99\n\
+         $xs[-1] = 77\n\
+         $xs[1] += 5\n\
+         puts ...$xs\n\
+         k = \"2\"\n\
+         $xs[$k] = 5\n\
+         puts ...$xs\n\
+         nested = [outer: [inner: 1], rows: [1 2]]\n\
+         $nested.outer.inner = 42\n\
+         $nested.rows[1] = 7\n\
+         puts $nested.outer.inner\n\
+         puts ...$nested.rows\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // A new key appends in insertion order; a negative index counts from the
+        // end, as it does on the way in.
+        "14 2 3\na b c\n99 25 77\n99 25 5\n42\n1 7\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A member write follows the same **local-by-default** rule every other
+/// assignment does: inside a function it shadows the outer binding rather than
+/// reaching through to it, exactly as `n += …` and `n = …` already do. `global`
+/// remains the way to write the outer one.
+#[test]
+fn a_member_assignment_is_local_by_default_like_every_other() {
+    let out = run_with_input(
+        "m = [a: 1]\n\
+         n = [a: 1]\n\
+         func member() { $m.a = 99\n\
+         puts member-inside $m.a }\n\
+         func append() { n += [b: 2]\n\
+         puts append-inside $n:len }\n\
+         func rebind() { global m = [a: 7]\n\
+         puts rebind-inside $m.a }\n\
+         member\n\
+         puts member-outside $m.a\n\
+         append\n\
+         puts append-outside $n:len\n\
+         rebind\n\
+         puts rebind-outside $m.a\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // The member write and the `+=` agree: both shadow. Only `global` carries
+        // out of the function.
+        "member-inside 99\nmember-outside 1\n\
+         append-inside 2\nappend-outside 1\n\
+         rebind-inside 7\nrebind-outside 7\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Nothing along a member path is conjured: a missing intermediate key is an
+/// error, not an empty map created to hold the write. The **last** step is the one
+/// exception, and only for a map, where adding a key is what assignment is for.
+#[test]
+fn a_member_assignment_fails_loud_rather_than_creating_structure() {
+    for (source, message) in [
+        // An intermediate key that is not there.
+        (
+            "m = [a: 1]\n$m.typo.deep = 1\n",
+            "$m.typo.deep: no `typo` in this map",
+        ),
+        // `+=` has nothing to combine with when the key is absent, so it is not
+        // quietly a first write.
+        ("m = [a: 1]\n$m.new += 1\n", "$m.new: no `new` in this map"),
+        // A list is written in place; there is no value to fill a gap with.
+        (
+            "xs = [1 2]\n$xs[5] = 1\n",
+            "$xs[5]: list index out of range",
+        ),
+        (
+            "xs = [1 2]\n$xs[-9] = 1\n",
+            "$xs[-9]: list index out of range",
+        ),
+        (
+            "s = \"text\"\n$s.key = 1\n",
+            "$s.key: cannot assign into a string",
+        ),
+        (
+            "xs = [1 2]\n$xs.key = 1\n",
+            "$xs.key: a list has no `key` member",
+        ),
+        // A slice names a copy of a run of elements, not a place.
+        (
+            "xs = [1 2 3]\n$xs[0..2] = 9\n",
+            "$xs[0..2]: cannot assign to a slice",
+        ),
+        ("$nope.key = 1\n", "nope: unbound variable"),
+        // `+=` type rules are the whole-variable ones, because both go through
+        // one `append_into`.
+        (
+            "xs = [1 2]\n$xs[0] += \"s\"\n",
+            "$xs[0]: can only add an integer to an integer",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source} gave {stderr}");
+    }
+
+    // A right-hand side that raised `break` produced no value, so the place keeps
+    // what it had rather than taking a placeholder.
+    let broke =
+        run_with_input("m = [a: 1]\nfor i in [1] { $m.a = (if true { break }) }\nputs $m.a\n");
+    assert_eq!(String::from_utf8_lossy(&broke.stdout), "1\n");
+}
+
+/// The reserved namespaces keep the handling they had: `$env.KEY` is still the
+/// byte-boundary environment write, and neither `$env` nor `$sh` becomes an
+/// ordinary place just because member assignment now exists.
+#[test]
+fn member_assignment_leaves_the_reserved_namespaces_alone() {
+    let env = run_with_input("$env.MESH_TEST_M = hello\nputs $env.MESH_TEST_M\n");
+    assert_eq!(String::from_utf8_lossy(&env.stdout), "hello\n");
+
+    // Unchanged from before: an index or modifier on `$env`, and any write to
+    // `$sh`, are not assignment targets.
+    for source in [
+        "$env.PATH[0] = x\n",
+        "$env.PATH:dedup = x\n",
+        "$sh.name = x\n",
+        "$sh.args[0] = x\n",
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(2), "{source}");
+    }
+}
+
+/// `global $m.key = value` writes **into** the session-global binding rather than
+/// shadowing it — the escape hatch a local-by-default member write needs, so a
+/// function can modify a caller's collection instead of copying it.
+#[test]
+fn a_global_member_assignment_writes_through_to_the_outer_binding() {
+    let out = run_with_input(
+        "m = [a: 1]\n\
+         xs = [1 2]\n\
+         val = 9\n\
+         func write() { global $m.key = $val\n\
+         global $m.a += 5\n\
+         global $xs[0] = 9 }\n\
+         write\n\
+         puts $m.a $m.key\n\
+         puts ...$xs\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6 9\n9 2\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `global` names the global scope, so it writes there even where a local
+    // shadows the name — the local keeps what it had.
+    let shadowed = run_with_input(
+        "m = [a: 1]\n\
+         func write() { m = [a: 100]\n\
+         global $m.a = 7\n\
+         puts local $m.a }\n\
+         write\n\
+         puts global $m.a\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&shadowed.stdout),
+        "local 100\nglobal 7\n"
+    );
+
+    // The global scope *is* the target, so there is nothing to copy inward: an
+    // unbound name is simply an error.
+    let unbound = run_with_input("func write() { global $nope.k = 1 }\nwrite\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&unbound.stderr).contains("nope: unbound variable"),
+        "{}",
+        String::from_utf8_lossy(&unbound.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&unbound.stdout), "after\n");
+}
+
+/// A **failed** write must leave scope state exactly as it found it. Where the
+/// name is only bound further out, seeding the local shadow before walking the path
+/// meant an errored statement still shadowed the outer binding — so a later
+/// `global $m.… = …` wrote the global while reads went on seeing the stale copy.
+///
+/// The whole-variable `+=` had the same hole, since both go through one
+/// `Vars::update` now; the test pins both, because the point is that they agree.
+#[test]
+fn a_failed_write_leaves_no_local_shadow_behind() {
+    let member = run_with_input(
+        "m = [a: 1]\n\
+         func f() { $m.missing.deep = 2\n\
+         global $m.a = 3\n\
+         puts sees $m.a }\n\
+         f\n\
+         puts global $m.a\n",
+    );
+    // Without the fix the failed write shadows `m`, so `sees` reports the stale 1.
+    assert_eq!(
+        String::from_utf8_lossy(&member.stdout),
+        "sees 3\nglobal 3\n"
+    );
+    assert!(
+        String::from_utf8_lossy(&member.stderr).contains("no `missing` in this map"),
+        "{}",
+        String::from_utf8_lossy(&member.stderr)
+    );
+
+    let whole = run_with_input(
+        "n = [a: 1]\n\
+         func f() { n += 5\n\
+         global n = [a: 3]\n\
+         puts sees $n.a }\n\
+         f\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&whole.stdout), "sees 3\n");
+
+    // The shadow still appears when the write *succeeds*: that is the
+    // local-by-default rule, not a leak.
+    let succeeded = run_with_input(
+        "m = [a: 1]\n\
+         func f() { $m.a = 2\n\
+         global $m.a = 3\n\
+         puts sees $m.a }\n\
+         f\n\
+         puts global $m.a\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&succeeded.stdout),
+        "sees 2\nglobal 3\n"
+    );
+}
+
+/// A colon inside a **subscript** belongs to the key, not to a modifier chain, so
+/// every quoted key that reads also writes. Scanning the target text for a bare `:`
+/// got this wrong: `$m["a:b"]` reads fine but was rejected as an assignment target.
+#[test]
+fn a_key_containing_a_colon_is_writable_as_well_as_readable() {
+    let out = run_with_input(
+        "m = [\"a:b\": 1]\n\
+         puts read $m[\"a:b\"]\n\
+         $m[\"a:b\"] = 9\n\
+         puts wrote $m[\"a:b\"]\n\
+         nested = [\"a:b\": [x: 1]]\n\
+         $nested[\"a:b\"].x = 5\n\
+         puts deep $nested[\"a:b\"].x\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "read 1\nwrote 9\ndeep 5\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A `:` *between* accesses is still a modifier, and still not a place.
+    for source in [
+        "xs = [1 2]\n$xs:dedup = 9\n",
+        "m = [a: 1]\n$m.a:upper = X\n",
+    ] {
+        let rejected = run_with_input(source);
+        assert_eq!(rejected.status.code(), Some(2), "{source}");
+    }
+}
+
 #[test]
 fn reading_an_unset_env_entry_is_still_a_loud_error() {
     let out = run_with_input("puts $env.MESH_TEST_ABSENT\nputs after\n");

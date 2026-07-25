@@ -532,6 +532,44 @@ recovers and continues. An interpolated value is a single literal value — it i
 never split on spaces or matched against filenames. Interpolation happens in bare
 words and `"…"`, never in `'…'` or `r'…'`.
 
+### Member assignment
+
+`$m.key = value` and `$xs[0] = value` write **into** a bound collection rather
+than rebinding the name, along a path that may mix members and indices:
+
+```
+config = [name: mesh, tags: [a b], nested: [depth: 1]]
+$config.name = shell            # replace a value
+$config.owner = me              # add a key
+$config.tags[1] = c             # write a list element
+$config.tags[-1] = d            # negative counts from the end, as a read does
+$config.nested.depth += 1       # combine, using the same rules as `n += …`
+$config["a:b"] = x              # a quoted key, colon and all
+
+func rename(new) { global $config.name = $new }   # write the outer binding
+```
+
+A **place** is a member or an index. A modifier is not (`$xs:dedup = …` is a
+syntax error, as it already was), nor is a slice — `$xs[0..2] = …` names a copy of
+a run of elements, and a length-changing assignment has no defined meaning yet.
+`$env` and `$sh` keep their own handling: see [The environment](#the-environment).
+
+Two rules are worth stating outright, because both are choices:
+
+- **Local by default**, like every other assignment. Inside a function
+  `$m.key = v` shadows an outer `m` rather than reaching through to it — the same
+  thing `m += …` and `m = …` already do. **`global $m.key = v`** writes *into* the
+  session-global binding instead, so a function can modify a caller's collection
+  without rebinding the whole thing; it names the global scope, so it writes there
+  even where a local shadows the name, and an unbound global is an error since
+  there is nothing to copy inward.
+- **Nothing along the path is created.** A missing intermediate key is a loud
+  error, not an empty map conjured to hold the write, so `$m.typo.key = v` says so
+  instead of quietly building a structure nobody asked for. The one exception is a
+  **new key at the end of a map**, which is how a key is added. A list is only ever
+  written in place: an out-of-range index is an error, since there is no value to
+  fill a gap with, and `+=` on an absent map key has nothing to combine with.
+
 ### The environment
 
 `$env.KEY = value` writes the process environment, so children inherit it, and
@@ -578,10 +616,12 @@ $env.PATH` needs a spread or a join like any other list. Splitting is **exact** 
 every empty component is kept, since `PATH=/usr/bin:` means "…and the cwd", and a
 split/join round trip is byte-faithful.
 
-Only a plain `$env.KEY` is an assignment target — any name you can read you can
-also assign, including a kebab name like `$env.MY-VAR`. `$env.PATH[0] = …` and
+Only a plain `$env.KEY` is an assignment target *here* — any name you can read you
+can also assign, including a kebab name like `$env.MY-VAR`. `$env.PATH[0] = …` and
 `$env.PATH:dedup = …` describe derived values rather than places, so they are
-syntax errors. Of the other spellings, only `export --list NAME` is still
+syntax errors. (An ordinary map or list **does** take an indexed write — see
+[Member assignment](#member-assignment) — but `$env` holds bytes rather than typed
+values, so it keeps the narrower rule.) Of the other spellings, only `export --list NAME` is still
 unimplemented.
 
 `+=` works on the raw bytes already in the environment, so a value that is not

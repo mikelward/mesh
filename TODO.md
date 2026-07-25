@@ -266,8 +266,17 @@ file as tasks land.
       still be called `global`, `unset`, or `export`. Deferred: deleting a
       collection element (`unset $m.key`, `unset $xs[i]`), which waits on
       general member assignment.
-- [ ] General member assignment (`$m.key = v`), of which the `$env.KEY` form
-      here is a special case with its own byte-boundary rules.
+- [x] General member assignment — `$m.key = v`, `$xs[0] = v`, and `+=`, along a
+      path mixing members and indices. Local-by-default like any other assignment,
+      so a write inside a function shadows rather than reaching through. Nothing
+      along the path is auto-created (a missing intermediate key is loud); the one
+      exception is a new key at the end of a map. `global $m.key = v` writes into
+      the session-global binding instead, the escape hatch that lets a function
+      modify a caller's collection. A slice is not a place, and a list is written
+      in place, so an out-of-range index is an error. `$env.KEY` keeps its own
+      byte-boundary rules and `$sh` stays read-only. Still deferred:
+      deleting a collection element (`unset $m.key`, `unset $xs[i]`), which this
+      unblocks.
 
 ## Beyond M3 — Invocation
 
