@@ -426,6 +426,22 @@ impl JobTable {
                             let id = self.jobs[index].id;
                             self.mark_current(id);
                         }
+                        // A stopped job that has been SIGKILLed is about to end,
+                        // but the kernel need not have posted that by the time
+                        // the next `wait` polls — and on a `None` poll the cached
+                        // stop is what gets reported, so `kill -KILL %1; wait 1`
+                        // answered 147 instead of 137 more often than not.
+                        // Dropping the mark sends that wait down the blocking
+                        // path, which is the only thing that can be sure.
+                        //
+                        // SIGKILL alone: it acts on a stopped process, where an
+                        // ordinary fatal signal like TERM stays *pending* until
+                        // something continues the job. Clearing the mark for one
+                        // of those would leave `wait` blocking on a job that is
+                        // not going to end.
+                        if !failed && signal == libc::SIGKILL {
+                            self.jobs[index].state = JobState::Running;
+                        }
                         failed
                     }
                     None => true,
