@@ -2235,6 +2235,61 @@ fn kill_signals_a_job_or_a_pid() {
 }
 
 #[test]
+fn kill_takes_signal_zero_as_a_liveness_probe() {
+    // `kill -0` sends nothing and reports whether the target exists and could be
+    // signalled — how a script asks whether something is still running.
+    //
+    // The sign matters as much as the zero: expanding a job builtin's arguments
+    // as typed values turned `-0` into the integer `0`, and `kill 0 $pid` sends
+    // to *the caller's own process group*. Arguments other than handles keep the
+    // text ordinary expansion gives them, so the option survives as written.
+    let out = run_with_input(
+        "sleep 5 &\nkill -0 $sh.jobs[1].pid\nputs live=$sh.status\nkill -s 0 $sh.jobs[1].pid\nputs spelled=$sh.status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "live=0\nspelled=0\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let dead = run_with_input("kill -0 999999\nputs dead=$sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&dead.stdout), "dead=1\n");
+    assert!(
+        String::from_utf8_lossy(&dead.stderr).contains("kill: 999999"),
+        "{:?}",
+        dead.stderr
+    );
+}
+
+#[test]
+fn kill_works_from_a_pipeline_stage() {
+    // Unlike `fg` / `bg` / `wait`, `kill` neither waits nor touches the terminal,
+    // and signalling needs permission rather than parenthood — so a forked stage
+    // can do it with the job table it inherited, as bash's `kill` can.
+    for reference in ["$j", "%1"] {
+        let out = run_with_input(&format!(
+            "j = sleep 30 &\nkill {reference} | cat\nputs piped=$sh.status\nwait $j\nputs waited=$sh.status\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "piped=0\nwaited=143\n",
+            "{reference}: stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The three that *do* need to be the shell still say so.
+    let waited = run_with_input("sleep 5 &\nwait $sh.jobs[1] | cat\nputs w=$sh.status\n");
+    assert!(
+        String::from_utf8_lossy(&waited.stderr)
+            .contains("wait: no job control in a pipeline stage"),
+        "{:?}",
+        waited.stderr
+    );
+}
+
+#[test]
 fn kill_reports_what_it_cannot_do() {
     for (line, needle) in [
         ("kill", "kill: expected a job or a pid"),

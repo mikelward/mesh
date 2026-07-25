@@ -393,6 +393,11 @@ and signalling only the leader leaves the rest running. A **pid** signals only
 that process. Each target is signalled independently, so one bad name does not
 stop the rest.
 
+`kill -0` sends nothing and reports whether the target exists and could be
+signalled — the liveness probe. Unlike `fg`, `bg` and `wait`, `kill` works from
+a pipeline stage (`kill $j | cat`): it neither waits for a job nor takes the
+terminal, and signalling needs permission rather than parenthood.
+
 An **id wins over a prefix**, so `%1` is job 1 rather than a command that happens
 to start with `1`. A bare `%` names no job, and neither does a prefix nothing
 matches; both say so. `%?string`, the *substring* match, is not implemented —

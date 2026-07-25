@@ -1741,7 +1741,10 @@ fn split_signal(args: &[String]) -> Result<(libc::c_int, &[String]), &str> {
 /// any case — the spellings every shell's `kill` accepts.
 fn signal_number(name: &str) -> Option<libc::c_int> {
     if let Ok(number) = name.parse::<libc::c_int>() {
-        return (number > 0 && number < 64).then_some(number);
+        // Zero included: `kill -0` sends nothing and reports whether the target
+        // exists and could be signalled, which is how every shell script asks
+        // whether a process is still alive.
+        return (0..64).contains(&number).then_some(number);
     }
     let upper = name.to_ascii_uppercase();
     Some(match upper.strip_prefix("SIG").unwrap_or(&upper) {
