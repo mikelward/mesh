@@ -799,9 +799,9 @@ pub fn run_pipeline(
         let stderr_alone_on_pipe = stderr_to_pipe && !stdout_to_pipe;
         // A background external defers its opens to the helper, so — exactly as in
         // `fork_in_shell` — the shell must read fd 1's fate from `cmd.redirs`
-        // rather than from an opened file. Without this the stage takes the pipe
-        // branch below and records `piped_out`, which excuses a SIGPIPE that the
-        // foreground spelling reports.
+        // rather than from an opened file. Its stdout ends on that file, so a
+        // `SIGPIPE` from the stage is real and `piped_out` must not excuse it,
+        // the way it does for a stage that really writes to the pipe.
         let defers_stdout = background && stdout_is_redirected(&cmd);
         let mut piped_out = false;
         let mut combined_pipe = None;
@@ -811,7 +811,7 @@ pub fn run_pipeline(
         let mut pipe_write = None;
         // A descriptor above the standard slots claimed the pipe, so the pipe has
         // to exist even when stdout went elsewhere.
-        let extras_on_pipe = !is_last && !defers_stdout && !extra_pipe_out.is_empty();
+        let extras_on_pipe = !is_last && !extra_pipe_out.is_empty();
         if let Some(file) = out_file {
             if merge_stderr {
                 match file.try_clone() {
@@ -848,10 +848,17 @@ pub fn run_pipeline(
                 piped_out = true;
             }
             command.stdout(file);
-        } else if !is_last && !defers_stdout && stdout_to_pipe {
-            if merge_stderr || extras_on_pipe {
+        } else if !is_last && stdout_to_pipe {
+            if merge_stderr || extras_on_pipe || defers_stdout {
                 // Own the pipe rather than letting `Stdio::piped()` make it, so
                 // every descriptor that resolved to it can be given the write end.
+                //
+                // A deferred stage needs it for a different reason: the helper
+                // resolves that stage's redirections itself, seeded with whatever
+                // the shell handed it, so `3>&1 > file |` copies the pipe onto
+                // fd 3 there only if fd 1 *is* the pipe when the helper starts.
+                // Handing it `Stdio::piped()` would work, but the read end has to
+                // reach the next stage even though `piped_out` stays false.
                 let (read, write) = match new_pipe() {
                     Ok(pair) => pair,
                     Err(error) => {
@@ -885,7 +892,7 @@ pub fn run_pipeline(
             } else {
                 command.stdout(Stdio::piped());
             }
-            piped_out = true;
+            piped_out = !defers_stdout;
         } else if extras_on_pipe {
             // Stdout moved off the pipe without becoming a file (`1<&0 3>&1 |`),
             // yet fd 3 still holds it and the next stage still has to be fed.
@@ -1670,6 +1677,10 @@ impl Source {
         Ok(match self {
             Source::File(file) => Some(file),
             Source::Inherit(from) if from != fd => Some(dup_shell_fd(from)?),
+            // A descriptor that copied an EOF stdin needs a `/dev/null` of its
+            // own: only stdin has a slot the caller fills with one, so anything
+            // else would be left closed and read `EBADF` instead of end-of-file.
+            Source::Null if fd != libc::STDIN_FILENO => Some(File::open("/dev/null")?),
             _ => None,
         })
     }
@@ -1742,6 +1753,11 @@ impl Sources {
     ///
     /// Everything handed to the child is lifted here first, so installing one
     /// descriptor can never clobber the handle another one still needs.
+    ///
+    /// Saturating, so a redirection naming the largest descriptor a `c_int` can
+    /// hold reports an error from the lift rather than overflowing. Nothing can
+    /// be lifted above such a descriptor, which is the honest answer: no process
+    /// has that many open files.
     fn install_floor(&self) -> libc::c_int {
         self.0
             .iter()
@@ -1749,7 +1765,7 @@ impl Sources {
             .max()
             .unwrap_or(libc::STDERR_FILENO)
             .max(libc::STDERR_FILENO)
-            + 1
+            .saturating_add(1)
     }
 }
 
