@@ -2720,11 +2720,16 @@ fn a_descriptor_can_be_closed_for_a_command() {
     // way it does for a redirected one.
     let dir = fresh_dir("close_descriptor");
     let both = "sh -c 'echo out; echo err >&2'";
+    // `err` is the marker the closed descriptor would have carried, so look for
+    // it as a whole line. A bare `contains` also matches the "err" inside the
+    // "error" of any unrelated diagnostic, which reports someone else's bug
+    // under this test's name and message.
+    let leaked = |stderr: &[u8]| String::from_utf8_lossy(stderr).lines().any(|l| l == "err");
 
     let out = run_with_input(&format!("{both} 2>&-\n"));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
     assert!(
-        !String::from_utf8_lossy(&out.stderr).contains("err"),
+        !leaked(&out.stderr),
         "stderr survived the close: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -2735,7 +2740,7 @@ fn a_descriptor_can_be_closed_for_a_command() {
     ));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!stderr.contains("err"), "{stderr}");
+    assert!(!leaked(&out.stderr), "{stderr}");
     assert!(
         stderr.contains("back"),
         "fd 2 stayed closed after the redirection: {stderr}"
@@ -2745,7 +2750,7 @@ fn a_descriptor_can_be_closed_for_a_command() {
     // descriptors somewhere other than the spawning shell.
     let out = run_with_input(&format!("{both} 2>&- | cat\n"));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("err"));
+    assert!(!leaked(&out.stderr));
 
     let sink = dir.join("bg.txt");
     let out = run_with_input(&format!(
@@ -2754,7 +2759,7 @@ fn a_descriptor_can_be_closed_for_a_command() {
     ));
     assert_eq!(std::fs::read_to_string(&sink).unwrap_or_default(), "out\n");
     assert!(
-        !String::from_utf8_lossy(&out.stderr).contains("err"),
+        !leaked(&out.stderr),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -8462,29 +8467,46 @@ fn a_heredoc_body_can_exceed_a_pipe_buffer() {
 fn a_heredoc_leaves_no_file_behind() {
     // The temporary is unlinked as soon as it is opened, so nothing survives the
     // command and nothing is reachable by name while it runs.
-    let before = std::fs::read_dir(std::env::temp_dir())
-        .unwrap()
+    //
+    // The shell gets a private `TMPDIR`, which `std::env::temp_dir` honors, so
+    // the directory holds this test's temporaries and no one else's. Counting
+    // the shared system directory instead meant counting every other test's
+    // heredocs too — three dozen of them, each visible for the instant between
+    // its open and its unlink — and a neighbor caught inside that window
+    // during the "before" snapshot, then gone by "after", failed this test for a
+    // file it never created.
+    let dir = fresh_dir("heredoc_temp");
+    let mut child = mesh_command()
+        .env("TMPDIR", &dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"cat << END\nbody\nEND\n")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait for mesh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "body\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read the shell's temp dir")
         .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("mesh-heredoc-")
-        })
-        .count();
-    let out = run_with_input("cat << END\nbody\nEND\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "body\n");
-    let after = std::fs::read_dir(std::env::temp_dir())
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("mesh-heredoc-")
-        })
-        .count();
-    assert_eq!(before, after, "a heredoc temporary was left behind");
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().starts_with("mesh-heredoc-"))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "a heredoc temporary was left behind: {left:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
