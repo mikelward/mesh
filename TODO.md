@@ -475,6 +475,20 @@ of each PR had landed by another route, but these pieces had not.
       where it is the one value the writer can spell and the reader cannot take
       back; pinned by `the_smallest_integer_writes_correctly_but_does_not_read_back_yet`
       in `repl.rs`, which fails when this is fixed.
+- [ ] **Two modifier tables, one of them quietly stale.** `lexer::Modifier`
+      (`lexer.rs:36`) and `expand::Modifier` (`expand.rs:27`) are separate enums
+      with separate `from_name` tables, and the lexer's has not been extended
+      since the initial path set: `Keys`, `Values`, `Int`, `Type`, `Exists`,
+      `Read`, `Write`, `Files`, `Dirs`, `Links`, `Exec`, `Tty`, and `Repr` — 13
+      names — exist only in `expand`. Nothing is broken for the shell, because a
+      name the lexer does not know ends its modifier scan and the parser's postfix
+      path handles it; that is how `:keys` has always worked. But
+      `lexer::split_line` is `pub`, so a consumer tokenizing with it sees
+      `$x:keys` as `$x` followed by literal `:keys`, and the two tables have to be
+      remembered together every time a modifier is added. Fix by having the lexer
+      defer to `expand::Modifier::from_name` — one table — rather than by adding
+      13 entries to a second one. Raised by Codex review on #223 against `:repr`,
+      which is consistent with the other twelve rather than a new instance.
 - [ ] **The rest of `fork` isolation.** Two pieces of the `DESIGN.md` cluster are
       still open. **`fork func name(params) { … }`**, a func whose *body* is a
       subshell, needs a decision first: a subshell returns only bytes, so what does
