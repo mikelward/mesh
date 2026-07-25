@@ -836,6 +836,56 @@ not $x:len >> out.txt  # command
 A *spaced* `<` / `>` in a condition is a comparison rather than a redirect, there as
 anywhere, so `if not $y > 2 { … }` negates the comparison.
 
+The same two rules govern a **word operand** on its own, which is how a variable
+names a command. A word is a *value* only when the value is the whole statement;
+anything continuing the line makes it the command line it looks like, and a redirect
+after the *completed* operand is a redirection rather than a comparison:
+
+```mesh
+editor = vim
+$editor              # a value — the string "vim"
+$editor notes.txt    # runs vim on notes.txt
+$editor > log        # runs vim, stdout redirected
+$editor ...$files    # runs vim on each of them
+$editor | cat        # a pipeline: a value cannot be a pipeline stage
+$editor || puts oops # a connector: runs vim, branches on its exit status
+$editor &            # backgrounds the command
+
+p = "src/main.rs"
+$p:base out          # runs `main.rs` with the argument `out`
+$p:base > log        # runs it, redirected — the command word ends after `:base`
+```
+
+A negation is the other kind of operand: it has no command reading, so `&&` and `||`
+join the value statement rather than making a command of it, and `not $b && puts x`
+negates and then branches.
+
+A **command word** is a word plus its *attached* argument-free `:modifier` suffixes,
+and nothing wider. Spacing decides, exactly as it does for an argument — `puts $x :len`
+prints `:len` rather than a length — so a spaced postfix after the command word is the
+next argument:
+
+```mesh
+e = echo
+$e:len            # a value: the length of the word "echo"
+$e :len           # runs echo with the argument ":len"
+```
+
+An operand that cannot be a command word keeps the comparison reading:
+
+```mesh
+x = 1
+$x + 1 > 1        # a comparison: arithmetic cannot be a command word
+ns = [7 8]
+$ns[0 + 0] > 0    # a comparison: a computed index cannot be one either
+$ns[0] > out.txt  # a command, redirected: a literal index is part of the word
+```
+
+In a condition a spaced comparison still compares, modifiers and all, so
+`if $xs:len > 5 { … }` asks about the length. And a *derived* value is not a place:
+`$xs:dedup = 9` is a syntax error saying so, never an attempt to run a command named
+by the value.
+
 `~` tests a string against a bare glob or a regex; `!~` negates the result.
 Globs match the whole string, while regexes search for a match unless explicitly
 anchored:

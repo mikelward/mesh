@@ -321,6 +321,34 @@ file as tasks land.
       (`not [1 2] > out.txt`) redirects too.
       `not -1` remains a command, since `-1` is not a value start anywhere in command
       position — see the negative-literal item under "Loose ends".
+- [x] **A word operand is a value only when it is the whole statement**, and a redirect
+      after it is found by scanning to the end of the **command word** — a word plus its
+      attached argument-free `:modifier` suffixes. Both halves were wrong for the same
+      reason: the check looked one token past the *start* of an operand, which is the
+      `:` in `$p:base` — so `$editor file` reported `expected a statement separator`
+      while `$editor > log` worked, and `$x:len > out.txt` read the `>` as a comparison
+      instead of a redirection. The scan is deliberately not a parse; every parse-based
+      version reached too far, since the grammar nests whole expressions inside a
+      subscript or a call, which is how `$x + 1 > 1` and `$xs[0 + 0] > 0` briefly became
+      commands that truncated a file named after the right operand. `$xs[0] > f` still
+      redirects, a literal index being part of the word. `$cmd` with arguments, a spread, a pipeline, `&&` / `||`,
+      a backgrounding `&`, a spaced postfix argument (`$e :len` echoes `:len` rather than
+      measuring the word), and every redirect spelling (`>`, `>out`, `>>`) now reach the
+      command they name — a bare `$cmd || fallback` ran nothing at all before, and
+      branched on the truthiness of the *word* rather than the exit status. A negation is
+      the other kind of operand, with no command reading, so `not $b && puts x` stays a
+      value statement: the *shape* question an operand check asks is kept separate from
+      the *statement* question, which is what conflating them broke.
+      Unchanged: an operand that *is* the whole statement stays a value (`$xs:len` on
+      its own), a spaced comparison in a condition stays one (`if $xs:len > 5`), and a
+      derived value stays a non-place (`$xs:dedup = 9` is still a syntax error, not a
+      command). `value_is_whole_statement` is shared with the leading-`not` rule, taking
+      a parameter for the one way the two operand kinds differ, rather than being
+      duplicated per clause. The redirect question is *two* predicates on purpose, since
+      it is two questions: for a word operand the operand is itself the command word, so
+      only word shapes can take a redirect, while for a negation `not` is the command
+      word and the operand is an argument, so any shape can precede one
+      (`not [1 2] > out.txt`).
 - [x] `$sh.status` (the readable `$?`) and `$sh.pipestatus` (a real list, not
       bash's magic `PIPESTATUS` array). The two always describe the *same* run:
       a compound's status is its body's, so the breakdown stays the body's too —
@@ -358,6 +386,16 @@ of each PR had landed by another route, but these pieces had not.
       forms, but the keyword is absent from `GRAMMAR.md` and `docs/`, is not
       listed among the deferred syntax there, and does not parse — `fork { pwd }`
       is a syntax error today.
+- [ ] **A redirect after a non-word value operand.** `[1 2] > out.txt` and
+      `(1) > out.txt` read the `>` as a comparison and fail with "comparison requires
+      two integers or two strings"; `[1 2] >> out.txt` is a syntax error, since `>>` is
+      never a comparison. Unlike a word operand there is no second reading to fall back
+      on — `[` always opens a list literal, so there is no `[1 2]` *command* the way a
+      shell without list values would have one — so the fix is not "route it to the
+      command parser" but deciding what a redirect after a value means at all. Options:
+      reject it with a message naming the real problem ("a value cannot be
+      redirected"), or let a value statement be redirected and write its text form,
+      which is the same question as displaying a value at the prompt (below).
 - [ ] **The parser has no recursion-depth limit.** Deeply nested input aborts the
       whole shell with `thread 'main' has overflowed its stack` instead of reporting
       a syntax error. Not new — on `main`, before any of #215, both of these already
