@@ -376,6 +376,26 @@ file as tasks land.
       **not** reap — a completed job stays available to `fg`, and reaping still
       reports and removes it at its own time. Deferred: `j = cmd &` binding a
       handle, `kill $j` / `wait $j`, and the `%n` sigil.
+- [x] `wait JOB`, taking the same `N` / `%N` reference `fg` and `bg` take. It is
+      `fg` without the foreground — no `SIGCONT`, and the terminal stays with the
+      shell — so a background job goes on being one and only its status comes
+      back. Waiting is what lets backgrounded work outlive the script that
+      started it, since the shell hangs its jobs up on the way out. A finished
+      job answers from its record, a stopped one reports its stop status rather
+      than blocking on a job that will not finish, and SIGINT abandons the wait
+      (`130`) while leaving the job listed — which needed a `sigaction` catcher
+      around the wait, because the interactive shell ignores SIGINT and a
+      background job never receives the keystroke itself.
+- [ ] **The rest of `wait`.** `wait` with **no operand** — bash's "every child,
+      with an aggregate status" — is refused rather than guessed at, since `fg`'s
+      no-operand default means "the most recent one" and the two would read
+      alike. `DESIGN.md` defers the aggregate; deciding it is what unblocks the
+      bare form, along with multiple operands (`wait 1 2`). `wait $j` on a job
+      handle waits on `j = cmd &`, deferred above.
+- [ ] **A `kill` builtin.** `DESIGN.md` lists it among the job builtins, so that
+      `kill $j` / `kill %2` signal a *job* while `kill 49001` stays a pid. It
+      needs the same job-reference resolution `wait` uses (`JobTable::resolve`),
+      which is why the two belong together.
 - [ ] The rest of `$sh.*`: `$sh.options` and the hook maps.
 
 ## Loose ends
@@ -700,22 +720,24 @@ reasoning, and the open ones are at the bottom.
         parse as integers, so `chmod 0644 f` is unaffected either way — the octal
         reading would only ever govern `n = 007`, where nobody is writing a mode,
         while `n = 09` breaking is a real cost.
-- [ ] **What `fg` does with a job that has already finished.** `JobTable::info`
-      polls with `waitpid(WNOHANG)` to answer `$sh.jobs` and reaps the pid, but
-      deliberately keeps the job so a completed one stays available to a later
-      `fg` (`exec.rs:134-146`). `fg` then signals a process group with no members
-      left and fails — `printf '/bin/true &\nsleep 0.3\nfg\n' | mesh` prints
-      `mesh: fg: No such process (os error 3)` and returns 1, every time. Since
-      *every* executable refreshes `$sh.jobs`, merely running a command between
-      the job finishing and the `fg` is enough, so reading the table changes what
-      `fg` does — the one thing keeping the job was meant to prevent. Options:
-      hand back the status the job already carries (the reason it was kept at
-      all); reap and report first, so `fg` says `no such job` the way bash does
-      after its own prompt-time reap; or keep the failure but give it a message
-      that names the real situation. The exit-time hangup hit this same `ESRCH`
-      and was fixed by ignoring it (`hangup_group`), which is *not* the answer
-      here: `fg` has a status to return, and silence would make a finished job
-      indistinguishable from a successful resume.
+- [x] **What `fg` does with a job that has already finished** — *decided: hand
+      back the status the job already carries*, which is the reason a completed
+      job is kept in the table at all. `JobTable::info` polls with
+      `waitpid(WNOHANG)` to answer `$sh.jobs` and reaps the pid while keeping the
+      record, so `fg` signaled a process group with no members left and failed:
+      `printf '/bin/true &\nsleep 0.3\nfg\n' | mesh` printed `mesh: fg: No such
+      process (os error 3)` and returned 1, every time. Since *every* executable
+      refreshes `$sh.jobs`, merely running a command in between was enough, so
+      reading the table decided what `fg` did — the one thing keeping the job was
+      meant to prevent. `fg` now polls before signaling and, for a finished job,
+      reports `[n] Done (status) cmd` and returns that status; the note is what
+      keeps it distinguishable from a successful resume, which ruled out simply
+      ignoring the `ESRCH` the way the exit-time hangup does. The alternatives —
+      reaping first so `fg` says `no such job` like bash after its own
+      prompt-time reap, or keeping the failure with a better message — both throw
+      away a status that is sitting right there. `wait` was implemented on the
+      same rule, so waiting after the fact reports what waiting through it would
+      have.
 - [x] **Choose a repo license** — *decided: `MIT OR Apache-2.0`* (the
       Rust-ecosystem norm, as used by Rust itself). Nothing constrained the choice:
       all current/planned deps are permissive (`reedline`/`nix`/`crossterm` MIT)

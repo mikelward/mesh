@@ -4262,12 +4262,13 @@ fn run_expanded(words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     // on them or hand them the terminal — the same answer bash gives in a
     // subshell.
     let job_status = match words[0].as_str() {
-        "fg" | "bg" if shell.forked => {
+        "fg" | "bg" | "wait" if shell.forked => {
             note!("mesh: {}: no job control in a pipeline stage", words[0]);
             Some(1)
         }
         "fg" => Some(shell.jobs.foreground(&words[1..])),
         "bg" => Some(shell.jobs.background(&words[1..])),
+        "wait" => Some(shell.jobs.wait(&words[1..])),
         "jobs" => Some(shell.jobs.list(&words[1..], !shell.forked)),
         _ => None,
     };

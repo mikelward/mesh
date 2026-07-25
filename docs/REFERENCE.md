@@ -154,9 +154,9 @@ notice reports and what a signal needs), `cmd`, `state` — `running`, `stopped`
 or `done` — and `status`, empty until the job finishes and then its exit code.
 
 Reading it **polls but does not reap**: a finished job reports `done` with its
-status and stays in the table, so a later `fg` still finds it and the usual
-`[1] Done (0) …` notice still arrives at its own time. Looking at the table never
-changes what the shell does.
+status and stays in the table, so a later `fg` or `wait` still finds it and hands
+back that status, and the usual `[1] Done (0) …` notice still arrives at its own
+time. Looking at the table never changes what the shell does.
 
 `$sh.options` and the hook maps in `DESIGN.md` are not implemented yet.
 
@@ -332,6 +332,42 @@ one-MiB output cap.
 | `exit [n]` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). |
 | `prompt [text]` | Set the interactive prompt to `text`. With no arguments, print the current prompt; `--reset` restores the status-sensitive default. |
 | `prompt-hook [event] name function` | Register a named function for a prompt lifecycle event. The default event is `preprompt`. Reusing `name` within an event replaces that hook without changing its order. |
+| `jobs` | List the jobs, one `[id] State command` per line. |
+| `fg [job]` | Resume a job in the foreground and wait for it. No argument takes the most recent job. |
+| `bg [job]` | Resume a stopped job in the background. No argument takes the most recent job. |
+| `wait job` | Wait for a job to finish and report its status — see [Job control](#job-control). |
+
+### Job control
+
+A job reference is its id, either bare (`fg 2`) or with the `%` sigil (`fg %2`).
+`fg` and `bg` take the most recent job when given none.
+
+**`wait`** reports a job's exit status without giving it the terminal, which is
+what lets a script hand work to the background and collect the result:
+
+```mesh
+sh -c 'sleep 1; echo done' &
+wait 1                          # blocks; $sh.status is the job's
+```
+
+Waiting is how backgrounded work survives the shell: jobs still running when the
+shell exits are hung up, so without a `wait` whatever they had left to do is
+lost.
+
+A job that has **already finished** answers from the status its record carries,
+so waiting after the fact reports the same thing as waiting through it. The job
+then leaves the table, and the usual `[1] Done (0) …` notice is not repeated for
+a status you have already been given. Ctrl-C abandons the *wait*, reporting
+`130`, and leaves the job running and listed.
+
+A job that is **stopped** does not finish on its own, so waiting for one reports
+its `128 + signal` stop status straight away rather than blocking on it; `bg`
+or `fg` is what a stopped job wants.
+
+Unlike bash, `wait` needs a job: the no-operand form there means "every child,
+with an aggregate status", which is not yet decided here. `wait $j` on a job
+handle, `kill`, and `disown` are likewise not implemented — see
+[`DESIGN.md`](../DESIGN.md#job-control).
 
 ### Custom prompts and hooks
 
