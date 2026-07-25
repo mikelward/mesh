@@ -20,6 +20,7 @@ pub(crate) const NAMES: &[&str] = &[
     "jobs",
     "prompt",
     "prompt-hook",
+    "source",
 ];
 
 /// Outcome of a builtin. `Status` reports an exit status and continues the loop;
@@ -54,6 +55,7 @@ pub(crate) fn help(name: &str) -> Option<String> {
         "jobs" => "jobs",
         "prompt" => "prompt [--reset | TEXT]",
         "prompt-hook" => "prompt-hook [--remove] [EVENT] NAME [FUNCTION]",
+        "source" => "source FILE",
         _ => return None,
     };
     Some(format_help(usage))

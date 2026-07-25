@@ -7874,7 +7874,8 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     let out = run_with_input("puts ...$sh:keys\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "status pipestatus pid ppid version interactive stdin stdout stderr jobs name args\n"
+        "status pipestatus pid ppid version interactive stdin stdout stderr jobs \
+         origin source name args\n"
     );
 
     // A mistyped key is still a loud error, and `status` is not a reserved
@@ -7887,6 +7888,341 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     );
     let out = run_with_input("status = mine\nputs $status\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "mine\n");
+}
+
+/// `source FILE` runs a file's code in **this** shell, so what it defines and
+/// assigns outlives it — the whole point, and what makes an rc file possible.
+#[test]
+fn source_runs_a_file_in_the_current_shell() {
+    let dir = fresh_dir("source_current");
+    std::fs::write(
+        dir.join("lib.mesh"),
+        "func greet(who) { puts hello $who }\nshared = from-lib\n",
+    )
+    .unwrap();
+    let main = dir.join("main.mesh");
+    std::fs::write(&main, "source lib.mesh\ngreet world\nputs $shared\n").unwrap();
+
+    let out = mesh_command()
+        .arg(main.to_str().unwrap())
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the sourcing script");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hello world\nfrom-lib\n"
+    );
+    assert!(out.status.success(), "{:?}", out.status);
+}
+
+/// `$sh.origin` and `$sh.source` answer "what is being evaluated, and where does it
+/// live" — the two questions `DESIGN.md` leaves as a TODO, kept **orthogonal to
+/// interactivity**. `$sh.source` reports the *innermost* file, so it changes across
+/// a `source` and changes back afterwards.
+#[test]
+fn origin_and_source_describe_the_input_being_evaluated() {
+    let dir = fresh_dir("source_origin");
+    std::fs::write(dir.join("inner.mesh"), "puts inner $sh.origin $sh.source\n").unwrap();
+    std::fs::write(
+        dir.join("outer.mesh"),
+        "puts outer $sh.origin $sh.source\n\
+         source inner.mesh\n\
+         puts back $sh.origin $sh.source\n",
+    )
+    .unwrap();
+    let main = dir.join("main.mesh");
+    std::fs::write(
+        &main,
+        "puts main $sh.origin $sh.source\nsource outer.mesh\n",
+    )
+    .unwrap();
+
+    let out = mesh_command()
+        .arg("main.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the nesting script");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // A script is `script`; each sourced file is `sourced` and names itself;
+        // and the outer file gets its own answer back once the inner one returns.
+        "main script main.mesh\n\
+         outer sourced outer.mesh\n\
+         inner sourced inner.mesh\n\
+         back sourced outer.mesh\n"
+    );
+
+    // The origins that are not files report themselves with an empty `$sh.source`.
+    let command = run_with_args(&["-c", "puts $sh.origin [$sh.source]"]);
+    assert_eq!(String::from_utf8_lossy(&command.stdout), "command []\n");
+    let piped = run_with_input("puts $sh.origin [$sh.source]\n");
+    assert_eq!(String::from_utf8_lossy(&piped.stdout), "stdin []\n");
+}
+
+/// A startup file is a sourced file, and reports itself as one. That is what lets
+/// an rc file locate a sibling — the `${BASH_SOURCE[0]}` use case `DESIGN.md` cites
+/// — and `$sh.name` cannot do it, since it never changes.
+#[test]
+fn a_startup_file_reports_itself_as_sourced() {
+    let home = fresh_dir("source_startup");
+    let config = home.join("mesh");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("env.mesh"),
+        "puts env $sh.origin $sh.source\nfrom-env = yes\n",
+    )
+    .unwrap();
+    let main = home.join("main.mesh");
+    std::fs::write(&main, "puts main $sh.origin\nputs $from-env\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .arg(main.to_str().unwrap())
+        .env("XDG_CONFIG_HOME", &home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run with a startup file");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "env sourced {}\n",
+            config.join("env.mesh").display()
+        )),
+        "{stdout}"
+    );
+    // The script's own frame is restored, and what the startup file set persists.
+    assert!(stdout.contains("main script\n"), "{stdout}");
+    assert!(stdout.contains("yes\n"), "{stdout}");
+}
+
+/// A startup file that leaves through `return` must **publish** its status, because
+/// a startup file never passes through `run_recorded` — the funnel that normally
+/// does it. Otherwise the next file in the chain reads `$sh.status` as whatever ran
+/// before, while receiving the returned code as its `last`: two answers for one run.
+#[test]
+fn a_startup_file_that_returns_publishes_its_status() {
+    let home = fresh_dir("source_startup_status");
+    let config = home.join("mesh");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("env.mesh"),
+        "puts env-runs\nreturn 7\nputs never\n",
+    )
+    .unwrap();
+    std::fs::write(config.join("login.mesh"), "puts login-sees $sh.status\n").unwrap();
+    let main = home.join("main.mesh");
+    std::fs::write(&main, "puts script-sees $sh.status\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .arg("--login")
+        .arg(main.to_str().unwrap())
+        .env("XDG_CONFIG_HOME", &home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run a login shell");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // `login.mesh` sees the 7 `env.mesh` returned; the script then sees 0,
+        // because `login.mesh`'s own `puts` is the last thing that ran.
+        "env-runs\nlogin-sees 7\nscript-sees 0\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// How `source` fails. A **parse** error rejects the whole file, so a broken rc
+/// cannot leave a half-defined config — `DESIGN.md` §"Error handling".
+#[test]
+fn source_reports_its_failures_with_the_shells_own_statuses() {
+    let dir = fresh_dir("source_failures");
+    std::fs::write(
+        dir.join("bad.mesh"),
+        "puts one\nthis is ( broken\nputs two\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("adir")).unwrap();
+
+    let run = |body: &str| {
+        let path = dir.join("run.mesh");
+        std::fs::write(&path, body).unwrap();
+        mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run")
+    };
+
+    // None of a file with a syntax error runs — neither statement around it.
+    let bad = run("source bad.mesh\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&bad.stdout), "after\n");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("syntax error"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    // The statuses `mesh FILE` itself uses, so a missing or unreadable file
+    // answers the same however it is reached.
+    for (body, code, message) in [
+        ("source nope.mesh\n", 127, "No such file"),
+        ("source adir\n", 126, "Is a directory"),
+        ("source\n", 2, "needs a file to run"),
+        ("source a b\n", 2, "takes exactly one file"),
+    ] {
+        let out = run(body);
+        assert_eq!(out.status.code(), Some(code), "{body}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(message),
+            "{body} gave {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// `return` leaves the innermost unit that has an invoker to return **to**: a
+/// function, or a sourced file — whose `source` takes the returned value's status.
+/// A script, a `-c` string, and a typed line have no caller, so there it stays an
+/// error. That is the distinction bash draws, and it is what makes an early-out in a
+/// config file writable at all: `exit` would take the whole shell with it.
+#[test]
+fn return_leaves_a_sourced_file_and_gives_source_its_status() {
+    let dir = fresh_dir("source_return");
+    let run = |name: &str, body: &str, main: &str| {
+        std::fs::write(dir.join(name), body).unwrap();
+        std::fs::write(dir.join("run.mesh"), main).unwrap();
+        mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run")
+    };
+
+    // A value becomes `source`'s status, and nothing after the `return` runs.
+    let valued = run(
+        "lib.mesh",
+        "puts in-lib\nreturn 3\nputs never\n",
+        "source lib.mesh\nputs after $sh.status\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&valued.stdout), "in-lib\nafter 3\n");
+
+    // A bare `return` carries the last status, exactly as a bare `exit` does.
+    let bare = run(
+        "lib.mesh",
+        "sh -c \"exit 1\"\nreturn\nputs never\n",
+        "source lib.mesh\nputs after $sh.status\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&bare.stdout), "after 1\n");
+
+    // It stops the *innermost* file only: the outer one carries on with the
+    // status it was handed.
+    std::fs::write(dir.join("inner.mesh"), "puts inner\nreturn 5\nputs never\n").unwrap();
+    let nested = run(
+        "outer.mesh",
+        "puts outer\nsource inner.mesh\nputs outer-sees $sh.status\nputs outer-end\n",
+        "source outer.mesh\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&nested.stdout),
+        "outer\ninner\nouter-sees 5\nouter-end\n"
+    );
+
+    // A function is a nearer unit than the file holding it, so its `return` is the
+    // function's and the file keeps going.
+    let inside = run(
+        "lib.mesh",
+        "func f() { return 9 }\nx = f()\nputs fn $x\nreturn 2\n",
+        "source lib.mesh\nputs after $sh.status\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&inside.stdout), "fn 9\nafter 2\n");
+
+    // The guard a config file wants, now writable.
+    let guard = run(
+        "lib.mesh",
+        "if $sh.interactive == false { puts batch\nreturn }\nputs interactive-only\n",
+        "source lib.mesh\nputs done\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&guard.stdout), "batch\ndone\n");
+}
+
+/// The other half: `exit` in a sourced file ends the **shell**, because `source`
+/// runs in this shell rather than a child. And a top level with no caller still
+/// refuses a `return`, naming both units that accept one.
+#[test]
+fn exit_in_a_sourced_file_ends_the_shell_while_a_script_refuses_return() {
+    let dir = fresh_dir("source_exit");
+    std::fs::write(dir.join("lib.mesh"), "puts in-lib\nexit 7\nputs never\n").unwrap();
+    std::fs::write(dir.join("run.mesh"), "source lib.mesh\nputs never-either\n").unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "in-lib\n");
+    assert_eq!(out.status.code(), Some(7));
+
+    // A script's own top level has nothing to return to.
+    std::fs::write(dir.join("plain.mesh"), "puts a\nreturn 3\nputs b\n").unwrap();
+    let script = mesh_command()
+        .arg("plain.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(String::from_utf8_lossy(&script.stdout), "a\nb\n");
+    assert!(
+        String::from_utf8_lossy(&script.stderr)
+            .contains("return: not inside a function or sourced file"),
+        "{}",
+        String::from_utf8_lossy(&script.stderr)
+    );
+}
+
+/// `source` is a **status-producing command**, so whatever the file's last statement
+/// produced stops at the `source`. Otherwise the file's value carries out and
+/// `func f() { source lib.mesh }` returns whatever the file happened to end with —
+/// a list, a string — where every other command yields its status.
+#[test]
+fn source_produces_a_status_not_the_files_last_value() {
+    let dir = fresh_dir("source_status");
+    let run = |tail: &str| {
+        std::fs::write(dir.join("lib.mesh"), format!("x = \"hi\"\n{tail}\n")).unwrap();
+        std::fs::write(
+            dir.join("run.mesh"),
+            "func f() { source lib.mesh }\ny = f()\nputs $y\n",
+        )
+        .unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // A string and a list both stop here; without the normalization the function
+    // returned the value itself, and the list even needed a spread to print.
+    assert_eq!(run("$x"), "0\n");
+    assert_eq!(run("[1 2]"), "0\n");
+
+    // An integer tail *is* a status — and the same one running the file as a
+    // script exits with, which is the agreement that matters.
+    assert_eq!(run("42"), "42\n");
+    std::fs::write(dir.join("lib.mesh"), "x = \"hi\"\n42\n").unwrap();
+    let as_script = mesh_command()
+        .arg("lib.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run as a script");
+    assert_eq!(as_script.status.code(), Some(42));
 }
 
 // ---------------------------------------------------------------------------

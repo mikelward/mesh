@@ -41,6 +41,57 @@ Scripts can carry a shebang, since `#` starts a comment:
 puts "hi $sh.args[0]"
 ```
 
+### `source`
+
+`source FILE` runs a file's mesh code in **this** shell, so what it defines and
+assigns outlives it — the reason a config file can work at all:
+
+```mesh
+source lib.mesh                # functions and variables it sets persist
+```
+
+Exactly one operand. Arguments for a sourced file would be positional parameters,
+and mesh has no way to set those yet, so they are refused rather than ignored. A
+missing file reports `127` and an unreadable one `126` — the statuses `mesh FILE`
+itself uses, so the same failure answers the same however it is reached. A **syntax
+error rejects the whole file**, so none of it runs and a broken rc cannot leave a
+half-defined config.
+
+**`return` leaves a sourced file**, and `source` reports the returned value's
+status; a bare `return` carries the last status, as a bare `exit` does. `exit` still
+ends the **shell**, from a sourced file included, since `source` runs in this shell
+rather than a child. A script, a `-c` string, and a typed line have no caller, so
+`return` there is an error naming both units that accept one. This is what makes an
+early out writable:
+
+```mesh
+if $sh.interactive == false { return }   # the rest is interactive-only
+```
+
+### `$sh.origin` and `$sh.source`
+
+Two read-only entries say **what is being evaluated**:
+
+| Entry | Value |
+| --- | --- |
+| `$sh.origin` | `script`, `sourced`, `command` (`-c`), `stdin` (`-s`), or `interactive` |
+| `$sh.source` | the file's path for `script` / `sourced`, empty otherwise |
+
+They are deliberately **not** the same question as `$sh.interactive`. The two come
+apart today with `-s`: `mesh -s` on a terminal reads typed commands, yet its origin
+is `stdin` and `$sh.interactive` is `false`, because only the interactive loop sets
+that. (The reverse pairing — a script that is also interactive — waits on `-i`,
+which is not implemented yet.)
+
+`$sh.source` reports the **innermost** file, so it changes across a `source` and
+changes back afterwards, and a startup file reports itself as `sourced` — which is
+how one locates a sibling. `$sh.name` (bash's `$0`) cannot do that: it never
+changes.
+
+Together they replace bash's `${BASH_SOURCE[0]}` and the
+`[[ "${BASH_SOURCE[0]}" != "$0" ]]` guard, which becomes the direct
+`if $sh.origin == script { … }`.
+
 ### `$sh.args` and `$sh.name`
 
 Positional arguments are a real list — `$sh.args` — not `$1` / `$@` / `$#`:
@@ -881,7 +932,7 @@ Arms may have `if` guards, and an unmatched expression yields `""`.
 ```
 func name(params) { body }    # define a named function
 name arg ...                  # call it; args bind to the positionals
-return [ N ]                  # exit the body early (inside a function only)
+return [ N ]                  # exit the body early (or a sourced file — see `source`)
 ```
 
 Define a callable with `func`. Parameters are **named** — reference them as
@@ -945,8 +996,9 @@ greet world          # -> hi, world
   exits early carrying a value (viewed the same way: `return 3` is status `3`,
   masked to 0–255, like `exit`); a bare `return` carries the **result so far** —
   the last value the body produced, or the status of a command that produced
-  none, or the empty string if nothing ran. Both stop the rest of the body. At
-  top level `return` is a recoverable error.
+  none, or the empty string if nothing ran. Both stop the rest of the body. At a
+  top level `return` is a recoverable error, **except** in a sourced file, which it
+  leaves the way it leaves a function body — see [`source`](#source).
 
 - **Redirection.** A function takes `>`, `>>`, `<`, `2>`, and `2>&1` like any command
   (`f > out.txt`, `r < input`). Because a function runs inside the shell, the

@@ -297,10 +297,23 @@ file as tasks land.
 - [ ] `-i` to force an interactive session when stdin is not a terminal.
 - [ ] Mutating positional arguments (`shift` / `set --`), deferred in `DESIGN.md`
       along with system-wide `/etc/mesh/*` startup files.
-- [ ] A `source` builtin, and the input **origin** (`script` / `sourced` /
-      `command` / `stdin` / `interactive`) plus `$sh.source` that `DESIGN.md`
-      §"Startup and invocation" leaves as a TODO — a file needs to know it is
-      being sourced, and where it lives.
+- [x] A `source` builtin, and the input **origin** (`script` / `sourced` /
+      `command` / `stdin` / `interactive`) plus `$sh.source`, resolving the TODO
+      block in `DESIGN.md` §"Startup and invocation". `source FILE` runs a file in
+      this shell; a startup file reports itself as `sourced` too, so `$sh.source`
+      locates a sibling. `$sh.source` reports the **innermost** file, not a stack.
+      `return` leaves a sourced file and gives `source` its status (a bare one
+      carries the last status); `exit` still ends the shell; a script/`-c`/typed
+      top level has no caller, so `return` there stays an error. Missing and
+      unreadable files answer `127` / `126`, the statuses `mesh FILE` uses.
+      Deferred: arguments for a sourced file, which need `shift` / `set --`.
+- [ ] **A leading `not` is not a value start.** `x = not $b` and
+      `if $a and not $b { … }` both work, but `if not $b { … }` reports
+      `command not found: not` — the condition is handed to the command parser
+      because `value_start_in` does not recognize `not`. `DESIGN.md` writes the
+      idiom that way (`skip $p unless $p:exists`, `if $a:exists and not $b:exists`),
+      so the leading form should start a value like the attached `:name(…)` call
+      does. Pre-existing; found while writing a config-file guard.
 - [x] `$sh.status` (the readable `$?`) and `$sh.pipestatus` (a real list, not
       bash's magic `PIPESTATUS` array). The two always describe the *same* run:
       a compound's status is its body's, so the breakdown stays the body's too —

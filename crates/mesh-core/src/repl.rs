@@ -254,6 +254,8 @@ fn run_batch(text: &str, options: &StartupOptions) -> ExitCode {
     shell
         .vars
         .set_invocation(options.name.clone(), options.args.clone());
+    let (origin, source) = options.origin(false);
+    shell.vars.set_origin(origin, source);
     let last = match run_startup_files(options, false, 0, &mut shell) {
         Step::Continue(code) => code,
         Step::Exit(code) => return ExitCode::from(run_logout(options, code, &mut shell)),
@@ -296,6 +298,30 @@ struct StartupOptions {
     args: Vec<String>,
     /// The shell-or-script name, exposed as `$sh.name` (bash's `$0`).
     name: String,
+}
+
+impl StartupOptions {
+    /// The input this invocation establishes: `DESIGN.md`'s **origin**, plus the
+    /// path for the origins that are files.
+    ///
+    /// Kept separate from interactivity on purpose — `mesh -i script.mesh` is both
+    /// interactive and a script — so `interactive` only decides between the two
+    /// readings of a bare invocation, which is the one place they overlap.
+    fn origin(&self, interactive: bool) -> (vars::Origin, String) {
+        match &self.invocation {
+            Invocation::Script(path) => (vars::Origin::Script, path.to_string_lossy().into_owned()),
+            Invocation::Command(_) => (vars::Origin::Command, String::new()),
+            Invocation::Stdin => (vars::Origin::Stdin, String::new()),
+            Invocation::Default | Invocation::Print(_) => (
+                if interactive {
+                    vars::Origin::Interactive
+                } else {
+                    vars::Origin::Stdin
+                },
+                String::new(),
+            ),
+        }
+    }
 }
 
 impl Default for StartupOptions {
@@ -541,7 +567,81 @@ fn run_config_file(path: &Path, last: u8, shell: &mut Shell) -> Step {
             return Step::Continue(1);
         }
     };
-    run_line(&text, last, false, shell)
+    // A startup file *is* a sourced file, so it reports itself the same way — which
+    // is what lets `rc.mesh` locate a sibling through `$sh.source`.
+    run_sourced_text(&text, path, last, shell)
+}
+
+/// `source FILE` — run a file's mesh code in **this** shell, so what it defines
+/// and assigns persists after it returns.
+///
+/// Exactly one operand. Extra arguments would be positional parameters for the
+/// sourced file, and mesh has no way to set those yet (`shift` / `set --` are
+/// deferred in `DESIGN.md`), so they are refused rather than silently ignored.
+fn source_file(args: &[String], last: u8, shell: &mut Shell) -> Step {
+    let [path] = args else {
+        let message = if args.is_empty() {
+            "source: needs a file to run"
+        } else {
+            "source: takes exactly one file; arguments for a sourced file are not \
+             supported yet"
+        };
+        note!("mesh: {message}");
+        return Step::Continue(2);
+    };
+    let path = Path::new(path);
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            note!("mesh: source: {}: {error}", path.display());
+            // The statuses `mesh FILE` itself uses for the same two failures, so a
+            // missing or unreadable file answers the same however it is reached.
+            return Step::Continue(if error.kind() == io::ErrorKind::NotFound {
+                127
+            } else {
+                126
+            });
+        }
+    };
+    run_sourced_text(&text, path, last, shell)
+}
+
+/// Run a file's text as a nested input, reporting itself through `$sh.origin` and
+/// `$sh.source` while it does.
+///
+/// The frame is popped on **every** path out, including the ones that leave through
+/// `exit` or a `return`, so a `$sh.source` read after the file finishes can never
+/// name it.
+fn run_sourced_text(text: &str, path: &Path, last: u8, shell: &mut Shell) -> Step {
+    shell
+        .vars
+        .push_input(vars::Origin::Sourced, path.to_string_lossy().into_owned());
+    let step = run_line(text, last, false, shell);
+    shell.vars.pop_input();
+    let step = match step {
+        // `return` from a sourced file's top level ends *that file* and nothing
+        // further: the value it carries becomes this `source`'s status, so a nested
+        // source returns to its own caller rather than unwinding the whole stack.
+        Step::Return(value) => Step::Continue(status_of(&value)),
+        step => step,
+    };
+    // `source` is a **status-producing command**, so whatever the file's last
+    // statement produced stops here. Without this the file's value carries out
+    // through `run_recorded`, and `func f() { source lib.mesh }` returns whatever
+    // `lib.mesh` happened to end with — an integer, a list — where every other
+    // command yields its status. Set on both paths, since a startup file is run
+    // outside `run_recorded` and would otherwise leave the value behind.
+    if let Step::Continue(code) = step {
+        shell.result = Value::Integer(i64::from(code));
+        shell.produced = Produced::Status;
+        // Published here rather than left to `run_recorded`, which a startup file
+        // never passes through: a `return` in `env.mesh` is converted above, and
+        // without this the next file — and the script after it — would read
+        // `$sh.status` as whatever ran before. Recording again is harmless for the
+        // `source` builtin, whose `run_recorded` then sees the status it wanted.
+        shell.record_status(code, vec![code]);
+    }
+    step
 }
 
 fn run_startup_files(
@@ -924,8 +1024,13 @@ fn run_executable(
             }
             match kind {
                 parser::ControlKind::Return => {
-                    if !in_function {
-                        note!("mesh: return: not inside a function");
+                    // A `return` leaves the innermost unit that has an invoker to
+                    // return *to*: a function, or a sourced file — whose `source`
+                    // command takes the returned value's status. A script, a `-c`
+                    // string, and a typed line have no caller, so there it stays an
+                    // error, the same distinction bash draws.
+                    if !in_function && !shell.vars.in_sourced_file() {
+                        note!("mesh: return: not inside a function or sourced file");
                         return Step::Continue(1);
                     }
                     // `return val` unwinds carrying any value (its status is a view
@@ -4122,6 +4227,9 @@ fn run_expanded(words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     match words[0].as_str() {
         "prompt" => return configure_prompt(&words[1..], shell),
         "prompt-hook" => return configure_prompt_hook(&words[1..], shell),
+        // `source` runs mesh code in *this* shell, so it belongs here rather than
+        // in `builtins::dispatch`, which is handed only words and a status.
+        "source" => return source_file(&words[1..], last, shell),
         _ => {}
     }
     // Job control belongs to the shell that owns the jobs. A forked stage is not
@@ -5432,6 +5540,8 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     // reads commands but is not one, so this is recorded by the loop rather than
     // derived from `isatty`.
     shell.vars.set_interactive(true);
+    let (origin, source) = options.origin(true);
+    shell.vars.set_origin(origin, source);
     let mut last = match run_startup_files(options, true, 0, &mut shell) {
         Step::Continue(code) => code,
         Step::Exit(code) => {
@@ -6055,6 +6165,8 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
     shell
         .vars
         .set_invocation(options.name.clone(), options.args.clone());
+    let (origin, source) = options.origin(false);
+    shell.vars.set_origin(origin, source);
     let mut last = match run_startup_files(options, false, 0, &mut shell) {
         Step::Continue(code) => code,
         Step::Exit(code) => {
