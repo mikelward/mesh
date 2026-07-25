@@ -53,12 +53,14 @@ file as tasks land.
 - [x] Descriptors above 2 (`3< file`, `3> file`, `2>&3`). Redirection state is
       keyed by descriptor rather than a fixed `[Source; 3]`, and anything past
       the standard three is installed by the child itself, since only those have
-      a `Stdio` slot. Duplicating an unopened descriptor is `EBADF`. Deferred:
-      closing one (`n>&-`).
+      a `Stdio` slot. Duplicating an unopened descriptor is `EBADF`.
+- [x] Closing a descriptor (`n>&-`), across all four routes, restored with the
+      redirection on the in-shell one. A descriptor closed earlier in the list is
+      gone, so copying it afterwards is `EBADF` — source order decides here as
+      it does everywhere else.
 - [x] Descriptor duplication: `2>&1`, `>&2`, `<&0`, and the both-streams forms
       `>& file` and `&> file`. A bare `>&` picks its meaning from the token as
       written, so a computed target (`>&$fd`) is refused rather than guessed at.
-      Deferred: closing a descriptor (`n>&-`).
 - [x] Heredocs: `<< END … END` interpolates its body (`$…` plus the `"…"` escape
       set, resolved through the command grammar so a heredoc and a string cannot
       disagree); `<< 'END'` is raw. The body reaches the command as an unlinked
