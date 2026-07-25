@@ -89,6 +89,12 @@ pub struct Cmd {
 pub struct JobTable {
     jobs: Vec<Job>,
     next_id: usize,
+    /// The job `%%` / `%+` names, and the one `%-` names behind it. A job takes
+    /// the current spot when it is registered, when it stops, and when `bg`
+    /// starts it again — the events that make it the one you most likely mean.
+    /// Ids rather than indices, so removing a job cannot silently repoint them.
+    current: Option<usize>,
+    previous: Option<usize>,
 }
 
 struct Job {
@@ -140,14 +146,22 @@ impl JobTable {
     /// observation change behavior. Reaping still reports and removes it at its
     /// own time.
     pub fn info(&mut self) -> Vec<JobInfo> {
-        self.jobs
+        // Noting a stop here rather than inside the walk, which holds the table
+        // borrowed: a job found stopped becomes the current one, exactly as it
+        // would have had `reap` been the one to notice.
+        let mut newly_stopped = Vec::new();
+        let info = self
+            .jobs
             .iter_mut()
             .map(|job| {
                 let mut status = None;
                 if job.state == JobState::Running {
                     match poll_outcomes(&mut job.outcomes) {
                         Some(WaitResult::Complete(code)) => status = Some(code),
-                        Some(WaitResult::Stopped(code)) => job.state = JobState::Stopped(code),
+                        Some(WaitResult::Stopped(code)) => {
+                            job.state = JobState::Stopped(code);
+                            newly_stopped.push(job.id);
+                        }
                         None => {}
                     }
                 }
@@ -163,13 +177,19 @@ impl JobTable {
                     status,
                 }
             })
-            .collect()
+            .collect();
+        for id in newly_stopped {
+            self.mark_current(id);
+        }
+        info
     }
 
     pub fn new() -> Self {
         Self {
             jobs: Vec::new(),
             next_id: 1,
+            current: None,
+            previous: None,
         }
     }
 
@@ -188,6 +208,7 @@ impl JobTable {
         // usable status into `mesh: fg: No such process`.
         if let Some(WaitResult::Complete(status)) = poll_outcomes(&mut self.jobs[index].outcomes) {
             let job = self.jobs.remove(index);
+            self.forget(job.id);
             note!("[{}] Done ({status}) {}", job.id, job.command);
             return status;
         }
@@ -207,12 +228,17 @@ impl JobTable {
             .flatten();
         reclaim_terminal(job.shell_modes.as_ref());
         match result {
-            WaitResult::Complete(status) => status,
+            WaitResult::Complete(status) => {
+                self.forget(job.id);
+                status
+            }
             WaitResult::Stopped(status) => {
                 job.job_modes = stopped_modes;
                 job.state = JobState::Stopped(status);
                 note!("[{}] Stopped {}", job.id, job.command);
+                let id = job.id;
                 self.jobs.push(job);
+                self.mark_current(id);
                 status
             }
         }
@@ -264,13 +290,16 @@ impl JobTable {
         let result = wait_outcomes_until(&mut self.jobs[index].outcomes, on_interrupt);
         match result {
             Some(WaitResult::Complete(status)) => {
-                self.jobs.remove(index);
+                let job = self.jobs.remove(index);
+                self.forget(job.id);
                 status
             }
             Some(WaitResult::Stopped(status)) => {
                 let job = &mut self.jobs[index];
                 job.state = JobState::Stopped(status);
+                let id = job.id;
                 note!("[{}] Stopped {}", job.id, job.command);
+                self.mark_current(id);
                 status
             }
             // Ctrl-C gives up on the wait, not on the job: it keeps running and
@@ -289,7 +318,9 @@ impl JobTable {
             return 1;
         }
         job.state = JobState::Running;
+        let id = job.id;
         note!("[{}] Running {}", job.id, job.command);
+        self.mark_current(id);
         0
     }
 
@@ -329,11 +360,14 @@ impl JobTable {
                 match poll_outcomes(&mut self.jobs[index].outcomes) {
                     Some(WaitResult::Complete(status)) => {
                         let job = self.jobs.remove(index);
+                        self.forget(job.id);
                         note!("[{}] Done ({status}) {}", job.id, job.command);
                         continue;
                     }
                     Some(WaitResult::Stopped(code)) => {
                         self.jobs[index].state = JobState::Stopped(code);
+                        let id = self.jobs[index].id;
+                        self.mark_current(id);
                     }
                     None => {}
                 }
@@ -342,6 +376,63 @@ impl JobTable {
         }
     }
 
+    /// Make `id` the current job, pushing the one it displaces to `%-`.
+    fn mark_current(&mut self, id: usize) {
+        if self.current == Some(id) {
+            return;
+        }
+        // A job that was `%-` and is now `%+` leaves nothing behind it, so the
+        // slot is refilled below rather than kept pointing at the same job twice.
+        if self.previous == Some(id) {
+            self.previous = None;
+        }
+        self.previous = self.current.or(self.previous);
+        self.current = Some(id);
+        self.refill_previous();
+    }
+
+    /// Drop a job that has left the table from `%+` / `%-`, promoting behind it.
+    fn forget(&mut self, id: usize) {
+        if self.current == Some(id) {
+            self.current = self.previous.take();
+        } else if self.previous == Some(id) {
+            self.previous = None;
+        }
+        if self.current.is_none() {
+            self.current = self.jobs.last().map(|job| job.id);
+        }
+        self.refill_previous();
+    }
+
+    /// Point `%-` at the most recent job that is not already `%+`.
+    fn refill_previous(&mut self) {
+        if self.previous.is_some_and(|id| self.index_of(id).is_some()) {
+            return;
+        }
+        self.previous = self
+            .jobs
+            .iter()
+            .rev()
+            .map(|job| job.id)
+            .find(|id| Some(*id) != self.current);
+    }
+
+    fn index_of(&self, id: usize) -> Option<usize> {
+        self.jobs.iter().position(|job| job.id == id)
+    }
+
+    /// Where `%+` points, falling back to the newest job — a table that has
+    /// jobs always has a current one, even if nothing has marked it yet.
+    fn current_index(&self) -> Option<usize> {
+        self.current
+            .and_then(|id| self.index_of(id))
+            .or_else(|| self.jobs.len().checked_sub(1))
+    }
+
+    /// Find a job by reference. `fg` / `bg` / `wait` only ever take a job, so a
+    /// **bare id** (`fg 2`) is unambiguous; `%` covers the rest — `%2` by id,
+    /// `%%` / `%+` for the current job, `%-` for the one before it, and
+    /// `%prefix` for the most recent command that starts with it.
     fn resolve(&self, args: &[String], name: &str) -> Option<usize> {
         if args.len() > 1 {
             note!("mesh: {name}: too many arguments");
@@ -352,16 +443,37 @@ impl JobTable {
             return None;
         }
         let Some(reference) = args.first() else {
-            return Some(self.jobs.len() - 1);
+            return self.current_index();
         };
-        let id = reference
-            .strip_prefix('%')
-            .unwrap_or(reference)
-            .parse::<usize>();
-        match id
-            .ok()
-            .and_then(|id| self.jobs.iter().position(|job| job.id == id))
-        {
+        let found = match reference.strip_prefix('%') {
+            Some("%" | "+") => self.current_index(),
+            Some("-") => self.previous.and_then(|id| self.index_of(id)),
+            Some(rest) if rest.starts_with('?') => {
+                // `DESIGN.md` keeps `%?string` for the substring match and defers
+                // it; saying so beats reporting it as a job that does not exist.
+                note!(
+                    "mesh: {name}: {reference}: matching a command by substring is not implemented"
+                );
+                return None;
+            }
+            // An id wins over a prefix, so `%1` stays job 1 rather than the most
+            // recent command that happens to begin with "1".
+            Some(rest) => match rest.parse::<usize>() {
+                Ok(id) => self.index_of(id),
+                // A bare `%` names nothing, and `starts_with("")` would match the
+                // newest job rather than say so.
+                Err(_) if rest.is_empty() => None,
+                Err(_) => self
+                    .jobs
+                    .iter()
+                    .rposition(|job| job.command.starts_with(rest)),
+            },
+            None => reference
+                .parse::<usize>()
+                .ok()
+                .and_then(|id| self.index_of(id)),
+        };
+        match found {
             Some(index) => Some(index),
             None => {
                 note!("mesh: {name}: {reference}: no such job");
@@ -988,6 +1100,7 @@ pub fn run_pipeline(
                 job_modes: None,
                 state: JobState::Running,
             });
+            jobs.mark_current(id);
             return PipelineStatus::whole(0);
         }
         let result = wait_outcomes(&mut outcomes);
@@ -1033,6 +1146,7 @@ pub fn run_pipeline(
                     job_modes,
                     state: JobState::Stopped(status),
                 });
+                jobs.mark_current(id);
             }
             status
         }

@@ -339,8 +339,30 @@ one-MiB output cap.
 
 ### Job control
 
-A job reference is its id, either bare (`fg 2`) or with the `%` sigil (`fg %2`).
-`fg` and `bg` take the most recent job when given none.
+`fg`, `bg` and `wait` all take the same job reference. Since they only ever take
+a job, a **bare id** is unambiguous — `fg 2` — and the `%` sigil covers the rest:
+
+| Reference | Names |
+|---|---|
+| `2` / `%2` | Job 2 |
+| `%%` / `%+` | The **current** job |
+| `%-` | The **previous** job |
+| `%prefix` | The most recent job whose command starts with `prefix` |
+
+A job becomes **current** when it is registered, when it stops, and when `bg`
+starts it again — the events that make it the one you most likely mean. The job
+it displaces becomes the previous one. When the current job leaves the table the
+previous is promoted, and the job behind that fills the `%-` it vacated, so both
+sigils keep meaning something without being repointed by hand. `fg` and `bg` take
+the current job when given none.
+
+An **id wins over a prefix**, so `%1` is job 1 rather than a command that happens
+to start with `1`. A bare `%` names no job, and neither does a prefix nothing
+matches; both say so. `%?string`, the *substring* match, is not implemented —
+`DESIGN.md` keeps the spelling and defers the behavior, and mesh refuses it by
+name rather than reporting a job that does not exist. Note that `?` is a glob
+character first, so a `%?…` reference has to be quoted to reach a job builtin at
+all.
 
 **`wait`** reports a job's exit status without giving it the terminal, which is
 what lets a script hand work to the background and collect the result:

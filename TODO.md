@@ -386,6 +386,15 @@ file as tasks land.
       (`130`) while leaving the job listed — which needed a `sigaction` catcher
       around the wait, because the interactive shell ignores SIGINT and a
       background job never receives the keystroke itself.
+- [x] The full `%` job reference: `%%` / `%+` for the current job, `%-` for the
+      previous one, and `%prefix` for the most recent command starting with it,
+      alongside the `%N` and bare-`N` forms already there. The table tracks the
+      current and previous job by **id** rather than position, so a job leaving
+      cannot silently repoint them: a job takes the current spot when it is
+      registered, when it stops, and when `bg` restarts it, and when the current
+      job leaves the previous is promoted and the job behind it fills `%-`. An
+      id still wins over a prefix, so `%1` is job 1. Deferred with a message that
+      names it: `%?string`, the substring match `DESIGN.md` also defers.
 - [ ] **The rest of `wait`.** `wait` with **no operand** — bash's "every child,
       with an aggregate status" — is refused rather than guessed at, since `fg`'s
       no-operand default means "the most recent one" and the two would read

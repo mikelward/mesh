@@ -1950,6 +1950,80 @@ fn a_waited_job_leaves_the_table() {
 }
 
 #[test]
+fn the_current_and_previous_job_sigils_name_the_last_two() {
+    // `%%` and `%+` are the job you most likely mean — the newest — and `%-` is
+    // the one behind it. Each job waited for here exits with its own status, so
+    // the statuses say which job each sigil actually picked.
+    let out = run_with_input(
+        "sh -c 'sleep 0.05; exit 4' &\nsh -c 'sleep 0.05; exit 5' &\nwait %-\nputs previous=$sh.status\nwait %+\nputs current=$sh.status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "previous=4\ncurrent=5\n"
+    );
+
+    let aliased = run_with_input("sh -c 'exit 6' &\nwait %%\nputs current=$sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&aliased.stdout), "current=6\n");
+}
+
+#[test]
+fn a_job_that_leaves_promotes_the_one_behind_it() {
+    // `%+` and `%-` follow the table rather than naming fixed ids. Waiting for
+    // the current job of three promotes the previous one into `%+`, and the job
+    // behind *that* fills the `%-` it vacated — so both sigils have moved on by
+    // one without either being named directly.
+    let out = run_with_input(
+        "sh -c 'sleep 0.05; exit 4' &\nsh -c 'sleep 0.05; exit 5' &\nsh -c 'sleep 0.05; exit 6' &\nwait %+\nputs newest=$sh.status\nwait %-\nputs behind=$sh.status\nwait %+\nputs promoted=$sh.status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "newest=6\nbehind=4\npromoted=5\n"
+    );
+}
+
+#[test]
+fn a_percent_prefix_names_the_most_recent_matching_command() {
+    // The most recent match, not the first: two jobs start with `sh`, and the
+    // later one is what `%sh` means.
+    let out = run_with_input(
+        "sh -c 'sleep 0.05; exit 4' &\nsleep 9 &\nsh -c 'sleep 0.05; exit 7' &\nwait %sh\nputs matched=$sh.status\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "matched=7\n");
+
+    // An id wins over a prefix, so `%1` stays job 1 even where a command starts
+    // with "1".
+    let numeric =
+        run_with_input("sh -c 'sleep 0.05; exit 3' &\n1234 &\nwait %1\nputs by-id=$sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&numeric.stdout), "by-id=3\n");
+}
+
+#[test]
+fn unusable_job_references_say_so() {
+    for (reference, needle) in [
+        // A prefix nothing matches, and a bare `%`, which names no job at all —
+        // `starts_with("")` would otherwise quietly match the newest job.
+        ("%nope", "%nope: no such job"),
+        ("%", "%: no such job"),
+        // `DESIGN.md` keeps `%?string` for a substring match and defers it, so
+        // it is refused by name rather than reported as a missing job. It needs
+        // quoting to get this far: `?` is a glob character first.
+        (
+            "'%?leep'",
+            "matching a command by substring is not implemented",
+        ),
+    ] {
+        let out = run_with_input(&format!("sleep 9 &\nwait {reference}\nputs after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{reference}: {stderr}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "after\n",
+            "{reference}"
+        );
+    }
+}
+
+#[test]
 fn wait_needs_a_job_to_wait_for() {
     // Bare `wait` is bash's "every child"; `fg`'s no-operand "the most recent
     // one" would read the same and mean something else, so it is refused until
