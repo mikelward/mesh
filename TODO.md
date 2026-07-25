@@ -506,6 +506,24 @@ of each PR had landed by another route, but these pieces had not.
         heredoc, but the only heredoc specified today is command-redirection (feeds
         bytes to a command; an unquoted delimiter would expand). A raw,
         *value-producing* heredoc spelling still needs defining.
+- [ ] **Arithmetic operators.** mesh has `Value::Integer` (i64, already checked —
+      `+=` past `i64::MAX` is a loud `numeric overflow`) but no operator beyond
+      `+=`, while [`DESIGN.md`](DESIGN.md) already writes infix arithmetic in three
+      places without ever specifying it: `$m:int + 1` (`:replaceall` callback),
+      `port: $base + 1` (named arguments), and `$a:ms / $b:ms` (the time model,
+      whose argument for *not* needing a float type rests on integer `/` existing).
+      Full write-up pending; one sub-question is already open:
+  - [ ] **How subtraction is spelled.** `*`, `/` and `%` are unclaimed, but a
+        spaced infix `-` is already **glob exclusion** (`*.txt - *.bak`), and both
+        it and arithmetic want value positions, so `$a - $b` is ambiguous on its
+        face. Options: type-directed dispatch (ints subtract, globs/lists exclude),
+        which is what `+=` already does and what the proposed `-=` is specced to
+        do; a modifier form (`$a:minus($b)`, matching `$m:int` / `$a:ms`); or
+        confining arithmetic to a delimiter, inside which no glob context exists.
+        `~` is **not** available — it is mesh's infix match operator. No other
+        shell has this collision, since bash's `$((a-b))` and fish's `math` both
+        put arithmetic inside a delimiter, so the answer may fall out of the
+        context decision rather than needing one of its own.
 - [x] **Choose a repo license** — *decided: `MIT OR Apache-2.0`* (the
       Rust-ecosystem norm, as used by Rust itself). Nothing constrained the choice:
       all current/planned deps are permissive (`reedline`/`nix`/`crossterm` MIT)
