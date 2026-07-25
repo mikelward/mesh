@@ -150,8 +150,13 @@ file as tasks land.
 - [x] Calling for a value — `f(arg, key: value, ...$spread)` returns the
       function's value (last expression, or an explicit `return`), with `key:`
       options binding the same parameter as `--flag`; command position (`f arg`)
-      still streams. Deferred: a bare literal as an implicit result (`{ 42 }`
-      parses `42` as a command — use `return 42` or an operator expression).
+      still streams.
+- [x] A lone integer literal is a value, so a block can yield one: `{ 42 }` is 42
+      rather than "command not found: 42". Narrow by design — the whole statement
+      must be that literal, so `42 foo`, `42 > file`, and `42 | cat` stay commands.
+      A bare `-3` still does not qualify (it lexes as the minus operator, not one
+      numeric word); `return -3` and `(-3)` carry it. Nothing changes for `3.5`,
+      since mesh has no float literals.
 - [x] Lambdas — `func(params) { body }` as an expression yielding a function
       value, value-called through the variable it is bound to (`$double(5)`),
       reusing the whole signature grammar. Scope is a `func`'s: parameters and

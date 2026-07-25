@@ -334,6 +334,16 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
   value — its last expression, or the value carried by `return` — while `f arg`
   runs the function for its status. `key: value` binds the parameter its `--key`
   flag would.
+- **A lone integer literal is a value.** `func answer() { 42 }` yields the integer
+  42; before, `42` resolved as a command name and reported "command not found".
+  The rule is the narrowest one that closes the gap: the **whole statement** must
+  be that literal, so `42 foo` and `42 > file` stay the commands they were. The
+  first token is not enough to decide — a word is assembled from adjacent tokens,
+  and `3.5` peeks as `3` — so the check parses the statement and requires a bare
+  scalar whose *whole* text is an `i64`. A bare `-3` therefore does not qualify
+  either: it lexes as the minus operator followed by `3`, and `return -3` or
+  `(-3)` carries it. In statement position the value is discarded and the status
+  is the usual view of an integer — itself — exactly as `41 + 1` already gave.
 - **Lambdas.** `func(params) { body }` — the declaration with the name left off —
   is an expression yielding a **function value**. It reuses the signature grammar
   above in full (defaults, `--flags`, `...rest`). Bind it and value-call it

@@ -2614,6 +2614,158 @@ fn a_bare_return_uses_the_last_status() {
 }
 
 #[test]
+fn a_lone_numeric_literal_is_a_value_not_a_command() {
+    // "A block evaluates to its last expression — a bare value, a `[…]` literal, …"
+    // (`DESIGN.md`). Every such spelling already worked *except* an unquoted
+    // numeral, which fell through to command resolution: `func f() { 42 }` reported
+    // "command not found: 42". It is a value now, and a real integer — not the
+    // string "42".
+    let out = run_with_input(
+        "func answer() { 42 }\nfunc zero() { 0 }\nfunc big() { 1000 }\n\
+         a = answer()\nb = zero()\nc = big()\n\
+         sum = $a + 1\n\
+         puts \"$a $b $c $sum\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42 0 1000 43\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // In statement position the value is discarded and its status is the usual view
+    // of an integer — itself, as `41 + 1` already gave. The new spelling reaches an
+    // existing rule rather than adding one.
+    let status = run_with_input("42\n");
+    assert_eq!(status.status.code(), Some(42));
+    assert!(status.stderr.is_empty(), "{:?}", status.stderr);
+    assert_eq!(
+        run_with_input("41 + 1\n").status.code(),
+        status.status.code(),
+        "a lone literal and the operator form should agree"
+    );
+}
+
+#[test]
+fn only_a_lone_numeral_becomes_a_value() {
+    // The rule is deliberately the narrowest one that closes the gap: the *whole*
+    // statement must be the literal, the same shape a quoted literal already had.
+    // Everything a numeral-led command could mean before still means it.
+    let dir = fresh_dir("numeric_literal_statement");
+
+    // With arguments it is still a command, so the diagnostic still names it.
+    let args = run_with_input("42 foo\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&args.stderr).contains("command not found: 42"),
+        "{:?}",
+        args.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&args.stdout), "after\n");
+
+    // With a redirection it is still a command, so `42 > file` still tries to run
+    // one — statement position keeps the redirect reading of `>`.
+    let redirect = run_with_input(&format!("cd {}\n42 > out\nputs after\n", dir.display()));
+    assert!(
+        String::from_utf8_lossy(&redirect.stderr).contains("command not found: 42"),
+        "{:?}",
+        redirect.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&redirect.stdout), "after\n");
+
+    // Heading a pipeline it is still a command. An expression cannot *be* a
+    // pipeline stage, so classifying `42 | cat` as one would leave the `|`
+    // unconsumed and turn a command that runs today into a syntax error — which
+    // rejects the whole script, a much bigger change than the diagnostic it
+    // replaced.
+    for piped in ["42 | cat", "42 |& cat"] {
+        let out = run_with_input(&format!("{piped}\nputs after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("command not found: 42"),
+            "{piped}: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("syntax error"),
+            "{piped} must stay a pipeline: {stderr:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{piped}");
+    }
+
+    // The separators an expression statement *can* take are unaffected: 42 is a
+    // nonzero status, so `&&` short-circuits and `||` runs its right side.
+    let and = run_with_input("42 && puts yes\nputs end\n");
+    assert_eq!(String::from_utf8_lossy(&and.stdout), "end\n");
+    let or = run_with_input("42 || puts no\n");
+    assert_eq!(String::from_utf8_lossy(&or.stdout), "no\n");
+
+    // Two places where the classification *does* show through, both consistent with
+    // rules that already existed. In condition position the literal is a value whose
+    // status is itself, so a nonzero one takes `else` — the same branch as before,
+    // without the spurious "command not found" on the way.
+    let condition = run_with_input("if 42 { puts t } else { puts f }\n");
+    assert_eq!(String::from_utf8_lossy(&condition.stdout), "f\n");
+    assert!(condition.stderr.is_empty(), "{:?}", condition.stderr);
+
+    // And `&` on an expression is refused, as it is for any non-command statement,
+    // rather than backgrounding a command named `42`. Recoverable either way.
+    let backgrounded = run_with_input("42 &\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&backgrounded.stderr).contains("backgrounding an expression"),
+        "{:?}",
+        backgrounded.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&backgrounded.stdout), "after\n");
+
+    // A word only *spelled* like a numeral is not one. `4"2"`, `42""`, and `4\2`
+    // all compose to the text `42`, but expansion keeps the quoted and escaped
+    // pieces and yields the **string** — so the predicate asks for a single *bare*
+    // text piece, not merely concatenated text that parses. These three were
+    // already string expressions before this change (the quoted-literal arm owns
+    // them); what matters is that they still are, and are not mistaken for the new
+    // integer rule.
+    for spelled in ["4\"2\"", "42\"\"", "4\\2"] {
+        let out = run_with_input(&format!(
+            "func f() {{ {spelled} }}\nv = f()\nn = $v + 1\nputs \"[$v] $n\"\n"
+        ));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("expected integer"),
+            "{spelled} should still be the string \"42\": {stderr:?}"
+        );
+    }
+    // The bare spelling is the integer, and arithmetic on it works.
+    let bare = run_with_input("func f() { 42 }\nv = f()\nn = $v + 1\nputs $n\n");
+    assert_eq!(String::from_utf8_lossy(&bare.stdout), "43\n");
+
+    // A bare word that happens to name a command is untouched: `true` is the
+    // command, and its status is the block's value.
+    let word = run_with_input("func t() { true }\nv = t()\nputs $v\n");
+    assert_eq!(String::from_utf8_lossy(&word.stdout), "0\n");
+
+    // mesh has no float literals, so `3.5` is still just a word — and still a
+    // command. Closing that would mean adding a type, not a parse rule.
+    let float = run_with_input("func f() { 3.5 }\nv = f()\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&float.stderr).contains("command not found: 3.5"),
+        "{:?}",
+        float.stderr
+    );
+
+    // A *negative* literal lexes as the minus operator followed by `3`, not as one
+    // numeric word, so it does not reach this rule; `return -3` and `(-3)` both
+    // carry it, and both are already the documented spellings.
+    let negative = run_with_input("func f() { -3 }\nv = f()\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&negative.stderr).contains("command not found: -3"),
+        "{:?}",
+        negative.stderr
+    );
+    let carried = run_with_input(
+        "func f() { return -3 }\nfunc g() { (-3) }\n\
+         a = f()\nb = g()\nputs \"$a $b\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&carried.stdout), "-3 -3\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_value_call_returns_the_functions_value() {
     // `f(args)` calls a function for its value: the last expression, or an explicit
     // `return`. Positionals are comma-separated inside the parens.

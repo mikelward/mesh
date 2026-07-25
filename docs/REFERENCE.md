@@ -635,6 +635,19 @@ greet world          # -> hi, world
   `return` carries — so a function can be used in an expression. Command position
   (`f arg`) is unchanged: it runs the function for its status.
 
+  A block's last expression can be a bare value, including a **lone integer
+  literal**:
+
+  ```
+  func answer() { 42 }
+  x = answer()                        # 42, an integer
+  ```
+
+  Only when the whole statement *is* that literal. `42 foo` and `42 > file` are
+  still commands, and a bare `-3` is the minus operator rather than one numeral —
+  write `return -3` or `(-3)`. mesh has no float literals, so `3.5` is still just
+  a word.
+
   ```
   func double(n) { return $n * 2 }
   x = double(21)                      # x is 42
