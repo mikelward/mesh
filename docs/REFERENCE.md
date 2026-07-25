@@ -624,7 +624,7 @@ greet world          # -> hi, world
   none, or the empty string if nothing ran. Both stop the rest of the body. At
   top level `return` is a recoverable error.
 
-- **Redirection.** A function takes `>`, `>>`, `<`, and `2>` like any command
+- **Redirection.** A function takes `>`, `>>`, `<`, `2>`, and `2>&1` like any command
   (`f > out.txt`, `r < input`). Because a function runs inside the shell, the
   redirection applies to the shell's own descriptors for the duration of the
   call, so output from the body — including from an external command it runs —

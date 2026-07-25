@@ -92,6 +92,12 @@ pub enum TokenKind {
     Less,
     Greater,
     Append,
+    /// `>&` — make a descriptor a copy of another (`2>&1`).
+    GreaterAmp,
+    /// `<&` — the input-side spelling of the same (`0<&3`).
+    LessAmp,
+    /// `&>` — send both stdout and stderr to one target.
+    AmpGreater,
     Heredoc,
     LParen,
     RParen,
@@ -382,6 +388,15 @@ pub enum RedirectKind {
     Output,
     Append,
     Heredoc,
+    /// `N>&M` — the target names a descriptor, not a path. Output side, so a
+    /// missing `N` defaults to stdout.
+    DuplicateOut,
+    /// `N<&M` — the input-side spelling, defaulting to stdin. Kept distinct from
+    /// [`RedirectKind::DuplicateOut`] precisely so that default survives.
+    DuplicateIn,
+    /// `&> file` — stdout and stderr to one target, the shorthand for
+    /// `> file 2>&1`.
+    Both,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -630,17 +645,6 @@ impl<'a> Lexer<'a> {
             if c == '\\' && self.source[self.position..].starts_with("\\\n") {
                 self.position += 2;
                 continue;
-            }
-            if ["&>", ">&", "<&"]
-                .iter()
-                .any(|operator| self.source[self.position..].starts_with(operator))
-            {
-                return Err(ParseError {
-                    kind: ParseErrorKind::Expected(
-                        "descriptor duplication (`2>&1`, `&>`) is not supported yet",
-                    ),
-                    span: start..start + 2,
-                });
             }
             if c == '#' {
                 while self.position < self.source.len() && self.char_at(self.position) != Some('\n')
@@ -899,6 +903,9 @@ impl<'a> Lexer<'a> {
             ("||", TokenKind::OrOr),
             (">>", TokenKind::Append),
             ("<<", TokenKind::Heredoc),
+            (">&", TokenKind::GreaterAmp),
+            ("<&", TokenKind::LessAmp),
+            ("&>", TokenKind::AmpGreater),
             ("+=", TokenKind::PlusEqual),
             ("==", TokenKind::Operator("==".into())),
             ("!=", TokenKind::Operator("!=".into())),
@@ -1545,6 +1552,21 @@ impl Parser {
                 Some(RedirectKind::Append)
             } else if self.eat(&TokenKind::Heredoc).is_some() {
                 Some(RedirectKind::Heredoc)
+            } else if self.eat(&TokenKind::GreaterAmp).is_some() {
+                // `>&` is two operators wearing one spelling, told apart by the
+                // target: `>&2` names a descriptor and duplicates, `>& file`
+                // names a path and takes both streams there. Decided on the
+                // token as written rather than after expansion, so the meaning
+                // of a line never depends on a variable's contents.
+                Some(if self.at_descriptor_word() {
+                    RedirectKind::DuplicateOut
+                } else {
+                    RedirectKind::Both
+                })
+            } else if self.eat(&TokenKind::LessAmp).is_some() {
+                Some(RedirectKind::DuplicateIn)
+            } else if self.eat(&TokenKind::AmpGreater).is_some() {
+                Some(RedirectKind::Both)
             } else {
                 None
             };
@@ -1579,6 +1601,11 @@ impl Parser {
                 if fd.is_some() && kind == RedirectKind::Heredoc {
                     return Err(self.error(ParseErrorKind::Expected(
                         "a heredoc on a descriptor other than stdin",
+                    )));
+                }
+                if fd.is_some() && kind == RedirectKind::Both {
+                    return Err(self.error(ParseErrorKind::Expected(
+                        "`&>` to name no descriptor; it always means stdout and stderr",
                     )));
                 }
                 if self.at_command_end() {
@@ -2023,6 +2050,18 @@ impl Parser {
             bindings.push(self.binding_pattern()?);
         }
         Ok(bindings)
+    }
+
+    /// Is the next token a bare run of digits — the shape a descriptor takes?
+    fn at_descriptor_word(&self) -> bool {
+        self.peek().is_some_and(|token| match &token.value {
+            TokenKind::Word(word) => matches!(
+                word.pieces.as_slice(),
+                [WordPiece::Text { text, quote: QuoteMode::Bare }]
+                    if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit())
+            ),
+            _ => false,
+        })
     }
 
     /// A bare `$env.KEY` in assignment position, consumed on a match.
