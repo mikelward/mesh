@@ -723,27 +723,14 @@ pub fn params_prefix_status(list: &str) -> PrefixStatus {
 /// `i64::MAX` both worked. Folding the sign into the literal is what languages
 /// with two's-complement integers do, Rust included.
 ///
-/// Deliberately narrow. Only a single **bare** word folds, and only when the
-/// signed text actually parses:
-///
-/// - A quoted or interpolated word (`-"5"`, `-$n`) stays a `Negate`, since those
-///   are strings and variables rather than literals, and the runtime negation is
-///   what type-checks them.
-/// - A magnitude too large even with the sign stays a `Negate` too, so it keeps
-///   reporting "expected integer" instead of quietly becoming the string
-///   `-99999999999999999999`.
-/// - Double negation folds only the inner `-`: in `- -5` and `-(-5)` the outer
-///   operand then starts with `-` rather than a digit, so it negates the literal
-///   `-5` at runtime and gives `5`, as it did before. (`--5` is not this case at
-///   all — it lexes as one flag-shaped bare word and never reaches here.)
+/// Anything that does not fold keeps the runtime negation, which is what
+/// type-checks a string or a variable and reports the overflow.
 fn negative_literal(minus: &Span, operand: &Expr) -> Option<Expr> {
     let Expr::Scalar(word) = operand else {
         return None;
     };
-    // Whether the signed text parses is the whole test, and it is exact: it
-    // rejects a non-numeric word (`-abc`), a magnitude past the range
-    // (`-99999999999999999999`), and an already-signed one (the `-5` an inner
-    // fold just produced) without a separate shape check to keep in step.
+    // Whether the signed text parses is the whole test — exact on its own, so
+    // there is no second shape check to drift out of step with it.
     let text = format!("-{}", word.value.bare_word()?);
     text.parse::<i64>().ok()?;
     Some(Expr::Scalar(Spanned {
