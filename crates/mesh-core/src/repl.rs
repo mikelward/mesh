@@ -7089,17 +7089,24 @@ fn handle_signal(
             }
             let text = std::mem::take(pending);
             let command = text.trim_end_matches('\n').to_string();
+            let marks = shell.vars.interactive();
+            // Both marks sit outside the hooks, so that everything printed
+            // because this command was submitted falls inside the region they
+            // bracket. A `preexec` hook that writes before `C` is folded into
+            // the command line the user typed; a `postexec` hook that writes
+            // after `D` lands outside the output a terminal will offer to fold.
+            semantic_mark(marks, SemanticMark::OutputStart);
             run_prompt_hooks(
                 PromptEvent::PreExec,
                 vec![Value::String(command.clone())],
                 shell,
             );
-            let marks = shell.vars.interactive();
-            semantic_mark(marks, SemanticMark::OutputStart);
+            // The clock still starts here: `elapsed` is the command's own, and
+            // reporting a hook's time as part of it would make the number
+            // depend on what happens to be registered.
             let start = Instant::now();
             let step = run_line(&text, last, false, shell);
             let status = step.status();
-            semantic_mark(marks, SemanticMark::CommandDone(status));
             let elapsed = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
             run_prompt_hooks(
                 PromptEvent::PostExec,
@@ -7110,6 +7117,9 @@ fn handle_signal(
                 ],
                 shell,
             );
+            // Still the *command's* status. A hook's own outcome is not the
+            // command's, and `D` is answering for the command.
+            semantic_mark(marks, SemanticMark::CommandDone(status));
             Some(step)
         }
         // Ctrl-D (EOF) exits with the last status, abandoning any in-progress

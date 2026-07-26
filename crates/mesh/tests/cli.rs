@@ -1300,23 +1300,65 @@ fn semantic_mark_harness(exec: &MeshExec) -> i32 {
     if unsafe { libc::tcsetpgrp(master, mesh) } < 0 || !pty_wait_for_prompt(master) {
         return 43;
     }
+    // Hooks that print. Their output is produced *because* the command was
+    // submitted, so a terminal folding "this command's output" should get it —
+    // which means both marks have to sit outside the hooks, not inside them.
+    for line in [
+        "func pre(c) { puts PREHOOK }\n",
+        "func post(c, s, e) { puts POSTHOOK }\n",
+        "prompt-hook preexec p1 pre\n",
+        "prompt-hook postexec p2 post\n",
+    ] {
+        if unsafe { libc::write(master, line.as_ptr().cast(), line.len()) } != line.len() as isize
+            || pty_read_until_command_done(master).is_none()
+        {
+            return 44;
+        }
+    }
     // A failing command, so the status in `D` is one no default could produce.
     let command = b"sh -c 'exit 3'\n";
     if unsafe { libc::write(master, command.as_ptr().cast(), command.len()) }
         != command.len() as isize
     {
-        return 44;
-    }
-    if !pty_wait_for_marker(master, b"\x1b]133;D;3\x1b\\") {
         return 45;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(master) else {
+        return 46;
+    };
+    if status != 3 {
+        return 47;
+    }
+    // Both hooks *inside* the region the marks bracket — the claim itself,
+    // rather than a chain of positions that happens to encode it.
+    //
+    // Searching the whole buffer for the first `PREHOOK` does not work: the line
+    // editor echoes what is typed, so the literal text is already on the wire
+    // from `func pre(c) { puts PREHOOK }` several commands earlier. Whatever of
+    // that echo is still unread when this read begins sits ahead of `C`, and a
+    // first-occurrence search then reports the hook as *preceding* the mark —
+    // intermittently, depending on how much was drained. Slicing to the region
+    // first removes the question.
+    let at = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|p| p == needle);
+    let (Some(open), Some(close)) = (
+        at(&seen, b"\x1b]133;C\x1b\\"),
+        at(&seen, b"\x1b]133;D;3\x1b\\"),
+    ) else {
+        return 48;
+    };
+    if open >= close {
+        return 49;
+    }
+    let region = &seen[open..close];
+    if at(region, b"PREHOOK").is_none() || at(region, b"POSTHOOK").is_none() {
+        return 50;
     }
     let quit = b"exit\n";
     if unsafe { libc::write(master, quit.as_ptr().cast(), quit.len()) } != quit.len() as isize {
-        return 46;
+        return 51;
     }
-    let mut status = 0;
-    if unsafe { libc::waitpid(mesh, &mut status, 0) } != mesh {
-        return 47;
+    let mut reaped = 0;
+    if unsafe { libc::waitpid(mesh, &mut reaped, 0) } != mesh {
+        return 52;
     }
     unsafe { libc::close(master) };
     0
