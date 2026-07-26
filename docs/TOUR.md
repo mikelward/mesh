@@ -29,6 +29,43 @@ mesh: command not found: nonesuch
 
 Leave with `exit`, or press Ctrl-D on an empty line.
 
+## Asking mesh what it knows
+
+`help` prints mesh in one screen: every builtin with its usage, then every
+keyword and operator with the shape it is written in.
+
+<pre>
+mesh$ <strong>help</strong>
+mesh, in one screen. `help NAME` explains one entry; for a builtin,
+`NAME --help` prints the same thing.
+
+Builtins:
+  bg [JOB]                       Resume a stopped job in the background
+  cd [DIR]                       Change the working directory
+  …
+Syntax:
+  cmd arg …                      Run a builtin, a function, or a program
+  cmd | cmd                      Pipe one command's output into the next
+  …
+</pre>
+
+`help NAME` explains one entry. For a builtin that is exactly what `NAME --help`
+prints; for a keyword it is the shape you write, which is the only way to ask —
+`if --help` would be an `if` whose condition is a command called `--help`.
+
+<pre>
+mesh$ <strong>help for</strong>
+Repeat over a list, a range, or a map
+
+Syntax: for NAME in VALUE { … }
+</pre>
+
+Every keyword the parser reserves and every operator a line can carry answers to
+`help`, asked for exactly as you would type it — `help unless`, `help '+='`,
+`help '=='`. Where several share a row the row explains the family, so the other
+half of a construct answers with the construct: `help else` explains `if`, and
+`help continue` explains `break`.
+
 ## Completing what you type
 
 Press Tab while typing the first word of a command to complete builtins,

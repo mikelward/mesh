@@ -396,6 +396,7 @@ one-MiB output cap.
 
 | Builtin | Effect |
 | --- | --- |
+| `help [name …]` | List every builtin with its usage, then the shapes a line takes, each with a one-line summary. With names, explain each one instead — a builtin's entry is exactly what `name --help` prints, and a keyword's shows its syntax. Every reserved word and every operator answers, asked for as you would type it (`help unless`, `help '+='`); where several share a row, that row explains the family, so `help else` answers with `if`. A name that is neither is an error: an external command's help is its own, so ask it with `name --help`. |
 | `puts [arg …]` | Render each argument and print them separated by single spaces, then a newline. No arguments prints a blank line. Rendering is per value: a scalar as itself, a **list** as its elements joined by newlines, a **map** as `key: value` lines. A value with no byte form — a job or stream handle, a function, a pattern — is a loud error rather than a guess, and so is a collection nested inside one. Unlike argv, `puts` sees the real value, so `puts $xs` needs no `...`; a *written* argument keeps its own text, so `puts 007` prints `007`. It takes no flags. |
 | `print [arg …]` | The same as `puts` with **no trailing newline**, for partial lines. No arguments prints nothing. |
 | `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`. |
@@ -410,6 +411,7 @@ one-MiB output cap.
 | `bg [job]` | Resume a stopped job in the background. No argument takes the most recent job. |
 | `wait job` | Wait for a job to finish and report its status — see [Job control](#job-control). |
 | `kill [-signal] job\|pid …` | Signal a job's process group, or a pid. Default `TERM`. |
+| `disown [-h] [-a \| -r] [job …]` | Stop tracking a job — see [Job control](#job-control). |
 
 ### Job control
 

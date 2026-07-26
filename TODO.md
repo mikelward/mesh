@@ -306,6 +306,22 @@ file as tasks land.
       one unit, so a syntax error rejects the whole file; a missing script exits
       `127` and an unreadable one `126`. Shebangs work by way of `#` comments.
 - [x] `--help` and `--version`.
+- [x] A `help` builtin, bash's `help` in mesh's shape. Bare `help` prints mesh in
+      one screen: every builtin with its usage, then every keyword and operator
+      with the shape it is written in, each with a one-line summary. `help NAME …`
+      explains one — a builtin's entry is exactly what `NAME --help` prints, and a
+      keyword's shows its syntax, which is the only way to ask (`if --help` is an
+      `if` whose condition is a command called `--help`). Every reserved word the
+      parser knows and every operator a line can carry answers, asked for as it is
+      typed (`help unless`, `help '+='`); where several share a row that row
+      explains the family, so `help else` explains `if`, and the tests hold both
+      lists against the table. The
+      builtin side reads the one table `is_builtin`, completion, and each
+      builtin's `--help` already answer from, so a builtin cannot be dispatchable
+      but undiscoverable; each builtin's `--help` now opens with that summary, as
+      clap's generated help does. A name that is neither is an error rather than a
+      lookup elsewhere: an external command's help is its own, and `NAME --help`
+      asks it.
 - [x] First slice of the read-only `$sh` namespace: `$sh.args` (a real list, not
       `$1` / `$@` / `$#`) and `$sh.name`. `sh` joins `env` as a reserved name.
 - [ ] `-i` to force an interactive session when stdin is not a terminal.
