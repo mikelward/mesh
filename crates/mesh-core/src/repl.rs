@@ -1342,7 +1342,30 @@ fn run_ast_match(node: &parser::MatchExpr, last: u8, in_function: bool, shell: &
                 Err(step) => return step,
             }
         }
-        return compound_result(run_source(&arm.body, 0, in_function, shell), shell);
+        return match &arm.body {
+            parser::MatchBody::Block(body) => {
+                compound_result(run_source(body, 0, in_function, shell), shell)
+            }
+            // `=> value` is a value context: a bare word is a string, never a
+            // command, so this deliberately skips the command dispatch an
+            // expression *statement* would do. Like that statement, it reports the
+            // status view of its value.
+            parser::MatchBody::Value(expression) => {
+                match eval_expr(expression, 0, in_function, shell) {
+                    Ok(_) if shell.control.is_some() => {
+                        shell.produced = Produced::Nothing;
+                        Step::Continue(0)
+                    }
+                    Ok(value) => {
+                        let code = status_of(&value);
+                        shell.result = value;
+                        shell.produced = Produced::Value;
+                        Step::Continue(code)
+                    }
+                    Err(step) => step,
+                }
+            }
+        };
     }
     // No arm matched, so nothing produced a value — as for a branchless `if`.
     shell.produced = Produced::Nothing;
@@ -3885,7 +3908,13 @@ fn eval_match_expr(
                 continue;
             }
         }
-        return eval_value_body(&arm.body, 0, in_function, shell);
+        return match &arm.body {
+            parser::MatchBody::Value(expression) => eval_expr(expression, 0, in_function, shell),
+            // How a statement-context block yields a value is the open
+            // value-production question (the same one `func` bodies have), so this
+            // keeps the existing block-value behavior rather than settling it.
+            parser::MatchBody::Block(body) => eval_value_body(body, 0, in_function, shell),
+        };
     }
     Ok(Value::String(String::new()))
 }

@@ -131,6 +131,8 @@ pub enum TokenKind {
     RangeInclusive,
     Equal,
     PlusEqual,
+    /// `=>` — separates a `match` arm's pattern from its body.
+    FatArrow,
     Operator(String),
 }
 
@@ -503,7 +505,15 @@ pub struct MatchExpr {
 pub struct MatchArm {
     pub pattern: MatchPattern,
     pub guard: Option<Expr>,
-    pub body: Source,
+    pub body: MatchBody,
+}
+
+/// An arm's right-hand side: `=> value` is a **value** expression (a bare word is a
+/// string), `=> { … }` is a **block** in ordinary statement context (a bare word runs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchBody {
+    Value(Expr),
+    Block(Source),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1043,6 +1053,20 @@ impl<'a> Lexer<'a> {
 
     fn punctuation(&self) -> Option<(&'static str, TokenKind)> {
         let rest = &self.source[self.position..];
+        // `=>` separates a match arm from its body, but like the other value
+        // operators it needs a boundary on each side. Without that rule an
+        // attached redirection would be swallowed: `puts value=>out` is the word
+        // `value=` followed by `>out`, not a fat arrow.
+        if let Some(tail) = rest.strip_prefix("=>") {
+            let before = self.source[..self.position].chars().next_back();
+            let after = tail.chars().next();
+            let boundary = |value: Option<char>| {
+                value.is_none_or(|c| c.is_whitespace() || ",()[]{};=:".contains(c))
+            };
+            if boundary(before) && boundary(after) {
+                return Some(("=>", TokenKind::FatArrow));
+            }
+        }
         let choices = [
             ("$(", TokenKind::CaptureStart),
             ("...", TokenKind::Spread),
@@ -2229,15 +2253,27 @@ impl Parser {
                 None
             };
             self.newlines();
-            let body = self.block()?;
+            self.expect(&TokenKind::FatArrow, "`=>`")?;
+            self.newlines();
+            // `=> { … }` is a block in statement context; anything else is a value
+            // expression, where a bare word is a string.
+            let body = if self.same(&TokenKind::LBrace) {
+                MatchBody::Block(self.block()?)
+            } else {
+                MatchBody::Value(self.expression()?)
+            };
             arms.push(MatchArm {
                 pattern,
                 guard,
                 body,
             });
-            self.newlines();
             if self.at_end() {
                 return Err(self.eof(ParseErrorKind::Unterminated('{')));
+            }
+            // Arms are terminator-separated: a newline or `;`, never a comma. The
+            // separator is required, so `a => 1 b => 2` does not parse.
+            if self.terminators() == 0 && !self.same(&TokenKind::RBrace) {
+                return Err(self.error(ParseErrorKind::Expected("a newline or `;`")));
             }
         }
         self.position += 1;

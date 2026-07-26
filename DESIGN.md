@@ -2013,7 +2013,9 @@ interchangeable pair as everywhere else in mesh, and **never a comma** — and t
   `"markdown"`), `f()` is a call taken for its return value, `$v` / `[a b]` / `42` are
   themselves.
 - `=> { … }` is a **block** — ordinary **statement context**, so a bare word *runs*
-  (`=> { markdown }` executes `markdown`), commands stream, and several statements are
+  (`=> { markdown }` executes `markdown`; note the *current* single-bare-word block
+  rule below still reads that shape as a scalar in expression position), commands
+  stream, and several statements are
   fine.
 
 The `=>` is what terminates the pattern-and-guard, which is why it is required rather than
@@ -2034,9 +2036,10 @@ Rust's `=> 1` and `{ 1 }` agree — so a bare-word *value* is arm-only; in an `i
 quote it (`if $root { "[root]" }`). Both constructs share the same residual block-value
 rule, so neither is worse off than the other for multi-statement bodies.
 
-*(Implementation delta: M3 currently parses arms as `pattern { body }` with no `=>`, and
-resolves a block's value by tail-coercion — see the current-behavior notes below.
-Adopting this form is a parser change.)*
+*(This form is **implemented**: `=>` is a token, an arm body is a value expression or a
+block, and a missing arrow or a missing separator between arms is a syntax error. How a
+`=> { … }` block yields a value in expression position is still the open value-production
+question, so that part keeps its existing behavior — see the notes below.)*
 
 Arm patterns, in one vocabulary:
 
@@ -2081,13 +2084,13 @@ Rules:
 
 **`~` and `match` share one pattern vocabulary, but `~` is a strict subset** *(current
 M3 behavior)*. For a **string** subject and a **glob or regex** pattern,
-`match $x { P { … } }` takes the `P` arm iff `$x ~ P` — that shared core is learned
+`match $x { P => … }` takes the `P` arm iff `$x ~ P` — that shared core is learned
 once. But an arm does strictly more than a `~` RHS:
 
 | Pattern | `match` arm | `~` RHS |
 | --- | --- | --- |
 | glob `*.txt`, regex `/re/` (string subject) | ✔ | ✔ |
-| literal on any type (`match 7 { 7 { … } }`) | ✔ (`==`) | ✗ — `~` needs a **string** left operand |
+| literal on any type (`match 7 { 7 => … }`) | ✔ (`==`) | ✗ — `~` needs a **string** left operand |
 | range `1..=9` | ✔ | ✗ |
 | alternation `a \| b` | ✔ | ✗ — `~`'s RHS is one glob/regex value |
 | list-binding `[a b]`, `[cmd ...rest]` | ✔ | ✗ — `~` is a bool, binds nothing |
@@ -2118,17 +2121,21 @@ a range, or a list-binding — a one-arm `match` is exactly right (`match $xs
 [`if`-binding](#conditionals-if-is-an-expression). The overlap is the same one every
 language with both `if` and `match`/`switch` has.
 
-**How an arm body yields a value** *(current M3 behavior)*. An arm body is a **block**,
-the same `{ … }` as an `if` branch. Whether it produces a value depends on position,
-exactly like `if`:
+**How an arm body yields a value** *(current behavior)*. A **`=> value`** arm is settled
+and simple: the expression is evaluated in value context, so a bare word is a scalar
+literal (`=> markdown` is `"markdown"`, `=> 7` is integer `7`), and in statement position
+its value is discarded, reporting the value's status view.
 
-- **Statement position** — `match $x { … }` on its own line — runs the arm as an
-  ordinary block: commands execute and stream, *no* value, *no* capture. `*.x { ls }`
+A **`=> { … }`** block is the part still governed by the open value-production question,
+and it behaves as it always has — by position, exactly like an `if` branch:
+
+- **Statement position** — `match $x { … }` on its own line — runs the block as an
+  ordinary block: commands execute and stream, *no* value, *no* capture. `*.x => { ls }`
   runs `ls`.
 - **Expression position** — `y = match $x { … }`, or nested in another value expression
-  — resolves the body to a value by its tail (`eval_value_body`): (1) a
-  **value-expression tail** (`{ "text" }`, `{ $v }`, `{ [a b] }`, nested `if`/`match`)
-  yields that value; (2) a body that is a **single bare word** (`{ markdown }`) is read
+  — resolves the block to a value by its tail (`eval_value_body`): (1) a
+  **value-expression tail** (`=> { "text" }`, `{ $v }`, `{ [a b] }`, nested `if`/`match`)
+  yields that value; (2) a block that is a **single bare word** (`=> { markdown }`) is read
   as a **scalar literal** — usually the string `"markdown"`, but a numeric or boolean
   spelling types accordingly (`{ 7 }` is integer `7`, `{ false }` is boolean `false`),
   and only when that word is the whole body (`{ puts x; text }` runs `text`); (3) a body
@@ -3627,8 +3634,9 @@ to avoid" rather than promising the latter as done.
   `|` alternation, terminator-separated (newline or `;`, never comma); and a `/re/` arm
   does **not** auto-bind its
   captures — capture goes through the value-side `:match` extractor. See
-  [Matching](#matching-match) and [Destructuring](#destructuring). Note M3 currently
-  parses arrow-free `pattern { body }` arms, so the decided form is a parser change.)*
+  [Matching](#matching-match) and [Destructuring](#destructuring). This spelling is
+  **implemented**; what a `=> { … }` block yields in expression position is still the
+  open value-production question above.)*
   **Tests**
   replace `[[ ]]` (`~`/`!~` pattern-match, type-directed
   comparisons, `$p:type`/`:exists`/`:exec` file tests, `and`/`or`/`not` vs command

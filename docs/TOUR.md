@@ -468,12 +468,16 @@ guards:
 <pre>
 mesh$ <strong>command = [start server verbose]</strong>
 mesh$ <strong>result = match $command {
-...   [verb ...args] if $verb == start { [$verb ...$args] }
-...   _ { [] }
+...   [verb ...args] if $verb == start =&gt; [$verb ...$args]
+...   _ =&gt; []
 ... }</strong>
 mesh$ <strong>puts ...$result</strong>
 start server verbose
 </pre>
+
+Every arm needs `=>`, and arms are separated by a newline or `;`. A body is either a
+value or a `{ }` block, which is what decides how a bare word reads: `=> text` is the
+string `"text"`, while `=> { less $file }` runs a command.
 
 Use `~` when a one-line glob or regex boolean test is clearer than a `match`.
 

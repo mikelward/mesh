@@ -117,8 +117,8 @@ esac
 
 # mesh
 <strong>match $f {
-  *.bak { mv $f $f:stem }
-  _     { mv $f "$f.bak" }
+  *.bak =&gt; { mv $f $f:stem }
+  _     =&gt; { mv $f "$f.bak" }
 }</strong>
 </pre>
 
