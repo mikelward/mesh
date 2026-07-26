@@ -583,7 +583,18 @@ for-expr = "for" ws name ws "in" ws value… ws? "{" body "}"
 for item in $items {
   puts $item
 }
+
+for f in * {          # a lone `*` in an operand slot is the glob, not `*`
+  puts $f             # the operator; `4 * 3` still multiplies
+}
 ```
+
+A space-delimited `*` lexes as the multiplication operator — spacing is the only
+thing that separates mesh's two spellings — so an **operand** slot reads it back
+as the bare glob word and expands it. Which slot it is settles the ambiguity
+without lookahead: a binary `*` is consumed before its right operand is parsed,
+so only the glob ever reaches the operand parser. Statement position is
+unchanged, where a leading `*` is a word and keeps the command reading.
 
 ### Not yet parsed
 Nested/general list expressions, maps, bare `{ }` blocks, `match`,
