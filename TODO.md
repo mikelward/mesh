@@ -894,6 +894,154 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       the terminal working correctly and is not this bug; a regression test for
       this has to use a command that leaves stdin alone.
 
+## Beyond M3 — Modifier arguments and `gets` ✅ (landed)
+
+- [x] `:get(KEY, DEFAULT)` — the total accessor, on maps and lists, plus a bare
+      `$env` resolving to the whole table as a map so `$env:get(EDITOR, vim)`
+      needs no rule of its own. This is the mesh spelling of `${VAR:-default}`,
+      by a wide margin the most-used thing a real shell rc reaches for.
+- [x] The affix family: `:stripstart(P)` / `:stripend(S)` drop an affix once,
+      `:trimstart` / `:trimend` peel whitespace (or a given char set) repeatedly.
+- [x] The replace family: `:replaceall(OLD, NEW)` and the anchored
+      `:replacestart` / `:replaceend`, with a **literal string** pattern —
+      `${x//a/b}` and its anchored kin. The regex spelling of the slot is split
+      out; see below.
+- [x] Argument-taking modifiers in **command-argument** position
+      (`puts $env:get(EDITOR, vim)`), which used to be a syntax error: a command
+      word stops in front of the `(`, so the arguments arrived glued to it.
+- [x] `gets [var]`, reading descriptor 0 a byte at a time so it cannot swallow
+      input belonging to the next command.
+
+- [ ] **The spread of an argument-taking modifier at a command boundary.**
+      `puts ...$x:split(":")` is still a syntax error. `CommandItem::Value` has
+      no spread variant — `UnaryOp::Spread` is produced by the parser and
+      consumed by nothing — so routing the run through the expression parser
+      would pass one list where the reader asked for its elements. Deliberately
+      left loud rather than made silently wrong; bind it first for now.
+- [ ] **Should `gets` return the line, so `while line = gets()` works?**
+      *(mikelward)* The command form built here binds a variable and reports a
+      status, which is what `while gets line { … }` needs and nothing more.
+      `DESIGN.md` §"Builtins" also wants `gets` to **return** the line as its
+      value, which is the part that composes:
+
+      ```mesh
+      while line = gets() { puts $line }     # the spelling to consider
+      [k v] = gets():split("=")              # read and destructure in one
+      if line = gets() { … }
+      ```
+
+      The pieces are mostly already decided elsewhere, which is what makes this
+      worth doing rather than reopening:
+      - The **assignment-as-condition** rule is settled (`DESIGN.md` §"Tests and
+        comparisons"): `lhs = rhs` is true iff the RHS is truthy and its shape
+        fits, so `while line = gets()` needs no new grammar — it is the same rule
+        `if [one two] = $s:match(/…/)` already uses.
+      - The **EOF value** is pinned: `gets()` yields `false`, *not* `""`, so a
+        blank line (truthy `""`) cannot end a loop. That is already how the
+        command form's status behaves, so the two cannot disagree.
+      - What is missing is the **value-call route** — the one `style()` and
+        `link()` take, where parens attached to a name yield a value rather than a
+        status. `gets` would be the first builtin to have *both* spellings.
+
+      Open sub-questions to settle first:
+      - Does bare `gets` (no parens, no variable) stay the "consume and discard a
+        line" form, or does the value form make it redundant?
+      - `gets line` and `line = gets()` would both bind `line`. Two spellings for
+        one act is the thing `DESIGN.md` usually declines — is the command form
+        still worth keeping once the value form exists, or does it retire?
+      - A value-returning `gets` in a **pipeline stage** runs in a forked process,
+        so the binding does not outlive it. Same as any builtin, but worth a line
+        in the reference, since `cmd | while gets line { … }` is the shape people
+        will reach for (`DESIGN.md`:3462 already flags that form as *planned*).
+- [ ] **A regex pattern for the replace family** — the `/…/` slot `DESIGN.md`
+      §"String" specifies, split into its own change because it is where the
+      difficulty lives. What it has to get right, each of which was a real bug
+      when it was attempted inline:
+  - [ ] **Anchoring, not filtering.** `find_iter` reports non-overlapping
+        leftmost-first matches, so an earlier match eats the bytes a later
+        trailing one needed and `re("ab|bc")` against `abc` never offers the `bc`
+        that ends the string.
+  - [ ] **`\A` / `\z`, not `^` / `$`.** The latter move to *line* edges under
+        `:m`, and a subject's edge is not a line's.
+  - [ ] **The subject stays whole.** Testing truncated slices to find a longer
+        match fabricates context for a look-around: `re(r"a\b")` has no match in
+        `ab` but passes against the slice `a`, whose cut end reads as a word
+        boundary.
+  - [ ] **Extended mode cannot be read off the flags.** `(?x)` turns it on from
+        inside the pattern, and a trailing `#` comment then swallows any
+        generated `)` and anchor. Retrying the wrap with a closing newline works
+        and cannot mask a broken pattern, since a swallowed `)` always leaves the
+        group unclosed.
+  - [ ] **A flagged literal is a chain, not a bare regex.** `/a/:i` parses as `:i`
+        applied to an `Expr::Regex`, so a slot conversion that inspects only the
+        top of the tree drops it and leaves `:i` on a string.
+  - [x] **The match contract is the engine's** *(decided — mikelward)*. Anchor,
+        and document what anchoring gives rather than promising more. At the
+        *trailing* edge that is already the longest match, free: every candidate
+        finishes at `\z`, so the leftmost start wins. At the *leading* edge every
+        candidate starts at 0, so `regex`'s leftmost-**first** rule picks the
+        alternative written first (`a|ab` takes `a`) — write the one you want
+        first, as in any regex. True leftmost-longest at both edges is
+        deliberately **not** promised: it needs `regex-automata` for
+        anchored-at-offset search on an intact haystack, and every attempt to
+        fake it on top of `regex::Regex` produced a worse bug than the asymmetry
+        it removed.
+  - [ ] **Capture backreferences in a replacement.** `NEW` is literal text —
+        `regex`'s own `$1` expansion is suppressed — because `DESIGN.md` still
+        calls the spelling (`${1}` vs `$1`) provisional.
+- [ ] **`:has(VALUE)`.** The parser knows the name; the engine does not.
+
+- [ ] **`postfix` consumes a *spaced* call suffix, so a following group is
+      stolen.** `y = $x:upper (1)` reports "modifier :upper does not take
+      arguments" and `puts $x:split (":") (1)` reports "value is not callable",
+      because `postfix` eats a `(` whether or not it abuts. Pre-existing — both
+      reproduce on `origin/main` — but argument-taking modifiers in command
+      position give it one more spelling to show up in
+      (`puts $x:split(":") (1)`). The documented rule is that spacing decides an
+      attached call from an argument (`docs/REFERENCE.md` §Commands), so the fix
+      is for `postfix` to require adjacency the way `value_argument_starts` now
+      does. Not done here because it changes call syntax in *expression* position
+      too — `f (1)` currently calls `f` and would stop — which is a language
+      decision rather than a bug fix.
+
+- [ ] **How `puts` should render a nested structure.** *(mikelward)* A collection
+      inside a collection has no rendering today, so `puts $m` on
+      `[a: [1 2]]` is a loud error, and so is `puts $env` — the path-type names
+      are lists, which is what keeps `$env.PATH` and `$env:get(PATH, …)` the same
+      value. The error is honest (better than a guessed flattening), but it means
+      the one obvious way to *look at* a nested value is unavailable, and `$env`
+      made that reachable by accident rather than by choice.
+
+      `puts` renders for **reading** — a scalar as itself, a list one element per
+      line, a map as `key: value` lines — so the question is what the nested case
+      reads as. Some shapes to weigh:
+  - [ ] An **indented** rendering, one level per depth, which is what a reader
+        drawing it by hand would do. Needs a rule for how deep before it stops
+        being readable, and whether a list of scalars stays on one line.
+  - [ ] Defer to **`:repr`**, which already writes any nested value down and is
+        defined round-trip. That answers "show me what I have" without inventing
+        a second format — but `:repr` quotes for round-tripping, which is exactly
+        what `puts` exists not to do.
+  - [ ] Render only the **outer** level, with a nested element shown by its shape
+        (`[3 elements]`, `[2 entries]`) rather than its contents. Keeps output one
+        line per entry, at the cost of not showing the value.
+
+      Whatever it becomes, `$env` should print under it rather than needing a
+      rule of its own — a listing whose entries are typed the way every other read
+      types them is the point of it being an ordinary map.
+
+- [ ] **A modifier chain in `"…"` is dropped when punctuation abuts it.**
+      `puts "$x:upper"` renders `AB`, but `puts "[$x:upper]"` renders
+      `[ab:upper]` — the closing bracket is scanned into the modifier name, the
+      name then matches nothing, and the whole chain silently reverts to literal
+      text. The **command-word** path drops a modifier the same silent
+      way when it is one that needs an argument: `puts $x:split` prints the
+      subject unchanged rather than saying `:split` requires a separator, where
+      the same chain in `x = $y:split` reports it. Pre-existing, and not specific to the new modifiers. It is the bad
+      kind of failure: no error, just the wrong string. The scanner should stop a
+      modifier name at the first character that cannot be in one, and only then
+      decide whether the name it read is a modifier.
+
 ## Loose ends
 
 Small items rescued from pull requests that were closed as superseded — the bulk

@@ -2561,6 +2561,80 @@ fn abandoned_line_harness(exec: &MeshExec) -> i32 {
     0
 }
 
+/// Ctrl-C cancels an interactive `gets`, leaving its variable alone.
+///
+/// An interactive shell ignores SIGINT while a foreground *job* holds the
+/// terminal, but `gets` blocks in the shell's own process, where there is no job
+/// to receive the keystroke. Left ignored, Ctrl-C did nothing and the **next
+/// line typed was swallowed as the read's input** — so the discriminator is what
+/// `$x` holds afterwards, not merely that the shell survived.
+#[test]
+fn ctrl_c_cancels_an_interactive_gets() {
+    let config = fresh_dir("gets interrupt");
+    let exec = MeshExec::new(&config);
+    let harness = unsafe { libc::fork() };
+    assert_ne!(harness, -1, "fork the PTY harness");
+    if harness == 0 {
+        unsafe { libc::_exit(gets_interrupt_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+fn gets_interrupt_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 90;
+    };
+    // Bind first, so the check below distinguishes "left alone" from "never set".
+    if !pty_write(shell.master, b"x = kept\n") {
+        return 91;
+    }
+    if pty_read_until_command_done(shell.master).is_none() {
+        return 92;
+    }
+    // `gets` is reached only after the `puts`, so waiting for that marker is what
+    // guarantees the read is actually blocked before Ctrl-C arrives. Sent blind,
+    // the keystroke can beat the command to the terminal and cancel the *line*
+    // instead, which tests nothing.
+    if !pty_write(shell.master, b"puts BLOCKING; gets x\n") {
+        return 93;
+    }
+    if !pty_wait_for_marker(shell.master, b"BLOCKING\r\n") {
+        return 94;
+    }
+    // Ctrl-C while the read blocks. The shell must come back to a prompt rather
+    // than sit waiting for a line.
+    if !pty_write(shell.master, b"\x03") {
+        return 101;
+    }
+    let Some((_, code)) = pty_read_until_command_done(shell.master) else {
+        return 95;
+    };
+    // The status any interrupted foreground command reports.
+    if code != 130 {
+        return 96;
+    }
+    // The read was cancelled, so the binding is untouched — and this line is a
+    // command, not the input `gets` was waiting for.
+    if !pty_write(shell.master, b"puts CHECK-$x\n") {
+        return 97;
+    }
+    let Some((seen, _)) = pty_read_until_command_done(shell.master) else {
+        return 98;
+    };
+    if occurrences(&seen, b"CHECK-kept\r\n") == 0 {
+        return 99;
+    }
+    if !stop_pty_shell(shell) {
+        return 100;
+    }
+    0
+}
+
 #[test]
 fn an_interactive_shell_reports_where_it_is() {
     // A directory with a space in it, so the encoding is exercised end to end.
@@ -16534,6 +16608,446 @@ fn folding_the_sign_claims_literals_and_nothing_else() {
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("expected integer"),
             "{source:?} gave {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// `:get(KEY, DEFAULT)` is the total accessor — the mesh spelling of bash's
+/// `${VAR:-default}`, which every shell rc reaches for constantly.
+#[test]
+fn get_answers_a_default_where_a_strict_read_would_fail() {
+    let out = run_with_input(
+        r#"m = [editor: vim]
+puts $m:get(editor, nano)
+puts $m:get(pager, less)
+xs = [a b c]
+puts $xs:get(1, "-") $xs:get(9, "-") $xs:get(-1, "-")
+"#,
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "vim\nless\nb - c\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A bare `$env` is the whole table, which is what gives `$env:get(NAME, …)` an
+/// ordinary map to work on. `$env.NAME` stays the strict read that errors.
+#[test]
+fn env_get_falls_back_where_a_strict_env_read_errors() {
+    let out =
+        run_with_input("puts $env:get(MESH_TEST_ABSENT, fallback)\nputs $env.MESH_TEST_ABSENT\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "fallback\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("MESH_TEST_ABSENT"));
+}
+
+/// A bare `$env` is a map whose path-type entries are lists, so `puts $env` meets
+/// the ordinary "a collection inside a collection has no rendering" rule. Pinned
+/// alongside an ordinary nested map, because the point is that `$env` is **not** a
+/// special case — making it printable would mean changing what `puts` does for
+/// every map, which is a language decision rather than a fix here.
+#[test]
+fn a_bare_env_reads_through_its_accessors_rather_than_printing_whole() {
+    let out = run_with_input("puts $env\n");
+    let whole = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(whole.contains("has no rendering"), "{whole}");
+
+    let out = run_with_input("m = [a: [1 2]]\nputs $m\n");
+    let ordinary = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(ordinary.contains("has no rendering"), "{ordinary}");
+
+    // The accessors are what it is for, and they work.
+    let out = run_with_input(
+        "puts $env:get(MESH_TEST_ABSENT, none)\nputs ($env:keys:len > 0)\nputs $env.PATH:len\n",
+    );
+    let mut lines = String::from_utf8_lossy(&out.stdout).into_owned();
+    lines.truncate(lines.trim_end().len());
+    let mut lines = lines.lines();
+    assert_eq!(lines.next(), Some("none"));
+    assert_eq!(lines.next(), Some("true"));
+    // `PATH` is a list, which is the reason the whole map does not print.
+    assert!(
+        lines
+            .next()
+            .is_some_and(|count| count.parse::<u32>().is_ok()),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// The affix family: drop a known prefix/suffix once, or peel a character set.
+#[test]
+fn the_affix_modifiers_strip_once_and_trim_repeatedly() {
+    let out = run_with_input(
+        r#"f = report.tar.gz
+puts $f:stripend(".tar.gz")
+puts $f:stripend(".zip")
+puts $f:stripstart("report")
+padded = "///a//"
+puts $padded:trimstart("/") $padded:trimend("/")
+spaced = "  hi  "
+puts $spaced:trimstart:replaceall(" ", "_") $spaced:trimend:replaceall(" ", "_")
+"#,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "report\nreport.tar.gz\n.tar.gz\na// ///a\nhi__ __hi\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The replace family. The pattern matches **verbatim**, metacharacters and all,
+/// and the anchored forms act only on a leading / trailing match.
+#[test]
+fn the_replace_modifiers_match_their_pattern_verbatim() {
+    let out = run_with_input(
+        r#"s = "a.b.c"
+puts $s:replaceall(".", "-")
+puts $s:replacestart("a", "Z") $s:replaceend("c", "Z")
+puts $s:replacestart("b", "Z")
+xs = [x.js y.js]
+ys = $xs:replaceend(".js", ".ts")
+puts ...$ys
+"#,
+    );
+    // The `.` is a literal dot, not "any character" — a string pattern never
+    // quietly becomes a regex.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a-b-c\nZ.b.c a.b.Z\na.b.c\nx.ts y.ts\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Until the regex slot is built the pattern is **always** literal, so a bare
+/// `/a/` is the three-character text rather than a pattern. Pinned because it is
+/// the reading a quoted `"/a/"` requires — by the time the value reaches the
+/// modifier the two are indistinguishable — and because a reader who wrote the
+/// eventual regex spelling gets a no-op rather than an error until then.
+#[test]
+fn a_slash_literal_in_a_replace_pattern_is_still_literal_text() {
+    let out = run_with_input(
+        r#"puts "abc":replaceall(/a/, X)
+puts "x/a/y":replaceall("/a/", "/b/")
+puts "a/a/b":replaceall(/a/, X)
+"#,
+    );
+    // Line 1 finds no `/a/` in `abc`, so nothing changes. Line 3 does contain it.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "abc\nx/b/y\naXb\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// An `re()` value names the gap rather than being read as text.
+#[test]
+fn a_regex_value_in_a_replace_pattern_says_it_is_not_built() {
+    let out = run_with_input("puts \"abc\":replaceall(re(\"a\"), X)\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not take a regex pattern yet"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success());
+}
+
+/// A bare word in a replace pattern is the string it looks like. There is no
+/// glob reading in this slot, so a word that should match itself must not be
+/// turned into one.
+#[test]
+fn a_bare_word_in_a_replace_pattern_stays_the_string_it_looks_like() {
+    let out = run_with_input(
+        r#"puts "abc":replaceall(a, "X")
+puts "abc":replacestart(a, "X")
+puts "abc":replaceend(c, "X")
+"#,
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Xbc\nXbc\nabX\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A modifier's string argument is flattened like its subject: which bytes are
+/// split or stripped on must not depend on how they happen to be colored. Shared
+/// with `:split` / `:join`, so this covers those too.
+#[test]
+fn a_modifier_takes_a_styled_string_argument_as_its_text() {
+    let out = run_with_input(
+        r#"suffix = style(".js", fg: red)
+puts "a.js":stripend($suffix)
+sep = style(":", fg: red)
+puts "a:b":split($sep):len
+xs = [x y]
+puts $xs:join($sep)
+"#,
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\n2\nx:y\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A styled key looks itself up: display attributes are rendering-only, so which
+/// entry `:get` finds must not depend on how the key happens to be colored. The
+/// subject and the replace family's pattern flatten the same way.
+#[test]
+fn get_looks_up_a_styled_key_as_its_text() {
+    let out = run_with_input(
+        r#"m = [k: ok]
+key = style(k, fg: red)
+puts $m:get($key, fallback)
+puts $m:get(style(absent, fg: red), fallback)
+"#,
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\nfallback\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// An argument-taking modifier reads the same in **command position** as it does
+/// on the right of an `=`. It used to be a syntax error there, since a command
+/// word stops in front of the `(` and the arguments arrived glued to it.
+#[test]
+fn an_argument_taking_modifier_works_as_a_command_argument() {
+    let out = run_with_input(
+        r#"dirs = [/usr/bin /bin]
+puts $dirs:join(":")
+m = [k: v]
+puts $m:get(k, none) $m:get(absent, none)
+puts "a.b":stripend(".b")
+"#,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "/usr/bin:/bin\nv none\na\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The `(` has to **abut** the modifier name, exactly as it must abut a word for
+/// an attached call. Spacing is the whole signal: `puts $x:upper (1)` is a chain
+/// and a separate `(1)` argument, and reading it as `$x:upper(1)` would take an
+/// argument the reader gave to `puts`.
+#[test]
+fn a_modifier_argument_list_must_abut_the_modifier_name() {
+    let out = run_with_input("x = hi\nputs $x:upper (1)\nputs $x:upper ($x:len)\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "HI 1\nHI 2\n");
+    // Every step of the run has to abut the one before it, not just the `(`: a gap
+    // before the colon ends the chain too, leaving `:upper(lo)` the separate
+    // modifier-reference call it reads as.
+    let out = run_with_input("x = hi\nputs $x :upper(lo)\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi LO\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Attached, it really is a call — and an argument-free modifier says so.
+    let out = run_with_input("x = hi\nputs $x:upper(1)\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not take arguments"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A bare `:name` after a value is still literal text when it names no modifier,
+/// so recognizing an argument list cannot have changed `$host:$port`.
+#[test]
+fn a_non_modifier_colon_stays_literal_in_command_position() {
+    let out = run_with_input("host = h\nport = 1\nputs $host:$port\nputs $host:upper\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "h:1\nH\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The modifiers say what they need rather than guessing, so a wrong argument
+/// type or count is loud.
+#[test]
+fn a_misused_modifier_argument_is_a_loud_error() {
+    for (source, message) in [
+        ("xs = [a]\nputs $xs:get(0)\n", "takes exactly 2 arguments"),
+        (
+            "puts \"a\":replaceall(\"a\", 1)\n",
+            "replacement must be a string",
+        ),
+        ("puts \"a\":stripend(\"\")\n", "must not be empty"),
+        (
+            "puts \"a\":replaceall([a], \"b\")\n",
+            "pattern must be a string",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(message),
+            "`{source}` did not report {message}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.status.success(), "`{source}` should have failed");
+    }
+}
+
+/// `gets` must not read past its own newline: the rest of stdin belongs to
+/// whatever runs next, so a buffered reader would silently eat it.
+#[test]
+fn gets_leaves_the_rest_of_stdin_for_the_next_command() {
+    let mut command = mesh_command();
+    command
+        .arg("-c")
+        .arg("gets first\nputs \"first=$first\"\ncat\n")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn mesh");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"one\ntwo\nthree\n")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait for mesh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first=one\ntwo\nthree\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// End of input reports status 1 and leaves the variable alone, which is what
+/// makes `while gets line { … }` terminate; a blank line does not.
+#[test]
+fn gets_reports_end_of_input_without_clobbering_its_variable() {
+    let mut command = mesh_command();
+    command
+        .arg("-c")
+        .arg("line = kept\nwhile gets line { puts \"[$line]\" }\ngets line\nputs \"last=$line status=$sh.status\"\n")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn mesh");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"a\n\nb")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait for mesh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[a]\n[]\n[b]\nlast=b status=1\n"
+    );
+}
+
+/// `gets` refuses the namespace names, and does so **before** reading, so a
+/// rejected operand does not also swallow the line the caller could retry with.
+/// A binding under `env` or `sh` could never be read back — resolution always
+/// takes those names as the namespaces.
+#[test]
+fn gets_refuses_a_reserved_namespace_without_consuming_input() {
+    for name in ["env", "sh"] {
+        let mut command = mesh_command();
+        command
+            .arg("-c")
+            .arg(format!("gets {name}\ncat\n"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn mesh");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(b"untouched\n")
+            .expect("write stdin");
+        let out = child.wait_with_output().expect("wait for mesh");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("reserved namespace"),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The line is still there for whatever runs next.
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "untouched\n");
+    }
+}
+
+/// Invalid UTF-8 is **refused**, not replaced with U+FFFD. `gets` reads data in,
+/// so it follows the capture — which rejects a non-UTF-8 stream — rather than
+/// `$env`, whose lossy read renders a table the shell was handed. Binding
+/// corrupted text and reporting success would outlive any chance of noticing.
+#[test]
+fn gets_refuses_a_non_utf8_line_and_leaves_its_variable_alone() {
+    let mut command = mesh_command();
+    command
+        .arg("-c")
+        .arg("v = kept\ngets v\nputs \"v=$v status=$sh.status\"\n")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn mesh");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"a\xffb\n")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait for mesh");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not valid UTF-8"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Status 2, not the 1 that means end of input — a read error must not end a
+    // `while gets line` as though the input had simply run out.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v=kept status=2\n");
+}
+
+/// `gets` checks its operand, and takes at most one.
+#[test]
+fn gets_rejects_a_bad_operand() {
+    for (source, message) in [
+        ("gets 1bad\n", "is not a variable name"),
+        ("gets a b\n", "takes at most one variable name"),
+    ] {
+        let out = run_with_input(source);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(message),
+            "`{source}` did not report {message}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }

@@ -41,6 +41,11 @@ pub enum Modifier {
     Values,
     Upper,
     Lower,
+    /// Peel whitespace from the front / back, repeatedly. The argument-free
+    /// members of the affix family — the char-set forms (`:trimstart("/")`) take
+    /// an argument and so are evaluated with the rest of that family, not here.
+    TrimStart,
+    TrimEnd,
     Int,
     /// This value written as the mesh source you would have typed for it, as a
     /// string. The inverse of reading a literal, so `$x:repr` on a value that
@@ -86,6 +91,8 @@ impl Modifier {
             "values" => Self::Values,
             "upper" => Self::Upper,
             "lower" => Self::Lower,
+            "trimstart" => Self::TrimStart,
+            "trimend" => Self::TrimEnd,
             "int" => Self::Int,
             "repr" => Self::Repr,
             "exists" => Self::Exists,
@@ -575,13 +582,17 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
     // indexes into the value it read, which is what makes `$env.PATH[0]` and
     // `$env.PATH[1..]` work on the path-type lists.
     let (mut value, accesses) = if vref.name == "env" {
-        let [Access::Member(key), rest @ ..] = vref.accesses.as_slice() else {
-            return Err(ExpandError::Unsupported("$env".to_string()));
-        };
-        (
-            crate::environ::read(key).ok_or_else(|| ExpandError::UnsetEnv(key.clone()))?,
-            rest,
-        )
+        match vref.accesses.as_slice() {
+            [Access::Member(key), rest @ ..] => (
+                crate::environ::read(key).ok_or_else(|| ExpandError::UnsetEnv(key.clone()))?,
+                rest,
+            ),
+            // A bare `$env` is the whole table as a map, so the total accessor
+            // `$env:get(EDITOR, vim)` needs no rule of its own. A subscript or a
+            // slice still has no meaning here: the environment is keyed by name,
+            // and `$env[0]` would name whichever entry happened to sort first.
+            accesses => (crate::environ::snapshot(), accesses),
+        }
     } else if vref.name == "sh" {
         (vars.shell_namespace(), vref.accesses.as_slice())
     } else {
@@ -1075,6 +1086,123 @@ pub(crate) fn join_value(value: Value, separator: &str) -> Result<Value, ExpandE
     Ok(Value::String(out))
 }
 
+/// Run a per-string transform over a value, mapping element-wise across a list
+/// the way the argument-free string modifiers do (`DESIGN.md` §"String": a
+/// replace modifier "is a value modifier, so it maps over a list element-wise
+/// like `:stem`"). Shared by the whole affix and replace family so they cannot
+/// disagree about which values they accept.
+///
+/// A styled subject is flattened to its text before `transform` sees it, matching
+/// [`apply_modifier`]; the arms below are the exhaustiveness the compiler wants.
+pub(crate) fn map_strings(
+    value: Value,
+    name: &str,
+    transform: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<Value, ExpandError> {
+    let fail = |message: &str| ExpandError::Modifier {
+        name: name.into(),
+        message: message.into(),
+    };
+    match value.plain() {
+        Value::String(text) => transform(&text)
+            .map(Value::String)
+            .map_err(|message| fail(&message)),
+        Value::List(values) => values
+            .into_iter()
+            .map(|value| map_strings(value, name, transform))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
+        Value::Map(_) => Err(fail("cannot map over a map")),
+        Value::Integer(_) | Value::Boolean(_) => Err(fail("requires a string")),
+        Value::Styled(_)
+        | Value::Regex(_)
+        | Value::Glob(_)
+        | Value::Stream(_)
+        | Value::Job(_)
+        | Value::Function(_) => Err(fail("cannot apply a string modifier to this value")),
+    }
+}
+
+/// `:get(KEY, DEFAULT)` — the **total** accessor. Where `$m.key` and `$xs[i]`
+/// fail loudly on a miss, this answers `default`, which is what makes it the
+/// mesh spelling of `${VAR:-default}` (`DESIGN.md` §"Arrays / lists").
+///
+/// A map takes a string key and a list an integer index, negative counting from
+/// the end as a subscript does. Asking a map for an integer — or a list for a
+/// name — is a loud error rather than a silent `default`: a key of the wrong
+/// *type* is a mistake in the program, not an absence in the data, and returning
+/// the default would hide it forever.
+pub(crate) fn get_value(value: Value, key: Value, default: Value) -> Result<Value, ExpandError> {
+    let fail = |message: String| ExpandError::Modifier {
+        name: "get".into(),
+        message,
+    };
+    // The key is flattened like the subject: display attributes are rendering-only,
+    // so a `style()`d key is the string it shows, and looking one up must not
+    // depend on how it happens to be colored. `default` is left alone — it is
+    // returned as a value rather than consumed as text.
+    let key = key.plain();
+    match value.plain() {
+        Value::Map(entries) => {
+            let key = match key {
+                Value::String(key) => key,
+                other => {
+                    return Err(fail(format!(
+                        "a map key is a string, got {}",
+                        value_kind(&other)
+                    )));
+                }
+            };
+            Ok(entries
+                .into_iter()
+                .find(|(name, _)| *name == key)
+                .map_or(default, |(_, found)| found))
+        }
+        Value::List(values) => {
+            let index = match key {
+                Value::Integer(index) => index,
+                other => {
+                    return Err(fail(format!(
+                        "a list index is an integer, got {}",
+                        value_kind(&other)
+                    )));
+                }
+            };
+            let offset = if index < 0 {
+                values.len() as i128 + i128::from(index)
+            } else {
+                i128::from(index)
+            };
+            Ok(usize::try_from(offset)
+                .ok()
+                .and_then(|offset| values.into_iter().nth(offset))
+                .unwrap_or(default))
+        }
+        other => Err(fail(format!(
+            "requires a map or a list, got {}",
+            value_kind(&other)
+        ))),
+    }
+}
+
+/// The word a diagnostic uses for a value's type. Local to the modifiers here so
+/// they can name what they were handed without reaching into the runtime.
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) => "a string",
+        Value::Styled(_) => "a styled string",
+        Value::Integer(_) => "an integer",
+        Value::Boolean(_) => "a boolean",
+        Value::List(_) => "a list",
+        Value::Map(_) => "a map",
+        Value::Regex(_) => "a regex",
+        Value::Glob(_) => "a glob",
+        Value::Stream(_) => "a stream handle",
+        Value::Job(_) => "a job handle",
+        Value::Function(_) => "a function value",
+    }
+}
+
 fn modifier_name(modifier: Modifier) -> &'static str {
     match modifier {
         Modifier::Dir => "dir",
@@ -1093,6 +1221,8 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::Values => "values",
         Modifier::Upper => "upper",
         Modifier::Lower => "lower",
+        Modifier::TrimStart => "trimstart",
+        Modifier::TrimEnd => "trimend",
         Modifier::Int => "int",
         Modifier::Repr => "repr",
         Modifier::Exists => "exists",
@@ -1212,6 +1342,8 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         Modifier::Bare => bare_name(path.file_name().and_then(|p| p.to_str())).to_string(),
         Modifier::Upper => value.to_uppercase(),
         Modifier::Lower => value.to_lowercase(),
+        Modifier::TrimStart => value.trim_start().to_string(),
+        Modifier::TrimEnd => value.trim_end().to_string(),
         Modifier::Int
         | Modifier::Len
         | Modifier::First
@@ -1310,8 +1442,8 @@ fn has_glob_meta(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Access, ExpandError, Modifier, VarRef, accessible_c, apply_tilde, has_glob_meta,
-        join_value, resolve_value, split_value,
+        Access, ExpandError, Modifier, VarRef, accessible_c, apply_modifier, apply_tilde,
+        get_value, has_glob_meta, join_value, map_strings, resolve_value, split_value,
     };
     use crate::vars::{Value, Vars};
 
@@ -1393,6 +1525,118 @@ mod tests {
         assert_eq!(
             join_value(Value::List(vec![]), ","),
             Ok(Value::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn get_answers_the_default_only_when_the_key_is_absent() {
+        let map = Value::Map(vec![
+            ("EDITOR".into(), Value::String("vim".into())),
+            ("EMPTY".into(), Value::String(String::new())),
+        ]);
+        assert_eq!(
+            get_value(
+                map.clone(),
+                Value::String("EDITOR".into()),
+                Value::String("nano".into())
+            ),
+            Ok(Value::String("vim".into()))
+        );
+        assert_eq!(
+            get_value(
+                map.clone(),
+                Value::String("PAGER".into()),
+                Value::String("less".into())
+            ),
+            Ok(Value::String("less".into()))
+        );
+        // A key bound to `""` is *present*, so it wins over the default — the one
+        // place this differs from bash's `${EMPTY:-less}`, which substitutes.
+        assert_eq!(
+            get_value(
+                map,
+                Value::String("EMPTY".into()),
+                Value::String("less".into())
+            ),
+            Ok(Value::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn get_indexes_a_list_from_either_end_and_falls_back_past_it() {
+        let xs = list(&["a", "b", "c"]);
+        let fallback = || Value::String("-".into());
+        assert_eq!(
+            get_value(xs.clone(), Value::Integer(1), fallback()),
+            Ok(Value::String("b".into()))
+        );
+        assert_eq!(
+            get_value(xs.clone(), Value::Integer(-1), fallback()),
+            Ok(Value::String("c".into()))
+        );
+        assert_eq!(
+            get_value(xs.clone(), Value::Integer(99), fallback()),
+            Ok(fallback())
+        );
+        assert_eq!(
+            get_value(xs, Value::Integer(-99), fallback()),
+            Ok(fallback())
+        );
+    }
+
+    #[test]
+    fn get_refuses_a_key_of_the_wrong_type_rather_than_defaulting() {
+        // A name asked of a list — or an index asked of a map — is a mistake in the
+        // program, not an absence in the data, so answering `default` would bury it.
+        assert!(matches!(
+            get_value(list(&["a"]), Value::String("a".into()), Value::Integer(0)),
+            Err(ExpandError::Modifier { name, .. }) if name == "get"
+        ));
+        assert!(matches!(
+            get_value(
+                Value::Map(vec![("k".into(), Value::Integer(1))]),
+                Value::Integer(0),
+                Value::Integer(0)
+            ),
+            Err(ExpandError::Modifier { name, .. }) if name == "get"
+        ));
+        assert!(matches!(
+            get_value(Value::String("s".into()), Value::Integer(0), Value::Integer(0)),
+            Err(ExpandError::Modifier { name, .. }) if name == "get"
+        ));
+    }
+
+    #[test]
+    fn a_string_transform_maps_over_a_list_and_refuses_a_map() {
+        let mut upper = |text: &str| Ok(text.to_uppercase());
+        assert_eq!(
+            map_strings(list(&["a", "b"]), "t", &mut upper),
+            Ok(list(&["A", "B"]))
+        );
+        assert_eq!(
+            map_strings(Value::String("a".into()), "t", &mut upper),
+            Ok(Value::String("A".into()))
+        );
+        assert!(matches!(
+            map_strings(Value::Map(vec![]), "t", &mut upper),
+            Err(ExpandError::Modifier { name, .. }) if name == "t"
+        ));
+    }
+
+    #[test]
+    fn trim_peels_whitespace_from_the_named_end_only() {
+        assert_eq!(
+            apply_modifier(Value::String("  hi  ".into()), Modifier::TrimStart),
+            Ok(Value::String("hi  ".into()))
+        );
+        assert_eq!(
+            apply_modifier(Value::String("  hi  ".into()), Modifier::TrimEnd),
+            Ok(Value::String("  hi".into()))
+        );
+        // A string transform, so it maps element-wise like `:upper`.
+        assert_eq!(
+            apply_modifier(list(&[" a", " b"]), Modifier::TrimStart),
+            Ok(list(&["a", "b"]))
         );
     }
 

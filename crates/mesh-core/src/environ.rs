@@ -34,12 +34,52 @@ pub(crate) fn is_path_var(key: &str) -> bool {
 /// Read `$env.KEY`, or `None` when it is unset — a strict read, so the caller
 /// reports the absence rather than substituting an empty string.
 pub(crate) fn read(key: &str) -> Option<Value> {
-    let raw = env::var_os(key)?.to_string_lossy().into_owned();
-    Some(if is_path_var(key) {
+    Some(typed(key, &env::var_os(key)?))
+}
+
+/// The mesh value an entry's raw bytes denote: a list for a path-type name,
+/// a string otherwise. Shared by [`read`] and [`snapshot`] so a name cannot be
+/// typed one way when asked for by name and another when listed.
+fn typed(key: &str, raw: &std::ffi::OsStr) -> Value {
+    let raw = raw.to_string_lossy();
+    if is_path_var(key) {
         Value::List(split_path(&raw))
     } else {
-        Value::String(raw)
-    })
+        Value::String(raw.into_owned())
+    }
+}
+
+/// The whole environment as an ordered map, sorted by name so the order is stable
+/// rather than inherited from `environ`'s arbitrary one. Each entry is typed as
+/// [`read`] types it, so a path-type name is a **list** here too — which is what
+/// keeps `$env:get(PATH, …)` and `$env.PATH` the same value, and what makes the
+/// map one `puts` refuses, under the ordinary rule that a collection nested in a
+/// collection has no rendering. `$env:keys`, `$env:get(NAME, …)` and `$env.NAME`
+/// are the ways to read it; sorting is for those, not for a whole-map print.
+///
+/// This is what a bare `$env` denotes, which is what gives `$env:get(EDITOR,
+/// vim)` — the `${EDITOR:-vim}` of `DESIGN.md` §"Variables and assignment" — an
+/// ordinary map to work on rather than a special case in the resolver.
+pub(crate) fn snapshot() -> Value {
+    entries_of(env::vars_os())
+}
+
+/// The listing, built from `(name, value)` pairs rather than by re-querying each
+/// name. Re-querying loses an entry whose **name** is not valid UTF-8: the lossy
+/// spelling names nothing, so the entry vanishes — or, worse, names some *other*
+/// variable that really is spelled that way, and the listing shows its value
+/// under the wrong key. The pair is already in hand, so nothing has to be asked
+/// for twice. Split out so a test can hand it names the process does not have.
+fn entries_of(vars: impl Iterator<Item = (OsString, OsString)>) -> Value {
+    let mut entries: Vec<(String, Value)> = vars
+        .map(|(key, value)| {
+            let key = key.to_string_lossy().into_owned();
+            let value = typed(&key, &value);
+            (key, value)
+        })
+        .collect();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    Value::Map(entries)
 }
 
 /// Split a path-type value **exactly**: every empty component is kept, leading,
@@ -218,5 +258,44 @@ mod tests {
         // Case matters: the environment is case-sensitive, so `Path` is a
         // different, ordinary variable.
         assert!(!is_path_var("Path"));
+    }
+
+    /// A listing is built from the pairs it was handed, so an entry whose **name**
+    /// is not valid UTF-8 still appears — under its lossy spelling, since that is
+    /// all a mesh string can hold, but with **its own value**. Re-querying the
+    /// lossy name instead would drop it, or find a different variable that really
+    /// is spelled that way and show that one's value under this key.
+    #[test]
+    fn a_listing_keeps_an_entry_whose_name_is_not_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = OsString::from_vec(b"BAD\xffNAME".to_vec());
+        let lossy = invalid.to_string_lossy().into_owned();
+        let Value::Map(entries) = entries_of(
+            [
+                (invalid, OsString::from("its own")),
+                // Present under the *lossy* spelling too, which is what makes the
+                // re-query path pick the wrong one rather than merely lose one.
+                (OsString::from(lossy.clone()), OsString::from("the other")),
+                (OsString::from("PATH"), OsString::from("/bin:/usr/bin")),
+            ]
+            .into_iter(),
+        ) else {
+            panic!("a listing is a map");
+        };
+
+        let found: Vec<&Value> = entries
+            .iter()
+            .filter(|(key, _)| *key == lossy)
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(found.len(), 2, "both entries survive: {entries:?}");
+        assert!(found.contains(&&Value::String("its own".into())));
+        assert!(found.contains(&&Value::String("the other".into())));
+
+        // A path-type name is still typed as a list when listed, exactly as
+        // reading it by name gives.
+        let path = entries.iter().find(|(key, _)| key == "PATH").expect("PATH");
+        assert_eq!(path.1, Value::List(split_path("/bin:/usr/bin")));
     }
 }

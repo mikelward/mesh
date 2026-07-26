@@ -2175,6 +2175,28 @@ extern "C" fn note_interrupt(signal: libc::c_int) {
     }
 }
 
+/// Run `body` with SIGINT able to cut short a blocking call inside it, and report
+/// whether one arrived.
+///
+/// The same need a blocking wait has, for the same reason: an interactive shell
+/// ignores SIGINT while a foreground job holds the terminal, but a builtin that
+/// blocks in the *shell's own* process has no job to receive the keystroke, so an
+/// ignored SIGINT would leave it stuck with no way out. `gets` is the case —
+/// without this, Ctrl-C at a `gets` prompt does nothing and the next line typed
+/// is swallowed as its input instead of being run.
+///
+/// `false` when the shell is not interactive, where SIGINT keeps its default
+/// disposition and ends the shell as it would during any other command.
+pub(crate) fn interruptible<T>(body: impl FnOnce() -> T) -> (T, bool) {
+    let catcher = SigintCatcher::install();
+    let value = body();
+    // Read before the catcher is dropped: dropping clears the flag, since the
+    // next installer must not see this one's.
+    let interrupted = catcher.is_some() && SIGINT_SEEN.load(Ordering::SeqCst);
+    drop(catcher);
+    (value, interrupted)
+}
+
 /// Make SIGINT interrupt a blocking wait, putting the previous disposition back
 /// when the wait ends.
 ///

@@ -602,6 +602,103 @@ fn run_config_file(path: &Path, last: u8, shell: &mut Shell) -> Step {
 /// Exactly one operand. Extra arguments would be positional parameters for the
 /// sourced file, and mesh has no way to set those yet (`shift` / `set --` are
 /// deferred in `DESIGN.md`), so they are refused rather than silently ignored.
+/// `gets [VAR]` — read one line from stdin, strip its trailing newline, and bind
+/// it to `VAR` (`DESIGN.md` §"Builtins").
+///
+/// **At end of input the status is `1` and `VAR` is left alone**, which is what
+/// terminates `while gets line { … }`. An empty line is a successful read of `""`,
+/// not an ending — a blank line in the middle of a file must not stop the loop —
+/// so only a zero-byte read ends it.
+///
+/// The line is read a **byte at a time** rather than through a buffered reader:
+/// a buffer would swallow input past the newline, and the bytes after this line
+/// belong to whatever runs next — a `gets` in a loop, or an external command
+/// sharing the same stdin.
+///
+/// Reading with no `VAR` consumes the line and reports whether there was one,
+/// which is the "skip a line" spelling. The value form `gets()` — the one that
+/// yields the line into an expression — is not wired up yet.
+fn gets(args: &[String], shell: &mut Shell) -> Step {
+    let name = match args {
+        [] => None,
+        [name] => Some(name.as_str()),
+        _ => {
+            note!("mesh: gets: takes at most one variable name");
+            return Step::Continue(2);
+        }
+    };
+    // Checked before a byte is read, so a rejected operand does not also consume
+    // the line: an error that swallowed input would leave the caller no way to
+    // retry. `env` and `sh` are refused for the same reason every binding path
+    // refuses them — resolution always reads those names as the namespaces, so a
+    // binding there is one that can never be read back.
+    if let Some(name) = name {
+        if !parser::valid_name(name) {
+            note!("mesh: gets: `{name}` is not a variable name");
+            return Step::Continue(2);
+        }
+        if vars::is_reserved_namespace(name) {
+            note!("mesh: gets: `{name}` is a reserved namespace");
+            return Step::Continue(2);
+        }
+    }
+    let mut line = Vec::new();
+    // Descriptor 0 directly, not `io::stdin()`: that handle buffers, so it would
+    // read past the newline and the bytes it swallowed would never reach whatever
+    // runs next — the following `gets`, or an external command sharing this stdin.
+    // `ManuallyDrop` because the descriptor is the shell's, not ours to close.
+    // The same reasoning, and the same reader, as the interactive input loop.
+    //
+    // Wrapped so Ctrl-C can cancel it: an interactive shell ignores SIGINT while a
+    // foreground *job* holds the terminal, but this blocks in the shell's own
+    // process, where there is no job to receive the keystroke. Left ignored, Ctrl-C
+    // did nothing here and the next line typed was swallowed as this read's input.
+    let (read, interrupted) = exec::interruptible(|| {
+        let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
+        read_line(&mut *stdin, &mut line, false)
+    });
+    if interrupted {
+        // The status any interrupted foreground command reports, and `var` keeps
+        // whatever it held — a cancelled read has read nothing. The newline is
+        // what the terminal's own `^C` echo lacks, so the next prompt starts on a
+        // line of its own.
+        note!("");
+        return Step::Continue(130);
+    }
+    // Status 1 is reserved for end of input, so an I/O failure reports 2 like the
+    // operand errors above. Sharing 1 would let a real read error end a
+    // `while gets line` as though the input had simply run out.
+    if let Err(err) = read {
+        note!("mesh: gets: {err}");
+        return Step::Continue(2);
+    }
+    // Only a zero-byte read is the end. A file's last line without a trailing
+    // newline is still a line, and an empty line is a successful read of `""` —
+    // a blank line in the middle of a file must not stop a `while gets line`.
+    if line.is_empty() {
+        return Step::Continue(1);
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    // **Strict**, not lossy. `gets` reads data in, so it follows the capture —
+    // which refuses a stream that is not UTF-8 — rather than `$env`, whose lossy
+    // read renders a table the shell was handed and cannot refuse. Replacing the
+    // bad bytes with U+FFFD here would hand back corrupted text and call it
+    // success, and the corruption would outlive any chance of noticing it.
+    let text = match String::from_utf8(line) {
+        Ok(text) => text,
+        Err(_) => {
+            note!("mesh: gets: line is not valid UTF-8");
+            return Step::Continue(2);
+        }
+    };
+    if let Some(name) = name {
+        shell.vars.set_value(name, Value::String(text));
+    }
+    Step::Continue(0)
+}
+
 fn source_file(args: &[String], last: u8, shell: &mut Shell) -> Step {
     let [path] = args else {
         let message = if args.is_empty() {
@@ -3233,8 +3330,23 @@ fn eval_link(
 /// Is `name` a modifier that requires a parenthesized argument list? Used only to
 /// give a clearer error when such a modifier is written bare (`:split` without
 /// arguments) rather than the generic "not implemented yet".
+/// `:trimstart` / `:trimend` are deliberately absent: their argument (a char set)
+/// is optional, so the bare spelling is the whitespace form rather than a mistake.
 fn modifier_takes_arguments(name: &str) -> bool {
-    matches!(name, "join" | "split" | "map" | "filter" | "each")
+    matches!(
+        name,
+        "join"
+            | "split"
+            | "map"
+            | "filter"
+            | "each"
+            | "get"
+            | "stripstart"
+            | "stripend"
+            | "replaceall"
+            | "replacestart"
+            | "replaceend"
+    )
 }
 
 /// Apply an argument-free modifier to a value.
@@ -3292,6 +3404,58 @@ fn eval_modifier_with_arguments(
                 expand::join_value(value, &separator)
             };
             result.map_err(runtime_message)
+        }
+        // `:get(KEY, DEFAULT)` — the total accessor. Both arguments are ordinary
+        // values, so no shape is imposed here beyond the count; which key types
+        // suit which subject is `expand::get_value`'s to say.
+        "get" => {
+            let Some([key, default]) = value_arguments(name, arguments, last, in_function, shell)?
+            else {
+                return Ok(control_placeholder());
+            };
+            expand::get_value(value, key, default).map_err(runtime_message)
+        }
+        // The affix family. `:stripstart` / `:stripend` drop a literal affix once
+        // if it is there and are a no-op otherwise, and the char-set spellings of
+        // `:trimstart` / `:trimend` peel the given characters repeatedly — the
+        // whitespace default being the argument-free form handled elsewhere.
+        "stripstart" | "stripend" | "trimstart" | "trimend" => {
+            let Some(affix) = single_string_argument(name, arguments, last, in_function, shell)?
+            else {
+                return Ok(control_placeholder());
+            };
+            if affix.is_empty() {
+                return runtime_error(format!("modifier :{name} argument must not be empty"));
+            }
+            let mut transform = |text: &str| -> Result<String, String> {
+                Ok(match name {
+                    "stripstart" => text.strip_prefix(&affix).unwrap_or(text).to_string(),
+                    "stripend" => text.strip_suffix(&affix).unwrap_or(text).to_string(),
+                    "trimstart" => text.trim_start_matches(|c| affix.contains(c)).to_string(),
+                    _ => text.trim_end_matches(|c| affix.contains(c)).to_string(),
+                })
+            };
+            expand::map_strings(value, name, &mut transform).map_err(runtime_message)
+        }
+        // `:replaceall(OLD, NEW)` and its anchored kin. `OLD` is a **match slot**
+        // (`DESIGN.md` §"String"): a string matches verbatim, a regex as a pattern
+        // — the same no-silent-coercion rule `~` and `:int` follow, so a string
+        // full of metacharacters never quietly becomes one.
+        "replaceall" | "replacestart" | "replaceend" => {
+            let Some([old, new]) = value_arguments(name, arguments, last, in_function, shell)?
+            else {
+                return Ok(control_placeholder());
+            };
+            let new = match new.plain() {
+                Value::String(new) => new,
+                other => {
+                    return runtime_error(format!(
+                        "modifier :{name} replacement must be a string, got {}",
+                        value_kind(&other)
+                    ));
+                }
+            };
+            replace_modifier(name, value, old, &new)
         }
         // The higher-order modifiers. Each takes one **callable** — a lambda, or a
         // named function reached through a variable — and applies it per element.
@@ -3376,6 +3540,90 @@ fn eval_modifier_with_arguments(
 /// type-checking a value that was never produced. Without that, the placeholder an
 /// unwinding `eval_expr` returns is read as the argument itself and reported as a
 /// type error — hiding the control flow behind a diagnostic about a string.
+/// Evaluate exactly `N` positional modifier arguments, imposing no type of their
+/// own — a modifier whose arguments are ordinary values (`:get`, the replace
+/// family) says what it needs itself, so the shapes stay next to the rule.
+///
+/// `None` means a control flow effect (a `return` in a lambda default, say) took
+/// over mid-evaluation, matching the sibling helpers.
+fn value_arguments<const N: usize>(
+    name: &str,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Option<[Value; N]>, Step> {
+    if arguments.len() != N {
+        return runtime_error(format!(
+            "modifier :{name} takes exactly {N} arguments, got {}",
+            arguments.len()
+        ));
+    }
+    let mut values = Vec::with_capacity(N);
+    for argument in arguments {
+        let parser::Argument::Positional(expression) = argument else {
+            return runtime_error(format!("modifier :{name} takes positional arguments only"));
+        };
+        let Some(value) = eval_operand(expression, last, in_function, shell)? else {
+            return Ok(None);
+        };
+        values.push(value);
+    }
+    Ok(Some(
+        <[Value; N]>::try_from(values).unwrap_or_else(|_| unreachable!("length checked above")),
+    ))
+}
+
+/// A per-string modifier step, as [`expand::map_strings`] takes one. Boxed
+/// because which one it is depends on whether the pattern arrived as a string or
+/// a regex, and the two capture different things.
+type StringTransform<'a> = dyn FnMut(&str) -> Result<String, String> + 'a;
+
+/// Apply `:replaceall` / `:replacestart` / `:replaceend` to `subject`.
+///
+/// The replacement is **literal** — `regex`'s own `$1` expansion is suppressed —
+/// because the capture-backreference spelling is still provisional in
+/// `DESIGN.md`; taking `$1` now would freeze a syntax the design has not chosen,
+/// and the wrong choice is worse than the missing one.
+fn replace_modifier(name: &str, subject: Value, old: Value, new: &str) -> Result<Value, Step> {
+    let mut transform: Box<StringTransform<'_>> = match old.plain() {
+        Value::String(old) => {
+            if old.is_empty() {
+                return runtime_error(format!("modifier :{name} pattern must not be empty"));
+            }
+            Box::new(move |text: &str| {
+                Ok(match name {
+                    "replacestart" => match text.strip_prefix(&old) {
+                        Some(rest) => format!("{new}{rest}"),
+                        None => text.to_string(),
+                    },
+                    "replaceend" => match text.strip_suffix(&old) {
+                        Some(head) => format!("{head}{new}"),
+                        None => text.to_string(),
+                    },
+                    _ => text.replace(&old, new),
+                })
+            })
+        }
+        // A regex pattern is not wired up yet — it lands with the rest of the
+        // regex match slot. Named rather than lumped in with "wrong type" below,
+        // so a reader who wrote the documented `/…/` spelling is told it is
+        // coming rather than that their value was nonsense.
+        Value::Regex(_) => {
+            return runtime_error(format!(
+                "modifier :{name} does not take a regex pattern yet; use a string"
+            ));
+        }
+        other => {
+            return runtime_error(format!(
+                "modifier :{name} pattern must be a string, got {}",
+                value_kind(&other)
+            ));
+        }
+    };
+    expand::map_strings(subject, name, &mut *transform).map_err(runtime_message)
+}
+
 fn single_callable_argument(
     name: &str,
     arguments: &[parser::Argument],
@@ -3435,7 +3683,11 @@ fn single_string_argument(
     let Some(value) = eval_operand(expression, last, in_function, shell)? else {
         return Ok(None);
     };
-    match value {
+    // Flattened first, like the subject and like the replace family's own
+    // arguments: display attributes are rendering-only, so a `style()`d separator
+    // or affix is the text it shows. Which bytes a modifier splits or strips on
+    // must not depend on how they happen to be colored.
+    match value.plain() {
         Value::String(value) => Ok(Some(value)),
         _ => runtime_error(format!("modifier :{name} argument must be a string")),
     }
@@ -5264,6 +5516,9 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
         // `source` runs mesh code in *this* shell, so it belongs here rather than
         // in `builtins::dispatch`, which is handed only words and a status.
         "source" => return source_file(&words[1..], last, shell),
+        // `gets` binds a variable in *this* shell, so like `source` it cannot go
+        // through `builtins::dispatch`, which sees only words and a status.
+        "gets" => return gets(&words[1..], shell),
         _ => {}
     }
     // Job control belongs to the shell that owns the jobs. A forked stage is not
@@ -8767,7 +9022,7 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
 
     loop {
         line.clear();
-        match read_line(&mut *stdin, &mut line) {
+        match read_line(&mut *stdin, &mut line, true) {
             Ok(0) => break, // EOF
             Ok(_) => {}
             Err(err) => {
@@ -8825,7 +9080,15 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
 /// Read one line (up to and including the newline) into `out`, one byte at a
 /// time so nothing beyond the newline is consumed. Returns the number of bytes
 /// read; 0 signals EOF.
-fn read_line(reader: &mut impl Read, out: &mut Vec<u8>) -> io::Result<usize> {
+/// `retry_on_signal` decides what an `EINTR` means here. The interactive input
+/// loop retries — a signal the shell survives is not the end of a line — while
+/// `gets` gives up, so a Ctrl-C can cancel a read that would otherwise block
+/// until a line or EOF arrived.
+fn read_line(
+    reader: &mut impl Read,
+    out: &mut Vec<u8>,
+    retry_on_signal: bool,
+) -> io::Result<usize> {
     let mut byte = [0u8; 1];
     loop {
         match reader.read(&mut byte) {
@@ -8836,7 +9099,7 @@ fn read_line(reader: &mut impl Read, out: &mut Vec<u8>) -> io::Result<usize> {
                     break;
                 }
             }
-            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted && retry_on_signal => continue,
             Err(err) => return Err(err),
         }
     }
