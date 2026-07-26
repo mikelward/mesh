@@ -654,12 +654,9 @@ than the string the argv boundary would have produced.
       test make that a per-command answer rather than the shell's, since words are
       rendered before a redirection is opened. `NO_COLOR` (non-empty, per
       no-color.org) and `TERM=dumb` drop it. Re-styling is additive.
-- [ ] **A value call as a command argument.** `puts style(x, fg: red)`,
-      `puts re(a)` and `puts $f(1)` are all syntax errors today — the parser takes
-      no call in an argument position, so a styled value has to reach `puts` through
-      a variable or a function's return value. That is the natural spelling for a
-      prompt segment, so nothing is blocked, but it is the first thing anyone tries.
-      Not specific to `style`; whatever fixes it fixes all three.
+- [ ] **A value call as a command argument** — one corner of "no value expression in
+      an argument position", tracked under §"Loose ends". `puts style(x, fg: red)` is
+      the spelling anyone tries first, and it is a syntax error.
 - [ ] **256-color and truecolor.** `Color` is the sixteen ANSI names, which is what
       every color-capable terminal agrees on. Going further needs a spelling for the
       value (`fg: 33`? `fg: "#8be9fd"`? both?) and a **downgrade** rule to the
@@ -904,6 +901,38 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
 
 Small items rescued from pull requests that were closed as superseded — the bulk
 of each PR had landed by another route, but these pieces had not.
+
+- [ ] **No value expression can sit in an argument position.** Every one of these is
+      `syntax error: expected a command word`, while each works in a value position:
+
+      ```
+      puts $(pwd)        ls $(pwd)          # command substitution — the big one
+      puts (1 + 2)                          # `DESIGN.md` §"Arithmetic" writes this verbatim
+      puts style(x, fg: red)   puts re(a)   # value constructors
+      puts $f(1)         puts pwd():capture # a call, and a capture
+      ```
+
+      `DESIGN.md` uses two of these in its own examples — `puts $(ls)` in §"I/O" and
+      `puts (1 + 2)` in §"Arithmetic" — so this is unimplemented rather than
+      undecided. `$(…)` in an argument is the most-used construct in any shell after
+      variables, which makes this the largest gap in the language today.
+
+      The parser already *intends* it: `value_start_in`'s comment says "`puts (1 + 2)`
+      is `puts` with an argument", and it is only the statement-level command/value
+      discrimination that reads it that way. The argument loop never got the other
+      half — `parser::command` calls `command_word` for every item, and
+      `token_word_pieces` rejects `(`, `$(`, `[` and an attached call, which is
+      where the error comes from. So the shape of the fix is a third `CommandItem`
+      beside `Word` and `Redirect`, plus the expansion path in `repl` that turns one
+      into argument values. Everything downstream of that already exists: the
+      evaluator handles all these forms in a value position.
+- [ ] **`$(…)` does not interpolate inside `"…"`.** `puts "at $(pwd) now"` prints
+      `at $(pwd) now` — the substitution is literal text, not a value. Separate
+      machinery from the item above (interpolation, not argument parsing) and it has
+      its own `DESIGN.md` counter-example: the prompt segment
+      `func host-info() { style("$(hostname)", fg: red) }` yields the *string*
+      `$(hostname)`, so the documented way to write a prompt cannot work. `$var` and
+      `${…}` do interpolate; only the capture form is missing.
 
 - [x] **FreeBSD compile-check in CI.** `cargo check --workspace --all-targets
       --target x86_64-unknown-freebsd` runs alongside the macOS cross-check, so a
