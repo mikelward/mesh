@@ -2503,10 +2503,15 @@ so a **bare id** there (`fg 2`) is unambiguous. The **handle** (`$sh.jobs[2]`, o
 the finished job's record carries its final `status` at that point before leaving
 `$sh.jobs`.
 
-*(deferred past the spike: the fuzzy `%?string` (substring) reference;
-per-stage `pipestatus` on a backgrounded pipeline; and a `jobdone` hook to fire on completion. Terminal plumbing —
-process groups, `tcsetpgrp`, `SIGTSTP`/`SIGCONT` — is implementation, not
-surface.)*
+A **`jobdone` hook** fires alongside that notice, once per finished job, taking
+`id`, `command`, and `status` — see `docs/REFERENCE.md`. It runs where the notice
+is printed rather than the instant the job ends, so it carries the same timing:
+a job that finishes while a line is being typed is reported once that line is
+submitted.
+
+*(deferred past the spike: the fuzzy `%?string` (substring) reference, and
+per-stage `pipestatus` on a backgrounded pipeline. Terminal plumbing — process
+groups, `tcsetpgrp`, `SIGTSTP`/`SIGCONT` — is implementation, not surface.)*
 
 ### Signals
 

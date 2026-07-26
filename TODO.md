@@ -480,9 +480,43 @@ file as tasks land.
       the prompt around the notice, which is a reedline integration question
       rather than a job-control one — reedline owns the terminal read, and
       `SIGCHLD` carries `SA_RESTART` outside a wait precisely so it does *not*
-      disturb that read. The `jobdone` hook `DESIGN.md` reserves wants the same
-      machinery, and cannot run *from* the handler in any case, since it is
-      arbitrary mesh code and the handler may only forward.
+      disturb that read. The `jobdone` hook now fires from that same `reap`, so
+      it inherits the same timing and moving the notice moves the hook with it —
+      neither could ever run *from* the handler, being arbitrary mesh code where
+      the handler may only forward.
+
+      What reedline offers is its `external_printer` feature, which prints above
+      the prompt and repaints around it — the redraw half, solved. The cost is
+      the other half: attaching a printer switches reedline's terminal read from
+      blocking to `poll`ing on a 100ms interval, and it is attached for the life
+      of the editor, so an idle prompt with no jobs at all wakes ten times a
+      second forever. That is the decision this is really waiting on, and the
+      shapes are: accept the polling; make it opt-in as bash does with `set -b`
+      (a `notify` option), so only sessions that ask pay for it; or rebuild the
+      editor as the job table goes empty and non-empty, so the polling lasts
+      exactly as long as there is something to report. The last is closest to
+      free at the prompt and the most machinery, and needs the editor's history
+      and session state to survive a rebuild.
+- [ ] **A `mesh-core` unit test occasionally hangs the whole suite.** Seen three
+      times in roughly a dozen `cargo test --workspace` runs, always after the
+      CLI tests have passed, and in a *different* test each time —
+      `exec::tests::spawn_failure_reclaims_the_terminal` once,
+      `repl::tests::named_prompt_hooks_replace_in_place_and_run_before_the_prompt`
+      another — each reported as "has been running for over 60 seconds" and never
+      finishing. Not cargo and not a leaked pipe: the CLI test binary itself
+      exits promptly (~26s over five direct runs), and no `Blocking waiting for
+      file lock` appears in any log.
+
+      The suspected mechanism is the classic one for these tests: they `fork()`
+      from the multi-threaded test harness, and a child that touches a lock some
+      other thread held at fork time (the allocator's, or the reaper's) blocks
+      forever — after which the parent's blocking `waitpid` never returns, which
+      is exactly the shape observed. Unproven: it has not been caught in the act,
+      and three attempts to reproduce it deliberately (including under load) came
+      back clean. Worth attaching a debugger to the child on the next occurrence
+      rather than guessing again. Note one of the two sightings predates
+      `JobTable::drop` learning to poll, so that change is not the cause even
+      though it added a lock to a path a forked child can reach.
 - [ ] **A stopped job killed from outside can still be reported stopped.**
       `wait` reports a stopped job's cached stop rather than blocking, since a
       stopped job does not finish on its own. Our own `kill -KILL` clears that
