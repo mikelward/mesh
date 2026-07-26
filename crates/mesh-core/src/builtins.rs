@@ -6,6 +6,7 @@
 
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -14,6 +15,7 @@ pub(crate) const NAMES: &[&str] = &[
     "cd",
     "pwd",
     "puts",
+    "clip",
     "exit",
     "fg",
     "bg",
@@ -53,6 +55,7 @@ pub(crate) fn help(name: &str) -> Option<String> {
         "cd" => "cd [DIR]",
         "pwd" => "pwd",
         "puts" => "puts [ARG ...]",
+        "clip" => "clip [TEXT ...]",
         "exit" => "exit [N]",
         "fg" | "bg" => return Some(format_help(&format!("{name} [JOB]"))),
         "jobs" => "jobs",
@@ -86,6 +89,7 @@ pub fn dispatch(words: &[String], last: u8) -> Option<Builtin> {
         "cd" => Some(Builtin::Status(cd(&words[1..]))),
         "pwd" => Some(Builtin::Status(pwd(&words[1..]))),
         "puts" => Some(Builtin::Status(puts(&words[1..]))),
+        "clip" => Some(Builtin::Status(clip(&words[1..]))),
         "exit" => Some(exit(&words[1..], last)),
         _ => None,
     }
@@ -210,6 +214,91 @@ fn puts(args: &[String]) -> u8 {
     write_stdout("puts", &line)
 }
 
+/// How much base64 `clip` will send. Terminals bound the sequence they will
+/// accept and drop anything longer without saying so; xterm's limit is the
+/// smallest of the common ones, and a refusal that names the size beats a
+/// clipboard that silently did not change.
+const CLIP_LIMIT: usize = 74_994;
+
+/// `clip [TEXT …]` — copy to the terminal's clipboard with `OSC 52`, per
+/// `DESIGN.md` "terminal control". With no arguments it reads stdin, so
+/// `puts hi | clip` and `clip hi` both work. Arguments join with a space, as
+/// `puts` does, and neither form adds a trailing newline: a clipboard holds what
+/// was asked for, and a stray newline shows up when it is pasted into a shell.
+///
+/// The sequence goes to `/dev/tty`, not stdout. It is a message to the terminal
+/// rather than program output, so stdout is the wrong channel twice over:
+/// `clip x > file` would put escape bytes in the file and nothing on the
+/// clipboard, and `clip` inside a pipeline would corrupt the stream. Writing to
+/// the terminal directly also lets a *script* copy, which is the point of having
+/// this over hand-emitting the escape.
+///
+/// Whether the copy lands is the terminal's business: OSC 52 is widely but not
+/// universally implemented — xterm wants `allowWindowOps`, tmux wants
+/// `set-clipboard on` — and there is no reply to wait for, so a successful write
+/// means "asked", not "copied". Reading the clipboard back is deliberately not
+/// here: it needs a query and a response, so it can block on a terminal that will
+/// never answer.
+fn clip(args: &[String]) -> u8 {
+    let text = if args.is_empty() {
+        let mut buffer = Vec::new();
+        if let Err(err) = std::io::Read::read_to_end(&mut std::io::stdin(), &mut buffer) {
+            note!("mesh: clip: {err}");
+            return 1;
+        }
+        buffer
+    } else {
+        args.join(" ").into_bytes()
+    };
+    let encoded = base64(&text);
+    if encoded.len() > CLIP_LIMIT {
+        note!(
+            "mesh: clip: {} bytes is more than the {CLIP_LIMIT}-byte limit terminals accept",
+            encoded.len()
+        );
+        return 1;
+    }
+    let sequence = format!("\x1b]52;c;{encoded}\x1b\\");
+    match OpenOptions::new().write(true).open("/dev/tty") {
+        Ok(mut terminal) => match terminal.write_all(sequence.as_bytes()) {
+            Ok(()) => 0,
+            Err(err) => {
+                note!("mesh: clip: {err}");
+                1
+            }
+        },
+        Err(err) => {
+            note!("mesh: clip: no terminal to copy through: {err}");
+            1
+        }
+    }
+}
+
+/// Standard base64, the alphabet `OSC 52` carries its payload in.
+///
+/// Written out rather than taken as a dependency: it is the one encoding mesh
+/// needs, and twenty lines is cheaper than a crate in the build graph.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        // Missing bytes count as zero and their characters become `=`, which is
+        // what the padding means: this many sextets carry no data.
+        let packed = u32::from(group[0]) << 16
+            | u32::from(group.get(1).copied().unwrap_or(0)) << 8
+            | u32::from(group.get(2).copied().unwrap_or(0));
+        for sextet in 0..4 {
+            if sextet <= group.len() {
+                let index = (packed >> (18 - 6 * sextet)) & 0x3f;
+                out.push(char::from(ALPHABET[index as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// `exit [N]` — leave the shell with status `N`. With no argument it exits with
 /// the **last command's status** (`last`), the POSIX convention (`false; exit`
 /// leaves 1), not a bare 0. The status is an 8-bit process status, so an
@@ -236,7 +325,7 @@ fn exit(args: &[String], last: u8) -> Builtin {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_builtin, path_line};
+    use super::{base64, help, is_builtin, path_line};
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -251,5 +340,42 @@ mod tests {
         assert!(is_builtin("jobs"));
         assert!(is_builtin("fg"));
         assert!(is_builtin("bg"));
+    }
+
+    #[test]
+    fn base64_matches_the_rfc_4648_vectors() {
+        // Every padding case, from the RFC's own examples: no padding, one `=`,
+        // two `=`. Getting the padding wrong is the classic way to write an
+        // encoder that works on a third of its inputs.
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_encodes_bytes_rather_than_text() {
+        // A clipboard carries whatever it was handed, so the encoder takes bytes:
+        // not UTF-8, and not text at all.
+        assert_eq!(base64(b"\xff\xff\xff"), "////");
+        assert_eq!(base64(b"\x00\x00\x00"), "AAAA");
+        assert_eq!(base64(b"\xff"), "/w==");
+        assert_eq!(base64("é".as_bytes()), "w6k=");
+        // Both characters that distinguish standard base64 from the URL-safe
+        // alphabet, which a terminal would not accept.
+        assert_eq!(base64(b"\xfb\xef\xbe"), "++++");
+        assert_eq!(base64(b"\xff\xef\xbf"), "/++/");
+    }
+
+    #[test]
+    fn clip_is_a_builtin_with_help() {
+        assert!(is_builtin("clip"));
+        assert_eq!(
+            help("clip").as_deref(),
+            Some("Usage: clip [TEXT ...]\n\nOptions:\n  --help  Print help\n")
+        );
     }
 }
