@@ -546,6 +546,23 @@ file as tasks land.
 - [ ] The rest of `$sh.*`: the hook maps, `$sh.complete`, and `$sh.signal`.
       `$sh.options` has landed, along with the per-key mutability the rest of the
       configuration half needs.
+- [ ] **`$sh.options` values are booleans, and its keys are flat.** Both hold for
+      every setting that exists, and neither is a decision against the alternatives
+      — they are simply what was needed. Two things would force the shape open, and
+      it is worth knowing which:
+  - [ ] A setting with a **third state**. The `auto`/`yes`/`no` shape `DESIGN.md`
+        discusses is about *function* flags (§"Functions", the negatable/tri-state
+        TODO), not about settings, so nothing here is waiting on it — but a
+        settings-side case is easy to imagine (`ls --color=auto`'s question:
+        decorate when the terminal wants it, not merely when interactive). Today
+        `Options` is an array of `AtomicBool` and `assign` accepts only
+        `Value::Boolean`; a third state means a per-setting value *type*, and the
+        strict "`true` or `false`" message becomes per-setting too.
+  - [ ] A **nested** setting. `DESIGN.md` already writes one —
+        `$sh.options.complete.probe` — which the flat map cannot hold: the write
+        path stops at one key past `options` and says a setting has nothing inside
+        it. Deciding whether that key is spelled `complete.probe` (flat, with a dot
+        in the name) or a real submap is what unblocks it.
 
 ## Beyond M3 — Terminal integration
 
