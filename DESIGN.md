@@ -2482,10 +2482,8 @@ so a **bare id** there (`fg 2`) is unambiguous. The **handle** (`$sh.jobs[2]`, o
 the finished job's record carries its final `status` at that point before leaving
 `$sh.jobs`.
 
-*(deferred past the spike: `disown` / nohup-style persistence past shell exit;
-`wait` with no args / multiple jobs and its aggregate status; the fuzzy
-`%?string` (substring) reference; per-stage `pipestatus` on a backgrounded
-pipeline; and a `jobdone` hook to fire on completion. Terminal plumbing —
+*(deferred past the spike: the fuzzy `%?string` (substring) reference;
+per-stage `pipestatus` on a backgrounded pipeline; and a `jobdone` hook to fire on completion. Terminal plumbing —
 process groups, `tcsetpgrp`, `SIGTSTP`/`SIGCONT` — is implementation, not
 surface.)*
 
@@ -2510,8 +2508,8 @@ signals never end your session; only a lost terminal (SIGHUP) does:
 - **SIGHUP** (terminal closed) — the shell exits, **SIGHUPs its jobs, then sends
   SIGCONT to any that are *stopped*** (a stopped job can't act on the HUP until it's
   continued; a running job just gets the HUP); **SIGTERM** is ignored interactively
-  (as bash does). (A `disown` exemption from the HUP arrives with `disown` itself,
-  which is [deferred](#job-control).)
+  (as bash does). (`disown` exempts a job from this HUP; `disown -h`
+  keeps the job in the table and exempts only the hangup.)
 
 **User handlers are keyed hook maps, not bash's `trap`.** `$sh.signal.<NAME>` is an
 insertion-ordered map of named callables — the *same shape* as `$sh.preprompt` and

@@ -442,9 +442,70 @@ A job that is **stopped** does not finish on its own, so waiting for one reports
 its `128 + signal` stop status straight away rather than blocking on it; `bg`
 or `fg` is what a stopped job wants.
 
-Unlike bash, `wait` needs a job: the no-operand form there means "every child,
-with an aggregate status", which is not yet decided here. `disown` is not
-implemented — see [`DESIGN.md`](../DESIGN.md#job-control).
+A bare `wait` waits for **every job in the table**, oldest first, and several
+operands (`wait 1 2`) wait for each in turn. Either way the status is **the last
+job to fail, or 0 if none did** — the pipefail rule applied to the other place
+where several things finish at once. bash returns 0 from a bare `wait`
+regardless, which discards the one thing the caller waited to find out.
+
+Both forms treat a stopped job the way naming it does: its stop status counts
+towards the answer, and it is left in the table rather than blocked on. One
+Ctrl-C ends the whole wait at 130, however many jobs were still to come; they
+keep running and keep their places.
+
+`disown` gives a job up:
+
+```mesh
+make -j8 &
+disown              # not this shell's job any more
+```
+
+A disowned job leaves the table, so `jobs` no longer lists it, `fg` / `bg` /
+`wait` can no longer name it, a bare `wait` does not wait for it, and it is not
+hung up when the shell exits. It stays the shell's *child* — it is still reaped,
+so it cannot become a zombie — but nothing is left that reports its status.
+
+`disown -h` is the narrower form: the job stays in the table in every way, and
+only the hangup is skipped. Use `-a` for every job or `-r` for the running ones;
+with no operand it is the current job. `-a` and `-r` name different sets, so
+giving both is an error rather than a silent choice between them. Neither takes
+a job.
+
+"Running" for `-r` means what it says: not stopped, and not already finished
+either. A job that has exited but whose status nobody has collected yet is still
+in the table with a status to hand back, and `-r` leaves it there.
+
+**A job that is stopped when it is given up does not outlive the shell**, under
+either form, and `disown` says so:
+
+```
+mesh$ disown
+mesh: disown: [1] is stopped and will not survive the shell; `bg %1` first
+```
+
+The exemption cannot cover it. Once the shell that parented it goes, its process
+group is orphaned, and the kernel — not mesh — sends SIGHUP then SIGCONT to an
+orphaned group containing a stopped process. The only way to prevent that would
+be to continue the group as the shell leaves, which means resuming a job you
+stopped on purpose, without asking, at the one moment you can no longer object.
+bash and zsh both decline to do that and warn instead; so does mesh. `bg` it
+first and the disown holds.
+
+A `disown -h` job stays in the table, so it can stop *after* it was given up.
+The exemption is void just the same, and the shell says so on the way out:
+
+```
+mesh: exit: [1] is stopped, so it will not survive the shell
+```
+
+A job given up by a plain `disown` gets no such warning, because it left the
+table — a stop after that point is not something the shell can see.
+
+| | listed by `jobs` | named by `fg` / `wait` | waited by bare `wait` | hung up at exit |
+|---|---|---|---|---|
+| ordinary job | yes | yes | yes | yes |
+| `disown -h` | yes | yes | yes | **no** |
+| `disown` | **no** | **no** | **no** | **no** |
 
 ### Custom prompts and hooks
 

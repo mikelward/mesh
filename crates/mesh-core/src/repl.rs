@@ -92,6 +92,15 @@ impl Shell {
         if self.forked {
             return;
         }
+        // Children the shell still owns but no longer has a *job* for — what a
+        // plain `disown` leaves behind, and what a forked stage's background
+        // children always were. Nothing else would collect them: the handler
+        // only forwards, and the table is the only other thing that drains, so
+        // an empty table used to mean a discarded child stayed a zombie for the
+        // rest of the session. Still no syscall in the common case — once
+        // everything is reaped the reaper owns nothing and this walks an empty
+        // set.
+        crate::reaper::drain();
         // No jobs means no syscall, which is the common case.
         let jobs = if self.jobs.has_jobs() {
             self.jobs.info()
@@ -4320,7 +4329,7 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
 /// `kill $j`, `kill $j 2>/dev/null` and `kill $j | cat` have to agree.
 fn job_builtin_words(words: &[Word], vars: &Vars) -> Option<Result<Vec<String>, Step>> {
     let name = command_name(words, vars)?;
-    if !matches!(name.as_str(), "fg" | "bg" | "wait" | "kill") {
+    if !matches!(name.as_str(), "fg" | "bg" | "wait" | "kill" | "disown") {
         return None;
     }
     let mut expanded = vec![name];
@@ -4430,7 +4439,7 @@ fn run_expanded(words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
         // terminal, and signalling needs permission rather than parenthood, so a
         // forked stage can do it with the table it inherited — `kill %1 | cat`
         // works as bash's does.
-        "fg" | "bg" | "wait" if shell.forked => {
+        "fg" | "bg" | "wait" | "disown" if shell.forked => {
             note!("mesh: {}: no job control in a pipeline stage", words[0]);
             Some(1)
         }
@@ -4441,6 +4450,7 @@ fn run_expanded(words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
             Some(shell.jobs.wait(&words[1..], interactive))
         }
         "kill" => Some(shell.jobs.kill(&words[1..])),
+        "disown" => Some(shell.jobs.disown(&words[1..])),
         "jobs" => Some(shell.jobs.list(&words[1..], !shell.forked)),
         _ => None,
     };

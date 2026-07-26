@@ -80,8 +80,8 @@ makes a shell a shell.
 - Process groups, `tcsetpgrp`, foreground signal handling, stopped-job tracking,
   `&` background launch, and `jobs` / `fg` / `bg` / `wait` / `kill` ✅ landed.
   `j = cmd &` binds a job handle, and `fg` / `bg` / `wait` / `kill` take it or a
-  `%` reference. `wait`'s no-operand "every child" form and `disown` remain
-  planned.
+  `%` reference. `wait` takes no operand (every job in the table) or several,
+  reporting the last failure, and `disown` gives a job up ✅ landed.
 - **Ctrl-C returns to the prompt** with status `130` (child gets SIGINT, shell
   survives) ✅ landed.
 - Hand the terminal to full-screen programs (`vim`) and get it back cleanly ✅
