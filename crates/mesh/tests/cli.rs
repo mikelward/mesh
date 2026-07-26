@@ -251,6 +251,55 @@ fn run_with_bytes(input: &[u8]) -> Output {
     child.wait_with_output().expect("wait for mesh")
 }
 
+/// Run mesh in its own session, so it has no controlling terminal at all.
+///
+/// Whether the test runner has one is not something the suite can assume — it does
+/// under `cargo test` in a terminal and does not in CI — and `/dev/tty` is exactly
+/// the difference. `setsid` makes the answer the same either way.
+fn run_without_a_terminal(input: &str) -> Output {
+    let mut command = mesh_command();
+    // SAFETY: `setsid` between fork and exec is async-signal-safe, and the child
+    // is never a process-group leader here, so the call cannot fail for that.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for mesh")
+}
+
+#[test]
+fn clip_needs_a_terminal_and_says_so() {
+    // The sequence is a message to the terminal, so with no terminal there is
+    // nowhere to send it — and nothing is written to stdout, which is the mistake
+    // worth guarding: an escape on stdout would corrupt a pipeline and still not
+    // reach any clipboard.
+    let out = run_without_a_terminal("clip hi\nputs status=$sh.status\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mesh: clip: no terminal"),
+        "stderr was {stderr:?}"
+    );
+    assert!(stdout.contains("status=1"), "stdout was {stdout:?}");
+    assert!(!stdout.contains("\x1b]52"), "stdout was {stdout:?}");
+}
+
 #[test]
 fn runs_an_external_command() {
     let out = run_with_input("echo hello\n");
@@ -1940,6 +1989,66 @@ fn term_change_harness(exec: &MeshExec) -> i32 {
         return 135;
     }
     unsafe { libc::close(shell.master) };
+    0
+}
+
+#[test]
+fn clip_copies_through_the_terminal() {
+    let exec = MeshExec::new(isolated_config_home());
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(clip_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// `clip` reaches the terminal, from an argument and from a pipe.
+///
+/// A pty is the only place this shows: the sequence goes to `/dev/tty` rather than
+/// stdout, precisely so that a redirect or a pipeline cannot swallow it, which also
+/// means no piped test can see it arrive.
+fn clip_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 140;
+    };
+    if !pty_write(shell.master, b"clip hello world\n") {
+        return 141;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 142;
+    };
+    if status != 0 {
+        return 143;
+    }
+    // `aGVsbG8gd29ybGQ=` is `hello world`: arguments join with a space, as `puts`
+    // does, and nothing is added to what was asked for.
+    if occurrences(&seen, b"\x1b]52;c;aGVsbG8gd29ybGQ=\x1b\\") == 0 {
+        return 144;
+    }
+    // From a pipe, with no arguments — and the newline `puts` wrote is part of what
+    // was handed over, so `cGlwZWQK` decodes to `piped\n`. `clip` copies what it is
+    // given rather than deciding which bytes the user meant.
+    if !pty_write(shell.master, b"puts piped | clip\n") {
+        return 145;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 146;
+    };
+    if status != 0 {
+        return 147;
+    }
+    if occurrences(&seen, b"\x1b]52;c;cGlwZWQK\x1b\\") == 0 {
+        return 148;
+    }
+    if !stop_pty_shell(shell) {
+        return 149;
+    }
     0
 }
 

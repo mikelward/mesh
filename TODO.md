@@ -604,19 +604,40 @@ that could change a command's status would be worse than a missing decoration.
       dependency decision as much as a feature, and worth taking once rather than
       per sequence — `hs`/`tsl` is the same question OSC 52 and the notification
       sequences will ask.
-- [ ] **`sgr_stripped_width` skips only CSI SGR.** An OSC sequence in a custom
-      prompt is counted as visible width, so the continuation indicator comes out
-      too long. Reachable today: `\e` is a supported escape, and hand-rolling
-      `prompt "\e]0;…\a mesh$ "` is what people will do until the title item above
-      lands.
+- [x] **The prompt width scan counted escape sequences as columns.** It
+      recognized only SGR, so an OSC title in a custom prompt — `prompt
+      "\e]0;mesh\a mesh$ "`, the reachable case — was measured as if it printed and
+      the continuation indicator came out that much too long. `escape_stripped_width`
+      (renamed, since the old name was the wrong claim) now discounts OSC to either
+      terminator and CSI with any final byte. Cursor motion is deliberately not
+      modeled: reedline lays out the same line with every escape at zero width, and
+      the number has to agree with the editor rather than with the terminal.
 - [ ] **OSC 633** — VS Code's extension of 133, which reedline also ships markers
       for. Picking the dialect from `$env.TERM_PROGRAM` is the same capability
       question the title sequence asks, so decide them together.
 - [ ] **Hyperlinks** (OSC 8) — a `link(text, url)` sibling to `style()`, per
       `DESIGN.md`, rather than a raw escape.
-- [ ] **Clipboard** (OSC 52) and **notifications** (OSC 9 / 777) — builtins. The
-      notification's threshold has its input already: `postexec` is handed the
-      command's elapsed milliseconds. OSC 9;4 progress reporting belongs with it.
+- [x] **Clipboard** (OSC 52) — the `clip` builtin. `clip TEXT …` joins its
+      arguments with a space as `puts` does; with no arguments it reads stdin, so
+      `puts hi | clip` works. It copies exactly the bytes it was handed — a pipe's
+      trailing newline included — because "copy what you were given" needs no
+      exception list, and base64 is written out rather than taken as a dependency.
+      The sequence goes to `/dev/tty`, not stdout: it is a message to the terminal,
+      so `clip x > file` would otherwise put escapes in the file and nothing on the
+      clipboard, and `clip` in a pipeline would corrupt the stream. Writing to the
+      terminal also lets a *script* copy, which is the point of the builtin over a
+      hand-emitted escape. Refused above 74,994 bytes of base64, the smallest of the
+      common terminal limits, since past it a terminal drops the sequence without
+      saying so. Whether the copy lands is the terminal's business — xterm wants
+      `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success
+      means "asked", not "copied".
+      Deferred: **reading** the clipboard back, which needs a query and a response
+      and so can block on a terminal that never answers; and the `p` (primary)
+      selection.
+- [ ] **Notifications** (OSC 9 / 777) — a builtin, plus an automatic one when a
+      long command finishes. The threshold has its input already: `postexec` is
+      handed the command's elapsed milliseconds. OSC 9;4 progress reporting belongs
+      with it.
 - [ ] **Cursor shape per mode** (DECSCUSR) — blocked on vi mode; the line editor
       is Emacs-only today.
 - [ ] **Synchronized output** (DEC 2026) — belongs around reedline's repaint

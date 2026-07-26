@@ -3022,8 +3022,13 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
   cds internally, a startup file — without a `postcd` hook of its own.
 - ***Hyperlinks*** *(OSC 8)* — clickable paths/URLs in output; likely a `style()`
   sibling (`link(text, url)`) rather than a raw escape, keeping color-as-data.
-- ***Clipboard*** *(OSC 52)* — copy to the terminal's clipboard (works over ssh); a
-  builtin.
+- ***Clipboard*** *(OSC 52)* — **decided: a builtin, `clip`.** `clip TEXT …` or
+  `… | clip`, copying the bytes it was handed to the terminal's clipboard, which is
+  what makes it work over `ssh` where no local clipboard tool can be reached. The
+  sequence goes to `/dev/tty` rather than stdout, since it is a message to the
+  terminal and not output — that is also what lets a script copy. Reading the
+  clipboard back stays out: it needs a query and a reply, so it can block on a
+  terminal that never answers.
 - ***Notifications*** *(OSC 9 / 777)* — desktop notification, e.g. auto-notify when a
   long command finishes (pairs with the `postexec` duration).
 - ***Cursor shape per mode*** *(DECSCUSR `\e[…q`)* — block in vi NORMAL, bar in
@@ -3033,7 +3038,7 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
   updates atomically without flicker.
 
   Decide per feature: automatic, a hook/builtin, or out of scope (left to a
-  hand-emitted `print "\e…"`). The four marked **decided** above have landed;
+  hand-emitted `print "\e…"`). The five marked **decided** above have landed;
   `TODO.md` §"Beyond M3 — Terminal integration" tracks the rest.)*
 
 **Command hooks fire for the outer interactive command only.** `preexec` /
