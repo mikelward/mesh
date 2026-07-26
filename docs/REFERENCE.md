@@ -680,6 +680,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `gets [var]` | Read one line from stdin, strip its trailing newline, and bind it to `var`. **At end of input the status is `1` and `var` is left unchanged**, which is what terminates `while gets line { … }`. An empty line is a successful read of `""` — a blank line mid-file must not end a loop — so only a zero-byte read ends it, and a final line with no trailing newline is still a line. A line that is not valid UTF-8 is **refused** rather than repaired — status `2`, and `var` is left alone — following the capture rather than `$env`'s lossy read; status `2` is also what an I/O error reports, so `1` means end of input and nothing else. Interactively, **Ctrl-C cancels a read** — status `130`, and `var` keeps whatever it held, since a cancelled read has read nothing. It reads a byte at a time, so the bytes after the line reach whatever runs next rather than being swallowed by a buffer. With no `var` it consumes the line and reports only whether there was one. The value form `gets()`, which yields the line into an expression, is not wired up yet. |
 | `style(text, fg: …, bg: …, bold: …)` | A [styled value](#styled-values) — text plus display attributes. A **value call**, parens attached, because a command position yields a status. Colors are the sixteen ANSI names: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `grey` (or `gray`, or `bright-black`), and `bright-` forms of the rest. |
 | `link(text, url)` | A [styled value](#styled-values) carrying an `OSC 8` hyperlink, so `text` is clickable. The url needs a **scheme** (`https://…`, `file://host/path`) and anything RFC 3986 forbids raw is percent-encoded, a space included; over 2083 encoded bytes is refused, since past a terminal's own limit the whole sequence — link text included — is dropped. |
+| `glob(pattern)` · `files(dir = ".")` · `dirs(dir = ".")` | The paths a pattern matches, and a directory's immediate files or subdirectories — a **list**, since these are [value calls](#the-glob-family) rather than commands. |
 | `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`. `CDPATH` and autocd are not implemented, so a bare directory name is a command, not a `cd`. |
 | `pwd` | Print the working directory. |
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
@@ -1066,6 +1067,49 @@ Applied to each word before the command runs.
 A pattern that matches nothing contributes **no arguments**. A word with no
 pattern character is a literal and passes through unchanged. Quoting a pattern
 character makes it literal.
+
+### The `glob` family
+
+The same expansion, asked for as a [value call](#functions), so it answers with a
+**list** of paths instead of replacing a word:
+
+| Call | Yields |
+| --- | --- |
+| `glob(pattern)` | The paths `pattern` matches. |
+| `files(dir = ".")` | The files directly in `dir`. |
+| `dirs(dir = ".")` | The subdirectories of `dir`. |
+
+```
+for d in dirs() { puts "$d/" }     # walk the working directory
+for f in files(src) { … }          # or a named one
+found = glob("*.log")              # bind the list and reuse it
+ls ...$found                       # a stored list still spreads into argv
+```
+
+`glob` is what expands a pattern the program **built**, since a value never
+re-globs on its own: `ls $p` passes the string `*.jpg` verbatim, and `glob($p)`
+hands over its matches. There is no lazy glob value — the call expands when it
+runs, and deferring it is an ordinary thunk (`later = func() { glob("*.txt") }`,
+re-globbing on each `$later()`).
+
+`files` and `dirs` are that call preset to `DIR/*` plus the type filter the name
+already carries — the same filter the `:files` / `:dirs`
+[modifiers](#modifiers) name. Entries come back sorted, hidden entries skipped,
+and prefixed by the directory: `files(src)` yields `src/deep.txt`, while the
+default `.` adds no prefix.
+
+Everything else is the word rule above. **Nothing matched is the empty list**,
+which covers a missing or unreadable directory, so programmatic use never throws;
+a malformed pattern is the one error, since a `glob()` call — unlike a word,
+which can still be a filename — has nothing else to mean. The argument is a plain
+string and so takes no tilde expansion, for the same reason `ls $p` takes none;
+write `~/…` as a bare argument (`dirs(~/src)`), which the *word* rules expand
+before the call sees it, or `glob("$env.HOME/…")`. A path that starts with `.` is
+quoted — `dirs(".")`, `files("../src")` — because bare `.` and `..` are the
+member and range operators.
+
+These are calls, never commands: a bare `dirs` is a command-not-found, and the
+names are reserved so `func dirs(…)` is refused.
 
 ## Quoting
 
@@ -2167,9 +2211,10 @@ x += "!"                      # 'danger!'            — a plain string; attribu
 /bin/echo $danger             # danger               — argv carries bytes
 ```
 
-`style` and `link` are reserved names, like `re`: a `func style(…)` would be
-reachable as a command but never as a value call, so it is refused rather than
-shipped as a function whose meaning depends on how it is called.
+`style` and `link` are reserved names, like `re` and the
+[`glob` family](#the-glob-family): a `func style(…)` would be reachable as a
+command but never as a value call, so it is refused rather than shipped as a
+function whose meaning depends on how it is called.
 
 Attributes are **added**, not replaced, so a segment can be emphasized without
 knowing its color — and a call naming no attribute is simply a string:
@@ -2246,7 +2291,9 @@ family (`:replaceall`, `:replacestart`, `:replaceend`), and `:map` / `:filter` /
 the first-only `:replace`, the time and sort families) is not implemented, and
 neither are the regex capture modifiers or a capture backreference in a
 replacement. One of them **spread** at a command boundary
-(`puts ...$x:split(":")`) is also not implemented — bind it first.
+(`puts ...$x:split(":")`) is also not implemented — bind it first, which is the
+same gap a spread value call hits (`ls ...glob($p)` → `found = glob($p)`,
+`ls ...$found`).
 `gets` reads a line as a command; the value form `gets()` does not.
 Of heredocs, the command-redirection form documented under
 Commands works, as do here-strings; a value-producing heredoc spelling does not.

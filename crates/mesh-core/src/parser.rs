@@ -229,7 +229,7 @@ impl std::fmt::Display for ParseError {
             ParseErrorKind::ReservedFunctionName(name) => {
                 write!(
                     f,
-                    "syntax error: `{name}` is a built-in value constructor and cannot be a function name"
+                    "syntax error: `{name}` is a built-in value call and cannot be a function name"
                 )
             }
             ParseErrorKind::DuplicateParameter(name) => {
@@ -1731,9 +1731,18 @@ fn token_word_pieces(kind: &TokenKind) -> Option<Vec<WordPiece>> {
     }])
 }
 
-/// Names that cannot be user functions because they are built-in **value**
-/// constructors, reachable only through the `name(...)` call form.
-const RESERVED_FUNCTION_NAMES: &[&str] = &["re", "style", "link"];
+/// Names that cannot be user functions because they are built-in **values**,
+/// reachable only through the `name(...)` call form: the `re` / `style` / `link`
+/// constructors, and the `glob` family, which expands rather than constructs but
+/// answers with a value all the same.
+pub const RESERVED_FUNCTION_NAMES: &[&str] = &["re", "style", "link", "glob", "files", "dirs"];
+
+/// Does this name call a built-in **value** rather than a command? Asked wherever
+/// a call has to be told apart from a command that merely shares the call spelling
+/// — `f(…):capture` is one, since a command's record has no `.value` to fill in.
+pub fn value_builtin(name: &str) -> bool {
+    RESERVED_FUNCTION_NAMES.contains(&name)
+}
 
 struct Parser {
     tokens: Vec<Token>,
@@ -2294,11 +2303,11 @@ impl Parser {
     fn function(&mut self) -> Result<Executable, ParseError> {
         self.take_word("func");
         let name = self.name()?;
-        // `re(...)` and `style(...)` are built-in value constructors. A function of
-        // either name would be reachable as a command (`re x`) but never as a value
-        // call, since `re(x)` always builds a regex and `style(x)` always builds a
-        // styled value — so reserve the names rather than ship a function that
-        // behaves differently depending on how it is called.
+        // `re(...)`, `style(...)` and the `glob` family answer with a built-in value.
+        // A function of one of those names would be reachable as a command (`re x`)
+        // but never as a value call, since `re(x)` always builds a regex and
+        // `dirs(x)` always lists a directory — so reserve the names rather than ship
+        // a function that behaves differently depending on how it is called.
         if RESERVED_FUNCTION_NAMES.contains(&name.as_str()) {
             return Err(self.error(ParseErrorKind::ReservedFunctionName(name)));
         }

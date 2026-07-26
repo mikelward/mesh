@@ -464,6 +464,13 @@ for d in dirs()  { … }
 for f in files(src) { … } # a named directory
 ```
 
+They are `DIR/*` with the filter applied, so they inherit globbing's policies
+rather than growing their own: entries are sorted, a **hidden** entry is skipped
+(the `find` comparison above is about depth, not the dotfile rule — `*` is the
+authority there), and a missing or unreadable directory is the empty list, as any
+pattern that matched nothing is. An entry is prefixed by the directory it was
+asked for, `.` adding none — `files(src)` is `src/a.txt`, `files()` is `a.txt`.
+
 **Matching a string is a different operation.** Finding files (touches the disk) and
 asking "does this *string* look like this pattern" (no disk at all) split the way
 Python splits `glob` from `fnmatch`. The `~` operator carries the match side:

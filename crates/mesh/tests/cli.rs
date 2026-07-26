@@ -1231,6 +1231,170 @@ fn glob_star_excludes_dotfiles() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A directory with one file, one subdirectory, and one hidden entry of each —
+/// enough to tell the `files` / `dirs` split and the hidden rule apart.
+fn glob_family_dir(tag: &str) -> PathBuf {
+    let dir = fresh_dir(tag);
+    std::fs::write(dir.join("b.ext"), "").unwrap();
+    std::fs::write(dir.join("a.ext"), "").unwrap();
+    std::fs::write(dir.join(".hidden"), "").unwrap();
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::fs::create_dir(dir.join(".git")).unwrap();
+    std::fs::write(dir.join("sub").join("deep.ext"), "").unwrap();
+    dir
+}
+
+#[test]
+fn dirs_and_files_walk_the_working_directory_by_type() {
+    // The `for d in dirs() { … }` walk `DESIGN.md` §"Globbing" opens with: a value
+    // call, so it answers with a list the loop iterates rather than with a status.
+    let dir = glob_family_dir("glob_family_walk");
+    let out = run_with_input(&format!(
+        "cd {}\nfor d in dirs() {{ puts \"d:$d\" }}\nfor f in files() {{ puts \"f:$f\" }}\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "d:sub\nf:a.ext\nf:b.ext\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_glob_family_answers_with_a_list_value() {
+    // A list, not words: it can be bound, joined, and counted like any other, which
+    // is the whole point of the call form over the bare literal.
+    let dir = glob_family_dir("glob_family_list");
+    let out = run_with_input(&format!(
+        "cd {}\nfound = glob(\"*.ext\")\nputs $found:join(\",\")\nputs $found:len\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.ext,b.ext\n2\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn glob_expands_a_pattern_a_value_would_not() {
+    // The pair the design turns on: `ls $p` passes the pattern verbatim because a
+    // value never re-globs, and `glob($p)` is how the same string is expanded on
+    // purpose.
+    let dir = glob_family_dir("glob_family_runtime");
+    let out = run_with_input(&format!(
+        "cd {}\np = \"*.ext\"\nputs $p\nputs glob($p):join(\" \")\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "*.ext\na.ext b.ext\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_glob_family_takes_a_directory_and_prefixes_what_it_finds() {
+    // Entries come back as paths relative to where the caller stands, so an entry of
+    // a named directory is usable without rebuilding the prefix by hand.
+    let dir = glob_family_dir("glob_family_named");
+    let out = run_with_input(&format!(
+        "cd {}\nputs files(sub):join(\" \")\nputs files(\"{}/sub\"):join(\" \")\n",
+        dir.display(),
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("sub/deep.ext\n{}/sub/deep.ext\n", dir.display())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_glob_family_skips_hidden_entries_as_a_bare_star_does() {
+    // The wrappers are `DIR/*` with a type filter, so they inherit the per-component
+    // hidden rule rather than inventing a second one: `.git` is a directory and
+    // `.hidden` a file, and neither is reported.
+    let dir = glob_family_dir("glob_family_hidden");
+    let out = run_with_input(&format!(
+        "cd {}\nputs dirs():join(\" \")\nputs files():join(\" \")\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "sub\na.ext b.ext\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_glob_family_call_that_matches_nothing_is_the_empty_list() {
+    // Globbing's no-match rule, all the way through: a missing directory reads as a
+    // pattern that matched nothing, so programmatic use never throws.
+    let dir = glob_family_dir("glob_family_empty");
+    let out = run_with_input(&format!(
+        "cd {}\nputs dirs(nowhere):len\nputs glob(\"*.none\"):len\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n0\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_empty_directory_argument_is_no_directory_rather_than_the_root() {
+    // The empty path names nothing, so it takes the missing-directory answer. It
+    // must not reach the root: `DIR/*` loses a trailing slash on the way to a
+    // pattern, which is the one place `""` and `/` could quietly become the same
+    // lookup — and the wrong one is unbounded.
+    let out = run_with_input("puts files(\"\"):len\nputs dirs(\"\"):len\nputs dirs(\"/\"):len\n");
+    let counts = String::from_utf8_lossy(&out.stdout);
+    let counts: Vec<_> = counts.lines().collect();
+    assert_eq!(&counts[..2], ["0", "0"]);
+    // The root really does have subdirectories, so the two answers are distinct
+    // rather than both empty by accident.
+    assert_ne!(counts[2], "0", "{counts:?}");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn glob_reports_a_malformed_pattern() {
+    // Unlike a bare word, which can still be a filename and so falls back to itself,
+    // an explicit `glob()` was asked for a pattern and has nothing else to mean.
+    let out = run_with_input("puts glob(\"[\")\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("glob():"),
+        "{:?}",
+        out.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn the_glob_family_reports_a_directory_that_is_not_a_string() {
+    // `dirs(*.ext)` globs before the call sees it, so the argument arrives as a list
+    // — a mistake worth naming rather than treating the first match as the directory.
+    let dir = glob_family_dir("glob_family_kind");
+    let out = run_with_input(&format!(
+        "cd {}\nputs dirs(*.ext)\nputs after\n",
+        dir.display()
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("dirs(): the directory must be a string"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capturing_a_glob_family_call_records_its_value() {
+    // `:capture` has to route a built-in *value* name to the call path: sending
+    // `glob` to the command path would report a command-not-found for a call that
+    // ran fine and returned a list.
+    let dir = glob_family_dir("glob_family_capture");
+    let out = run_with_input(&format!(
+        "cd {}\nr = glob(\"*.ext\"):capture\nputs $r.value:join(\" \")\nputs $r.status\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.ext b.ext\n0\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn tilde_preserves_home_bytes_including_trailing_slash() {
     // With a trailing slash in $HOME, `~/child` keeps the bytes verbatim
@@ -8756,16 +8920,17 @@ fn an_assignment_whose_value_broke_keeps_the_previous_binding() {
 }
 
 #[test]
-fn a_builtin_value_constructor_cannot_be_a_function_name() {
-    // `re(...)` and `style(...)` are built-in value constructors, so a `func` of
-    // either name would be reachable as a command but never as a value call —
-    // reserve the names instead of shipping a function whose meaning depends on how
-    // it is called. The error is recoverable: the next command still runs.
-    for name in ["re", "style", "link"] {
+fn a_builtin_value_call_cannot_be_a_function_name() {
+    // `re(...)`, `style(...)` and the `glob` family answer with a built-in value, so
+    // a `func` of one of those names would be reachable as a command but never as a
+    // value call — reserve the names instead of shipping a function whose meaning
+    // depends on how it is called. The error is recoverable: the next command still
+    // runs.
+    for name in ["re", "style", "link", "glob", "files", "dirs"] {
         let out = run_with_input(&format!("func {name}(x) {{ return $x }}\nputs after\n"));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains(&format!("`{name}` is a built-in value constructor")),
+            stderr.contains(&format!("`{name}` is a built-in value call")),
             "{stderr}"
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");

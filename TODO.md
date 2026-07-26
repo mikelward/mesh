@@ -1061,6 +1061,44 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       modifier name at the first character that cannot be in one, and only then
       decide whether the name it read is a modifier.
 
+## Beyond M3 — The `glob` family ✅ (landed)
+
+- [x] **`glob(PATTERN)`, `files(DIR=.)` and `dirs(DIR=.)`.** The expansion side of
+      `DESIGN.md` §"Globbing", as **value calls** answering with a path list — so
+      `for d in dirs() { … }` works, where before `dirs` fell through to
+      "a command has no return value". The value-return machinery was already
+      there (a `func` called for its value has iterated since M3); these three
+      names simply had no implementation behind them. `expand::glob_paths` is the
+      word path's own matcher with the pattern arriving as a string, so hidden
+      entries, sort order, and no-match-is-empty are inherited rather than
+      restated; the wrappers are `entries_pattern` (`DIR/*`, `.` unprefixed, the
+      directory escaped because it is a path) plus the `:files` / `:dirs` filter.
+      The names join `re` / `style` / `link` as reserved, and `parser::value_builtin`
+      now backs the `:capture` routing that only `re` had been spelled into —
+      `style(x):capture` reported a command-not-found before.
+- [ ] **A spread value call at a command boundary.** `ls ...glob($p)` — the
+      `DESIGN.md` spelling — is still a syntax error, alongside the
+      `puts ...$x:split(":")` it shares a cause with: `CommandItem::Value` has no
+      spread variant, so the expression path would build a `UnaryOp::Spread`
+      nothing consumes. Workaround is a binding (`found = glob($p)`, `ls ...$found`),
+      which is why this is ergonomics rather than a hole.
+- [ ] **A `.`-leading path in value-argument position.** `dirs(.)` and
+      `files(./src)` are syntax errors — `.` is the member operator and `..` the
+      range one — so an explicit current or parent directory is quoted
+      (`dirs(".")`, `files("../src")`). `dirs()` covers the common case, and `..`
+      cannot be recovered without colliding with ranges, so the quote may simply be
+      the answer.
+- [ ] **A pattern whose first component starts with `.` matches nothing useful.**
+      `.*` yields `./.` and `./..` rather than the dotfiles — the `glob` crate's
+      reading of a pattern that opens with `.`, so the bare word and `glob(".*")`
+      are wrong in exactly the same way. There is no working way to list hidden
+      entries today. Pre-existing and shared, but the `glob` family makes it easy
+      to reach for.
+- [ ] **The qualifier argument list.** `*(f)`, `*(size > 1M)` and
+      `glob("*", type: file)` — the ANDed predicate options — are unimplemented;
+      the type half is reachable through the `:files` / `:dirs` modifiers and the
+      `files()` / `dirs()` wrappers, the size/age/`exec`/`empty` half not at all.
+
 ## Loose ends
 
 Small items rescued from pull requests that were closed as superseded — the bulk

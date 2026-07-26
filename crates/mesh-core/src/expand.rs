@@ -490,15 +490,82 @@ fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), Exp
     }
 
     let pattern = glob_pattern(&pieces);
-    let options = glob::MatchOptions {
-        require_literal_leading_dot: true,
-        ..glob::MatchOptions::new()
-    };
-    match glob::glob_with(&pattern, options) {
+    match glob::glob_with(&pattern, glob_options()) {
         Ok(paths) => out.extend(paths.flatten().map(|p| p.to_string_lossy().into_owned())),
         Err(_) => out.push(literal(&pieces)),
     }
     Ok(())
+}
+
+/// The match options a glob runs under, wherever it is spelled: a hidden entry
+/// matches only when the pattern's own component starts with a literal `.`
+/// (`DESIGN.md` §"Globbing").
+fn glob_options() -> glob::MatchOptions {
+    glob::MatchOptions {
+        require_literal_leading_dot: true,
+        ..glob::MatchOptions::new()
+    }
+}
+
+/// Expand a pattern to the paths it matches, the way a bare glob word does —
+/// same hidden-entry rule, and no match is the empty list rather than an error.
+///
+/// The pattern arrives as a *string* rather than as word pieces, so unlike
+/// [`expand_word`] there is nothing here to keep literal and nothing to escape:
+/// the caller wrote `glob(…)` to ask for the whole string to be read as a
+/// pattern. That also means a malformed pattern is an **error** rather than the
+/// silent fall-back-to-literal a bare word takes — a word can still be a
+/// filename, an explicit `glob()` call cannot.
+pub(crate) fn glob_paths(pattern: &str) -> Result<Vec<String>, String> {
+    let paths = glob::glob_with(pattern, glob_options()).map_err(|error| error.msg.to_string())?;
+    Ok(paths
+        .flatten()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
+}
+
+/// A directory's immediate entries that pass a file-type filter — the expansion
+/// behind `files(DIR)` and `dirs(DIR)` (`DESIGN.md` §"Globbing").
+///
+/// Built as `DIR/*` so the wrappers inherit globbing's policies rather than
+/// growing their own: entries come back sorted, a hidden entry is skipped, and a
+/// missing or unreadable directory is the empty list, exactly as the pattern
+/// would have been had it been written out.
+pub(crate) fn directory_entries(directory: &str, filter: Modifier) -> Result<Vec<String>, String> {
+    let Some(pattern) = entries_pattern(directory) else {
+        return Ok(Vec::new());
+    };
+    let paths = glob_paths(&pattern)?;
+    Ok(paths
+        .into_iter()
+        .filter(|path| matches_file_filter(path, filter))
+        .collect())
+}
+
+/// The `DIR/*` pattern whose matches are `DIR`'s immediate entries, or `None` for
+/// a directory that names none.
+///
+/// `.` contributes no prefix, so `files()` yields `a.txt` rather than `./a.txt` —
+/// the spelling a bare `*` would have produced, and the one that reads back as a
+/// path relative to where the caller stands. The directory is escaped because it
+/// is a **path**, not a pattern: `dirs("src/[old]")` looks inside that directory
+/// rather than matching a character class.
+fn entries_pattern(directory: &str) -> Option<String> {
+    // The empty path names no directory, so it is the empty list a missing one
+    // gives. Checked before the trim, which cannot tell it apart from `/`
+    // afterwards — and answering `/*` would widen `files("")` from "nothing" to
+    // the whole root, the one wrong answer available.
+    if directory.is_empty() {
+        return None;
+    }
+    let trimmed = directory.trim_end_matches('/');
+    Some(match trimmed {
+        // `/` trims to nothing but does name a directory: the root. `.` is the
+        // caller's own.
+        "" => "/*".to_string(),
+        "." => "*".to_string(),
+        _ => format!("{}/*", glob::Pattern::escape(trimmed)),
+    })
 }
 
 /// Escape literal pieces without allowing `-` to become a range operator when
@@ -1443,7 +1510,8 @@ fn has_glob_meta(text: &str) -> bool {
 mod tests {
     use super::{
         Access, ExpandError, Modifier, VarRef, accessible_c, apply_modifier, apply_tilde,
-        get_value, has_glob_meta, join_value, map_strings, resolve_value, split_value,
+        entries_pattern, get_value, has_glob_meta, join_value, map_strings, resolve_value,
+        split_value,
     };
     use crate::vars::{Value, Vars};
 
@@ -1671,6 +1739,26 @@ mod tests {
     fn detects_glob_metacharacters() {
         assert!(has_glob_meta("*.rs"));
         assert!(!has_glob_meta("plain.txt"));
+    }
+
+    #[test]
+    fn directory_entries_glob_the_directorys_own_children() {
+        // `.` contributes no prefix, so the entries read as a bare `*` would spell
+        // them; every other directory is a *path*, so its own metacharacters are
+        // escaped rather than matched.
+        assert_eq!(entries_pattern("."), Some("*".to_string()));
+        assert_eq!(entries_pattern("src"), Some("src/*".to_string()));
+        // A trailing slash is the same directory, not an empty child component.
+        assert_eq!(entries_pattern("src/"), Some("src/*".to_string()));
+        assert_eq!(
+            entries_pattern("src/[old]"),
+            Some("src/[[]old[]]/*".to_string())
+        );
+        // `/` names the root; the empty path names no directory at all, and the
+        // two must not collapse into each other once the trailing slash is gone.
+        assert_eq!(entries_pattern("/"), Some("/*".to_string()));
+        assert_eq!(entries_pattern("//"), Some("/*".to_string()));
+        assert_eq!(entries_pattern(""), None);
     }
 
     #[test]

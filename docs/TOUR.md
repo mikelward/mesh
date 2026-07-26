@@ -241,6 +241,21 @@ notes.txt todo.txt
 > If a pattern matches nothing, it contributes **no arguments** — not the pattern
 > itself. A search that finds nothing is simply empty.
 
+The same expansion has a call form, which hands back a **list** you can loop over
+or bind. `dirs()` and `files()` are the directory's own subdirectories and files:
+
+<pre>
+mesh$ <strong>for d in dirs() { puts "$d/" }</strong>
+src/
+tests/
+mesh$ <strong>notes = glob("*.txt")</strong>
+mesh$ <strong>puts $notes:len</strong>
+2
+</pre>
+
+`glob()` is how a pattern you *built* gets expanded — a stored string is inert, so
+`ls $p` passes `*.txt` through as text, and `glob($p)` asks for its matches.
+
 A `~` at the start of a word becomes your home directory:
 
 <pre>
