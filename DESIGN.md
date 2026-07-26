@@ -2995,9 +2995,13 @@ casing.
 owns the line editor and prompt, so it should decide first-class handling — a hook,
 a builtin, or automatic — for the escape/OSC features a modern interactive shell is
 expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
-- ***Window/tab title*** *(OSC 0/1/2)* — set alongside the prompt, from `preexec`;
-  needs the per-`$env.TERM` sequence choice (xterm `\e]0;…\a` vs screen/tmux
-  `\ek…`). A `$sh.title` hook or a `set-title` builtin.
+- ***Window/tab title*** *(OSC 0/1/2)* — **decided: automatic.** `user@host: dir` at
+  the prompt and the command line while one runs, with the sequence chosen from
+  `$env.TERM` (xterm `\e]0;…\a`, screen/tmux `\ek…`, nothing for a terminal not known
+  to take one — an allowlist, since a terminal wrongly assumed to take a title
+  prints it instead). The off switch wants to be `$sh.options.osc-title`, and waits on `$sh`
+  becoming a writable place; a *replacement* for the text — a `$sh.title` hook — is
+  still open, and is a different question from turning it off.
 - ***Bracketed paste*** *(`\e[?2004h/l`)* — **decided: on, always.** Pasted input is
   inserted, not executed line by line, and a lone newline in a paste doesn't submit.
 - ***Shell integration / semantic prompt marks*** *(OSC 133 `A`/`B`/`C`/`D`)* —
@@ -3024,7 +3028,7 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
   updates atomically without flicker.
 
   Decide per feature: automatic, a hook/builtin, or out of scope (left to a
-  hand-emitted `print "\e…"`). The three marked **decided** above have landed;
+  hand-emitted `print "\e…"`). The four marked **decided** above have landed;
   `TODO.md` §"Beyond M3 — Terminal integration" tracks the rest.)*
 
 **Command hooks fire for the outer interactive command only.** `preexec` /

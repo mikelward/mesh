@@ -47,6 +47,13 @@ struct MeshExec {
 
 impl MeshExec {
     fn new(config_home: &Path) -> Self {
+        Self::with_environment(config_home, &[])
+    }
+
+    /// Extra `NAME=value` entries, replacing any the test process inherited.
+    /// `TERM` needs this: what a shell writes for the terminal depends on it, and
+    /// what the test runner was started with is not a fact the tests can assume.
+    fn with_environment(config_home: &Path, extra: &[(&str, &str)]) -> Self {
         use std::ffi::CString;
 
         let path = CString::new(env!("CARGO_BIN_EXE_mesh")).unwrap();
@@ -55,6 +62,7 @@ impl MeshExec {
 
         let mut environment: Vec<_> = std::env::vars_os()
             .filter(|(name, _)| name != "XDG_CONFIG_HOME")
+            .filter(|(name, _)| !extra.iter().any(|(replaced, _)| name == replaced))
             .map(|(name, value)| {
                 let mut entry = name.into_encoded_bytes();
                 entry.push(b'=');
@@ -65,6 +73,9 @@ impl MeshExec {
         let mut config = b"XDG_CONFIG_HOME=".to_vec();
         config.extend(config_home.as_os_str().as_bytes());
         environment.push(CString::new(config).unwrap());
+        for (name, value) in extra {
+            environment.push(CString::new(format!("{name}={value}")).unwrap());
+        }
 
         let mut envp: Vec<_> = environment.iter().map(|entry| entry.as_ptr()).collect();
         envp.push(std::ptr::null());
@@ -1215,15 +1226,15 @@ fn spawn_failure_returns_terminal_to_interactive_shell() {
 
 #[test]
 fn a_piped_shell_writes_no_terminal_sequences() {
-    // The marks, the working-directory report and bracketed-paste mode are all for
-    // a terminal that is drawing the session. Everything else reading mesh's
+    // The marks, the working-directory report, the window title and
+    // bracketed-paste mode are all for a terminal that is drawing the session. Everything else reading mesh's
     // stdout — a pipe, a file, the several hundred assertions in this file — asked
     // for the command's bytes and nothing else, so any of them reaching those
     // callers would be corruption rather than decoration.
     //
     // What this actually pins is *where they are written from*. Today no piped
-    // path reaches `semantic_mark` or `report_cwd` at all: both are called only
-    // from the interactive loop, and their `interactive` check is a second lock on
+    // path reaches `semantic_mark`, `report_cwd` or `set_title` at all: all three
+    // are called only from the interactive loop, and their `interactive` check is a second lock on
     // a door that is already shut. So deleting that check does not fail this test —
     // moving a call somewhere shared, like `run_line` or the `cd` builtin, does,
     // which is the mistake actually available to make.
@@ -1250,6 +1261,10 @@ fn a_piped_shell_writes_no_terminal_sequences() {
             assert!(
                 !text.contains("\x1b[?2004"),
                 "bracketed paste escaped to a pipe: {text:?}"
+            );
+            assert!(
+                !text.contains("\x1b]0;") && !text.contains("\x1bk"),
+                "a window title escaped to a pipe: {text:?}"
             );
         }
     }
@@ -1454,6 +1469,32 @@ fn stop_pty_shell(shell: PtyShell) -> bool {
 fn pty_write(master: RawFd, bytes: &[u8]) -> bool {
     let written = unsafe { libc::write(master, bytes.as_ptr().cast(), bytes.len()) };
     written == bytes.len() as isize
+}
+
+/// Everything the shell writes from here until end of file — for what it says on
+/// its way out, which `pty_read_until_one_of` cannot see: that reader treats the
+/// read of 0 bytes at EOF as failure, and at exit the last bytes and the EOF
+/// arrive together.
+fn pty_read_to_end(master: RawFd) -> Vec<u8> {
+    let mut ready = libc::pollfd {
+        fd: master,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut seen = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if unsafe { libc::poll(&mut ready, 1, QUIET) } <= 0 {
+            break;
+        }
+        let mut chunk = [0_u8; 256];
+        let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if count <= 0 {
+            break;
+        }
+        seen.extend_from_slice(&chunk[..count as usize]);
+    }
+    seen
 }
 
 fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
@@ -1740,6 +1781,182 @@ fn cwd_report_harness(exec: &MeshExec, directory: &Path) -> i32 {
         return 107;
     }
     0
+}
+
+#[test]
+fn an_interactive_shell_titles_the_window() {
+    let directory = fresh_dir("osc title")
+        .canonicalize()
+        .expect("canonicalize the temp directory");
+    // `TERM` decides which sequence is written, and what the test runner inherited
+    // is not a fact the test can assume — under `TERM=dumb` the correct answer is
+    // to write nothing at all.
+    //
+    // `HOME` is pinned for the same reason, raised in review: the title shortens a
+    // directory under `$HOME` to `~/…`, so a runner started with `HOME=/tmp` would
+    // be told to expect an absolute path while the shell correctly wrote an
+    // abbreviated one. A separate directory, not an unwritable one, so history has
+    // somewhere to go and startup stays quiet. The abbreviating itself has unit
+    // tests; what this asserts is the shape of the title.
+    let home = fresh_dir("osc title home");
+    let exec = MeshExec::with_environment(
+        isolated_config_home(),
+        &[
+            ("TERM", "xterm-256color"),
+            ("USER", "tester"),
+            ("HOME", home.to_str().expect("a temp path that is UTF-8")),
+        ],
+    );
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(title_harness(&exec, &directory)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// Where the shell is at the prompt, what it is running while it runs, and back
+/// again afterwards.
+///
+/// The third of those is the one worth a pty: it is not a separate feature but a
+/// consequence of the prompt writing its title every time, and a title that stuck
+/// on the last command would be the natural bug.
+fn title_harness(exec: &MeshExec, directory: &Path) -> i32 {
+    let Some(shell) = start_pty_shell(exec, Some(directory)) else {
+        return 110;
+    };
+    let at_prompt = format!("\x1b]0;tester@{}: {}\x07", host_name(), directory.display());
+    if occurrences(&shell.startup, at_prompt.as_bytes()) == 0 {
+        return 111;
+    }
+    // A command long enough to run, so its title is on the wire before the
+    // prompt's replaces it.
+    if !pty_write(shell.master, b"sh -c 'sleep 0.3'\n") {
+        return 112;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 113;
+    };
+    if status != 0 {
+        return 114;
+    }
+    if occurrences(&seen, b"\x1b]0;sh -c 'sleep 0.3'\x07") == 0 {
+        return 115;
+    }
+    // And the directory title comes back, which is what keeps a finished window
+    // from claiming it is still busy. It is written immediately after `D`, so the
+    // read above has usually taken it already while draining past the mark —
+    // looking in what is in hand before waiting for more is the difference between
+    // this test and a ten-second timeout.
+    if occurrences(&seen, at_prompt.as_bytes()) == 0
+        && pty_read_until_one_of(shell.master, &[at_prompt.as_bytes()]).is_none()
+    {
+        return 116;
+    }
+    // And the title is given back when the shell leaves. Raised in review: `exit`
+    // set the title to `exit` and then returned without reaching another prompt, so
+    // the window kept that name after mesh was gone. Asserted as *the last title
+    // written*, not merely as present, since being last is the whole claim.
+    if !pty_write(shell.master, b"exit 0\n") {
+        return 117;
+    }
+    let farewell = pty_read_to_end(shell.master);
+    let last_title = farewell
+        .windows(4)
+        .rposition(|part| part == b"\x1b]0;")
+        .filter(|at| farewell.get(at + 4) == Some(&0x07));
+    if last_title.is_none() {
+        return 118;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(shell.mesh, &mut status, 0) } != shell.mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 119;
+    }
+    unsafe { libc::close(shell.master) };
+    0
+}
+
+#[test]
+fn changing_term_does_not_orphan_the_title() {
+    let exec = MeshExec::with_environment(
+        isolated_config_home(),
+        &[("TERM", "xterm-256color"), ("USER", "tester")],
+    );
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(term_change_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// `$env.TERM` is read once, so a session cannot end holding a title it can no
+/// longer clear.
+///
+/// Assigning a terminal with no title used to strand one: the command's title went
+/// out under the old `TERM`, and every write afterwards — including the clear at
+/// exit — asked the new one and stayed silent, leaving the window named after the
+/// assignment. Raised in review on #238.
+fn term_change_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 130;
+    };
+    if !pty_write(shell.master, b"$env.TERM = dumb\n") {
+        return 131;
+    }
+    if pty_read_until_command_done(shell.master).is_none() {
+        return 132;
+    }
+    if !pty_write(shell.master, b"exit 0\n") {
+        return 133;
+    }
+    let farewell = pty_read_to_end(shell.master);
+    // Still the empty title last, under the `TERM` the session started with.
+    let last_title = farewell
+        .windows(4)
+        .rposition(|part| part == b"\x1b]0;")
+        .filter(|at| farewell.get(at + 4) == Some(&0x07));
+    if last_title.is_none() {
+        return 134;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(shell.mesh, &mut status, 0) } != shell.mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 135;
+    }
+    unsafe { libc::close(shell.master) };
+    0
+}
+
+/// This host's name, the way the shell reads it — the title carries it, and
+/// hardcoding one would only test the machine the suite happens to run on.
+fn host_name() -> String {
+    let mut buffer = [0_u8; 256];
+    // SAFETY: `gethostname` writes at most `buffer.len()` bytes through a pointer
+    // valid and writable for exactly that many.
+    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+        return String::new();
+    }
+    let end = buffer
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf8_lossy(&buffer[..end]).into_owned()
 }
 
 fn spawn_failure_harness(exec: &MeshExec) -> i32 {

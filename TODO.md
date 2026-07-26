@@ -546,9 +546,39 @@ that could change a command's status would be worse than a missing decoration.
       one call site covers both halves `DESIGN.md` asks for — the first prompt is
       the startup report a fresh remote shell owes a new split, and any later move
       reaches the next prompt whatever caused it.
-- [ ] **Window/tab title** (OSC 0/1/2, screen's `\ek`). Needs the per-`$env.TERM`
-      sequence choice and a decision between automatic, a `$sh.title` hook, and a
-      builtin.
+- [x] **Window/tab title** (OSC 0, screen's `\ek`). Automatic: `user@host: dir` at
+      the prompt, the command line while a command runs, so a row of tabs reads at
+      a glance. The sequence follows `$env.TERM` — `\ek…\e\\` inside screen or tmux,
+      where the name belongs to the pane rather than to the outer window, OSC 0 for
+      a terminal on the `TITLE_TERMS` allowlist, and *nothing* for anything else.
+      An allowlist because the two ways of being wrong are not equal: an unlisted
+      terminal quietly has no title, while one wrongly assumed to take a title
+      *prints* it at every prompt — `TERM=linux` reads `ESC ]` as a palette sequence
+      and abandons it at the first non-hex byte, leaving the text on screen and the
+      `BEL` ringing, and `ansi` and `sun` have no title at all. It is what bash, zsh
+      and fish all do too. A name matches a family exactly or up to a `-` or `.`,
+      the separators terminfo uses for variants, so `xterm-kitty` and
+      `screen.xterm-256color` come along while `st52` — an Atari VT52 — does not
+      get in on the strength of starting with `st`.
+      Terminated with `BEL` rather than the `ST` mesh uses elsewhere, since every
+      shell's `PS1` idiom spells it that way and terminals exist that answer only
+      to that spelling. Control characters in the text become spaces and the title
+      is cut at 96 characters: both the command line and the directory carry text
+      mesh did not choose, and a filename holding an `ESC` would otherwise end
+      mesh's sequence and start one of its own.
+      Remaining: the **off switch**, which wants to be `$sh.options.osc-title`
+      alongside `$sh.options.bold-input` below, and waits on `$sh` becoming a
+      writable place.
+- [ ] **Ask terminfo which sequence the terminal takes**, instead of matching
+      `$env.TERM` against a list. `hs`, `tsl` and `fsl` hold exactly the title
+      sequence — including screen's `ESC k` form — so reading them would replace
+      both the `TITLE_TERMS` allowlist and the multiplexer special case with data,
+      and would answer for terminals nobody has added to a list yet. It needs a
+      terminfo reader mesh does not have: the binary format, the `$TERMINFO` and
+      `/usr/share/terminfo` search path, and the extended-capability section. A
+      dependency decision as much as a feature, and worth taking once rather than
+      per sequence — `hs`/`tsl` is the same question OSC 52 and the notification
+      sequences will ask.
 - [ ] **`sgr_stripped_width` skips only CSI SGR.** An OSC sequence in a custom
       prompt is counted as visible width, so the continuation indicator comes out
       too long. Reachable today: `\e` is a supported escape, and hand-rolling
