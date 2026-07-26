@@ -1372,6 +1372,31 @@ fn display_words(words: &[parser::Word]) -> Vec<String> {
         .collect()
 }
 
+/// The words a **deferred** stage is registered and listed under: its display
+/// words, with a literal `command` prefix taken off.
+///
+/// The job is the program, so the table has to name the program — that is what
+/// `jobs` shows and what `%prefix` matches, and `wait %sleep` must find
+/// `command sleep $(…) &` exactly as it finds `command sleep 0.2 &`. The eager
+/// paths get this from [`external_stage`], which strips before the stage is built;
+/// a deferred stage is registered *before* its words are expanded, so the same cut
+/// has to be made on the spelling.
+///
+/// Only a literally written prefix is taken: these are unexpanded words, and a
+/// first word that is anything but the bare text `command` is left alone — as is a
+/// `command` line with no program in it, which is about to report an error rather
+/// than run anything.
+fn deferred_words(words: &[parser::Word]) -> Vec<String> {
+    let shown = display_words(words);
+    match shown.split_first() {
+        Some((first, rest)) if first == "command" => match command_line(rest) {
+            CommandLine::External(program) => program,
+            _ => shown,
+        },
+        _ => shown,
+    }
+}
+
 /// Does this command hold a value the **parent** has to evaluate, whatever happens
 /// next — so that backgrounding it would run the work at the prompt?
 ///
@@ -4919,7 +4944,7 @@ fn run_single(
         };
         return Step::Continue(run_stages(
             vec![exec::Cmd {
-                words: display_words(&words),
+                words: deferred_words(&words),
                 redirs: opened,
                 pipe_stderr: false,
                 in_shell: true,
@@ -4990,7 +5015,13 @@ fn run_single(
     // A redirected builtin runs in the shell like a redirected function: the
     // targets apply to the shell's own descriptors around the call, so there is
     // nothing to configure on a child.
-    let builtin = builtins::is_builtin(&argv[0]);
+    //
+    // `command NAME …` resolves to the program here rather than in the shell, so
+    // a redirected or backgrounded one is that program's own process: the child
+    // `&` needs is the program itself, not a shell that goes on to run it.
+    let external = external_stage(&argv);
+    let builtin = external.is_none();
+    let argv = external.unwrap_or(argv);
     let opened = match expand_redirs(redirs, last, in_function, shell) {
         Ok(redirs) => redirs,
         Err(step) => return step,
@@ -5061,7 +5092,7 @@ fn run_multi(
                 Err(step) => return step,
             };
             cmds.push(exec::Cmd {
-                words: display_words(&words),
+                words: deferred_words(&words),
                 redirs: opened,
                 pipe_stderr,
                 in_shell: true,
@@ -5095,12 +5126,12 @@ fn run_multi(
                     note!("mesh: return: cannot be used in a pipeline");
                     return Step::Continue(2);
                 }
-                let body = if builtins::is_builtin(&argv[0]) {
-                    StageBody::Builtin
-                } else {
-                    StageBody::External
-                };
-                (argv, body)
+                // `command NAME …` is the program `NAME`, so the stage is that
+                // program rather than a forked shell that runs it.
+                match external_stage(&argv) {
+                    Some(program) => (program, StageBody::External),
+                    None => (argv, StageBody::Builtin),
+                }
             }
         };
         let opened = match expand_redirs(redirs, last, in_function, shell) {
@@ -5291,11 +5322,11 @@ fn run_stage_in_shell(
                     // stage can run, and the eager paths refuse it in the same terms.
                     note!("mesh: {}", context.returning());
                     Step::Continue(2)
-                } else if builtins::is_builtin(&argv[0]) {
-                    run_expanded(argv, last, shell)
-                } else {
+                } else if let Some(program) = external_stage(&argv) {
                     // Replaces this process, so nothing below runs on success.
-                    return exec::exec_stage(&argv);
+                    return exec::exec_stage(&program);
+                } else {
+                    run_expanded(argv, last, shell)
                 }
             }
             Err(step) => step,
@@ -5673,10 +5704,100 @@ fn job_id_of(value: &Value) -> Option<usize> {
     }
 }
 
-/// Run a command whose words are already expanded: `return`, generated help, the
-/// prompt and job-control builtins, then the builtin → external chain. A function
-/// has already been resolved by the caller, which still has its unexpanded words
-/// and so can keep its arguments typed.
+/// What a `command …` line comes to, once `command`'s own words are read off the
+/// front.
+enum CommandLine {
+    /// The program to run and its arguments, with the `command` prefix gone.
+    External(Vec<String>),
+    /// `command --help` — mesh's own help, since no program was named to ask.
+    Help,
+    /// A leading word that reads as one of `command`'s options and is not one.
+    Unknown(String),
+    /// A `command` with no program in it at all.
+    Nothing,
+}
+
+/// Read `command`'s own words off the front of `args`, which is everything after
+/// the word `command` itself.
+///
+/// **Only the leading words are `command`'s.** The first word that is not an
+/// option of its own names the program, and everything after that word belongs to
+/// the program — which is the whole point of the builtin, so `command ls --help`
+/// asks `ls` for its help rather than printing this builtin's.
+///
+/// The program name is taken verbatim, `command` included: a second `command` is
+/// a program of that name to look for, not another prefix to peel. The rule is
+/// "the operand is the program", with no exception to remember.
+///
+/// A **flag-looking** word in front of the program is `command`'s own, and
+/// `--help` is the only one it has, so anything else there is a usage error rather
+/// than a program name. Two reasons, and either would do: `command -v ls` is a
+/// bash reflex that would otherwise report "command not found: -v", which is a
+/// true statement about the wrong question; and reading `-v` as a program today is
+/// what `command -v` would have to keep meaning tomorrow, when the option it
+/// obviously names is built. `command -- -v` still runs a program called `-v`.
+fn command_line(args: &[String]) -> CommandLine {
+    let program = match args {
+        [] => return CommandLine::Nothing,
+        [flag, ..] if flag == "--help" => return CommandLine::Help,
+        // `command` owns its terminator, because only it knows where its options
+        // end: after `--` the next word is the program even if it reads as a flag.
+        [terminator, rest @ ..] if terminator == "--" => rest,
+        [flag, ..] if flag.starts_with('-') => return CommandLine::Unknown(flag.clone()),
+        rest => rest,
+    };
+    match program {
+        [] => CommandLine::Nothing,
+        program => CommandLine::External(program.to_vec()),
+    }
+}
+
+/// The external argv this already-expanded stage runs, if it runs one: an
+/// ordinary external's own words, or — for `command NAME …` — the program it
+/// names, with the prefix taken off. Stripping it here is what makes the stage
+/// *be* the program: one process, not a forked shell that then runs one.
+///
+/// `None` for anything the shell runs itself — a builtin, or a `command` line with
+/// no program in it (`command`, `command --help`), which [`run_expanded`] answers.
+///
+/// A function is never asked about: every caller resolved one before this, since a
+/// function takes typed arguments and these words are already argv.
+fn external_stage(argv: &[String]) -> Option<Vec<String>> {
+    if argv[0] != "command" {
+        return (!builtins::is_builtin(&argv[0])).then(|| argv.to_vec());
+    }
+    match command_line(&argv[1..]) {
+        CommandLine::External(program) => Some(program),
+        CommandLine::Help | CommandLine::Unknown(_) | CommandLine::Nothing => None,
+    }
+}
+
+/// Report a word in front of the program that reads as one of `command`'s options
+/// and is not one, and give back the usage status.
+///
+/// `-v` and `-V` get their own answer because they are not so much unknown as
+/// **unbuilt**: they are what a reader coming from another shell types to ask what
+/// a name would run, and "not an option" would send them looking for the spelling
+/// mesh uses instead of telling them there is not one yet.
+fn unknown_command_option(flag: &str) -> Step {
+    if flag == "-v" || flag == "-V" {
+        note!(
+            "mesh: command: {flag}: asking what a name would run is not built yet; \
+             `command -- {flag}` runs a program of that name"
+        );
+    } else {
+        note!(
+            "mesh: command: {flag}: not an option of `command`; \
+             `command -- {flag}` runs a program of that name"
+        );
+    }
+    Step::Continue(2)
+}
+
+/// Run a command whose words are already expanded: `return`, `command`, generated
+/// help, the prompt and job-control builtins, then the builtin → external chain. A
+/// function has already been resolved by the caller, which still has its unexpanded
+/// words and so can keep its arguments typed.
 fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     if words.is_empty() {
         // A command whose words all expanded away (e.g. a glob with no
@@ -5687,6 +5808,21 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     // level; `run_line` decides which by `in_function`).
     if words[0] == "return" {
         return make_return(&words[1..], shell);
+    }
+    // `command` is read before any of the resolution below, because everything
+    // below is what it exists to skip — and because its arguments are another
+    // command's: the generic `--help` and `--` handling would read
+    // `command ls --help` as a question about `command`.
+    if words[0] == "command" {
+        return match command_line(&words[1..]) {
+            CommandLine::External(program) => Step::Continue(exec::run(&program, &mut shell.jobs)),
+            CommandLine::Help => Step::Continue(builtins::print_help("command")),
+            CommandLine::Unknown(flag) => unknown_command_option(&flag),
+            CommandLine::Nothing => {
+                note!("mesh: command: expected a program to run");
+                Step::Continue(2)
+            }
+        };
     }
     if builtins::is_builtin(&words[0]) {
         if auto_help_requested_strings(&words[1..]) {
@@ -8680,6 +8816,11 @@ fn completed_command(signal: &Signal, pending: &str, gate: &HeredocGate) -> Opti
 #[derive(Default)]
 struct CompletionState {
     commands: Vec<String>,
+    /// The executables on `$PATH` alone — what `command NAME` can actually find.
+    /// Kept beside `commands` rather than subtracted from it, because a builtin's
+    /// name is often a program too (`kill`, `pwd`, `printf`), and subtracting
+    /// would drop the program along with the builtin.
+    programs: Vec<String>,
     help: HashMap<String, CompletionSpec>,
     cache: CompletionCache,
     variables: Vec<(String, Value)>,
@@ -8687,14 +8828,13 @@ struct CompletionState {
 
 impl CompletionState {
     fn from_shell(shell: &Shell) -> Self {
-        let mut commands: Vec<String> = builtins::names().map(str::to_owned).collect();
-        commands.extend(shell.funcs.names().map(str::to_owned));
+        let mut programs: Vec<String> = Vec::new();
         if let Some(path) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path) {
                 let Ok(entries) = std::fs::read_dir(dir) else {
                     continue;
                 };
-                commands.extend(entries.flatten().filter_map(|entry| {
+                programs.extend(entries.flatten().filter_map(|entry| {
                     use std::os::unix::fs::PermissionsExt;
                     let metadata = entry.metadata().ok()?;
                     (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
@@ -8702,6 +8842,11 @@ impl CompletionState {
                 }));
             }
         }
+        programs.sort();
+        programs.dedup();
+        let mut commands: Vec<String> = builtins::names().map(str::to_owned).collect();
+        commands.extend(shell.funcs.names().map(str::to_owned));
+        commands.extend(programs.iter().cloned());
         commands.sort();
         commands.dedup();
         let mut help: HashMap<_, _> = builtins::names()
@@ -8717,6 +8862,7 @@ impl CompletionState {
         }));
         Self {
             commands,
+            programs,
             help,
             cache: CompletionCache::default(),
             variables: shell
@@ -8743,7 +8889,7 @@ impl Completer for MeshCompleter {
         } else if command_position(&line[..start]) {
             rank_candidates(state.commands.clone(), word)
         } else if let Some(words) = command_segment_words(line) {
-            argument_completions(&state, &words, word)
+            segment_completions(&state, &words, word)
         } else {
             path_completions(word)
         };
@@ -8763,10 +8909,76 @@ fn suggestions(values: Vec<String>, start: usize, pos: usize) -> Vec<Suggestion>
         .collect()
 }
 
-fn argument_completions(state: &CompletionState, words: &[String], word: &str) -> Vec<String> {
+/// Which resolution a completion is being asked about: the chain a bare name
+/// takes, or — behind `command` — the program alone.
+///
+/// Completion has to answer the same question execution does, or it offers names
+/// that will not run and reads the wrong command's flags: with a `func ls` defined,
+/// `command ls --<Tab>` must ask the *program* for its options, not the function
+/// whose whole reason for existing is that it wraps it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lookup {
+    Shell,
+    External,
+}
+
+/// The completions for a word that is not the first of its command line.
+///
+/// `command NAME …` runs `NAME`, so it completes as though the prefix were not
+/// written: the word after it is a **program name**, and everything after that is
+/// that program's own business, asked of that program.
+///
+/// Which words are `command`'s own is **the same question `command_line` answers**,
+/// asked of the words actually entered — every word but the one being typed — so
+/// the two cannot drift. A flag in front of the program is `command`'s, so
+/// `command --<Tab>` offers `--help`; one after it belongs to the program, so
+/// `command cargo --<Tab>` asks cargo. Counting words instead got both ends wrong
+/// in turn: first every option prefix went to `command`'s spec, then a *rejected*
+/// leading flag counted as the program, so `command -v <Tab>` completed arguments
+/// for `-v` — and would have run a `$PATH` file of that name to probe its help —
+/// for a line that reports a usage error rather than running anything.
+fn segment_completions(state: &CompletionState, words: &[String], word: &str) -> Vec<String> {
+    if words[0] != "command" {
+        return argument_completions(state, words, word, Lookup::Shell);
+    }
+    let typed = usize::from(!word.is_empty());
+    let entered = words
+        .get(1..words.len().saturating_sub(typed))
+        .unwrap_or_default();
+    let terminated = entered.first().is_some_and(|word| word == "--");
+    match command_line(entered) {
+        // A program is already named, so the rest of the line is its own.
+        CommandLine::External(_) => {
+            let rest = if terminated { &words[2..] } else { &words[1..] };
+            argument_completions(state, rest, word, Lookup::External)
+        }
+        // Only `command`'s own words so far, so the program is still to come. A
+        // flag here is `command`'s too — unless `--` already ended its options,
+        // after which the word is the program however it reads.
+        CommandLine::Nothing if word.starts_with('-') && !terminated => {
+            argument_completions(state, words, word, Lookup::Shell)
+        }
+        // The program's *name* completes from `$PATH` alone, since a builtin or a
+        // function is exactly what `command` will not run.
+        CommandLine::Nothing => rank_candidates(state.programs.clone(), word),
+        // The words entered are `command`'s own and have already settled what the
+        // line does — print its help, or report the flag — so there is no program
+        // to ask and nothing past them to complete.
+        CommandLine::Help | CommandLine::Unknown(_) => {
+            argument_completions(state, words, word, Lookup::Shell)
+        }
+    }
+}
+
+fn argument_completions(
+    state: &CompletionState,
+    words: &[String],
+    word: &str,
+    lookup: Lookup,
+) -> Vec<String> {
     if let Some((option, prefix)) = word.split_once('=') {
         let context = &words[..words.len().saturating_sub(1)];
-        if let Some(hint) = completion_for(state, context).value_hint(option) {
+        if let Some(hint) = completion_for(state, context, lookup).value_hint(option) {
             return value_completions(hint, prefix)
                 .into_iter()
                 .map(|value| format!("{option}={value}"))
@@ -8784,11 +8996,11 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
         && option.starts_with('-')
     {
         let context = &parent[..parent.len() - 1];
-        if let Some(hint) = completion_for(state, context).value_hint(option) {
+        if let Some(hint) = completion_for(state, context, lookup).value_hint(option) {
             return value_completions(hint, word);
         }
     }
-    let parent_help = completion_for(state, parent);
+    let parent_help = completion_for(state, parent, lookup);
     let paths = parent_help.positional_hint().map_or_else(
         || path_completions(word),
         |hint| value_completions(hint, word),
@@ -8819,7 +9031,7 @@ fn argument_completions(state: &CompletionState, words: &[String], word: &str) -
     } else {
         parent
     };
-    let mut values = completion_for(state, help_words).matching("");
+    let mut values = completion_for(state, help_words, lookup).matching("");
     if completing_word && exact_subcommand {
         values = values
             .into_iter()
@@ -8837,10 +9049,17 @@ fn value_completions(hint: &ValueHint, prefix: &str) -> Vec<String> {
     }
 }
 
-fn completion_for(state: &CompletionState, words: &[String]) -> CompletionSpec {
+fn completion_for(state: &CompletionState, words: &[String], lookup: Lookup) -> CompletionSpec {
     let Some(command) = words.first() else {
         return CompletionSpec::default();
     };
+    // Behind `command` the shell's own specs are the wrong ones: the builtin and
+    // function help is what the name would have meant *without* the prefix, so the
+    // program is asked directly — and a name with no program answers with nothing,
+    // which is the same nothing running it would find.
+    if lookup == Lookup::External {
+        return state.cache.spec_for(words);
+    }
     state
         .help
         .get(command)
@@ -9462,17 +9681,18 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgumentRecall, CompletionState, HeredocGate, Integration, Invocation, MeshPrompt,
-        NOTIFY_LIMIT, PromptEvent, PromptHook, PromptMarkers, SemanticMark, Shell, StartupOptions,
-        Step, TITLE_LIMIT, TimestampedHistory, argument_completions, body_awaits_close,
-        command_notification, command_position, command_segment_words, command_words,
-        completed_command, cwd_url, duration_words, escape_stripped_width, eval_binary,
-        expand_history_designators, expansion_word, func_definition_is_open, handle_signal,
-        help_completions, history_designators, history_path_from, input_highlighter,
-        interactive_keybindings, interruptible_task, last_argument, mark_sequence,
-        needs_more_input, open_history, path_completions_sync, persist_logical_history,
-        prepare_history_path, prompt_title, run_line, run_prompt_hooks, run_source, running_title,
-        title_sequence, title_text, variable_completions, vscode_escaped,
+        ArgumentRecall, CommandLine, CompletionState, HeredocGate, Integration, Invocation, Lookup,
+        MeshPrompt, NOTIFY_LIMIT, PromptEvent, PromptHook, PromptMarkers, SemanticMark, Shell,
+        StartupOptions, Step, TITLE_LIMIT, TimestampedHistory, argument_completions,
+        body_awaits_close, command_line, command_notification, command_position,
+        command_segment_words, command_words, completed_command, cwd_url, deferred_words,
+        duration_words, escape_stripped_width, eval_binary, expand_history_designators,
+        expansion_word, external_stage, func_definition_is_open, handle_signal, help_completions,
+        history_designators, history_path_from, input_highlighter, interactive_keybindings,
+        interruptible_task, last_argument, mark_sequence, needs_more_input, open_history,
+        path_completions_sync, persist_logical_history, prepare_history_path, prompt_title,
+        run_line, run_prompt_hooks, run_source, running_title, segment_completions, title_sequence,
+        title_text, variable_completions, vscode_escaped,
     };
     use crate::builtins::{Multiplexer, through_multiplexer};
     use crate::options::Options;
@@ -10386,11 +10606,11 @@ mod tests {
             ..CompletionState::default()
         };
         assert_eq!(
-            argument_completions(&state, &["cargo".into(), "bu".into()], "bu"),
+            argument_completions(&state, &["cargo".into(), "bu".into()], "bu", Lookup::Shell),
             ["build"]
         );
         assert_eq!(
-            argument_completions(&state, &["cargo".into(), "bl".into()], "bl"),
+            argument_completions(&state, &["cargo".into(), "bl".into()], "bl", Lookup::Shell),
             ["build"]
         );
         let state = CompletionState {
@@ -10402,20 +10622,212 @@ mod tests {
             .into(),
             ..CompletionState::default()
         };
-        let completions = argument_completions(&state, &["tool".into(), "co".into()], "co");
+        let completions =
+            argument_completions(&state, &["tool".into(), "co".into()], "co", Lookup::Shell);
         assert_eq!(&completions[..2], ["commit", "checkout"]);
         assert_eq!(
-            argument_completions(&state, &["tool".into(), "bu".into()], "bu"),
+            argument_completions(&state, &["tool".into(), "bu".into()], "bu", Lookup::Shell),
             Vec::<String>::new()
         );
         assert!(
             argument_completions(
                 &state,
                 &["cargo".into(), "definitely-missing".into()],
-                "definitely-missing"
+                "definitely-missing",
+                Lookup::Shell
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn a_command_prefix_completes_as_though_it_were_not_written() {
+        // A session with a `puts` builtin, a `cargo` function wrapping the
+        // program, and `cargo` / `cat` on `$PATH`.
+        let state = CompletionState {
+            commands: vec!["cargo".into(), "cat".into(), "puts".into()],
+            programs: vec!["cargo".into(), "cat".into()],
+            help: [
+                (
+                    "cargo".into(),
+                    "Options:\n  --wrapper  the function's own flag\n".into(),
+                ),
+                // As the session derives it from the builtin's own help.
+                ("command".into(), "Options:\n  --help  Print help\n".into()),
+            ]
+            .into(),
+            ..CompletionState::default()
+        };
+        // The word after `command` is a program name, whether it has been started
+        // or not — and a `--` before it does not change that. `puts` is missing
+        // because it is a builtin: `command puts` would find no program.
+        assert_eq!(
+            segment_completions(&state, &["command".into()], ""),
+            ["cargo", "cat"]
+        );
+        assert_eq!(
+            segment_completions(&state, &["command".into(), "car".into()], "car"),
+            ["cargo"]
+        );
+        assert_eq!(
+            segment_completions(
+                &state,
+                &["command".into(), "--".into(), "car".into()],
+                "car"
+            ),
+            ["cargo"]
+        );
+        // Past the program name it is the *program's* own line. The function's
+        // generated help is what the bare name would have offered, and offering it
+        // here would describe the wrapper rather than what is about to run.
+        assert!(
+            !segment_completions(
+                &state,
+                &["command".into(), "cargo".into(), "--w".into()],
+                "--w"
+            )
+            .iter()
+            .any(|value| value == "--wrapper"),
+        );
+        assert_eq!(
+            argument_completions(
+                &state,
+                &["cargo".into(), "--w".into()],
+                "--w",
+                Lookup::Shell
+            ),
+            ["--wrapper"]
+        );
+        // Which words are `command`'s own is decided by position, not by the shape
+        // of the word: a flag **before** the program is `command`'s…
+        assert_eq!(
+            segment_completions(&state, &["command".into(), "--h".into()], "--h"),
+            ["--help"]
+        );
+        // …and one after it belongs to the program, so it must not fall back to
+        // `command`'s own spec and offer `--help` for cargo's line.
+        for line in [
+            vec!["command".to_owned(), "cargo".into(), "--".into()],
+            vec![
+                "command".to_owned(),
+                "--".into(),
+                "cargo".into(),
+                "--".into(),
+            ],
+        ] {
+            assert_eq!(
+                segment_completions(&state, &line, "--"),
+                argument_completions(
+                    &state,
+                    &["cargo".into(), "--".into()],
+                    "--",
+                    Lookup::External
+                ),
+                "{line:?}"
+            );
+        }
+        // A flag `command` *rejects* is not a program either: completing after it
+        // as though it were would offer arguments for a line that reports a usage
+        // error, and would run a `$PATH` file of that name to ask it for help.
+        for entered in ["-v", "-V", "--hepl", "--help"] {
+            let line = vec!["command".to_owned(), entered.to_owned()];
+            assert_eq!(
+                segment_completions(&state, &line, ""),
+                argument_completions(&state, &line, "", Lookup::Shell),
+                "{entered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deferred_stage_is_registered_under_the_program_it_will_run() {
+        // A deferred stage joins the job table *before* its words are expanded, so
+        // the cut the eager paths make in `external_stage` has to be made on the
+        // spelling too — or `jobs` names `command` and `%sleep` finds nothing.
+        let words = |line: &str| -> Vec<parser::Word> {
+            line.split_whitespace()
+                .map(|word| parser::Word {
+                    pieces: vec![parser::WordPiece::Text {
+                        text: word.to_owned(),
+                        quote: parser::QuoteMode::Bare,
+                    }],
+                })
+                .collect()
+        };
+        assert_eq!(deferred_words(&words("command sleep 1")), ["sleep", "1"]);
+        assert_eq!(deferred_words(&words("command -- sleep 1")), ["sleep", "1"]);
+        // Nothing to strip, or nothing that will run: left as written.
+        assert_eq!(deferred_words(&words("sleep 1")), ["sleep", "1"]);
+        assert_eq!(deferred_words(&words("command")), ["command"]);
+        assert_eq!(
+            deferred_words(&words("command --help")),
+            ["command", "--help"]
+        );
+        assert_eq!(
+            deferred_words(&words("command -v ls")),
+            ["command", "-v", "ls"]
+        );
+    }
+
+    #[test]
+    fn command_reads_only_the_words_in_front_of_the_program() {
+        let words =
+            |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_owned).collect() };
+        // Its own `--help` is the first word after it and nothing else: everything
+        // from the program name on belongs to the program.
+        assert!(matches!(command_line(&words("--help")), CommandLine::Help));
+        assert!(matches!(command_line(&[]), CommandLine::Nothing));
+        assert!(matches!(command_line(&words("--")), CommandLine::Nothing));
+        let external = |args: &[String]| match command_line(args) {
+            CommandLine::External(program) => program,
+            _ => panic!("expected a program"),
+        };
+        assert_eq!(external(&words("ls --help")), words("ls --help"));
+        assert_eq!(
+            external(&words("grep -- -x file")),
+            words("grep -- -x file")
+        );
+        // `--` ends `command`'s own options and is consumed, so the word after it
+        // is the program however it reads.
+        assert_eq!(external(&words("-- --help")), words("--help"));
+        assert_eq!(external(&words("-- -v ls")), words("-v ls"));
+        // The operand is the program, with no second prefix to peel: a `command`
+        // there is a program of that name to look for.
+        assert_eq!(external(&words("command ls")), words("command ls"));
+        // A flag-looking word in front of the program is `command`'s own, and
+        // `--help` is the only one it has. Reading `-v` as a program name would
+        // report "command not found: -v" for a question mesh understood, and
+        // would be the meaning `command -v` had to keep once it is built.
+        for line in ["-v ls", "-V ls", "--hepl", "-x"] {
+            let flag = words(line)[0].clone();
+            assert!(
+                matches!(command_line(&words(line)), CommandLine::Unknown(word) if word == flag),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_stage_is_the_program_rather_than_a_shell_that_runs_it() {
+        let words =
+            |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_owned).collect() };
+        // The prefix comes off, so the stage forks once — and the program is
+        // looked up past the builtin of that name, which is the point.
+        assert_eq!(
+            external_stage(&words("command ls -l")),
+            Some(words("ls -l"))
+        );
+        assert_eq!(
+            external_stage(&words("command puts hi")),
+            Some(words("puts hi"))
+        );
+        // A builtin still runs in the shell, and so does a `command` with no
+        // program in it — `run_expanded` has the answer for those.
+        assert_eq!(external_stage(&words("puts hi")), None);
+        assert_eq!(external_stage(&words("command")), None);
+        assert_eq!(external_stage(&words("command --help")), None);
+        assert_eq!(external_stage(&words("command -v ls")), None);
+        assert_eq!(external_stage(&words("ls -l")), Some(words("ls -l")));
     }
 
     #[test]
@@ -10432,7 +10844,12 @@ mod tests {
         };
 
         assert_eq!(
-            argument_completions(&state, &["cat".into(), prefix.clone()], &prefix),
+            argument_completions(
+                &state,
+                &["cat".into(), prefix.clone()],
+                &prefix,
+                Lookup::Shell
+            ),
             [format!("{}/", child.display())]
         );
         fs::remove_dir_all(dir).unwrap();
@@ -10471,7 +10888,12 @@ mod tests {
         };
 
         assert_eq!(
-            argument_completions(&state, &["vi".into(), prefix.clone()], &prefix),
+            argument_completions(
+                &state,
+                &["vi".into(), prefix.clone()],
+                &prefix,
+                Lookup::Shell
+            ),
             [
                 cargo_lock.to_string_lossy().into_owned(),
                 cargo_toml.to_string_lossy().into_owned()
@@ -10528,7 +10950,8 @@ mod tests {
             argument_completions(
                 &state,
                 &["tool".into(), "--file".into(), prefix.clone()],
-                &prefix
+                &prefix,
+                Lookup::Shell
             ),
             [
                 file.to_string_lossy().into_owned(),
@@ -10539,28 +10962,45 @@ mod tests {
             argument_completions(
                 &state,
                 &["tool".into(), "--directory".into(), prefix.clone()],
-                &prefix
+                &prefix,
+                Lookup::Shell
             ),
             [format!("{}/", child.display())]
         );
         assert_eq!(
-            argument_completions(&state, &["tool".into(), "--color=a".into()], "--color=a"),
+            argument_completions(
+                &state,
+                &["tool".into(), "--color=a".into()],
+                "--color=a",
+                Lookup::Shell
+            ),
             ["--color=auto", "--color=always"]
         );
         assert_eq!(
-            argument_completions(&state, &["tool".into(), "--color=nv".into()], "--color=nv"),
+            argument_completions(
+                &state,
+                &["tool".into(), "--color=nv".into()],
+                "--color=nv",
+                Lookup::Shell
+            ),
             ["--color=never"]
         );
         assert!(
-            argument_completions(&state, &["tool".into(), "--color=NV".into()], "--color=NV")
-                .is_empty()
+            argument_completions(
+                &state,
+                &["tool".into(), "--color=NV".into()],
+                "--color=NV",
+                Lookup::Shell
+            )
+            .is_empty()
         );
         let fuzzy_prefix = format!("{}/ft", dir.display());
         assert_eq!(
             argument_completions(
                 &state,
                 &["tool".into(), "--file".into(), fuzzy_prefix.clone()],
-                &fuzzy_prefix
+                &fuzzy_prefix,
+                Lookup::Shell
             ),
             [file.to_string_lossy().into_owned()]
         );
@@ -10593,7 +11033,8 @@ mod tests {
             argument_completions(
                 &state,
                 &[command, "build".into(), "--color".into(), "a".into()],
-                "a"
+                "a",
+                Lookup::Shell
             ),
             ["auto", "always"]
         );
