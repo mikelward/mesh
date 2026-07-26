@@ -233,10 +233,9 @@ variables and functions remain available for the session.
 `--rcfile FILE` replaces `rc.mesh`, while `--norc` skips the interactive RC
 file. Neither option skips `env.mesh` or the login files.
 
-Interactive command history is saved in
-`$XDG_STATE_HOME/mesh/history.sqlite3`, falling back to
-`~/.local/state/mesh/history.sqlite3`. Pass `--no-save-history` (or the shorter
-`--no-history` alias) to keep history in memory for that session instead.
+Interactive command history is saved under `$XDG_STATE_HOME` — see
+[History and recall](#history-and-recall). Pass `--no-save-history` (or the
+shorter `--no-history` alias) to keep history in memory for that session instead.
 
 ---
 
@@ -247,6 +246,114 @@ separated by spaces.
 
 ```
 command arg1 arg2 …
+```
+
+### Comments and line breaks
+
+`#` starts a comment that runs to the end of the line. It is only a comment where
+a **word begins**, so a `#` inside a word (`file#1`) or inside quotes is ordinary
+text — which is what lets a script carry a shebang and a URL fragment alike:
+
+```mesh
+# a whole-line comment
+puts hi          # and a trailing one
+puts a#b         # a#b — not a comment
+puts "# text"    # quoted, so literal
+```
+
+A `\` at the end of a line **continues** it, joining the next line as though the
+break were not there. A blank or whitespace-only line is not a command: it runs
+nothing and leaves `$sh.status` as it was.
+
+```mesh
+puts one \
+     two          # one two
+```
+
+Line breaks inside an unclosed `{ … }`, `[ … ]`, `( … )`, or quote continue the
+statement too, so a block or a list literal may span lines without a `\`.
+Interactively the continuation prompt is `...`.
+
+### Pipelines and sequencing
+
+```
+cmd | cmd          # stdout of the left becomes stdin of the right
+cmd |& cmd         # stdout *and* stderr, both to the next stage
+cmd && cmd         # run the right one only if the left succeeded
+cmd || cmd         # run the right one only if the left failed
+cmd ; cmd          # run one after the other, whatever happened
+cmd &              # run it in the background as a job
+```
+
+**`|`** connects stdout to the next stage's stdin. **`|&`** connects stderr as
+well — the shorthand for `2>&1 |`, per connector, so one pipeline can mix them:
+
+```mesh
+build |& tee log            # both streams into `tee`
+noisy |& grep -v warning | wc -l
+build 2>&1 | tee log        # the same as the first line, spelled out
+```
+
+Every stage runs in its **own process**, a builtin and a mesh function included,
+so a `cd` or an assignment inside one does not outlive it (`puts hi | tr a-z A-Z`
+runs the builtin in a fork). Stages run concurrently.
+
+A pipeline's status is the **pipefail** status: the last stage to fail, or `0`
+when none did — mesh has no option to turn that off. `$sh.pipestatus` breaks it
+down by stage, and an upstream `SIGPIPE` is forgiven; see
+[Exit status](#exit-status).
+
+**`&&`** and **`||`** are left-associative and share one precedence level, as in
+POSIX shells, so `a && b || c` is `(a && b) || c`. They branch on the exit status
+of what precedes them — for a value statement, on the [status view](#exit-status)
+of the value.
+
+**`;`** and a newline mean the same thing: run the next statement regardless. A
+single trailing `;` is allowed.
+
+**`&`** backgrounds a command or a pipeline and prints the job's `[id] pid`
+notice; see [Job control](#job-control). It backgrounds a **command**, so
+`&` after an expression, an assignment, an `if`, a `match`, a loop, or a
+definition is refused rather than forked. The one assignment that takes it is
+`j = cmd &`, which binds the job handle — the `&` belongs to the job there, not
+to the assignment.
+
+### Postfix guards — `if` and `unless`
+
+A statement can carry its own condition at the end, which is the one-line form of
+wrapping it in `if`:
+
+```mesh
+puts "no branch" if $branch == ""
+puts $iface $addr unless $addr == ""
+return early if $n == 0
+continue if $line ~ /^#/
+```
+
+The condition is a **value expression**, not a command: `puts x if test -d .git`
+is not a guard at all (see below). Use a full `if` block for a command condition.
+
+A guard may follow a command, a pipeline stage, a `return` / `break` /
+`continue`, or a bare value statement. It may **not** follow an assignment —
+`x = 1 if $b` is a syntax error rather than a conditional binding.
+
+When the condition is false the statement **does not run**, and `$sh.status` is
+left exactly as it was — a skipped statement reports nothing of its own:
+
+```mesh
+sh -c 'exit 3'
+puts skipped if false
+puts $sh.status               # 3 — the guard reported nothing
+```
+
+`if` and `unless` are only guards where the rest of the line **forms a complete
+value expression**; otherwise they are ordinary arguments, so a command can still
+be handed the word:
+
+```mesh
+puts x if test -d .git        # prints: x if test -d .git
+puts done if $ok              # a guard — `$ok` completes the expression
+puts 'if'                     # quoted, so always an argument
 ```
 
 ### Values as arguments
@@ -341,6 +448,33 @@ another; the one exception says so out loud, as `gets` does above.
 `echo` is deliberately *not* intercepted — an external `echo` handles `-n` and
 `-e`, which mesh's flag-free [`puts`](#builtins) would print as text; the note
 only appears when `PATH` has no `echo` to run.
+
+### Command substitution — `$(…)`
+
+`$(command)` runs a command and becomes its **standard output, as one string**:
+
+```mesh
+here = $(pwd)
+puts "at $(pwd) now"
+puts "$(id -un)@$(hostname)"     # glue it to text by quoting the whole word
+```
+
+- **Trailing newlines are trimmed**, all of them; interior ones are kept, so
+  `$(printf "a\nb\n")` is the two-line string `a\nb` and not a list. Split it
+  when you want the lines (`lines = $(cat log):split("\n")`).
+- **Only stdout is captured.** The command's stderr goes where the shell's does,
+  so a diagnostic still reaches the terminal instead of ending up in the value.
+- **The result is one literal value** — never re-split on spaces, never re-globbed
+  — like every other value: `puts $(puts '*')` prints `*`.
+- **A failing capture stops the statement.** The assignment or command it was part
+  of does not run, and the shell recovers and reads the next one; the failing
+  command's own diagnostic is the report.
+- The body is ordinary mesh, so it may hold several statements
+  (`$(puts a; puts b)`), a pipeline, or another capture.
+
+It is usable wherever a value is — an assignment, a condition, a command argument
+(see [Values as arguments](#values-as-arguments)), and inside `"…"` (see
+[Quoting](#quoting)) — but **not** inside `'…'`, `r'…'`, or a heredoc body.
 
 ### Redirection
 
@@ -446,6 +580,8 @@ syntax error). Like a heredoc it travels by an unlinked temporary file, so a lon
 one cannot deadlock, and either can be backgrounded — the body reaches the stage
 as memory, and the stage writes the temporary in its own process.
 
+## The interactive session
+
 ### Tab completion
 
 In an interactive shell, Tab completes according to the cursor's current word:
@@ -470,6 +606,68 @@ including Vim's `[file ..]`, do the same for ordinary command arguments.
 External-command help probes have null stdin, a two-second timeout, and a
 one-MiB output cap.
 
+### Line editing
+
+The interactive line editor takes **emacs keys** — the set your fingers already
+have:
+
+| Key | Effect |
+| --- | --- |
+| Ctrl-A / Ctrl-E | Start / end of the line |
+| Ctrl-B / Ctrl-F, arrows | Back / forward one character |
+| Alt-B / Alt-F | Back / forward one word |
+| Ctrl-P / Ctrl-N, up / down | Previous / next history entry |
+| Ctrl-R | Search history backwards |
+| Ctrl-W / Alt-D | Cut the word before / after the cursor |
+| Ctrl-U / Ctrl-K | Cut to the start / end of the line |
+| Ctrl-Y | Paste what was cut |
+| Ctrl-Z / Ctrl-G | Undo / redo *while editing*; Ctrl-Z stops a **running** command instead |
+| Ctrl-L | Clear the screen |
+| Tab | Complete — see [Tab completion](#tab-completion) |
+| Alt-. | Insert the previous command's last argument; press again to walk back |
+| Ctrl-C | Abandon the line, buffered block and all, and re-prompt |
+| Ctrl-D | Exit, on an empty line |
+
+Ctrl-C **abandons** rather than runs: nothing executes and `$sh.status` is left
+as it was. A line that opens a block or a quote keeps reading at the `...`
+continuation prompt until it balances, and Ctrl-C drops the whole thing.
+
+The line is drawn in bold unless `$sh.options.bold-input` is off, and bracketed
+paste is always on, so a pasted multi-line block arrives as text to read rather
+than as commands already run.
+
+### History and recall
+
+Commands are saved to `$XDG_STATE_HOME/mesh/history.sqlite3` (falling back to
+`~/.local/state/mesh/history.sqlite3`), owner-readable only, and a multi-line
+command is stored and recalled as the **one logical command** it was typed as.
+Recall reaches back through earlier sessions but not sideways into a peer session
+that started later, so two shells open at once do not interleave each other's
+lines. `--no-save-history` keeps a session's history in memory instead.
+
+Three **word designators** expand against the previous command line before it is
+parsed:
+
+| Form | Expands to |
+| --- | --- |
+| `!^` | Its first argument |
+| `!$` | Its last argument |
+| `!*` | All of its arguments, separated by spaces |
+
+```
+mesh$ mkdir -p build/out
+mesh$ cd !$
+cd build/out
+```
+
+The expanded line is echoed, as above, so what ran is on the screen. Expansion is
+quote-safe: a `!` inside `"…"`, `'…'`, or `r'…'`, after a backslash, or not
+followed by one of the three designators stays literal — which is what leaves
+`!!`, `!string`, and `!n` free to be added later; they are not implemented. A
+line with no arguments makes `!*` empty but `!^` / `!$` an error, and with no
+previous command at all, all three are an error. Alt-. inserts the same last
+argument by hand, and repeating it walks back through earlier commands.
+
 ## Builtins
 
 | Builtin | Effect |
@@ -479,7 +677,7 @@ one-MiB output cap.
 | `print [arg …]` | The same as `puts` with **no trailing newline**, for partial lines. No arguments prints nothing. |
 | `style(text, fg: …, bg: …, bold: …)` | A [styled value](#styled-values) — text plus display attributes. A **value call**, parens attached, because a command position yields a status. Colors are the sixteen ANSI names: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `grey` (or `gray`, or `bright-black`), and `bright-` forms of the rest. |
 | `link(text, url)` | A [styled value](#styled-values) carrying an `OSC 8` hyperlink, so `text` is clickable. The url needs a **scheme** (`https://…`, `file://host/path`) and anything RFC 3986 forbids raw is percent-encoded, a space included; over 2083 encoded bytes is refused, since past a terminal's own limit the whole sequence — link text included — is dropped. |
-| `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`. |
+| `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`. `CDPATH` and autocd are not implemented, so a bare directory name is a command, not a `cd`. |
 | `pwd` | Print the working directory. |
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
 | `notify [text …]` | Raise a desktop notification through the terminal with `OSC 9`. Arguments or stdin, like `clip`. A command that runs for more than ten seconds notifies on its own, with its outcome and duration — `$sh.options.command-notify = false` turns that off. Inside tmux the sequence is wrapped for passthrough, which tmux forwards only with `allow-passthrough` set. Support is uneven and unreportable — iTerm2, WezTerm, Ghostty, kitty and ConEmu raise these; xterm and Alacritty discard them; tmux needs `allow-passthrough` — so success means "asked". |
@@ -492,6 +690,7 @@ one-MiB output cap.
 | `wait job` | Wait for a job to finish and report its status — see [Job control](#job-control). |
 | `kill [-signal] job\|pid …` | Signal a job's process group, or a pid. Default `TERM`. |
 | `disown [-h] [-a \| -r] [job …]` | Stop tracking a job — see [Job control](#job-control). |
+| `source file` | Run a file's mesh code in this shell — see [`source`](#source). |
 
 ### Flags and `--`
 
@@ -986,9 +1185,6 @@ Neither word is reserved — only `env` and `sh` are — so a variable may still
 called `global` or `unset`; they lead a statement only where one can follow.
 Unsetting `env` or `sh` is refused.
 
-Not yet supported: deleting a collection element (`unset $m.key`, `unset $xs[i]`),
-which waits on general member assignment.
-
 Lists are bracketed, space-separated values. They preserve nesting: `$xs` in a
 literal inserts a list as one nested element, while `...$xs` flattens exactly
 one level. The same distinction applies when appending and when an indexed
@@ -1152,7 +1348,10 @@ is `\$`.
 Recognized postfix modifiers apply from left to right after a variable, member,
 or list access. They work in bare and double-quoted interpolation; braced form
 puts the modifier inside the braces (`${file:stem}`). An unrecognized `:name`
-is literal text, so `$host:$port` is not mistaken for a modifier chain.
+is literal text, so `$host:$port` is not mistaken for a modifier chain. A name
+mesh **reserves** for a modifier it has not built yet — `:sort`, `:words`,
+`:lines`, `:replace`, and the rest of the `DESIGN.md` set — is a loud
+`not implemented yet` in a value context rather than a silent no-op.
 
 | Modifier | Input | Result |
 | --- | --- | --- |
@@ -1178,8 +1377,12 @@ is literal text, so `$host:$port` is not mistaken for a modifier chain.
 | `:keys` | map | Keys as an insertion-ordered list. |
 | `:values` | map | Values as an insertion-ordered list. |
 | `:repr` | any value with a literal form | The value written as the mesh source you would have typed for it, as a string. |
+| `:tty` | stream handle | Is that stream a terminal? The `test -t N` replacement — see [`$sh.args` and `$sh.name`](#shargs-and-shname). |
 | `:split(SEP)` | string | Split on the literal separator into a list. |
 | `:join(SEP)` | list | Fold the list into a string, `SEP` between elements. |
+| `:map(F)` / `:filter(F)` / `:each(F)` | list | Apply a callable per element — see [Functions](#functions). |
+| `:i` `:m` `:s` `:x` | regex | Pattern flags — see [Operators and matching](#operators-and-matching). |
+| `:capture` | a **call** | Every channel of the call as a record — see [Functions](#functions). |
 
 Path and case modifiers map over lists. Collection modifiers consume a list or
 map as a whole. The **file tests** (`:exists`, `:type`, `:read`, `:write`)
@@ -1402,12 +1605,29 @@ not_source = notes.txt !~ *.rs
 ```
 
 A slash-delimited regex is recognized only in the right operand of `~` or `!~`.
-Its body is raw except that `\/` includes a literal slash. Append `:i`, `:m`, or
-`:s` for case-insensitive, multiline, or dot-matches-newline behavior:
+Its body is raw except that `\/` includes a literal slash. Flags are postfix
+modifiers on the pattern, each with a short and a long spelling:
+
+| Flag | Long form | Effect |
+| --- | --- | --- |
+| `:i` | `:ignorecase` | Match without regard to case. |
+| `:m` | `:multiline` | `^` and `$` match at line boundaries. |
+| `:s` | `:dotall` | `.` matches a newline. |
+| `:x` | `:extended` | Ignore whitespace in the pattern, so it can be spaced out. |
 
 ```mesh
 case_insensitive = ERROR ~ /error/:i
+also_insensitive = ERROR ~ /error/:ignorecase
 contains_slash = a/b ~ /a\/b/
+```
+
+They chain like any other modifier (`/error/:i:m`), and they apply to a compiled
+`re(…)` value as readily as to a literal. A `/…/` literal is one **word**, so it
+cannot contain a space — which is why `:x`, whose whole point is a spaced-out
+pattern, pairs with `re(…)`:
+
+```mesh
+spaced = re("\\d{3} - \\d{4}"):x
 ```
 
 Use `re(STRING)` to compile a regex for reuse or to build one from a value, and
@@ -1722,7 +1942,7 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
   - **Scope is a function's scope** — fresh locals, the parameters, the globals.
     A lambda does *not* close over the scope it was written in, so one inside a
     function cannot read that function's locals; the read fails loud. (mesh has
-    exactly two variable scopes; see [Variables](#variables-and-assignment).)
+    exactly two variable scopes; see [Variables](#variables).)
   - **A global binding is visible to the body**, which is what lets a lambda
     recurse: `fact = func(n) { if $n == 0 { return 1 }\n return $n * $fact($n - 1) }`.
   - **No text form.** A function value is the one value that cannot be bytes, so a
@@ -1930,9 +2150,12 @@ func dir-info() { style(tilde-pwd(), fg: blue) }    # a prompt segment
 
 ## Not yet implemented
 
-Most modifier arguments (beyond `:split` / `:join`), the command-word form of an
-argument-taking modifier, and regex capture modifiers are not yet implemented.
-Of heredocs, the command-redirection form documented under Commands works, as do
-here-strings; a value-producing heredoc spelling does not.
-`style` covers the sixteen ANSI colors only.
+The argument-taking modifiers that work today are `:split`, `:join`, `:map`,
+`:filter`, and `:each`; the rest of the `DESIGN.md` set (`:get`, `:match`,
+`:words`, `:lines`, `:replace`, the time and sort families) is not implemented,
+and neither is the command-word form of one (`puts $dirs:join(":")`) or the regex
+capture modifiers. Of heredocs, the command-redirection form documented under
+Commands works, as do here-strings; a value-producing heredoc spelling does not.
+The history designators `!!`, `!string`, and `!n` are not implemented — only
+`!^`, `!$`, and `!*` are. `style` covers the sixteen ANSI colors only.
 See [`ROADMAP.md`](../ROADMAP.md).

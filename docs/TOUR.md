@@ -133,6 +133,96 @@ mesh$ <strong>cd -</strong>
 /tmp
 </pre>
 
+## Pipes and redirection
+
+The shell spine is the one you already know. `|` joins one command's output to
+the next command's input:
+
+<pre>
+mesh$ <strong>cat words.txt | sort -r | head -2</strong>
+gamma
+beta
+</pre>
+
+`|&` carries **stderr down the pipe as well**, which saves writing `2>&1 |`:
+
+<pre>
+mesh$ <strong>sh -c 'echo out; echo trouble &gt;&amp;2' |&amp; sort</strong>
+out
+trouble
+</pre>
+
+Files attach with the usual operators — `>` writes, `>>` appends, `<` reads,
+`2>` takes stderr on its own, and `&>` takes both streams:
+
+<pre>
+mesh$ <strong>puts one &gt; out.txt</strong>
+mesh$ <strong>puts two &gt;&gt; out.txt</strong>
+mesh$ <strong>cat &lt; out.txt</strong>
+one
+two
+mesh$ <strong>sh -c 'echo oops &gt;&amp;2' 2&gt; err.txt</strong>
+</pre>
+
+Any descriptor works, not just the standard three (`3< input.txt`), and `n>&-`
+closes one. For input written in place there is the heredoc, and the here-string
+for a single word:
+
+<pre>
+mesh$ <strong>name = world</strong>
+mesh$ <strong>cat &lt;&lt; END</strong>
+... <strong>hello $name</strong>
+... <strong>END</strong>
+hello world
+mesh$ <strong>wc -l &lt;&lt;&lt; hi</strong>
+1
+</pre>
+
+An unquoted heredoc delimiter interpolates the body; quote it (`<< 'END'`) and
+the body is raw.
+
+## Chaining, and how a command reports
+
+`;` runs one command after another, `&&` runs the next only if the last
+succeeded, and `||` only if it failed:
+
+<pre>
+mesh$ <strong>test -e words.txt &amp;&amp; puts found || puts missing</strong>
+found
+</pre>
+
+`$sh.status` is the last command's exit status — the readable replacement for
+`$?`. A pipeline reports the **pipefail** status, always: the last stage to fail,
+or `0` when none did. `$sh.pipestatus` is the per-stage breakdown, as a real list:
+
+<pre>
+mesh$ <strong>sh -c 'exit 3' | sort</strong>
+mesh$ <strong>puts $sh.status ...$sh.pipestatus</strong>
+3 3 0
+</pre>
+
+Read them in **one** command when you want both: reading either is itself a
+command, so a first `puts` would replace what a second one reports.
+
+## Background jobs
+
+`&` runs a command in the background and hands you back the prompt. Bind it and
+you have a **job handle** — mesh's replacement for `$!`:
+
+<pre>
+mesh$ <strong>j = sleep 30 &amp;</strong>
+[1] 4812
+mesh$ <strong>puts $j.state</strong>
+running
+mesh$ <strong>jobs</strong>
+[1] Running sleep 30
+mesh$ <strong>wait $j</strong>
+</pre>
+
+`fg`, `bg`, `wait`, and `kill` all take a handle, a `%1`-style reference, or a
+bare job id (`fg 1`). The whole table is a value too — `$sh.jobs` — so a prompt
+can read the live jobs straight out of it instead of scraping `jobs` output.
+
 ## Matching filenames
 
 An unquoted `*`, `?`, or `[…]` is matched against the files in the directory —
@@ -226,6 +316,49 @@ Read an environment variable through `$env`:
 mesh$ <strong>puts $env.HOME</strong>
 /home/you
 </pre>
+
+## Capturing a command's output
+
+`$(command)` is the command's standard output as a value. Trailing newlines are
+trimmed; nothing else is touched:
+
+<pre>
+mesh$ <strong>here = $(pwd)</strong>
+mesh$ <strong>puts "at $here"</strong>
+at /home/you
+mesh$ <strong>count = $(cat words.txt | wc -l)</strong>
+mesh$ <strong>puts $count</strong>
+3
+</pre>
+
+A capture works in an argument too (`puts $(pwd)`), and inside `"…"`, which is
+how you glue it to text: `puts "$(id -un)@$(hostname)"`. What comes back is one
+literal value — never re-split, never re-globbed — and a capture whose command
+fails stops the statement rather than substituting nothing.
+
+## Writing the environment
+
+`$env.KEY = value` writes the process environment, so children inherit it.
+`export KEY = value` is the same write in the spelling your fingers know:
+
+<pre>
+mesh$ <strong>export GREETING = hi</strong>
+mesh$ <strong>sh -c 'echo $GREETING'</strong>
+hi
+</pre>
+
+Path-type names — `PATH`, `MANPATH`, `CDPATH`, and a few more — are **lists** on
+the way in and `:`-joined on the way out, so the `IFS` juggling disappears:
+
+<pre>
+mesh$ <strong>$env.PATH += /opt/bin</strong>
+mesh$ <strong>puts $env.PATH:last</strong>
+/opt/bin
+mesh$ <strong>$env.PATH = $env.PATH:dedup</strong>
+</pre>
+
+Only strings cross into the environment, so a list or map has to be joined
+first — mesh says so rather than inventing a rendering.
 
 ## Lists preserve structure
 
@@ -459,6 +592,44 @@ https=443
 `continue` skips to its next iteration. A list-pattern binder destructures each
 list element, for example `for [key value] in $pairs { ... }`.
 
+## Repeating with `while` and `loop`
+
+`while` tests before each pass, taking the same two condition forms `if` does —
+a value's truthiness or a command's exit status. `loop` repeats until something
+breaks out:
+
+<pre>
+mesh$ <strong>i = 0</strong>
+mesh$ <strong>while $i &lt; 3 { puts $i; i = $i + 1 }</strong>
+0
+1
+2
+mesh$ <strong>while test -e /tmp/lock { sleep 1 }</strong>
+mesh$ <strong>loop { if deploy-succeeded { break }; sleep 5 }</strong>
+</pre>
+
+In a condition a spaced comparison compares — `while $i < 3` is a test, not a
+redirection — while `cmd > log` still writes the file.
+
+## One-line guards
+
+A statement can carry its own condition at the end, which reads better than
+wrapping one line in an `if`. `unless` is the inverse:
+
+<pre>
+mesh$ <strong>for n in 1..=4 {</strong>
+...   <strong>continue if $n == 2</strong>
+...   <strong>puts $n unless $n == 3</strong>
+... <strong>}</strong>
+1
+4
+</pre>
+
+The condition is a value expression rather than a command, and a false guard
+skips the statement without disturbing `$sh.status`. `if` only starts a guard
+when what follows completes an expression, so `puts x if test -d .git` still
+hands `puts` those words as arguments.
+
 ## Selecting a value with `match`
 
 `match` tries arms from top to bottom. It supports exact values, globs, regular
@@ -533,7 +704,161 @@ mesh$ <strong>check /etc && puts present</strong>
 present
 </pre>
 
+A function is also an ordinary pipeline stage or background job — `f | sort`,
+`echo x | f`, `f &` — each running in its own process, exactly as an external
+command does.
+
+## Calling a function for a value
+
+Attach the parentheses and you get the function's **value** rather than its
+status: the last expression of the body, or whatever `return` carries.
+
+<pre>
+mesh$ <strong>func double(n) { return $n * 2 }</strong>
+mesh$ <strong>x = double(21)</strong>
+mesh$ <strong>puts $x</strong>
+42
+</pre>
+
+Arguments there are expressions, and `key: value` binds the same parameter the
+`--key` flag does, so `deploy(prod, force: true)` and `deploy prod --force` are
+the same call.
+
+When you want every channel at once, `:capture` runs the call and hands back a
+record of `.value`, `.out`, `.err`, and `.status`:
+
+<pre>
+mesh$ <strong>func build() { puts compiling; return ok }</strong>
+mesh$ <strong>r = build():capture</strong>
+mesh$ <strong>puts "$r.value $r.status"</strong>
+ok 0
+mesh$ <strong>puts $r.out:repr</strong>
+'compiling\n'
+</pre>
+
+## Lambdas, and modifiers that take them
+
+`func(params) { body }` with no name is a **function value**. `:map`, `:filter`,
+and `:each` take one and apply it to every element of a list:
+
+<pre>
+mesh$ <strong>xs = [1 2 3 4]</strong>
+mesh$ <strong>doubled = $xs:map(func(x) { $x * 2 })</strong>
+mesh$ <strong>evens = $xs:filter(func(x) { $x % 2 == 0 })</strong>
+mesh$ <strong>puts ...$doubled</strong>
+2 4 6 8
+mesh$ <strong>puts ...$evens</strong>
+2 4
+</pre>
+
+A bare `:modifier` is itself a callable, so a mapper that only forwards to one
+can be written directly — `$paths:map(:base)` says what
+`$paths:map(func(p) { $p:base })` says. `:filter` insists on a real boolean, and
+`:each` runs for effect and yields nothing.
+
+Bind a lambda and call it through the variable — the `$` is required, since a
+bare `double(5)` looks for a *declared* function:
+
+<pre>
+mesh$ <strong>double = func(x) { $x * 2 }</strong>
+mesh$ <strong>puts $double(5)</strong>
+10
+</pre>
+
+## Isolating a block with `fork`
+
+A `func` is not a subshell: a `cd` inside one persists, on purpose. `fork { … }`
+is the opt-in for the other behavior — the body runs in a forked child, so the
+cwd, environment, and bindings it changes are its own:
+
+<pre>
+mesh$ <strong>fork { cd /tmp; puts $(pwd) }</strong>
+/tmp
+mesh$ <strong>puts $(pwd)</strong>
+/home/you
+</pre>
+
+Only bytes cross back out: what the child prints appears, its exit status becomes
+the block's, and an `exit` inside ends the child rather than your shell.
+
+## Color and links
+
+`style` returns a string carrying display attributes, and `link` one carrying a
+hyperlink. Both are value calls, so the parens are attached:
+
+<pre>
+mesh$ <strong>danger = style("danger", fg: red, bold: true)</strong>
+mesh$ <strong>puts $danger</strong>
+danger
+mesh$ <strong>puts "level: $danger"</strong>
+level: danger
+mesh$ <strong>puts link("the docs", "https://example.com/guide")</strong>
+the docs
+</pre>
+
+Everywhere bytes are wanted the value behaves as its plain text — `$danger:len`
+is `6`, and a comparison matches the text — and the escapes are written only when
+the command's own stdout is a terminal, so a redirect or a capture gets clean
+text.
+
+## Running a script
+
+The same language runs from a file. `mesh script.mesh a b c` passes the
+arguments as `$sh.args`, a real list, and `#` starts a comment, so a shebang
+works:
+
+```mesh
+#!/usr/bin/env mesh
+puts "$sh.name got $sh.args:len arguments"
+for arg in $sh.args { puts $arg }
+```
+
+`mesh -c "puts hi"` runs one command string, and with neither, mesh reads
+commands from stdin — so `echo 'ls' | mesh` works without a flag. A script is
+parsed as a single unit, so a syntax error anywhere in the file means none of it
+runs.
+
+## Making it your shell
+
+mesh reads its configuration from `$XDG_CONFIG_HOME/mesh` (or `~/.config/mesh`):
+`env.mesh` every invocation, `login.mesh` for login shells, and `rc.mesh` for
+interactive ones. `source FILE` runs a file's mesh code in *this* shell, so what
+it defines outlives it:
+
+<pre>
+mesh$ <strong>source lib.mesh</strong>
+mesh$ <strong>greet world</strong>
+hi, world
+</pre>
+
+The prompt is `prompt "text"`, and a `preprompt` hook makes it dynamic. Other
+hooks fire around each command and each finished job:
+
+```mesh
+func refresh-prompt() { prompt "$(pwd)> " }
+prompt-hook cwd refresh-prompt          # `cwd` names the hook, so it can be replaced
+
+func command-finished(cmd, status, elapsed) {
+  puts "$cmd exited $status after ${elapsed}ms"
+}
+prompt-hook postexec log command-finished
+```
+
+Interactive decorations — bold input, the window title, the working-directory
+report, shell integration marks, the notification a slow command raises — are all
+on out of the box and each turns off on its own:
+
+```mesh
+$sh.options.osc-title = false
+```
+
+At the prompt itself the keys are the emacs ones (Ctrl-A, Ctrl-R to search
+history, Alt-. to pull in the last argument), history is saved across sessions,
+and `!$` / `!^` / `!*` reach for the previous command's arguments.
+
 ---
 
-That's everything mesh does today. New features land one at a time, and this tour
-grows to match.
+That is the tour: the main features, in the order they build on each other. It is
+not everything — [`REFERENCE.md`](REFERENCE.md) lists the whole surface, down to
+the corners this walk skipped, and `help` at the prompt answers for any builtin,
+keyword, or operator by name.
