@@ -249,6 +249,50 @@ separated by spaces.
 command arg1 arg2 …
 ```
 
+### Values as arguments
+
+An argument is usually a word, but it can be a **value expression** wherever the
+spelling could not be a word anyway — parentheses, a capture, or an attached call:
+
+```mesh
+puts (1 + 2)                  # 3
+puts ($n + 3)
+puts $(pwd)                   # a capture, in argv
+puts before $(pwd) after      # glued to its neighbours, in argument order
+puts style(x, fg: red)        # a value call
+puts f()                      # a function's value
+```
+
+The result is **literal**, exactly as an interpolated variable is: never re-split,
+never re-globbed, so `puts $(puts '*')` prints `*`.
+
+It carries the *value*, not its text. So a builtin that reads values gets one —
+`puts f()` on a list prints one element per line — while a command that needs bytes
+meets the ordinary argv rule and refuses a collection by name:
+
+```mesh
+/bin/echo f()                 # error: a list needs `...` to become command arguments
+```
+
+A value argument is a **whole** argument: text attached to it (`pre$(x)post`, `f()x`)
+is a syntax error rather than silently three arguments. Bind it and interpolate
+instead — `m = $(…)` then `pre${m}post`.
+
+It cannot be **backgrounded** yet: `puts $(sleep 10) &` is refused, because the
+argument would run in the shell rather than in the job's fork — the prompt would hang
+for ten seconds and the `&` would buy nothing. Bind it first (`m = $(…)` then
+`cmd $m &`). A foreground pipeline is fine.
+
+A following `<` or `>` is still a **redirection**, so `puts (1 + 2) > out` writes the
+file. That is because an argument is parsed just above comparison precedence; a
+comparison you actually want gets its own parens (`puts (1 < 2)` prints `true`), and
+`&&`, `||` and `|` keep their readings for the same reason.
+
+`[` and `..` are **not** value syntax here: in an argument they are already a glob
+character class (`ls src/[ab]*`) and the literal word `1..3`. Spacing decides an
+attached call from an argument — `puts(1 + 2)` calls `puts` for a value (and a command
+has none), while `puts (1 + 2)` passes it one.
+
 An unknown command prints `command not found` and sets a failing status. When
 the name is a bash builtin mesh spells differently, the message names mesh's
 spelling in a parenthetical, so a bash reflex has somewhere to go:
@@ -1826,14 +1870,13 @@ Past that the two differ:
 There is no setting to manage and no capability to probe on either path, because
 dropping the attributes is always available.
 
-A `style(…)` or `link(…)` call is a **value call** and mesh has no call-as-argument
-form yet, so write it through a variable or a function's return value rather than
-inline:
+Both are **value calls**, so the parens are attached to the name — a bare `style …`
+would run it in command position and yield a status. They can be written inline as an
+argument, or returned from a function, which is how a prompt segment is built:
 
 ```mesh
+puts style(x, fg: red)                              # inline
 func dir-info() { style(tilde-pwd(), fg: blue) }    # a prompt segment
-r = style(x, fg: red)
-puts $r                                            # not `puts style(x, fg: red)`
 ```
 
 ## Not yet implemented
@@ -1842,7 +1885,5 @@ Most modifier arguments (beyond `:split` / `:join`), the command-word form of an
 argument-taking modifier, and regex capture modifiers are not yet implemented.
 Of heredocs, the command-redirection form documented under Commands works, as do
 here-strings; a value-producing heredoc spelling does not.
-A **value call in an argument position** — `puts style(x, fg: red)`, `puts re(a)`,
-`puts $f(1)` — is a syntax error; assign it first. `style` covers the sixteen ANSI
-colors only.
+`style` covers the sixteen ANSI colors only.
 See [`ROADMAP.md`](../ROADMAP.md).

@@ -55,7 +55,8 @@ pipeline        = pipe-stage (("|" | "|&") pipe-stage)* ;
 pipe-stage      = simple-command postfix-guard? | value-call ;
 
 simple-command  = command-item+ ;
-command-item    = command-word | redirection ;
+command-item    = command-word | redirection | value-argument ;
+value-argument  = value-expression ;   # only after a command-word; see below
 redirection     = redirect-op command-word | heredoc-redirect ;
 redirect-op     = "<" | ">" | ">>" | fd-redirect ;       # fd forms: later
 here-string-redirect
@@ -64,6 +65,23 @@ heredoc-redirect
                 = "<<" heredoc-delimiter HEREDOC_BODY ;
 heredoc-delimiter
                 = command-word ;
+
+**`value-argument`** is a value expression in an argument position — `puts (1 + 2)`,
+`puts $(pwd)`, `puts style(x, fg: red)`, `puts f()`. Four rules, all of them about
+telling it apart from a `command-word`:
+
+1. **Only the shapes a word cannot spell** start one: `$(`, `(`, an *attached*
+   `name(` / `$name(`, an *attached* `:name(`. `[` and `..` are excluded — in an
+   argument they are a glob character class and literal text — so a list literal or a
+   range there stays a `command-word`.
+2. **Only after a `command-word`.** A leading redirection makes `command-item+`
+   non-empty without naming a command, and a value cannot be word zero.
+3. **Parsed above comparison precedence**, so a following `<` / `>` is a
+   `redirection` rather than a comparison. A comparison in an argument needs its own
+   parens; `&&` / `||` / `|` are below comparison and keep their readings too.
+4. **Whole-argument.** Adjacent text on either side — including a redirect target —
+   is a syntax error rather than a second item, so `pre$(x)post` does not silently
+   become three arguments.
 
 compound-statement
                 = assignment

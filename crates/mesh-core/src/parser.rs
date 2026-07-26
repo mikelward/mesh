@@ -151,6 +151,11 @@ pub enum ParseErrorKind {
     Expected(&'static str),
     ReservedParameter(String),
     ReservedFunctionName(String),
+    /// A value argument with text glued to it — `pre$(x)post`, `f()x`. Its own
+    /// variant because the fix a reader needs is a *spelling*, not a rethink: the
+    /// message names both, and it keeps this the loud error it was before value
+    /// arguments existed rather than three arguments where one was written.
+    GluedValueArgument,
     DuplicateParameter(String),
     RequiredAfterOptional(String),
     ParameterAfterRest(String),
@@ -193,6 +198,12 @@ impl std::fmt::Display for ParseError {
                     "syntax error: `{name}` is reserved and cannot be a parameter"
                 )
             }
+            ParseErrorKind::GluedValueArgument => write!(
+                f,
+                "syntax error: a value argument cannot have text attached; separate it \
+                 with a space, or bind it first and interpolate — `m = $(…)` then \
+                 `pre${{m}}post`"
+            ),
             ParseErrorKind::ReservedFunctionName(name) => {
                 write!(
                     f,
@@ -453,6 +464,14 @@ pub struct Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandItem {
     Word(Spanned<Word>),
+    /// A **value expression** as an argument — `puts (1 + 2)`, `puts $(pwd)`,
+    /// `puts style(x, fg: red)`. `DESIGN.md` writes the first two in its own examples
+    /// (§"Arithmetic" and §"I/O"); the parser accepts the shapes that have no word
+    /// spelling, so a list literal and a range stay the text they already are.
+    ///
+    /// Kept unevaluated here because running it needs the shell — a `$(…)` launches a
+    /// command and a call runs a function — which the parser does not have.
+    Value(Spanned<Expr>),
     Redirect {
         kind: RedirectKind,
         /// The descriptor named by a `N>`-style prefix, if any. `None` means the
@@ -1872,6 +1891,58 @@ impl Parser {
                     target,
                     body,
                 });
+            } else if items
+                .iter()
+                .any(|item| matches!(item, CommandItem::Word(_)))
+                && self.value_argument_starts()
+            {
+                let start = self.peek().map_or(0, |token| token.span.start);
+                // Parsed **above comparison precedence**, so a following `<` / `>` is
+                // left for the redirect parser above rather than swallowed as a
+                // comparison: `puts (1 + 2) > out` has to write a file, not print
+                // `true`. Arithmetic (6) and the postfix forms bind tighter than 4 and
+                // are unaffected, and a comparison that really is wanted says so with
+                // its own parens — `puts (1 < 2)` reaches a fresh `expression` inside
+                // the group and prints `true`. `&&`, `||` and `|` sit below 4 too, so
+                // they keep their connector readings for free.
+                // A **redirect target** counts as well as a word: `>out$(x)` reaches
+                // here with `Redirect` as the last item, so checking only `Word` let the
+                // glued spelling through and passed the capture as a separate argument.
+                let glued_before = match items.last() {
+                    Some(CommandItem::Word(word)) => word.span.end == start,
+                    Some(CommandItem::Redirect { target, .. }) => target.span.end == start,
+                    _ => false,
+                };
+                let expression = self.binary(Self::COMPARISON_PRECEDENCE + 1)?;
+                let end = self.tokens[self.position - 1].span.end;
+                // A value argument is a whole argument, so text touching either side of
+                // it is **refused** rather than silently becoming a separate one:
+                // `pre$(x)post` would otherwise hand over three arguments where the
+                // reader wrote one, and quietly. Gluing a value into a word needs a
+                // value piece inside `Word`, which is its own change — until then this
+                // stays the syntax error it was before value arguments existed, with a
+                // message naming spellings that work. Not `"…$(…)…"`: a capture does not
+                // interpolate inside quotes either (`TODO.md`), so the message points at
+                // binding it first, which does.
+                // Only a token that could *continue* an argument counts: a newline or a
+                // `;` sits flush against the expression too, and neither is glued text.
+                let glued_after = self.peek().is_some_and(|token| {
+                    token.span.start == end
+                        && matches!(
+                            token.value,
+                            TokenKind::Word(_) | TokenKind::CaptureStart | TokenKind::LParen
+                        )
+                });
+                if glued_before || glued_after {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::GluedValueArgument,
+                        span: start..end,
+                    });
+                }
+                items.push(CommandItem::Value(Spanned {
+                    value: expression,
+                    span: start..end,
+                }));
             } else {
                 items.push(CommandItem::Word(self.command_word()?));
             }
@@ -1881,6 +1952,57 @@ impl Parser {
         }
         let guard = self.guard()?;
         Ok(Command { items, guard })
+    }
+
+    /// Does a **value** start here, in an argument position?
+    ///
+    /// Only ever asked once a `CommandItem::Word` is in hand, since a value is an
+    /// *argument*: a command whose first item is a redirection has a non-empty item
+    /// list and still no command word, so testing emptiness let `>out f()` take the
+    /// call as word zero and run whatever it returned — a syntax error before.
+    ///
+    /// Deliberately narrower than [`value_start_in`], which weighs a command reading
+    /// against a value one for a whole *statement*. Here the command word is already
+    /// in hand, so the only question is whether this token can be part of an argument
+    /// word at all — and the four shapes below cannot, which is exactly why every one
+    /// of them is a syntax error today. Accepting them cannot change what any working
+    /// script means.
+    ///
+    /// `[` and `..` are pointedly absent. Both *are* value syntax elsewhere, but in an
+    /// argument they are already text with a job: `[` opens a glob character class
+    /// (`ls gt/[ab]*`), and `1..3` is the literal word. Reading either as a value here
+    /// would break working scripts, so a list literal or a range in an argument stays
+    /// a separate decision.
+    fn value_argument_starts(&mut self) -> bool {
+        // `$( … )` and `( … )` have no word spelling at all.
+        if matches!(
+            self.peek().map(|token| &token.value),
+            Some(TokenKind::CaptureStart | TokenKind::LParen)
+        ) {
+            return true;
+        }
+        // An **attached** call: a command word stops in front of `(`, so `style(x)`,
+        // `$f(1)` and `pwd()` are calls rather than words. The spacing is the whole
+        // signal, which is why it is asked of the tokens rather than of a parsed tree.
+        if let (Some(word), Some(next)) = (self.peek(), self.tokens.get(self.position + 1))
+            && matches!(word.value, TokenKind::Word(_))
+            && matches!(next.value, TokenKind::LParen)
+            && next.span.start == word.span.end
+        {
+            return true;
+        }
+        // An attached modifier-reference call — `:exists("Cargo.toml")` — the same
+        // form `value_start_in` admits at the start of a statement. A bare `:name`
+        // stays a word, so `puts :stem` keeps its reading.
+        self.same(&TokenKind::Colon)
+            && self.modifier_ref_name().is_some()
+            && self
+                .tokens
+                .get(self.position + 1)
+                .zip(self.tokens.get(self.position + 2))
+                .is_some_and(|(name, next)| {
+                    matches!(next.value, TokenKind::LParen) && name.span.end == next.span.start
+                })
     }
 
     fn command_word(&mut self) -> Result<Spanned<Word>, ParseError> {
@@ -2597,6 +2719,13 @@ impl Parser {
         }
         self.pipeline().map(Executable::Pipeline)
     }
+
+    /// The precedence of the comparison operators in [`Parser::binary_op`]'s table —
+    /// `==`, `!=`, `<`, `<=`, `>`, `>=`, `~`, `!~`.
+    ///
+    /// Named because a command **argument** is parsed just above it, which is what keeps
+    /// a following `<` / `>` a redirection instead of a comparison.
+    const COMPARISON_PRECEDENCE: u8 = 4;
 
     fn binary(&mut self, minimum: u8) -> Result<Expr, ParseError> {
         let mut left = self.prefix()?;
@@ -4102,7 +4231,7 @@ mod tests {
             .iter()
             .map(|item| match item {
                 CommandItem::Word(word) => word.value.text(),
-                CommandItem::Redirect { .. } => panic!(),
+                CommandItem::Redirect { .. } | CommandItem::Value(_) => panic!(),
             })
             .collect();
         assert_eq!(words, ["echo", "file.txt", "./tool", "key:value", "xs[0]"]);

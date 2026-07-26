@@ -12973,6 +12973,239 @@ fn a_modifier_taking_arguments_still_leaves_a_comparison() {
 /// its **leading operand** — a bare word is what a command is spelled with, so an
 /// expression leading with one stays the command line it is.
 #[test]
+fn a_value_expression_can_be_a_command_argument() {
+    // `DESIGN.md` writes two of these in its own examples — `puts (1 + 2)` in
+    // §"Arithmetic" and `puts $(ls)` in §"I/O" — and every one was a syntax error.
+    let out = run_with_input(
+        "puts (1 + 2)\n\
+         puts (10 / 3)\n\
+         puts a (1 + 2) b\n\
+         n = 4\n\
+         puts ($n + 3)\n\
+         puts $(pwd)\n\
+         puts before $(pwd) after\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(&lines[..4], &["3", "3", "a 3 b", "7"], "{stdout:?}");
+    // The capture reaches argv rather than being refused, and glues to neighbours in
+    // argument order.
+    assert!(lines[4].starts_with('/'), "{stdout:?}");
+    assert_eq!(lines[5], format!("before {} after", lines[4]), "{stdout:?}");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_value_argument_stays_typed_for_a_builtin_and_bytes_for_an_external() {
+    // The argument carries the **value**, not its text, so everything the styled and
+    // collection work built still applies at this new position: `puts` renders a list
+    // per line and keeps a styled value's attributes, while argv gets the same loud
+    // refusal it gives a bare list.
+    let rendered =
+        run_with_input("func xs() { return [a b] }\nputs xs()\nputs style(x, fg: red)\n");
+    assert_eq!(String::from_utf8_lossy(&rendered.stdout), "a\nb\nx\n");
+    assert!(rendered.stderr.is_empty(), "{:?}", rendered.stderr);
+
+    let refused = run_with_input("func xs() { return [a b] }\n/bin/echo xs()\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("a list needs `...`"),
+        "{:?}",
+        refused.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&refused.stdout), "after\n");
+
+    // A value with no byte form is refused by name wherever it lands.
+    let handle = run_with_input("puts re(a)\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&handle.stderr).contains("a pattern has no text form"),
+        "{:?}",
+        handle.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&handle.stdout), "after\n");
+}
+
+#[test]
+fn a_value_argument_needs_a_command_word_before_it() {
+    // A value is an *argument*, so it cannot be word zero. A leading redirection makes
+    // the item list non-empty without naming a command, so testing emptiness let
+    // `>out f()` take the call's value as the command and run it — where these were
+    // syntax errors before value arguments existed.
+    let dir = fresh_dir("value_argument_needs_a_word");
+    let file = dir.join("out");
+    for source in ["func f() { return /bin/echo }\n>{} f()\n", ">{} (1 + 2)\n"] {
+        let _ = std::fs::remove_file(&file);
+        let out = run_with_input(&source.replace("{}", &file.display().to_string()));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+            "{source:?}: {:?}",
+            out.stderr
+        );
+    }
+
+    // A redirection may still *lead*, as long as a command word precedes the value.
+    let led = run_with_input(&format!(">{} puts (1 + 2)\n", file.display()));
+    assert!(led.stderr.is_empty(), "{:?}", led.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&file).ok().as_deref(),
+        Some("3\n"),
+        "a leading redirect should not stop a later value argument"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_backgrounded_value_argument_is_refused_rather_than_run_in_the_shell() {
+    // The argument is evaluated while the stage is assembled, before the fork, so
+    // backgrounding it would run the work in the shell: `puts $(sleep …) &` would hang
+    // the prompt and the `&` would buy nothing. And a mutating call would change the
+    // parent's globals, where `docs/REFERENCE.md` says a background stage's changes
+    // stay in the child.
+    let refused = run_with_input("puts $(pwd) &\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("cannot be backgrounded yet"),
+        "{:?}",
+        refused.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&refused.stdout), "after\n");
+
+    // The isolation rule it protects, on the spelling that does work: a backgrounded
+    // *function* keeps its changes in the child.
+    let isolated = run_with_input(
+        "n = before\nfunc change() { global n = MUTATED\n  puts ran }\nchange &\nwait\nputs n=$n\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&isolated.stdout),
+        "ran\nn=before\n",
+        "{:?}",
+        isolated.stderr
+    );
+
+    // A foreground pipeline is allowed: the stage forks, but the pipeline waits either
+    // way and the result is right.
+    let piped = run_with_input("puts $(puts hi) | cat\n");
+    assert_eq!(String::from_utf8_lossy(&piped.stdout), "hi\n");
+    assert!(piped.stderr.is_empty(), "{:?}", piped.stderr);
+}
+
+#[test]
+fn control_flow_inside_a_value_argument_belongs_to_the_caller() {
+    // The argument runs with the caller's `in_function`, so a `return` in one leaves
+    // the enclosing function. Evaluated as top-level code it reported "not inside a
+    // function" and the body carried on past it.
+    let returned = run_with_input(
+        "func f() { puts (if true { return 7 })\n  puts BAD }\nx = f()\nputs x=$x:repr\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&returned.stdout), "x=7\n");
+    assert!(returned.stderr.is_empty(), "{:?}", returned.stderr);
+
+    // A `break` in an argument still belongs to the enclosing loop.
+    let broken = run_with_input(
+        "for i in [1 2 3] { puts (if $i == 2 { break })\n  puts saw=$i }\nputs done\n",
+    );
+    let stdout = String::from_utf8_lossy(&broken.stdout);
+    assert!(stdout.contains("saw=1"), "{stdout:?}");
+    assert!(!stdout.contains("saw=2"), "{stdout:?}");
+    assert!(stdout.ends_with("done\n"), "{stdout:?}");
+}
+
+#[test]
+fn a_redirect_after_a_value_argument_still_redirects() {
+    // A command argument is parsed just *above* comparison precedence, so a following
+    // `<` / `>` is left to the redirect parser. Read as a comparison instead, these
+    // printed `true` (or failed comparing) and created no file.
+    let dir = fresh_dir("value_argument_redirect");
+    for (source, want) in [
+        ("puts (1 + 2) > {}\n", "3\n"),
+        ("puts $(puts hi) > {}\n", "hi\n"),
+        ("puts style(x, fg: red) > {}\n", "x\n"),
+    ] {
+        let file = dir.join("out");
+        let _ = std::fs::remove_file(&file);
+        let out = run_with_input(&source.replace("{}", &file.display().to_string()));
+        assert!(out.stdout.is_empty(), "{source:?}: {:?}", out.stdout);
+        assert!(out.stderr.is_empty(), "{source:?}: {:?}", out.stderr);
+        assert_eq!(
+            std::fs::read_to_string(&file).ok().as_deref(),
+            Some(want),
+            "{source:?}"
+        );
+    }
+
+    // A comparison that really is wanted says so with its own parens, where a fresh
+    // expression parse gives it back.
+    let compared = run_with_input("puts (1 < 2)\nputs (2 <= 1)\n");
+    assert_eq!(String::from_utf8_lossy(&compared.stdout), "true\nfalse\n");
+
+    // The connectives sit below comparison too, so they keep their readings.
+    let connected = run_with_input("func f() { return v }\nputs f() && puts second\n");
+    assert_eq!(String::from_utf8_lossy(&connected.stdout), "v\nsecond\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn text_glued_to_a_value_argument_is_a_loud_error() {
+    // A value argument is a whole argument. Silently handing over three arguments
+    // where `pre$(x)post` was written would be worse than the syntax error this was
+    // before value arguments existed, so it stays one — with a message naming a
+    // spelling that works, which `"…$(…)…"` is not (a capture does not interpolate
+    // inside quotes).
+    for source in [
+        "/bin/echo pre$(puts x)post\n",
+        "puts f()x\n",
+        "puts x$(puts y)\n",
+        // A **redirect target** counts too: `>out$(x)` reaches the check with
+        // `Redirect` as the last item, so a word-only test let it through and passed
+        // the capture as a separate argument.
+        "/bin/echo hi >out$(puts suffix)\n",
+    ] {
+        let out = run_with_input(&format!("func f() {{ return v }}\n{source}"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("a value argument cannot have text attached"),
+            "{source:?}: {stderr:?}"
+        );
+        assert!(out.stdout.is_empty(), "{source:?}: {:?}", out.stdout);
+    }
+
+    // The spelling the message points at does work.
+    let bound = run_with_input("m = $(puts x)\nputs pre${m}post\n");
+    assert_eq!(String::from_utf8_lossy(&bound.stdout), "prexpost\n");
+
+    // And a value argument flush against the *end* of a command is not glued text —
+    // a newline sits there too.
+    let trailing = run_with_input("func f() { return v }\nputs f()\nputs f();\n");
+    assert_eq!(String::from_utf8_lossy(&trailing.stdout), "v\nv\n");
+    assert!(trailing.stderr.is_empty(), "{:?}", trailing.stderr);
+}
+
+#[test]
+fn a_value_argument_is_literal_and_leaves_globs_alone() {
+    let dir = fresh_dir("value_argument_literal");
+    std::fs::write(dir.join("apple"), "").unwrap();
+    std::fs::write(dir.join("banana"), "").unwrap();
+    let listing = dir.display();
+
+    // `[` and `..` keep their argument readings: a glob character class and the
+    // literal word. Reading either as value syntax here would break working scripts,
+    // so only the shapes with *no* word spelling became values.
+    let unchanged = run_with_input(&format!("puts 1..3\nputs {listing}/[ab]*\n"));
+    assert_eq!(
+        String::from_utf8_lossy(&unchanged.stdout),
+        format!("1..3\n{listing}/apple {listing}/banana\n")
+    );
+
+    // And a value argument is literal, exactly as an interpolated variable is: what a
+    // capture produced is never re-globbed.
+    let literal = run_with_input(&format!("cd {listing}\nputs $(puts '*')\n"));
+    assert_eq!(String::from_utf8_lossy(&literal.stdout), "*\n");
+    assert!(literal.stderr.is_empty(), "{:?}", literal.stderr);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_command_line_that_parses_as_an_expression_is_still_a_command() {
     let dir = fresh_dir("command_line_parses_as_expression");
     // Infix operators between a command and its arguments.
@@ -12991,15 +13224,20 @@ fn a_command_line_that_parses_as_an_expression_is_still_a_command() {
     let parent = run_with_input(&format!("cd {}\nls ..\n", dir.display()));
     assert!(parent.stderr.is_empty(), "`ls ..` should list: {parent:?}");
 
-    // A *spaced* `(` is the next argument, not a call, and the tree does not record
-    // the difference — so the check for it has to happen before the parse.
+    // A *spaced* `(` is the next argument, an **attached** one is a call, and the tree
+    // does not record the difference — so the check for it happens before the parse.
+    // Both sides are asserted here, since a spacing rule with only one side tested is
+    // a rule that can quietly collapse.
     let spaced = run_with_input("puts (1 + 2)\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&spaced.stdout), "3\nafter\n");
+    assert!(spaced.stderr.is_empty(), "{:?}", spaced.stderr);
+
+    let attached = run_with_input("r = puts(1 + 2)\nputs after\n");
     assert!(
-        String::from_utf8_lossy(&spaced.stderr).contains("syntax error"),
-        "{:?}",
-        spaced.stderr
+        String::from_utf8_lossy(&attached.stderr).contains("a command has no return value"),
+        "attached `(` should be a call on the command: {:?}",
+        attached.stderr
     );
-    assert_eq!(String::from_utf8_lossy(&spaced.stdout), "after\n");
 
     // Only a **command word** loses to a following `&&` / `||` / `&`, because only it
     // has the command reading the shell idiom wants — see

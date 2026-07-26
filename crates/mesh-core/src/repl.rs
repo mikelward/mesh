@@ -937,7 +937,7 @@ fn run_executable(
         return Step::Continue(2);
     }
     match node {
-        Pipeline(pipeline) => run_ast_pipeline(pipeline, background, last, shell),
+        Pipeline(pipeline) => run_ast_pipeline(pipeline, background, last, in_function, shell),
         Assignment {
             pattern,
             append,
@@ -1777,6 +1777,7 @@ fn run_ast_pipeline(
     node: &parser::Pipeline,
     background: bool,
     last: u8,
+    in_function: bool,
     shell: &mut Shell,
 ) -> Step {
     let mut stages = Vec::with_capacity(node.stages.len());
@@ -1792,11 +1793,68 @@ fn run_ast_pipeline(
             }
             Err(step) => return step,
         }
+        // A value argument is evaluated in **this** process while the stage is being
+        // assembled, and backgrounding is where that is visibly wrong: the fork has not
+        // happened yet, so `puts $(sleep 10) &` would run the ten seconds in the parent
+        // before registering the job — the prompt hangs and the `&` buys nothing. It is
+        // also where `docs/REFERENCE.md` promises isolation, so a mutating call would
+        // change the parent's globals rather than the child's.
+        //
+        // Refused rather than silently done in the wrong process. A *foreground*
+        // pipeline is left alone: its stage forks too, so a mutating argument has the
+        // same isolation gap, but nothing about the timing or the result is observable —
+        // the pipeline waits either way — and refusing it would cost `puts $(pwd) | cat`,
+        // which is an ordinary thing to write. `TODO.md` carries that nuance.
+        //
+        // Doing it right means the *stage* evaluating its own arguments, which needs
+        // `exec::Cmd`'s words to stop being final at assembly time — the same
+        // restructure the ordering and glued-text items want.
+        if background
+            && command
+                .items
+                .iter()
+                .any(|item| matches!(item, parser::CommandItem::Value(_)))
+        {
+            note!(
+                "mesh: a value argument cannot be backgrounded yet; bind it first — \
+                 `m = $(…)` then `cmd $m &`"
+            );
+            return Step::Continue(2);
+        }
         let mut words = Vec::new();
         let mut redirs = Vec::new();
         for item in &command.items {
             match item {
                 parser::CommandItem::Word(word) => words.push(expansion_word(&word.value)),
+                // A value argument is evaluated **here**, where the shell is: a
+                // `$(…)` launches a command and a call runs a function, neither of
+                // which the expander can do. The result rides into expansion as a
+                // literal piece, exactly as an interpolated variable does.
+                //
+                // In argument order, so `f (a()) (b())` runs `a` before `b`, and
+                // before the redirect targets are opened — the order every other
+                // argument already follows.
+                parser::CommandItem::Value(expression) => {
+                    // Through `eval_operand_of`, which puts `shell.result` /
+                    // `shell.produced` back: an argument is an *operand*, so whatever it
+                    // produced along the way must not be left standing as the enclosing
+                    // command's result. The same treatment `eval_call` gives a callee and
+                    // an assignment gives its right-hand side.
+                    //
+                    // `in_function` is the caller's, so a `return` inside an argument
+                    // belongs to the enclosing function rather than reporting "not
+                    // inside a function" and carrying on.
+                    match eval_operand_of(&expression.value, last, in_function, shell) {
+                        Ok(value) if shell.control.is_some() => {
+                            // Control flow is unwinding (a `return`/`break` inside the
+                            // argument); the statement layer acts on `shell.control`.
+                            let _ = value;
+                            return Step::Continue(last);
+                        }
+                        Ok(value) => words.push(Word(vec![Piece::Value(value)])),
+                        Err(step) => return step,
+                    }
+                }
                 parser::CommandItem::Redirect {
                     kind,
                     fd,
@@ -2721,7 +2779,7 @@ fn eval_expr(
             // `kill` take. Which job the launch created is read off the table
             // rather than threaded back through the pipeline's status.
             let launched = shell.jobs.next_id();
-            match run_ast_pipeline(pipeline, true, last, shell) {
+            match run_ast_pipeline(pipeline, true, last, in_function, shell) {
                 // A launch that registered nothing — inside a forked stage, or
                 // one that failed before it had a process group — has no handle
                 // to give, so the status stands in as it did before.
@@ -7288,6 +7346,9 @@ fn command_words(line: &str) -> Option<Vec<String>> {
         .iter()
         .filter_map(|item| match item {
             parser::CommandItem::Word(word) => line.get(word.span.clone()).map(str::to_owned),
+            // A value argument is source text like a word, and this reads the line
+            // for completion rather than running anything, so its span serves.
+            parser::CommandItem::Value(value) => line.get(value.span.clone()).map(str::to_owned),
             parser::CommandItem::Redirect { .. } => None,
         })
         .collect();
