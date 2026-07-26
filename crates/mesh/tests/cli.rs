@@ -2008,8 +2008,100 @@ fn jobdone_hook_harness(exec: &MeshExec) -> i32 {
     }
     seen.extend_from_slice(&ordering);
 
-    if !stop_pty_shell(shell) {
-        return 121;
+    // Last, and it doubles as the shutdown: a job reported by the *same command
+    // line that exits*. `jobs` reaps it and prints the notice, and the exit
+    // leaves before the loop comes round to drain — so the hook has to run as
+    // part of going away, not at a next prompt there will never be.
+    //
+    // The `preprompt` handler registered above is removed first; it sleeps, and
+    // leaving it would run before this prompt and reap the job itself, which is
+    // the previous case rather than this one.
+    if !pty_write(shell.master, b"prompt-hook --remove preprompt p\n") {
+        return 149;
+    }
+    let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+        return 150;
+    };
+    seen.extend_from_slice(&window);
+    // An `exit` handler, to pin the *order*. It stands for the teardown one is
+    // for — `DESIGN.md`'s example is closing a job-publish file — so a `jobdone`
+    // that arrived after it would be writing to something already closed.
+    for line in [
+        "func bye(s) { puts EXITHOOK }\n",
+        "prompt-hook exit e bye\n",
+    ] {
+        if !pty_write(shell.master, line.as_bytes()) {
+            return 157;
+        }
+        let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+            return 158;
+        };
+        seen.extend_from_slice(&window);
+    }
+    // The handler is replaced in place (same event and name) by one that reports
+    // a job *itself* — it need only run `jobs`. A drain that took one list would
+    // leave whatever its own handlers queued for a later pass, and at shutdown
+    // there is no later pass. Two jobs, staggered so the second finishes while
+    // the first one's handler is sleeping.
+    for line in [
+        "func chain(id, cmd, status) { puts JOBDONE=$id/$status; sleep 0.5; jobs }\n",
+        "prompt-hook jobdone j1 chain\n",
+        "sh -c 'sleep 0.2; exit 3' &\n",
+        "sh -c 'sleep 0.7; exit 4' &\n",
+    ] {
+        if !pty_write(shell.master, line.as_bytes()) {
+            return 151;
+        }
+        let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+            return 152;
+        };
+        seen.extend_from_slice(&window);
+    }
+    // Long enough for the first job to end and not the second, and it ends while
+    // the shell waits for input, so the drain at the top of the loop has already
+    // run and nothing has noticed it yet.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    // A bare `exit`, with no `jobs` to do the noticing. `exit` is a builtin and
+    // forks nothing, so no wait runs on the way past either: unless the exit
+    // path reaps, the shell leaves without the notice or the hook, having
+    // watched the job finish and said nothing. The earlier `jobs; exit` form
+    // only ever tested the draining half.
+    if !pty_write(shell.master, b"exit 0\n") {
+        return 153;
+    }
+    // To EOF: the last bytes and the end of file arrive together, so the readers
+    // that stop at a prompt cannot see what the shell says on its way out.
+    let parting = pty_read_to_end(shell.master);
+    let mut status = 0;
+    let reaped = unsafe { libc::waitpid(shell.mesh, &mut status, 0) } == shell.mesh;
+    unsafe { libc::close(shell.master) };
+    if !reaped || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return 154;
+    }
+    // The notice is the control: if `jobs` did not report the first job here,
+    // this case is not exercising the exit path at all and passing would mean
+    // nothing. Ids are not pinned — several cases ran before this one — so the
+    // statuses are what identify the two jobs.
+    if occurrences(&parting, b"Done (3)") == 0 {
+        return 155;
+    }
+    // Both: the one the exiting line reported, and the one its own handler
+    // reported while running. The second is the whole point — a single-pass
+    // drain reports the first and drops the second.
+    if occurrences(&parting, b"/3\r\n") != 1 || occurrences(&parting, b"/4\r\n") != 1 {
+        return 156;
+    }
+    // And both came before the teardown, not after it.
+    let at = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|p| p == needle);
+    let (Some(first), Some(second), Some(bye)) = (
+        at(&parting, b"/3\r\n"),
+        at(&parting, b"/4\r\n"),
+        at(&parting, b"EXITHOOK\r\n"),
+    ) else {
+        return 159;
+    };
+    if first > bye || second > bye {
+        return 160;
     }
     0
 }

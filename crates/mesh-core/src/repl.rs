@@ -684,11 +684,42 @@ fn run_startup_files(
 }
 
 fn run_logout(options: &StartupOptions, last: u8, shell: &mut Shell) -> u8 {
+    // Anything the exiting command line itself reported. `jobs; exit` reaps the
+    // job, prints its `[N] Done`, and then leaves before the loop comes round to
+    // drain — so the hook has to run on the way out or never, there being no
+    // next prompt to defer it to.
+    //
+    // Here for the same reason the title is cleared here: every exit path
+    // arrives at this function. Draining where the *loop* happens to look meant
+    // enumerating the moments a job can be noticed, and that list was wrong four
+    // times running — `jobs`, `fg`, a `preprompt` handler, and now `exit`.
+    //
+    // Reaped first, and not only drained: a job that ended while the shell was
+    // waiting for the line that turned out to be `exit` has been noticed by
+    // nobody, so there is nothing queued to drain. `exit` is a builtin and forks
+    // nothing, so no wait ran on the way past. Without this it leaves with
+    // neither its `[N] Done` nor its hook — the shell saw it finish and said
+    // nothing at all.
+    //
+    // Only when interactive, because reaping is what *prints* the notice, and a
+    // script that backgrounds something has never been told about it: every
+    // report so far comes from the prompt loop, which a script does not have.
+    // Reaping here regardless put `[1] Done (0) …` on the stderr of any script
+    // that left a job running, which two tests caught and which is not this
+    // change's business.
+    if shell.vars.interactive() {
+        shell.jobs.reap();
+    }
+    run_jobdone_hooks(shell);
     if options.login
         && let Some(path) = config_dir().map(|dir| dir.join("logout.mesh"))
     {
         let _ = run_config_file(&path, last, shell);
     }
+    // Again, because `logout.mesh` is a script like any other and can report a
+    // job itself. Cheap when nothing is queued, and it makes the guarantee whole
+    // rather than true of every case someone thought to list.
+    run_jobdone_hooks(shell);
     // Clear the title on the way out, and last, so mesh has the final word over a
     // `logout.mesh` that writes one. Every exit path arrives here, which is what
     // makes this the place: `exit` would otherwise leave the window named after
@@ -5110,16 +5141,30 @@ fn environment_prompt_title() -> String {
 /// user explicitly `wait`ed for never appears here: its status went to the
 /// caller, which is the answer the hook exists to give.
 fn run_jobdone_hooks(shell: &mut Shell) {
-    for job in shell.jobs.take_finished() {
-        run_prompt_hooks(
-            PromptEvent::JobDone,
-            vec![
-                Value::Integer(i64::try_from(job.id).unwrap_or(i64::MAX)),
-                Value::String(job.command),
-                Value::Integer(i64::from(job.status)),
-            ],
-            shell,
-        );
+    // Until nothing new is queued, rather than once: a handler is arbitrary mesh
+    // code and can report a job itself — it need only run `jobs` — and those
+    // arrive *after* the list this call took. One pass would leave them for a
+    // later drain, which at shutdown does not come.
+    //
+    // Bounded because a handler that reports a fresh job on every pass would
+    // otherwise keep the shell here for good, and a shell that will not exit is
+    // worse than a hook that fires late. The limit is far above any real chain.
+    for _ in 0..64 {
+        let finished = shell.jobs.take_finished();
+        if finished.is_empty() {
+            return;
+        }
+        for job in finished {
+            run_prompt_hooks(
+                PromptEvent::JobDone,
+                vec![
+                    Value::Integer(i64::try_from(job.id).unwrap_or(i64::MAX)),
+                    Value::String(job.command),
+                    Value::Integer(i64::from(job.status)),
+                ],
+                shell,
+            );
+        }
     }
 }
 
@@ -7175,6 +7220,20 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                 match handle_signal(signal, last, &mut shell, &mut pending, &mut gate) {
                     None => continue, // an unfinished `func` body: read the next line
                     Some(Step::Exit(code)) => {
+                        // Before the `exit` hook, not just before leaving. That
+                        // hook is where a session tears down what it set up —
+                        // `DESIGN.md` gives closing a job-publish file as the
+                        // example — so a `jobdone` after it would be writing to
+                        // something already closed. `run_logout` drains too, and
+                        // still needs to: it is the path every *other* exit
+                        // takes, including one from a startup file that never
+                        // reaches this arm.
+                        //
+                        // Reaped first for the reason given there: a job that
+                        // ended while this line was being typed has been noticed
+                        // by nobody, and `exit` forks nothing that would notice.
+                        shell.jobs.reap();
+                        run_jobdone_hooks(&mut shell);
                         run_prompt_hooks(
                             PromptEvent::Exit,
                             vec![Value::Integer(i64::from(code))],
