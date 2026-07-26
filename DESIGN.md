@@ -2693,9 +2693,14 @@ programs or user functions:
     so `while gets line { … }` terminates. An empty line still reads as a truthy
     `""` — only EOF is `false` — so blank lines don't end the loop. With no `var`
     it just yields the line (or `false`).
-- **Formatting** — `style` (produce a [styled value](#hooks-and-the-prompt) for
-  the prompt); it must be a built-in because a structured return value can't come
-  from an external command.
+- **Formatting** — **`style(text, fg: name, bg: name, bold: bool)`** produces a
+  [styled value](#hooks-and-the-prompt) — for the prompt, and for `puts`/`print`,
+  the other renderers. It must be a built-in because a structured return value
+  can't come from an external command, and a **value call** (`style(…)`, parens
+  attached) because a command position yields a status: a bare `style …` runs it as
+  a command. Colors are the sixteen ANSI names (`red`, `bright-blue`, `grey`/`gray`
+  for bright black); 256-color and truecolor wait on a spelling for the value and a
+  downgrade rule for terminals that can't show them.
 - **Vars / env** — `export`, `unset`, `global`, and `source FILE` to (re-)load a
   file — re-sourcing your rc is safe because [hooks are keyed](#hooks-and-the-prompt).
 - **Jobs** — `fg`, `bg`, `jobs`, `kill`, `wait` ([Job control](#job-control)).
@@ -3217,16 +3222,26 @@ alike, since emptiness is judged by the payload text (not emitted as bare contro
 codes). `style` is the one styling primitive in the MVP (color + bold).
 
 A styled value is **not a new scalar type** — it is a **string carrying display
-attributes**. Everywhere *except* prompt rendering it behaves exactly as its
+attributes**. Everywhere *except* rendering it behaves exactly as its
 text: the same [argv](#spread--flattening) rule (its text crosses, an
 embedded NUL is the same hard error), the same [`+=`](#arrays-lists) (it
 concatenates as its text, yielding a plain string — attributes are
 rendering-only and don't survive), the same comparisons and string
-interpolation. **Only the prompt renderer reads the attributes**; every other
-context sees a string. So `style` adds presentation metadata to a string without
-minting a type that must be defined at each boundary. *(A richer per-fragment
-"styled spans" value — where concatenation preserves each fragment's own style —
-is a possible later iteration; the MVP keeps one attribute set per string.)*
+interpolation — and, for the same reason, a **modifier** transforms it as its text
+and yields a plain result. **Only a renderer reads the attributes** — the prompt
+renderer, and [`puts` / `print`](#builtins) writing to a color-capable terminal;
+every other context sees a string. So `style` adds presentation metadata to a
+string without minting a type that must be defined at each boundary. *(A richer
+per-fragment "styled spans" value — where concatenation preserves each fragment's
+own style — is a possible later iteration; the MVP keeps one attribute set per
+string.)*
+
+**Styling a styled value adds to it.** `style(style(x, fg: red), bold: true)` is
+red *and* bold: a named argument overrides only the attribute it names, so a caller
+can emphasize a segment someone else produced without knowing its color. And a call
+that names **no** attribute is a plain string, not a styled value with nothing to
+render — one representation per meaning, so `style(x)` and `x` are the same value by
+type as well as by comparison.
 
 **Line structure is the map — newlines are not in-band.** Because each top-level
 entry is a line, line breaks come from the **map's shape**, never from an in-band

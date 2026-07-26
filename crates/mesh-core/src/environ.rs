@@ -102,6 +102,10 @@ fn append_bytes(key: &str, addition: Value) -> Result<OsString, String> {
 fn serialize(key: &str, value: Value) -> Result<String, String> {
     Ok(match value {
         Value::String(text) => text,
+        // The environment carries bytes, so a styled value crosses as its text.
+        // Shipping SGR escapes to every child would be the wrong reading of
+        // "behaves exactly as its text".
+        Value::Styled(styled) => styled.text,
         Value::Integer(number) => number.to_string(),
         Value::Boolean(flag) => flag.to_string(),
         Value::List(entries) if is_path_var(key) => join_path(key, entries)?,

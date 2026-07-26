@@ -61,11 +61,18 @@ impl MeshExec {
         let argv = [arguments[0].as_ptr(), std::ptr::null()];
 
         let mut environment: Vec<_> = std::env::vars_os()
-            // `TERM_PROGRAM` decides the shell-integration dialect, so a suite run
-            // from inside VS Code's terminal would otherwise flip every `OSC 133`
-            // assertion to `OSC 633`. Never inherited; the one test that wants it
-            // passes it explicitly.
-            .filter(|(name, _)| name != "XDG_CONFIG_HOME" && name != "TERM_PROGRAM")
+            // Two variables decide *what the shell writes* rather than how it
+            // behaves, so inheriting either makes an assertion depend on how the
+            // suite was launched. Never inherited; a test that wants one passes it
+            // explicitly.
+            //
+            // `TERM_PROGRAM` picks the shell-integration dialect, so a suite run
+            // from inside VS Code's terminal would flip every `OSC 133` assertion to
+            // `OSC 633`. `NO_COLOR` suppresses a styled value's attributes, so a
+            // suite run with it set would see no SGR at all.
+            .filter(|(name, _)| {
+                name != "XDG_CONFIG_HOME" && name != "TERM_PROGRAM" && name != "NO_COLOR"
+            })
             .filter(|(name, _)| !extra.iter().any(|(replaced, _)| name == replaced))
             .map(|(name, value)| {
                 let mut entry = name.into_encoded_bytes();
@@ -813,6 +820,92 @@ fn a_captured_puts_renders_its_values_too() {
         "{:?}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn a_styled_value_behaves_as_its_text_everywhere_but_a_renderer() {
+    // `DESIGN.md` §"Hooks and the prompt": a styled value is a string carrying
+    // display attributes, not a type of its own. Every boundary here wants bytes,
+    // and every one of them sees the text — piped, so nothing decorates.
+    let out = run_with_input(
+        "r = style(\"danger\", fg: red)\n\
+         puts $r\n\
+         puts \"in a string: $r\"\n\
+         puts $r:len $r:upper\n\
+         puts $r:repr\n\
+         if $r == danger { puts equal }\n\
+         if $r < zzz { puts ordered }\n\
+         if $r ~ re(dang) { puts matched }\n\
+         if $r !~ re(safe) { puts unmatched }\n\
+         p = style(\"a:b\", fg: red)\n\
+         parts = $p:split(\":\")\n\
+         puts $parts:repr\n\
+         xs = [danger safe]\n\
+         if $r in $xs { puts member }\n\
+         x = $r\n\
+         x += !\n\
+         puts $x:repr\n\
+         ys = [$r safe]\n\
+         j = $ys:join(\",\")\n\
+         puts $j:repr\n\
+         /bin/echo argv: $r\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "danger\n\
+         in a string: danger\n\
+         6 DANGER\n\
+         'danger'\n\
+         equal\n\
+         ordered\n\
+         matched\n\
+         unmatched\n\
+         ['a', 'b']\n\
+         member\n\
+         'danger!'\n\
+         'danger,safe'\n\
+         argv: danger\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn style_needs_a_text_argument_and_known_attributes() {
+    for (src, needle) in [
+        ("r = style()\n", "style() requires one text argument"),
+        ("r = style(a, b)\n", "style() takes one text argument"),
+        ("r = style(a, fg: chartreuse)\n", "is not a color name"),
+        ("r = style(a, colour: red)\n", "no `colour` attribute"),
+        ("r = style(a, bold: yes)\n", "`bold` must be a boolean"),
+        ("r = style(...[a])\n", "does not accept spread arguments"),
+        // The text comes through the same rendering `puts` uses, so a value with no
+        // byte form is the same loud error here as there.
+        (
+            "j = sleep 0.1 &\nr = style($j)\n",
+            "a job handle has no text form",
+        ),
+    ] {
+        let out = run_with_input(&format!("{src}puts recovered\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{src:?}: {stderr:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).ends_with("recovered\n"),
+            "{src:?}: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+#[test]
+fn style_with_no_attributes_is_just_the_string() {
+    // One representation per meaning: a call that named nothing has nothing to
+    // render, so it yields a plain string rather than a styled value that would
+    // print identically. `:repr` is how that shows without a terminal.
+    let out = run_with_input(
+        "a = style(x)\nputs $a:repr\nb = style(5)\nputs $b:repr\nc = style(true)\nputs $c:repr\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "'x'\n'5'\n'true'\n");
+    assert!(out.stderr.is_empty());
 }
 
 #[test]
@@ -2965,6 +3058,146 @@ fn notify_harness(exec: &MeshExec) -> i32 {
     }
     if !stop_pty_shell(shell) {
         return 163;
+    }
+    0
+}
+
+#[test]
+fn a_styled_value_colors_only_what_reaches_the_terminal() {
+    let exec = MeshExec::with_environment(isolated_config_home(), &[("TERM", "xterm-256color")]);
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(style_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// A styled value emits its attributes only where they can be seen.
+///
+/// A pty is the one place that is visible: every piped test sees stdout that is not
+/// a terminal, which is exactly the case where the escapes are *supposed* to be
+/// absent — so a piped test can prove the stripping and nothing else.
+///
+/// The decision is made per command, before its redirections are opened, so what
+/// this pins is that each caller answered for its own stdout rather than for the
+/// shell's.
+fn style_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 200;
+    };
+    if !pty_write(shell.master, b"r = style(\"danger\", fg: red)\n")
+        || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 201;
+    }
+    // Bold and a background too, so the parameter order is pinned rather than just
+    // the fact that something was emitted.
+    if !pty_write(shell.master, b"b = style(hi, fg: blue, bold: true)\n")
+        || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 202;
+    }
+    if !pty_write(shell.master, b"puts $r\n") {
+        return 203;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 204;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b[31mdanger\x1b[0m") == 0 {
+        return 205;
+    }
+    if !pty_write(shell.master, b"puts $b\n") {
+        return 206;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 207;
+    };
+    // Bold first, then the color: one `SGR` carrying both, not two sequences.
+    if status != 0 || occurrences(&seen, b"\x1b[1;34mhi\x1b[0m") == 0 {
+        return 208;
+    }
+    // Re-styling *adds*: the red survives while bold is turned on.
+    if !pty_write(shell.master, b"e = style($r, bold: true)\n")
+        || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 209;
+    }
+    if !pty_write(shell.master, b"puts $e\n") {
+        return 210;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 211;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b[1;31mdanger\x1b[0m") == 0 {
+        return 212;
+    }
+    // A pipe means this stage's stdout is not the terminal, so the text goes
+    // through plain even though the shell's own stdout is one.
+    if !pty_write(shell.master, b"puts $r | cat\n") {
+        return 213;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 214;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b[31m") != 0 {
+        return 215;
+    }
+    // A redirection is the case the per-command decision exists for: the words are
+    // rendered *before* the target is opened, so only asking "does this command
+    // retarget stdout" keeps the escapes out of the file.
+    let file = fresh_dir("style_redirect").join("out");
+    let line = format!("puts $r > {}\n", file.display());
+    if !pty_write(shell.master, line.as_bytes())
+        || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 216;
+    }
+    match std::fs::read(&file) {
+        Ok(written) if written == b"danger\n" => {}
+        _ => return 217,
+    }
+    // `NO_COLOR` drops the attributes and keeps the text, with no other change to
+    // what the shell writes.
+    if !pty_write(shell.master, b"$env.NO_COLOR = 1\n")
+        || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 218;
+    }
+    if !pty_write(shell.master, b"puts $r\n") {
+        return 219;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 220;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b[31m") != 0 || occurrences(&seen, b"danger") == 0 {
+        return 221;
+    }
+    // `TERM=dumb` is the one terminal name for which SGR is text rather than
+    // styling, so it is refused separately from the tty test.
+    if !pty_write(shell.master, b"$env.NO_COLOR = ''\n")
+        || pty_read_until_command_done(shell.master).is_none()
+        || !pty_write(shell.master, b"$env.TERM = dumb\n")
+        || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 222;
+    }
+    if !pty_write(shell.master, b"puts $r\n") {
+        return 223;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 224;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b[31m") != 0 || occurrences(&seen, b"danger") == 0 {
+        return 225;
+    }
+    if !stop_pty_shell(shell) {
+        return 226;
     }
     0
 }
@@ -7951,17 +8184,19 @@ fn an_assignment_whose_value_broke_keeps_the_previous_binding() {
 
 #[test]
 fn a_builtin_value_constructor_cannot_be_a_function_name() {
-    // `re(...)` is a built-in value constructor, so a `func re` would be reachable
-    // as a command but never as a value call — reserve the name instead of
-    // shipping a function whose meaning depends on how it is called. The error is
-    // recoverable: the next command still runs.
-    let out = run_with_input("func re(x) { return $x }\nputs after\n");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("`re` is a built-in value constructor"),
-        "{stderr}"
-    );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    // `re(...)` and `style(...)` are built-in value constructors, so a `func` of
+    // either name would be reachable as a command but never as a value call —
+    // reserve the names instead of shipping a function whose meaning depends on how
+    // it is called. The error is recoverable: the next command still runs.
+    for name in ["re", "style"] {
+        let out = run_with_input(&format!("func {name}(x) {{ return $x }}\nputs after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("`{name}` is a built-in value constructor")),
+            "{stderr}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    }
 
     // A name that merely contains or resembles it is unaffected.
     let ok = run_with_input("func read(x) { return \"ok:$x\" }\ny = read(v)\nputs \"$y\"\n");

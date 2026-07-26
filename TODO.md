@@ -625,15 +625,32 @@ than the string the argv boundary would have produced.
       argues its `--help` is data too, against the "built-ins ship their specs the
       same way" rule that gives it a usage screen. One answer for all of them, not a
       carve-out for `puts`.
-- [ ] **Styled values and `style()`** — a `Value::Styled { text, attributes }`
-      that renders as its text everywhere bytes are wanted (argv, `:join`,
-      comparison, interpolation) and emits its attributes only when `puts`/`print`
-      is writing to a color-capable terminal. `NO_COLOR` drops the color and keeps
-      the text. Needs the `DESIGN.md` §"Hooks and the prompt" line that says only
-      the prompt renderer reads the attributes to widen to the output builtins.
+- [x] **Styled values and `style()`.** `Value::Styled` carries text plus a `Style`
+      (foreground, background, bold — the MVP set). It behaves as its text at every
+      boundary that wants bytes: `Value`'s `PartialEq`/`Hash` are hand-written so a
+      styled value *equals and hashes as* its text, ordering and `in` read the text,
+      `+=` and every modifier flatten to a plain result, and argv, the environment,
+      interpolation and `:repr` all see the text. Attributes are read in one place,
+      `builtins::rendered_for_output`, and emitted only when the command's own
+      stdout is a color-capable terminal — `redirects_stdout` plus the last-stage
+      test make that a per-command answer rather than the shell's, since words are
+      rendered before a redirection is opened. `NO_COLOR` (non-empty, per
+      no-color.org) and `TERM=dumb` drop it. Re-styling is additive.
+- [ ] **A value call as a command argument.** `puts style(x, fg: red)`,
+      `puts re(a)` and `puts $f(1)` are all syntax errors today — the parser takes
+      no call in an argument position, so a styled value has to reach `puts` through
+      a variable or a function's return value. That is the natural spelling for a
+      prompt segment, so nothing is blocked, but it is the first thing anyone tries.
+      Not specific to `style`; whatever fixes it fixes all three.
+- [ ] **256-color and truecolor.** `Color` is the sixteen ANSI names, which is what
+      every color-capable terminal agrees on. Going further needs a spelling for the
+      value (`fg: 33`? `fg: "#8be9fd"`? both?) and a **downgrade** rule to the
+      nearest of the sixteen for terminals that cannot show it — otherwise the
+      capability question `style` was designed to avoid comes straight back.
 - [ ] **`link(text, url)`** (OSC 8) on the same machinery: a styled value whose
       attribute is a hyperlink, stripped when stdout is not a terminal and kept
-      under `NO_COLOR` (a link is not color).
+      under `NO_COLOR` (a link is not color). Tracked with the other terminal
+      sequences under §"Terminal integration".
 
 ## Beyond M3 — Terminal integration
 
@@ -758,7 +775,11 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       carry is absent too — it exists for a script VS Code injects into a shell it
       launched, and mesh is not that.
 - [ ] **Hyperlinks** (OSC 8) — a `link(text, url)` sibling to `style()`, per
-      `DESIGN.md`, rather than a raw escape.
+      `DESIGN.md`, rather than a raw escape. Now unblocked: `Value::Styled` and the
+      per-command "does this stdout reach a terminal" decision are the machinery it
+      needs, so `link` adds an attribute to `Style` rather than a value kind. One
+      difference from color: a link is **kept** under `NO_COLOR`, which is about
+      color and not about escapes.
 - [x] **Clipboard** (OSC 52) — the `clip` builtin. `clip TEXT …` joins its
       arguments with a space as `puts` does; with no arguments it reads stdin, so
       `puts hi | clip` works. It copies exactly the bytes it was handed — a pipe's
