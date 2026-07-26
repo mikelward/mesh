@@ -926,7 +926,9 @@ of each PR had landed by another route, but these pieces had not.
       the job, so the prompt hangs and the `&` buys nothing — and
       `docs/REFERENCE.md` promises a background stage's changes stay in the child, which
       a mutating argument would break (`puts change() &` left `n=MUTATED` where
-      `change &` correctly leaves `n=before`).
+      `change &` correctly leaves `n=before`). The refusal covers an **interpolated
+      capture** and a redirect target too (`repl::carries_a_value`), since those are
+      evaluated in the same place.
 
       **A foreground pipeline is allowed**, with the same isolation gap and nothing
       observable: the pipeline waits either way, the result is right, and refusing it
@@ -971,19 +973,32 @@ of each PR had landed by another route, but these pieces had not.
       `capture_source` wants "did the body fail", and `status_of` on a value is not that
       question. Nothing to do with argument position: `m = $(5 + 0)` has always done
       this. It shows up more now only because the form is reachable in more places.
-- [ ] **Text glued to a value argument.** `pre$(x)post` and `f()x` are a loud syntax
-      error naming the spellings that work, because handing over three arguments where
-      one was written would be silently wrong. Gluing them into one word needs a value
-      piece inside `parser::Word`, which makes `expansion_word` need the shell — the
-      same restructure the ordering item above wants, so the two land together.
+- [ ] **Text glued to a *bare* value argument.** `pre$(x)post` and `f()x` are a loud
+      syntax error pointing at `"pre$(…)post"`, the quoted spelling that works, because
+      handing over three arguments where one was written would be silently wrong. The
+      value piece the quoted form needs now exists (`parser::WordPiece::Value`), so what
+      is left is parser-side: `command_word` gluing an adjacent `$(` into the word it
+      touches, and the value-argument branch doing the same for text that follows.
 
-- [ ] **`$(…)` does not interpolate inside `"…"`.** `puts "at $(pwd) now"` prints
-      `at $(pwd) now` — the substitution is literal text, not a value. Separate
-      machinery from the item above (interpolation, not argument parsing) and it has
-      its own `DESIGN.md` counter-example: the prompt segment
-      `func host-info() { style("$(hostname)", fg: red) }` yields the *string*
-      `$(hostname)`, so the documented way to write a prompt cannot work. `$var` and
-      `${…}` do interpolate; only the capture form is missing.
+- [x] **`$(…)` interpolates inside `"…"`.** `puts "at $(pwd) now"` substitutes, and
+      `DESIGN.md`'s prompt segment `func host-info() { style("$(hostname)", fg: red) }`
+      styles the host name rather than the *string* `$(hostname)`. The piece scanner
+      turns `$(` inside a double-quoted string into a `WordPiece::Value`, whose extent
+      is found by lexing the body — bounded at the `)` that closes it, since scanning
+      characters would close `"$(puts "a)b")"` on the wrong one — and whose body is
+      parsed there and then, so a syntax error inside stays a parse error.
+
+      `repl::expansion_word` evaluates the piece, which is what makes it shell-aware
+      (a `$(…)` launches a command); the value rides into expansion as the same
+      `Piece::Value` a value *argument* uses, so it is literal thereafter — never
+      re-split, never re-globbed. Only `"…"`: `'…'`, `r"…"` and `\$(` stay text.
+
+- [ ] **A capture does not interpolate in a heredoc body.** `<< END` interpolates
+      `$var` and the `"…"` escape set, but `$(cmd)` stays as written — the body is
+      interpolated from its *text* by `repl::interpolate_heredoc`, which resolves references
+      against `Vars` and has no shell, rather than by the word machinery a string
+      goes through. `docs/REFERENCE.md` §"Heredocs" says so now. Worth closing for
+      consistency, and it wants the same shell-aware treatment `expansion_word` got.
 
 - [x] **FreeBSD compile-check in CI.** `cargo check --workspace --all-targets
       --target x86_64-unknown-freebsd` runs alongside the macOS cross-check, so a

@@ -275,13 +275,15 @@ meets the ordinary argv rule and refuses a collection by name:
 ```
 
 A value argument is a **whole** argument: text attached to it (`pre$(x)post`, `f()x`)
-is a syntax error rather than silently three arguments. Bind it and interpolate
-instead — `m = $(…)` then `pre${m}post`.
+is a syntax error rather than silently three arguments. Quote the word to glue them —
+`"pre$(x)post"`, which interpolates (see [Quoting](#quoting)).
 
 It cannot be **backgrounded** yet: `puts $(sleep 10) &` is refused, because the
 argument would run in the shell rather than in the job's fork — the prompt would hang
-for ten seconds and the `&` would buy nothing. Bind it first (`m = $(…)` then
-`cmd $m &`). A foreground pipeline is fine.
+for ten seconds and the `&` would buy nothing. The same goes for an interpolated
+capture (`puts "$(sleep 10)" &`) and one in a redirect target, which are evaluated in
+the same place. Bind it first (`m = $(…)` then `cmd $m &`). A foreground pipeline is
+fine.
 
 A following `<` or `>` is still a **redirection**, so `puts (1 + 2) > out` writes the
 file. That is because an argument is parsed just above comparison precedence; a
@@ -365,7 +367,8 @@ string uses, so `$m.key[0]:upper` means the same thing in both, and a malformed
 reference (`${bad`) or a malformed `\u{…}` escape is the same error in both. One
 difference from a string, on purpose: an escape that is not in the set at all —
 `\d`, `\p` — stays as written rather than erroring, because bodies carry regexes,
-JSON, and Windows paths where a stray backslash is ordinary text.
+JSON, and Windows paths where a stray backslash is ordinary text. A **capture** is
+not substituted in a body — `$(cmd)` stays as written — though it is in a string.
 
 A body is **data**, so it is never tilde-expanded, globbed, or word-split.
 
@@ -377,7 +380,9 @@ hello $name and \n stay literal
 END
 ```
 
-The delimiter itself is never expanded; it is matched as written. A body of any
+The delimiter itself is never expanded; it is matched as written — and since a
+capture in one would mean running a command to decide where the body ends, a
+delimiter containing one (`<<"$(x)"`) is a syntax error. A body of any
 size is fine — it reaches the command as a temporary file that is unlinked as
 soon as it is opened, so nothing is reachable by name while the command runs and
 nothing is left behind after.
@@ -847,6 +852,21 @@ cannot cross `execve` or the environment.
 
 Adjacent quoted and bare pieces concatenate into one argument: `--flag='a b'` is
 a single argument, `""` is one empty argument.
+
+A `"…"` string interpolates a **capture** as well as a variable, which is how a value
+is glued to text:
+
+```mesh
+puts "at $(pwd) now"
+puts "$(id -un)@$(hostname)"
+func host-info() { style("$(hostname)", fg: red) }
+```
+
+What the capture produced crosses **whole** — quoted, so it is never re-split and
+never re-globbed, however many spaces or `*`s it contains. A capture that fails is an
+error there as everywhere, so the statement stops rather than substituting nothing,
+and a syntax error inside it is reported when the line is parsed. `'…'` and `r"…"` are
+literal, and `\$(` keeps the text in a double-quoted string.
 
 ## Variables
 

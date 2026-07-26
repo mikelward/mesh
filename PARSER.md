@@ -141,7 +141,13 @@ position, `_` discards an element, and at most one `...` rest binding is
 permitted; list-pattern items are not recursively patterns.
 
 `command-word` is the lexer's adjacency-preserving word token, including
-interpolations and expression atoms allowed in command position. Keywords are
+interpolations and expression atoms allowed in command position. A double-quoted
+section may contain a `capture` (`"at $(pwd) now"`), which becomes a **value piece**
+of the word: its extent is found by lexing the body, bounded at the `)` that closes
+it, and the body is parsed with the enclosing word rather than at run time. The value
+is evaluated where the shell is, before the word is expanded, and is literal from
+there on — never re-split, never re-globbed — exactly as an interpolated variable is.
+Keywords are
 recognized only where the grammar expects them; an ordinary command may still
 receive `if`, `unless`, `for`, or `match` as an argument. In command position,
 an unquoted `if` or `unless` starts a postfix guard only when the remaining

@@ -25,8 +25,21 @@ pub enum QuoteMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WordPiece {
-    Text { text: String, quote: QuoteMode },
-    Variable { name: String, quote: QuoteMode },
+    Text {
+        text: String,
+        quote: QuoteMode,
+    },
+    Variable {
+        name: String,
+        quote: QuoteMode,
+    },
+    /// A **value** spliced into the word — `"at $(pwd) now"`.
+    ///
+    /// Evaluating it needs the shell (a `$(…)` launches a command), so it happens
+    /// where the shell is — [`crate::repl::expansion_word`] — and rides into
+    /// expansion as a literal piece, exactly as an interpolated variable does:
+    /// never re-split, never re-globbed.
+    Value(Box<Spanned<Expr>>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,12 +48,19 @@ pub struct Word {
 }
 
 impl Word {
+    /// The word's literal spelling — what a caller that needs a *name* reads.
+    ///
+    /// A value piece contributes nothing: it has no spelling until it is evaluated.
+    /// Every caller pairs this with [`word_is_quoted`], which reports a value piece
+    /// as "not a bare literal", so none of them mistakes the remaining text for the
+    /// whole word.
     pub fn text(&self) -> String {
         self.pieces
             .iter()
             .map(|piece| match piece {
                 WordPiece::Text { text, .. } => text.as_str(),
                 WordPiece::Variable { name, .. } => name.as_str(),
+                WordPiece::Value(_) => "",
             })
             .collect()
     }
@@ -201,8 +221,7 @@ impl std::fmt::Display for ParseError {
             ParseErrorKind::GluedValueArgument => write!(
                 f,
                 "syntax error: a value argument cannot have text attached; separate it \
-                 with a space, or bind it first and interpolate — `m = $(…)` then \
-                 `pre${{m}}post`"
+                 with a space, or quote the whole word — `\"pre$(…)post\"`"
             ),
             ParseErrorKind::ReservedFunctionName(name) => {
                 write!(
@@ -797,6 +816,23 @@ impl<'a> Lexer<'a> {
     }
 
     fn run(mut self) -> Result<Vec<Token>, ParseError> {
+        Ok(self.lex(false)?.0)
+    }
+
+    /// Lex the body of a `$( … )` whose `$(` sits just before `self.position`,
+    /// stopping at the `)` that closes it. Returns the body's tokens — including
+    /// that `)`, which the parser expects — and the offset just past it.
+    ///
+    /// Bounded because the caller is midway through a **string**: the text after the
+    /// capture's `)` is string content, and lexing it as code would report the
+    /// string's own closing quote as an unterminated one.
+    fn capture_body(mut self) -> Result<(Vec<Token>, usize), ParseError> {
+        self.lex(true)
+    }
+
+    fn lex(&mut self, until_close: bool) -> Result<(Vec<Token>, usize), ParseError> {
+        let body_start = self.position;
+        let mut depth = 0_usize;
         let mut tokens = Vec::new();
         let mut line_start = 0;
         while self.position < self.source.len() {
@@ -829,10 +865,22 @@ impl<'a> Lexer<'a> {
             }
             if let Some((text, kind)) = self.punctuation() {
                 self.position += text.len();
+                // A `)` at depth zero is the one that closes the capture being lexed.
+                // Only parens count: a `)` inside a quoted word (`$(puts "a)b")`) is
+                // part of that word's token and never reaches here.
+                let closes = until_close && depth == 0 && kind == TokenKind::RParen;
+                match kind {
+                    TokenKind::LParen | TokenKind::CaptureStart => depth += 1,
+                    TokenKind::RParen => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
                 tokens.push(Spanned {
                     value: kind,
                     span: start..self.position,
                 });
+                if closes {
+                    return Ok((tokens, self.position));
+                }
                 continue;
             }
             let mut pieces = Vec::new();
@@ -933,6 +981,20 @@ impl<'a> Lexer<'a> {
                             self.position += escaped.len_utf8();
                             push_text(&mut pieces, &decoded.to_string(), mode);
                         } else if inner == '$' && mode == QuoteMode::Double {
+                            // `"… $(cmd) …"` — a capture interpolates inside double
+                            // quotes, the same as `$name` does. It becomes a value
+                            // piece rather than text, so its output crosses whole:
+                            // quoted, so never split and never globbed.
+                            if self.source[self.position..].starts_with("$(") {
+                                let (expression, end) =
+                                    capture_in_string(self.source, self.position)?;
+                                pieces.push(WordPiece::Value(Box::new(Spanned {
+                                    value: expression,
+                                    span: self.position..end,
+                                })));
+                                self.position = end;
+                                continue;
+                            }
                             let end = variable_end(self.source, self.position)?;
                             if end == self.position + 1 {
                                 push_text(&mut pieces, "$", QuoteMode::Double);
@@ -988,7 +1050,16 @@ impl<'a> Lexer<'a> {
                 span: start..self.position,
             });
         }
-        Ok(tokens)
+        // Ran out of input with the capture still open. Reported as an unterminated
+        // `(` so it reads like the open delimiter it is, rather than as whatever the
+        // string's own quote would have been blamed for.
+        if until_close {
+            return Err(ParseError {
+                kind: ParseErrorKind::Unterminated('('),
+                span: body_start..self.source.len(),
+            });
+        }
+        Ok((tokens, self.position))
     }
 
     fn consume_heredocs(
@@ -1010,6 +1081,21 @@ impl<'a> Lexer<'a> {
                         span: tokens[index].span.clone(),
                     });
                 };
+                // A delimiter is matched against the body's lines as *text*, so a
+                // capture in one has nothing to contribute — and evaluating the word
+                // would run a command to decide where a heredoc ends. Refused rather
+                // than half-honored: `<<"$(x)"` used to be the literal delimiter
+                // `$(x)`, which is nobody's intent worth keeping.
+                if word
+                    .pieces
+                    .iter()
+                    .any(|piece| matches!(piece, WordPiece::Value(_)))
+                {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::Expected("a heredoc delimiter without a capture"),
+                        span: tokens[index + 1].span.clone(),
+                    });
+                }
                 requests.push((index + 1, word.text(), word_is_quoted(word)));
             }
         }
@@ -1184,6 +1270,28 @@ fn push_variable(pieces: &mut Vec<WordPiece>, variable: &str, quote: QuoteMode) 
     });
 }
 
+/// Parse the `$( … )` starting at `dollar`, from **inside** a double-quoted string.
+/// Returns the capture and the offset just past its `)`.
+///
+/// A `$name` reference ends where its characters stop, so [`variable_end`] can scan
+/// for it. A capture body is a whole script, so where it ends is a question only the
+/// grammar answers — `"$(puts "a)b")"` closes on the second `)`, not the first. So
+/// the body is lexed and parsed here and now, which is also what keeps a syntax
+/// error inside it a *parse* error rather than a surprise at run time.
+fn capture_in_string(source: &str, dollar: usize) -> Result<(Expr, usize), ParseError> {
+    let (tokens, end) = Lexer {
+        source,
+        position: dollar + 2,
+    }
+    .capture_body()?;
+    let mut parser = Parser {
+        tokens,
+        position: 0,
+        source_len: end,
+    };
+    Ok((Expr::Capture(parser.source(Some(TokenKind::RParen))?), end))
+}
+
 pub(crate) fn variable_end(source: &str, start: usize) -> Result<usize, ParseError> {
     let rest = &source[start..];
     if let Some(braced) = rest.strip_prefix("${") {
@@ -1355,11 +1463,18 @@ pub(crate) fn decode_unicode_escape(source: &str, start: usize) -> Option<(char,
     Some((char::from_u32(value)?, start + close + 2))
 }
 
+/// Is this word something other than a plain bare literal?
+///
+/// Asked by every decision that needs the word to *be* its spelling — a flag name,
+/// a function name, a heredoc delimiter, a command reading. A **value** piece
+/// answers yes for the same reason a quote does: the word is not the text it looks
+/// like, so `--flag$(x)` is not the flag `flag` and `$(x)y` is not a name.
 fn word_is_quoted(word: &Word) -> bool {
     word.pieces.iter().any(|piece| match piece {
         WordPiece::Text { quote, .. } | WordPiece::Variable { quote, .. } => {
             *quote != QuoteMode::Bare
         }
+        WordPiece::Value(_) => true,
     })
 }
 
@@ -1918,12 +2033,10 @@ impl Parser {
                 // A value argument is a whole argument, so text touching either side of
                 // it is **refused** rather than silently becoming a separate one:
                 // `pre$(x)post` would otherwise hand over three arguments where the
-                // reader wrote one, and quietly. Gluing a value into a word needs a
-                // value piece inside `Word`, which is its own change — until then this
-                // stays the syntax error it was before value arguments existed, with a
-                // message naming spellings that work. Not `"…$(…)…"`: a capture does not
-                // interpolate inside quotes either (`TODO.md`), so the message points at
-                // binding it first, which does.
+                // reader wrote one, and quietly. Gluing a value into a *bare* word is
+                // its own change — until then this stays the syntax error it was before
+                // value arguments existed, and the message points at `"pre$(…)post"`,
+                // the quoted spelling that does interpolate.
                 // Only a token that could *continue* an argument counts: a newline or a
                 // `;` sits flush against the expression too, and neither is glued text.
                 let glued_after = self.peek().is_some_and(|token| {
@@ -4218,6 +4331,82 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_capture_inside_double_quotes_becomes_a_value_piece() {
+        let tokens = tokenize("\"at $(pwd) now\"").unwrap();
+        let TokenKind::Word(word) = &tokens[0].value else {
+            panic!()
+        };
+        let [
+            WordPiece::Text {
+                text: before,
+                quote: QuoteMode::Double,
+            },
+            WordPiece::Value(capture),
+            WordPiece::Text {
+                text: after,
+                quote: QuoteMode::Double,
+            },
+        ] = word.pieces.as_slice()
+        else {
+            panic!("{:?}", word.pieces)
+        };
+        assert_eq!((before.as_str(), after.as_str()), ("at ", " now"));
+        // Parsed here and now, so a syntax error inside is a *parse* error — see
+        // `capture_in_string`.
+        let Expr::Capture(body) = &capture.value else {
+            panic!("{:?}", capture.value)
+        };
+        assert_eq!(body.statements.len(), 1);
+        // The span covers `$(pwd)`, the text the piece stands in for.
+        assert_eq!(capture.span, 4..10);
+    }
+
+    #[test]
+    fn a_capture_inside_double_quotes_ends_where_the_grammar_says() {
+        // Not at the first `)`: that one is inside a word of the body. Scanning
+        // characters would close the capture there and leave `b")"` as string text.
+        let tokens = tokenize("\"[$(puts \"a)b\")]\"").unwrap();
+        let TokenKind::Word(word) = &tokens[0].value else {
+            panic!()
+        };
+        assert!(
+            matches!(
+                word.pieces.as_slice(),
+                [
+                    WordPiece::Text { text: open, .. },
+                    WordPiece::Value(_),
+                    WordPiece::Text { text: close, .. },
+                ] if open == "[" && close == "]"
+            ),
+            "{:?}",
+            word.pieces
+        );
+
+        // Nesting closes innermost-first, the same as outside a string.
+        assert!(tokenize("\"$(puts \"$(pwd)\")\"").is_ok());
+
+        // A capture that never closes is an unterminated `(`, not the string's quote.
+        assert!(matches!(
+            tokenize("puts \"$(pwd"),
+            Err(ParseError {
+                kind: ParseErrorKind::Unterminated('('),
+                ..
+            })
+        ));
+        // With the string's quote still there, the body claims it first — a quote is
+        // ordinary inside a capture (`$(puts "x")`), so the lexer cannot know this one
+        // was meant to close the outer string. Still a syntax error, still names an
+        // unclosed delimiter.
+        assert!(matches!(
+            tokenize("puts \"$(pwd\""),
+            Err(ParseError {
+                kind: ParseErrorKind::Unterminated('"'),
+                ..
+            })
+        ));
     }
 
     #[test]

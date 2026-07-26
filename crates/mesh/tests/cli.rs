@@ -13061,16 +13061,41 @@ fn a_backgrounded_value_argument_is_refused_rather_than_run_in_the_shell() {
     // the prompt and the `&` would buy nothing. And a mutating call would change the
     // parent's globals, where `docs/REFERENCE.md` says a background stage's changes
     // stay in the child.
-    let refused = run_with_input("puts $(pwd) &\nputs after\n");
-    assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("cannot be backgrounded yet"),
-        "{:?}",
-        refused.stderr
-    );
-    assert_eq!(String::from_utf8_lossy(&refused.stdout), "after\n");
+    // An interpolated capture is evaluated in the same place for the same reason, so
+    // it is refused in the same breath — checking only `CommandItem::Value` left
+    // `puts "$(sleep …)" &` hanging the prompt, since the capture rides inside a
+    // *word*. A redirect target counts too.
+    for source in [
+        "puts $(pwd) &\n",
+        "puts \"[$(pwd)]\" &\n",
+        "puts hi > \"o$(pwd).txt\" &\n",
+    ] {
+        let refused = run_with_input(&format!("{source}puts after\n"));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("cannot be backgrounded yet"),
+            "{source:?}: {:?}",
+            refused.stderr
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&refused.stdout),
+            "after\n",
+            "{source:?}"
+        );
+    }
 
-    // The isolation rule it protects, on the spelling that does work: a backgrounded
-    // *function* keeps its changes in the child.
+    // The isolation rule it protects, on the spelling it protects it from: a mutating
+    // call in an interpolated capture reached the parent's globals.
+    let unmutated = run_with_input(
+        "n = before\nfunc change() { global n = MUTATED }\nputs \"[$(change)]\" &\nputs n=$n\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&unmutated.stdout).contains("n=before"),
+        "{:?}",
+        unmutated.stdout
+    );
+
+    // The same rule on the spelling that does work: a backgrounded *function* keeps
+    // its changes in the child.
     let isolated = run_with_input(
         "n = before\nfunc change() { global n = MUTATED\n  puts ran }\nchange &\nwait\nputs n=$n\n",
     );
@@ -13148,9 +13173,8 @@ fn a_redirect_after_a_value_argument_still_redirects() {
 fn text_glued_to_a_value_argument_is_a_loud_error() {
     // A value argument is a whole argument. Silently handing over three arguments
     // where `pre$(x)post` was written would be worse than the syntax error this was
-    // before value arguments existed, so it stays one — with a message naming a
-    // spelling that works, which `"…$(…)…"` is not (a capture does not interpolate
-    // inside quotes).
+    // before value arguments existed, so it stays one — with a message naming the
+    // quoted spelling, which does interpolate.
     for source in [
         "/bin/echo pre$(puts x)post\n",
         "puts f()x\n",
@@ -13170,8 +13194,9 @@ fn text_glued_to_a_value_argument_is_a_loud_error() {
     }
 
     // The spelling the message points at does work.
-    let bound = run_with_input("m = $(puts x)\nputs pre${m}post\n");
-    assert_eq!(String::from_utf8_lossy(&bound.stdout), "prexpost\n");
+    let quoted = run_with_input("/bin/echo \"pre$(puts x)post\"\n");
+    assert_eq!(String::from_utf8_lossy(&quoted.stdout), "prexpost\n");
+    assert!(quoted.stderr.is_empty(), "{:?}", quoted.stderr);
 
     // And a value argument flush against the *end* of a command is not glued text —
     // a newline sits there too.
@@ -13203,6 +13228,126 @@ fn a_value_argument_is_literal_and_leaves_globs_alone() {
     assert!(literal.stderr.is_empty(), "{:?}", literal.stderr);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_capture_interpolates_inside_double_quotes() {
+    // `"… $(cmd) …"` printed its own source text before: the piece scanner read the
+    // `$` as a literal and the `(` as more text. `DESIGN.md` writes the prompt idiom
+    // `style("$(hostname)", fg: red)` in §"Prompt", which yielded the *string*
+    // `$(hostname)`.
+    let out = run_with_input(
+        "puts \"at $(puts here) now\"\n\
+         puts \"$(puts one)\"\n\
+         puts \"$(puts a) and $(puts b)\"\n\
+         m = \"pre$(puts x)post\"\n\
+         puts $m\n\
+         puts (style(\"$(puts host)\", fg: red))\n\
+         func f(n) { puts \"got $n from $(puts cap)\" }\n\
+         f 1\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "at here now\none\na and b\nprexpost\nhost\ngot 1 from cap\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // Only in double quotes. A single-quoted or raw string is literal, and `\$(` is
+    // the escape that keeps the text where a double-quoted string is wanted.
+    let literal = run_with_input(
+        "puts '$(puts no)'\n\
+         puts r\"$(puts no)\"\n\
+         puts \"\\$(puts no)\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&literal.stdout),
+        "$(puts no)\n$(puts no)\n$(puts no)\n"
+    );
+    assert!(literal.stderr.is_empty(), "{:?}", literal.stderr);
+}
+
+#[test]
+fn an_interpolated_capture_crosses_whole() {
+    // Quoted, so the output is one argument however many spaces and glob characters
+    // it contains — the rule an interpolated variable already follows. A shell that
+    // re-split here is where `for f in "$(ls)"` goes wrong.
+    let dir = fresh_dir("interpolated_capture_whole");
+    std::fs::write(dir.join("apple"), "").unwrap();
+    std::fs::write(dir.join("banana"), "").unwrap();
+
+    let out = run_with_input(&format!(
+        "cd {}\n\
+         x = \"$(puts 'a b')\"\n\
+         puts $x:len\n\
+         puts \"$(puts '*')\"\n\
+         for w in \"$(puts one)\" {{ puts item=$w }}\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3\n*\nitem=one\n",
+        "{:?}",
+        out.stderr
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_interpolated_capture_fails_as_loudly_as_a_bare_one() {
+    // A capture's non-zero status is an error wherever it is written (`DESIGN.md`
+    // §"Results and status"), so the statement stops rather than interpolating the
+    // empty string the way a shell would.
+    let failed = run_with_input("puts \"[$(false)]\"\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&failed.stdout), "after\n");
+
+    // A syntax error inside the capture is reported at *parse* time, so nothing in
+    // the statement runs.
+    let malformed = run_with_input("puts \"[$(if)]\"\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr).contains("syntax error"),
+        "{:?}",
+        malformed.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&malformed.stdout), "after\n");
+
+    // An unclosed capture is a syntax error naming the delimiter, not a hang.
+    let unclosed = run_with_input("puts \"[$(pwd\n");
+    assert!(
+        String::from_utf8_lossy(&unclosed.stderr).contains("unclosed `(`"),
+        "{:?}",
+        unclosed.stderr
+    );
+}
+
+#[test]
+fn a_heredoc_keeps_a_capture_out_of_its_delimiter_and_its_body() {
+    // A body is interpolated from its text, and only for `$…` references — so a
+    // capture stays as written. `docs/REFERENCE.md` §"Heredocs" says so.
+    let body = run_with_input("x = X\ncat << END\nvar $x and $(puts cap)\nEND\n");
+    assert_eq!(
+        String::from_utf8_lossy(&body.stdout),
+        "var X and $(puts cap)\n",
+        "{:?}",
+        body.stderr
+    );
+
+    // A **delimiter** is matched as text, so a capture in one would mean running a
+    // command to decide where the body ends. Refused rather than run: this used to be
+    // the literal delimiter `$(x)`, which is nobody's intent worth keeping.
+    let delimiter = run_with_input("cat <<\"$(puts x)\"\nbody\n$(puts x)\n");
+    assert!(
+        String::from_utf8_lossy(&delimiter.stderr)
+            .contains("a heredoc delimiter without a capture"),
+        "{:?}",
+        delimiter.stderr
+    );
+    assert!(delimiter.stdout.is_empty(), "{:?}", delimiter.stdout);
+
+    // An ordinary quoted delimiter is untouched.
+    let quoted = run_with_input("cat << \"END\"\nliteral $x\nEND\n");
+    assert_eq!(String::from_utf8_lossy(&quoted.stdout), "literal $x\n");
 }
 
 #[test]

@@ -72,7 +72,7 @@ word   = piece+
 piece  = bare | escape | double | single | raw   # adjacent pieces fuse
 bare   = <unquoted chars, expandable>             # e.g. * ? [ ~ are active here
 escape = "\" <any char>                           # literal next char; \<nl> = continuation
-double = '"' ( <text> | c-escape | var )* '"'      # interpolates + escapes
+double = '"' ( <text> | c-escape | var | capture )* '"'  # interpolates + escapes
 single = "'" ( <text> | s-escape )* "'"           # escapes, no interpolation; $ literal
 raw    = ("r'" <bytes> "'") | ('r"' <bytes> '"')  # no escapes at all
 ```
@@ -89,6 +89,10 @@ The escape sets (an **unknown escape inside a quote is a syntax error**):
 - **Double quotes** `"…"` interpolate variables, including member access and
   integer indexing, and interpret the C-style escape set. Braces delimit a
   reference before literal text: `"${file}.txt"`.
+- **A capture interpolates too**: `"at $(pwd) now"`. Where it *ends* is decided by
+  the grammar rather than by scanning for `)`, so `"$(puts "a)b")"` closes on the
+  second one, and its body is parsed with the string — a syntax error inside is a
+  syntax error, not a surprise at run time. `\$(` keeps the text.
 - **Single quotes** `'…'` do *not* interpolate but *do* escape (Python `str`):
   `'a\nb'` is two lines, `'$x'` is a literal `$x`, and `'\d'` is an **error**.
 - **Raw strings** `r'…'` / `r"…"` take no escapes — the home for regex source
