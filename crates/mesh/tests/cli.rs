@@ -1213,6 +1213,115 @@ fn spawn_failure_returns_terminal_to_interactive_shell() {
     );
 }
 
+#[test]
+fn a_piped_shell_writes_no_semantic_marks() {
+    // The marks are for a terminal that is drawing the session. Everything else
+    // reading mesh's stdout — a pipe, a file, the several hundred assertions in
+    // this file — asked for the command's bytes and nothing else, so a mark that
+    // reached them would be corruption rather than decoration.
+    //
+    // What this actually pins is *where the marks are written from*. Today no
+    // piped path reaches `semantic_mark` at all: it is called only from the
+    // interactive loop's `handle_signal`, and its `interactive` check is a second
+    // lock on a door that is already shut. So deleting that check does not fail
+    // this test — moving the call somewhere shared, like `run_line`, does, which
+    // is the mistake actually available to make.
+    //
+    // `mesh -s` is the case worth pinning among the three: it reads commands from
+    // a terminal without being an interactive session, which is why the shell
+    // records interactivity rather than deriving it from `isatty`.
+    for out in [
+        run_with_input("puts hi\nsh -c 'exit 3'\nputs after\n"),
+        run_with_args(&["-c", "puts hi\nsh -c 'exit 3'\n"]),
+        run_with_args(&["-s"]),
+    ] {
+        for stream in [&out.stdout, &out.stderr] {
+            let text = String::from_utf8_lossy(stream);
+            assert!(
+                !text.contains("\x1b]133"),
+                "a mark escaped to a pipe: {text:?}"
+            );
+            assert!(!text.contains("133;"), "a mark escaped to a pipe: {text:?}");
+        }
+    }
+}
+
+#[test]
+fn an_interactive_shell_marks_where_the_command_ended() {
+    let exec = MeshExec::new(isolated_config_home());
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(semantic_mark_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// `C` before the command's output and `D` after it, carrying its status.
+///
+/// The status is what makes `D` worth having over a prompt: a terminal — or a
+/// test — reads the outcome from the stream instead of inferring it from which
+/// prompt glyph was painted, and a repaint cannot forge it, because the shell
+/// writes it once when the command actually ends.
+fn semantic_mark_harness(exec: &MeshExec) -> i32 {
+    let mut master = -1;
+    let mut slave = -1;
+    if open_pty_pair(&mut master, &mut slave) != 0
+        || unsafe { libc::setsid() } < 0
+        || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
+    {
+        return 40;
+    }
+    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    let mesh = unsafe { libc::fork() };
+    if mesh < 0 {
+        return 41;
+    }
+    if mesh == 0 {
+        unsafe {
+            libc::setpgid(0, 0);
+            libc::dup2(slave, libc::STDIN_FILENO);
+            libc::dup2(slave, libc::STDOUT_FILENO);
+            libc::dup2(slave, libc::STDERR_FILENO);
+            libc::close(master);
+            libc::close(slave);
+        }
+        unsafe { libc::_exit(exec_mesh(exec)) };
+    }
+    if unsafe { libc::setpgid(mesh, mesh) } < 0 && unsafe { libc::getpgid(mesh) } != mesh {
+        return 42;
+    }
+    unsafe { libc::close(slave) };
+    if unsafe { libc::tcsetpgrp(master, mesh) } < 0 || !pty_wait_for_prompt(master) {
+        return 43;
+    }
+    // A failing command, so the status in `D` is one no default could produce.
+    let command = b"sh -c 'exit 3'\n";
+    if unsafe { libc::write(master, command.as_ptr().cast(), command.len()) }
+        != command.len() as isize
+    {
+        return 44;
+    }
+    if !pty_wait_for_marker(master, b"\x1b]133;D;3\x1b\\") {
+        return 45;
+    }
+    let quit = b"exit\n";
+    if unsafe { libc::write(master, quit.as_ptr().cast(), quit.len()) } != quit.len() as isize {
+        return 46;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(mesh, &mut status, 0) } != mesh {
+        return 47;
+    }
+    unsafe { libc::close(master) };
+    0
+}
+
 fn spawn_failure_harness(exec: &MeshExec) -> i32 {
     let mut master = -1;
     let mut slave = -1;

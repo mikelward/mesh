@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 
 use reedline::{
     Color, ColumnarMenu, Completer, EditCommand, Emacs, History, HistoryItem, HistoryItemId,
-    HistorySessionId, KeyCode, KeyModifiers, Keybindings, MenuBuilder, Prompt, PromptEditMode,
-    PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, SearchDirection, SearchQuery,
-    Signal, SimpleMatchHighlighter, Span, SqliteBackedHistory, Suggestion,
+    HistorySessionId, KeyCode, KeyModifiers, Keybindings, MenuBuilder, Osc133Markers, Prompt,
+    PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, SearchDirection,
+    SearchQuery, Signal, SimpleMatchHighlighter, Span, SqliteBackedHistory, Suggestion,
     default_emacs_keybindings,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -4544,6 +4544,46 @@ fn register_prompt_hook(event: PromptEvent, name: &str, function: &str, shell: &
     Step::Continue(0)
 }
 
+/// The two OSC 133 marks the *shell* owns. reedline emits `A` and `B` — the
+/// prompt's own boundaries — because it is the one drawing the prompt; `C` and
+/// `D` bracket the command, which only the shell knows.
+enum SemanticMark {
+    /// `C` — the prompt is finished and what follows is the command's output.
+    OutputStart,
+    /// `D` — the command is over, with the status it ended on.
+    CommandDone(u8),
+}
+
+/// Write an OSC 133 mark, so a terminal can tell prompt from input from output:
+/// jump between commands, fold their output, badge a failure. `DESIGN.md`
+/// "terminal control" lists the sequence set; this is the pair with boundaries
+/// mesh already has, at `PreExec` and `PostExec`.
+///
+/// **Only when the session is interactive.** `set_interactive` is recorded by
+/// the interactive loop rather than derived from `isatty`, so `mesh -s` on a
+/// terminal — which reads commands without being a session — stays quiet, and so
+/// does every piped run the test suite asserts byte-exact output from. A mark on
+/// stdout that the caller did not ask for is corruption, not decoration.
+///
+/// Terminated with `ST` rather than `BEL`, matching what reedline emits for `A`
+/// and `B`, so one stream does not mix the two spellings.
+///
+/// Failure to write is ignored: the command's status is the command's, and a
+/// decoration that could change it would be worse than a missing decoration.
+fn semantic_mark(interactive: bool, mark: SemanticMark) {
+    if !interactive {
+        return;
+    }
+    let sequence = match mark {
+        SemanticMark::OutputStart => "\x1b]133;C\x1b\\".to_string(),
+        SemanticMark::CommandDone(status) => format!("\x1b]133;D;{status}\x1b\\"),
+    };
+    use std::io::Write as _;
+    let mut out = io::stdout();
+    let _ = out.write_all(sequence.as_bytes());
+    let _ = out.flush();
+}
+
 fn run_prompt_hooks(event: PromptEvent, args: Vec<Value>, shell: &mut Shell) {
     let hooks: Vec<String> = shell
         .prompt
@@ -6421,6 +6461,11 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     let keybindings = interactive_keybindings();
     let completion_menu = completion_menu();
     let mut editor = Reedline::create()
+        // `A` and `B` — where the prompt starts and where the user's input does.
+        // The shell emits `C` and `D` itself, at `PreExec` and `PostExec`; see
+        // `semantic_mark`. Both halves have to be present for a terminal to make
+        // sense of the stream, and only reedline knows where it drew the prompt.
+        .with_semantic_markers(Some(Osc133Markers::boxed()))
         .with_edit_mode(Box::new(Emacs::new(keybindings)))
         .with_quick_completions(true)
         .with_highlighter(Box::new(input_highlighter()))
@@ -7044,9 +7089,12 @@ fn handle_signal(
                 vec![Value::String(command.clone())],
                 shell,
             );
+            let marks = shell.vars.interactive();
+            semantic_mark(marks, SemanticMark::OutputStart);
             let start = Instant::now();
             let step = run_line(&text, last, false, shell);
             let status = step.status();
+            semantic_mark(marks, SemanticMark::CommandDone(status));
             let elapsed = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
             run_prompt_hooks(
                 PromptEvent::PostExec,
