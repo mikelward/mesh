@@ -1146,9 +1146,13 @@ fn run_executable(
             if runs_as_command(expression)
                 && let parser::Expr::Scalar(word) = expression
             {
+                let word = match expansion_word(&word.value, last, in_function, shell) {
+                    Ok(word) => word,
+                    Err(step) => return step,
+                };
                 return run_pipeline(
                     vec![Stage {
-                        words: vec![expansion_word(&word.value)],
+                        words: vec![word],
                         redirs: Vec::new(),
                         pipe_stderr: false,
                     }],
@@ -1221,6 +1225,27 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
     })
 }
 
+/// Does this command item hold a value the **parent** would have to evaluate?
+///
+/// A value argument is one (`puts $(pwd)`), and so is a *word* with a value piece in
+/// it — `puts "$(pwd)"`, `> "o$(n).txt"` — since an interpolated capture is evaluated
+/// where the shell is, exactly as an argument's is. Both matter to the same caller:
+/// backgrounding, which must not run either in the parent. A heredoc body is not
+/// checked because it does not interpolate a capture at all (`TODO.md`).
+fn carries_a_value(item: &parser::CommandItem) -> bool {
+    let has_value_piece = |word: &parser::Spanned<parser::Word>| {
+        word.value
+            .pieces
+            .iter()
+            .any(|piece| matches!(piece, parser::WordPiece::Value(_)))
+    };
+    match item {
+        parser::CommandItem::Value(_) => true,
+        parser::CommandItem::Word(word) => has_value_piece(word),
+        parser::CommandItem::Redirect { target, .. } => has_value_piece(target),
+    }
+}
+
 /// Whether an expression statement is really a **command**: a lone scalar word
 /// carrying a quoted piece, the spelling that runs a program whose path needs
 /// quoting (`"/opt/my program"`). Such a statement produces a status, not a
@@ -1231,6 +1256,9 @@ fn runs_as_command(expression: &parser::Expr) -> bool {
         parser::WordPiece::Text { quote, .. } | parser::WordPiece::Variable { quote, .. } => {
             !matches!(quote, parser::QuoteMode::Bare)
         }
+        // A value only reaches a word from inside quotes, so `"$(which ls)"` is
+        // the same spelling with the path computed — still a command.
+        parser::WordPiece::Value(_) => true,
     }))
 }
 
@@ -1793,7 +1821,7 @@ fn run_ast_pipeline(
             }
             Err(step) => return step,
         }
-        // A value argument is evaluated in **this** process while the stage is being
+        // A value in a command is evaluated in **this** process while the stage is being
         // assembled, and backgrounding is where that is visibly wrong: the fork has not
         // happened yet, so `puts $(sleep 10) &` would run the ten seconds in the parent
         // before registering the job — the prompt hangs and the `&` buys nothing. It is
@@ -1809,14 +1837,9 @@ fn run_ast_pipeline(
         // Doing it right means the *stage* evaluating its own arguments, which needs
         // `exec::Cmd`'s words to stop being final at assembly time — the same
         // restructure the ordering and glued-text items want.
-        if background
-            && command
-                .items
-                .iter()
-                .any(|item| matches!(item, parser::CommandItem::Value(_)))
-        {
+        if background && command.items.iter().any(carries_a_value) {
             note!(
-                "mesh: a value argument cannot be backgrounded yet; bind it first — \
+                "mesh: a value cannot be backgrounded yet; bind it first — \
                  `m = $(…)` then `cmd $m &`"
             );
             return Step::Continue(2);
@@ -1825,7 +1848,12 @@ fn run_ast_pipeline(
         let mut redirs = Vec::new();
         for item in &command.items {
             match item {
-                parser::CommandItem::Word(word) => words.push(expansion_word(&word.value)),
+                parser::CommandItem::Word(word) => {
+                    match expansion_word(&word.value, last, in_function, shell) {
+                        Ok(word) => words.push(word),
+                        Err(step) => return step,
+                    }
+                }
                 // A value argument is evaluated **here**, where the shell is: a
                 // `$(…)` launches a command and a call runs a function, neither of
                 // which the expander can do. The result rides into expansion as a
@@ -1861,7 +1889,10 @@ fn run_ast_pipeline(
                     target,
                     body,
                 } => {
-                    let target = expansion_word(&target.value);
+                    let target = match expansion_word(&target.value, last, in_function, shell) {
+                        Ok(target) => target,
+                        Err(step) => return step,
+                    };
                     match kind {
                         // `&> file` is defined as `> file 2>&1`, so desugar it
                         // into exactly that pair rather than carrying a third
@@ -2021,21 +2052,45 @@ fn interpolate_heredoc(text: &str, vars: &Vars) -> Result<String, String> {
     Ok(out)
 }
 
-fn expansion_word(word: &parser::Word) -> Word {
-    Word(
-        word.pieces
-            .iter()
-            .map(|piece| match piece {
-                parser::WordPiece::Text { text, quote } => Piece::Text {
-                    text: text.clone(),
-                    expandable: matches!(quote, parser::QuoteMode::Bare),
-                },
-                parser::WordPiece::Variable { name, quote } => {
-                    Piece::Var(expansion_variable(name, *quote))
+/// Turn a parsed word into an expansion word, evaluating any **value** piece on
+/// the way — `"at $(pwd) now"`.
+///
+/// Shell-aware because that evaluation has to be: a `$(…)` launches a command,
+/// which the expander cannot do. Same division of labor as a value *argument*
+/// (`parser::CommandItem::Value`), and the same place in the order — before the
+/// word is expanded, and before any redirect target is opened.
+fn expansion_word(
+    word: &parser::Word,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Word, Step> {
+    let mut pieces = Vec::with_capacity(word.pieces.len());
+    for piece in &word.pieces {
+        pieces.push(match piece {
+            parser::WordPiece::Text { text, quote } => Piece::Text {
+                text: text.clone(),
+                expandable: matches!(quote, parser::QuoteMode::Bare),
+            },
+            parser::WordPiece::Variable { name, quote } => {
+                Piece::Var(expansion_variable(name, *quote))
+            }
+            parser::WordPiece::Value(expression) => {
+                // Through `eval_operand_of`, which puts `shell.result` /
+                // `shell.produced` back: a piece of a word is an *operand*, so what
+                // it produced must not stand as the enclosing command's result.
+                let value = eval_operand_of(&expression.value, last, in_function, shell)?;
+                // Control flow is unwinding — a `return` inside the capture. Stop
+                // rather than expand a word that was never finished; the statement
+                // layer acts on `shell.control`.
+                if shell.control.is_some() {
+                    return Err(Step::Continue(last));
                 }
-            })
-            .collect(),
-    )
+                Piece::Value(value)
+            }
+        });
+    }
+    Ok(Word(pieces))
 }
 
 /// One resolved step of an assignment path. A subscript stays text because which
@@ -2490,18 +2545,21 @@ fn eval_expr(
         return Ok(control_placeholder());
     }
     match expr {
-        E::Scalar(word) => expand::expand_values(vec![expansion_word(&word.value)], &shell.vars)
-            .map_err(|e| {
-                note!("mesh: {e}");
-                Step::Continue(1)
-            })
-            .map(|mut v| {
-                if v.len() == 1 {
-                    v.pop().unwrap()
-                } else {
-                    Value::List(v)
-                }
-            }),
+        E::Scalar(word) => {
+            let word = expansion_word(&word.value, last, in_function, shell)?;
+            expand::expand_values(vec![word], &shell.vars)
+                .map_err(|e| {
+                    note!("mesh: {e}");
+                    Step::Continue(1)
+                })
+                .map(|mut v| {
+                    if v.len() == 1 {
+                        v.pop().unwrap()
+                    } else {
+                        Value::List(v)
+                    }
+                })
+        }
         E::Regex(pattern) => {
             let value = RegexValue::new(pattern.clone());
             compile_regex(&value).map_err(runtime_message)?;
@@ -10773,8 +10831,9 @@ mod tests {
             Value::Map(vec![("a]b".into(), Value::String("ok".into()))]),
         );
 
+        let expansion = expansion_word(&word.value, 0, false, &mut shell).expect("a plain word");
         assert_eq!(
-            crate::expand::expand_values(vec![expansion_word(&word.value)], &shell.vars),
+            crate::expand::expand_values(vec![expansion], &shell.vars),
             Ok(vec![Value::String("ok".into())])
         );
     }
