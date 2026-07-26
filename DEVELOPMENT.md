@@ -161,6 +161,7 @@ mesh/
 │   │       ├── parser.rs   # span-carrying M3 tokens and command/value AST
 │   │       ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
 │   │       ├── vars.rs     # variable store: global scope + function-local scopes
+│   │       ├── options.rs  # $sh.options — the settings, shared with the line editor
 │   │       ├── funcs.rs    # user-defined function store (name → params + body)
 │   │       ├── builtins.rs # cd, pwd, puts, exit + job-builtin recognition
 │   │       └── exec.rs     # launch external commands + pipelines/redirection

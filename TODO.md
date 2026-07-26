@@ -543,7 +543,9 @@ file as tasks land.
       finished, and whether it is keyed by job id rather than positional (a
       pipeline's stages have an order; a set of jobs has ids). Worth deciding
       before anything depends on the scalar being the whole answer.
-- [ ] The rest of `$sh.*`: `$sh.options` and the hook maps.
+- [ ] The rest of `$sh.*`: the hook maps, `$sh.complete`, and `$sh.signal`.
+      `$sh.options` has landed, along with the per-key mutability the rest of the
+      configuration half needs.
 
 ## Beyond M3 — Terminal integration
 
@@ -553,6 +555,11 @@ The escape/OSC surface a modern interactive shell drives, from the TODO block in
 and every piped run stay byte-exact — and **failure-ignoring**, since a decoration
 that could change a command's status would be worse than a missing decoration.
 
+Each landed decoration is on by default with a `$sh.options` off switch, except
+bracketed paste, which is deliberately not optional. A new one here should arrive
+with its switch: add an `Opt` variant in `options.rs` and read it through
+`repl::decoration`, which pairs the setting with the interactive test.
+
 - [x] **Shell integration / semantic prompt marks** (OSC 133). reedline emits `A`
       and `B`, the prompt's own boundaries, since it draws the prompt; the shell
       emits `C` before the output and `D` with the status after, from outside the
@@ -561,7 +568,9 @@ that could change a command's status would be worse than a missing decoration.
       no status: nothing ran, so there is no outcome to report, but the input
       region reedline opened at `B` still has to be closed. A blank submission gets
       no marks and fires no hooks — it is not a command, for the same reason
-      history keeps no row for it.
+      history keeps no row for it. `$sh.options.shell-integration` turns the marks
+      off, reedline's `A`/`B` along with the shell's `C`/`D`: half the marks leaves
+      a terminal reading the output as input, which is worse than none.
 - [x] **Bracketed paste** (`CSI ?2004 h`). On, always: reedline's guard defaults
       to off, so without asking for it a paste's newlines each arrive as Enter and
       every line but the last runs before it can be read.
@@ -570,7 +579,14 @@ that could change a command's status would be worse than a missing decoration.
       UTF-8 still reports. Written once per prompt, after the `preprompt` hooks:
       one call site covers both halves `DESIGN.md` asks for — the first prompt is
       the startup report a fresh remote shell owes a new split, and any later move
-      reaches the next prompt whatever caused it.
+      reaches the next prompt whatever caused it. `$sh.options.cwd-report` turns it
+      off.
+- [x] **Bold input.** The line being typed is drawn in bold — uniform weight rather
+      than token-aware color, so it makes no syntax claim and reads on any theme —
+      and survives Enter into scrollback, which is what keeps a command
+      distinguishable from its own output after the fact.
+      `$sh.options.bold-input` turns it off, read per repaint so the change lands
+      on the next keystroke rather than the next session.
 - [x] **Window/tab title** (OSC 0, screen's `\ek`). Automatic: `user@host: dir` at
       the prompt, the command line while a command runs, so a row of tabs reads at
       a glance. The sequence follows `$env.TERM` — `\ek…\e\\` inside screen or tmux,
@@ -591,9 +607,10 @@ that could change a command's status would be worse than a missing decoration.
       is cut at 96 characters: both the command line and the directory carry text
       mesh did not choose, and a filename holding an `ESC` would otherwise end
       mesh's sequence and start one of its own.
-      Remaining: the **off switch**, which wants to be `$sh.options.osc-title`
-      alongside `$sh.options.bold-input` below, and waits on `$sh` becoming a
-      writable place.
+      Remaining: the **off switch**, `$sh.options.osc-title`. `$sh.options` exists
+      now, so it is a matter of adding the `Opt` variant and reading it through
+      `repl::decoration` — deliberately left to its own change rather than folded
+      into the one that made `$sh` writable.
 - [ ] **Ask terminfo which sequence the terminal takes**, instead of matching
       `$env.TERM` against a list. `hs`, `tsl` and `fsl` hold exactly the title
       sequence — including screen's `ESC k` form — so reading them would replace
@@ -815,11 +832,6 @@ of each PR had landed by another route, but these pieces had not.
          it must answer is where a literal ends and a flag begins, since `head -1`
          and `sort -1` stay commands with flags; likely "attached digits after
          `-` in *value* position," not everywhere.
-- [ ] **Document bold input in `DESIGN.md`.** Interactive input renders bold
-      (`repl.rs`, `input_highlighter`), but the *design* — uniform weight rather
-      than token-aware color, live as you type, surviving Enter into scrollback,
-      and whether it gets a `$sh.options.bold-input` off switch — is written down
-      nowhere.
 - [ ] **Finish moving the job-synchronizing tests onto `wait`.** A good number of
       tests need to say "the background job has finished". Sleeping at it is a
       live flake source, since no interval is long enough on a machine that is

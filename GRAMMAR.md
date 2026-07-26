@@ -132,7 +132,7 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
 - **`$m.key = value`**, **`$xs[0] = value`** (and `+=`) write **into** a bound
   collection instead of rebinding the name, along a path that mixes members and
   indices (`$m.rows[1].name = …`). A modifier is not a place (`$xs:dedup = …`), nor
-  is a slice, and `$env` / `$sh` keep their own handling. Local-by-default like any
+  is a slice, and `$env` keeps its own handling above. Local-by-default like any
   other assignment: inside a function the write shadows an outer binding rather
   than reaching through to it, and **`global $m.key = value`** is how it writes the
   outer one instead. **`unset $m.key`** / **`unset $xs[0]`** remove such a place
@@ -140,6 +140,11 @@ name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
   what follows. Nothing along the path is created — a missing
   intermediate key is an error — except a **new map key at the end**, which is how
   a key is added.
+- **`$sh.options.NAME = value`** takes the same grammar — `$sh` *is* a place — but
+  which entries may be written is decided at run time, not here: the settings map
+  accepts a boolean, and every other `$sh` entry is refused by name. `global` and
+  `unset` are refused on it too. Making this a syntax error instead produced a
+  message about the `=` that could name neither the entry nor the reason.
 - **`$name` / `${name}`** read a variable; **`$env.KEY` / `${env.KEY}`** read the
   environment (strict), and **`$xs[N]` / `${xs[N]}`** read an exact list element.
   These forms have the same meaning in bare words and `"…"`; braces delimit a
