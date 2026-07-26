@@ -1015,6 +1015,120 @@ fn puts_and_print_still_answer_help() {
 }
 
 #[test]
+fn a_builtin_takes_the_dash_dash_terminator_out_of_the_way() {
+    // `DESIGN.md` §"Command resolution and help" offers `--` as the escape from the
+    // generated `--help`, and a builtin has to honor it the way a function does —
+    // ending the search *and* consuming the terminator. Left in, the escape stopped
+    // the detection and then printed the `--` it was written with.
+    let out = run_with_input(
+        "puts -- --help\n\
+         puts -- a b\n\
+         puts a -- b\n\
+         puts -- -- x\n\
+         v = --help\n\
+         puts -- $v\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // Only the *first* `--` goes: a literal one stays writable after it.
+        "--help\na b\na b\n-- x\n--help\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_builtin_with_options_keeps_the_terminator_for_its_own_parser() {
+    // Only the builtin knows where its options end, so it consumes `--` itself.
+    // Removing it centrally would undo the thing it was written for.
+    //
+    // `kill` reads a leading `-SIGNAL`, so after `--` a `-9` is a *target*.
+    let out = run_with_input("kill -- -9\nputs status=$sh.status\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("-9") && !stderr.contains("--:"),
+        "`-9` should reach kill as a target, not a signal: {stderr:?}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=1\n");
+
+    // `disown` reads `-h`/`-a`/`-r`, so after `--` a `-h` is a job reference — and
+    // there is no job by that name, so the job it would have marked is untouched.
+    let disown = run_with_input("sleep 30 &\ndisown -- -h\nputs status=$sh.status\njobs\n");
+    let stdout = String::from_utf8_lossy(&disown.stdout);
+    assert!(stdout.contains("status=1"), "{stdout:?}");
+    assert!(stdout.contains("Running sleep 30"), "{stdout:?}");
+    assert!(
+        String::from_utf8_lossy(&disown.stderr).contains("-h: no such job"),
+        "{:?}",
+        String::from_utf8_lossy(&disown.stderr)
+    );
+
+    // `prompt` reads `--reset`, so after `--` it is the prompt text. A prompt is
+    // exactly the kind of value that can start with a dash.
+    let set = run_with_input("prompt -- --reset\nprompt\n");
+    assert_eq!(String::from_utf8_lossy(&set.stdout), "--reset\n");
+    assert!(set.stderr.is_empty(), "{:?}", set.stderr);
+
+    // Without the terminator it is still the option it looks like.
+    let reset = run_with_input("prompt 'x> '\nprompt --reset\nprompt\n");
+    assert_eq!(String::from_utf8_lossy(&reset.stdout), "mesh$ \n");
+
+    // `prompt-hook` reads `--remove`, so after `--` every word is an operand — which
+    // is what lets a hook be *named* `--remove`, the case the terminator exists for.
+    for (source, label) in [
+        ("prompt-hook -- p1 h\n", "plain"),
+        ("prompt-hook -- --remove h\n", "a hook named --remove"),
+        ("prompt-hook -- preexec p1 h\n", "with an event"),
+    ] {
+        let out = run_with_input(&format!(
+            "func h(c) {{ puts hook }}\n{source}puts status=$sh.status\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "status=0\n",
+            "{label}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // And `--remove` without the terminator still removes.
+    let removed = run_with_input(
+        "func h(c) { puts hook }\nprompt-hook p1 h\nprompt-hook --remove p1\nputs status=$sh.status\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&removed.stdout), "status=0\n");
+}
+
+#[test]
+fn a_builtin_and_a_function_read_flags_the_same_way() {
+    // The rule is one rule, not one per command kind. A word that *is* `--help`
+    // asks for help whether it was written or came out of a variable — mesh's
+    // expansion safety is about not splitting or globbing a value, not about
+    // laundering a word that is a flag — and `--` is the way to mean it as data.
+    let out = run_with_input(
+        "func g(...xs) { puts $xs:repr }\n\
+         v = --help\n\
+         g -- --help\n\
+         g -- -- x\n\
+         g a -- b\n\
+         g -- $v\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "['--help']\n['--', 'x']\n['a', 'b']\n['--help']\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // And a bare `--help` reaches the generated help on both paths.
+    for command in ["puts --help\n", "func h(x) { puts $x }\nh --help\n"] {
+        let out = run_with_input(command);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Usage:"),
+            "{command:?}: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+#[test]
 fn cd_updates_pwd_and_oldpwd_for_children() {
     let out = run_with_input("cd /\nprintenv PWD\ncd /usr\nprintenv OLDPWD\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "/\n/\n");

@@ -406,7 +406,7 @@ one-MiB output cap.
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
 | `notify [text …]` | Raise a desktop notification through the terminal with `OSC 9`. Arguments or stdin, like `clip`. A command that runs for more than ten seconds notifies on its own, with its outcome and duration — `$sh.options.command-notify = false` turns that off. Inside tmux the sequence is wrapped for passthrough, which tmux forwards only with `allow-passthrough` set. Support is uneven and unreportable — iTerm2, WezTerm, Ghostty, kitty and ConEmu raise these; xterm and Alacritty discard them; tmux needs `allow-passthrough` — so success means "asked". |
 | `exit [n]` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). |
-| `prompt [text]` | Set the interactive prompt to `text`. With no arguments, print the current prompt; `--reset` restores the status-sensitive default. |
+| `prompt [text]` | Set the interactive prompt to `text`. With no arguments, print the current prompt; `--reset` restores the status-sensitive default, and `prompt -- --reset` sets that literal text. |
 | `prompt-hook [event] name function` | Register a named function for a prompt lifecycle event. The default event is `preprompt`. Reusing `name` within an event replaces that hook without changing its order. |
 | `jobs` | List the jobs, one `[id] State command` per line. |
 | `fg [job]` | Resume a job in the foreground and wait for it. No argument takes the most recent job. |
@@ -414,6 +414,30 @@ one-MiB output cap.
 | `wait job` | Wait for a job to finish and report its status — see [Job control](#job-control). |
 | `kill [-signal] job\|pid …` | Signal a job's process group, or a pid. Default `TERM`. |
 | `disown [-h] [-a \| -r] [job …]` | Stop tracking a job — see [Job control](#job-control). |
+
+### Flags and `--`
+
+Every command mesh owns — builtin or function — reads flags by one rule.
+
+**`--help` prints the generated help**, whether it was written or arrived in a
+variable: `x = --help; puts $x` prints the usage, and so does `f $x`. mesh's
+expansion safety is about never *splitting* or *globbing* a value; it was never a
+promise to launder a word that is a flag.
+
+**`--` ends the options and is consumed**, so it is how you mean a flag-looking word
+as data:
+
+```mesh
+puts -- --help                # --help
+puts -- -- x                  # -- x     — only the first one goes
+prompt -- --reset             # sets the prompt to the text `--reset`
+kill -- -9 %1                 # looks for a job named `-9`, not signal 9
+```
+
+Which command consumes it depends on which has options to end. `puts`, `print`,
+`clip`, `notify`, `cd`, `source` and `help` have none of their own, so the terminator
+is simply removed. `kill`, `disown`, `prompt` and `prompt-hook` do, so each ends its
+own options at `--` — only they know where those stop.
 
 ### Job control
 

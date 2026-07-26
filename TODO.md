@@ -629,18 +629,20 @@ than the string the argv boundary would have produced.
       `puts $xs`, `puts $xs > out` and `puts $xs | cat` agree. Only a word ordinary
       expansion *cannot* render takes the typed route — value typing reads a bare
       literal as a number, and `puts 007` has to print `007`.
-- [ ] **A builtin's auto-help fires on `--help` that arrived as data.** `x = --help;
-      puts $x` prints the usage screen, and so does `xs = [--help]; puts $xs` —
-      `run_expanded` reads expanded *words*, so nothing distinguishes the flag from
-      a value that spells it. True of every builtin (`cd $x` too) and true before
-      the output builtins rendered values; the list case is one more way to reach
-      it, not a new mechanism. `DESIGN.md` §"Command resolution and help" gives `--`
-      as the escape — and it works for the detection — but a builtin then *prints*
-      the `--`, since none of them consume it. Settling this means deciding whether
-      a builtin parses flags at all: `DESIGN.md` says `puts` "takes no flags", which
-      argues its `--help` is data too, against the "built-ins ship their specs the
-      same way" rule that gives it a usage screen. One answer for all of them, not a
-      carve-out for `puts`.
+- [x] **One flag rule for builtins and functions.** Settled: builtins parse flags —
+      several must, since `kill -9`, `disown -a`, `prompt --reset` and
+      `prompt-hook --remove` are their spellings — and `DESIGN.md`'s "`puts` takes no
+      flags" means none *of its own*, never that its `--help` is data. The two
+      sentences were not in tension. A word that **is** `--help` asks for help
+      wherever it came from, which is what functions already did (`x = --help; f $x`
+      prints usage), because expansion safety is about not splitting or globbing a
+      value rather than laundering a flag. The real defect was `--`: detected and then
+      left in, so `puts -- --help` printed `-- --help`. Now a builtin with **no**
+      options has the first `--` removed centrally (`builtins::reads_options`, read off
+      the usage line so it cannot go stale), while one **with** options keeps it —
+      only that builtin knows where its options end, and stripping it centrally made
+      `kill -- -9 %1` send SIGKILL and `prompt -- --reset` reset. `prompt` gained the
+      handling `kill` already had.
 - [x] **Styled values and `style()`.** `Value::Styled` carries text plus a `Style`
       (foreground, background, bold — the MVP set). It behaves as its text at every
       boundary that wants bytes: `Value`'s `PartialEq`/`Hash` are hand-written so a

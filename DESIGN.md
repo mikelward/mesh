@@ -2929,6 +2929,24 @@ literal `--help` after `--` reaches the body as data (`ll -- --help`), never the
 auto-help. So the synthesized help fills the gap only where the function hasn't
 spoken for the name.
 
+**One flag rule, for built-ins and functions alike** *(decided)*. Built-ins parse
+flags — several must, since `kill -9`, `disown -a`, `prompt --reset` and
+`prompt-hook --remove` are their spellings — and `puts` "takes no flags" means it has
+none *of its own*, not that its `--help` is data. Two consequences, and they are the
+same for both kinds of command:
+
+- **A word that *is* `--help` asks for help, wherever it came from.** `x = --help;
+  puts $x` prints the usage, and so does `f $x` on a function. mesh's expansion
+  safety is about never *splitting* or *globbing* a value — it was never a promise to
+  launder a word that is a flag, and a shell in which `$x` could smuggle one past
+  option parsing would be the surprising one.
+- **`--` ends the options and is consumed.** Who consumes it depends on who has
+  options to end: a command **with** options owns its terminator, because only it
+  knows where its options stop (`kill -- -9 %1` looks for a job named `-9`;
+  `prompt -- --reset` sets that text), while for a command with **no** options there
+  is nothing to end, so the terminator is removed before it is reached. Either way
+  only the *first* `--` goes, so a literal one stays writable after it.
+
 **Generation is lazy.** A spec is generated the first time you complete
 *arguments* for a command with no spec yet, then cached, so later Tabs never
 regenerate. The man-page parse is tried first because it runs nothing; the
