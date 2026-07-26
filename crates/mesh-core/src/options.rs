@@ -37,6 +37,11 @@ pub enum Opt {
     /// `bold-input` — draw what is being typed in bold, so a command stays
     /// distinguishable from its own output once both are in scrollback.
     BoldInput,
+    /// `command-notify` — the desktop notification a command raises when it has
+    /// run for longer than the threshold. Off is for anyone who would rather not
+    /// have a notification daemon told what they are running, or who works
+    /// somewhere the notification lands on the wrong machine.
+    CommandNotify,
     /// `cwd-report` — the `OSC 7` working-directory report, so a new tab or split
     /// opens where the shell is. Quiet in a terminal that ignores it, but it is
     /// one more sequence on the wire.
@@ -60,8 +65,9 @@ impl Opt {
     /// [`Options`] indexes its flags by an `Opt`'s position *here*, which is the
     /// enum's declaration order; `all_options_index_themselves` holds the two
     /// together.
-    pub const ALL: [Opt; 4] = [
+    pub const ALL: [Opt; 5] = [
         Opt::BoldInput,
+        Opt::CommandNotify,
         Opt::CwdReport,
         Opt::OscTitle,
         Opt::ShellIntegration,
@@ -72,6 +78,7 @@ impl Opt {
     pub fn key(self) -> &'static str {
         match self {
             Opt::BoldInput => "bold-input",
+            Opt::CommandNotify => "command-notify",
             Opt::CwdReport => "cwd-report",
             Opt::OscTitle => "osc-title",
             Opt::ShellIntegration => "shell-integration",
@@ -244,6 +251,7 @@ mod tests {
             options.entries(),
             vec![
                 ("bold-input".to_owned(), Value::Boolean(true)),
+                ("command-notify".to_owned(), Value::Boolean(true)),
                 ("cwd-report".to_owned(), Value::Boolean(false)),
                 ("osc-title".to_owned(), Value::Boolean(true)),
                 ("shell-integration".to_owned(), Value::Boolean(true)),

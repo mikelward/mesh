@@ -642,7 +642,7 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       the prompt, the command line while a command runs, so a row of tabs reads at
       a glance. The sequence follows `$env.TERM` — `\ek…\e\\` inside screen or tmux,
       where the name belongs to the pane rather than to the outer window, OSC 0 for
-      a terminal on the `TITLE_TERMS` allowlist, and *nothing* for anything else.
+      a terminal on the `OSC_TERMS` allowlist, and *nothing* for anything else.
       An allowlist because the two ways of being wrong are not equal: an unlisted
       terminal quietly has no title, while one wrongly assumed to take a title
       *prints* it at every prompt — `TERM=linux` reads `ESC ]` as a palette sequence
@@ -665,7 +665,7 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
 - [ ] **Ask terminfo which sequence the terminal takes**, instead of matching
       `$env.TERM` against a list. `hs`, `tsl` and `fsl` hold exactly the title
       sequence — including screen's `ESC k` form — so reading them would replace
-      both the `TITLE_TERMS` allowlist and the multiplexer special case with data,
+      both the `OSC_TERMS` allowlist and the multiplexer special case with data,
       and would answer for terminals nobody has added to a list yet. It needs a
       terminfo reader mesh does not have: the binary format, the `$TERMINFO` and
       `/usr/share/terminfo` search path, and the extended-capability section. A
@@ -702,10 +702,42 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       Deferred: **reading** the clipboard back, which needs a query and a response
       and so can block on a terminal that never answers; and the `p` (primary)
       selection.
-- [ ] **Notifications** (OSC 9 / 777) — a builtin, plus an automatic one when a
-      long command finishes. The threshold has its input already: `postexec` is
-      handed the command's elapsed milliseconds. OSC 9;4 progress reporting belongs
-      with it.
+- [x] **Notifications** (OSC 9) — the `notify` builtin, plus an automatic one when
+      a command takes longer than ten seconds: `mesh: cargo build — done in 1m15s`,
+      or `— exit 2 in …` when it failed, since a failure that finished while you
+      were away is the case worth a notification at all. `notify TEXT …` takes
+      arguments or stdin and writes to `/dev/tty`, exactly as `clip` does; the
+      automatic one writes to stdout, where the other automatic sequences go, since
+      an interactive session's stdout *is* the terminal.
+      The threshold stands in for the question mesh cannot answer — whether anyone
+      is watching. Terminals report focus (`CSI ?1004 h`), but the line editor owns
+      the input, so those events never reach the shell; a command long enough to
+      walk away from is the usable proxy. Ten seconds is long enough that the news
+      is news and short enough to catch a build.
+      Gated by the same `OSC_TERMS` allowlist as the title (renamed from
+      `TITLE_TERMS`, since it now decides two sequences): the question it answers is
+      "will this terminal parse an `OSC` rather than print it", and a terminal that
+      parses one it does not implement discards it. Which terminals actually *raise*
+      notifications is unaskable — iTerm2, WezTerm, Ghostty, kitty and ConEmu do,
+      xterm and Alacritty discard, tmux swallows without `allow-passthrough` — and
+      there is no reply either way, so success means "asked".
+      Off switch: `$sh.options.command-notify`, alongside the others — for anyone who
+      would rather not have a notification daemon told what they are running.
+      Inside **tmux** the sequence is wrapped in the `DCS tmux;` envelope with its
+      `ESC`s doubled, since a multiplexer consumes an `OSC` it does not implement
+      rather than forwarding it; tmux passes the envelope on when
+      `allow-passthrough` is set and discards it otherwise, which is the same
+      silence as sending nothing. `$TMUX` and `$STY` decide which multiplexer is in
+      the way, because `$env.TERM` cannot: tmux is commonly configured to set
+      `TERM=screen-256color`.
+      Deferred: **screen's** passthrough, whose payload limit and quirks mesh has no
+      way to test against here — and a wrong envelope *prints*, which is the failure
+      the allowlist exists to avoid; **OSC 777**, whose `notify;title;body` split
+      would double up on the terminals that support both; a **configurable
+      threshold**, which is a value rather than a flag and so wants more of
+      `$sh.options` than exists; **OSC 9;4 progress**; and skipping the notification
+      when the terminal has focus, which needs focus events the line editor does not
+      surface.
 - [ ] **Cursor shape per mode** (DECSCUSR) — blocked on vi mode; the line editor
       is Emacs-only today.
 - [ ] **Synchronized output** (DEC 2026) — belongs around reedline's repaint

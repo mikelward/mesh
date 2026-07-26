@@ -284,6 +284,40 @@ fn run_without_a_terminal(input: &str) -> Output {
 }
 
 #[test]
+fn notify_needs_a_terminal_and_says_so() {
+    // Same contract as `clip`, and the same reason for `setsid`: the sequence is a
+    // message to the terminal, so with none there is nowhere to send it — and
+    // nothing may reach stdout, which would corrupt a pipeline and still notify
+    // nobody.
+    let out = run_without_a_terminal("notify hi\nputs status=$sh.status\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mesh: notify: no terminal"),
+        "stderr was {stderr:?}"
+    );
+    assert!(stdout.contains("status=1"), "stdout was {stdout:?}");
+    assert!(!stdout.contains("\x1b]9"), "stdout was {stdout:?}");
+}
+
+#[test]
+fn notify_refuses_an_empty_message() {
+    // A notification with nothing in it is a mistake being reported as success:
+    // most likely a variable that expanded to nothing.
+    let out = run_without_a_terminal("notify \"\"\nputs status=$sh.status\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mesh: notify: nothing to say"),
+        "stderr was {stderr:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("status=1"),
+        "stdout was {:?}",
+        out.stdout
+    );
+}
+
+#[test]
 fn clip_needs_a_terminal_and_says_so() {
     // The sequence is a message to the terminal, so with no terminal there is
     // nowhere to send it — and nothing is written to stdout, which is the mistake
@@ -1348,6 +1382,10 @@ fn a_piped_shell_writes_no_terminal_sequences() {
             assert!(
                 !text.contains("\x1b]0;") && !text.contains("\x1bk"),
                 "a window title escaped to a pipe: {text:?}"
+            );
+            assert!(
+                !text.contains("\x1b]9;"),
+                "a notification escaped to a pipe: {text:?}"
             );
         }
     }
@@ -2498,6 +2536,87 @@ fn clip_harness(exec: &MeshExec) -> i32 {
     }
     if !stop_pty_shell(shell) {
         return 149;
+    }
+    0
+}
+
+#[test]
+fn notify_reaches_the_terminal_and_a_quick_command_does_not() {
+    let exec = MeshExec::with_environment(isolated_config_home(), &[("TERM", "xterm-256color")]);
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(notify_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// `notify` reaches the terminal, and a command that finishes quickly raises
+/// nothing by itself.
+///
+/// The automatic notification's *threshold* is unit-tested against
+/// `command_notification`, which takes it as an argument — an end-to-end test of
+/// the ten-second case would cost ten seconds of suite time to cover one call
+/// site. What is worth an end-to-end test is the pair either side of it: that the
+/// sequence really reaches a terminal (via the builtin, which writes the same
+/// `OSC 9`), and that an ordinary fast command stays silent, which is the failure
+/// that would make mesh unusable rather than merely quiet.
+fn notify_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 150;
+    };
+    if !pty_write(shell.master, b"notify hello from mesh\n") {
+        return 151;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 152;
+    };
+    if status != 0 {
+        return 153;
+    }
+    if occurrences(&seen, b"\x1b]9;hello from mesh\x07") == 0 {
+        return 154;
+    }
+    // A command well under the threshold: no notification of its own. The `notify`
+    // above proves the channel works, so silence here is a decision rather than a
+    // broken pipe.
+    if !pty_write(shell.master, b"sh -c 'sleep 0.2'\n") {
+        return 155;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 156;
+    };
+    if status != 0 {
+        return 157;
+    }
+    if occurrences(&seen, b"\x1b]9;") != 0 {
+        return 158;
+    }
+    // The setting reaches the automatic notification: with it off, a command over
+    // the threshold would raise nothing. The threshold itself is unit-tested, so
+    // what this pins is that the flag is consulted at all — `notify` keeps working,
+    // since a builtin is called rather than drawn and needs no off switch.
+    if !pty_write(shell.master, b"$sh.options.command-notify = false\n")
+        || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 159;
+    }
+    if !pty_write(shell.master, b"notify still explicit\n") {
+        return 160;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 161;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b]9;still explicit\x07") == 0 {
+        return 162;
+    }
+    if !stop_pty_shell(shell) {
+        return 163;
     }
     0
 }
@@ -13261,7 +13380,7 @@ fn the_settings_map_reads_as_booleans_that_start_on() {
     let out = run_with_input("puts ...$sh.options:keys\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "bold-input cwd-report osc-title shell-integration\n"
+        "bold-input command-notify cwd-report osc-title shell-integration\n"
     );
 
     let out = run_with_input(
@@ -13270,7 +13389,8 @@ fn the_settings_map_reads_as_booleans_that_start_on() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "bold-input true\ncwd-report true\nosc-title true\nshell-integration true\ndirect true\n"
+        "bold-input true\ncommand-notify true\ncwd-report true\nosc-title true\n\
+         shell-integration true\ndirect true\n"
     );
     assert!(
         out.status.success(),
@@ -13306,7 +13426,7 @@ fn a_setting_can_be_turned_off_and_back_on() {
     let out = run_with_input("$sh.options.bold-input = false\nputs ...$sh.options:values\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "false true true true\n"
+        "false true true true true\n"
     );
 }
 
