@@ -1,5 +1,12 @@
 # A prompt in mesh
 
+> **This is the design target, not what runs today.** The `$sh.prompt` map,
+> styled segments, `rule`, and the `postcd` event below are not implemented yet.
+> What works now is the `prompt` builtin and named `prompt-hook` functions for
+> the `preprompt`, `preexec`, `postexec`, `jobdone`, and `exit` events — see
+> [Custom prompts and hooks](REFERENCE.md#custom-prompts-and-hooks) in the
+> reference, which shows the same context line built with today's API.
+
 In mesh your prompt is a **map of named pieces**, one per line — not a single
 cryptic `$PS1` string. Each piece is a small function returning text (optionally
 with color). Pieces that have nothing to show simply disappear. Here's a complete,

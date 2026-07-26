@@ -69,14 +69,16 @@ passes the words already entered to `COMMAND --help` and extracts options and
 subcommands from both output streams; builtins and defined functions use their
 generated help in the same way. File, directory, and enumerated option values
 narrow argument completion to the expected type. A growing slice of the language
-is in place: quoting and escapes,
-`~` and filename globs, typed scalar/list/map values, arithmetic and comparisons,
-regex and glob matching with `~`, collection iteration and destructuring,
-functions, `if`/`match` expressions, and postfix value modifiers.
-For a hands-on walk through what runs today, see
-[`docs/TOUR.md`](docs/TOUR.md); for a terse lookup,
-[`docs/REFERENCE.md`](docs/REFERENCE.md). This is the completed M3 language
-surface; later design work remains tracked in
+is in place: quoting and escapes, `~` and filename globs, captures and heredocs,
+typed scalar/list/map values, arithmetic and comparisons, regex and glob matching
+with `~`, collection iteration and destructuring, `while`/`loop`, `if`/`match`
+expressions, postfix `if`/`unless` guards, postfix value modifiers, functions —
+value calls, lambdas, and the higher-order `:map`/`:filter`/`:each` — `fork`
+subshells, environment writes, scripts and `source`, and styled, clickable
+output. For a hands-on walk through the main features, see
+[`docs/TOUR.md`](docs/TOUR.md); for a terse lookup of the whole surface,
+[`docs/REFERENCE.md`](docs/REFERENCE.md). That covers the completed M3 language
+surface and the work since; later design work remains tracked in
 [`ROADMAP.md`](ROADMAP.md) and [`TODO.md`](TODO.md).
 
 ## Name
