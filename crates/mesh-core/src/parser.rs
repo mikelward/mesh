@@ -1707,6 +1707,15 @@ fn match_pattern_operand(expression: Expr) -> Expr {
     }
 }
 
+/// Does this word's text begin with `/`? The test that tells `../x` from a range,
+/// a leading `/` being a spelling no operand has.
+fn word_starts_with_slash(word: &Word) -> bool {
+    matches!(
+        word.pieces.first(),
+        Some(WordPiece::Text { text, .. }) if text.starts_with('/')
+    )
+}
+
 fn token_word_pieces(kind: &TokenKind) -> Option<Vec<WordPiece>> {
     if let TokenKind::Word(word) = kind {
         return Some(word.pieces.clone());
@@ -3118,6 +3127,60 @@ impl Parser {
         Ok(value)
     }
 
+    /// Grow a word rightwards through every **adjacent** token that has a word
+    /// spelling, so a run the lexer split on punctuation (`./x`, `a.b`, `x[0]`)
+    /// comes back as the one word it looks like. `pieces` is what the leading
+    /// token contributed and `span` is where it sat.
+    fn word_run(&mut self, pieces: Vec<WordPiece>, span: Range<usize>) -> Expr {
+        let start = span.start;
+        let mut end = span.end;
+        let mut pieces = pieces;
+        let mut brackets = 0usize;
+        while self.peek().is_some_and(|next| next.span.start == end) {
+            match self.peek().map(|next| &next.value) {
+                Some(TokenKind::LBracket) => brackets += 1,
+                Some(TokenKind::RBracket) if brackets > 0 => brackets -= 1,
+                Some(TokenKind::RBracket)
+                    if self.tokens.get(self.position + 1).is_some_and(|next| {
+                        next.span.start == self.peek().unwrap().span.end
+                            && matches!(next.value, TokenKind::Word(_))
+                    }) => {}
+                Some(
+                    TokenKind::RBracket
+                    | TokenKind::RParen
+                    | TokenKind::RBrace
+                    | TokenKind::Comma
+                    | TokenKind::Colon
+                    | TokenKind::Semi
+                    | TokenKind::Amp
+                    | TokenKind::AndAnd
+                    | TokenKind::OrOr
+                    | TokenKind::Pipe
+                    | TokenKind::PipeBoth
+                    | TokenKind::Less
+                    | TokenKind::Greater
+                    | TokenKind::Append
+                    | TokenKind::Heredoc
+                    | TokenKind::Range
+                    | TokenKind::RangeInclusive
+                    | TokenKind::Operator(_),
+                ) => break,
+                _ => {}
+            }
+            let Some(next_pieces) = self.peek().and_then(|next| token_word_pieces(&next.value))
+            else {
+                break;
+            };
+            end = self.peek().unwrap().span.end;
+            self.position += 1;
+            pieces.extend(next_pieces);
+        }
+        Expr::Scalar(Spanned {
+            value: Word { pieces },
+            span: start..end,
+        })
+    }
+
     fn primary(&mut self) -> Result<Expr, ParseError> {
         if self.eat(&TokenKind::CaptureStart).is_some() {
             self.newlines();
@@ -3193,55 +3256,42 @@ impl Parser {
                         span: token.span,
                     }))
                 } else {
-                    let start = token.span.start;
-                    let mut end = token.span.end;
-                    let mut pieces = word.pieces;
-                    let mut brackets = 0usize;
-                    while self.peek().is_some_and(|next| next.span.start == end) {
-                        match self.peek().map(|next| &next.value) {
-                            Some(TokenKind::LBracket) => brackets += 1,
-                            Some(TokenKind::RBracket) if brackets > 0 => brackets -= 1,
-                            Some(TokenKind::RBracket)
-                                if self.tokens.get(self.position + 1).is_some_and(|next| {
-                                    next.span.start == self.peek().unwrap().span.end
-                                        && matches!(next.value, TokenKind::Word(_))
-                                }) => {}
-                            Some(
-                                TokenKind::RBracket
-                                | TokenKind::RParen
-                                | TokenKind::RBrace
-                                | TokenKind::Comma
-                                | TokenKind::Colon
-                                | TokenKind::Semi
-                                | TokenKind::Amp
-                                | TokenKind::AndAnd
-                                | TokenKind::OrOr
-                                | TokenKind::Pipe
-                                | TokenKind::PipeBoth
-                                | TokenKind::Less
-                                | TokenKind::Greater
-                                | TokenKind::Append
-                                | TokenKind::Heredoc
-                                | TokenKind::Range
-                                | TokenKind::RangeInclusive
-                                | TokenKind::Operator(_),
-                            ) => break,
-                            _ => {}
-                        }
-                        let Some(next_pieces) =
-                            self.peek().and_then(|next| token_word_pieces(&next.value))
-                        else {
-                            break;
-                        };
-                        end = self.peek().unwrap().span.end;
-                        self.position += 1;
-                        pieces.extend(next_pieces);
-                    }
-                    Ok(Expr::Scalar(Spanned {
-                        value: Word { pieces },
-                        span: start..end,
-                    }))
+                    Ok(self.word_run(word.pieces, token.span))
                 }
+            }
+            // A word can begin with punctuation the expression grammar otherwise
+            // owns, and the leading `.` of a relative path is the case that bites:
+            // `./x`, `.*` and `.` are all one word to the lexer's caller, but the
+            // `.` arrives as its own `Dot`. Command position already stitches the
+            // run back together (`token_word_pieces`); an operand slot has to do
+            // the same or `x = ./foo` is a syntax error while `puts ./foo` works.
+            // Member access never lands here — a postfix `.` is consumed after a
+            // value, so the only `.` that can start an expression is a path's.
+            TokenKind::Dot => Ok(self.word_run(
+                vec![WordPiece::Text {
+                    text: ".".into(),
+                    quote: QuoteMode::Bare,
+                }],
+                token.span,
+            )),
+            // `..` is the range token, and stays one everywhere a range can be
+            // written — `..3`, `1..`, a bare `..`. A `/` attached to it cannot
+            // continue a range, though, since no operand starts with one, so
+            // `../x` is unambiguously the parent-directory path.
+            TokenKind::Range
+                if self.peek().is_some_and(|next| {
+                    next.span.start == token.span.end
+                        && matches!(&next.value, TokenKind::Word(word)
+                            if word_starts_with_slash(word))
+                }) =>
+            {
+                Ok(self.word_run(
+                    vec![WordPiece::Text {
+                        text: "..".into(),
+                        quote: QuoteMode::Bare,
+                    }],
+                    token.span,
+                ))
             }
             TokenKind::Range | TokenKind::RangeInclusive => {
                 self.position -= 1;

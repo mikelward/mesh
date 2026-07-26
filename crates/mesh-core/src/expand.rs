@@ -490,21 +490,67 @@ fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), Exp
     }
 
     let pattern = glob_pattern(&pieces);
-    match glob::glob_with(&pattern, glob_options()) {
-        Ok(paths) => out.extend(paths.flatten().map(|p| p.to_string_lossy().into_owned())),
-        Err(_) => out.push(literal(&pieces)),
+    match glob_matches(&pattern) {
+        Some(paths) => out.extend(paths),
+        None => out.push(literal(&pieces)),
     }
     Ok(())
 }
 
-/// The match options a glob runs under, wherever it is spelled: a hidden entry
-/// matches only when the pattern's own component starts with a literal `.`
-/// (`DESIGN.md` §"Globbing").
-fn glob_options() -> glob::MatchOptions {
-    glob::MatchOptions {
+/// Every path a pattern matches, with the dotfile rule applied: a `*`, `?` or
+/// `[…]` never matches a leading `.`, but a **literal** `.` written in the pattern
+/// does — so `*` skips dotfiles and `.*` finds them.
+///
+/// `glob`'s own `require_literal_leading_dot` cannot express that second half. It
+/// drops every dot-prefixed name from the directory listing before the pattern is
+/// ever consulted (`fill_todo`), so under it `.*` matched no dotfile at all — only
+/// the synthetic `.` and `..` entries the crate adds back for a dot-led pattern.
+/// The matcher does implement the rule correctly, so enumerate with the option
+/// **off** and re-check each candidate with it **on**: the walk sees the dotfiles,
+/// and the decision stays the crate's.
+///
+/// `.` and `..` are dropped whatever the pattern. They are the crate's synthesis
+/// rather than directory entries, they arrive spelled against the pattern's base
+/// (`./..`), and a loop over `.*` wants the dotfiles, not its own directory.
+///
+/// `None` means the pattern is one `glob` refuses, which leaves the word literal.
+fn glob_matches(pattern: &str) -> Option<Vec<String>> {
+    let literal_dot = glob::MatchOptions {
         require_literal_leading_dot: true,
         ..glob::MatchOptions::new()
-    }
+    };
+    let walk = glob::MatchOptions {
+        require_literal_leading_dot: false,
+        ..literal_dot
+    };
+    // The walk reports a match in its own spelling, which is not always the one
+    // the pattern was written in: a leading `./` is normalized away, so `./tool[0]`
+    // comes back as `tool0`. Re-checking has to compare like with like or every
+    // `./`-led pattern would filter its own matches out.
+    let compiled = glob::Pattern::new(undotted(pattern)).ok()?;
+    let paths = glob::glob_with(pattern, walk).ok()?;
+    Some(
+        paths
+            .flatten()
+            .map(|path| path.to_string_lossy().into_owned())
+            .filter(|path| {
+                !names_self_or_parent(path) && compiled.matches_with(undotted(path), literal_dot)
+            })
+            .collect(),
+    )
+}
+
+/// A path minus a leading `./`, the one spelling difference between what a pattern
+/// says and what the walk reports.
+fn undotted(path: &str) -> &str {
+    path.strip_prefix("./").unwrap_or(path)
+}
+
+/// Does this path name a directory's own `.` or `..` entry? Checked as text
+/// because `Path` normalizes a trailing `.` out of existence (`dir/.` keeps only
+/// `dir`), which would let the entry through as its own parent.
+fn names_self_or_parent(path: &str) -> bool {
+    matches!(path, "." | "..") || path.ends_with("/.") || path.ends_with("/..")
 }
 
 /// Expand a pattern to the paths it matches, the way a bare glob word does —
@@ -517,11 +563,10 @@ fn glob_options() -> glob::MatchOptions {
 /// silent fall-back-to-literal a bare word takes — a word can still be a
 /// filename, an explicit `glob()` call cannot.
 pub(crate) fn glob_paths(pattern: &str) -> Result<Vec<String>, String> {
-    let paths = glob::glob_with(pattern, glob_options()).map_err(|error| error.msg.to_string())?;
-    Ok(paths
-        .flatten()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect())
+    // Compiled here rather than inside the walk so a malformed pattern can carry
+    // the crate's own message out; `glob_matches` only reports that it refused.
+    glob::Pattern::new(pattern).map_err(|error| error.msg.to_string())?;
+    Ok(glob_matches(pattern).unwrap_or_default())
 }
 
 /// A directory's immediate entries that pass a file-type filter — the expansion
