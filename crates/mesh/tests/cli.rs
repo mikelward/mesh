@@ -1518,6 +1518,138 @@ fn bracketed_paste_harness(exec: &MeshExec) -> i32 {
     0
 }
 
+#[test]
+fn a_blank_line_is_not_a_command() {
+    let exec = MeshExec::new(isolated_config_home());
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(blank_line_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// A bare Enter submits nothing, so it gets no marks and fires no hooks.
+///
+/// Both halves of that matter to a terminal: an empty command block is one more
+/// thing to page past when jumping between commands, and it would be badged with
+/// a status the user never caused.
+/// Counted over the whole session rather than asserted per command: the reads
+/// hand back every byte they take, in order, so a total over all of them is exact
+/// even though where one read stops and the next begins is not. Which is the only
+/// way to be sure a mark is *absent* — a window that happened to end early would
+/// otherwise report the blank line as unmarked whatever the shell did.
+fn blank_line_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 70;
+    };
+    let mut seen = shell.startup.clone();
+    for line in [
+        "func pre(c) { puts PREHOOK }\n",
+        "prompt-hook preexec p1 pre\n",
+    ] {
+        if !pty_write(shell.master, line.as_bytes()) {
+            return 71;
+        }
+        let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+            return 72;
+        };
+        seen.extend_from_slice(&window);
+    }
+    // The blank line. Read to the next prompt rather than to a `D` — the claim is
+    // that there is no `D` to wait for. Type-ahead does not survive a submission,
+    // so the next command has to wait for this prompt before it is written.
+    if !pty_write(shell.master, b"\n") {
+        return 73;
+    }
+    let Some(window) = pty_read_until_one_of(shell.master, &[INPUT_READY]) else {
+        return 74;
+    };
+    seen.extend_from_slice(&window);
+    // A real command after it, with a status no default could produce. This is the
+    // positive control: without it, a shell that had stopped marking anything at
+    // all would pass the counts below.
+    if !pty_write(shell.master, b"sh -c 'exit 7'\n") {
+        return 75;
+    }
+    let Some((window, status)) = pty_read_until_command_done(shell.master) else {
+        return 76;
+    };
+    seen.extend_from_slice(&window);
+    if status != 7 {
+        return 77;
+    }
+    // Three commands ran — the two that set the hook up, and the one that failed —
+    // so three `C` marks. A blank line that marked itself makes it four.
+    if occurrences(&seen, b"\x1b]133;C\x1b\\") != 3 {
+        return 78;
+    }
+    // And one `preexec` firing, for that same failing command. `PREHOOK\r\n` rather
+    // than `PREHOOK`, because the line editor echoes the `func` that defines it and
+    // repaints as it goes: the hook's *output* is the occurrence that ends the line.
+    if occurrences(&seen, b"PREHOOK\r\n") != 1 {
+        return 79;
+    }
+    if !stop_pty_shell(shell) {
+        return 89;
+    }
+    0
+}
+
+#[test]
+fn an_abandoned_line_is_closed_without_a_status() {
+    let exec = MeshExec::new(isolated_config_home());
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(abandoned_line_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// Ctrl-C on a half-typed line ends the input region reedline opened at `B`.
+///
+/// Without it the stream leaves that region open and a terminal reads the next
+/// prompt, and everything after it, as more of what the user was typing.
+fn abandoned_line_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 90;
+    };
+    if !pty_write(shell.master, b"half-typed line") || !pty_write(shell.master, b"\x03") {
+        return 91;
+    }
+    // `D` with no status: nothing ran, so there is no outcome to report — and a
+    // `D;0` here would badge the abandoned line as a command that succeeded.
+    // `ST` immediately after `D` is what distinguishes it from `D;<status>`.
+    if pty_read_until_one_of(shell.master, &[b"\x1b]133;D\x1b\\"]).is_none() {
+        return 92;
+    }
+    // The line was cancelled, not the session.
+    if !pty_write(shell.master, b"puts alive\n") {
+        return 93;
+    }
+    let Some((seen, _)) = pty_read_until_command_done(shell.master) else {
+        return 94;
+    };
+    if occurrences(&seen, b"alive\r\n") == 0 {
+        return 95;
+    }
+    if !stop_pty_shell(shell) {
+        return 96;
+    }
+    0
+}
+
 fn spawn_failure_harness(exec: &MeshExec) -> i32 {
     let mut master = -1;
     let mut slave = -1;

@@ -4549,14 +4549,18 @@ fn register_prompt_hook(event: PromptEvent, name: &str, function: &str, shell: &
     Step::Continue(0)
 }
 
-/// The two OSC 133 marks the *shell* owns. reedline emits `A` and `B` — the
-/// prompt's own boundaries — because it is the one drawing the prompt; `C` and
-/// `D` bracket the command, which only the shell knows.
+/// The OSC 133 marks the *shell* owns. reedline emits `A` and `B` — the prompt's
+/// own boundaries — because it is the one drawing the prompt; `C` and `D` bracket
+/// the command, which only the shell knows.
 enum SemanticMark {
     /// `C` — the prompt is finished and what follows is the command's output.
     OutputStart,
     /// `D` — the command is over, with the status it ended on.
     CommandDone(u8),
+    /// `D` with no status — the line was abandoned, so there is no command and
+    /// no outcome to report, but the input region reedline opened at `B` still
+    /// has to be closed.
+    CommandAbandoned,
 }
 
 /// Write an OSC 133 mark, so a terminal can tell prompt from input from output:
@@ -4582,6 +4586,7 @@ fn semantic_mark(interactive: bool, mark: SemanticMark) {
     let sequence = match mark {
         SemanticMark::OutputStart => "\x1b]133;C\x1b\\".to_string(),
         SemanticMark::CommandDone(status) => format!("\x1b]133;D;{status}\x1b\\"),
+        SemanticMark::CommandAbandoned => "\x1b]133;D\x1b\\".to_string(),
     };
     use std::io::Write as _;
     let mut out = io::stdout();
@@ -7094,6 +7099,16 @@ fn handle_signal(
             }
             let text = std::mem::take(pending);
             let command = text.trim_end_matches('\n').to_string();
+            // A bare Enter submitted no command: nothing runs, nothing prints.
+            // Marking it would give a terminal an empty command block to offer to
+            // fold and to badge with a status the user never caused, and the
+            // hooks would be answering about a command line that does not exist —
+            // the same reason history does not keep a row for it. `run_line`
+            // still runs, so the blank line clears top-level control state
+            // exactly as it did before.
+            if command.trim().is_empty() {
+                return Some(run_line(&text, last, false, shell));
+            }
             let marks = shell.vars.interactive();
             // Both marks sit outside the hooks, so that everything printed
             // because this command was submitted falls inside the region they
@@ -7134,6 +7149,14 @@ fn handle_signal(
         _ => {
             // Ctrl-C: cancel the current line (and any buffered `func` body) and
             // re-prompt, keeping the status.
+            //
+            // reedline has already written `B`, so without a `D` here the stream
+            // leaves the input region open and the terminal reads everything up
+            // to the next prompt as more of what the user typed. `D` closes it,
+            // and carries *no* status: the abandoned line ran nothing, and
+            // reporting `last` would badge the new line with the old command's
+            // outcome.
+            semantic_mark(shell.vars.interactive(), SemanticMark::CommandAbandoned);
             pending.clear();
             gate.reset();
             Some(Step::Continue(last))
