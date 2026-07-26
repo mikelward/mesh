@@ -3162,8 +3162,19 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
   distinguishable from its own output after the fact. Weight and not color because
   color would be a syntax claim the shell would then have to keep true, and because
   it has to read on any theme.
-- ***Hyperlinks*** *(OSC 8)* — clickable paths/URLs in output; likely a `style()`
-  sibling (`link(text, url)`) rather than a raw escape, keeping color-as-data.
+- ***Hyperlinks*** *(OSC 8)* — **decided: `link(text, url)`**, a `style` sibling
+  rather than a raw escape, for the same reason color is data: the shell measures the
+  visible width from the text and can drop the link where it cannot be followed,
+  neither of which it can do with an opaque `\e]8;;…` inside a string. It builds the
+  same [styled value](#hooks-and-the-prompt) `style` does — each sets the attributes
+  it names — so the two compose in either order. The URL is percent-encoded outside
+  printable ASCII, which is both what the sequence asks for and what stops an `ESC`
+  in a URL from ending mesh's own sequence; a **scheme is required**, since a
+  terminal needs an absolute URI and guessing `file://` would need a hostname to be
+  right over `ssh`. Unlike color it survives **`NO_COLOR`** — that silences the
+  palette, and dropping a link would lose the URL rather than make output plainer —
+  but it does want a terminal known to parse an `OSC`, the same allowlist the title
+  and the notification use.
 - ***Clipboard*** *(OSC 52)* — **decided: a builtin, `clip`.** `clip TEXT …` or
   `… | clip`, copying the bytes it was handed to the terminal's clipboard, which is
   what makes it work over `ssh` where no local clipboard tool can be reached. The

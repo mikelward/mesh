@@ -400,6 +400,7 @@ one-MiB output cap.
 | `puts [arg …]` | Render each argument and print them separated by single spaces, then a newline. No arguments prints a blank line. Rendering is per value: a scalar as itself, a **list** as its elements joined by newlines, a **map** as `key: value` lines. A value with no byte form — a job or stream handle, a function, a pattern — is a loud error rather than a guess, and so is a collection nested inside one. Unlike argv, `puts` sees the real value, so `puts $xs` needs no `...`; a *written* argument keeps its own text, so `puts 007` prints `007`. It takes no flags. |
 | `print [arg …]` | The same as `puts` with **no trailing newline**, for partial lines. No arguments prints nothing. |
 | `style(text, fg: …, bg: …, bold: …)` | A [styled value](#styled-values) — text plus display attributes. A **value call**, parens attached, because a command position yields a status. Colors are the sixteen ANSI names: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `grey` (or `gray`, or `bright-black`), and `bright-` forms of the rest. |
+| `link(text, url)` | A [styled value](#styled-values) carrying an `OSC 8` hyperlink, so `text` is clickable. The url needs a **scheme** (`https://…`, `file://host/path`) and anything RFC 3986 forbids raw is percent-encoded, a space included; over 2083 encoded bytes is refused, since past a terminal's own limit the whole sequence — link text included — is dropped. |
 | `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`. |
 | `pwd` | Print the working directory. |
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
@@ -1717,9 +1718,9 @@ x += "!"                      # 'danger!'            — a plain string; attribu
 /bin/echo $danger             # danger               — argv carries bytes
 ```
 
-`style` is a reserved name, like `re`: a `func style(…)` would be reachable as a
-command but never as a value call, so it is refused rather than shipped as a
-function whose meaning depends on how it is called.
+`style` and `link` are reserved names, like `re`: a `func style(…)` would be
+reachable as a command but never as a value call, so it is refused rather than
+shipped as a function whose meaning depends on how it is called.
 
 Attributes are **added**, not replaced, so a segment can be emphasized without
 knowing its color — and a call naming no attribute is simply a string:
@@ -1729,14 +1730,58 @@ loud = style($danger, bold: true)   # still red, now bold
 style(x)                            # the plain string `x`
 ```
 
-**The color drops itself** when it cannot be seen: stdout is not a terminal
-(a pipe, a redirect, a `$(…)` capture, a `:capture` record), `NO_COLOR` is set to
-anything non-empty, or `TERM=dumb`. The decision is per command, so `puts $danger`
-is colored while `puts $danger > log` is not — there is no setting to manage and no
-capability to probe, because dropping the attributes is always available.
+### Hyperlinks
 
-A `style(…)` call is a **value call** and mesh has no call-as-argument form yet, so
-write it through a variable or a function's return value rather than inline:
+`link(text, url)` builds the same kind of value, with an `OSC 8` hyperlink as the
+attribute — so `text` is clickable in a terminal that supports it and is ordinary
+text everywhere else:
+
+```mesh
+u = link("the docs", "https://example.com/guide")
+puts $u                             # clickable "the docs"
+puts $u:repr                        # 'the docs' — still just its text
+```
+
+The two compose **in either order**, since each sets only the attributes it names:
+
+```mesh
+link(style(x, fg: blue), $url)      # the same blue clickable `x`
+style(link(x, $url), fg: blue)
+```
+
+The url needs a **scheme**. A terminal needs an absolute URI, so a bare path is a
+link that silently does nothing; mesh says so rather than guessing at `file://`,
+which would need a hostname to be right over `ssh`.
+
+Anything RFC 3986 does not allow raw is **percent-encoded**, so a space in a path
+becomes `%20` — `file://host/My File.txt` is an ordinary path and an invalid URI, and
+a terminal may reject the whole link over it. That is the same rule that stops an
+`ESC` inside a url from ending the sequence early. Delimiters are kept, so `?`, `&`,
+`=`, `#` and an existing `%20` all survive as written. Over 2083 encoded bytes is
+refused, because past a terminal's own limit the whole sequence is dropped and the
+link *text* goes with it.
+
+### When decoration drops itself
+
+Neither escape is written unless the command's own stdout is a terminal — so a pipe,
+a redirect, a `$(…)` capture and a `:capture` record all get plain text. The decision
+is **per command**, so `puts $danger` is colored while `puts $danger > log` is not.
+
+Past that the two differ:
+
+| | Color | Link |
+| --- | --- | --- |
+| stdout is not a terminal | dropped | dropped |
+| `NO_COLOR` set to anything non-empty | dropped | **kept** — a link is not color, and dropping it loses the url |
+| `TERM=dumb` | dropped | dropped |
+| `TERM` not known to parse an `OSC` (`linux`, `ansi`, `sun`) | kept — SGR is universal | dropped, or the terminal would print the url |
+
+There is no setting to manage and no capability to probe on either path, because
+dropping the attributes is always available.
+
+A `style(…)` or `link(…)` call is a **value call** and mesh has no call-as-argument
+form yet, so write it through a variable or a function's return value rather than
+inline:
 
 ```mesh
 func dir-info() { style(tilde-pwd(), fg: blue) }    # a prompt segment
@@ -1752,5 +1797,5 @@ Of heredocs, the command-redirection form documented under Commands works, as do
 here-strings; a value-producing heredoc spelling does not.
 A **value call in an argument position** — `puts style(x, fg: red)`, `puts re(a)`,
 `puts $f(1)` — is a syntax error; assign it first. `style` covers the sixteen ANSI
-colors only, and `link` (OSC 8) does not exist yet.
+colors only.
 See [`ROADMAP.md`](../ROADMAP.md).

@@ -1499,7 +1499,7 @@ fn token_word_pieces(kind: &TokenKind) -> Option<Vec<WordPiece>> {
 
 /// Names that cannot be user functions because they are built-in **value**
 /// constructors, reachable only through the `name(...)` call form.
-const RESERVED_FUNCTION_NAMES: &[&str] = &["re", "style"];
+const RESERVED_FUNCTION_NAMES: &[&str] = &["re", "style", "link"];
 
 struct Parser {
     tokens: Vec<Token>,

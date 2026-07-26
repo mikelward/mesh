@@ -350,9 +350,9 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
 - **Name.** A function name cannot be a reserved word (`func` / `return`) or a
   builtin (`cd` / `pwd` / `puts` / `print` / `exit` / `jobs` / `fg` / `bg`), since
   those resolve first and the definition could never be reached. Nor can it be a
-  built-in **value constructor** (`re` / `style`), which is the opposite problem:
-  `re(x)` and `style(x)` always build a value, so such a function would be reachable
-  as a command and never as a call.
+  built-in **value constructor** (`re` / `style` / `link`), which is the opposite
+  problem: those always build a value, so such a function would be reachable as a
+  command and never as a call.
 - **Call.** A defined name in command position runs the function. Resolution is
   **builtins → functions → external**; the argument count must match the
   positionals (an arity mismatch is a loud, recoverable error). Arguments bind

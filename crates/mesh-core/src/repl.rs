@@ -35,7 +35,7 @@ use crate::completion::{CompletionCache, CompletionSpec, ValueHint, rank_candida
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
 use crate::options::{Opt, Options};
-use crate::vars::{self, RegexValue, Style, StyledValue, Value, Vars};
+use crate::vars::{self, Decoration, RegexValue, Style, StyledValue, Value, Vars};
 use crate::{environ, exec, expand, parser};
 
 const COMPLETION_MENU: &str = "completion_menu";
@@ -2840,6 +2840,9 @@ fn eval_call(
     if name == "style" {
         return eval_style(arguments, last, in_function, shell);
     }
+    if name == "link" {
+        return eval_link(arguments, last, in_function, shell);
+    }
     if name != "re" {
         // A user function called for its value; an external (or unknown) command
         // has no return value — point at `$(…)` for its output instead.
@@ -2925,10 +2928,10 @@ fn eval_style(
                 // A styled argument carries its attributes in as the defaults, which
                 // is what makes re-styling additive.
                 if let Value::Styled(styled) = &value {
-                    style = styled.style;
+                    style = styled.style.clone();
                     inherited = true;
                 }
-                match builtins::rendered_for_output(&value, false) {
+                match builtins::rendered_for_output(&value, Decoration::plain()) {
                     Ok(rendered) => text = Some(rendered),
                     Err(message) => return runtime_error(format!("style(): {message}")),
                 }
@@ -2988,6 +2991,79 @@ fn eval_style(
     if style.is_plain() && !inherited {
         return Ok(Value::String(text));
     }
+    Ok(Value::Styled(Box::new(StyledValue { text, style })))
+}
+
+/// `link(text, url)` — a **styled value** whose attribute is an `OSC 8` hyperlink,
+/// per `DESIGN.md` §"terminal control".
+///
+/// A `style` sibling rather than a raw escape, and for the same reason color is: the
+/// URL stays *data*, so the shell can measure the visible width from the text and
+/// drop the link where it cannot be followed. A raw `\e]8;;…` in a string would be
+/// opaque to both.
+///
+/// Composes with `style` in either order — both build the same value, each setting
+/// the attributes it names — so `link(style(x, fg: blue), u)` and
+/// `style(link(x, u), fg: blue)` are the same blue clickable `x`.
+///
+/// Two positional arguments rather than `url:` named, because both are required and
+/// the pair reads in the order it renders. It takes the text through the same
+/// rendering `style` and `puts` use, so a value with no byte form is the same loud
+/// error here as there.
+fn eval_link(
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let mut positional: Vec<Value> = Vec::with_capacity(2);
+    for argument in arguments {
+        match argument {
+            parser::Argument::Positional(expression) => {
+                let Some(value) = eval_operand(expression, last, in_function, shell)? else {
+                    return Ok(control_placeholder());
+                };
+                if positional.len() == 2 {
+                    return runtime_error("link() takes a text and a url argument");
+                }
+                positional.push(value);
+            }
+            parser::Argument::Named(name, _) => {
+                return runtime_error(format!(
+                    "link(): no `{name}` argument; it takes the text and the url positionally"
+                ));
+            }
+            parser::Argument::Spread(_) => {
+                return runtime_error("link() does not accept spread arguments");
+            }
+        }
+    }
+    let [subject, url] = positional.as_slice() else {
+        return runtime_error("link() requires a text and a url argument");
+    };
+    // The URL is text like any other argument, so it renders the same way — but its
+    // *attributes* are meaningless here, and a styled URL almost certainly means the
+    // arguments were swapped rather than that the caller wanted escapes in a target.
+    let Some(url) = url.as_text() else {
+        return runtime_error(format!(
+            "link(): the url must be a string, not {}",
+            value_kind(url)
+        ));
+    };
+    let url =
+        vars::link_url(url).map_err(|message| runtime_message(format!("link(): {message}")))?;
+    // An existing link is replaced rather than nested: `OSC 8` has no notion of one
+    // link inside another, and the innermost target is the one that was just asked
+    // for.
+    let mut style = match subject {
+        Value::Styled(styled) => styled.style.clone(),
+        _ => Style::default(),
+    };
+    style.link = Some(url);
+    let text = match builtins::rendered_for_output(subject, Decoration::plain()) {
+        Ok(rendered) => rendered,
+        Err(message) => return runtime_error(format!("link(): {message}")),
+    };
     Ok(Value::Styled(Box::new(StyledValue { text, style })))
 }
 
@@ -3703,10 +3779,10 @@ fn channel_record(value: Option<Value>, out: String, err: String, status: u8) ->
 /// command position. Everything else takes the bytes-only argv rule.
 fn capture_argument_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
     if matches!(name, "puts" | "print") {
-        // `decorate: false` — a capture's stdout is a pipe into the record, so a
-        // styled value contributes its text. The record holds data, and escape
-        // bytes in it would compare unequal to the text they decorate.
-        return match builtins::rendered_for_output(value, false) {
+        // A capture's stdout is a pipe into the record, so a styled value
+        // contributes its text: the record holds data, and escape bytes in it would
+        // compare unequal to the text they decorate.
+        return match builtins::rendered_for_output(value, Decoration::plain()) {
             Ok(text) => Ok(vec![text]),
             Err(message) => runtime_error(format!("{name}: {message}")),
         };
@@ -4240,8 +4316,12 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
     // is the one thing that *does* change: `> file` means this command's stdout is
     // not the terminal, whatever the shell's own stdout is. Backgrounding does not
     // change it — the fork inherits the shell's stdout.
-    let decorate = !redirects_stdout(&redirs) && builtins::colors_wanted();
-    let expanded = match typed_builtin_words(&words, &shell.vars, decorate) {
+    let decoration = if redirects_stdout(&redirs) {
+        Decoration::plain()
+    } else {
+        stdout_decoration()
+    };
+    let expanded = match typed_builtin_words(&words, &shell.vars, decoration) {
         Some(words) => words,
         None => expand::expand(words, &shell.vars).map_err(|err| {
             note!("mesh: {err}");
@@ -4319,8 +4399,11 @@ fn run_multi(stages: Vec<Stage>, background: bool, last: u8, shell: &mut Shell) 
         } = stage;
         // Only the last stage can be writing to the terminal; every earlier one has
         // stdout on a pipe, so a styled value there renders as plain text.
-        let decorate =
-            index + 1 == count && !redirects_stdout(&redirs) && builtins::colors_wanted();
+        let decoration = if index + 1 == count && !redirects_stdout(&redirs) {
+            stdout_decoration()
+        } else {
+            Decoration::plain()
+        };
         // Command words expand before the redirect targets, the order `run_single`
         // uses, so a stage reports the same first failure the unpiped command
         // does — and `f * > summary` cannot glob the file the redirection is
@@ -4344,7 +4427,7 @@ fn run_multi(stages: Vec<Stage>, background: bool, last: u8, shell: &mut Shell) 
         } else {
             // A stage expands its own words, so a builtin that reads typed
             // arguments needs the same conversion here as it gets elsewhere.
-            let expanded = match typed_builtin_words(&words, &shell.vars, decorate) {
+            let expanded = match typed_builtin_words(&words, &shell.vars, decoration) {
                 Some(words) => words,
                 None => expand::expand(words, &shell.vars).map_err(|err| {
                     note!("mesh: {err}");
@@ -4631,7 +4714,7 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         return dispatch_function_call(&name, args, shell);
     }
     // No redirection on this path, so the command's stdout is the shell's.
-    if let Some(words) = typed_builtin_words(&tokens, &shell.vars, builtins::colors_wanted()) {
+    if let Some(words) = typed_builtin_words(&tokens, &shell.vars, stdout_decoration()) {
         return match words {
             Ok(words) => run_expanded(words, last, shell),
             Err(step) => step,
@@ -4654,17 +4737,17 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
 /// here: `puts $xs`, `puts $xs > out` and `puts $xs | cat` have to render the list
 /// the same way, just as `kill $j` and `kill $j | cat` have to name the same job.
 ///
-/// `decorate` is each caller's answer to "does this command's stdout reach a
-/// color-capable terminal", which decides whether a **styled** value emits its
-/// attributes. It has to be the caller's because words are rendered *before* a
-/// redirection is opened or a pipe is attached, so this function's own view of
-/// stdout is the shell's, not the command's.
+/// `decoration` is each caller's answer to "which escapes does this command's own
+/// stdout take", which decides what a **styled** value emits. It has to be the
+/// caller's because words are rendered *before* a redirection is opened or a pipe is
+/// attached, so this function's own view of stdout is the shell's, not the
+/// command's.
 fn typed_builtin_words(
     words: &[Word],
     vars: &Vars,
-    decorate: bool,
+    decoration: Decoration,
 ) -> Option<Result<Vec<String>, Step>> {
-    job_builtin_words(words, vars).or_else(|| output_builtin_words(words, vars, decorate))
+    job_builtin_words(words, vars).or_else(|| output_builtin_words(words, vars, decoration))
 }
 
 /// `puts`/`print`'s words, with their arguments rendered from **values** rather
@@ -4692,7 +4775,7 @@ fn typed_builtin_words(
 fn output_builtin_words(
     words: &[Word],
     vars: &Vars,
-    decorate: bool,
+    decoration: Decoration,
 ) -> Option<Result<Vec<String>, Step>> {
     let name = command_name(words, vars)?;
     if !matches!(name.as_str(), "puts" | "print") {
@@ -4700,7 +4783,7 @@ fn output_builtin_words(
     }
     let mut expanded = vec![name.clone()];
     for word in words.iter().skip(1) {
-        match output_words(word, vars, &name, decorate) {
+        match output_words(word, vars, &name, decoration) {
             Ok(rendered) => expanded.extend(rendered),
             Err(step) => return Some(Err(step)),
         }
@@ -4714,7 +4797,12 @@ fn output_builtin_words(
 /// expansion gives it, so a glob still contributes one word per match and a bare
 /// `007` still prints as written. Anything else — a list, a map, a value with no
 /// byte form at all, a styled value — is rendered per `DESIGN.md` §"I/O".
-fn output_words(word: &Word, vars: &Vars, name: &str, decorate: bool) -> Result<Vec<String>, Step> {
+fn output_words(
+    word: &Word,
+    vars: &Vars,
+    name: &str,
+    decoration: Decoration,
+) -> Result<Vec<String>, Step> {
     // A styled value is deliberately *not* a scalar here: its rendering is the
     // whole point, so it must not fall through to ordinary expansion, which would
     // hand over the text with the attributes dropped.
@@ -4728,7 +4816,7 @@ fn output_words(word: &Word, vars: &Vars, name: &str, decorate: bool) -> Result<
         Ok(values) if !values.iter().all(scalar) => values
             .iter()
             .map(|value| {
-                builtins::rendered_for_output(value, decorate).map_err(|message| {
+                builtins::rendered_for_output(value, decoration).map_err(|message| {
                     note!("mesh: {name}: {message}");
                     Step::Continue(1)
                 })
@@ -5317,6 +5405,44 @@ const OSC_TERMS: &[&str] = &[
     "xterm",
 ];
 
+/// Which escapes the shell's **own** stdout takes, for a command that has not
+/// redirected it.
+///
+/// The `TERM` half of the answer lives here because [`takes_osc`] does; the
+/// descriptor half is [`builtins::terminal_decoration`], next to the writing. Split
+/// that way so each capability rule stays in one place rather than one per caller.
+///
+/// `TERM` is read **live** rather than through [`session_term`]'s snapshot, and the
+/// difference is not an oversight. The snapshot exists because a *region* must not be
+/// opened in one dialect and closed in another — an OSC 133 mark, a title cleared at
+/// exit. A styled value spans nothing: each render is self-contained, so reading the
+/// current `TERM` is both correct and what `NO_COLOR` already does beside it.
+fn stdout_decoration() -> Decoration {
+    builtins::terminal_decoration(takes_osc(std::env::var_os("TERM").as_deref()))
+}
+
+/// Will this terminal **parse** an `OSC` rather than print it?
+///
+/// The one question every `OSC` mesh writes has to ask, so it is asked in one place:
+/// the notification uses it, and so does an `OSC 8` hyperlink.
+///
+/// An allowlist rather than a denylist because the two ways of being wrong are not
+/// equal. A terminal missing from the list quietly gets no decoration, which nobody
+/// has to debug; one wrongly assumed to parse `OSC` **prints the payload** —
+/// `TERM=linux` reads `ESC ]` as the start of a palette sequence and abandons it at
+/// the first non-hex byte, leaving the rest on screen.
+///
+/// Multiplexers count: they parse the stream themselves, so a sequence they do not
+/// implement is discarded rather than forwarded to be printed.
+fn takes_osc(term: Option<&std::ffi::OsStr>) -> bool {
+    let Some(term) = term.and_then(std::ffi::OsStr::to_str) else {
+        return false;
+    };
+    names_terminal(term, "screen")
+        || names_terminal(term, "tmux")
+        || OSC_TERMS.iter().any(|family| names_terminal(term, family))
+}
+
 /// Is `term` this terminal family, or a variant of it?
 ///
 /// Terminfo separates a variant from its family with `-` or `.`
@@ -5391,11 +5517,7 @@ fn notification_sequence(
     inside: Multiplexer,
     text: &str,
 ) -> Option<String> {
-    let term = term?.to_str()?;
-    let known = names_terminal(term, "screen")
-        || names_terminal(term, "tmux")
-        || OSC_TERMS.iter().any(|family| names_terminal(term, family));
-    known.then(|| {
+    takes_osc(term).then(|| {
         builtins::through_multiplexer(
             &format!("\x1b]9;{}\x07", builtins::osc_payload(text, NOTIFY_LIMIT)),
             inside,

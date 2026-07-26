@@ -133,15 +133,40 @@ impl std::hash::Hash for StyledValue {
     }
 }
 
-/// The display attributes `style` understands. Color and bold are the MVP set
-/// (`DESIGN.md` §"Hooks and the prompt"); `None` for a color means "leave it
-/// alone" rather than "default", so a nested re-style can add bold without
-/// resetting the color.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+/// The display attributes a renderer may apply. Color and bold are `style`'s MVP
+/// set (`DESIGN.md` §"Hooks and the prompt"); `link` is `link()`'s. `None` for a
+/// color means "leave it alone" rather than "default", so a nested re-style can add
+/// bold without resetting the color.
+///
+/// Not `Copy`, because the URL is owned — the one attribute that is not a flag.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Style {
     pub foreground: Option<Color>,
     pub background: Option<Color>,
     pub bold: bool,
+    /// The `OSC 8` target, already percent-encoded and known to carry a scheme.
+    pub link: Option<String>,
+}
+
+/// What a renderer may emit on the stream it is writing to.
+///
+/// Two bits rather than one, because the two escapes answer to different things.
+/// `NO_COLOR` silences the **palette**, not every sequence — a hyperlink is not
+/// color, and dropping it would lose the URL rather than make output plainer. A
+/// stream that is not a terminal takes neither.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Decoration {
+    /// SGR: color and bold.
+    pub color: bool,
+    /// `OSC 8` hyperlinks.
+    pub links: bool,
+}
+
+impl Decoration {
+    /// Emit nothing — what a pipe, a redirect and a capture all get.
+    pub fn plain() -> Self {
+        Self::default()
+    }
 }
 
 /// The eight ANSI colors and their bright forms — the set every terminal that
@@ -245,12 +270,54 @@ impl Style {
         *self == Style::default()
     }
 
-    /// The SGR sequence that turns these attributes on, empty when there are
-    /// none. Backgrounds are the foreground codes plus ten, the ANSI offset.
-    pub fn prefix(&self) -> String {
-        if self.is_plain() {
-            return String::new();
+    /// `text` wrapped in whatever `decoration` allows — the one place attributes
+    /// become bytes.
+    ///
+    /// The link goes **outermost** so the whole run is clickable including any
+    /// color, and each escape is emitted only if its own bit is set: an
+    /// `OSC 8` link survives `NO_COLOR` while the SGR does not.
+    ///
+    /// **Deliberately not wrapped for a multiplexer**, unlike the `OSC 9`
+    /// notification. The difference is that `OSC 8` brackets text that has to end up
+    /// in the pane, and the `DCS tmux;` envelope forwards its payload to the outer
+    /// terminal *instead of* drawing it — so wrapping would lose the link text
+    /// entirely. Measured against tmux 3.4: raw, tmux parses the sequence, stores the
+    /// hyperlink per cell and re-emits it (`capture-pane -e` shows it back), which is
+    /// also what keeps the link alive across a scroll or a resize that tmux repaints
+    /// itself; wrapped, nothing reaches the pane at all, with or without
+    /// `allow-passthrough`. An older tmux that does not implement `OSC 8` discards it
+    /// and the text still lands, which is the right failure.
+    pub fn render(&self, text: &str, decoration: Decoration) -> String {
+        let sgr = if decoration.color {
+            self.sgr()
+        } else {
+            String::new()
+        };
+        let link = decoration.links.then_some(self.link.as_deref()).flatten();
+        let mut out = String::with_capacity(text.len() + 16);
+        if let Some(url) = link {
+            out.push_str("\u{1b}]8;;");
+            out.push_str(url);
+            out.push_str("\u{1b}\\");
         }
+        out.push_str(&sgr);
+        out.push_str(text);
+        if !sgr.is_empty() {
+            // `SGR 0` rather than the targeted off-codes: a full reset is what every
+            // prompt idiom uses, and it cannot leave an attribute a partial reset
+            // missed.
+            out.push_str("\u{1b}[0m");
+        }
+        if link.is_some() {
+            // The empty URI is how `OSC 8` says "the link ends here".
+            out.push_str("\u{1b}]8;;\u{1b}\\");
+        }
+        out
+    }
+
+    /// The SGR sequence that turns the color attributes on, empty when there are
+    /// none. Backgrounds are the foreground codes plus ten, the ANSI offset.
+    fn sgr(&self) -> String {
         let mut parameters = Vec::with_capacity(3);
         if self.bold {
             parameters.push(1);
@@ -261,16 +328,95 @@ impl Style {
         if let Some(color) = self.background {
             parameters.push(u16::from(color.foreground_code()) + 10);
         }
+        if parameters.is_empty() {
+            // Never a bare `ESC [ m`, which some terminals read as a reset.
+            return String::new();
+        }
         let parameters: Vec<String> = parameters.iter().map(u16::to_string).collect();
         format!("\u{1b}[{}m", parameters.join(";"))
     }
+}
 
-    /// The reset that ends them. `SGR 0` rather than the targeted off-codes: a
-    /// full reset is what every prompt idiom uses, and it cannot leave an
-    /// attribute set that a partial reset missed.
-    pub fn suffix(&self) -> &'static str {
-        if self.is_plain() { "" } else { "\u{1b}[0m" }
+/// How long an `OSC 8` target may be. The practical URL ceiling, and well under
+/// what terminals accept — past their own limits a terminal drops the whole
+/// sequence, taking the link text with it, so a refusal naming the size beats
+/// output that silently lost a word.
+pub const LINK_LIMIT: usize = 2083;
+
+/// May this byte stand for itself in a URI?
+///
+/// RFC 3986's own three sets, and nothing else: **unreserved** (`ALPHA`, `DIGIT`,
+/// `-._~`), **gen-delims** (`:/?#[]@`) and **sub-delims** (`!$&'()*+,;=`) — the
+/// characters that carry a URL's structure — plus `%`, so a target that already
+/// spells `%20` keeps it rather than having the escape re-escaped into `%2520`.
+///
+/// Everything else is encoded, which is not only about control bytes. A **space** is
+/// the common case: `file://host/My File` is an ordinary path and an invalid URI, and
+/// a terminal is entitled to reject the whole link over it. `"`, `<`, `>`, `\`, `^`,
+/// `` ` ``, `{`, `|` and `}` are the same story — printable, and forbidden raw.
+fn uri_safe(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            // unreserved
+            b'-' | b'.' | b'_' | b'~'
+            // gen-delims
+            | b':' | b'/' | b'?' | b'#' | b'[' | b']' | b'@'
+            // sub-delims
+            | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+            // an existing escape
+            | b'%'
+        )
+}
+
+/// A URL made safe to put in an `OSC 8` payload, or the reason it cannot be.
+///
+/// Two rules:
+///
+/// - **Anything RFC 3986 does not allow raw is percent-encoded** — see
+///   [`uri_safe`]. That covers the sequence's own requirement, since an `ESC` or a
+///   `BEL` in the URL would end mesh's sequence and leave the rest on screen (the
+///   injection the title payload also guards against), *and* the ordinary case of a
+///   space in a path, which a terminal is entitled to reject the whole link over.
+///   The delimiters that carry a URL's structure are kept, so `?`, `&`, `=`, `#` and
+///   an existing `%20` all survive as written.
+/// - **A scheme is required.** A terminal needs an absolute URI to do anything with,
+///   so a bare path is a link that silently does not work — worth saying rather than
+///   guessing at `file://`, which would also need a hostname to be correct over
+///   `ssh`.
+pub fn link_url(url: &str) -> Result<String, String> {
+    let Some((scheme, _)) = url.split_once(':') else {
+        return Err(format!(
+            "`{url}` has no scheme; a terminal needs an absolute URL like \
+             `https://…` or `file://host/path`"
+        ));
+    };
+    let named = !scheme.is_empty()
+        && scheme.starts_with(|first: char| first.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if !named {
+        return Err(format!(
+            "`{url}` does not start with a scheme; a terminal needs an absolute URL \
+             like `https://…` or `file://host/path`"
+        ));
     }
+    let mut encoded = String::with_capacity(url.len());
+    for byte in url.bytes() {
+        if uri_safe(byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if encoded.len() > LINK_LIMIT {
+        return Err(format!(
+            "URL is {} bytes encoded, over the {LINK_LIMIT}-byte limit",
+            encoded.len()
+        ));
+    }
+    Ok(encoded)
 }
 
 /// Why a value cannot be written as a literal, in the words a diagnostic wants.
@@ -1069,7 +1215,10 @@ pub fn append_into(current: &mut Value, value: Value, name: &str) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, FuncValue, NoLiteral, RegexValue, Style, StyledValue, Value, Vars};
+    use super::{
+        Color, Decoration, FuncValue, LINK_LIMIT, NoLiteral, RegexValue, Style, StyledValue, Value,
+        Vars, link_url,
+    };
 
     #[test]
     fn a_scalar_writes_the_literal_you_would_have_typed() {
@@ -1247,10 +1396,10 @@ mod tests {
         assert_eq!(vars.get("g"), Some(&Value::String("before".into())));
     }
     /// A styled value with `text` and no attributes but `style`.
-    fn styled(text: &str, style: Style) -> Value {
+    fn styled(text: &str, style: &Style) -> Value {
         Value::Styled(Box::new(StyledValue {
             text: text.to_owned(),
-            style,
+            style: style.clone(),
         }))
     }
 
@@ -1268,16 +1417,16 @@ mod tests {
         };
         // Styling must not change what a value *is*, or `==` and `:dedup` would
         // answer differently depending on how a segment was decorated.
-        assert_eq!(styled("x", red), Value::String("x".into()));
-        assert_eq!(styled("x", red), styled("x", bold));
-        assert_ne!(styled("x", red), Value::String("y".into()));
+        assert_eq!(styled("x", &red), Value::String("x".into()));
+        assert_eq!(styled("x", &red), styled("x", &bold));
+        assert_ne!(styled("x", &red), Value::String("y".into()));
         // `1 == "1"` stays false: only the two *text* kinds are unified.
-        assert_ne!(styled("1", red), Value::Integer(1));
+        assert_ne!(styled("1", &red), Value::Integer(1));
 
         let mut set = HashSet::new();
         set.insert(Value::String("x".into()));
         assert!(
-            !set.insert(styled("x", red)),
+            !set.insert(styled("x", &red)),
             "hashing must agree with `eq`"
         );
         assert_eq!(set.len(), 1);
@@ -1291,7 +1440,7 @@ mod tests {
         };
         // `:repr` round-trips by equality, and equality is by text — so the text is
         // the honest thing to write, quoted like any other string.
-        assert_eq!(styled("x", red).to_literal().as_deref(), Ok("'x'"));
+        assert_eq!(styled("x", &red).to_literal().as_deref(), Ok("'x'"));
     }
 
     #[test]
@@ -1302,11 +1451,18 @@ mod tests {
             ..Style::default()
         };
         let mut vars = Vars::new();
-        vars.set_value("s", styled("a", red));
-        vars.append("s", styled("b", red)).unwrap();
+        vars.set_value("s", styled("a", &red));
+        vars.append("s", styled("b", &red)).unwrap();
         assert_eq!(vars.get("s"), Some(&Value::String("ab".into())));
         assert!(vars.get("s").unwrap().styled_text().is_none());
     }
+
+    /// Everything this stream would take, for a render test that is about the
+    /// bytes rather than about the capability rules.
+    const EVERYTHING: Decoration = Decoration {
+        color: true,
+        links: true,
+    };
 
     #[test]
     fn sgr_carries_bold_then_foreground_then_background() {
@@ -1316,20 +1472,123 @@ mod tests {
             foreground: Some(Color::Blue),
             background: Some(Color::White),
             bold: true,
+            link: None,
         };
-        assert_eq!(style.prefix(), "\u{1b}[1;34;47m");
-        assert_eq!(style.suffix(), "\u{1b}[0m");
+        assert_eq!(style.render("x", EVERYTHING), "\u{1b}[1;34;47mx\u{1b}[0m");
         // A bright color is the 90/100 range, not 30/40 with a modifier.
         let bright = Style {
             foreground: Some(Color::BrightBlack),
             ..Style::default()
         };
-        assert_eq!(bright.prefix(), "\u{1b}[90m");
+        assert_eq!(bright.render("x", EVERYTHING), "\u{1b}[90mx\u{1b}[0m");
         // Nothing named means nothing emitted — never a bare `ESC [ m`, which
         // some terminals read as a reset.
         assert!(Style::default().is_plain());
-        assert_eq!(Style::default().prefix(), "");
-        assert_eq!(Style::default().suffix(), "");
+        assert_eq!(Style::default().render("x", EVERYTHING), "x");
+    }
+
+    #[test]
+    fn a_link_wraps_outside_the_color_and_each_drops_on_its_own() {
+        let style = Style {
+            foreground: Some(Color::Blue),
+            link: Some("https://x.test/".to_owned()),
+            ..Style::default()
+        };
+        // The link is outermost, so the whole colored run is clickable, and it
+        // closes with the empty URI that means "the link ends here".
+        assert_eq!(
+            style.render("x", EVERYTHING),
+            "\u{1b}]8;;https://x.test/\u{1b}\\\u{1b}[34mx\u{1b}[0m\u{1b}]8;;\u{1b}\\"
+        );
+        // `NO_COLOR` leaves the link: it is not color, and dropping it would lose
+        // the URL rather than make the output plainer.
+        assert_eq!(
+            style.render(
+                "x",
+                Decoration {
+                    color: false,
+                    links: true
+                }
+            ),
+            "\u{1b}]8;;https://x.test/\u{1b}\\x\u{1b}]8;;\u{1b}\\"
+        );
+        // A terminal that would print an `OSC` gets the color and no link.
+        assert_eq!(
+            style.render(
+                "x",
+                Decoration {
+                    color: true,
+                    links: false
+                }
+            ),
+            "\u{1b}[34mx\u{1b}[0m"
+        );
+        assert_eq!(style.render("x", Decoration::plain()), "x");
+    }
+
+    #[test]
+    fn a_link_url_is_encoded_where_it_would_break_the_sequence() {
+        // A URL's delimiters are left alone, so the structure the caller wrote
+        // survives — `?`, `&`, `=`, `#`, and an existing `%20` that must not become
+        // `%2520`.
+        assert_eq!(
+            link_url("https://x.test/a?b=c&d=e#f%20g").as_deref(),
+            Ok("https://x.test/a?b=c&d=e#f%20g")
+        );
+        // A **space** is the ordinary case, not an exotic one: a path with one is
+        // an invalid URI, and a terminal may reject the whole link over it.
+        assert_eq!(
+            link_url("file://host/My File.txt").as_deref(),
+            Ok("file://host/My%20File.txt")
+        );
+        // The rest of RFC 3986's forbidden printables, which are just as raw-illegal
+        // as a space despite looking harmless.
+        assert_eq!(
+            link_url("https://x.test/a\"b<c>d\\e^f`g{h|i}j").as_deref(),
+            Ok("https://x.test/a%22b%3Cc%3Ed%5Ce%5Ef%60g%7Bh%7Ci%7Dj")
+        );
+        // Sub-delims stay: they are legal raw and some APIs depend on them.
+        assert_eq!(
+            link_url("https://x.test/a!$&'()*+,;=b").as_deref(),
+            Ok("https://x.test/a!$&'()*+,;=b")
+        );
+        // An `ESC` or `BEL` would end mesh's own sequence and leave the rest on
+        // screen. This is the title payload's injection guard in URL form.
+        assert_eq!(
+            link_url("https://x/\u{1b}]0;pwned\u{7}").as_deref(),
+            Ok("https://x/%1B]0;pwned%07")
+        );
+        // Non-ASCII is encoded per the `OSC 8` specification.
+        assert_eq!(link_url("https://x/é").as_deref(), Ok("https://x/%C3%A9"));
+        assert_eq!(
+            link_url("file://host/path").as_deref(),
+            Ok("file://host/path")
+        );
+        assert_eq!(
+            link_url("mailto:a@b.test").as_deref(),
+            Ok("mailto:a@b.test")
+        );
+    }
+
+    #[test]
+    fn a_link_url_needs_a_scheme_and_a_bounded_length() {
+        // A terminal needs an absolute URI, so a bare path is a link that silently
+        // does nothing — said rather than guessed at `file://`, which would need a
+        // hostname to be right over `ssh`.
+        assert!(link_url("/etc/passwd").is_err());
+        assert!(link_url("x.test/a").is_err());
+        assert!(link_url("12://x").is_err(), "a scheme starts with a letter");
+        assert!(link_url(":no-scheme").is_err());
+        assert!(link_url("").is_err());
+        // Over the limit a terminal drops the whole sequence, taking the link text
+        // with it, so the size is named rather than silently truncated.
+        let long = format!("https://x.test/{}", "a".repeat(LINK_LIMIT));
+        let message = link_url(&long).expect_err("over the limit");
+        assert!(message.contains(&LINK_LIMIT.to_string()), "{message}");
+        // Encoding counts against the limit, not the written length: a URL of
+        // non-ASCII triples on the way out.
+        let wide = format!("https://x.test/{}", "é".repeat(LINK_LIMIT / 2));
+        assert!(link_url(&wide).is_err());
     }
 
     #[test]
