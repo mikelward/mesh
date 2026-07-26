@@ -1607,6 +1607,32 @@ reasoning, and the open ones are at the bottom.
       `Dot` token and nothing starts a value expression with one; the same word
       is fine as a command argument (`puts ./*`). Sibling of the lone-`*` fix —
       a shell spelling the expression grammar does not recognize.
+- [ ] **A glob inside a list literal nests instead of contributing elements.**
+      `GRAMMAR.md` says each scalar element uses the word-expansion rules, "so a
+      glob can contribute zero or more elements", but `xs = [*.txt]` is a list of
+      **one** element that is itself the match list — `$xs:len` is `1`, and
+      `puts $xs` reports `a list inside a list has no rendering`. `[z *.txt]`
+      measures `2` the same way. Either the element expansion should splice its
+      matches, as it does in command arguments, or the nesting is deliberate and
+      the doc sentence is wrong; decide which before writing the test.
+- [ ] **Two space-separated globs in a list literal do not parse.** `xs = [* *]`
+      is `expected a value expression`: list elements are space-separated, so the
+      second lone `*` lands in binary-operator position and reads as
+      multiplication against the first. The lone-`*` fix deliberately did not
+      touch this — inside `[…]` the two readings are genuinely ambiguous under
+      the current spacing rule, so it needs a decision, not a parser tweak.
+      `[*.txt *.txt]` is unaffected, its stars being inside words.
+- [ ] **`$(…)` does not split on newlines.** `capture_source`
+      (`crates/mesh-core/src/repl.rs:4315`) returns one `Value::String` with
+      trailing newlines trimmed, but `DESIGN.md` §"Modifiers" specifies the
+      default capture as a **newline split → list**, and §"Loops" writes
+      `for line in $(git status --porcelain)` as the safe line-by-line idiom.
+      Today that loop runs **once** with the whole blob bound to `line` — a quiet
+      wrong answer rather than an error, which makes this worse than the missing
+      `:lines` / `:nulls` / `:raw` modifiers beside it (those at least say
+      `modifier :lines is not implemented yet`). Landing the split is what makes
+      `:raw` mean anything, since `:raw` is defined as the member that turns it
+      off.
 - [ ] **Reserve only bare `_` as discard, allow `_name`.** Today a name must
       start with a letter, so a leading underscore is rejected wholesale (`_` and
       `_x` alike) — `_` is the discard pattern (`DESIGN.md`). Reconsider narrowing
