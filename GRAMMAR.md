@@ -216,10 +216,18 @@ Each command is now a **pipeline** of `|`-joined stages, and every stage may car
 ```
 segment = pipeline
 pipeline = stage ("|" stage)*
-stage    = (word | redir)+            # words and redirections interleave
+stage    = (word | redir | value)+    # words, redirections and values interleave
 redir    = ("<" | ">" | ">>") word    # the following word is the target file
+value    = "(" expr ")" | "$(" … ")" | call    # only after a word; see below
 ```
 
+- A **`value`** is a value expression as an argument (`puts (1 + 2)`,
+  `puts $(pwd)`, `puts style(x, fg: red)`). Only the spellings a word cannot have
+  start one — `(`, `$(`, an attached `name(` / `:name(` — so `[` stays a glob
+  character class and `1..3` stays literal text. It must follow a **word**, since a
+  value cannot name the command; it binds tighter than a comparison, so a following
+  `>` is still a redirection; and it is a whole argument, so text attached to it is a
+  syntax error rather than a second one. Backgrounding one is not supported yet.
 - **`|`** connects one command's stdout to the next command's stdin (a single
   `|`; `||` is still the sequence separator, matched first). **`>`** truncates (or
   creates) a file with stdout, **`>>`** appends, **`<`** reads stdin from a file.

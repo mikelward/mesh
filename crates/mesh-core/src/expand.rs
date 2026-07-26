@@ -111,8 +111,23 @@ pub struct VarRef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Piece {
-    Text { text: String, expandable: bool },
+    Text {
+        text: String,
+        expandable: bool,
+    },
     Var(VarRef),
+    /// A value argument (`puts (1 + 2)`, `puts $(pwd)`, `puts style(x, fg: red)`),
+    /// **already evaluated**.
+    ///
+    /// Evaluating it needs the shell — a `$(…)` launches a command, a call runs a
+    /// function — so it happens where the shell is, before expansion, and the result
+    /// rides in here. Like an interpolated variable the value is *literal*: never
+    /// re-split, never re-globbed.
+    ///
+    /// Carrying the value rather than its text is what lets `puts style(x, fg: red)`
+    /// keep its attributes and `puts (…)` on a list render per-line, since
+    /// [`expand_call_values`] can hand the value straight over.
+    Value(Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +162,10 @@ pub enum ExpandError {
         id: usize,
     },
     NotAList(String),
+    /// A **value argument** with no byte form — `ls (1..3)`. Carries the whole
+    /// diagnostic rather than a category, because the argv rules read better named
+    /// ("a list needs `...`") than classified, and there is no variable to name.
+    ArgumentValue(String),
     IndexOutOfRange {
         name: String,
         index: i64,
@@ -176,6 +195,7 @@ impl std::fmt::Display for ExpandError {
                 write!(f, "job {id} is no longer in the job table")
             }
             ExpandError::NotAList(n) => write!(f, "${n}: cannot index a string value"),
+            ExpandError::ArgumentValue(message) => write!(f, "{message}"),
             ExpandError::IndexOutOfRange { name, index } => {
                 write!(f, "${name}[{index}]: list index out of range")
             }
@@ -301,6 +321,30 @@ fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError
     }
 }
 
+/// The text a **value argument** contributes to argv — the same bytes-only rule
+/// every other command argument meets, since an external takes bytes.
+///
+/// This is the fallback, not the main path: a word that is *only* a value argument
+/// reaches [`whole_value`] first and stays typed, so `puts style(x, fg: red)` keeps
+/// its attributes. Rendering here is for the cases that genuinely need bytes — an
+/// external command, or a value argument glued to text (`ls dir$(suffix)`).
+fn value_argument_text(value: &Value) -> Result<String, ExpandError> {
+    let refuse = |message: &str| Err(ExpandError::ArgumentValue(message.to_owned()));
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        // Its text is what crosses; argv carries bytes, not attributes.
+        Value::Styled(styled) => Ok(styled.text.clone()),
+        Value::Integer(number) => Ok(number.to_string()),
+        Value::Boolean(flag) => Ok(flag.to_string()),
+        Value::List(_) => refuse("a list needs `...` to become command arguments"),
+        Value::Map(_) => refuse("a map cannot be a command argument"),
+        Value::Regex(_) | Value::Glob(_) => refuse("a pattern cannot be a command argument"),
+        Value::Stream(_) => refuse("a stream handle has no text form"),
+        Value::Job(_) => refuse("a job handle has no text form"),
+        Value::Function(_) => refuse("a function value has no text form"),
+    }
+}
+
 fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
     values
         .into_iter()
@@ -339,6 +383,12 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
 
 /// Preserve a whole bare variable reference at an in-shell value boundary.
 fn whole_value(word: &Word, vars: &Vars) -> Option<Result<Value, ExpandError>> {
+    // A value argument is already a value; handing it over untouched is what lets
+    // `puts style(x, fg: red)` keep its attributes and `puts (…)` on a collection
+    // render per-line rather than meeting the argv rule.
+    if let [Piece::Value(value)] = word.0.as_slice() {
+        return Some(Ok(value.clone()));
+    }
     let [Piece::Var(vref)] = word.0.as_slice() else {
         return None;
     };
@@ -407,6 +457,9 @@ fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), Exp
         match piece {
             Piece::Text { text, expandable } => pieces.push((text, expandable)),
             Piece::Var(vref) => pieces.push((resolve(&vref, vars)?, false)),
+            // Literal, exactly as an interpolated variable is: never re-split and
+            // never re-globbed, so `puts $(ls)` cannot glob what it just listed.
+            Piece::Value(value) => pieces.push((value_argument_text(&value)?, false)),
         }
     }
     apply_tilde(&mut pieces);

@@ -654,9 +654,6 @@ than the string the argv boundary would have produced.
       test make that a per-command answer rather than the shell's, since words are
       rendered before a redirection is opened. `NO_COLOR` (non-empty, per
       no-color.org) and `TERM=dumb` drop it. Re-styling is additive.
-- [ ] **A value call as a command argument** — one corner of "no value expression in
-      an argument position", tracked under §"Loose ends". `puts style(x, fg: red)` is
-      the spelling anyone tries first, and it is a syntax error.
 - [ ] **256-color and truecolor.** `Color` is the sixteen ANSI names, which is what
       every color-capable terminal agrees on. Going further needs a spelling for the
       value (`fg: 33`? `fg: "#8be9fd"`? both?) and a **downgrade** rule to the
@@ -902,30 +899,84 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
 Small items rescued from pull requests that were closed as superseded — the bulk
 of each PR had landed by another route, but these pieces had not.
 
-- [ ] **No value expression can sit in an argument position.** Every one of these is
-      `syntax error: expected a command word`, while each works in a value position:
+- [x] **A value expression can be a command argument.** `puts (1 + 2)`, `puts $(pwd)`,
+      `ls $(pwd)`, `puts style(x, fg: red)`, `puts f()` and `puts pwd():capture` all
+      work; `DESIGN.md` wrote the first two in its own examples. `parser::command` gains
+      a `CommandItem::Value` when `value_argument_starts` sees a shape with no word
+      spelling — `$(`, `(`, an attached `name(`/`$f(`, an attached `:name(` — which is
+      why nothing could break: every one of them was a syntax error. `[` and `..` are
+      deliberately **not** in that set, since in an argument they are already a glob
+      character class and a literal word.
+
+      The value rides into expansion as `Piece::Value`, evaluated in
+      `run_ast_pipeline` where the shell is (a `$(…)` launches a command, a call runs a
+      function) and literal thereafter — never re-split, never re-globbed, exactly as
+      an interpolated variable is. It carries the **value**, not its text, so
+      `whole_value` hands it over typed: `puts f()` on a list renders per line and
+      `puts style(…)` keeps its attributes, while argv gets `value_argument_text` and
+      the same loud refusals a bare list already meets.
+- [ ] **A value argument is evaluated by the parent, not by the stage that runs it.**
+      Raised in review on the PR above, and the root the next two items share. Value
+      arguments run while the stage is assembled in `run_ast_pipeline`; a backgrounded or
+      piped stage runs in a *fork* that has not happened yet, so the work and any side
+      effects land in the parent.
+
+      **Backgrounding is refused for now**, because there it is visibly wrong:
+      `puts $(sleep 10) &` would spend the ten seconds in the parent before registering
+      the job, so the prompt hangs and the `&` buys nothing — and
+      `docs/REFERENCE.md` promises a background stage's changes stay in the child, which
+      a mutating argument would break (`puts change() &` left `n=MUTATED` where
+      `change &` correctly leaves `n=before`).
+
+      **A foreground pipeline is allowed**, with the same isolation gap and nothing
+      observable: the pipeline waits either way, the result is right, and refusing it
+      would cost `puts $(pwd) | cat`. A mutating call as an argument to a piped stage
+      does reach the parent's globals, which the restructure below fixes.
+
+      The fix is for the *stage* to evaluate its own arguments, which needs
+      `exec::Cmd`'s words to stop being final at assembly time — they feed the job
+      listing and `exec::run` today. That also fixes the ordering item and unblocks
+      glued text, so the three want one change.
+- [ ] **A value argument is evaluated before any word is expanded, not in source
+      order.** Raised in review on the PR above. Value arguments run while the stage is
+      assembled in `run_ast_pipeline`, and the words are expanded later as a batch in
+      `run_command`, so a value argument that mutates shell state is observed by words
+      written *earlier* on the line:
 
       ```
-      puts $(pwd)        ls $(pwd)          # command substitution — the big one
-      puts (1 + 2)                          # `DESIGN.md` §"Arithmetic" writes this verbatim
-      puts style(x, fg: red)   puts re(a)   # value constructors
-      puts $f(1)         puts pwd():capture # a call, and a capture
+      cmd = /bin/echo
+      func g() { global cmd = /bin/false; return x }
+      $cmd g()            # runs /bin/false, not the /bin/echo that was selected first
       ```
 
-      `DESIGN.md` uses two of these in its own examples — `puts $(ls)` in §"I/O" and
-      `puts (1 + 2)` in §"Arithmetic" — so this is unimplemented rather than
-      undecided. `$(…)` in an argument is the most-used construct in any shell after
-      variables, which makes this the largest gap in the language today.
+      Narrow to trigger — it needs a call in an argument that reassigns a `global` a
+      preceding word reads — but it is the wrong answer, and `capture_command`
+      evaluates its arguments in order, so the two paths disagree. Fixing it properly
+      means interleaving evaluation with expansion, which today cannot happen: the
+      expander takes `&Vars` while a value argument needs `&mut Shell`. Expanding the
+      earlier words eagerly instead would strip the typed path that lets `puts f()`
+      render a list per line, so it is not a shortcut. Deferred rather than half-done.
+- [ ] **`$( … )` around a value-producing statement fails with the value as a status.**
+      Pre-existing, and surfaced by review on the value-argument PR. The capture reads
+      the inner statement's status, and an expression statement's status is derived from
+      its *value*, so any non-zero one is read as a failure:
 
-      The parser already *intends* it: `value_start_in`'s comment says "`puts (1 + 2)`
-      is `puts` with an argument", and it is only the statement-level command/value
-      discrimination that reads it that way. The argument loop never got the other
-      half — `parser::command` calls `command_word` for every item, and
-      `token_word_pieces` rejects `(`, `$(`, `[` and an attached call, which is
-      where the error comes from. So the shape of the fix is a third `CommandItem`
-      beside `Word` and `Redirect`, plus the expansion path in `repl` that turns one
-      into argument values. Everything downstream of that already exists: the
-      evaluator handles all these forms in a value position.
+      ```
+      m = $(0 + 0)      # status 0, m is ''
+      m = $(5 + 0)      # status 5, and `m` is never bound
+      ```
+
+      So `$(5 + 0)` is unusable while `$(0 + 0)` works, which is the value/status
+      confusion `DESIGN.md` §"Result and `return`" otherwise keeps apart —
+      `capture_source` wants "did the body fail", and `status_of` on a value is not that
+      question. Nothing to do with argument position: `m = $(5 + 0)` has always done
+      this. It shows up more now only because the form is reachable in more places.
+- [ ] **Text glued to a value argument.** `pre$(x)post` and `f()x` are a loud syntax
+      error naming the spellings that work, because handing over three arguments where
+      one was written would be silently wrong. Gluing them into one word needs a value
+      piece inside `parser::Word`, which makes `expansion_word` need the shell — the
+      same restructure the ordering item above wants, so the two land together.
+
 - [ ] **`$(…)` does not interpolate inside `"…"`.** `puts "at $(pwd) now"` prints
       `at $(pwd) now` — the substitution is literal text, not a value. Separate
       machinery from the item above (interpolation, not argument parsing) and it has
