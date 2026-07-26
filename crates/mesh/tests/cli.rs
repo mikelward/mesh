@@ -168,7 +168,7 @@ fn non_interactive_shell_does_not_source_rc_config() {
     assert!(out.stderr.is_empty());
 }
 
-/// Script line that blocks until job 1 has finished, *without* consuming it.
+/// Script line that blocks until job `id` has finished, *without* consuming it.
 ///
 /// The tests using this assert on the shell's `[N] Done (…)` notice, or on a
 /// `jobs` listing that should already be empty. Both come from the prompt-time
@@ -181,11 +181,13 @@ fn non_interactive_shell_does_not_source_rc_config() {
 /// lost under load, and the failure is a *missing* `Done` line rather than a
 /// late one, so no amount of generosity closes it.
 ///
-/// Only sound while nothing between the `&` and this line can reap job 1.
-/// Reaping removes the job, and `$sh.jobs[1]` would then name a job that is
-/// gone — a loud read rather than a quiet false negative, but a failure either
-/// way.
-const AWAIT_JOB_1: &str = "while $sh.jobs[1].state == running { sleep 0.02 }\n";
+/// The id is a parameter because assuming 1 is a live hazard: launching a
+/// second background job reaps the finished first one, and the new job is 2.
+/// Waiting on 1 there reads a job that is gone — `no \`1\` in this map` — and
+/// returns at once, so the wait silently stops being one.
+fn await_job(id: u8) -> String {
+    format!("while $sh.jobs[{id}].state == running {{ sleep 0.02 }}\n")
+}
 
 /// `openpty` plus `FD_CLOEXEC` on both ends.
 ///
@@ -1923,23 +1925,53 @@ fn a_pipeline_can_run_in_the_background() {
 
 #[test]
 fn a_background_command_does_not_consume_shell_input() {
-    let out = run_with_input(&format!("cat & puts after\n{AWAIT_JOB_1}jobs\n"));
+    let out = run_with_input(&format!("cat & puts after\n{}jobs\n", await_job(1)));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("[1]"));
 }
 
 #[test]
 fn background_pipeline_retains_statuses_reaped_on_earlier_prompts() {
-    // The first `jobs` needs the pipeline still running and the second needs it
-    // finished, so neither end can be a guessed interval. The first needs no
-    // wait at all — `&` registers the job before the next command runs, and the
-    // pipeline's own `sleep 0.2` keeps it alive far longer than that — and the
-    // second polls the job's state. `wait` is not usable here: it takes the job
-    // out of the table, so the `Done (7)` this asserts on would never print.
-    let out = run_with_input(
-        "sh -c 'exit 7' | sleep 0.2 &\njobs\nwhile $sh.jobs[1].state == running { sleep 0.02 }\njobs\n",
+    // What is being tested is that a status collected at one table refresh
+    // survives to a later one, so the first `jobs` has to happen in the window
+    // where the *first* stage has exited and the last has not. Miss that window
+    // and the final `Done (7)` proves nothing: it could equally have been
+    // collected on the way past, and the test passes without exercising the
+    // retention it is named for.
+    //
+    // The pipe itself is what closes the window, rather than an interval chosen
+    // to sit inside it. Stage 2's `cat` sees EOF only once every write end is
+    // gone, and stage 1 holds the only one — so the marker it writes afterwards
+    // cannot appear until stage 1 has exited, and the `sleep` that follows it
+    // keeps stage 2 alive across the `jobs` that comes next. Both halves of the
+    // window are then facts about the pipeline rather than guesses about the
+    // scheduler.
+    //
+    // `wait` is not usable here: it takes the job out of the table, so the
+    // `Done (7)` this asserts on would never print.
+    let dir = fresh_dir("pipeline_retains_status");
+    let marker = dir.join("stage-one-gone");
+    let out = run_with_input(&format!(
+        "m = '{}'\n\
+         sh -c 'exit 7' | sh -c 'cat > /dev/null; echo x > {}; sleep 0.3' &\n\
+         while $m:exists == false {{ sleep 0.02 }}\n\
+         jobs\n\
+         {}jobs\n",
+        marker.to_string_lossy(),
+        marker.to_string_lossy(),
+        await_job(1)
+    ));
+    // The listing is the `jobs` builtin's own output and goes to stdout; the
+    // `Done` notice is the shell's and goes to stderr. Asserting both on one
+    // stream passes only by accident.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("] Running "),
+        "the first listing missed the window where stage 1 is gone and stage 2 is not: {stdout:?} {stderr:?}"
     );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Done (7)"));
+    assert!(stderr.contains("Done (7)"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2905,8 +2937,9 @@ fn a_reaped_job_notice_stays_with_the_shell() {
             let _ = std::fs::remove_file(dir.join(name));
         }
         let out = run_with_input(&format!(
-            "cd {}\nfunc noop() {{ true }}\nfunc shows() {{ jobs }}\n             sleep 0.05 &\n{AWAIT_JOB_1}{pipeline}\n",
-            dir.display()
+            "cd {}\nfunc noop() {{ true }}\nfunc shows() {{ jobs }}\n             sleep 0.05 &\n{}{pipeline}\n",
+            dir.display(),
+            await_job(1)
         ));
         assert_eq!(
             done(&out),
@@ -2920,7 +2953,8 @@ fn a_reaped_job_notice_stays_with_the_shell() {
     // It survives a stage that never starts, for the same reason: the shell is the
     // one reporting, so nothing depends on the stage running.
     let failed = run_with_input(&format!(
-        "sleep 0.05 &\n{AWAIT_JOB_1}jobs 2> /missing/log | cat\nputs after\n"
+        "sleep 0.05 &\n{}jobs 2> /missing/log | cat\nputs after\n",
+        await_job(1)
     ));
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert!(stderr.contains("/missing/log"), "{stderr:?}");
@@ -2929,7 +2963,9 @@ fn a_reaped_job_notice_stays_with_the_shell() {
 
     // And a backgrounded stage, whose targets are opened in the child.
     let backgrounded = run_with_input(&format!(
-        "sleep 0.05 &\n{AWAIT_JOB_1}jobs 2> /missing/log &\n{AWAIT_JOB_1}"
+        "sleep 0.05 &\n{}jobs 2> /missing/log &\n{}",
+        await_job(1),
+        await_job(2)
     ));
     assert!(
         String::from_utf8_lossy(&backgrounded.stderr).contains("] Done (0) sleep 0.05"),
@@ -2941,7 +2977,8 @@ fn a_reaped_job_notice_stays_with_the_shell() {
     // not trigger it: `puts hi | cat` would otherwise take a completed job out
     // from under a later `fg`, which the unpiped `puts hi` leaves alone.
     let unrelated = run_with_input(&format!(
-        "sleep 0.05 &\n{AWAIT_JOB_1}puts hi | cat\nfg\nputs end\n"
+        "sleep 0.05 &\n{}puts hi | cat\nfg\nputs end\n",
+        await_job(1)
     ));
     assert!(
         !String::from_utf8_lossy(&unrelated.stderr).contains("no current job"),
@@ -2953,7 +2990,8 @@ fn a_reaped_job_notice_stays_with_the_shell() {
     // A nested `jobs` still reads a fresh table, which is what the refresh is for.
     let nested = |tail: &str| {
         run_with_input(&format!(
-            "sleep 0.05 &\n{AWAIT_JOB_1}func f() {{ jobs }}\nf{tail}\n"
+            "sleep 0.05 &\n{}func f() {{ jobs }}\nf{tail}\n",
+            await_job(1)
         ))
     };
     assert_eq!(done(&nested("")), done(&nested(" | cat")));
@@ -3282,7 +3320,7 @@ fn job_control_stays_with_the_shell_that_owns_the_jobs() {
     // A job that finished since the last reap is reported the same either way:
     // the shell refreshes the table before forking the stage, since the fork
     // could not.
-    let finished = run_with_input(&format!("sleep 0.05 &\n{AWAIT_JOB_1}jobs | cat\n"));
+    let finished = run_with_input(&format!("sleep 0.05 &\n{}jobs | cat\n", await_job(1)));
     let piped = String::from_utf8_lossy(&finished.stderr);
     assert!(piped.contains("Done"), "{piped}");
     assert!(
