@@ -1222,25 +1222,81 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
     })
 }
 
-/// Does this command item hold a value the **parent** would have to evaluate?
+/// Can this stage hand its words to its own fork to expand?
 ///
-/// A value argument is one (`puts $(pwd)`), and so is a *word* with a value piece in
-/// it — `puts "$(pwd)"`, `> "o$(n).txt"` — since an interpolated capture is evaluated
-/// where the shell is, exactly as an argument's is. Both matter to the same caller:
-/// backgrounding, which must not run either in the parent. A heredoc body is not
-/// checked because it does not interpolate a capture at all (`TODO.md`).
-fn carries_a_value(item: &parser::CommandItem) -> bool {
-    let has_value_piece = |word: &parser::Spanned<parser::Word>| {
-        word.value
-            .pieces
-            .iter()
-            .any(|piece| matches!(piece, parser::WordPiece::Value(_)))
-    };
-    match item {
-        parser::CommandItem::Value(_) => true,
-        parser::CommandItem::Word(word) => has_value_piece(word),
-        parser::CommandItem::Redirect { target, .. } => has_value_piece(target),
-    }
+/// Only when it has a value to gain by it, and **only when it has no redirections**.
+/// A redirection is the shell's to resolve: it does that for every stage at once,
+/// before it forks any of them, which is what keeps `cat < fifo | cmd > fifo` from
+/// deadlocking. Deferring the words but not the targets would put the targets
+/// *first* — reversing the documented order, so a failing target would stop the
+/// words from ever running and `f * > summary` would glob the `summary` its own
+/// redirection had just created.
+///
+/// So a stage with both keeps the old behavior: the parent expands its words, in
+/// word order, before its targets. It gives up the isolation the deferral buys,
+/// which is why backgrounding one stays refused rather than silently running in the
+/// wrong process.
+fn can_defer(words: &[parser::Word], redirs: &[Redir]) -> bool {
+    redirs.is_empty() && words.iter().any(word_carries_a_value)
+}
+
+/// Does this word carry a value — `puts $(pwd)`, `puts "$(pwd)"`, `cmd f()`?
+///
+/// Asked of a stage that is about to **fork**, since a value is the one thing in a
+/// word whose expansion runs code, and running it here would run it in the wrong
+/// process. Everything else in a word — a variable, a glob, a tilde — is a pure
+/// read, so where it happens cannot be observed.
+fn word_carries_a_value(word: &parser::Word) -> bool {
+    word.pieces
+        .iter()
+        .any(|piece| matches!(piece, parser::WordPiece::Value(_)))
+}
+
+/// What a job listing shows for a stage that has not expanded its words yet.
+///
+/// A value has no text until it is evaluated, and evaluating it to *print* it would
+/// be the very thing the deferral avoids — so it shows as `$(…)`, the shape of what
+/// was written. The words around it are their own spelling, so `puts $(pwd) &` lists
+/// as `puts $(…)`.
+fn display_words(words: &[parser::Word]) -> Vec<String> {
+    words
+        .iter()
+        .map(|word| {
+            let mut text = String::new();
+            for piece in &word.pieces {
+                match piece {
+                    parser::WordPiece::Text { text: piece, .. } => text.push_str(piece),
+                    parser::WordPiece::Variable { name, .. } => text.push_str(name),
+                    parser::WordPiece::Value(_) => text.push_str("$(…)"),
+                }
+            }
+            text
+        })
+        .collect()
+}
+
+/// Does this command hold a value the **parent** has to evaluate, whatever happens
+/// next — so that backgrounding it would run the work at the prompt?
+///
+/// Only when it redirects. A stage with no redirections hands its words to its own
+/// fork ([`can_defer`]); one that redirects cannot, because the shell resolves every
+/// stage's targets before it forks any of them — in parallel, which is what keeps
+/// `cat < fifo | cmd > fifo` from deadlocking. So a value anywhere in a redirecting
+/// command is the parent's, and `&` on it is refused rather than silently done in
+/// the wrong process.
+///
+/// A heredoc body is not checked because it does not interpolate a capture at all
+/// (`TODO.md`).
+fn carries_a_value(items: &[parser::CommandItem]) -> bool {
+    let redirects = items
+        .iter()
+        .any(|item| matches!(item, parser::CommandItem::Redirect { .. }));
+    redirects
+        && items.iter().any(|item| match item {
+            parser::CommandItem::Value(_) => true,
+            parser::CommandItem::Word(word) => word_carries_a_value(&word.value),
+            parser::CommandItem::Redirect { target, .. } => word_carries_a_value(&target.value),
+        })
 }
 
 /// Whether an expression statement is really a **command**: a lone scalar word
@@ -1822,26 +1878,18 @@ fn run_ast_pipeline(
             }
             Err(step) => return step,
         }
-        // A value in a command is evaluated in **this** process while the stage is being
-        // assembled, and backgrounding is where that is visibly wrong: the fork has not
-        // happened yet, so `puts $(sleep 10) &` would run the ten seconds in the parent
-        // before registering the job — the prompt hangs and the `&` buys nothing. It is
-        // also where `docs/REFERENCE.md` promises isolation, so a mutating call would
-        // change the parent's globals rather than the child's.
-        //
-        // Refused rather than silently done in the wrong process. A *foreground*
-        // pipeline is left alone: its stage forks too, so a mutating argument has the
-        // same isolation gap, but nothing about the timing or the result is observable —
-        // the pipeline waits either way — and refusing it would cost `puts $(pwd) | cat`,
-        // which is an ordinary thing to write. `TODO.md` carries that nuance.
-        //
-        // Doing it right means the *stage* evaluating its own arguments, which needs
-        // `exec::Cmd`'s words to stop being final at assembly time — the same
-        // restructure the ordering and glued-text items want.
-        if background && command.items.iter().any(carries_a_value) {
+        // A value in a command that does not redirect travels to the stage and is
+        // evaluated in its fork, so backgrounding one is ordinary now. One that
+        // *does* redirect cannot travel: the shell resolves every stage's targets
+        // before it forks, in parallel, which is what keeps `cat < fifo | cmd > fifo`
+        // from deadlocking — see `can_defer`. Evaluating it here would run the work
+        // in the parent, where `puts $(slow) > out &` hangs the prompt and a mutating
+        // call reaches the parent's bindings that `docs/REFERENCE.md` promises the
+        // fork keeps. Refused rather than silently done in the wrong process.
+        if background && carries_a_value(&command.items) {
             note!(
-                "mesh: a value cannot be backgrounded yet; bind it first — \
-                 `m = $(…)` then `cmd $m &`"
+                "mesh: a value cannot be backgrounded with a redirection yet; \
+                 bind it first — `m = $(…)` then `cmd $m > out &`"
             );
             return Step::Continue(2);
         }
@@ -4408,6 +4456,34 @@ fn run_single(
     } else {
         stdout_decoration()
     };
+    // Backgrounded, this stage forks — so a value in one of its words is expanded
+    // *there*, and `puts $(sleep 10) &` spends the ten seconds in the job rather
+    // than at the prompt. A foreground redirected command has no fork to defer to:
+    // a builtin or function runs in the shell with the targets around the call, so
+    // its arguments were always this process's to evaluate.
+    if background && can_defer(&words, &redirs) {
+        let opened = match expand_redirs(redirs, last, in_function, shell) {
+            Ok(redirs) => redirs,
+            Err(step) => return step,
+        };
+        return Step::Continue(run_stages(
+            vec![exec::Cmd {
+                words: display_words(&words),
+                redirs: opened,
+                pipe_stderr: false,
+                in_shell: true,
+            }],
+            vec![StageBody::Deferred {
+                words,
+                decoration,
+                context: Deferred::Backgrounded,
+            }],
+            background,
+            last,
+            in_function,
+            shell,
+        ));
+    }
     // The words expand *before* the targets are opened: `f * > summary` must not
     // see the `summary` the redirection is about to create.
     let argv = match expand_stage(&words, decoration, last, in_function, shell) {
@@ -4432,6 +4508,7 @@ fn run_single(
                     vec![StageBody::Function(args)],
                     background,
                     last,
+                    in_function,
                     shell,
                 ));
             }
@@ -4493,6 +4570,7 @@ fn run_single(
         }],
         background,
         last,
+        in_function,
         shell,
     ))
 }
@@ -4523,6 +4601,27 @@ fn run_multi(
         } else {
             Decoration::plain()
         };
+        // A stage carrying a value expands in its **own** fork, not here: a call in
+        // one of its arguments belongs to the stage, and this process is not it.
+        // Every stage of a pipeline forks, so every one of them can defer.
+        if can_defer(&words, &redirs) {
+            let opened = match expand_redirs(redirs, last, in_function, shell) {
+                Ok(redirs) => redirs,
+                Err(step) => return step,
+            };
+            cmds.push(exec::Cmd {
+                words: display_words(&words),
+                redirs: opened,
+                pipe_stderr,
+                in_shell: true,
+            });
+            bodies.push(StageBody::Deferred {
+                words,
+                decoration,
+                context: Deferred::Piped,
+            });
+            continue;
+        }
         // Command words expand before the redirect targets, the order `run_single`
         // uses, so a stage reports the same first failure the unpiped command
         // does — and `f * > summary` cannot glob the file the redirection is
@@ -4565,7 +4664,14 @@ fn run_multi(
         });
         bodies.push(body);
     }
-    Step::Continue(run_stages(cmds, bodies, background, last, shell))
+    Step::Continue(run_stages(
+        cmds,
+        bodies,
+        background,
+        last,
+        in_function,
+        shell,
+    ))
 }
 
 /// What an in-shell stage runs, kept beside the `exec::Cmd` describing it.
@@ -4577,6 +4683,53 @@ enum StageBody {
     /// A function, with its arguments already expanded as **typed values** — the
     /// same guarantee a plain call gives, so `f $xs` still passes one list.
     Function(Vec<(Value, bool)>),
+    /// A stage whose words are **not expanded yet**, because one of them carries a
+    /// value — `puts $(pwd) | cat`, `cmd f() &`.
+    ///
+    /// Evaluating that in the parent would run the work in the wrong process: a
+    /// backgrounded stage would spend its time in the shell before the job was even
+    /// registered, and a mutating call would change the parent's bindings where
+    /// `docs/REFERENCE.md` promises the fork keeps them. So the stage carries its
+    /// words down to its own fork and expands them there — which is also what
+    /// decides, that late, whether it is a builtin, a function, or an external to
+    /// `exec::exec_stage` into.
+    Deferred {
+        words: Vec<parser::Word>,
+        decoration: Decoration,
+        /// Which of the two the stage is, since the words it will come to are
+        /// checked against the same rules the eager paths apply — and those two
+        /// say different things about the same word.
+        context: Deferred,
+    },
+}
+
+/// Why a stage was deferred, which is also what it says when its words turn out to
+/// name something a stage cannot be.
+#[derive(Clone, Copy)]
+enum Deferred {
+    /// One stage of a `|` pipeline.
+    Piped,
+    /// A single command with `&`.
+    Backgrounded,
+}
+
+impl Deferred {
+    /// What to say when the words come to nothing at all.
+    fn empty(self) -> &'static str {
+        match self {
+            Self::Piped => "empty command in a pipeline",
+            Self::Backgrounded => "redirection with no command is not supported yet",
+        }
+    }
+
+    /// What to say when they come to `return`, which is control flow unwinding a
+    /// function rather than a command a stage can run.
+    fn returning(self) -> &'static str {
+        match self {
+            Self::Piped => "return: cannot be used in a pipeline",
+            Self::Backgrounded => "return: cannot be redirected or backgrounded",
+        }
+    }
 }
 
 /// Run `cmds` as a pipeline, giving each in-shell stage the body in `bodies`
@@ -4590,6 +4743,7 @@ fn run_stages(
     bodies: Vec<StageBody>,
     background: bool,
     last: u8,
+    in_function: bool,
     shell: &mut Shell,
 ) -> u8 {
     debug_assert_eq!(cmds.len(), bodies.len());
@@ -4617,6 +4771,17 @@ fn run_stages(
         && cmds.iter().zip(&bodies).any(|(cmd, body)| match body {
             StageBody::Builtin => cmd.words == ["jobs"],
             StageBody::Function(_) => true,
+            // A deferred stage is *not* treated like a function, for all that what
+            // it runs is equally unknowable: almost every one of them is an ordinary
+            // command (`puts $(pwd) | cat`), and reaping for those would take a
+            // finished job out from under a later `fg` — the very cost this test
+            // exists to avoid. Its command word is usually a plain literal, so ask
+            // that: `jobs $(…) | …` still refreshes, and nothing else pays for it.
+            // A `jobs` spelled some other way sees a stale listing, which is the
+            // cheaper way to be wrong.
+            StageBody::Deferred { words, .. } => {
+                words.first().is_some_and(|word| word.is_bare_text("jobs"))
+            }
             StageBody::External => false,
         })
     {
@@ -4624,7 +4789,7 @@ fn run_stages(
     }
     let outcome = exec::run_pipeline(cmds, &mut jobs, background, &mut |index, cmd, jobs| {
         std::mem::swap(&mut shell.jobs, jobs);
-        let status = run_stage_in_shell(&bodies[index], cmd, last, shell);
+        let status = run_stage_in_shell(&bodies[index], cmd, last, in_function, shell);
         std::mem::swap(&mut shell.jobs, jobs);
         status
     });
@@ -4641,7 +4806,13 @@ fn run_stages(
 ///
 /// `last` is the status the pipeline started from, which a status-sensitive
 /// builtin — a bare `exit` — still reads.
-fn run_stage_in_shell(body: &StageBody, cmd: &exec::Cmd, last: u8, shell: &mut Shell) -> u8 {
+fn run_stage_in_shell(
+    body: &StageBody,
+    cmd: &exec::Cmd,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> u8 {
     shell.forked = true;
     let step = match body {
         StageBody::Function(args) => dispatch_function_call(&cmd.words[0], args.clone(), shell),
@@ -4650,6 +4821,34 @@ fn run_stage_in_shell(body: &StageBody, cmd: &exec::Cmd, last: u8, shell: &mut S
         // external lookup and report "command not found".
         StageBody::Builtin => run_expanded(cmd.words.clone(), last, shell),
         StageBody::External => unreachable!("an external stage has no in-shell body"),
+        // The words are expanded **here**, in the stage's own process, which is the
+        // whole point of deferring them: a `$(…)` or a call in one runs where its
+        // effects belong. What they come to decides how the stage ends — as a
+        // function call, a builtin, or this process replaced by a program.
+        StageBody::Deferred {
+            words,
+            decoration,
+            context,
+        } => match expand_stage(words, *decoration, last, in_function, shell) {
+            Ok(Expanded::Function { name, args }) => dispatch_function_call(&name, args, shell),
+            Ok(Expanded::Argv(argv)) => {
+                if argv.is_empty() {
+                    note!("mesh: {}", context.empty());
+                    Step::Continue(1)
+                } else if argv[0] == "return" {
+                    // `return` unwinds the enclosing function; it is not something a
+                    // stage can run, and the eager paths refuse it in the same terms.
+                    note!("mesh: {}", context.returning());
+                    Step::Continue(2)
+                } else if builtins::is_builtin(&argv[0]) {
+                    run_expanded(argv, last, shell)
+                } else {
+                    // Replaces this process, so nothing below runs on success.
+                    return exec::exec_stage(&argv);
+                }
+            }
+            Err(step) => step,
+        },
     };
     match step {
         Step::Continue(code) | Step::Exit(code) => code,

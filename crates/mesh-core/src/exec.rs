@@ -1063,6 +1063,36 @@ impl Program {
     }
 }
 
+/// Replace **this stage** with an external command, from inside its own fork.
+///
+/// The way in for a stage whose argv the shell did not know when it forked: one
+/// carrying a value (`/bin/echo $(pwd) | cat`), which has to be evaluated by the
+/// process that runs the stage rather than by the parent. Everything an ordinary
+/// external stage gets from [`StageBody::Exec`] it gets here instead — the same
+/// `execvp`, the same 126/127 from the same `errno`, on the same stage's stderr —
+/// only later, after its own body worked out what to run. The lookup was always the
+/// child's, since [`Program::new`] only converts argv to `CString`s.
+///
+/// Returns the status to exit with; on success it does not return at all. The
+/// conversion allocates, which an ordinary stage does before the fork on purpose;
+/// here there is no before, and the caller is a body that has been allocating all
+/// along (it just ran shell code to produce these words).
+///
+/// # Panics
+/// Never: an empty `words` is reported as the failure it is.
+pub fn exec_stage(words: &[String]) -> u8 {
+    let program = match Program::new(words) {
+        Ok(program) => program,
+        Err(error) => return spawn_error_code(words.first().map_or("", String::as_str), &error),
+    };
+    // SAFETY: called from a stage's fork — `run_stage_in_shell`'s child — and the
+    // caller returns this status straight into the `_exit` that ends it.
+    let error = unsafe { program.exec() };
+    // To *this stage's* stderr, wherever its redirections put it, as for
+    // `StageBody::Exec`.
+    spawn_error_code(&words[0], &error)
+}
+
 /// Run one pipeline stage in a forked child, with every descriptor it takes
 /// installed before its body starts.
 ///

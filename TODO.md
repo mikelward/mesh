@@ -915,41 +915,53 @@ of each PR had landed by another route, but these pieces had not.
       `whole_value` hands it over typed: `puts f()` on a list renders per line and
       `puts style(…)` keeps its attributes, while argv gets `value_argument_text` and
       the same loud refusals a bare list already meets.
-- [ ] **A value argument is evaluated by the parent, not by the stage that runs it.**
-      Raised in review on the PR above, and the root the next two items share. Value
-      arguments run while the stage is assembled in `run_ast_pipeline`; a backgrounded or
-      piped stage runs in a *fork* that has not happened yet, so the work and any side
-      effects land in the parent.
+- [x] **A stage evaluates its own value arguments, in its fork.** Raised in review on
+      the value-argument PR. Value arguments used to run while the stage was assembled
+      in `run_ast_pipeline`; a backgrounded or piped stage runs in a *fork* that had
+      not happened yet, so the work and any side effects landed in the parent —
+      `puts change() | cat` left `n=MUTATED` where `docs/REFERENCE.md` promises the
+      fork keeps it, and `puts $(sleep 10) &` was refused outright because it would
+      have spent the ten seconds at the prompt.
 
-      **Backgrounding is refused for now**, because there it is visibly wrong:
-      `puts $(sleep 10) &` would spend the ten seconds in the parent before registering
-      the job, so the prompt hangs and the `&` buys nothing — and
-      `docs/REFERENCE.md` promises a background stage's changes stay in the child, which
-      a mutating argument would break (`puts change() &` left `n=MUTATED` where
-      `change &` correctly leaves `n=before`). The refusal covers an **interpolated
-      capture** and a redirect target too (`repl::carries_a_value`), since those are
-      evaluated in the same place.
+      A stage whose words carry a value now travels **unexpanded** to its own process
+      as `StageBody::Deferred`, and `run_stage_in_shell` expands it there. What the
+      words come to is also what decides, that late, how the stage ends: a function
+      call, a builtin, or this process replaced by a program through the new
+      `exec::exec_stage`. `exec::Cmd::in_shell` is true for every deferred stage,
+      which is what keeps the parent from building a `Program` for argv it does not
+      have yet.
 
-      **A foreground pipeline is allowed**, with the same isolation gap and nothing
-      observable: the pipeline waits either way, the result is right, and refusing it
-      would cost `puts $(pwd) | cat`. A mutating call as an argument to a piped stage
-      does reach the parent's globals, which the restructure below fixes.
+      Two consequences worth knowing:
 
-      The fix is for the *stage* to evaluate its own arguments. A `Stage` now carries
-      its words parsed all the way down and `repl::expand_stage` is the one place that
-      expands them (see the item below), so what is left is moving that call **past the
-      fork** — into `run_stage_in_shell`, which already runs in the child.
+      - A job listing shows an unevaluated value as `$(…)` (`repl::display_words`),
+        since printing it properly would mean running it in the shell — the very thing
+        being deferred.
+      - A deferred stage does not refresh the job table unless its command word is
+        literally `jobs` (`repl::run_stages`). Treating it like a *function* stage —
+        conservatively, since what it runs is equally unknowable — reaped for every
+        `puts $(x) | cat` as well, and a reap removes finished jobs: a later
+        `wait $j` reported "no current job" instead of the status. Also from review.
+      - A refusal that depends on what the words come to now arrives from the stage.
+        `c = return` then `$c 7 &` is refused at the prompt with status 2; `$c $(x) &`
+        starts a job that reports the same message and exits 2, which `wait` gives
+        back. That is the shape every other failing background command already has
+        (`nosuchcmd &` starts and reports 127), so it stays.
 
-      Two things in `exec.rs` hold it in the parent, and neither is incidental:
+      Reporting an unknown command does **not** change, which is worth writing down
+      because it looks like it should: `Program::new` only converts argv to
+      `CString`s, so the PATH lookup was always `execvp`'s, in the stage's own
+      process. `nosuchcmd $(x) 2> log` and `nosuchcmd foo 2> log` both put the message
+      in `log` and report 127, piped or not, before this change and after.
 
-      - `Program::new(&cmd.words)` is built before forking (`exec.rs:1491`), so a
-        "command not found" is the shell's report rather than a child's. A stage whose
-        argv is not known until the fork would have to `exec` from inside the child —
-        `in_shell` for every such stage, with the body ending in an exec.
-      - Redirect targets are resolved in the parent, **concurrently across stages**
-        (`exec.rs:1367`), which is what keeps `cat < fifo | cmd > fifo` from
-        deadlocking. So a value in a *target* (`> "o$(n).txt"`) stays the parent's
-        either way, and backgrounding one stays refused.
+      A stage that **redirects** does not defer (`repl::can_defer`), and backgrounding
+      a value in one stays refused (`repl::carries_a_value`). The shell resolves every
+      stage's targets before it forks any of them, concurrently across stages, which is
+      what keeps `cat < fifo | cmd > fifo` from deadlocking — so deferring the words
+      while the targets stayed behind would expand the targets *first*, reversing the
+      documented order. Raised in review, where it had done exactly that: a failing
+      target stopped the words from running, and `f * $(x) > summary | cat` globbed the
+      `summary` its own redirection had just created.
+
 - [x] **A value in a word is evaluated when that word is expanded.** Raised in review
       on the PR above. Value arguments used to run while the stage was assembled in
       `run_ast_pipeline`, with the words expanded later as a batch, so a value that

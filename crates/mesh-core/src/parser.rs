@@ -102,7 +102,10 @@ impl Word {
         }
     }
 
-    fn is_bare_text(&self, expected: &str) -> bool {
+    /// Is this word exactly `expected`, spelled bare? Asked where a *spelling*
+    /// settles something before expansion could — a keyword, or which builtin a
+    /// stage is about to be.
+    pub(crate) fn is_bare_text(&self, expected: &str) -> bool {
         matches!(self.pieces.as_slice(), [WordPiece::Text { text, quote: QuoteMode::Bare }] if text == expected)
     }
 }
