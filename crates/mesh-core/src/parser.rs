@@ -2107,6 +2107,58 @@ impl Parser {
         {
             return true;
         }
+        // A modifier chain that ends in a **parenthesized argument list** is a value,
+        // not a word: a command word stops in front of the `(`, so the arguments
+        // would otherwise arrive as a separate argument glued to it. Recognizing the
+        // whole chain here is what lets `puts $env:get(EDITOR, vim)` read in command
+        // position exactly as it does on the right of an `=`.
+        //
+        // Asked of the tokens, like the attached-call check above, because the signal
+        // is the shape of the run rather than anything a parsed word records. A chain
+        // with no argument list (`puts $x:upper`) falls through and stays a word.
+        // A leading `...` is deliberately *not* skipped here: `CommandItem::Value`
+        // has no spread variant, so routing `...$x:split(":")` through the
+        // expression parser would build a `UnaryOp::Spread` nothing consumes and
+        // pass one list where the reader asked for its elements. Left as the syntax
+        // error it already was until the spread reaches the value-argument path.
+        if matches!(
+            self.peek().map(|token| &token.value),
+            Some(TokenKind::Word(_))
+        ) {
+            // **Every** step of the run has to abut the one before it. In command
+            // position spacing is what separates one argument from the next, so a
+            // gap anywhere ends the chain: `puts $x :upper(lo)` is the word `$x`
+            // and a separate `:upper(lo)` modifier-reference call, and
+            // `puts $x:upper (1)` is a chain and a separate `(1)`. Merging across
+            // either gap would take an argument the reader gave to `puts`.
+            let abuts = |this: &Self, offset: usize| {
+                this.tokens
+                    .get(this.position + offset)
+                    .zip(this.tokens.get(this.position + offset - 1))
+                    .is_some_and(|(token, previous)| token.span.start == previous.span.end)
+            };
+            let mut offset = 1;
+            while matches!(
+                self.tokens.get(self.position + offset).map(|t| &t.value),
+                Some(TokenKind::Colon)
+            ) && abuts(self, offset)
+            {
+                let Some(name) = self.word_text_at(offset + 1) else {
+                    break;
+                };
+                if !modifier_name(name) || !abuts(self, offset + 1) {
+                    break;
+                }
+                offset += 2;
+                if matches!(
+                    self.tokens.get(self.position + offset).map(|t| &t.value),
+                    Some(TokenKind::LParen)
+                ) && abuts(self, offset)
+                {
+                    return true;
+                }
+            }
+        }
         // An attached modifier-reference call — `:exists("Cargo.toml")` — the same
         // form `value_start_in` admits at the start of a statement. A bare `:name`
         // stays a word, so `puts :stem` keeps its reading.

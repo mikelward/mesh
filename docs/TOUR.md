@@ -466,9 +466,39 @@ mesh$ <strong>puts $fields:len</strong>
 </pre>
 
 `:split` treats the separator as a terminator, so a trailing delimiter adds no
-empty element (`"a:b:":split(":")` is `[a b]`). These argument-taking modifiers
-work in an assignment or other value context today; the bare command-word form
-(`puts $dirs:join(":")`) is not wired up yet.
+empty element (`"a:b:":split(":")` is `[a b]`). These read the same as a command
+argument as they do on the right of an `=` — `puts $dirs:join(":")` — with one
+exception: spreading one at a command boundary (`puts ...$path:split(":")`) is
+not wired up yet, so bind it first.
+
+`:get(KEY, DEFAULT)` is the **total** accessor, where `$m.key` and `$xs[i]` fail
+loud. It is how you read something that may not be there:
+
+<pre>
+mesh$ <strong>puts $env:get(EDITOR, vim)</strong>
+vim
+mesh$ <strong>puts $fields:get(9, "-")</strong>
+-
+</pre>
+
+A bare `$env` is the whole environment as a map, which is what gives `:get` an
+ordinary map to work on; `$env.NAME` stays the strict read that errors when the
+name is unset. Note that a name bound to `""` is *present*, so it wins over the
+default — bash's `${EMPTY:-vim}` substitutes, and this does not.
+
+Strings have an affix family for dropping a known prefix or suffix, and a replace
+family. The pattern matches **verbatim**, so a `.` is a dot rather than "any
+character" — a string never quietly becomes a regex. (`:replaceall` is global;
+`:replacestart` and `:replaceend` act only on a match at that edge.)
+
+<pre>
+mesh$ <strong>puts "report.tar.gz":stripend(".tar.gz")</strong>
+report
+mesh$ <strong>puts "a.b.c":replaceall(".", "-")</strong>
+a-b-c
+mesh$ <strong>puts "one.js":replaceend(".js", ".ts")</strong>
+one.ts
+</pre>
 
 ## Numbers, booleans, and operators
 

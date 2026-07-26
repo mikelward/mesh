@@ -437,13 +437,15 @@ spelling in a parenthetical, so a bash reflex has somewhere to go:
 
 ```
 mesh$ read line
-mesh: command not found: read (mesh spells this `gets`, which is not built yet)
+mesh: command not found: read (mesh spells this `gets`)
 mesh$ local x = 5
 mesh: command not found: local (a plain `x = 5` inside a `func` is already local)
 ```
 
 A note only names something that works today, so it never trades one error for
-another; the one exception says so out loud, as `gets` does above.
+another. It checks rather than asserts: while `gets` was still unbuilt the same
+note read "which is not built yet", and it retired that caveat by itself the
+moment the builtin landed.
 
 `echo` is deliberately *not* intercepted — an external `echo` handles `-n` and
 `-e`, which mesh's flag-free [`puts`](#builtins) would print as text; the note
@@ -675,6 +677,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `help [name …]` | List every builtin with its usage, then the shapes a line takes, each with a one-line summary. With names, explain each one instead — a builtin's entry is exactly what `name --help` prints, and a keyword's shows its syntax. Every reserved word and every operator answers, asked for as you would type it (`help unless`, `help '+='`); where several share a row, that row explains the family, so `help else` answers with `if`. A name that is neither is an error: an external command's help is its own, so ask it with `name --help`. |
 | `puts [arg …]` | Render each argument and print them separated by single spaces, then a newline. No arguments prints a blank line. Rendering is per value: a scalar as itself, a **list** as its elements joined by newlines, a **map** as `key: value` lines. A value with no byte form — a job or stream handle, a function, a pattern — is a loud error rather than a guess, and so is a collection nested inside one. Unlike argv, `puts` sees the real value, so `puts $xs` needs no `...`; a *written* argument keeps its own text, so `puts 007` prints `007`. It takes no flags. |
 | `print [arg …]` | The same as `puts` with **no trailing newline**, for partial lines. No arguments prints nothing. |
+| `gets [var]` | Read one line from stdin, strip its trailing newline, and bind it to `var`. **At end of input the status is `1` and `var` is left unchanged**, which is what terminates `while gets line { … }`. An empty line is a successful read of `""` — a blank line mid-file must not end a loop — so only a zero-byte read ends it, and a final line with no trailing newline is still a line. A line that is not valid UTF-8 is **refused** rather than repaired — status `2`, and `var` is left alone — following the capture rather than `$env`'s lossy read; status `2` is also what an I/O error reports, so `1` means end of input and nothing else. Interactively, **Ctrl-C cancels a read** — status `130`, and `var` keeps whatever it held, since a cancelled read has read nothing. It reads a byte at a time, so the bytes after the line reach whatever runs next rather than being swallowed by a buffer. With no `var` it consumes the line and reports only whether there was one. The value form `gets()`, which yields the line into an expression, is not wired up yet. |
 | `style(text, fg: …, bg: …, bold: …)` | A [styled value](#styled-values) — text plus display attributes. A **value call**, parens attached, because a command position yields a status. Colors are the sixteen ANSI names: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `grey` (or `gray`, or `bright-black`), and `bright-` forms of the rest. |
 | `link(text, url)` | A [styled value](#styled-values) carrying an `OSC 8` hyperlink, so `text` is clickable. The url needs a **scheme** (`https://…`, `file://host/path`) and anything RFC 3986 forbids raw is percent-encoded, a space included; over 2083 encoded bytes is refused, since past a terminal's own limit the whole sequence — link text included — is dropped. |
 | `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`. `CDPATH` and autocd are not implemented, so a bare directory name is a command, not a `cd`. |
@@ -711,7 +714,7 @@ prompt -- --reset             # sets the prompt to the text `--reset`
 kill -- -9 %1                 # looks for a job named `-9`, not signal 9
 ```
 
-Which command consumes it depends on which has options to end. `puts`, `print`,
+Which command consumes it depends on which has options to end. `puts`, `print`, `gets`,
 `clip`, `notify`, `cd`, `source` and `help` have none of their own, so the terminator
 is simply removed. `kill`, `disown`, `prompt` and `prompt-hook` do, so each ends its
 own options at `--` — only they know where those stop.
@@ -1380,6 +1383,12 @@ mesh **reserves** for a modifier it has not built yet — `:sort`, `:words`,
 | `:tty` | stream handle | Is that stream a terminal? The `test -t N` replacement — see [`$sh.args` and `$sh.name`](#shargs-and-shname). |
 | `:split(SEP)` | string | Split on the literal separator into a list. |
 | `:join(SEP)` | list | Fold the list into a string, `SEP` between elements. |
+| `:get(KEY, DEFAULT)` | map or list | **Total** access — `DEFAULT` when the key or index is absent. |
+| `:stripstart(P)` / `:stripend(S)` | string or list | Drop the affix once if it is there; a no-op otherwise. |
+| `:trimstart` / `:trimend` | string or list | Peel whitespace from that end, repeatedly. |
+| `:trimstart(CHARS)` / `:trimend(CHARS)` | string or list | Peel any of `CHARS` from that end, repeatedly. |
+| `:replaceall(OLD, NEW)` | string or list | Replace every occurrence of the literal `OLD`. |
+| `:replacestart(OLD, NEW)` / `:replaceend(OLD, NEW)` | string or list | Replace a **leading** / **trailing** occurrence only. |
 | `:map(F)` / `:filter(F)` / `:each(F)` | list | Apply a callable per element — see [Functions](#functions). |
 | `:i` `:m` `:s` `:x` | regex | Pattern flags — see [Operators and matching](#operators-and-matching). |
 | `:capture` | a **call** | Every channel of the call as a record — see [Functions](#functions). |
@@ -1445,14 +1454,75 @@ because `:split` trims a trailing empty field, `:join` then `:split` round-trips
 losslessly only when the list has no empty final element (`[a ""]:join(":")` is
 `"a:"`, which splits back to `[a]`).
 
+`:get(KEY, DEFAULT)` is the **total** accessor, where `$m.key` and `$xs[i]` fail
+loud: it answers `DEFAULT` when the key or index is absent, which is what makes
+`$env:get(EDITOR, vim)` the mesh spelling of `${EDITOR:-vim}`. A map takes a
+string key and a list an integer index, negative counting from the end. Note the
+one difference from bash: a key bound to `""` is **present**, so it wins over the
+default, where `${EMPTY:-x}` substitutes. Asking a map for an integer — or a list
+for a name — is a loud error rather than a silent default: a key of the wrong
+*type* is a mistake in the program, not an absence in the data. A bare `$env` is
+the whole environment as a map, which is what gives `:get` an ordinary map to
+work on; `$env.NAME` stays the strict read that errors when unset. Note that
+`puts $env` is refused: the path-type names are lists, and a collection nested in
+a collection has no rendering — the same answer `puts` gives for any such map.
+Read it with `$env:keys`, `$env:get(NAME, …)`, or `$env.NAME`.
+
+```mesh
+editor = $env:get(EDITOR, vim)
+puts $env:get(MESH_DEBUG, false)
+xs = [a b c]
+puts $xs:get(9, "-")            # -
+```
+
+The **affix** family drops a known prefix or suffix **once** — the everyday
+"strip a known extension" reach, with no regex escaping and no interior-match
+surprise (a global `:replaceall(".tar.gz", "")` would also rewrite
+`a.tar.gz.bak`). The **trim** pair peels repeatedly instead: whitespace by
+default, or any of a given character set.
+
+```mesh
+puts "report.tar.gz":stripend(".tar.gz")   # report
+puts "report.tar.gz":stripend(".zip")      # report.tar.gz — no match, no change
+puts "///a//":trimend("/")                 # ///a
+```
+
+The **replace** family matches its pattern **verbatim** — metacharacters and all,
+so a string full of `.` and `*` never quietly becomes one. `:replaceall` is
+global, as its name says; `:replacestart` and `:replaceend` act only on a match at
+that edge, so a pattern that happens to match in the middle leaves the string
+alone.
+
+```mesh
+puts "a.b.c":replaceall(".", "-")          # a-b-c   — a literal dot
+puts "one.js":replaceend(".js", ".ts")     # one.ts
+puts "a.b.c":replacestart("b", "Z")        # a.b.c   — no leading match
+```
+
+A **regex** pattern is not implemented yet, so the pattern is *always* the literal
+string. Two consequences worth knowing until it lands:
+
+- An `re()` value is refused, naming the gap.
+- A bare `/a/` is not special here — it is the three-character text `/a/`, and a
+  subject that does not contain it is simply unchanged. That is the reading a
+  quoted `"/a/"` needs (`"x/a/y":replaceall("/a/", "/b/")` is `x/b/y`), and by the
+  time the pattern reaches the modifier the two are the same value, so nothing can
+  tell them apart. Once the `/…/` slot `DESIGN.md` §"String" specifies is built, a
+  bare one reads as a pattern and the quoted form keeps its literal meaning.
+
+Every modifier here is a value modifier, so each **maps element-wise over a
+list** — `$paths:stripend(".js")` rewrites each path — except `:get`, which
+consumes the collection as a whole.
+
 `:split` operates on the **already-evaluated** value, so a `$(…)` capture has had
 its trailing newline trimmed before `:split` runs (`$(printf "a:\n"):split(":")`
 is `[a]`). Binding a split modifier to a substitution's *raw* bytes — the
 `DESIGN.md` split-modifier behavior, shared with the not-yet-built `:lines` /
-`:nulls` / `:raw` family — is deferred. Argument-taking modifiers currently work in expression position (an
-assignment right-hand side or other value context); the command-word form
-(`echo $dirs:join(":")`) is not wired up yet. Other argument-taking modifiers such
-as `:get(KEY, DEFAULT)` remain unimplemented.
+`:nulls` / `:raw` family — is deferred. Argument-taking modifiers work in expression position (an assignment right-hand
+side or other value context) and in command-argument position
+(`echo $dirs:join(":")`). Not yet: the **spread** of one at a command boundary —
+`puts ...$x:split(":")` is a syntax error, so bind it first (`xs = $x:split(":")`,
+then `puts ...$xs`). `:has(VALUE)` also remains unimplemented.
 
 Bare decimal literals and `true` / `false` produce typed integer and boolean
 values. Arithmetic requires integers, comparisons return booleans, and strings
@@ -2150,11 +2220,16 @@ func dir-info() { style(tilde-pwd(), fg: blue) }    # a prompt segment
 
 ## Not yet implemented
 
-The argument-taking modifiers that work today are `:split`, `:join`, `:map`,
-`:filter`, and `:each`; the rest of the `DESIGN.md` set (`:get`, `:match`,
-`:words`, `:lines`, `:replace`, the time and sort families) is not implemented,
-and neither is the command-word form of one (`puts $dirs:join(":")`) or the regex
-capture modifiers. Of heredocs, the command-redirection form documented under
+The argument-taking modifiers that work today are `:split`, `:join`, `:get`, the
+affix family (`:stripstart`, `:stripend`, `:trimstart`, `:trimend`), the replace
+family (`:replaceall`, `:replacestart`, `:replaceend`), and `:map` / `:filter` /
+`:each`; the rest of the `DESIGN.md` set (`:match`, `:has`, `:words`, `:lines`,
+the first-only `:replace`, the time and sort families) is not implemented, and
+neither are the regex capture modifiers. The replace family takes a **literal
+string** pattern only — its regex spelling is not built yet. One of them **spread** at a command boundary
+(`puts ...$x:split(":")`) is also not implemented — bind it first.
+`gets` reads a line as a command; the value form `gets()` does not.
+Of heredocs, the command-redirection form documented under
 Commands works, as do here-strings; a value-producing heredoc spelling does not.
 The history designators `!!`, `!string`, and `!n` are not implemented — only
 `!^`, `!$`, and `!*` are. `style` covers the sixteen ANSI colors only.

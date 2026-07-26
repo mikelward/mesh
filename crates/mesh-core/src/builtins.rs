@@ -25,6 +25,7 @@ const TABLE: &[(&str, &str)] = &[
     ("pwd", "Print the working directory"),
     ("puts [ARG ...]", "Render the arguments, then a newline"),
     ("print [ARG ...]", "As `puts`, with no trailing newline"),
+    ("gets [VAR]", "Read one line from stdin"),
     ("clip [TEXT ...]", "Copy text to the terminal's clipboard"),
     ("notify [TEXT ...]", "Raise a desktop notification"),
     ("exit [N]", "Leave the shell"),
@@ -982,11 +983,11 @@ mod tests {
             rename_note("echo").as_deref(),
             Some("mesh spells this `puts`")
         );
-        // `gets` is designed but unbuilt, so the note says so rather than
-        // sending the reader to a second `command not found`.
+        // The caveat retired itself when `gets` landed: the note checks
+        // `is_builtin`, so it now sends the reader straight to a working name.
         assert_eq!(
             rename_note("read").as_deref(),
-            Some("mesh spells this `gets`, which is not built yet")
+            Some("mesh spells this `gets`")
         );
         assert_eq!(
             rename_note("local").as_deref(),
