@@ -11,6 +11,8 @@ use std::io::IsTerminal;
 use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
+use crate::reaper;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirKind {
     In,
@@ -175,23 +177,23 @@ impl JobTable {
                 // a job that had died reported as stopped for good, and `wait`
                 // handing back its stop status instead of how it ended.
                 let mut status = None;
-                match poll_outcomes(&mut job.outcomes) {
-                    Some(WaitResult::Complete(code)) => {
+                match poll_outcomes(&mut job.outcomes).map(|polled| (polled.result, polled.seq)) {
+                    Some((WaitResult::Complete(code), _)) => {
                         status = Some(code);
                         // Reported as `done` below; the stopped mark would
                         // otherwise outlive the stop and mislead a later `wait`.
                         job.state = JobState::Running;
                     }
-                    Some(WaitResult::Stopped(code)) => {
+                    Some((WaitResult::Stopped(code), seq)) => {
                         job.state = JobState::Stopped(code);
-                        newly_current.push(job.id);
+                        newly_current.push((seq, job.id));
                     }
                     // A continue makes a job current wherever it is noticed —
                     // `bg` and a direct `kill -CONT` do it themselves, and a
                     // continue from a forked stage reaches the parent only here.
-                    Some(WaitResult::Continued) => {
+                    Some((WaitResult::Continued, seq)) => {
                         job.state = JobState::Running;
-                        newly_current.push(job.id);
+                        newly_current.push((seq, job.id));
                     }
                     None => {}
                 }
@@ -208,7 +210,16 @@ impl JobTable {
                 }
             })
             .collect();
-        for id in newly_current {
+        // By when the drain took each change, not by where the job sits in the
+        // table. Marking in table order made `%+` name whichever job the table
+        // held later, regardless of which had actually stopped later.
+        //
+        // This orders what the drain saw arrive separately, which a nudge per
+        // state change makes the usual case. Two changes in one scheduling
+        // interval are both pending before the drain starts and it cannot tell
+        // them apart — see `Transition::seq`.
+        newly_current.sort_by_key(|(seq, _)| *seq);
+        for (_, id) in newly_current {
             self.mark_current(id);
         }
         info
@@ -235,7 +246,9 @@ impl JobTable {
         // refreshes `$sh.jobs`, this is not a rare race: running anything at all
         // between the job finishing and the `fg` used to be enough to turn a
         // usable status into `mesh: fg: No such process`.
-        if let Some(WaitResult::Complete(status)) = poll_outcomes(&mut self.jobs[index].outcomes) {
+        if let Some(WaitResult::Complete(status)) =
+            poll_outcomes(&mut self.jobs[index].outcomes).map(|polled| polled.result)
+        {
             let job = self.jobs.remove(index);
             self.forget(job.id);
             note!("[{}] Done ({status}) {}", job.id, job.command);
@@ -323,7 +336,7 @@ impl JobTable {
         // Checked before the cached stop status is trusted: the job may have
         // been killed where it stood, or continued by something other than this
         // table, and either way the poll is what notices.
-        match poll_outcomes(&mut self.jobs[index].outcomes) {
+        match poll_outcomes(&mut self.jobs[index].outcomes).map(|polled| polled.result) {
             Some(WaitResult::Continued) => {
                 self.jobs[index].state = JobState::Running;
                 let id = self.jobs[index].id;
@@ -500,29 +513,37 @@ impl JobTable {
 
     /// Report jobs which completed since the preceding prompt and remove them.
     pub fn reap(&mut self) {
+        // Collected rather than marked as they are found, for the reason `info`
+        // sorts: a pass can notice several changes at once, and the order they
+        // are applied in decides `%+`.
+        let mut newly_current = Vec::new();
         let mut index = 0;
         while index < self.jobs.len() {
             // Every job, stopped ones included — see `info`.
-            match poll_outcomes(&mut self.jobs[index].outcomes) {
-                Some(WaitResult::Complete(status)) => {
+            match poll_outcomes(&mut self.jobs[index].outcomes)
+                .map(|polled| (polled.result, polled.seq))
+            {
+                Some((WaitResult::Complete(status), _)) => {
                     let job = self.jobs.remove(index);
                     self.forget(job.id);
                     note!("[{}] Done ({status}) {}", job.id, job.command);
                     continue;
                 }
-                Some(WaitResult::Stopped(code)) => {
+                Some((WaitResult::Stopped(code), seq)) => {
                     self.jobs[index].state = JobState::Stopped(code);
-                    let id = self.jobs[index].id;
-                    self.mark_current(id);
+                    newly_current.push((seq, self.jobs[index].id));
                 }
-                Some(WaitResult::Continued) => {
+                Some((WaitResult::Continued, seq)) => {
                     self.jobs[index].state = JobState::Running;
-                    let id = self.jobs[index].id;
-                    self.mark_current(id);
+                    newly_current.push((seq, self.jobs[index].id));
                 }
                 None => {}
             }
             index += 1;
+        }
+        newly_current.sort_by_key(|(seq, _)| *seq);
+        for (_, id) in newly_current {
+            self.mark_current(id);
         }
     }
 
@@ -1189,6 +1210,9 @@ pub fn run_pipeline(
                 if let Some(read) = read_end {
                     next_stdin = NextIn::Pipe(read);
                 }
+                // Claimed before anything can wait on it, so the drain knows
+                // this pid is the shell's to reap rather than one to step over.
+                reaper::own(pid);
                 outcomes.push(Outcome::Running { pid, piped_out });
             }
             Err(err) => {
@@ -1212,6 +1236,18 @@ pub fn run_pipeline(
         // falling through to `wait_outcomes`; the job then completes while the
         // nested child runs on, exactly as it does in a POSIX shell.
         if forked {
+            // The outcomes go with the stage's return, so nothing will ever read
+            // these children's statuses. They still have to be reaped — an
+            // unreaped child is a zombie for as long as the stage lives — but
+            // filing statuses no one can take grows the store for the life of a
+            // stage that loops, and once the kernel reuses one of those pids a
+            // later foreground child would read the old status instead of its
+            // own.
+            for outcome in &outcomes {
+                if let Outcome::Running { pid, .. } = outcome {
+                    reaper::abandon(*pid);
+                }
+            }
             return PipelineStatus::whole(0);
         }
         if let Some(pgid) = process_group {
@@ -1419,39 +1455,81 @@ fn wait_outcomes_until(outcomes: &mut [Outcome], on_interrupt: OnInterrupt) -> O
     Some(stopped.map_or(WaitResult::Complete(status), WaitResult::Stopped))
 }
 
-fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<WaitResult> {
+/// A poll's answer, with the arrival order of the transition behind it.
+///
+/// `seq` is what lets recency follow the *stops* rather than the table. Two jobs
+/// found stopped by the same poll are indistinguishable by anything else — the
+/// kernel reports that a child stopped, never when — so without carrying the
+/// drain's own ordering out to the caller, the only tiebreak left is whichever
+/// order the table happens to hold them in.
+struct Polled {
+    result: WaitResult,
+    seq: u64,
+}
+
+fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<Polled> {
+    // Everything the kernel is holding, before any of it is looked for. A poll
+    // that only drained the pid it was asked about would leave the rest sitting
+    // in the kernel, which is how state used to go stale between boundaries.
+    reaper::drain();
     let mut any_running = false;
     let mut status = 0;
+    // The newest stop or continue still standing, across every member. Kept
+    // rather than returned on sight: the store is a *queue*, so a job that
+    // stopped and was continued again between two polls has both waiting, and
+    // answering with the first left `$sh.jobs` reporting `stopped` until a second
+    // read happened to consume the rest. Reading is not supposed to be what moves
+    // the shell along.
+    let mut latest: Option<(u64, WaitResult)> = None;
     for outcome in &mut *outcomes {
         let Outcome::Running { pid, piped_out } = outcome else {
             continue;
         };
         let pid = *pid;
         let piped_out = *piped_out;
-        let mut raw = 0;
-        // `WCONTINUED` as well as `WUNTRACED`: without it a continue is simply
-        // invisible, and a job that something else restarted stays marked
-        // stopped for the rest of its life.
-        let result = unsafe {
-            libc::waitpid(
-                pid,
-                &mut raw,
-                libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED,
-            )
-        };
-        if result == 0 {
-            any_running = true;
-        } else if result > 0 && libc::WIFSTOPPED(raw) {
-            return Some(WaitResult::Stopped(128 + libc::WSTOPSIG(raw) as u8));
-        } else if result > 0 && libc::WIFCONTINUED(raw) {
-            return Some(WaitResult::Continued);
-        } else if result > 0 {
-            let code = wait_status(raw);
-            *outcome = Outcome::Completed { code, piped_out };
-            if code != 0 && !(piped_out && code == SIGPIPE_CODE) {
-                status = code;
+        let mut finished = None;
+        let mut pending: Option<(u64, WaitResult)> = None;
+        while let Some(transition) = reaper::take(pid) {
+            let raw = transition.raw;
+            let seq = transition.seq;
+            if libc::WIFSTOPPED(raw) {
+                pending = Some((seq, WaitResult::Stopped(128 + libc::WSTOPSIG(raw) as u8)));
+            } else if libc::WIFCONTINUED(raw) {
+                pending = Some((seq, WaitResult::Continued));
+            } else {
+                // Terminal: nothing can follow it, and it makes whatever this
+                // member did before irrelevant to what it *is*.
+                finished = Some(wait_status(raw));
+                break;
             }
         }
+        match finished {
+            Some(code) => {
+                *outcome = Outcome::Completed { code, piped_out };
+                if code != 0 && !(piped_out && code == SIGPIPE_CODE) {
+                    status = code;
+                }
+            }
+            // Only a member that is still there can make the job stopped, so a
+            // stop that its own exit overtook is dropped with it.
+            None => {
+                any_running = true;
+                if let Some((seq, result)) = pending {
+                    let newer = match &latest {
+                        Some((newest, _)) => seq > *newest,
+                        None => true,
+                    };
+                    if newer {
+                        latest = Some((seq, result));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((seq, result)) = latest
+        && any_running
+    {
+        return Some(Polled { result, seq });
     }
     if !any_running {
         status = outcomes.iter().fold(0, |status, outcome| match outcome {
@@ -1464,7 +1542,12 @@ fn poll_outcomes(outcomes: &mut [Outcome]) -> Option<WaitResult> {
             _ => status,
         });
     }
-    (!any_running).then_some(WaitResult::Complete(status))
+    // A completion needs no order: it removes the job rather than competing to
+    // be the current one.
+    (!any_running).then_some(Polled {
+        result: WaitResult::Complete(status),
+        seq: 0,
+    })
 }
 
 /// Hang up a job as the shell exits, where a group that is already gone is the
@@ -1590,6 +1673,9 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
         // SAFETY: leaving without unwinding, as above.
         unsafe { libc::_exit(i32::from(code)) };
     }
+    // The subshell is this process's child and nobody else's, so the drain is
+    // the one that must reap it.
+    reaper::own(pid);
     // A subshell has no job-table entry to be resumed from, so a stop would
     // otherwise strand it: the parent would return while the child sat stopped
     // forever, reachable only by an external `kill`. Until backgrounding is
@@ -1645,6 +1731,17 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
 /// wait on a *background* job reports the interruption as `ErrorKind::Interrupted`
 /// for the caller to give up on.
 fn wait_for_job(pid: libc::pid_t, on_interrupt: OnInterrupt) -> std::io::Result<(u8, bool)> {
+    // Here rather than at the callers, because this is the only place that
+    // blocks. Installed in `wait_outcomes_until` it covered pipelines and jobs
+    // and missed `fork_and_wait`, which reaches this directly — so a `fork { … }`
+    // block ran under the startup disposition, no wait was ever cut short, and
+    // every stop that happened meanwhile piled up to be drained together
+    // afterwards. `%+` then named whichever the drain happened to reach first.
+    //
+    // A catcher per blocking wait costs two `sigaction`s and two mask changes,
+    // against a call that is about to sleep. Cheap enough to put where it cannot
+    // be forgotten.
+    let _children = reaper::WaitCatcher::install();
     loop {
         // Checked before blocking as well as after, since a SIGINT that lands
         // between installing the handler and entering `waitpid` sets the flag
@@ -1652,32 +1749,38 @@ fn wait_for_job(pid: libc::pid_t, on_interrupt: OnInterrupt) -> std::io::Result<
         if on_interrupt == OnInterrupt::Abandon && SIGINT_SEEN.swap(false, Ordering::SeqCst) {
             return Err(std::io::Error::from(ErrorKind::Interrupted));
         }
-        let mut status = 0;
-        // SAFETY: `pid` is a live child PID and status points to writable
-        // storage. WUNTRACED requests the state transition needed for Ctrl-Z.
-        let result = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
-        if result < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == ErrorKind::Interrupted {
-                // Some other signal (a resized window, say) also lands here, so
-                // the flag rather than the `EINTR` is what says to give up.
-                if on_interrupt == OnInterrupt::Abandon && SIGINT_SEEN.swap(false, Ordering::SeqCst)
-                {
-                    return Err(err);
-                }
-                continue;
+        // The store first: a drain may already have taken what this wait is
+        // after, on behalf of some other job. Going straight to the kernel would
+        // block for news that has already arrived.
+        reaper::drain();
+        if let Some(transition) = reaper::take(pid) {
+            let status = transition.raw;
+            if libc::WIFEXITED(status) {
+                return Ok((libc::WEXITSTATUS(status) as u8, false));
             }
-            return Err(err);
+            if libc::WIFSIGNALED(status) {
+                return Ok((128u8.wrapping_add(libc::WTERMSIG(status) as u8), false));
+            }
+            if libc::WIFSTOPPED(status) {
+                return Ok((128u8.wrapping_add(libc::WSTOPSIG(status) as u8), true));
+            }
+            // A continue, which this wait did not ask about and cannot report.
+            // Keep waiting for the transition that ends it.
+            continue;
         }
-        if libc::WIFEXITED(status) {
-            return Ok((libc::WEXITSTATUS(status) as u8, false));
+        if !reaper::is_owned(pid) {
+            // Not a child of this process, or one whose last word has already
+            // been taken. Either way no further transition is coming, and the
+            // old code reached the same conclusion by way of `ECHILD`.
+            return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
         }
-        if libc::WIFSIGNALED(status) {
-            return Ok((128u8.wrapping_add(libc::WTERMSIG(status) as u8), false));
-        }
-        if libc::WIFSTOPPED(status) {
-            return Ok((128u8.wrapping_add(libc::WSTOPSIG(status) as u8), true));
-        }
+        // Sleeping rather than blocking in `waitpid`, because the catcher holds
+        // `SIGCHLD` and this hands it over atomically. A blocking `waitpid` has a
+        // window between the drain above and the syscall where a state change is
+        // handled and forgotten — leaving this asleep with an undrained
+        // transition behind it, so a long foreground wait collapses the arrival
+        // order of everything that happened during it.
+        reaper::wait_for_change();
     }
 }
 
@@ -2124,6 +2227,11 @@ static IN_FORKED_STAGE: AtomicBool = AtomicBool::new(false);
 /// `sleep`, and the prompt stops accepting input.
 pub(crate) fn mark_forked_stage() {
     IN_FORKED_STAGE.store(true, Ordering::Relaxed);
+    // The reaper's store came across the fork like everything else, and every
+    // pid in it belongs to the parent. Reaped here it would be a status this
+    // process has no right to and the parent then never sees, so a stage starts
+    // with nothing owned and nothing recorded.
+    reaper::forget_all();
 }
 
 /// Whether this process is a forked stage rather than the shell itself.

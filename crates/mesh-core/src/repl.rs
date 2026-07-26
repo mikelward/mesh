@@ -205,6 +205,11 @@ pub fn run() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Before anything can spawn a child. Every wait now reads from the reaper's
+    // store rather than calling `waitpid` itself, so this is not the optional
+    // extra a prompt-only notification would be — a shell without it would find
+    // the store permanently empty and wait forever.
+    crate::reaper::install();
     match &options.invocation {
         Invocation::Print(text) => {
             ExitCode::from(builtins::write_stdout("stdout", text.as_bytes()))

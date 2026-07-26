@@ -396,51 +396,95 @@ file as tasks land.
       job leaves the previous is promoted and the job behind it fills `%-`. An
       id still wins over a prefix, so `%1` is job 1. Deferred with a message that
       names it: `%?string`, the substring match `DESIGN.md` also defers.
-- [ ] **Learn about job state changes from `SIGCHLD` rather than by polling.**
-      The table is refreshed by *polling*: `info` and `reap` ask `waitpid` what
-      has changed since they last looked, which is why job state is only ever as
-      fresh as the last command boundary and why several changes noticed in one
-      pass arrive without an order between them. A handler that fires on
-      `SIGCHLD` and records each transition as it happens is what bash does, and
-      is the shape that fixes the class rather than its symptoms.
-      What it would buy, beyond the stop-ordering entry below: a `[1] Done` notice
-      at the moment a job finishes rather than at the next prompt, `$sh.jobs`
-      that is current without something having to read it, and the `jobdone` hook
-      `DESIGN.md` reserves — which cannot be honest while nothing knows a job is
-      done until asked. It would also close the last of the stopped-job races:
+- [x] **Reaping moved behind one owner, fed by `SIGCHLD`.** `waitpid` used to be
+      called wherever an answer was wanted, which made job state only as fresh as
+      the last command boundary and left changes noticed in one pass without an
+      order between them. `reaper::drain` now walks the pids the shell owns, asks
+      about each by name, and files what it gets stamped with the order it
+      arrived; everything that used to call `waitpid` reads from there.
+      This keeps the two properties that ruled out sprinkling
+      `waitpid(-1, WNOHANG | WUNTRACED)` at the call sites. Nothing steals: a
+      transition the drain takes on one job's behalf is *stored* rather than
+      discarded, so a blocking wait for another finds it waiting. And the handler
+      never touches the table — it does no work at all — so looking still cannot
+      change what the shell does.
+      Asking by name rather than discovering with `waitid(P_ALL, …, WNOWAIT)` is
+      what keeps the drain unobstructable, and what keeps it away from children
+      that are not the shell's: the completion helper waits on its own with
+      `Child::wait`, and a child inherited across `exec` belongs to whoever
+      spawned it. Discovering instead deadlocks, because an unowned pid's
+      transition stays pending and every probe answers with it.
+      A wait sleeps in `sigsuspend` with `SIGCHLD` held by `WaitCatcher`, which
+      hands the signal over atomically — a blocking `waitpid` leaves a window
+      where a state change is handled and forgotten, and the waiter then sleeps
+      with an undrained transition behind it. The handler forwards to the waiting
+      thread with `pthread_kill`, since mesh runs a reader thread for `$(…)` and
+      `:capture` and a process-directed signal reaches whichever thread does not
+      block it.
+      A self-pipe did this first and cost seven review findings, all of them the
+      same shape: a pipe is a descriptor, mesh lets a script name any descriptor,
+      and the endpoint kept turning up where a script had addressed it — including
+      by path, through `/dev/fd/100`, which no care about descriptor *names* can
+      cover. `pthread_kill` needs no namespace at all.
+- [ ] **Stops inside the same sub-millisecond window are still ordered
+      arbitrarily.** Recency follows the order the drain *took* each transition,
+      which is the order they happened as long as the shell drains between them.
+      Two that are both pending before a drain runs are ordered by whatever the
+      drain's walk over its owned pids reaches first, which is a `HashSet` and
+      therefore nothing.
+      Measured, with two jobs stopped from outside: at a 1ms gap — one `fork`
+      between the signals — `bg %+` names the job that stopped last 12 times out
+      of 12, as it does at 5ms, 20ms, 50ms and 150ms. Issued back to back with
+      nothing between them it is 8 of 15, which is a coin flip and the honest
+      answer: two signals in one syscall burst *are* concurrent, and there is no
+      order to recover. For contrast the same script before this work was 0 of 15
+      at every gap, because table position always won.
+      This is the residue of the older "ordered by the table, not by when they
+      happened" entry, and what remains of it is genuinely unavailable:
+      `SIGCHLD` does not queue, so a handler cannot count what coalesced, and no
+      portable interface records *when* a child stopped — `/proc/pid/stat` has a
+      start time and nothing else. See the `SA_SIGINFO` entry below for the one
+      move that would narrow it further without leaving POSIX.
+- [ ] **Record `si_pid` from the handler to narrow the ordering window.**
+      `SA_SIGINFO` hands the handler a `siginfo_t` naming the child that caused
+      *this* delivery. Recording those in arrival order — a preallocated ring and
+      atomics, which is async-signal-safe — would move the ordering boundary from
+      "between drains" to "between signal deliveries", and a delivery is much
+      cheaper than a drain, so the window above gets smaller.
+      It cannot close it. `SIGCHLD` is a standard signal, so two arriving before
+      the handler runs still collapse into one delivery and one `si_pid`; the
+      second child's place in the order is gone before any code can see it. So
+      this is a narrowing, not a fix, and worth doing only if the window turns
+      out to matter in practice — it costs a handler that writes state, which the
+      current one deliberately does not.
+      The alternatives all leave POSIX and none is worth it: `signalfd` still
+      delivers the coalesced signal; `pidfd_open` plus `epoll` orders *exits*
+      precisely but has no stop notification, and costs a descriptor per job;
+      `kqueue`'s `EVFILT_PROC` genuinely queues and is the closest thing to a
+      real answer, but only on the BSDs; the netlink proc connector has no
+      stop event and wants `CAP_NET_ADMIN`; and `ptrace` would work by making the
+      shell a debugger, which changes signal delivery and locks out real ones.
+- [ ] **Notify about a finished job when it finishes, not at the next prompt.**
+      The table is now current the moment anything drains, but the *notice* is
+      still printed by `reap` at the top of the REPL loop, so a job that ends
+      while a line is being typed is announced only once that line is submitted.
+      Bash is the same by default and prints immediately under `set -b`; doing it
+      here means the line editor waking on a child's state change and redrawing
+      the prompt around the notice, which is a reedline integration question
+      rather than a job-control one — reedline owns the terminal read, and
+      `SIGCHLD` carries `SA_RESTART` outside a wait precisely so it does *not*
+      disturb that read. The `jobdone` hook `DESIGN.md` reserves wants the same
+      machinery, and cannot run *from* the handler in any case, since it is
+      arbitrary mesh code and the handler may only forward.
+- [ ] **A stopped job killed from outside can still be reported stopped.**
       `wait` reports a stopped job's cached stop rather than blocking, since a
-      stopped job does not finish on its own, so a job killed *out* of its stop
-      by something other than this shell's own `kill` can be reported as stopped
-      by a `wait` whose single poll ran before the kernel posted the exit. Our
-      own `kill -KILL` clears the mark so that wait blocks instead, but nothing
-      can do the same for a `kill -9` typed in another terminal.
-      What makes it a real change rather than a swap: the poll's contract is that
-      *looking never changes what the shell does*, and a handler mutating the
-      table breaks the single-threaded assumption that contract rests on, so the
-      handler can only record (async-signal-safe) and let the loop drain it. It
-      must also not consume a notification a foreground `wait_outcomes` is about
-      to want — the same hazard that rules out a central
-      `waitpid(-1, WNOHANG | WUNTRACED)` drain today — so reaping has to move
-      behind one owner rather than being done wherever it is convenient.
-- [ ] **Stops noticed together are ordered by the table, not by when they
-      happened.** `info` and `reap` learn about stops by *polling*: a pass finds
-      "these jobs are stopped now" and marks each current, in the order the table
-      holds them. When two jobs stop between one poll and the next, the later
-      stop can therefore end up behind the earlier one in recency. Reproduced
-      with two `sleep 30 &` jobs, stopping job 2 and then job 1 from outside:
-      `%+` names job 2, though job 1 was the most recent stop.
-      The order is genuinely unavailable to a poll — `waitpid` reports *that* a
-      job stopped, never when, and no portable per-process stop timestamp
-      exists. Getting it right means learning of each stop as it happens, i.e. a
-      SIGCHLD-driven notification path feeding the table, which is what bash
-      does and a real change to a runtime that deliberately polls. A cheaper
-      half-step is draining `waitpid(-1, WNOHANG | WUNTRACED)` centrally, since
-      the kernel queues those notifications in event order — but a central drain
-      can consume a notification a foreground `wait_outcomes` is about to want,
-      so it needs care rather than a swap. Until then the limitation is only
-      visible in `fg` / `bg` / `%+` with no operand, and picking the wrong one of
-      two simultaneously stopped jobs is recoverable with an explicit id.
-      *(Raised by Codex review on #222.)*
+      stopped job does not finish on its own. Our own `kill -KILL` clears that
+      mark so the wait blocks for the real status, but a `kill -9` typed in
+      another terminal cannot be intercepted that way: if the drain has not yet
+      run when `wait` is asked, the stop is still what it knows. Closing it means
+      the wait consulting the kernel about whether the process is still stopped,
+      which has no portable answer, or treating any pending nudge as a reason to
+      re-drain before trusting the mark.
 - [x] **Job handles.** `j = cmd &` binds the job rather than the status of
       launching it, as a distinct `Value::Job` carrying the id. Reading a member
       resolves it against the live table, so `$j.state` moves on with the job

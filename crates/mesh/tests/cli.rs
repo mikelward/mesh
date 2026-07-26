@@ -2764,6 +2764,491 @@ fn a_continued_job_becomes_current_however_it_is_noticed() {
 }
 
 #[test]
+fn stops_between_command_boundaries_keep_the_order_they_happened_in() {
+    // Two jobs stopped from *outside* the shell, with no command boundary
+    // between them, so neither stop is noticed by anything the script ran.
+    //
+    // Job 2 is stopped first and job 1 second, so `%+` is job 1. Marking them in
+    // the order the table holds them made it job 2 — the answer that is right
+    // about the table and wrong about the world.
+    //
+    // The 150ms is load-bearing and is the *limit* of the guarantee, not a
+    // convenience. A nudge per state change means a shell awake between two
+    // stops takes them in order; two that land in the same scheduling interval
+    // are both pending before the drain starts, and `waitid` enumerates children
+    // in an order of the kernel's choosing. Without the pause this names job 2
+    // about nine runs in ten. Nothing portable records when a child stopped, so
+    // that case stays arbitrary — `TODO.md` keeps it rather than this test
+    // pretending to cover it.
+    let out = run_with_input(
+        "sh -c \"sleep 30\" &\n\
+         sh -c \"sleep 30\" &\n\
+         sleep 0.3\n\
+         p1 = $sh.jobs[1].pid\n\
+         p2 = $sh.jobs[2].pid\n\
+         sh -c \"kill -STOP -$p2; sleep 0.15; kill -STOP -$p1\"\n\
+         sleep 0.3\n\
+         bg %+\n",
+    );
+    // `bg` names the job it restarted, which is how `%+` is observable at all.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[1] Running"),
+        "%+ named the job the table held later, not the one that stopped later: {stderr}"
+    );
+}
+
+// The shell under test loops forever by design, so it is killed rather than
+// waited for — and killed as a *group*, see below. `wait4` is what reaps it.
+#[allow(clippy::zombie_processes)]
+#[test]
+fn a_forked_stage_reaps_the_background_children_it_abandons() {
+    // A forked stage that only launches background commands never reaches a
+    // foreground wait, a `jobs`, or anything else that drains. Its children are
+    // its own to reap, and with nothing reaping them they pile up as zombies
+    // until the stage hits its process limit — over 1600 in a second and a half
+    // before this fix, and the same on main, so it is older than the reaper.
+    // Abandoning a child now drains first, so each launch collects the ones
+    // before it.
+    //
+    // Two things this test has to get right, and got wrong first:
+    //
+    // The shell runs in its own **process group**, and the whole group is
+    // killed. Killing just the shell reparents the looping stage to init, where
+    // it keeps forking for the life of the machine — that is not a tidiness
+    // point, it exhausted this container's process table while I was developing
+    // the fix.
+    //
+    // And only *this group's* zombies are counted. A global `/proc` scan trips
+    // on whatever else the host or the rest of the suite is doing, which is a
+    // failure that has nothing to do with the shell under test.
+    if !Path::new("/proc/self/stat").exists() {
+        return; // reading process state this way is Linux-only
+    }
+    let mut command = mesh_command();
+    command
+        .arg("-c")
+        .arg("fork { loop { sh -c \"exit 7\" &; x = 1 } }")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: `setpgid` only moves this child into a group of its own, and is
+    // async-signal-safe, which is the bar `pre_exec` sets.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().expect("spawn mesh");
+    let group = child.id() as libc::pid_t;
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+
+    let zombies = zombies_in_group(group);
+
+    // The group, not the process: everything the shell forked shares it.
+    // SAFETY: a negated pid names its process group, which `pre_exec` created.
+    unsafe { libc::kill(-group, libc::SIGKILL) };
+    let mut status = 0;
+    // SAFETY: reaping the shell this test spawned.
+    unsafe { libc::wait4(group, &mut status, 0, std::ptr::null_mut()) };
+
+    assert!(
+        zombies < 50,
+        "a stage that only backgrounds left {zombies} zombies behind"
+    );
+}
+
+/// Zombies whose process group is `group`, read out of `/proc`.
+///
+/// By group rather than globally, so the count is about the shell under test
+/// and not about whatever else the host happens to be running.
+fn zombies_in_group(group: libc::pid_t) -> usize {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    let mut zombies = 0;
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // `comm` can contain spaces and parentheses, so the fields after it are
+        // taken from the last ')': state, ppid, pgrp.
+        let Some((_, rest)) = text.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let state = fields.next().unwrap_or("");
+        let _ppid = fields.next();
+        let pgrp: libc::pid_t = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+        if state.starts_with('Z') && pgrp == group {
+            zombies += 1;
+        }
+    }
+    zombies
+}
+
+#[test]
+fn a_fork_block_still_notices_what_happens_to_other_jobs() {
+    // Every blocking wait has to be cut short when a child changes state, or the
+    // changes pile up and are drained together afterwards — at which point their
+    // order is gone.
+    //
+    // The catcher was installed in `wait_outcomes_until`, which covers pipelines
+    // and jobs but not `fork_and_wait`: that reaches the blocking wait directly.
+    // So a `fork { … }` block ran under the startup disposition, nothing woke it,
+    // and two stops 300ms apart arrived as one batch. `bg %+` named the wrong job
+    // six runs in eight.
+    let out = run_with_input(
+        "sh -c \"sleep 30\" &\n\
+         sh -c \"sleep 30\" &\n\
+         sleep 0.3\n\
+         p1 = $sh.jobs[1].pid\n\
+         p2 = $sh.jobs[2].pid\n\
+         sh -c \"sleep 0.2; kill -STOP -$p2; sleep 0.3; kill -STOP -$p1\" &\n\
+         fork { sleep 1 }\n\
+         bg %+\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[1] Running"),
+        "a wait outside the pipeline path did not notice the stops as they happened: {stderr}"
+    );
+}
+
+#[test]
+fn a_stop_and_the_continue_after_it_are_both_read_at_once() {
+    // The store keeps a *queue* per pid, because a job can stop and be continued
+    // again between two polls. Answering with the first of those left `$sh.jobs`
+    // reporting `stopped` for a job that was running, and only a *second* read
+    // reported the truth — reading is not supposed to be what moves the shell on.
+    //
+    // The gap matters: continued quickly enough, the kernel discards the pending
+    // stop notification and there is only ever one transition to find. A second
+    // of separation is what guarantees the stop is observed before the continue,
+    // which is the case that queues both.
+    let out = run_with_input(
+        "sh -c \"sleep 30\" &\n\
+         sleep 0.3\n\
+         p = $sh.jobs[1].pid\n\
+         sh -c \"kill -STOP -$p; sleep 1; kill -CONT -$p; sleep 0.3\"\n\
+         puts first=$sh.jobs[1].state\n\
+         puts second=$sh.jobs[1].state\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("first=running"),
+        "the first read reported a stop the continue had already undone: {stdout}"
+    );
+    assert!(stdout.contains("second=running"), "{stdout}");
+}
+
+#[test]
+fn the_shell_holds_no_descriptor_a_script_can_reach() {
+    // The reaper wanted somewhere to be woken from, and a self-pipe put a
+    // descriptor of the shell's own into the numbering scripts address. It
+    // answered `>&3`, then `>&101` once moved, then collided with relocation
+    // targets, then could not relocate under a low limit, and was finally
+    // reachable *by path* through `/dev/fd/100` — seven findings for one
+    // descriptor. It is gone: the wait is cut short by `pthread_kill` to the
+    // waiting thread, which needs no namespace at all.
+    //
+    // So this is the invariant that bought, asserted the only way it can be:
+    // every way of naming a descriptor the shell might have kept says nothing
+    // is there.
+    for spelling in [
+        "puts hi >&100",
+        "puts hi >&101",
+        "cat 2>&101",
+        "cat 0<&100",
+        "puts hi >&3",
+    ] {
+        let out = run_with_input(&format!("{spelling}\nputs status=$sh.status\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Bad file descriptor"),
+            "{spelling}: {stderr}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("status=1"),
+            "{spelling}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    // Reachable by path, not just by number: `/dev/fd/N` and `/proc/self/fd/N`
+    // are opened as paths, so no amount of care about descriptor *names* covers
+    // them. With the pipe gone there is nothing for them to alias, and they
+    // report what a fresh shell does.
+    for path in ["/dev/fd/100", "/proc/self/fd/100", "/dev/fd/101"] {
+        let out = run_with_input(&format!("cat < {path}\nputs after\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("after"),
+            "{path} did not return: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    // And the shell still hears about its children, which is what any of this
+    // was in aid of.
+    let out = run_with_input("sh -c \"sleep 0.2; exit 6\" &\nwait 1\nputs waited=$sh.status\n");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("waited=6"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// `run_at_descriptor_limit` with `SIGCHLD` inherited as ignored — a shell whose
+/// children the kernel reaps behind its back, which is the state an ignore
+/// inherited from whatever started mesh actually produces.
+fn run_with_sigchld_ignored(limit: libc::rlim_t, command_line: &str) -> Output {
+    let mut command = mesh_command();
+    command.arg("-c").arg(command_line);
+    // SAFETY: both calls only change this child's own limits and dispositions,
+    // and both are async-signal-safe, which is the bar `pre_exec` sets.
+    unsafe {
+        command.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::signal(libc::SIGCHLD, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.output().expect("run mesh")
+}
+
+#[test]
+fn an_inherited_sigchld_ignore_does_not_hang_the_shell() {
+    // A shell started with `SIGCHLD` ignored has its children auto-reaped by the
+    // kernel, so no transition ever reaches the store — and a wait still told the
+    // pid is owned then waits for news that cannot come.
+    //
+    // Installing the handler used to sit *after* the pipe, so a failed `pipe`
+    // returned early and left the inherited ignore in place. `mesh -c true` hung
+    // outright. The disposition is now set first and unconditionally: losing the
+    // pipe costs a slower wait, losing this costs every wait there is.
+    let out = run_with_sigchld_ignored(4, "true");
+    assert!(out.status.success(), "{:?}", out.status);
+
+    // And with room for the pipe, so the ignore is the only thing wrong: the
+    // status still has to come back, which is what proves the child was waited
+    // for rather than auto-reaped behind the shell's back.
+    let out = run_with_sigchld_ignored(64, "sh -c \"exit 7\"");
+    assert_eq!(out.status.code(), Some(7), "{:?}", out.status);
+}
+
+#[test]
+fn a_redirection_naming_a_high_descriptor_behaves() {
+    // The shell's own descriptors move out of the way of a redirection, and
+    // *when* they move is as load-bearing as whether. Both of these were the
+    // same mistake seen from two sides.
+    let dir = fresh_dir("step_aside_order");
+
+    // Moving them during descriptor resolution was already too late for the
+    // in-shell path, which snapshots which targets it holds open before that: it
+    // saw an endpoint on fd 100, the move closed it, and the save then ran on a
+    // closed descriptor. `puts hi` still goes to stdout — redirecting fd 100
+    // says nothing about where `puts` writes — so the file is empty and the
+    // status is what this is about.
+    let empty = dir.join("empty.txt");
+    let out = run_with_input(&format!("puts hi 100> {}\n", empty.display()));
+    assert!(out.status.success(), "{:?}", out.stderr);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+    assert!(empty.exists(), "the redirection did not create its file");
+
+    // And moving them one at a time let an endpoint land on a number a *later*
+    // redirection names, or one an earlier redirection had already probed as
+    // free. `2>&102` was checked first and found 102 unused; relocating the
+    // endpoint at 100 then put it *on* 102, so the duplication succeeded — and
+    // the `>` went on to truncate a file it should never have opened.
+    let guarded = dir.join("guarded.txt");
+    std::fs::write(&guarded, "PRE-EXISTING").unwrap();
+    let out = run_with_input(&format!(
+        "sh -c true 2>&102 100> {}\nputs after\n",
+        guarded.display()
+    ));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Bad file descriptor"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&guarded).unwrap(),
+        "PRE-EXISTING",
+        "a file was truncated by a redirection that should have failed first"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_blocked_sigchld_does_not_slow_every_wait() {
+    // A disposition is not a delivery. A launcher that exec'd mesh with
+    // `SIGCHLD` blocked passes that mask on, so the handler never runs and the
+    // nudge pipe never becomes readable — leaving every wait to the poll timeout
+    // that exists only as a backstop. A 0.05s sleep took nearly two seconds.
+    //
+    // Wall clock is the right measure here, unlike the spin test: this bug cost
+    // latency rather than CPU.
+    let mut command = mesh_command();
+    command.arg("-c").arg("sleep 0.05");
+    // SAFETY: `pthread_sigmask` only changes this child's own mask, and is
+    // async-signal-safe, which is the bar `pre_exec` sets.
+    unsafe {
+        command.pre_exec(|| {
+            let mut blocked: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGCHLD);
+            if libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let start = std::time::Instant::now();
+    let out = command.output().expect("run mesh");
+    let elapsed = start.elapsed();
+    assert!(out.status.success(), "{:?}", out.status);
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "an inherited SIGCHLD block left the wait on its backstop: {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_low_descriptor_limit_exposes_nothing_of_the_shells() {
+    // A tight `RLIMIT_NOFILE` used to be the worst case for the shell's own
+    // plumbing: the nudge pipe could not get clear of the low numbers, so
+    // `puts hi >&4` returned 0 and fed `hi` to the next drain. With no pipe to
+    // place there is nothing left for a limit to squeeze, and this is the
+    // ordinary `EBADF` — asserted at a limit low enough to have broken it.
+    let out = run_at_descriptor_limit(8, "puts hi >&4");
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Bad file descriptor"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "the output went somewhere other than stdout: {:?}",
+        out.stdout
+    );
+}
+
+// `wait4` *is* this test's wait, and it is the one that has to be used: the
+// measurement is the child's CPU, which `Child::wait` does not report.
+#[allow(clippy::zombie_processes)]
+#[test]
+fn a_wait_under_a_descriptor_limit_does_not_spin() {
+    // `pipe` can fail — a low `RLIMIT_NOFILE` is enough — and then there is no
+    // descriptor to sleep on. Returning "no news" immediately turned every
+    // foreground wait into a tight drain loop that burned a core for the whole
+    // life of the child. The wait still has to *work*, just more slowly.
+    //
+    // Measured as CPU rather than wall clock: the bug did not make the shell
+    // slower, it made it hot. The threshold is far above what the fix costs
+    // (hundredths of a second) and far below a spin (a full second per second).
+    let mut command = mesh_command();
+    command.arg("-c").arg("sleep 1");
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 4,
+                rlim_max: 4,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().expect("spawn mesh");
+    let pid = child.id() as libc::pid_t;
+    let mut status = 0;
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::wait4(pid, &mut status, 0, &mut usage) },
+        pid,
+        "wait4 on the shell"
+    );
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    let cpu = usage.ru_utime.tv_sec as f64
+        + usage.ru_utime.tv_usec as f64 / 1e6
+        + usage.ru_stime.tv_sec as f64
+        + usage.ru_stime.tv_usec as f64 / 1e6;
+    assert!(
+        cpu < 0.5,
+        "a wait with no nudge pipe spun: {cpu:.3}s of CPU for a one-second sleep"
+    );
+}
+
+// The fork here is the point of the test, and the shell it exec's is waited for
+// by `wait4` below — `Child::wait` cannot express "wait for the process this
+// helper turned into".
+#[allow(clippy::zombie_processes)]
+#[test]
+fn a_child_inherited_from_a_parent_does_not_block_the_shell() {
+    // mesh can be exec'd by a process that already has a live child of its own.
+    // That child is not the shell's to reap, and it must not be able to stand in
+    // the way of the ones that are.
+    //
+    // Discovering which child changed with `waitid(P_ALL, …, WNOWAIT)` and then
+    // reaping it only if owned looks careful and deadlocks: `WNOWAIT` leaves the
+    // unowned transition pending, so every probe answers with the same pid and
+    // the shell's own children are never reached. This hung indefinitely.
+    let mut command = mesh_command();
+    command.arg("-c").arg("sleep 0.2");
+    // SAFETY: `fork` here creates a child that exits on its own; only
+    // async-signal-safe calls run in it, which is the bar `pre_exec` sets.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::fork() == 0 {
+                // Outlives the exec, then leaves a transition pending that
+                // belongs to nobody the shell knows about.
+                libc::usleep(50_000);
+                libc::_exit(0);
+            }
+            Ok(())
+        });
+    }
+    let start = std::time::Instant::now();
+    let out = command.output().expect("run mesh");
+    assert!(out.status.success(), "{:?}", out.status);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "an inherited child blocked the drain: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn a_child_the_shell_does_not_own_is_left_alone() {
+    // The drain is the only caller of `waitpid` now, and it reaps by asking for
+    // *any* child. Anything the shell did not spawn itself — the completion
+    // helper waits on its own with `Child::wait` — must still find its child
+    // waitable, so the drain identifies a pid before consuming it and steps over
+    // one it does not own.
+    //
+    // `fork` gives the shell a child of its own to reap while an unrelated one is
+    // outstanding; both statuses have to survive.
+    let out = run_with_input(
+        "fork { exit 3 }\nputs forked=$sh.status\nsh -c \"exit 4\"\nputs plain=$sh.status\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("forked=3"), "{stdout}");
+    assert!(stdout.contains("plain=4"), "{stdout}");
+}
+
+#[test]
 fn a_map_cannot_forge_a_job_handle() {
     // `m = [id: 1]` is ordinary data. Reading an `id` out of any map would make a
     // handle forgeable, and signalling a job on the strength of a field name is
