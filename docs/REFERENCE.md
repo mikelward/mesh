@@ -1059,7 +1059,9 @@ reading at all, and `&&` / `||` join the value statement rather than making a co
 of it — `not $b && puts x` negates and then branches.
 
 In a condition a spaced comparison still compares, modifiers and all, so
-`if $xs:len > 5 { … }` asks about the length. And a *derived* value is not a place:
+`if $xs:len > 5 { … }` asks about the length — and that holds for a **numeral** on
+the left too, signed or not: `if 1 < 2`, `if -1 < 0`, and `if 1:repr:len > 0` all
+compare. (Statement position is unchanged: `42 > file` still redirects.) And a *derived* value is not a place:
 `$xs:dedup = 9` is a syntax error saying so, never an attempt to run a command named
 by the value.
 
