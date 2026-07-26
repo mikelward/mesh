@@ -51,6 +51,26 @@ fn name_of(usage: &'static str) -> &'static str {
     usage.split(' ').next().unwrap_or(usage)
 }
 
+/// Does this builtin read **options of its own**, rather than taking every argument
+/// as data?
+///
+/// Read off the usage line, like [`name_of`], so it cannot go stale: a builtin whose
+/// usage shows a `-…` token takes options, and one that shows only operands does not.
+///
+/// The distinction decides who consumes the `--` terminator. A builtin with options
+/// **owns** it, because only that builtin knows where its options end — `kill` reads
+/// a leading `-SIGNAL`, so `kill -- -9 %1` has to reach `kill` with the `--` intact
+/// or `-9` goes back to being a signal. One with no options has nothing to end, so
+/// the terminator is pure noise in its arguments and is taken out centrally.
+pub(crate) fn reads_options(name: &str) -> bool {
+    entry(name).is_some_and(|(usage, _)| {
+        usage
+            .split(' ')
+            .skip(1)
+            .any(|token| token.trim_start_matches('[').starts_with('-'))
+    })
+}
+
 /// Every builtin's name, in table order. The completion tables want the set of
 /// names without the prose that goes with them.
 pub(crate) fn names() -> impl Iterator<Item = &'static str> {

@@ -4925,7 +4925,7 @@ fn job_id_of(value: &Value) -> Option<usize> {
 /// prompt and job-control builtins, then the builtin → external chain. A function
 /// has already been resolved by the caller, which still has its unexpanded words
 /// and so can keep its arguments typed.
-fn run_expanded(words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
+fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     if words.is_empty() {
         // A command whose words all expanded away (e.g. a glob with no
         // matches) is an empty-list result — status 0 per `DESIGN.md`.
@@ -4936,8 +4936,26 @@ fn run_expanded(words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     if words[0] == "return" {
         return make_return(&words[1..], shell);
     }
-    if builtins::is_builtin(&words[0]) && auto_help_requested_strings(&words[1..]) {
-        return Step::Continue(builtins::print_help(&words[0]));
+    if builtins::is_builtin(&words[0]) {
+        if auto_help_requested_strings(&words[1..]) {
+            return Step::Continue(builtins::print_help(&words[0]));
+        }
+        // `--` ended the search above; for a builtin with no options of its own it
+        // now has to be **taken out of the way**, exactly as `call_func` does when
+        // binding a function's arguments. Left in, the terminator `DESIGN.md` offers
+        // as the escape from auto-help stopped the detection and was then printed:
+        // `puts -- --help` wrote `-- --help`.
+        //
+        // A builtin that *does* read options keeps it, because only that builtin
+        // knows where its options end. Removing it here would undo the very thing it
+        // was written for — `kill -- -9 %1` would send SIGKILL rather than look for a
+        // job named `-9`, and `prompt -- --reset` would reset instead of setting that
+        // text.
+        if !builtins::reads_options(&words[0])
+            && let Some(at) = words.iter().skip(1).position(|word| word == "--")
+        {
+            words.remove(at + 1);
+        }
     }
     match words[0].as_str() {
         "prompt" => return configure_prompt(&words[1..], shell),
@@ -4997,6 +5015,24 @@ fn auto_help_requested_strings(args: &[String]) -> bool {
 }
 
 fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
+    // `prompt` owns its terminator because it reads an option: `--` ends the options
+    // and everything after it is the prompt text, so `prompt -- --reset` sets that
+    // string rather than resetting. A prompt is exactly the kind of value that can
+    // start with a dash — one built from `style(…)` escapes, or a literal `-> `.
+    if let [terminator, rest @ ..] = args
+        && terminator == "--"
+    {
+        return match rest {
+            [text] => {
+                shell.prompt.text = Some(text.clone());
+                Step::Continue(0)
+            }
+            _ => {
+                note!("mesh: prompt: expected one prompt string after `--`");
+                Step::Continue(2)
+            }
+        };
+    }
     match args {
         [] => {
             let text = shell.prompt.text.clone();
@@ -5021,10 +5057,14 @@ fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
 }
 
 fn configure_prompt_hook(args: &[String], shell: &mut Shell) -> Step {
-    let invalid = || {
-        note!("mesh: prompt-hook: expected [EVENT] NAME FUNCTION or --remove [EVENT] NAME");
-        Step::Continue(2)
-    };
+    // `prompt-hook` reads an option, so it owns its terminator: after `--` every word
+    // is an operand. That is what lets a hook be *named* `--remove`, which is the
+    // whole case the terminator exists for.
+    if let [terminator, rest @ ..] = args
+        && terminator == "--"
+    {
+        return register_hook_operands(rest, shell);
+    }
     match args {
         [flag, name] if flag == "--remove" => {
             shell
@@ -5035,7 +5075,7 @@ fn configure_prompt_hook(args: &[String], shell: &mut Shell) -> Step {
         }
         [flag, event, name] if flag == "--remove" => {
             let Some(event) = PromptEvent::parse(event) else {
-                return invalid();
+                return invalid_prompt_hook();
             };
             shell
                 .prompt
@@ -5043,15 +5083,30 @@ fn configure_prompt_hook(args: &[String], shell: &mut Shell) -> Step {
                 .retain(|hook| hook.event != event || hook.name != *name);
             Step::Continue(0)
         }
+        _ => register_hook_operands(args, shell),
+    }
+}
+
+/// The `[EVENT] NAME FUNCTION` form, with no option reading left to do.
+///
+/// Shared by the plain path and the one past `--`, so the two cannot drift into
+/// disagreeing about what an operand list looks like.
+fn register_hook_operands(args: &[String], shell: &mut Shell) -> Step {
+    match args {
         [name, function] => register_prompt_hook(PromptEvent::PrePrompt, name, function, shell),
         [event, name, function] => {
             let Some(event) = PromptEvent::parse(event) else {
-                return invalid();
+                return invalid_prompt_hook();
             };
             register_prompt_hook(event, name, function, shell)
         }
-        _ => invalid(),
+        _ => invalid_prompt_hook(),
     }
+}
+
+fn invalid_prompt_hook() -> Step {
+    note!("mesh: prompt-hook: expected [EVENT] NAME FUNCTION or --remove [EVENT] NAME");
+    Step::Continue(2)
 }
 
 fn register_prompt_hook(event: PromptEvent, name: &str, function: &str, shell: &mut Shell) -> Step {
