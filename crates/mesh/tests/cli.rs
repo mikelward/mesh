@@ -1888,6 +1888,17 @@ fn background_function_terminal_harness(exec: &MeshExec) -> i32 {
     0
 }
 
+/// How long a pty read waits on silence before calling it a failure.
+///
+/// Generous on purpose. The shell is *legitimately* quiet for stretches: while
+/// it starts up, while a command runs without printing, while a `wait` blocks.
+/// Nothing distinguishes that from a wedged shell except how long you are
+/// willing to sit there, so the only cost of being wrong in this direction is
+/// how slowly a genuinely broken run fails — bounded anyway by the deadline on
+/// each reader. Two seconds was too tight: it lost the startup race about twice
+/// in a hundred suite runs, reported as the shell never showing a prompt.
+const QUIET: libc::c_int = 10_000;
+
 /// `B` — the prompt is drawn and the shell is taking input.
 ///
 /// reedline **repaints**, so this arrives more than once per prompt: a session
@@ -1940,7 +1951,7 @@ fn pty_read_until_command_done(master: std::os::fd::RawFd) -> Option<(Vec<u8>, u
         // on it. What follows is the next prompt, and leaving it unread backs the
         // pty up until the shell blocks writing into it — which presents as the
         // shell ignoring whatever is typed next.
-        let timeout = if done.is_some() { 50 } else { 2_000 };
+        let timeout = if done.is_some() { 50 } else { QUIET };
         if unsafe { libc::poll(&mut ready, 1, timeout) } <= 0 {
             return done.map(|status| (seen, status));
         }
@@ -1981,7 +1992,7 @@ fn pty_wait_for_marker(master: std::os::fd::RawFd, marker: &[u8]) -> bool {
         if seen.windows(marker.len()).any(|part| part == marker) {
             return true;
         }
-        if unsafe { libc::poll(&mut ready, 1, 2_000) } <= 0 {
+        if unsafe { libc::poll(&mut ready, 1, QUIET) } <= 0 {
             return false;
         }
         let mut chunk = [0_u8; 256];
@@ -2045,7 +2056,7 @@ fn pty_read_until_one_of(master: std::os::fd::RawFd, accept: &[&[u8]]) -> Option
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         let found = seen(&prompt);
-        let timeout = if found { 50 } else { 2_000 };
+        let timeout = if found { 50 } else { QUIET };
         if unsafe { libc::poll(&mut ready, 1, timeout) } <= 0 {
             return found.then_some(prompt);
         }
