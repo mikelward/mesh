@@ -3062,8 +3062,18 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
   terminal and not output — that is also what lets a script copy. Reading the
   clipboard back stays out: it needs a query and a reply, so it can block on a
   terminal that never answers.
-- ***Notifications*** *(OSC 9 / 777)* — desktop notification, e.g. auto-notify when a
-  long command finishes (pairs with the `postexec` duration).
+- ***Notifications*** *(OSC 9)* — **decided: automatic, plus a `notify` builtin.** A
+  command that takes longer than ten seconds notifies when it finishes, with its
+  outcome: a failure that completed while you were away is the case worth a
+  notification. The threshold stands in for whether anyone is watching, which mesh
+  cannot ask — terminals report focus, but the line editor owns the input, so those
+  events never reach the shell. `notify TEXT …` sends one explicitly, taking
+  arguments or stdin like `clip`, and `$sh.options.command-notify` turns the
+  automatic one off. Inside tmux the sequence needs the `DCS tmux;` envelope, since a
+  multiplexer consumes an `OSC` it does not implement rather than forwarding it.
+  Making the *threshold* configurable wants a `$sh.options` that holds values and
+  not only flags. OSC 777 stays out: its `notify;title;body` form would double up on
+  terminals that support both.
 - ***Cursor shape per mode*** *(DECSCUSR `\e[…q`)* — block in vi NORMAL, bar in
   INSERT; driven by the same mode-change event as the keymap-indicator TODO in the
   line-editor section.

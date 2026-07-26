@@ -30,7 +30,7 @@ use reedline::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::builtins::{self, Builtin};
+use crate::builtins::{self, Builtin, Multiplexer, NOTIFY_LIMIT};
 use crate::completion::{CompletionCache, CompletionSpec, ValueHint, rank_candidates};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
@@ -4874,7 +4874,7 @@ fn session_term() -> Option<OsString> {
 /// - **screen and tmux** take `ESC k … ST`, naming the *window* inside the
 ///   multiplexer. Sent OSC 0 instead, tmux would forward it to the outer terminal
 ///   and the pane's own name would never change.
-/// - **A terminal in [`TITLE_TERMS`]** takes OSC 0, which sets the window and the
+/// - **A terminal in [`OSC_TERMS`]** takes OSC 0, which sets the window and the
 ///   icon name together.
 /// - **Anything else** is sent nothing.
 ///
@@ -4888,19 +4888,22 @@ fn title_sequence(term: Option<&std::ffi::OsStr>, text: &str) -> Option<String> 
     if names_terminal(term, "screen") || names_terminal(term, "tmux") {
         return Some(format!("\x1bk{}\x1b\\", title_text(text)));
     }
-    TITLE_TERMS
+    OSC_TERMS
         .iter()
         .any(|family| names_terminal(term, family))
         .then(|| format!("\x1b]0;{}\x07", title_text(text)))
 }
 
-/// The terminal families that take an OSC 0 title.
+/// The terminal families mesh will send an `OSC` sequence to — a title, or a
+/// notification.
 ///
 /// An allowlist because the two ways of being wrong are not equally bad: a
-/// terminal missing from here quietly has no title, while one wrongly assumed to
-/// take one *prints the title text at every prompt*. `TODO.md` carries the reasons
-/// in full, and terminfo as the follow-up that would replace the list with data.
-const TITLE_TERMS: &[&str] = &[
+/// terminal missing from here quietly gets neither, while one wrongly assumed to
+/// parse `OSC` *prints the payload*, as the Linux console does. A terminal here
+/// that does not implement a particular sequence discards it, which is what makes
+/// one list serve both. `TODO.md` carries the reasons in full, and terminfo as the
+/// follow-up that would replace the list with data.
+const OSC_TERMS: &[&str] = &[
     "alacritty",
     "contour",
     "foot",
@@ -4934,35 +4937,114 @@ fn names_terminal(term: &str, family: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.']))
 }
 
-/// A string safe to put in a title: control characters replaced by spaces, and no
-/// longer than [`TITLE_LIMIT`] characters.
-///
-/// The stripping is not tidiness. Both things mesh titles — the command line and
-/// the working directory — carry text it did not choose, and a filename may hold
-/// an `ESC`: `touch $'\e]0;x\a'` in a directory the user then `cd`s into would
-/// otherwise close mesh's sequence early and start one of its own, with the rest
-/// of the title as its payload. A control character cannot draw anything in a
-/// title bar, so replacing it costs nothing and ends the question. Spaces rather
-/// than deletion so a pasted two-line command does not read as one joined word.
+/// A string safe to put in a title, via the shared `OSC` payload rule.
 fn title_text(text: &str) -> String {
-    let mut title: String = text
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .take(TITLE_LIMIT)
-        .collect();
-    if text.chars().count() > TITLE_LIMIT {
-        // Trim first: a cut that lands mid-word reads better without the space
-        // before the ellipsis.
-        title = title.trim_end().to_string();
-        title.push('…');
+    builtins::osc_payload(text, TITLE_LIMIT)
+}
+
+/// How long a command must take before finishing is worth a desktop notification.
+///
+/// A threshold stands in for the question mesh cannot answer: whether anyone is
+/// watching. Terminals report focus (`CSI ?1004 h`), but the line editor owns the
+/// input, so those events do not reach the shell — and a command long enough to
+/// walk away from is the usable proxy. Ten seconds is long enough that a
+/// notification is news and short enough to catch a build.
+const NOTIFY_AFTER: Duration = Duration::from_secs(10);
+
+/// The notification for a command that has just finished, or `None` when it does
+/// not deserve one.
+///
+/// Split from the writing so the decision — the threshold, the wording, the
+/// terminal's suitability — is testable without a terminal or a ten-second wait.
+fn command_notification(
+    term: Option<&std::ffi::OsStr>,
+    inside: Multiplexer,
+    command: &str,
+    status: u8,
+    elapsed: Duration,
+    after: Duration,
+) -> Option<String> {
+    if elapsed < after {
+        return None;
     }
-    title
+    let outcome = if status == 0 {
+        "done".to_owned()
+    } else {
+        format!("exit {status}")
+    };
+    let tail = format!(" — {outcome} in {}", duration_words(elapsed));
+    // The command is cut to what is left after the parts that must survive, rather
+    // than the whole message being cut at the end. Cutting the assembled line drops
+    // the outcome and the duration off a long command's notification — exactly the
+    // words that make it worth raising. Raised in review on #242.
+    //
+    // Made safe before it is assembled, too: a control character at the end of the
+    // command would otherwise become a space sitting in front of the dash.
+    let room = NOTIFY_LIMIT.saturating_sub("mesh: ".len() + tail.chars().count());
+    let said = builtins::osc_payload(command, room);
+    notification_sequence(term, inside, &format!("mesh: {}{tail}", said.trim()))
+}
+
+/// `OSC 9` carrying `text`, for a terminal mesh will send `OSC` to — wrapped for
+/// the multiplexer in between, when there is one.
+///
+/// The same allowlist as the title, and for the same reason: a terminal that
+/// mis-parses `OSC` would print this instead. Which terminals *implement*
+/// notifications is a different and unaskable question — iTerm2, WezTerm, Ghostty,
+/// kitty and ConEmu raise them, xterm and Alacritty parse and discard, and none of
+/// them answer — so the list that keeps the payload off the screen is the only gate
+/// worth having.
+fn notification_sequence(
+    term: Option<&std::ffi::OsStr>,
+    inside: Multiplexer,
+    text: &str,
+) -> Option<String> {
+    let term = term?.to_str()?;
+    let known = names_terminal(term, "screen")
+        || names_terminal(term, "tmux")
+        || OSC_TERMS.iter().any(|family| names_terminal(term, family));
+    known.then(|| {
+        builtins::through_multiplexer(
+            &format!("\x1b]9;{}\x07", builtins::osc_payload(text, NOTIFY_LIMIT)),
+            inside,
+        )
+    })
+}
+
+/// A duration as a person would say it: `9s`, `1m30s`, `2h5m`.
+///
+/// Seconds are dropped once there are hours, since "2h5m3s" is more precision than
+/// anyone reads off a notification.
+fn duration_words(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match (seconds / 3600, (seconds % 3600) / 60, seconds % 60) {
+        (0, 0, seconds) => format!("{seconds}s"),
+        (0, minutes, seconds) => format!("{minutes}m{seconds}s"),
+        (hours, minutes, _) => format!("{hours}h{minutes}m"),
+    }
+}
+
+/// Write a notification, if the command earned one. `enabled` is [`decoration`]
+/// with [`Opt::CommandNotify`]; failure to write is ignored, like every other
+/// sequence mesh emits automatically.
+fn notify_command_done(enabled: bool, command: &str, status: u8, elapsed: Duration) {
+    if !enabled {
+        return;
+    }
+    let Some(sequence) = command_notification(
+        session_term().as_deref(),
+        builtins::multiplexer(),
+        command,
+        status,
+        elapsed,
+        NOTIFY_AFTER,
+    ) else {
+        return;
+    };
+    use std::io::Write as _;
+    let mut out = io::stdout();
+    let _ = out.write_all(sequence.as_bytes());
+    let _ = out.flush();
 }
 
 /// What the title says at the prompt: `user@host: directory`, the form a terminal
@@ -7682,7 +7764,17 @@ fn handle_signal(
             let start = Instant::now();
             let step = run_line(&text, last, false, shell);
             let status = step.status();
-            let elapsed = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+            let took = start.elapsed();
+            // Before the hooks, so a slow `postexec` handler cannot delay the news
+            // it is not part of — the notification answers for the command, as `D`
+            // does.
+            notify_command_done(
+                decoration(&shell.vars, Opt::CommandNotify),
+                &command,
+                status,
+                took,
+            );
+            let elapsed = i64::try_from(took.as_millis()).unwrap_or(i64::MAX);
             run_prompt_hooks(
                 PromptEvent::PostExec,
                 vec![
@@ -7985,17 +8077,18 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgumentRecall, CompletionState, HeredocGate, Invocation, MeshPrompt, PromptEvent,
-        PromptHook, PromptMarkers, Shell, StartupOptions, Step, TITLE_LIMIT, TimestampedHistory,
-        argument_completions, body_awaits_close, command_position, command_segment_words,
-        command_words, completed_command, cwd_url, escape_stripped_width, eval_binary,
-        expand_history_designators, expansion_word, func_definition_is_open, handle_signal,
-        help_completions, history_designators, history_path_from, input_highlighter,
-        interactive_keybindings, interruptible_task, last_argument, needs_more_input, open_history,
-        path_completions_sync, persist_logical_history, prepare_history_path, prompt_title,
-        run_line, run_prompt_hooks, run_source, running_title, title_sequence, title_text,
-        variable_completions,
+        ArgumentRecall, CompletionState, HeredocGate, Invocation, MeshPrompt, NOTIFY_LIMIT,
+        PromptEvent, PromptHook, PromptMarkers, Shell, StartupOptions, Step, TITLE_LIMIT,
+        TimestampedHistory, argument_completions, body_awaits_close, command_notification,
+        command_position, command_segment_words, command_words, completed_command, cwd_url,
+        duration_words, escape_stripped_width, eval_binary, expand_history_designators,
+        expansion_word, func_definition_is_open, handle_signal, help_completions,
+        history_designators, history_path_from, input_highlighter, interactive_keybindings,
+        interruptible_task, last_argument, needs_more_input, open_history, path_completions_sync,
+        persist_logical_history, prepare_history_path, prompt_title, run_line, run_prompt_hooks,
+        run_source, running_title, title_sequence, title_text, variable_completions,
     };
+    use crate::builtins::{Multiplexer, through_multiplexer};
     use crate::options::Options;
     use crate::parser;
     use crate::vars::Value;
@@ -9341,13 +9434,13 @@ mod tests {
         // long command line would be. 96 characters, then an ellipsis.
         let long = "x".repeat(200);
         let title = title_text(&long);
-        assert_eq!(title.chars().count(), TITLE_LIMIT + 1);
+        assert_eq!(title.chars().count(), TITLE_LIMIT);
         assert!(title.ends_with('…'), "{title}");
         // The cut counts characters, not bytes, so a multi-byte title is not
         // truncated early or split down the middle of one.
         let wide = "日".repeat(200);
         let wide_title = title_text(&wide);
-        assert_eq!(wide_title.chars().count(), TITLE_LIMIT + 1);
+        assert_eq!(wide_title.chars().count(), TITLE_LIMIT);
         assert!(wide_title.starts_with("日日"), "{wide_title}");
         // A title that fits keeps its exact text, ellipsis and all.
         assert_eq!(title_text("puts hi"), "puts hi");
@@ -9355,6 +9448,193 @@ mod tests {
             title_text(&"y".repeat(TITLE_LIMIT)),
             "y".repeat(TITLE_LIMIT)
         );
+    }
+
+    #[test]
+    fn a_command_earns_a_notification_by_taking_long_enough() {
+        let notification = |seconds| {
+            command_notification(
+                Some(OsStr::new("xterm")),
+                Multiplexer::None,
+                "cargo build",
+                0,
+                Duration::from_secs(seconds),
+                Duration::from_secs(10),
+            )
+        };
+        // The threshold is the whole feature: below it a notification is noise for
+        // a command the user watched finish.
+        assert_eq!(notification(0), None);
+        assert_eq!(notification(9), None);
+        assert_eq!(
+            notification(10).as_deref(),
+            Some("\x1b]9;mesh: cargo build — done in 10s\x07"),
+            "the boundary belongs to the notification, not to silence"
+        );
+        assert_eq!(
+            notification(42).as_deref(),
+            Some("\x1b]9;mesh: cargo build — done in 42s\x07")
+        );
+    }
+
+    #[test]
+    fn a_notification_says_how_it_ended() {
+        let notification = |status| {
+            command_notification(
+                Some(OsStr::new("xterm")),
+                Multiplexer::None,
+                "  make test  ",
+                status,
+                Duration::from_secs(75),
+                Duration::from_secs(10),
+            )
+        };
+        // The status is the reason to look: a failure that finished while you were
+        // away is exactly what a notification is for. Surrounding space goes, since
+        // the user's spacing is not news.
+        assert_eq!(
+            notification(0).as_deref(),
+            Some("\x1b]9;mesh: make test — done in 1m15s\x07")
+        );
+        assert_eq!(
+            notification(2).as_deref(),
+            Some("\x1b]9;mesh: make test — exit 2 in 1m15s\x07")
+        );
+        assert_eq!(
+            notification(130).as_deref(),
+            Some("\x1b]9;mesh: make test — exit 130 in 1m15s\x07")
+        );
+    }
+
+    #[test]
+    fn a_notification_goes_only_where_osc_is_understood() {
+        let notification = |term: Option<&str>| {
+            command_notification(
+                term.map(OsStr::new),
+                Multiplexer::None,
+                "sleep 30",
+                0,
+                Duration::from_secs(30),
+                Duration::from_secs(10),
+            )
+        };
+        // The same gate as the title, for the same reason: a terminal that
+        // mis-parses `OSC` prints the payload instead of raising anything.
+        assert!(notification(Some("xterm-256color")).is_some());
+        assert!(notification(Some("alacritty")).is_some());
+        // Inside a multiplexer it is worth sending: tmux swallows it without
+        // `allow-passthrough` and forwards it with, and neither prints it.
+        assert!(notification(Some("tmux-256color")).is_some());
+        assert!(notification(Some("screen.xterm-256color")).is_some());
+        assert_eq!(notification(Some("linux")), None);
+        assert_eq!(notification(Some("dumb")), None);
+        assert_eq!(notification(Some("st52")), None);
+        assert_eq!(notification(None), None);
+    }
+
+    #[test]
+    fn a_notification_cannot_carry_a_sequence_of_its_own() {
+        // The command line is the user's text, so the shared payload rule applies
+        // here as it does to the title: an `ESC` in it would otherwise end mesh's
+        // sequence and start another.
+        let notification = command_notification(
+            Some(OsStr::new("xterm")),
+            Multiplexer::None,
+            "puts \x1b]9;evil\x07",
+            0,
+            Duration::from_secs(11),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            notification.as_deref(),
+            Some("\x1b]9;mesh: puts  ]9;evil — done in 11s\x07")
+        );
+    }
+
+    #[test]
+    fn a_long_command_keeps_the_part_worth_reading() {
+        // Raised in review on #242: the message was assembled and *then* cut to the
+        // limit, so a long command line pushed the outcome and the duration off the
+        // end — the two things the notification exists to say.
+        let command = "cargo build --features ".to_owned() + &"a,".repeat(200);
+        let notification = command_notification(
+            Some(OsStr::new("xterm")),
+            Multiplexer::None,
+            &command,
+            2,
+            Duration::from_secs(95),
+            Duration::from_secs(10),
+        )
+        .expect("a long command still notifies");
+        assert!(
+            notification.ends_with("— exit 2 in 1m35s\x07"),
+            "the outcome was cut off: {notification:?}"
+        );
+        assert!(
+            notification.starts_with("\x1b]9;mesh: cargo build --features a,a,"),
+            "the command was not kept: {notification:?}"
+        );
+        // Still bounded, and the command is where the ellipsis lands.
+        assert!(
+            notification.chars().count() <= NOTIFY_LIMIT + "\x1b]9;\x07".len(),
+            "{} chars",
+            notification.chars().count()
+        );
+        assert!(notification.contains('…'), "{notification:?}");
+    }
+
+    #[test]
+    fn a_notification_is_wrapped_for_tmux_to_forward() {
+        // A multiplexer parses the stream itself, so an `OSC` it does not implement
+        // is consumed rather than passed on. tmux forwards a `DCS tmux;` envelope
+        // with the payload's `ESC`s doubled — also raised in review on #242, where
+        // the raw form was sent and could never arrive.
+        let wrapped = command_notification(
+            Some(OsStr::new("tmux-256color")),
+            Multiplexer::Tmux,
+            "make",
+            0,
+            Duration::from_secs(20),
+            Duration::from_secs(10),
+        )
+        .expect("tmux still notifies");
+        assert_eq!(
+            wrapped,
+            "\x1bPtmux;\x1b\x1b]9;mesh: make — done in 20s\x07\x1b\\"
+        );
+        // Outside a multiplexer the sequence goes as it is.
+        assert_eq!(
+            command_notification(
+                Some(OsStr::new("tmux-256color")),
+                Multiplexer::None,
+                "make",
+                0,
+                Duration::from_secs(20),
+                Duration::from_secs(10),
+            )
+            .as_deref(),
+            Some("\x1b]9;mesh: make — done in 20s\x07")
+        );
+        // Screen is left alone deliberately: its passthrough has quirks mesh cannot
+        // test against here, and a wrong envelope prints.
+        assert_eq!(
+            through_multiplexer("\x1b]9;hi\x07", Multiplexer::Screen),
+            "\x1b]9;hi\x07"
+        );
+    }
+
+    #[test]
+    fn durations_read_the_way_people_say_them() {
+        let words = |seconds| duration_words(Duration::from_secs(seconds));
+        assert_eq!(words(0), "0s");
+        assert_eq!(words(59), "59s");
+        assert_eq!(words(60), "1m0s");
+        assert_eq!(words(90), "1m30s");
+        assert_eq!(words(3599), "59m59s");
+        // Seconds drop once there are hours: more precision than anyone reads off a
+        // notification.
+        assert_eq!(words(3600), "1h0m");
+        assert_eq!(words(7505), "2h5m");
     }
 
     #[test]

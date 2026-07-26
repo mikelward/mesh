@@ -16,6 +16,7 @@ pub(crate) const NAMES: &[&str] = &[
     "pwd",
     "puts",
     "clip",
+    "notify",
     "exit",
     "fg",
     "bg",
@@ -56,6 +57,7 @@ pub(crate) fn help(name: &str) -> Option<String> {
         "pwd" => "pwd",
         "puts" => "puts [ARG ...]",
         "clip" => "clip [TEXT ...]",
+        "notify" => "notify [TEXT ...]",
         "exit" => "exit [N]",
         "fg" | "bg" => return Some(format_help(&format!("{name} [JOB]"))),
         "jobs" => "jobs",
@@ -90,6 +92,7 @@ pub fn dispatch(words: &[String], last: u8) -> Option<Builtin> {
         "pwd" => Some(Builtin::Status(pwd(&words[1..]))),
         "puts" => Some(Builtin::Status(puts(&words[1..]))),
         "clip" => Some(Builtin::Status(clip(&words[1..]))),
+        "notify" => Some(Builtin::Status(notify(&words[1..]))),
         "exit" => Some(exit(&words[1..], last)),
         _ => None,
     }
@@ -240,15 +243,9 @@ const CLIP_LIMIT: usize = 74_994;
 /// here: it needs a query and a response, so it can block on a terminal that will
 /// never answer.
 fn clip(args: &[String]) -> u8 {
-    let text = if args.is_empty() {
-        let mut buffer = Vec::new();
-        if let Err(err) = std::io::Read::read_to_end(&mut std::io::stdin(), &mut buffer) {
-            note!("mesh: clip: {err}");
-            return 1;
-        }
-        buffer
-    } else {
-        args.join(" ").into_bytes()
+    let text = match read_argument_text(args, "clip") {
+        Ok(text) => text,
+        Err(status) => return status,
     };
     let encoded = base64(&text);
     if encoded.len() > CLIP_LIMIT {
@@ -258,18 +255,162 @@ fn clip(args: &[String]) -> u8 {
         );
         return 1;
     }
-    let sequence = format!("\x1b]52;c;{encoded}\x1b\\");
+    write_terminal("clip", &format!("\x1b]52;c;{encoded}\x1b\\"))
+}
+
+/// Text safe to carry inside an `OSC` sequence: control characters replaced by
+/// spaces, and no longer than `limit` characters — the ellipsis of a cut included,
+/// so a caller reserving room for a suffix keeps all of it.
+///
+/// The stripping is not tidiness. Every payload mesh sends holds text it did not
+/// choose — a command line, a directory name, a message from a script — and a
+/// filename may contain an `ESC`: `touch $'\e]0;x\a'` in a directory the user then
+/// `cd`s into would otherwise close mesh's sequence early and start one of its own,
+/// with the rest of the payload as its argument. A control character cannot draw
+/// anything in a title bar or a notification, so replacing it costs nothing and
+/// ends the question. Spaces rather than deletion, so a pasted two-line command
+/// does not read as one joined word.
+///
+/// The limit belongs to the caller: a title bar and a notification have very
+/// different room, and the sequence that is cut should be the one deciding.
+pub(crate) fn osc_payload(text: &str, limit: usize) -> String {
+    let safe = || {
+        text.chars().map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+    };
+    if text.chars().count() <= limit {
+        return safe().collect();
+    }
+    // The ellipsis counts against the limit, so the result really is no longer
+    // than asked. It reading as one character too long is how a caller reserving
+    // room for a suffix lost the last character of it.
+    let mut payload: String = safe().take(limit.saturating_sub(1)).collect();
+    // Trim first: a cut that lands mid-word reads better without the space before
+    // the ellipsis.
+    payload = payload.trim_end().to_owned();
+    payload.push('…');
+    payload
+}
+
+/// The terminal multiplexer between mesh and the terminal, if any.
+///
+/// Read from the environment rather than from `$env.TERM`, which cannot answer it:
+/// tmux is commonly configured to set `TERM=screen-256color`, so the terminal name
+/// tells you a multiplexer is there without telling you which. `$TMUX` and `$STY`
+/// are set by the program that is actually running.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Multiplexer {
+    None,
+    Tmux,
+    Screen,
+}
+
+/// Which multiplexer this session is inside, held for the session.
+pub(crate) fn multiplexer() -> Multiplexer {
+    static INSIDE: std::sync::OnceLock<Multiplexer> = std::sync::OnceLock::new();
+    *INSIDE.get_or_init(|| {
+        if env::var_os("TMUX").is_some() {
+            Multiplexer::Tmux
+        } else if env::var_os("STY").is_some() {
+            Multiplexer::Screen
+        } else {
+            Multiplexer::None
+        }
+    })
+}
+
+/// `sequence`, wrapped so it survives the multiplexer in between.
+///
+/// A multiplexer parses the stream itself, so a sequence it does not implement is
+/// consumed rather than forwarded — which is why an unwrapped `OSC 9` never reaches
+/// the outer terminal from inside tmux, `allow-passthrough` or not. Raised in
+/// review on #242, where the code sent the raw form and the comment claimed
+/// passthrough would carry it.
+///
+/// tmux forwards a `DCS tmux;` envelope with every `ESC` in the payload doubled,
+/// when `allow-passthrough` is on; with it off the whole envelope is discarded,
+/// which is the same silence as before and no worse.
+///
+/// Screen is left alone: its passthrough has a payload limit and quirks mesh has
+/// no way to test against here, and a wrong envelope *prints*, which is the failure
+/// the allowlist exists to avoid. `TODO.md` carries it.
+pub(crate) fn through_multiplexer(sequence: &str, inside: Multiplexer) -> String {
+    match inside {
+        Multiplexer::Tmux => format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b")),
+        Multiplexer::None | Multiplexer::Screen => sequence.to_owned(),
+    }
+}
+
+/// Write a control sequence to the terminal itself, returning a builtin status.
+///
+/// `/dev/tty` rather than stdout, because these sequences are messages to the
+/// terminal and not program output: `clip x > file` would otherwise put escape
+/// bytes in the file and nothing on the clipboard, and either builtin inside a
+/// pipeline would corrupt the stream. It is also what lets a *script* reach the
+/// terminal, which is the point of having these as builtins rather than
+/// hand-emitted escapes.
+fn write_terminal(label: &str, sequence: &str) -> u8 {
     match OpenOptions::new().write(true).open("/dev/tty") {
         Ok(mut terminal) => match terminal.write_all(sequence.as_bytes()) {
             Ok(()) => 0,
             Err(err) => {
-                note!("mesh: clip: {err}");
+                note!("mesh: {label}: {err}");
                 1
             }
         },
         Err(err) => {
-            note!("mesh: clip: no terminal to copy through: {err}");
+            note!("mesh: {label}: no terminal to reach: {err}");
             1
+        }
+    }
+}
+
+/// How much of a notification mesh will send. Generous next to a title, since a
+/// notification is read once and has room for a line or two, but still bounded:
+/// the text can be a command line, and there is no reason to hand a notification
+/// daemon an unbounded one.
+pub(crate) const NOTIFY_LIMIT: usize = 256;
+
+/// `notify [TEXT …]` — raise a desktop notification through the terminal with
+/// `OSC 9`, per `DESIGN.md` "terminal control". Arguments join with a space, as
+/// `puts` does; with none, stdin is read, so `puts done | notify` works.
+///
+/// Support is uneven and unreportable: iTerm2, WezTerm, Ghostty, kitty and ConEmu
+/// raise these, while xterm and Alacritty parse the sequence and discard it, and
+/// tmux swallows it without `allow-passthrough`. There is no reply, so a
+/// successful write means "asked", exactly as for [`clip`].
+fn notify(args: &[String]) -> u8 {
+    let text = match read_argument_text(args, "notify") {
+        Ok(text) => text,
+        Err(status) => return status,
+    };
+    let message = osc_payload(&String::from_utf8_lossy(&text), NOTIFY_LIMIT);
+    if message.trim().is_empty() {
+        note!("mesh: notify: nothing to say");
+        return 1;
+    }
+    let sequence = through_multiplexer(&format!("\x1b]9;{message}\x07"), multiplexer());
+    write_terminal("notify", &sequence)
+}
+
+/// The text a builtin was given: its arguments joined with a space, or all of
+/// stdin when there are none. Shared by `clip` and `notify` so `x | clip` and
+/// `x | notify` read the same way.
+fn read_argument_text(args: &[String], label: &str) -> Result<Vec<u8>, u8> {
+    if !args.is_empty() {
+        return Ok(args.join(" ").into_bytes());
+    }
+    let mut buffer = Vec::new();
+    match std::io::Read::read_to_end(&mut std::io::stdin(), &mut buffer) {
+        Ok(_) => Ok(buffer),
+        Err(err) => {
+            note!("mesh: {label}: {err}");
+            Err(1)
         }
     }
 }

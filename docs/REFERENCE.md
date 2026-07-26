@@ -170,6 +170,7 @@ and each is **on**:
 | Setting | Off means |
 |---|---|
 | `bold-input` | The line you are typing is drawn in the terminal's normal weight, not bold |
+| `command-notify` | A command that runs longer than ten seconds finishes quietly, instead of raising a desktop notification. `notify` still works — it is called, not drawn |
 | `cwd-report` | No `OSC 7` working-directory report, so a new tab or split opens wherever your terminal would have anyway |
 | `osc-title` | The window and tab title is left alone, for a terminal or multiplexer that sets it itself |
 | `shell-integration` | No `OSC 133` prompt marks, so a terminal cannot tell prompt from input from output |
@@ -190,7 +191,7 @@ Write one at a time, usually from a startup file:
 ```mesh
 $sh.options.bold-input = false          # takes effect at once
 puts $sh.options.bold-input             # false
-puts ...$sh.options:keys                # bold-input cwd-report osc-title shell-integration
+puts ...$sh.options:keys                # bold-input command-notify cwd-report osc-title shell-integration
 ```
 
 The map is strict in both directions, because a setting that is silently not
@@ -383,6 +384,7 @@ one-MiB output cap.
 | `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`. |
 | `pwd` | Print the working directory. |
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
+| `notify [text …]` | Raise a desktop notification through the terminal with `OSC 9`. Arguments or stdin, like `clip`. A command that runs for more than ten seconds notifies on its own, with its outcome and duration — `$sh.options.command-notify = false` turns that off. Inside tmux the sequence is wrapped for passthrough, which tmux forwards only with `allow-passthrough` set. Support is uneven and unreportable — iTerm2, WezTerm, Ghostty, kitty and ConEmu raise these; xterm and Alacritty discard them; tmux needs `allow-passthrough` — so success means "asked". |
 | `exit [n]` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). |
 | `prompt [text]` | Set the interactive prompt to `text`. With no arguments, print the current prompt; `--reset` restores the status-sensitive default. |
 | `prompt-hook [event] name function` | Register a named function for a prompt lifecycle event. The default event is `preprompt`. Reusing `name` within an event replaces that hook without changing its order. |
