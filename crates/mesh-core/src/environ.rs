@@ -37,6 +37,18 @@ pub(crate) fn read(key: &str) -> Option<Value> {
     Some(typed(key, &env::var_os(key)?))
 }
 
+/// Every entry's **name**, for the completion tables. Names only, so nothing is
+/// typed on the way past — unlike [`snapshot`], which builds a value per entry
+/// and would be pure waste when only the keys are wanted.
+///
+/// A name that is not valid UTF-8 is skipped rather than lossily spelled: the
+/// lossy form names nothing, so completing it would insert a word that reads
+/// back as a different variable — or as some *other* entry that really is
+/// spelled that way.
+pub(crate) fn names() -> impl Iterator<Item = String> {
+    env::vars_os().filter_map(|(name, _)| name.into_string().ok())
+}
+
 /// The mesh value an entry's raw bytes denote: a list for a path-type name,
 /// a string otherwise. Shared by [`read`] and [`snapshot`] so a name cannot be
 /// typed one way when asked for by name and another when listed.

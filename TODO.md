@@ -322,6 +322,42 @@ file as tasks land.
       clap's generated help does. A name that is neither is an error rather than a
       lookup elsewhere: an external command's help is its own, and `NAME --help`
       asks it.
+- [x] A `whence` builtin — the name lookup every shell spells differently
+      (bash's and fish's `type`, nushell's `which`, ksh's `whence`, which is the
+      spelling taken, `-a` / `-q` included as `--all` / `--quiet`). It reports
+      what a bare word *is* in resolution order — syntax, builtin, function, then
+      the executables `PATH` holds — leading with the winner and naming what that
+      shadows, or listing every match under `--all`. Because mesh keeps bindings
+      in a namespace of their own, a variable or `$env` entry of the same name is
+      reported alongside rather than shadowed, and is asked for **without a
+      sigil**: `$xs` would expand before the builtin saw the name. A word with a
+      `/` is a path operand, read as command resolution reads it. `--quiet`
+      leaves only the status (`0` found, `1` not), which is `command -v`.
+      `type` is deliberately not taken: mesh has value types and `:type` already
+      asks a path's, so it stays free for the value question — which is `:repr`.
+- [ ] **Reconsider the name: `type`, `which`, or `whence`.** Shipped as `whence`
+      (ksh's, and the one word with no collision), but the choice is not closed —
+      it is the command every shell spells differently, and the two commoner
+      spellings each have a real case. **`type`** is the widest reflex by far
+      (bash, zsh, fish, POSIX); against it, mesh has value types and `$p:type`
+      already asks a path's, so the name is the obvious future spelling for the
+      *value* question, and spending it here forecloses that. **`which`** is
+      nushell's, is what fingers reach for interactively, and would shadow the
+      external harmlessly the way any builtin does; against it, the external
+      `which` is famous for *not* knowing about builtins and functions, so the
+      name says the opposite of what mesh's does, and `which -a foo` typed from
+      habit would hit mesh's option parsing rather than the external's. Decide
+      before the name is load-bearing in anyone's config; today the cost of a
+      change is the `RENAMED` table, one module, and the docs, since all four
+      spellings already point at whichever one wins.
+- [ ] **`whence(NAME)` as a value call**, returning the report as a map
+      (`[kind: external, path: /usr/bin/git, shadows: […]]`) rather than text, so
+      a script can branch on the kind instead of matching prose — the shape
+      nushell's `which` returns as a table. It retires the last `command -v`
+      idiom: `whence --quiet` answers "is it there", but not "where, and as
+      what". Needs the map's key set settled (one entry per `Finding` kind, and
+      whether a name in two namespaces yields a list) and builtins to reach
+      value-call position, which today only `style` / `link` / `re` do.
 - [x] First slice of the read-only `$sh` namespace: `$sh.args` (a real list, not
       `$1` / `$@` / `$#`) and `$sh.name`. `sh` joins `env` as a reserved name.
 - [ ] `-i` to force an interactive session when stdin is not a terminal.

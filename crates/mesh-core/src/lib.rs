@@ -37,5 +37,6 @@ pub mod parser;
 mod reaper;
 mod repl;
 mod vars;
+mod whence;
 
 pub use repl::run;

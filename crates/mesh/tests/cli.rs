@@ -8681,6 +8681,326 @@ fn help_is_a_builtin_a_pipeline_can_read() {
 }
 
 #[test]
+fn whence_names_a_function_by_its_signature() {
+    let out = run_with_input("func ll(...args) { ls -l ...$args }\nwhence ll\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ll is a function\n    func ll(...args)\n"
+    );
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn whence_shows_a_functions_flags_and_optionals_in_its_signature() {
+    let out = run_with_input(
+        "func deploy(target, --region = us-west, --force, ...hosts) { puts hi }\nwhence deploy\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "deploy is a function\n    func deploy(target, --region = …, --force, ...hosts)\n"
+    );
+}
+
+#[test]
+fn whence_names_a_builtin_and_a_keyword() {
+    // `prompt-hook` rather than `pwd`, which is also an external on most systems
+    // and so answers with a shadow note that has nothing to do with this.
+    let out = run_with_input("whence prompt-hook\nwhence unless\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("prompt-hook is a builtin\n    prompt-hook [--remove]"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("unless is syntax\n    cmd if COND"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn whence_finds_an_external_on_path() {
+    let out = run_with_input("whence sh\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("sh is /"), "{stdout}");
+    assert!(stdout.contains("/sh"), "{stdout}");
+}
+
+#[test]
+fn whence_reports_what_a_function_shadows() {
+    // The interactive question is "whence runs, and what did it hide" — so the
+    // winner leads and the note names what it displaced.
+    let out = run_with_input("func sh(...args) { puts nope }\nwhence sh\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("sh is a function (shadowing /"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\n    func sh(...args)\n"), "{stdout}");
+}
+
+#[test]
+fn whence_all_lists_every_match_in_resolution_order() {
+    let out = run_with_input("func sh(...args) { puts nope }\nwhence --all sh\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("sh is a function\n    func sh(...args)\nsh is /"),
+        "{stdout}"
+    );
+    // The winner keeps its plain headline: `--all` is the listing, not a note.
+    assert!(!stdout.contains("shadowing"), "{stdout}");
+}
+
+#[test]
+fn whence_reports_a_binding_by_its_bare_name() {
+    // A variable is asked about **without** the sigil: `$xs` would expand before
+    // `whence` ever saw it, and the value it produced could not say where it came
+    // from. The name is the question.
+    let out = run_with_input("xs = [a b c]\ngreeting = hi\nwhence xs greeting\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "xs is a variable\n    a list of 3: ['a', 'b', 'c']\n\
+         greeting is a variable\n    a string: 'hi'\n"
+    );
+}
+
+#[test]
+fn whence_names_the_scope_a_binding_lives_in() {
+    let out = run_with_input(
+        "global outer = 1\nfunc peek() { inner = 2; whence inner; whence outer }\npeek\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "inner is a local variable\n    an integer: 2\n\
+         outer is a variable\n    an integer: 1\n"
+    );
+}
+
+#[test]
+fn whence_reads_the_environment_as_its_own_namespace() {
+    // A command and an environment entry are separate namespaces in mesh, so a
+    // name that is both is reported as both rather than one winning.
+    let out = run_with_input("export MESH_WHENCE_E2E = hi\nwhence MESH_WHENCE_E2E\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "MESH_WHENCE_E2E is an environment entry\n    a string: 'hi'\n"
+    );
+}
+
+#[test]
+fn whence_reports_a_path_operand_rather_than_searching_for_it() {
+    let out = run_with_input("whence ./Cargo.toml\nwhence /\n");
+    // `/` is division first — the parser settles a shape before any lookup — and
+    // the directory it also names comes after, neither one shadowing the other.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "./Cargo.toml is a file, but not executable\n\
+         / is syntax\n    n = (1 + 2)\n/ is a directory\n"
+    );
+}
+
+#[test]
+fn whence_quiet_is_the_command_v_test() {
+    // `--quiet` makes the status the whole answer: no report on stdout, and no
+    // not-found note on stderr either, so a startup-file test stays silent
+    // without redirecting two streams.
+    let out = run_with_input(
+        "if whence --quiet sh { puts found }\nif whence --quiet definitely-no-such-command { puts bad } else { puts missing }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "found\nmissing\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn whence_prints_its_report_when_it_is_a_condition() {
+    // Without `--quiet` it is an ordinary command that writes: the status is
+    // still the test, but the report goes to stdout as it always does.
+    let out = run_with_input("if whence sh { puts found }\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("sh is /"), "{stdout}");
+    assert!(stdout.ends_with("found\n"), "{stdout}");
+}
+
+#[test]
+fn whence_reports_a_missing_name_and_keeps_the_rest() {
+    let out = run_with_input("whence nosuchname pwd\nputs \"status $sh.status\"\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("pwd is a builtin"), "{stdout}");
+    // A name that resolved still prints, so one typo does not cost the rest.
+    assert!(stdout.contains("status 1"), "{stdout}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("mesh: whence: nosuchname: not found"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn whence_points_another_shells_spelling_at_mesh_s() {
+    // Both directions: typing the other shell's name, and asking `whence` about
+    // it. `type` is bash's and fish's, `what` is neither but is the name a reader
+    // may have carried in from their own config.
+    let out = run_with_input("type ls\nwhat ls\nwhence type\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mesh: command not found: type (mesh spells this `whence`)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("mesh: command not found: what (mesh spells this `whence`)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("mesh: whence: type: not found (mesh spells this `whence`)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn whence_terminator_asks_about_a_flag_looking_name() {
+    let out = run_with_input("whence -- --all\nwhence --nope\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mesh: whence: --all: not found"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("mesh: whence: --nope: unknown option (`--all` or `--quiet`)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn whence_is_a_builtin_a_pipeline_can_read() {
+    let out = run_with_input("whence pwd | grep -c builtin\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+}
+
+#[test]
+fn whence_fails_for_a_shape_the_parser_does_not_claim() {
+    // `help`'s table documents an operator for every symbol a line can carry, and
+    // words the parser claims either always or only *contextually*. Only what it
+    // claims in command position runs when typed bare, so only that may report
+    // success — `unless` alone is `command not found`, for all that `cmd if COND`
+    // is real syntax, while `if` is claimed unconditionally as the prefix
+    // conditional and so does resolve.
+    let out = run_with_input(
+        "whence +\nputs \"plus $sh.status\"\n\
+         whence unless\nputs \"unless $sh.status\"\n\
+         whence if\nputs \"if $sh.status\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "+ is syntax\n    n = (1 + 2)\nplus 1\n\
+         unless is syntax\n    cmd if COND\nunless 1\n\
+         if is syntax\n    if COND { … } else { … }\nif 0\n"
+    );
+}
+
+#[test]
+fn whence_lets_a_function_outrank_a_contextual_keyword() {
+    // `fork` is the subshell keyword only before a block, so `func fork()` is legal
+    // and a bare `fork` calls it — see `a_command_named_fork_is_still_reachable`.
+    // The function is therefore the answer to "what runs", and the keyword is
+    // reported beside it rather than shadowing it.
+    let out = run_with_input("func fork() { puts CALLED }\nwhence fork\nfork\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "fork is a function\n    func fork()\n\
+         fork is syntax\n    fork { … }\n\
+         CALLED\n"
+    );
+    // No shadow note in either direction: they are not competing for the position.
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("shadowing"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn whence_names_a_job_handle_as_a_job() {
+    // Diagnostics group jobs with streams — both lack a byte form — but the
+    // question here is what the name holds, and `j = cmd &` holds a job.
+    let out = run_with_input("j = sleep 0 &\nwhence j\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("j is a variable\n    a job handle\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn whence_refuses_an_execute_bit_on_a_special_file() {
+    // `execve` refuses a fifo whatever its mode, so the bit alone must not make
+    // one look runnable — and "a named pipe" says why better than "not
+    // executable" would.
+    let dir = fresh_dir("whence_fifo");
+    let fifo = dir.join("p");
+    let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("path");
+    // SAFETY: an ordinary `mkfifo(3)` call on a path this test owns.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o755) }, 0);
+    let out = run_with_input(&format!(
+        "whence {0}\nputs \"status $sh.status\"\n",
+        fifo.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{} is a named pipe\nstatus 1\n", fifo.display())
+    );
+}
+
+#[test]
+fn whence_fails_for_a_path_operand_that_could_not_run() {
+    // Both still print — knowing *why* a path is not a command is the useful
+    // answer — but neither resolved, because running either is a `126`. Quiet
+    // mode is the `command -v` test, so it must not say yes to them.
+    let out = run_with_input(
+        "whence ./Cargo.toml\nputs \"file $sh.status\"\nwhence /etc\nputs \"dir $sh.status\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "./Cargo.toml is a file, but not executable\nfile 1\n\
+         /etc is a directory\ndir 1\n"
+    );
+    // An *executable* path operand still resolves — the rule is "could this
+    // run", not "is it a path".
+    let quiet = run_with_input(
+        "if whence --quiet ./Cargo.toml { puts bad } else { puts refused }\n\
+         if whence --quiet /bin/sh { puts runnable } else { puts bad }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&quiet.stdout),
+        "refused\nrunnable\n"
+    );
+}
+
+#[test]
+fn whence_searches_the_default_path_when_path_is_unset() {
+    // `execvp` falls back to `confstr(_CS_PATH)` when `PATH` is unset, so a
+    // sanitized environment still runs `sh` — and `whence` has to still find it,
+    // or it is wrong about the one thing it exists to be right about.
+    let mut child = mesh_command()
+        .env_remove("PATH")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"whence sh\n")
+        .expect("write commands");
+    let out = child.wait_with_output().expect("wait for mesh");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("sh is /"), "{stdout}");
+    assert!(stdout.contains("/sh"), "{stdout}");
+    assert!(out.status.success(), "{:?}", out.status);
+}
+
+#[test]
 fn option_terminator_passes_help_to_a_function_as_data() {
     let out = run_with_input("func show(value) { puts \"<$value>\" }\nshow -- --help\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "<--help>\n");
@@ -15904,7 +16224,7 @@ fn source_runs_a_file_in_the_current_shell() {
     assert!(out.status.success(), "{:?}", out.status);
 }
 
-/// `$sh.origin` and `$sh.source` answer "what is being evaluated, and where does it
+/// `$sh.origin` and `$sh.source` answer "whence is being evaluated, and where does it
 /// live" — the two questions `DESIGN.md` leaves as a TODO, kept **orthogonal to
 /// interactivity**. `$sh.source` reports the *innermost* file, so it changes across
 /// a `source` and changes back afterwards.
