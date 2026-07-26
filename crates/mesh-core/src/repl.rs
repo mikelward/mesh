@@ -20,10 +20,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reedline::{
-    Color, ColumnarMenu, Completer, EditCommand, Emacs, History, HistoryItem, HistoryItemId,
-    HistorySessionId, KeyCode, KeyModifiers, Keybindings, MenuBuilder, Osc133Markers, Prompt,
-    PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, SearchDirection,
-    SearchQuery, Signal, SimpleMatchHighlighter, Span, SqliteBackedHistory, Suggestion,
+    Color, ColumnarMenu, Completer, EditCommand, Emacs, Highlighter, History, HistoryItem,
+    HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, Keybindings, MenuBuilder,
+    Osc133Markers, Prompt, PromptEditMode, PromptHistorySearch, PromptKind, Reedline,
+    ReedlineEvent, ReedlineMenu, SearchDirection, SearchQuery, SemanticPromptMarkers, Signal,
+    SimpleMatchHighlighter, Span, SqliteBackedHistory, StyledText, Suggestion,
     default_emacs_keybindings,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -33,6 +34,7 @@ use crate::builtins::{self, Builtin};
 use crate::completion::{CompletionCache, CompletionSpec, ValueHint, rank_candidates};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
+use crate::options::{Opt, Options};
 use crate::vars::{self, RegexValue, Value, Vars};
 use crate::{environ, exec, expand, parser};
 
@@ -1938,11 +1940,87 @@ fn assign_into_member(
     shell: &mut Shell,
 ) -> Result<(), String> {
     let (root, steps) = resolve_path(target, "assign to", &shell.vars)?;
+    if root == "sh" {
+        return assign_into_shell(target, &steps, &value, append, global, &shell.vars);
+    }
     // Through `Vars::update`, so a failed path leaves no local shadow behind: the
     // write runs on a copy and is installed only once the whole thing succeeds.
     shell.vars.update(&root, global, |root| {
         write_at(root, &steps, value, append, target)
     })
+}
+
+/// `$sh.options.KEY = …` — the writable corner of the shell's own namespace.
+///
+/// `$sh` is not a variable, so none of the machinery above applies: the namespace
+/// a read sees is a snapshot built per access, and writing into that would land in
+/// a copy nobody keeps. The settings are reached through [`Options`] instead, and
+/// everything else in `$sh` is refused *by name*, so the message says which entry
+/// and why rather than leaving the user to infer it from a rejected `=`.
+///
+/// `DESIGN.md` §"Read-only vs. writable within `$sh`" is the list this enforces:
+/// the runtime entries are the shell's authoritative state, so config cannot
+/// corrupt an invariant; the configuration entries are the user's.
+fn assign_into_shell(
+    target: &str,
+    steps: &[PathStep],
+    value: &Value,
+    append: bool,
+    global: bool,
+    vars: &vars::Vars,
+) -> Result<(), String> {
+    // `global` governs which *scope* a write lands in, and `$sh` has none — it is
+    // the session's, whatever function is running. Silently accepting the word
+    // would suggest there is another `$sh` somewhere that this one is not.
+    if global {
+        return Err(
+            "`global` cannot apply to `$sh`: it is the session's, not a scope's".to_owned(),
+        );
+    }
+    let (top, rest) = steps.split_first().expect("the parser required one access");
+    let (PathStep::Member(entry) | PathStep::Subscript(entry)) = top;
+    if entry != "options" {
+        return Err(if shell_has_entry(entry, vars) {
+            format!("`$sh.{entry}` is read-only; only `$sh.options` may be assigned")
+        } else {
+            no_shell_entry(entry)
+        });
+    }
+    match rest {
+        // `$sh.options = …` wholesale. Refused rather than validated key by key:
+        // a map literal that omits a setting would have to mean either "leave it"
+        // or "reset it", and neither reading is obviously right. One setting at a
+        // time has no such question.
+        [] => Err("assign one setting at a time, as `$sh.options.NAME = false`".to_owned()),
+        [PathStep::Member(key) | PathStep::Subscript(key)] => {
+            // `+=` combines with what is there, which for a boolean is not a
+            // meaning `DESIGN.md` gives `+=` — and "or-equals" is not what anyone
+            // typing it would expect a setting to do.
+            if append {
+                return Err(format!("{target}: a setting is set with `=`, not `+=`"));
+            }
+            vars.options().assign(target, key, value)
+        }
+        // A setting is a boolean, so there is nothing under one to reach into.
+        _ => Err(format!(
+            "{target}: a setting is a boolean, with nothing inside it"
+        )),
+    }
+}
+
+/// Does `$sh` have this entry at all? Asked of the live namespace rather than a
+/// second list of names, so an entry added later cannot be reported as a typo.
+fn shell_has_entry(entry: &str, vars: &vars::Vars) -> bool {
+    let Value::Map(entries) = vars.shell_namespace() else {
+        unreachable!("$sh resolves to a map");
+    };
+    entries.iter().any(|(key, _)| key == entry)
+}
+
+/// The words a *read* of the same place uses, so a refused write and a failed
+/// read do not describe one namespace two different ways.
+fn no_shell_entry(entry: &str) -> String {
+    format!("$sh: no `{entry}` in this map")
 }
 
 /// Split a target's accesses into steps, resolving subscripts against the variable
@@ -1983,9 +2061,36 @@ fn resolve_path(
 /// element" rather than "leave a hole".
 fn unset_member(target: &str, global: bool, shell: &mut Shell) -> Result<(), String> {
     let (root, steps) = resolve_path(target, "unset", &shell.vars)?;
+    if root == "sh" {
+        return Err(unset_shell_error(target, &steps, &shell.vars));
+    }
     shell
         .vars
         .update(&root, global, |root| remove_at(root, &steps, target))
+}
+
+/// Why nothing in `$sh` can be removed.
+///
+/// Writable is not the same as removable. `$sh.options` has a **fixed** set of
+/// keys — each one is a question the shell asks itself every prompt — so removing
+/// one would leave that question with no answer rather than restoring a default.
+/// Assigning is the way back, and it is the only way that says which value you
+/// meant.
+fn unset_shell_error(target: &str, steps: &[PathStep], vars: &vars::Vars) -> String {
+    let (top, rest) = steps.split_first().expect("the parser required one access");
+    let (PathStep::Member(entry) | PathStep::Subscript(entry)) = top;
+    if entry == "options" {
+        return if rest.is_empty() {
+            "`$sh.options` cannot be removed; it is the settings map itself".to_owned()
+        } else {
+            format!("{target}: a setting cannot be removed; assign it instead")
+        };
+    }
+    if shell_has_entry(entry, vars) {
+        format!("`$sh.{entry}` is read-only")
+    } else {
+        no_shell_entry(entry)
+    }
 }
 
 /// Remove the entry a resolved path's last step names, as the whole effect of the
@@ -2901,7 +3006,7 @@ fn single_callable_argument(
 }
 
 /// How to name a value's type in a diagnostic.
-fn value_kind(value: &Value) -> &'static str {
+pub(crate) fn value_kind(value: &Value) -> &'static str {
     match value {
         Value::String(_) => "a string",
         Value::Integer(_) => "an integer",
@@ -4578,24 +4683,36 @@ enum SemanticMark {
     CommandAbandoned,
 }
 
+/// Is an interactive decoration on — the session is interactive *and* the
+/// setting governing it is set?
+///
+/// The two tests stay separate questions answered in one place. Interactivity is
+/// not the setting's job: `set_interactive` is recorded by the interactive loop
+/// rather than derived from `isatty`, so `mesh -s` on a terminal — which reads
+/// commands without being a session — stays quiet whatever `$sh.options` says,
+/// and so does every piped run the test suite asserts byte-exact output from.
+fn decoration(vars: &vars::Vars, option: Opt) -> bool {
+    vars.interactive() && vars.options().get(option)
+}
+
 /// Write an OSC 133 mark, so a terminal can tell prompt from input from output:
 /// jump between commands, fold their output, badge a failure. `DESIGN.md`
 /// "terminal control" lists the sequence set; this is the pair with boundaries
 /// mesh already has, at `PreExec` and `PostExec`.
 ///
-/// **Only when the session is interactive.** `set_interactive` is recorded by
-/// the interactive loop rather than derived from `isatty`, so `mesh -s` on a
-/// terminal — which reads commands without being a session — stays quiet, and so
-/// does every piped run the test suite asserts byte-exact output from. A mark on
-/// stdout that the caller did not ask for is corruption, not decoration.
+/// `enabled` is [`decoration`] with [`Opt::ShellIntegration`], decided by the
+/// caller and **once per command**: `C` and `D` bracket a region, so a setting
+/// changed by the command in between must not close a region that was never
+/// opened, or leave one open that was. A mark on stdout that the caller did not
+/// ask for is corruption, not decoration.
 ///
 /// Terminated with `ST` rather than `BEL`, matching what reedline emits for `A`
 /// and `B`, so one stream does not mix the two spellings.
 ///
 /// Failure to write is ignored: the command's status is the command's, and a
 /// decoration that could change it would be worse than a missing decoration.
-fn semantic_mark(interactive: bool, mark: SemanticMark) {
-    if !interactive {
+fn semantic_mark(enabled: bool, mark: SemanticMark) {
+    if !enabled {
         return;
     }
     let sequence = match mark {
@@ -4621,10 +4738,10 @@ fn semantic_mark(interactive: bool, mark: SemanticMark) {
 /// for (a terminal that asked to be told holds the last value it was told).
 ///
 /// The *physical* directory, from `getcwd`, since that is the path a new terminal
-/// can chdir to. Interactive-only and failure-ignoring for the same reasons as
-/// [`semantic_mark`].
-fn report_cwd(interactive: bool) {
-    if !interactive {
+/// can chdir to. `enabled` is [`decoration`] with [`Opt::CwdReport`]; failure to
+/// write is ignored for the same reason as [`semantic_mark`].
+fn report_cwd(enabled: bool) {
+    if !enabled {
         return;
     }
     let Ok(cwd) = std::env::current_dir() else {
@@ -6761,12 +6878,21 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     let completion = Arc::new(RwLock::new(CompletionState::default()));
     let keybindings = interactive_keybindings();
     let completion_menu = completion_menu();
+    // Before the editor, so the highlighter can be handed the *same* settings the
+    // shell writes to: `$sh.options.bold-input = false` has to reach a reedline
+    // that was built once, at startup.
+    let mut shell = Shell::new();
     let mut editor = Reedline::create()
         // `A` and `B` — where the prompt starts and where the user's input does.
         // The shell emits `C` and `D` itself, at `PreExec` and `PostExec`; see
         // `semantic_mark`. Both halves have to be present for a terminal to make
-        // sense of the stream, and only reedline knows where it drew the prompt.
-        .with_semantic_markers(Some(Osc133Markers::boxed()))
+        // sense of the stream, and only reedline knows where it drew the prompt —
+        // which is also why `$sh.options.shell-integration` is read from inside
+        // `PromptMarkers` rather than deciding whether to install them here.
+        .with_semantic_markers(Some(Box::new(PromptMarkers {
+            options: Arc::clone(shell.vars.options()),
+            marks: Osc133Markers,
+        })))
         // Bracketed paste (`CSI ?2004 h`), per `DESIGN.md` "terminal control":
         // pasted text is *inserted*, not executed line by line. reedline's guard
         // defaults to off, so without this a paste's newlines each arrive as
@@ -6774,7 +6900,9 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         .use_bracketed_paste(true)
         .with_edit_mode(Box::new(Emacs::new(keybindings)))
         .with_quick_completions(true)
-        .with_highlighter(Box::new(input_highlighter()))
+        .with_highlighter(Box::new(input_highlighter(Arc::clone(
+            shell.vars.options(),
+        ))))
         .with_visual_selection_style(nu_ansi_term::Style::default())
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(completion_menu)))
         .with_completer(Box::new(MeshCompleter {
@@ -6801,7 +6929,6 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             Err(err) => note!("mesh: could not open history database: {err}"),
         }
     }
-    let mut shell = Shell::new();
     shell
         .vars
         .set_invocation(options.name.clone(), options.args.clone());
@@ -6831,7 +6958,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             // where it left the shell rather than from where it found it. Only for
             // a fresh command: a continuation line is the same command line still
             // being typed, and the shell cannot have moved between the two.
-            report_cwd(shell.vars.interactive());
+            report_cwd(decoration(&shell.vars, Opt::CwdReport));
             set_title(shell.vars.interactive(), &environment_prompt_title());
         }
         *completion.write().expect("completion state poisoned") =
@@ -6948,8 +7075,68 @@ fn interactive_keybindings() -> Keybindings {
     keybindings
 }
 
-fn input_highlighter() -> SimpleMatchHighlighter {
-    SimpleMatchHighlighter::default().with_neutral_style(nu_ansi_term::Style::new().bold())
+/// Draws the line being typed, bold or plain per `$sh.options.bold-input`.
+///
+/// Both styles are built once and chosen per repaint, so a change reaches the
+/// next keystroke rather than the next session: reedline is handed the
+/// highlighter when the editor is built, and there is no later chance to swap it.
+/// That is what the settings live behind an `Arc` for — see [`crate::options`].
+struct InputHighlighter {
+    options: Arc<Options>,
+    bold: SimpleMatchHighlighter,
+    plain: SimpleMatchHighlighter,
+}
+
+impl Highlighter for InputHighlighter {
+    fn highlight(&self, line: &str, cursor: usize) -> StyledText {
+        if self.options.get(Opt::BoldInput) {
+            self.bold.highlight(line, cursor)
+        } else {
+            self.plain.highlight(line, cursor)
+        }
+    }
+}
+
+/// The prompt's own OSC 133 marks — `A` and `B` — gated on the same setting as
+/// the `C` and `D` [`semantic_mark`] writes.
+///
+/// Both halves or neither: a terminal that sees `A` and `B` with no `C`/`D` reads
+/// everything after the prompt as still being input, which is worse than a stream
+/// with no marks in it at all. reedline is handed the markers once, when the
+/// editor is built, so the setting is read here rather than by choosing whether to
+/// install them.
+struct PromptMarkers {
+    options: Arc<Options>,
+    marks: Osc133Markers,
+}
+
+impl SemanticPromptMarkers for PromptMarkers {
+    fn prompt_start(&self, kind: PromptKind) -> Cow<'_, str> {
+        if self.options.get(Opt::ShellIntegration) {
+            self.marks.prompt_start(kind)
+        } else {
+            Cow::Borrowed("")
+        }
+    }
+
+    fn command_input_start(&self) -> Cow<'_, str> {
+        if self.options.get(Opt::ShellIntegration) {
+            self.marks.command_input_start()
+        } else {
+            Cow::Borrowed("")
+        }
+    }
+}
+
+fn input_highlighter(options: Arc<Options>) -> InputHighlighter {
+    InputHighlighter {
+        options,
+        // Bold and nothing else: weight, not color, so the line stays readable on
+        // any theme and carries no syntax claim the shell would have to keep true.
+        bold: SimpleMatchHighlighter::default()
+            .with_neutral_style(nu_ansi_term::Style::new().bold()),
+        plain: SimpleMatchHighlighter::default(),
+    }
 }
 
 fn completion_menu() -> ColumnarMenu {
@@ -7406,12 +7593,15 @@ fn handle_signal(
             if command.trim().is_empty() {
                 return Some(run_line(&text, last, false, shell));
             }
-            let marks = shell.vars.interactive();
+            let marks = decoration(&shell.vars, Opt::ShellIntegration);
             // Before `C`, since a title is not output: it belongs outside the
             // region a terminal will offer to fold, next to the submission that
             // caused it. The prompt's title comes back at the next prompt, so a
             // command's title lasts exactly as long as the command.
-            set_title(marks, &running_title(&command));
+            //
+            // Still on `interactive()` rather than a setting of its own:
+            // `$sh.options.osc-title` is the next change, not this one.
+            set_title(shell.vars.interactive(), &running_title(&command));
             // Both marks sit outside the hooks, so that everything printed
             // because this command was submitted falls inside the region they
             // bracket. A `preexec` hook that writes before `C` is folded into
@@ -7458,7 +7648,10 @@ fn handle_signal(
             // and carries *no* status: the abandoned line ran nothing, and
             // reporting `last` would badge the new line with the old command's
             // outcome.
-            semantic_mark(shell.vars.interactive(), SemanticMark::CommandAbandoned);
+            semantic_mark(
+                decoration(&shell.vars, Opt::ShellIntegration),
+                SemanticMark::CommandAbandoned,
+            );
             pending.clear();
             gate.reset();
             Some(Step::Continue(last))
@@ -7730,7 +7923,7 @@ impl Prompt for MeshPrompt {
 mod tests {
     use super::{
         ArgumentRecall, CompletionState, HeredocGate, Invocation, MeshPrompt, PromptEvent,
-        PromptHook, Shell, StartupOptions, Step, TITLE_LIMIT, TimestampedHistory,
+        PromptHook, PromptMarkers, Shell, StartupOptions, Step, TITLE_LIMIT, TimestampedHistory,
         argument_completions, body_awaits_close, command_position, command_segment_words,
         command_words, completed_command, cwd_url, escape_stripped_width, eval_binary,
         expand_history_designators, expansion_word, func_definition_is_open, handle_signal,
@@ -7740,16 +7933,19 @@ mod tests {
         run_line, run_prompt_hooks, run_source, running_title, title_sequence, title_text,
         variable_completions,
     };
+    use crate::options::Options;
     use crate::parser;
     use crate::vars::Value;
     use reedline::{
         EditCommand, Highlighter, History, HistoryItem, KeyModifiers, Prompt, PromptEditMode,
-        Reedline, ReedlineEvent, SearchDirection, SearchQuery, Signal, SqliteBackedHistory,
+        PromptKind, Reedline, ReedlineEvent, SearchDirection, SearchQuery, SemanticPromptMarkers,
+        Signal, SqliteBackedHistory,
     };
     use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn temporary_history_path(name: &str) -> PathBuf {
@@ -9212,11 +9408,74 @@ mod tests {
 
     #[test]
     fn interactive_input_is_bold_without_a_foreground_color() {
-        let highlighted = input_highlighter().highlight("puts hello", 10);
+        let options = Arc::new(Options::default());
+        let highlighted = input_highlighter(options).highlight("puts hello", 10);
 
         assert_eq!(highlighted.buffer.len(), 1);
         assert_eq!(highlighted.buffer[0].0, nu_ansi_term::Style::new().bold());
         assert_eq!(highlighted.buffer[0].1, "puts hello");
+    }
+
+    /// `A` and `B` go with `C` and `D`. A terminal handed the prompt's marks but
+    /// no command marks reads everything after the prompt as still being input,
+    /// which is worse than a stream with none — so `shell-integration` has to
+    /// silence reedline's half too, not just the shell's.
+    #[test]
+    fn turning_off_shell_integration_silences_the_prompt_marks_too() {
+        let options = Arc::new(Options::default());
+        let markers = PromptMarkers {
+            options: Arc::clone(&options),
+            marks: reedline::Osc133Markers,
+        };
+
+        assert_eq!(
+            markers.prompt_start(PromptKind::Primary),
+            "\x1b]133;A;k=i\x1b\\"
+        );
+        assert_eq!(markers.command_input_start(), "\x1b]133;B\x1b\\");
+
+        options
+            .assign(
+                "$sh.options.shell-integration",
+                "shell-integration",
+                &Value::Boolean(false),
+            )
+            .expect("shell-integration is a setting");
+        assert_eq!(markers.prompt_start(PromptKind::Primary), "");
+        assert_eq!(markers.prompt_start(PromptKind::Secondary), "");
+        assert_eq!(markers.command_input_start(), "");
+    }
+
+    /// The highlighter is built once, when the session starts, so the setting has
+    /// to be read at draw time — not baked into the style at construction.
+    #[test]
+    fn turning_off_bold_input_reaches_the_highlighter_already_built() {
+        let options = Arc::new(Options::default());
+        let highlighter = input_highlighter(Arc::clone(&options));
+
+        options
+            .assign(
+                "$sh.options.bold-input",
+                "bold-input",
+                &Value::Boolean(false),
+            )
+            .expect("bold-input is a setting");
+        let plain = highlighter.highlight("puts hello", 10);
+        assert_eq!(plain.buffer.len(), 1);
+        assert_eq!(plain.buffer[0].0, nu_ansi_term::Style::default());
+        assert_eq!(plain.buffer[0].1, "puts hello");
+
+        // And back: the same highlighter bolds again, so the setting is a live
+        // read rather than a one-way latch.
+        options
+            .assign(
+                "$sh.options.bold-input",
+                "bold-input",
+                &Value::Boolean(true),
+            )
+            .expect("bold-input is a setting");
+        let bold = highlighter.highlight("puts hello", 10);
+        assert_eq!(bold.buffer[0].0, nu_ansi_term::Style::new().bold());
     }
 
     #[test]

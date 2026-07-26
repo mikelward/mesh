@@ -2364,9 +2364,14 @@ impl Parser {
     /// Requires at least one access: a place is what `$m.key` names, while a bare
     /// `$m` on the left of `=` is not how mesh spells a rebinding (`m = …` is).
     /// Refuses a trailing modifier, since `$xs:dedup` describes a derived value and
-    /// not somewhere to store one. `$env` and `$sh` are excluded — `$env.KEY` has
-    /// its own byte-boundary rules above, and `$sh` is read-only — so both keep the
-    /// diagnostics they already had.
+    /// not somewhere to store one.
+    ///
+    /// `$env` is excluded, keeping the byte-boundary rules `env_target` above
+    /// applies to it. `$sh` is **not**: `$sh.options.KEY = …` is a real place, and
+    /// which of the namespace's entries may be written is a runtime question — the
+    /// answer differs per key — so it belongs where the write happens rather than
+    /// in the grammar. Refusing `$sh` here made every `$sh.x = …` a syntax error
+    /// about the `=`, which named neither the entry nor why it was refused.
     fn member_target(&mut self) -> Option<String> {
         let TokenKind::Word(word) = &self.peek()?.value else {
             return None;
@@ -2386,7 +2391,7 @@ impl Parser {
             .or_else(|| name.strip_prefix('$'))?;
         let root_end = inner.find(['.', '[', ':'])?;
         let root = &inner[..root_end];
-        if !valid_name(root) || crate::vars::is_reserved_namespace(root) {
+        if !valid_name(root) || root == "env" {
             return None;
         }
         // Walk the accesses structurally rather than scanning for a `:`: a colon
@@ -4437,6 +4442,34 @@ mod tests {
                 op: BinaryOp::Equal,
                 ..
             }
+        ));
+    }
+
+    /// `$sh.x = …` is a **place**, so the grammar hands it on and the runtime
+    /// decides which entries may be written. `$env` keeps its own path, where the
+    /// byte-boundary rules live.
+    #[test]
+    fn the_shell_namespace_is_an_assignment_place_and_the_environment_is_not() {
+        let tree = complete("$sh.options.bold-input = false");
+        let Executable::MemberAssignment { target, append, .. } = &tree.statements[0].and_or.first
+        else {
+            panic!("expected a member assignment, got {:?}", tree.statements[0]);
+        };
+        assert_eq!(target, "$sh.options.bold-input");
+        assert!(!append);
+
+        // Even a runtime entry, which the runtime then refuses by name — the
+        // grammar does not know which is which, and a syntax error here could not
+        // say why.
+        assert!(matches!(
+            complete("$sh.status = 3").statements[0].and_or.first,
+            Executable::MemberAssignment { .. }
+        ));
+
+        // `$env.KEY` is still its own assignment, not a member write.
+        assert!(matches!(
+            complete("$env.HOME = /tmp").statements[0].and_or.first,
+            Executable::EnvAssignment { .. }
         ));
     }
 

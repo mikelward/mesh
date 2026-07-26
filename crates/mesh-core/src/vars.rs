@@ -4,13 +4,16 @@
 //! **function-local** scopes pushed for the duration of a `func` call. Reads
 //! resolve the innermost local scope, then the global scope — a callee never
 //! sees its caller's locals (lexical, not dynamic). Writes land in the innermost
-//! scope (a function-local when one is active, else the global). The read-only
-//! `$sh` namespace holds the invocation entries `$sh.name` and `$sh.args`;
-//! `export` and the rest of the `$sh.*` surface are deferred to later tasks —
-//! see `DESIGN.md` §"Variables and assignment".
+//! scope (a function-local when one is active, else the global). The `$sh`
+//! namespace holds the shell's own state: read-only apart from the
+//! [`options`](crate::options) settings map, per `DESIGN.md` §"Variables and
+//! assignment". The rest of the `$sh.*` surface — the hook maps, `$sh.complete`,
+//! `$sh.signal` — is deferred to later tasks.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use crate::options::Options;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
@@ -262,6 +265,11 @@ type Scope = HashMap<String, Value>;
 /// Names the shell owns rather than the user: `$env` is the process
 /// environment, `$sh` is the shell's own state. Neither can be bound by an
 /// assignment, a function parameter, or a pattern.
+///
+/// Reserved is about the *name*, not about mutability: `$sh.options.KEY = …`
+/// writes into the namespace without rebinding `sh`, which is why the parser's
+/// member-assignment place check excludes only `env` (whose own byte-boundary
+/// rules apply) rather than consulting this.
 pub fn is_reserved_namespace(name: &str) -> bool {
     matches!(name, "env" | "sh")
 }
@@ -299,6 +307,10 @@ pub struct Vars {
     /// stay orthogonal: this reports the **innermost** frame, so "where am I" has
     /// one answer, and interactivity stays separately in `interactive`.
     inputs: Vec<Input>,
+    /// The `$sh.options` settings, shared rather than owned: the line editor
+    /// holds a reader too, so a write here reaches the next keystroke. See
+    /// [`crate::options`].
+    options: Arc<Options>,
 }
 
 /// One level of input: where it came from, and its path when it has one.
@@ -358,6 +370,7 @@ impl Default for Vars {
                 origin: Origin::Stdin,
                 source: String::new(),
             }],
+            options: Arc::new(Options::default()),
         }
     }
 }
@@ -405,6 +418,13 @@ impl Vars {
     /// Whether this session is interactive, as recorded above.
     pub fn interactive(&self) -> bool {
         self.interactive
+    }
+
+    /// The live `$sh.options` settings. Handed out as the shared `Arc` rather
+    /// than a copy, because the line editor keeps its own reader — see
+    /// [`crate::options`].
+    pub fn options(&self) -> &Arc<Options> {
+        &self.options
     }
 
     /// Replace the outermost input — the one the invocation itself established.
@@ -458,12 +478,6 @@ impl Vars {
         self.stages = stages;
     }
 
-    /// The read-only `$sh` namespace as an ordered map, so member access,
-    /// indexing, and modifiers all work through the usual map and list paths.
-    ///
-    /// The runtime entries are built here rather than stored in `shell`, so
-    /// recording a status after every command is two field writes instead of a
-    /// keyed update of the map.
     /// Is the innermost input a **sourced file**? That is the one top level a
     /// `return` may leave, because it is the only one with an invoker to return to
     /// — the `source` command, whose status becomes the returned value's.
@@ -477,6 +491,14 @@ impl Vars {
             .expect("the outermost input is never popped")
     }
 
+    /// The `$sh` namespace as an ordered map, so member access, indexing, and
+    /// modifiers all work through the usual map and list paths.
+    ///
+    /// A **snapshot**, not the namespace itself: the runtime entries are built
+    /// here rather than stored in `shell`, so recording a status after every
+    /// command is two field writes instead of a keyed update of the map. That is
+    /// also why a write to `$sh.options` cannot go through this value — it would
+    /// land in a copy that is discarded — and takes the [`Options`] path instead.
     pub(crate) fn shell_namespace(&self) -> Value {
         let mut entries = vec![
             ("status".to_owned(), Value::Integer(i64::from(self.status))),
@@ -526,6 +548,9 @@ impl Vars {
                 "source".to_owned(),
                 Value::String(self.input().source.clone()),
             ),
+            // The one writable entry. Read like any other map, but assigned
+            // through `Options` rather than into this snapshot.
+            ("options".to_owned(), Value::Map(self.options.entries())),
         ];
         entries.extend(self.shell.iter().cloned());
         Value::Map(entries)

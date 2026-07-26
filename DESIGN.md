@@ -807,6 +807,20 @@ settings map, the `$sh.complete` [completion-override](#completion) map, and the
 (This is the one place the general map rules are constrained — individual keys
 carry a mutability flag.)
 
+**Decided, and landed for `$sh.options`.** A setting is written one at a time —
+`$sh.options.NAME = false` — and takes effect at once, in the session doing the
+writing; there is no whole-map assignment, because a map literal that omitted a
+key would have to mean either "leave it" or "reset it". The keys are **fixed** and
+the values are **booleans**: an unknown key is refused rather than added (a
+settings map that absorbs a typo is a setting silently not applied), a non-boolean
+is refused rather than coerced (`"false"` is a *string*, and a truthiness rule
+would turn the setting on), and `unset` is refused too — removing a setting would
+leave the shell's question unanswered rather than restore a default, and assigning
+is the way back. `global` does not apply: `$sh` is the session's, not a scope's,
+so a function that writes a setting has written it for the shell. Every setting is
+**on by default** and governs an interactive decoration, so turning one off never
+changes what a command *does* — see [Terminal control](#hooks-and-the-prompt).
+
 *(TODO: **indirect / by-name variable access.** Real configs reach a value through
 a *computed* name — fish's `my_set_color` does `eval "printf \$$arg"` to read the
 variable named by `$arg` (`bold`, `blue`, …); bash has `${!var}` and `declare -n`,
@@ -2648,7 +2662,7 @@ programs or user functions:
     entry. It fires for a **lone** word only (`src/ x` runs
     `src/` as a command); a trailing-slash word whose target isn't a directory is a
     *no-such-directory* error, not command-not-found. On by default —
-    `$sh.options.autocd = off` disables it.
+    `$sh.options.autocd = false` disables it.
 - **I/O**
   - **`puts [args…]`** — one order-preserving rule: **render each argument to
     text** — a scalar as itself, a **list** as its elements joined by newlines (a
@@ -2820,7 +2834,7 @@ that command, and reading its `--help` is within that intent (you would have run
 - **stdin from `/dev/null`**, so a command that reads input can't hang the prompt;
 - a **short timeout** with kill, and an **output-size cap**;
 - an **opt-out denylist** for commands whose `--help` isn't safe, plus a global
-  off switch **`$sh.options.complete.probe = off`** for anyone who wants *zero*
+  off switch **`$sh.options.complete.probe = false`** for anyone who wants *zero*
   implicit execution (curated specs, man pages, and file / dir still work);
 - **conservative parsing** — recognize the `-x` / `--long` / `--long=VAL` /
   subcommand-table shapes; if parsing yields nothing, silently fall back to
@@ -2942,7 +2956,7 @@ immediately followed by a **supported designator** — `!` (→ `!!`), `^` (→ 
 left literal. Two safety wins over bash: expansion happens **only unquoted** —
 *both* single and double quotes make `!` literal (bash expanding `!` inside double
 quotes is a classic footgun) — with `\!` to escape and a
-**`$sh.options.histexpand = off`** switch to turn it off entirely.
+**`$sh.options.histexpand = false`** switch to turn it off entirely.
 
 ### Hooks and the prompt
 
@@ -3004,22 +3018,34 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
   the prompt and the command line while one runs, with the sequence chosen from
   `$env.TERM` (xterm `\e]0;…\a`, screen/tmux `\ek…`, nothing for a terminal not known
   to take one — an allowlist, since a terminal wrongly assumed to take a title
-  prints it instead). The off switch wants to be `$sh.options.osc-title`, and waits on `$sh`
-  becoming a writable place; a *replacement* for the text — a `$sh.title` hook — is
-  still open, and is a different question from turning it off.
+  prints it instead). The off switch wants to be `$sh.options.osc-title`; `$sh` is
+  a writable place now, so it is unblocked but not yet wired. A *replacement* for
+  the text — a `$sh.title` hook — is still open, and is a different question from
+  turning it off.
 - ***Bracketed paste*** *(`\e[?2004h/l`)* — **decided: on, always.** Pasted input is
   inserted, not executed line by line, and a lone newline in a paste doesn't submit.
 - ***Shell integration / semantic prompt marks*** *(OSC 133 `A`/`B`/`C`/`D`)* —
-  **decided: automatic.** The line editor emits `A` and `B`, the prompt's own
+  **decided: automatic, off switch `$sh.options.shell-integration`.** The line
+  editor emits `A` and `B`, the prompt's own
   boundaries; the shell emits `C` before the output and `D` with the status after,
   from outside the `preexec`/`postexec` dispatch so a printing hook falls inside the
   region the marks bracket. A line abandoned with Ctrl-C is closed with a bare `D`
   and no status; a blank submission is not a command, so it is neither marked nor
-  hooked.
+  hooked. The setting silences **both** halves — a terminal given `A` and `B` with
+  no `C`/`D` reads everything after the prompt as still being input, which is worse
+  than a stream with no marks at all — and is read once per command, before it
+  runs, so a command that changes it cannot leave a `C` without its `D`.
 - ***cwd reporting*** *(OSC 7)* — **decided: automatic, once per prompt** (after the
-  `preprompt` hooks), which covers both the startup report a fresh remote shell owes
+  `preprompt` hooks), **off switch `$sh.options.cwd-report`**, which covers both the
+  startup report a fresh remote shell owes
   a new tab/split and every later move, whatever caused it — a `cd`, a `func` that
   cds internally, a startup file — without a `postcd` hook of its own.
+- ***Bold input*** — **decided: on, off switch `$sh.options.bold-input`.** What is
+  being typed is drawn in bold: uniform weight rather than token-aware color, live
+  as you type, and surviving Enter into scrollback, so a command stays
+  distinguishable from its own output after the fact. Weight and not color because
+  color would be a syntax claim the shell would then have to keep true, and because
+  it has to read on any theme.
 - ***Hyperlinks*** *(OSC 8)* — clickable paths/URLs in output; likely a `style()`
   sibling (`link(text, url)`) rather than a raw escape, keeping color-as-data.
 - ***Clipboard*** *(OSC 52)* — **decided: a builtin, `clip`.** `clip TEXT …` or
@@ -3038,8 +3064,15 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
   updates atomically without flicker.
 
   Decide per feature: automatic, a hook/builtin, or out of scope (left to a
-  hand-emitted `print "\e…"`). The five marked **decided** above have landed;
-  `TODO.md` §"Beyond M3 — Terminal integration" tracks the rest.)*
+  hand-emitted `print "\e…"`). The six marked **decided** above have landed;
+  `TODO.md` §"Beyond M3 — Terminal integration" tracks the rest.
+  Everything **automatic** here is interactive-only and, bracketed paste aside,
+  carries a `$sh.options` off switch — the decoration is the default because it
+  should be pleasant out of the box, and the switch is for the terminal,
+  multiplexer, or taste it does not suit. Bracketed paste has none deliberately:
+  with the guard off a pasted newline arrives as Enter and every line but the last
+  runs before it can be read, which is data loss rather than a decoration. A
+  builtin needs none either — it writes only when called.)*
 
 **Command hooks fire for the outer interactive command only.** `preexec` /
 `postexec` fire once for the command line you submit at the prompt — *not* for
@@ -3386,7 +3419,7 @@ to avoid" rather than promising the latter as done.
   by index deferred);
   the `!` clash resolved lexically (a designator must follow, so `!=` / `!~` and a
   lone `!` are untouched); both quotes make `!` literal, `\!` escapes, and
-  `$sh.options.histexpand = off` disables it. Substitution is a chainable,
+  `$sh.options.histexpand = false` disables it. Substitution is a chainable,
   **global** **`:old=new`** modifier on any history reference (`!git:foo=bar:x=y`;
   quote each side or backslash-escape for spaces / specials), with **`^old^new`**
   as shorthand for `!!:old=new`.

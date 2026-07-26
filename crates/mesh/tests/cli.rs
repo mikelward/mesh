@@ -1869,6 +1869,48 @@ fn an_interactive_shell_titles_the_window() {
     );
 }
 
+/// Wait for a path to appear, up to a deadline.
+///
+/// How a harness synchronizes with a command it cannot hear: with
+/// `shell-integration` off there is no `D` to wait for, and reading the echo back
+/// instead would re-answer the cursor-position queries in the accumulated buffer,
+/// which reedline takes as input. A file the command creates is neither.
+fn wait_for_path(path: &Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+/// The case a setting is actually *for*: an rc file turning a decoration off, so
+/// the session never emits it at all. The startup files run after the line editor
+/// is built, which is exactly why the settings are shared with it rather than read
+/// out of the variable store when it is constructed.
+#[test]
+fn a_startup_file_can_turn_a_decoration_off_before_the_first_prompt() {
+    let home = fresh_dir("options_rc");
+    let config = home.join("mesh");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("rc.mesh"), "$sh.options.cwd-report = false\n").unwrap();
+
+    let exec = MeshExec::new(&home);
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(rc_disabled_decoration_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
 /// Where the shell is at the prompt, what it is running while it runs, and back
 /// again afterwards.
 ///
@@ -2066,6 +2108,148 @@ fn host_name() -> String {
         .position(|&byte| byte == 0)
         .unwrap_or(buffer.len());
     String::from_utf8_lossy(&buffer[..end]).into_owned()
+}
+
+fn rc_disabled_decoration_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 130;
+    };
+    // The first prompt is the startup report — the half `DESIGN.md` asks for and
+    // the one an rc file has the least time to prevent. It is not there.
+    if occurrences(&shell.startup, b"\x1b]7;") != 0 {
+        return 131;
+    }
+    // Nor after a move, and the shell is otherwise a working session: the marks
+    // are untouched, which is what lets this read wait on one.
+    if !pty_write(shell.master, b"cd /\n") {
+        return 132;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 133;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b]7;") != 0 {
+        return 134;
+    }
+    if !stop_pty_shell(shell) {
+        return 135;
+    }
+    0
+}
+
+#[test]
+fn settings_turn_the_interactive_decorations_off_and_back_on() {
+    let directory = fresh_dir("options_decorations");
+    let exec = MeshExec::new(isolated_config_home());
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(decoration_settings_harness(&exec, &directory)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// `$sh.options.cwd-report` and `$sh.options.shell-integration` govern sequences
+/// the shell writes, so the proof is the wire: turn one off and the escape stops
+/// arriving, turn it back on and it resumes — in the same session, without
+/// restarting the shell.
+fn decoration_settings_harness(exec: &MeshExec, directory: &Path) -> i32 {
+    let Some(shell) = start_pty_shell(exec, Some(directory)) else {
+        return 110;
+    };
+    // The report is on to begin with, which is what makes the silence below mean
+    // something rather than just being a session that never reported.
+    if last_cwd_report(&shell.startup).is_none() {
+        return 111;
+    }
+    if !pty_write(shell.master, b"$sh.options.cwd-report = false\n")
+        || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 112;
+    }
+    // Two moves, so the quiet window covers two prompts rather than one: `OSC 7`
+    // is written per prompt, and a single prompt's worth could be a read that
+    // stopped early rather than a report that never came.
+    for line in [b"cd /\n".as_slice(), b"cd /tmp\n".as_slice()] {
+        if !pty_write(shell.master, line) {
+            return 113;
+        }
+        let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+            return 114;
+        };
+        if status != 0 || occurrences(&seen, b"\x1b]7;") != 0 {
+            return 115;
+        }
+    }
+    // Back on, and the next move reports again.
+    if !pty_write(shell.master, b"$sh.options.cwd-report = true\n")
+        || pty_read_until_command_done(shell.master).is_none()
+        || !pty_write(shell.master, b"cd /\n")
+    {
+        return 116;
+    }
+    let Some((seen, _)) = pty_read_until_command_done(shell.master) else {
+        return 117;
+    };
+    if occurrences(&seen, b"\x1b]7;") == 0 {
+        return 118;
+    }
+
+    // The marks. Turning them off is itself still marked: the decision is taken
+    // once per command, before it runs, so `C` cannot open a region that `D` then
+    // declines to close.
+    if !pty_write(shell.master, b"$sh.options.shell-integration = false\n") {
+        return 119;
+    }
+    let Some((seen, _)) = pty_read_until_command_done(shell.master) else {
+        return 120;
+    };
+    if occurrences(&seen, b"\x1b]133;D;") != 1 {
+        return 121;
+    }
+    // Two commands with the marks off. Neither can be waited for on the wire, so
+    // each announces itself with a file instead; the pty is left unread until the
+    // end, which is what puts both commands' bytes in the buffer examined below.
+    let quiet = directory.join("quiet");
+    let restored = directory.join("restored");
+    let mut line = Vec::from(b"touch ");
+    line.extend_from_slice(quiet.as_os_str().as_bytes());
+    line.push(b'\n');
+    if !pty_write(shell.master, &line) || !wait_for_path(&quiet) {
+        return 122;
+    }
+    // Re-enabling and a command in one line, so the harness can hear that the
+    // *assignment* landed. It runs with the marks still off, like the `touch`
+    // above: the decision for this line was taken before it ran.
+    let mut line = Vec::from(b"$sh.options.shell-integration = true ; touch ");
+    line.extend_from_slice(restored.as_os_str().as_bytes());
+    line.push(b'\n');
+    if !pty_write(shell.master, &line) || !wait_for_path(&restored) {
+        return 123;
+    }
+    // Now read everything those two commands wrote, plus one marked command after
+    // them. Exactly one `C` and one `D` in the lot: the pair belongs to `puts
+    // back`, so the two that ran with the setting off contributed none.
+    if !pty_write(shell.master, b"puts back\n") {
+        return 124;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 125;
+    };
+    if status != 0 || occurrences(&seen, b"back\r\n") == 0 {
+        return 126;
+    }
+    if occurrences(&seen, b"\x1b]133;C\x1b\\") != 1 || occurrences(&seen, b"\x1b]133;D;") != 1 {
+        return 127;
+    }
+    if !stop_pty_shell(shell) {
+        return 128;
+    }
+    0
 }
 
 fn spawn_failure_harness(exec: &MeshExec) -> i32 {
@@ -10525,16 +10709,21 @@ fn member_assignment_leaves_the_reserved_namespaces_alone() {
     let env = run_with_input("$env.MESH_TEST_M = hello\nputs $env.MESH_TEST_M\n");
     assert_eq!(String::from_utf8_lossy(&env.stdout), "hello\n");
 
-    // Unchanged from before: an index or modifier on `$env`, and any write to
-    // `$sh`, are not assignment targets.
-    for source in [
-        "$env.PATH[0] = x\n",
-        "$env.PATH:dedup = x\n",
-        "$sh.name = x\n",
-        "$sh.args[0] = x\n",
-    ] {
+    // Unchanged from before: an index or modifier on `$env` is not an assignment
+    // target, and the message for one comes from parsing it as an expression.
+    for source in ["$env.PATH[0] = x\n", "$env.PATH:dedup = x\n"] {
         let out = run_with_input(source);
         assert_eq!(out.status.code(), Some(2), "{source}");
+    }
+
+    // `$sh` is a place — `$sh.options` is writable — so a write to a runtime
+    // entry is refused at **run** time, by name, rather than being a syntax error
+    // about the `=` that named neither the entry nor the reason.
+    for source in ["$sh.name = x\n", "$sh.args[0] = x\n"] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(1), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("is read-only"), "{source} gave {stderr}");
     }
 }
 
@@ -10750,11 +10939,25 @@ fn unsetting_a_missing_element_is_a_loud_error() {
         assert!(stderr.contains(message), "{source} gave {stderr}");
     }
 
-    // The reserved namespaces are not places here either, so removing an entry
-    // from the environment is still not spelled this way.
-    for source in ["unset $env.PATH\n", "unset $sh.pid\n"] {
+    // `$env` is not a place here, so removing an entry from the environment is
+    // still not spelled this way.
+    let out = run_with_input("unset $env.PATH\n");
+    assert_eq!(out.status.code(), Some(2));
+
+    // `$sh` parses as one, and is refused by name instead — including the
+    // settings, which are writable but not removable.
+    for (source, message) in [
+        ("unset $sh.pid\n", "`$sh.pid` is read-only"),
+        (
+            "unset $sh.options.bold-input\n",
+            "a setting cannot be removed",
+        ),
+        ("unset $sh.options\n", "`$sh.options` cannot be removed"),
+    ] {
         let out = run_with_input(source);
-        assert_eq!(out.status.code(), Some(2), "{source}");
+        assert_eq!(out.status.code(), Some(1), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source} gave {stderr}");
     }
 }
 
@@ -12606,7 +12809,7 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "status pipestatus pid ppid version interactive stdin stdout stderr jobs \
-         origin source name args\n"
+         origin source options name args\n"
     );
 
     // A mistyped key is still a loud error, and `status` is not a reserved
@@ -12619,6 +12822,132 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     );
     let out = run_with_input("status = mine\nputs $status\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "mine\n");
+}
+
+/// `$sh.options` is a map of booleans, every one of them on out of the box.
+#[test]
+fn the_settings_map_reads_as_booleans_that_start_on() {
+    let out = run_with_input("puts ...$sh.options:keys\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "bold-input cwd-report shell-integration\n"
+    );
+
+    let out = run_with_input(
+        "for name in $sh.options:keys { puts $name $sh.options[$name] }\n\
+         puts direct $sh.options.bold-input\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "bold-input true\ncwd-report true\nshell-integration true\ndirect true\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A setting is writable, and the read that follows sees the new value — which is
+/// what makes `$sh.options` the first part of `$sh` that is not a snapshot of
+/// state the shell alone decides.
+#[test]
+fn a_setting_can_be_turned_off_and_back_on() {
+    let out = run_with_input(
+        "$sh.options.bold-input = false\n\
+         puts off $sh.options.bold-input\n\
+         $sh.options.bold-input = true\n\
+         puts on $sh.options.bold-input\n\
+         $sh.options[\"cwd-report\"] = false\n\
+         puts subscript $sh.options.cwd-report\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "off false\non true\nsubscript false\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // One setting at a time: turning one off leaves the others where they were.
+    let out = run_with_input("$sh.options.bold-input = false\nputs ...$sh.options:values\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "false true true\n");
+}
+
+/// Every way of getting `$sh.options` wrong, and what each one says. A settings
+/// map that accepts a typo is a setting silently not applied, so all of these are
+/// refused rather than absorbed.
+#[test]
+fn the_settings_map_refuses_everything_but_a_boolean_by_name() {
+    for (source, message) in [
+        // A typo is not a new setting, and the message lists what there is.
+        (
+            "$sh.options.bold-imput = false\n",
+            "$sh.options: no `bold-imput` in this map; the settings are bold-input",
+        ),
+        // Not coerced: `\"false\"` is a string, and a truthiness rule here would
+        // turn the setting *on*.
+        (
+            "$sh.options.bold-input = \"false\"\n",
+            "a setting is `true` or `false`, got a string",
+        ),
+        ("$sh.options.bold-input = 0\n", "got an integer"),
+        // Wholesale, which would have to answer what an omitted key means.
+        (
+            "$sh.options = [bold-input: false]\n",
+            "assign one setting at a time",
+        ),
+        // `+=` has no meaning for a boolean.
+        (
+            "$sh.options.bold-input += true\n",
+            "a setting is set with `=`, not `+=`",
+        ),
+        // Nothing to reach into.
+        (
+            "$sh.options.bold-input.x = true\n",
+            "a setting is a boolean, with nothing inside it",
+        ),
+        // `$sh` is the session's, so there is no other scope for `global` to name.
+        (
+            "func f() { global $sh.options.bold-input = false }\nf\n",
+            "`global` cannot apply to `$sh`",
+        ),
+        // And the read-only entries stay read-only, by name.
+        (
+            "$sh.status = 3\n",
+            "`$sh.status` is read-only; only `$sh.options` may be assigned",
+        ),
+        ("$sh.nope = 3\n", "$sh: no `nope` in this map"),
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(1), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source} gave {stderr}");
+    }
+
+    // Refused means unchanged, not "changed to whatever we could make of it".
+    let out = run_with_input("$sh.options.bold-input = \"false\"\nputs $sh.options.bold-input\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\n");
+}
+
+/// The settings are the session's, not a scope's: a function that turns one off
+/// has turned it off for the shell, with no `global` needed and no shadow copy to
+/// leave behind.
+#[test]
+fn a_setting_changed_in_a_function_stays_changed() {
+    let out = run_with_input(
+        "func quiet() { $sh.options.bold-input = false }\n\
+         quiet\n\
+         puts after $sh.options.bold-input\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after false\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// `source FILE` runs a file's code in **this** shell, so what it defines and

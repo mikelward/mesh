@@ -103,9 +103,10 @@ Positional arguments are a real list — `$sh.args` — not `$1` / `$@` / `$#`:
 | `$sh.args:len` | How many there are |
 | `$sh.name` | The script's name, or `mesh` when no script was named |
 
-Both are read-only, and `sh` is a reserved name: it cannot be assigned, used as
-a function parameter, or bound by a pattern. (Only `sh` itself is reserved — an
-ordinary variable may still be called `status`, `name`, or `args`.)
+`sh` is a reserved name: it cannot be assigned, used as a function parameter, or
+bound by a pattern. (Only `sh` itself is reserved — an ordinary variable may still
+be called `status`, `name`, or `args`.) Everything in `$sh` is read-only except
+[`$sh.options`](#shoptions), the settings map.
 
 The rest of the read-only runtime surface:
 
@@ -161,7 +162,49 @@ status and stays in the table, so a later `fg` or `wait` still finds it and hand
 back that status, and the usual `[1] Done (0) …` notice still arrives at its own
 time. Looking at the table never changes what the shell does.
 
-`$sh.options` and the hook maps in `DESIGN.md` are not implemented yet.
+### `$sh.options`
+
+The shell's settings, and the one part of `$sh` you can write. Each is a boolean,
+and each is **on**:
+
+| Setting | Off means |
+|---|---|
+| `bold-input` | The line you are typing is drawn in the terminal's normal weight, not bold |
+| `cwd-report` | No `OSC 7` working-directory report, so a new tab or split opens wherever your terminal would have anyway |
+| `shell-integration` | No `OSC 133` prompt marks, so a terminal cannot tell prompt from input from output |
+
+Each governs an **interactive decoration** and nothing else: turning one off never
+changes what a command does or prints, only what the shell draws around it. They
+are already off outside an interactive session — `mesh -s` on a terminal and every
+piped run stay byte-exact whatever the settings say.
+
+Write one at a time, usually from a startup file:
+
+```mesh
+$sh.options.bold-input = false          # takes effect at once
+puts $sh.options.bold-input             # false
+puts ...$sh.options:keys                # bold-input cwd-report shell-integration
+```
+
+The map is strict in both directions, because a setting that is silently not
+applied is worse than one that fails:
+
+```mesh
+$sh.options.bold-imput = false   # error: no `bold-imput` in this map
+$sh.options.bold-input = "false" # error: a setting is `true` or `false`, got a string
+$sh.options = [bold-input: false]# error: assign one setting at a time
+unset $sh.options.bold-input     # error: a setting cannot be removed; assign it instead
+```
+
+The settings are the session's, not a scope's, so a function that writes one has
+written it for the shell — and `global` is refused rather than accepted as a
+no-op, since there is no other `$sh` for it to name.
+
+Bracketed paste has no setting on purpose: with it off a pasted newline arrives as
+Enter, so every line but the last runs before you can read it.
+
+The hook maps in `DESIGN.md` — `$sh.prompt`, `$sh.preexec`, `$sh.complete`,
+`$sh.signal` — are not implemented yet.
 
 ---
 
