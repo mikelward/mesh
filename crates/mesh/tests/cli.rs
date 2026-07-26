@@ -1358,7 +1358,7 @@ fn spawn_failure_harness(exec: &MeshExec) -> i32 {
     let missing = b"mesh-command-that-does-not-exist\n";
     if unsafe { libc::write(master, missing.as_ptr().cast(), missing.len()) }
         != missing.len() as isize
-        || pty_read_until_any_prompt(master).is_none()
+        || pty_read_until_command_done(master).is_none()
     {
         return 33;
     }
@@ -1368,9 +1368,8 @@ fn spawn_failure_harness(exec: &MeshExec) -> i32 {
     {
         return 34;
     }
-    let output = match pty_read_until_prompt(master) {
-        Some(output) => output,
-        None => return 35,
+    let Some((output, _)) = pty_read_until_command_done(master) else {
+        return 35;
     };
     if !output.windows(11).any(|part| part == b"recovered\r\n") {
         return 36;
@@ -1436,9 +1435,8 @@ fn sigcont_harness(exec: &MeshExec) -> i32 {
     {
         return 23;
     }
-    let output = match pty_read_until_prompt(master) {
-        Some(output) => output,
-        None => return 24,
+    let Some((output, _)) = pty_read_until_command_done(master) else {
+        return 24;
     };
     if output.windows(13).any(|part| part == b"unsolicited\r\n") {
         return 25;
@@ -1516,7 +1514,7 @@ fn wait_interrupt_harness(exec: &MeshExec) -> i32 {
 
     let job = "sleep 30 &\n";
     if unsafe { libc::write(master, job.as_ptr().cast(), job.len()) } != job.len() as isize
-        || pty_read_until_prompt(master).is_none()
+        || pty_read_until_command_done(master).is_none()
     {
         return 44;
     }
@@ -1547,8 +1545,14 @@ fn wait_interrupt_harness(exec: &MeshExec) -> i32 {
         if count <= 0 {
             return 53;
         }
+        let fresh = seen.len().saturating_sub(3);
         seen.extend_from_slice(&chunk[..count as usize]);
-        if seen.windows(4).any(|part| part == b"\x1b[6n") {
+        // Answer only queries in the bytes that just arrived. Scanning the whole
+        // buffer re-answers every earlier query on every read, and reedline takes
+        // the replies as *input* — the line stops being empty, so Ctrl-D no
+        // longer exits and a harness waiting on the shell waits forever. The
+        // three-byte overlap is for a query split across two reads.
+        if seen[fresh..].windows(4).any(|part| part == b"\x1b[6n") {
             unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
         }
     }
@@ -1870,7 +1874,7 @@ fn background_function_terminal_harness(exec: &MeshExec) -> i32 {
     if unsafe { libc::write(master, alive.as_ptr().cast(), alive.len()) } != alive.len() as isize {
         return 18;
     }
-    let Some(echoed) = pty_read_until_prompt(master) else {
+    let Some((echoed, _)) = pty_read_until_command_done(master) else {
         return 19;
     };
     if !echoed.windows(5).any(|part| part == b"alive") {
@@ -1884,14 +1888,79 @@ fn background_function_terminal_harness(exec: &MeshExec) -> i32 {
     0
 }
 
+/// `B` — the prompt is drawn and the shell is taking input.
+///
+/// reedline **repaints**, so this arrives more than once per prompt: a session
+/// running one command emits `A B A B C D`. Waiting for the first is still sound
+/// for "the shell is up", which is all the callers below want from it, but it is
+/// why readiness is the only thing it is used for. Anything that has to line up
+/// with a *particular* command waits for [`pty_read_until_command_done`].
+const INPUT_READY: &[u8] = b"\x1b]133;B\x1b\\";
+
+/// `D` — the command ended, with its status. The shell writes it once, at the
+/// transition, so unlike a prompt it cannot be seen twice for one command.
+const COMMAND_DONE: &[u8] = b"\x1b]133;D;";
+
 /// Act as the small piece of terminal-emulator behavior reedline needs while
-/// waiting for its prompt.
+/// waiting for the shell to start taking input.
 fn pty_wait_for_prompt(master: std::os::fd::RawFd) -> bool {
-    pty_read_until_prompt(master).is_some()
+    pty_read_until_one_of(master, &[INPUT_READY]).is_some()
 }
 
-fn pty_read_until_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
-    pty_read_until_one_of(master, &[b"mesh$"])
+/// Read until the shell says the command is over, answering `ESC[6n` on the way,
+/// and return what it wrote along with the status it ended on.
+///
+/// This replaces "read until a prompt appears". A prompt is something reedline
+/// *draws*, and redraws: the reader could stop on a repaint of the previous
+/// command's prompt and take it for this command's, which is a bug that reached
+/// `main` twice. `D` is written once by the shell when the command actually
+/// ends, so there is nothing to mistake it for, and it carries the status —
+/// which the prompt only ever hinted at through its glyph.
+fn pty_read_until_command_done(master: std::os::fd::RawFd) -> Option<(Vec<u8>, u8)> {
+    let mut ready = libc::pollfd {
+        fd: master,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut seen = Vec::new();
+    // The status digits follow the mark, so the read is not finished until the
+    // sequence's terminator has arrived too.
+    let complete = |bytes: &[u8]| {
+        let start = bytes
+            .windows(COMMAND_DONE.len())
+            .position(|part| part == COMMAND_DONE)?;
+        let rest = &bytes[start + COMMAND_DONE.len()..];
+        let end = rest.windows(2).position(|part| part == b"\x1b\\")?;
+        std::str::from_utf8(&rest[..end]).ok()?.parse::<u8>().ok()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        let done = complete(&seen);
+        // Once the mark is in hand, keep draining briefly rather than stopping
+        // on it. What follows is the next prompt, and leaving it unread backs the
+        // pty up until the shell blocks writing into it — which presents as the
+        // shell ignoring whatever is typed next.
+        let timeout = if done.is_some() { 50 } else { 2_000 };
+        if unsafe { libc::poll(&mut ready, 1, timeout) } <= 0 {
+            return done.map(|status| (seen, status));
+        }
+        let mut chunk = [0_u8; 256];
+        let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if count <= 0 {
+            return None;
+        }
+        let fresh = seen.len().saturating_sub(3);
+        seen.extend_from_slice(&chunk[..count as usize]);
+        // Answer only queries in the bytes that just arrived. Scanning the whole
+        // buffer re-answers every earlier query on every read, and reedline takes
+        // the replies as *input* — the line stops being empty, so Ctrl-D no
+        // longer exits and a harness waiting on the shell waits forever. The
+        // three-byte overlap is for a query split across two reads.
+        if seen[fresh..].windows(4).any(|part| part == b"\x1b[6n") {
+            unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
+        }
+    }
+    complete(&seen).map(|status| (seen, status))
 }
 
 /// Read from the PTY until `marker` appears, answering cursor-position queries so
@@ -1920,8 +1989,14 @@ fn pty_wait_for_marker(master: std::os::fd::RawFd, marker: &[u8]) -> bool {
         if count <= 0 {
             return false;
         }
+        let fresh = seen.len().saturating_sub(3);
         seen.extend_from_slice(&chunk[..count as usize]);
-        if seen.windows(4).any(|part| part == b"\x1b[6n") {
+        // Answer only queries in the bytes that just arrived. Scanning the whole
+        // buffer re-answers every earlier query on every read, and reedline takes
+        // the replies as *input* — the line stops being empty, so Ctrl-D no
+        // longer exits and a harness waiting on the shell waits forever. The
+        // three-byte overlap is for a query split across two reads.
+        if seen[fresh..].windows(4).any(|part| part == b"\x1b[6n") {
             unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
         }
     }
@@ -1937,10 +2012,6 @@ fn pty_wait_for_marker(master: std::os::fd::RawFd, marker: &[u8]) -> bool {
 /// per-poll timeouts below are unchanged and still fail fast, so a shell that
 /// has genuinely gone quiet is caught as quickly as before; only a stream that
 /// keeps delivering gets the extra reads.
-fn pty_read_until_any_prompt(master: std::os::fd::RawFd) -> Option<Vec<u8>> {
-    pty_read_until_one_of(master, &[b"mesh$", b"mesh!"])
-}
-
 /// Read until one of `accept` appears, answering cursor-position queries so
 /// reedline keeps going, then drain briefly for whatever trails it.
 ///
