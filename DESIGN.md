@@ -2998,17 +2998,19 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
 - ***Window/tab title*** *(OSC 0/1/2)* — set alongside the prompt, from `preexec`;
   needs the per-`$env.TERM` sequence choice (xterm `\e]0;…\a` vs screen/tmux
   `\ek…`). A `$sh.title` hook or a `set-title` builtin.
-- ***Bracketed paste*** *(`\e[?2004h/l`)* — the editor must wrap pasted input so a
-  multi-line paste is **inserted, not executed** line by line, and a lone newline in
-  a paste doesn't submit. Almost certainly on by default, but it needs stating.
-- ***Shell integration / semantic prompt marks*** *(OSC 133 `A`/`B`/`C`/`D`)* — mark
-  prompt-start, command-start, output-start, and exit code so terminals (iTerm2, VS
-  Code, WezTerm) can jump between prompts, fold command output, and badge exit
-  status. mesh already has the exact `preexec`/`postexec`/prompt boundaries to emit
-  these; decide whether it does so automatically.
-- ***cwd reporting*** *(OSC 7)* — emit the cwd at startup / prompt render **and** on
-  `postcd`, so a new terminal tab/split opens in the same directory even before the
-  first `cd` (a fresh remote shell must report immediately, not only after a change).
+- ***Bracketed paste*** *(`\e[?2004h/l`)* — **decided: on, always.** Pasted input is
+  inserted, not executed line by line, and a lone newline in a paste doesn't submit.
+- ***Shell integration / semantic prompt marks*** *(OSC 133 `A`/`B`/`C`/`D`)* —
+  **decided: automatic.** The line editor emits `A` and `B`, the prompt's own
+  boundaries; the shell emits `C` before the output and `D` with the status after,
+  from outside the `preexec`/`postexec` dispatch so a printing hook falls inside the
+  region the marks bracket. A line abandoned with Ctrl-C is closed with a bare `D`
+  and no status; a blank submission is not a command, so it is neither marked nor
+  hooked.
+- ***cwd reporting*** *(OSC 7)* — **decided: automatic, once per prompt** (after the
+  `preprompt` hooks), which covers both the startup report a fresh remote shell owes
+  a new tab/split and every later move, whatever caused it — a `cd`, a `func` that
+  cds internally, a startup file — without a `postcd` hook of its own.
 - ***Hyperlinks*** *(OSC 8)* — clickable paths/URLs in output; likely a `style()`
   sibling (`link(text, url)`) rather than a raw escape, keeping color-as-data.
 - ***Clipboard*** *(OSC 52)* — copy to the terminal's clipboard (works over ssh); a
@@ -3022,7 +3024,8 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
   updates atomically without flicker.
 
   Decide per feature: automatic, a hook/builtin, or out of scope (left to a
-  hand-emitted `print "\e…"`).)*
+  hand-emitted `print "\e…"`). The three marked **decided** above have landed;
+  `TODO.md` §"Beyond M3 — Terminal integration" tracks the rest.)*
 
 **Command hooks fire for the outer interactive command only.** `preexec` /
 `postexec` fire once for the command line you submit at the prompt — *not* for

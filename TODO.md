@@ -520,6 +520,53 @@ file as tasks land.
       bare form, along with multiple operands (`wait 1 2`).
 - [ ] The rest of `$sh.*`: `$sh.options` and the hook maps.
 
+## Beyond M3 — Terminal integration
+
+The escape/OSC surface a modern interactive shell drives, from the TODO block in
+`DESIGN.md` §"terminal control". Everything here is **interactive-only** —
+`set_interactive` is recorded by the interactive loop, so `mesh -s` on a terminal
+and every piped run stay byte-exact — and **failure-ignoring**, since a decoration
+that could change a command's status would be worse than a missing decoration.
+
+- [x] **Shell integration / semantic prompt marks** (OSC 133). reedline emits `A`
+      and `B`, the prompt's own boundaries, since it draws the prompt; the shell
+      emits `C` before the output and `D` with the status after, from outside the
+      `preexec` / `postexec` dispatch so a printing hook's output falls inside the
+      region the marks bracket. A line abandoned with Ctrl-C gets a bare `D` with
+      no status: nothing ran, so there is no outcome to report, but the input
+      region reedline opened at `B` still has to be closed. A blank submission gets
+      no marks and fires no hooks — it is not a command, for the same reason
+      history keeps no row for it.
+- [x] **Bracketed paste** (`CSI ?2004 h`). On, always: reedline's guard defaults
+      to off, so without asking for it a paste's newlines each arrive as Enter and
+      every line but the last runs before it can be read.
+- [x] **cwd reporting** (OSC 7). `file://host/path`, percent-encoded per RFC 3986,
+      with the path's bytes encoded as they are so a directory whose name is not
+      UTF-8 still reports. Written once per prompt, after the `preprompt` hooks:
+      one call site covers both halves `DESIGN.md` asks for — the first prompt is
+      the startup report a fresh remote shell owes a new split, and any later move
+      reaches the next prompt whatever caused it.
+- [ ] **Window/tab title** (OSC 0/1/2, screen's `\ek`). Needs the per-`$env.TERM`
+      sequence choice and a decision between automatic, a `$sh.title` hook, and a
+      builtin.
+- [ ] **`sgr_stripped_width` skips only CSI SGR.** An OSC sequence in a custom
+      prompt is counted as visible width, so the continuation indicator comes out
+      too long. Reachable today: `\e` is a supported escape, and hand-rolling
+      `prompt "\e]0;…\a mesh$ "` is what people will do until the title item above
+      lands.
+- [ ] **OSC 633** — VS Code's extension of 133, which reedline also ships markers
+      for. Picking the dialect from `$env.TERM_PROGRAM` is the same capability
+      question the title sequence asks, so decide them together.
+- [ ] **Hyperlinks** (OSC 8) — a `link(text, url)` sibling to `style()`, per
+      `DESIGN.md`, rather than a raw escape.
+- [ ] **Clipboard** (OSC 52) and **notifications** (OSC 9 / 777) — builtins. The
+      notification's threshold has its input already: `postexec` is handed the
+      command's elapsed milliseconds. OSC 9;4 progress reporting belongs with it.
+- [ ] **Cursor shape per mode** (DECSCUSR) — blocked on vi mode; the line editor
+      is Emacs-only today.
+- [ ] **Synchronized output** (DEC 2026) — belongs around reedline's repaint
+      rather than in mesh.
+
 ## Loose ends
 
 Small items rescued from pull requests that were closed as superseded — the bulk
