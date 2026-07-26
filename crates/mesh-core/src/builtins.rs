@@ -13,24 +13,54 @@ use std::path::Path;
 
 use crate::vars::Value;
 
-pub(crate) const NAMES: &[&str] = &[
-    "cd",
-    "pwd",
-    "puts",
-    "print",
-    "clip",
-    "notify",
-    "exit",
-    "fg",
-    "bg",
-    "jobs",
-    "wait",
-    "disown",
-    "kill",
-    "prompt",
-    "prompt-hook",
-    "source",
+/// Every builtin as `(usage, summary)`: the usage line its `--help` prints, and
+/// the one-line description that sits beside it in `help`'s listing.
+///
+/// One table rather than a list of names beside a `match` of usages, so a new
+/// builtin cannot arrive dispatchable but unlisted, or listed but unexplained.
+/// The **name is the usage's first word** — a usage that did not start with the
+/// command you type would be wrong anyway, so there is nothing to keep in step.
+const TABLE: &[(&str, &str)] = &[
+    ("cd [DIR]", "Change the working directory"),
+    ("pwd", "Print the working directory"),
+    ("puts [ARG ...]", "Render the arguments, then a newline"),
+    ("print [ARG ...]", "As `puts`, with no trailing newline"),
+    ("clip [TEXT ...]", "Copy text to the terminal's clipboard"),
+    ("notify [TEXT ...]", "Raise a desktop notification"),
+    ("exit [N]", "Leave the shell"),
+    ("fg [JOB]", "Resume a job in the foreground"),
+    ("bg [JOB]", "Resume a stopped job in the background"),
+    ("jobs", "List the jobs"),
+    ("wait [JOB …]", "Wait for a job to finish"),
+    ("disown [-h] [-a | -r] [JOB …]", "Stop tracking a job"),
+    ("kill [-SIGNAL] JOB|PID ...", "Signal a job or a process"),
+    (
+        "prompt [--reset | TEXT]",
+        "Set or print the interactive prompt",
+    ),
+    (
+        "prompt-hook [--remove] [EVENT] NAME [FUNCTION]",
+        "Register a function for a prompt event",
+    ),
+    ("source FILE", "Run a file's commands in this shell"),
+    ("help [NAME ...]", "List the builtins, or explain one"),
 ];
+
+/// The name a usage line belongs to: its first word.
+fn name_of(usage: &'static str) -> &'static str {
+    usage.split(' ').next().unwrap_or(usage)
+}
+
+/// Every builtin's name, in table order. The completion tables want the set of
+/// names without the prose that goes with them.
+pub(crate) fn names() -> impl Iterator<Item = &'static str> {
+    TABLE.iter().map(|(usage, _)| name_of(usage))
+}
+
+/// The table row for `name`, if it names a builtin.
+fn entry(name: &str) -> Option<&'static (&'static str, &'static str)> {
+    TABLE.iter().find(|(usage, _)| name_of(usage) == name)
+}
 
 /// Outcome of a builtin. `Status` reports an exit status and continues the loop;
 /// `Exit` ends the shell with the given status.
@@ -42,7 +72,7 @@ pub enum Builtin {
 /// Does `name` name a builtin? Used to route one to the in-shell path — run
 /// directly for a plain command, or in a forked stage inside a pipeline.
 pub fn is_builtin(name: &str) -> bool {
-    NAMES.contains(&name)
+    entry(name).is_some()
 }
 
 /// Bash builtins mesh renames, mapped to the mesh builtin that replaces them.
@@ -107,25 +137,8 @@ pub fn print_help(name: &str) -> u8 {
 
 /// Return the same help text printed by `NAME --help`.
 pub(crate) fn help(name: &str) -> Option<String> {
-    let usage = match name {
-        "cd" => "cd [DIR]",
-        "pwd" => "pwd",
-        "puts" => "puts [ARG ...]",
-        "print" => "print [ARG ...]",
-        "clip" => "clip [TEXT ...]",
-        "notify" => "notify [TEXT ...]",
-        "exit" => "exit [N]",
-        "fg" | "bg" => return Some(format_help(&format!("{name} [JOB]"))),
-        "jobs" => "jobs",
-        "wait" => "wait [JOB …]",
-        "disown" => "disown [-h] [-a | -r] [JOB …]",
-        "kill" => "kill [-SIGNAL] JOB|PID ...",
-        "prompt" => "prompt [--reset | TEXT]",
-        "prompt-hook" => "prompt-hook [--remove] [EVENT] NAME [FUNCTION]",
-        "source" => "source FILE",
-        _ => return None,
-    };
-    Some(format_help(usage))
+    let (usage, summary) = entry(name)?;
+    Some(format_help(usage, summary))
 }
 
 /// Write generated help through the builtin-safe stdout path.
@@ -133,8 +146,262 @@ pub fn print_generated_help(name: &str, help: &str) -> u8 {
     write_stdout(name, help.as_bytes())
 }
 
-fn format_help(usage: &str) -> String {
-    format!("Usage: {usage}\n\nOptions:\n  --help  Print help\n")
+/// The summary leads, as it does in the help clap generates and the completion
+/// parser already reads: a prose line carries no options, so it adds a sentence
+/// for a reader without changing what a spec is built from.
+fn format_help(usage: &str, summary: &str) -> String {
+    format!("{summary}\n\nUsage: {usage}\n\nOptions:\n  --help  Print help\n")
+}
+
+/// The shape of a line, as `(names, form, summary)`: what to type, and the words
+/// `help` will find it by. A keyword is looked up by itself, an operator by the
+/// symbol, and a construct's other half by the word a reader would ask about —
+/// `help else` is a question about `if`, so it answers with `if`.
+///
+/// Not the grammar: `PARSER.md` has that, and a copy of it here would be wrong
+/// within a release. This is the one-screen reminder of what a mesh line can be,
+/// which is what a reader in front of a prompt is asking for. What it does owe
+/// is *reachability* — every reserved word the parser knows and every operator a
+/// line can carry answers to `help`, even where several share one row, because a
+/// reader who is told "not a keyword" about `unless` has been told something
+/// false. The tests hold both lists against this table.
+const SYNTAX: &[(&[&str], &str, &str)] = &[
+    (
+        &["command"],
+        "cmd arg …",
+        "Run a builtin, a function, or a program",
+    ),
+    (
+        &["|", "|&"],
+        "cmd | cmd",
+        "Pipe stdout on; `|&` carries stderr too",
+    ),
+    (
+        &["&&", "||", ";"],
+        "cmd && cmd",
+        "Chain on success; `||` on failure, `;` always",
+    ),
+    (
+        &[">", "<", ">>", "2>", ">&", "<&", "&>"],
+        "cmd > FILE",
+        "Redirect; `<` reads, `>>` appends, `&>` both",
+    ),
+    (
+        &["<<", "<<<"],
+        "cmd << END … END",
+        "Feed a heredoc; `<<< TEXT` is one line of it",
+    ),
+    (&["&"], "cmd &", "Run in the background as a job"),
+    (
+        &["=", "+="],
+        "NAME = VALUE",
+        "Bind a name — local in a `func`; `+=` appends",
+    ),
+    (
+        &["$", "."],
+        "$NAME",
+        "Read a value; `$m.key` and `$xs[0]` too",
+    ),
+    (&["$("], "$(cmd)", "Capture a command's output as a value"),
+    (
+        &["[", "]", ",", "..", "..="],
+        "[a b]  [key: value]",
+        "A list and a map; `1..=3` is a range",
+    ),
+    (&["..."], "...$xs", "Spread a list into separate arguments"),
+    (
+        &[":"],
+        "$path:base",
+        "Postfix modifiers: `:base` `:len` `:int` …",
+    ),
+    (
+        &["\"", "'"],
+        "\"text $NAME\"",
+        "Interpolate; `'…'` and `r'…'` do not",
+    ),
+    (
+        &["*", "?", "~"],
+        "*.txt ~/dir",
+        "Globs and `~` expand; quoting stops them",
+    ),
+    (
+        &["==", "!=", "<=", ">="],
+        "$x == $y",
+        "Compare: `==` `!=` `<` `>` `<=` `>=`, and `in`",
+    ),
+    (
+        &["+", "-", "/", "%", "(", ")"],
+        "n = (1 + 2)",
+        "Arithmetic: `+` `-` `*` `/` `%`",
+    ),
+    (
+        &["!~", "re"],
+        "$name ~ *.txt",
+        "Match a glob, or `re(…)`; `!~` inverts it",
+    ),
+    (
+        &["global"],
+        "global NAME = VALUE",
+        "Bind in the session scope instead",
+    ),
+    (
+        &["export"],
+        "export NAME = VALUE",
+        "Bind a name in the environment",
+    ),
+    (&["unset"], "unset NAME", "Remove a binding from this scope"),
+    (
+        &["if", "else", "{", "}"],
+        "if COND { … } else { … }",
+        "Run a body when a condition holds",
+    ),
+    (
+        &["unless"],
+        "cmd if COND",
+        "Guard one line; `unless` is the inverse",
+    ),
+    (
+        &["match"],
+        "match VALUE { PAT { … } … }",
+        "Take the first arm whose pattern matches",
+    ),
+    (
+        &["for", "in"],
+        "for NAME in VALUE { … }",
+        "Repeat over a list, a range, or a map",
+    ),
+    (
+        &["while"],
+        "while COND { … }",
+        "Repeat while a condition holds",
+    ),
+    (&["loop"], "loop { … }", "Repeat until something breaks out"),
+    (
+        &["break", "continue"],
+        "break",
+        "Leave the nearest loop; `continue` restarts",
+    ),
+    (
+        &["not", "and", "or"],
+        "not $x",
+        "Negate a value; `and` and `or` join two",
+    ),
+    (
+        &["func"],
+        "func NAME(PARAMS) { … }",
+        "Define a function; call it by name",
+    ),
+    (
+        &["return"],
+        "return [VALUE]",
+        "Leave a function, or a sourced file",
+    ),
+    (&["fork"], "fork { … }", "Run a body in a forked child"),
+];
+
+/// Return the help text for a syntax entry — the keyword shape of what `help`
+/// prints for a builtin. No `Options:` section, because a keyword takes no
+/// flags: `if --help` is an `if` whose condition is a command called `--help`.
+fn syntax_help(name: &str) -> Option<String> {
+    let (_, form, summary) = SYNTAX.iter().find(|(names, ..)| names.contains(&name))?;
+    Some(format!("{summary}\n\nSyntax: {form}\n"))
+}
+
+/// The widest form the summary column makes room for. `prompt-hook`'s full
+/// signature is half again as wide as any other, and indenting every summary
+/// past it would push the shortest lines — `jobs`, `pwd` — into empty space.
+const USAGE_COLUMN: usize = 32;
+
+const OVERVIEW_HEADER: &str = "\
+mesh, in one screen. `help NAME` explains one entry; for a builtin,
+`NAME --help` prints the same thing.
+
+Builtins:
+";
+
+const SYNTAX_HEADER: &str = "\nSyntax:\n";
+
+/// The listing `help` prints with no arguments: every builtin and every shape a
+/// line can take, each with what it does beside it — `bash`'s `help` in mesh's
+/// two-column shape.
+///
+/// The builtins are alphabetical, because that list is read by looking a name
+/// up; the table itself stays in its own order, which groups the job builtins
+/// together. The syntax keeps its authored order instead, which runs from a bare
+/// command out to functions: that section is read from the top, as a tour.
+fn overview() -> String {
+    // Char counts, not byte lengths: `wait [JOB …]` carries a three-byte
+    // ellipsis, and padding by bytes would leave it a column short.
+    let width = |form: &str| form.chars().count();
+    // One column across both sections, so the summaries read down the page as a
+    // single list however the two tables happen to be worded.
+    let column = TABLE
+        .iter()
+        .map(|(usage, _)| *usage)
+        .chain(SYNTAX.iter().map(|(_, form, _)| *form))
+        .map(width)
+        .filter(|form| *form <= USAGE_COLUMN)
+        .max()
+        .unwrap_or(USAGE_COLUMN);
+    let row = |listing: &mut String, form: &str, summary: &str| {
+        listing.push_str("  ");
+        listing.push_str(form);
+        if width(form) > column {
+            // Too wide to share the line: the summary takes the next one, still
+            // in the column the rest of the listing reads down.
+            listing.push('\n');
+            listing.push_str(&" ".repeat(column + 4));
+        } else {
+            listing.push_str(&" ".repeat(column - width(form) + 2));
+        }
+        listing.push_str(summary);
+        listing.push('\n');
+    };
+    let mut builtins: Vec<_> = TABLE.iter().collect();
+    builtins.sort_by_key(|(usage, _)| name_of(usage));
+    let mut listing = String::from(OVERVIEW_HEADER);
+    for (usage, summary) in builtins {
+        row(&mut listing, usage, summary);
+    }
+    listing.push_str(SYNTAX_HEADER);
+    for (_, form, summary) in SYNTAX {
+        row(&mut listing, form, summary);
+    }
+    listing
+}
+
+/// `help [NAME ...]` — with no arguments, list every builtin and every shape a
+/// line can take; with names, explain each one. A builtin's entry is exactly
+/// what its `--help` prints.
+///
+/// A name that is neither is an error rather than a lookup of some other kind:
+/// mesh has no help of its own for a function or an external command, and
+/// `NAME --help` is that command's own answer — which is what the note points
+/// at. The other names still print, so one typo in a list does not cost the rest.
+fn run_help(args: &[String]) -> u8 {
+    if args.is_empty() {
+        return write_stdout("help", overview().as_bytes());
+    }
+    let mut status = 0;
+    let mut text = String::new();
+    for name in args {
+        match help(name).or_else(|| syntax_help(name)) {
+            Some(entry) => {
+                // A blank line between entries, so two of them do not read as one.
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&entry);
+            }
+            None => {
+                note!(
+                    "mesh: help: {name}: not a builtin or a keyword; try `{name} --help`, or `help` for the list"
+                );
+                status = 1;
+            }
+        }
+    }
+    status | write_stdout("help", text.as_bytes())
 }
 
 /// If `words[0]` names a builtin, run it and return its outcome; otherwise
@@ -150,6 +417,7 @@ pub fn dispatch(words: &[String], last: u8) -> Option<Builtin> {
         "print" => Some(Builtin::Status(puts(&words[1..], false))),
         "clip" => Some(Builtin::Status(clip(&words[1..]))),
         "notify" => Some(Builtin::Status(notify(&words[1..]))),
+        "help" => Some(Builtin::Status(run_help(&words[1..]))),
         "exit" => Some(exit(&words[1..], last)),
         _ => None,
     }
@@ -630,7 +898,10 @@ fn exit(args: &[String], last: u8) -> Builtin {
 
 #[cfg(test)]
 mod tests {
-    use super::{Value, base64, help, is_builtin, path_line, rename_note, rendered_for_output};
+    use super::{
+        SYNTAX, TABLE, Value, base64, help, is_builtin, names, overview, path_line, rename_note,
+        rendered_for_output, syntax_help,
+    };
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -727,7 +998,9 @@ mod tests {
         assert!(is_builtin("clip"));
         assert_eq!(
             help("clip").as_deref(),
-            Some("Usage: clip [TEXT ...]\n\nOptions:\n  --help  Print help\n")
+            Some(
+                "Copy text to the terminal's clipboard\n\nUsage: clip [TEXT ...]\n\nOptions:\n  --help  Print help\n"
+            )
         );
     }
 
@@ -736,7 +1009,9 @@ mod tests {
         assert!(is_builtin("print"));
         assert_eq!(
             help("print").as_deref(),
-            Some("Usage: print [ARG ...]\n\nOptions:\n  --help  Print help\n")
+            Some(
+                "As `puts`, with no trailing newline\n\nUsage: print [ARG ...]\n\nOptions:\n  --help  Print help\n"
+            )
         );
     }
 
@@ -791,6 +1066,141 @@ mod tests {
             Value::Map(vec![("k".to_owned(), Value::Map(vec![]))]),
         ] {
             assert!(rendered_for_output(&value, false).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn every_name_the_shell_recognizes_is_listed_with_help() {
+        // The listing is the reason the table exists: a builtin that answers to
+        // its name but never appears here is one a reader cannot discover.
+        let listing = overview();
+        let mut seen = Vec::new();
+        for name in names() {
+            assert!(is_builtin(name), "{name}");
+            assert!(help(name).is_some(), "{name}");
+            assert!(
+                listing.contains(&format!("  {name}")),
+                "{name} is missing from the listing"
+            );
+            assert!(!seen.contains(&name), "{name} is in the table twice");
+            seen.push(name);
+        }
+        assert_eq!(seen.len(), TABLE.len());
+    }
+
+    /// The rows of one section of the listing, without its heading.
+    fn section(listing: &str, heading: &str) -> Vec<String> {
+        listing
+            .lines()
+            .skip_while(|line| *line != heading)
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn the_builtins_are_listed_alphabetically() {
+        // The builtins are a lookup table, so they are read by name. (The syntax
+        // section is a tour, and deliberately keeps its authored order.)
+        let listing = overview();
+        let names: Vec<_> = section(&listing, "Builtins:")
+            .iter()
+            .filter(|row| !row.starts_with("   "))
+            .filter_map(|row| row.split_whitespace().next().map(str::to_owned))
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "{listing}");
+    }
+
+    #[test]
+    fn every_summary_starts_in_one_column() {
+        // Both sections share a column, including the summary pushed onto its own
+        // line by an over-wide usage — measured in characters, since
+        // `wait [JOB …]` pads around a three-byte ellipsis.
+        let listing = overview();
+        let rows: Vec<_> = section(&listing, "Builtins:")
+            .into_iter()
+            .chain(section(&listing, "Syntax:"))
+            .collect();
+        let indent = |row: &str| row.chars().take_while(|c| *c == ' ').count();
+        let continuation = rows
+            .iter()
+            .find(|row| row.starts_with("     "))
+            .expect("prompt-hook's summary wraps onto its own line")
+            .clone();
+        for row in &rows {
+            assert!(
+                indent(row) == 2 || indent(row) == indent(&continuation),
+                "{row:?} starts in neither column"
+            );
+        }
+    }
+
+    #[test]
+    fn a_keyword_is_explained_by_the_form_it_is_written_in() {
+        assert_eq!(
+            syntax_help("while").as_deref(),
+            Some("Repeat while a condition holds\n\nSyntax: while COND { … }\n")
+        );
+        // The other half of a construct answers with the construct: `help else`
+        // is a question about `if`, and an operator is asked for by its symbol.
+        assert_eq!(syntax_help("else"), syntax_help("if"));
+        assert_eq!(syntax_help("continue"), syntax_help("break"));
+        assert_eq!(syntax_help("in"), syntax_help("for"));
+        assert!(syntax_help("|").is_some_and(|help| help.contains("cmd | cmd")));
+    }
+
+    #[test]
+    fn every_syntax_entry_is_listed_and_reachable_by_each_of_its_names() {
+        let listing = overview();
+        for (names, form, _) in SYNTAX {
+            assert!(
+                listing.contains(&format!("  {form}")),
+                "{form} is missing from the listing"
+            );
+            for name in *names {
+                assert!(syntax_help(name).is_some(), "{name}");
+                // A keyword is not a builtin, so the two lookups cannot collide.
+                assert!(!is_builtin(name), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_keyword_the_parser_reserves_is_explained() {
+        // Mirrors the reserved words `parser.rs` matches on. A keyword the parser
+        // knows and `help` does not is a reader being told, falsely, that a word
+        // they just used is not a keyword.
+        for keyword in [
+            "func", "return", "if", "else", "unless", "match", "for", "in", "while", "loop",
+            "break", "continue", "fork", "global", "unset", "export", "not", "and", "or", "re",
+        ] {
+            assert!(syntax_help(keyword).is_some(), "{keyword}");
+        }
+    }
+
+    #[test]
+    fn every_operator_a_line_can_carry_is_explained() {
+        // Several share a row — `<` and `<=` are read in different places — but
+        // each has to answer, since a reader asks with the symbol they typed.
+        for operator in [
+            "|", "|&", "&&", "||", ";", "&", ">", "<", ">>", "2>", ">&", "<&", "&>", "<<", "<<<",
+            "=", "+=", "==", "!=", "<=", ">=", "+", "-", "/", "%", "*", "?", "~", "!~", "$", "$(",
+            "...", ":", ".", ",", "(", ")", "[", "]", "{", "}", "..", "..=",
+        ] {
+            assert!(syntax_help(operator).is_some(), "{operator}");
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_neither_a_builtin_nor_a_keyword_has_no_help() {
+        // `help ls` must not answer for a command mesh does not own; `ls --help`
+        // is that command's own business.
+        for name in ["ls", "", "help ", "fi", "then", "esac", "elif"] {
+            assert_eq!(help(name), None, "{name}");
+            assert_eq!(syntax_help(name), None, "{name}");
         }
     }
 }

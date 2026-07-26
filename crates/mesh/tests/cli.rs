@@ -7545,13 +7545,176 @@ fn functions_generate_help_from_their_signatures_without_running() {
 
 #[test]
 fn builtins_print_standard_command_line_help() {
-    let out = run_with_input("cd --help\nputs --help\n");
+    let out = run_with_input("cd --help\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "Usage: cd [DIR]\n\nOptions:\n  --help  Print help\nUsage: puts [ARG ...]\n\nOptions:\n  --help  Print help\n"
+        "Change the working directory\n\nUsage: cd [DIR]\n\nOptions:\n  --help  Print help\n"
     );
     assert!(out.status.success());
     assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn help_lists_every_builtin_with_its_usage() {
+    let out = run_with_input("help\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for usage in [
+        "cd [DIR]",
+        "puts [ARG ...]",
+        "print [ARG ...]",
+        "clip [TEXT ...]",
+        "notify [TEXT ...]",
+        "exit [N]",
+        "fg [JOB]",
+        "bg [JOB]",
+        "jobs",
+        "wait [JOB …]",
+        "disown [-h] [-a | -r] [JOB …]",
+        "kill [-SIGNAL] JOB|PID ...",
+        "prompt [--reset | TEXT]",
+        "prompt-hook [--remove] [EVENT] NAME [FUNCTION]",
+        "source FILE",
+        "help [NAME ...]",
+    ] {
+        assert!(stdout.contains(&format!("  {usage}")), "{usage}: {stdout}");
+    }
+    // The summary is what tells a reader which builtin they want.
+    assert!(
+        stdout.contains("Copy text to the terminal's clipboard"),
+        "{stdout}"
+    );
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn help_lists_the_keywords_and_the_shape_of_a_line() {
+    let out = run_with_input("help\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for form in [
+        "cmd | cmd",
+        "cmd && cmd",
+        "cmd > FILE",
+        "cmd &",
+        "NAME = VALUE",
+        "global NAME = VALUE",
+        "export NAME = VALUE",
+        "unset NAME",
+        "if COND { … } else { … }",
+        "cmd if COND",
+        "match VALUE { PAT { … } … }",
+        "for NAME in VALUE { … }",
+        "while COND { … }",
+        "loop { … }",
+        "break",
+        "func NAME(PARAMS) { … }",
+        "return [VALUE]",
+        "fork { … }",
+        "cmd << END … END",
+        "[a b]  [key: value]",
+        "...$xs",
+        "$path:base",
+        "$x == $y",
+        "n = (1 + 2)",
+        "$name ~ *.txt",
+    ] {
+        assert!(stdout.contains(&format!("  {form}")), "{form}: {stdout}");
+    }
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn help_explains_every_keyword_and_operator_a_line_can_carry() {
+    // A reader asks with the word or symbol they just typed, so each has to
+    // answer — `unless`, `+=`, and `==` are as much syntax as `if` and `|` are.
+    let script: String = KEYWORDS_AND_OPERATORS
+        .iter()
+        .map(|name| format!("help '{name}'\n"))
+        .collect();
+    let out = run_with_input(&script);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "",
+        "a keyword or operator went unexplained"
+    );
+    assert!(out.status.success());
+}
+
+/// Everything the parser reserves or reads as an operator. Held here as well as
+/// in the unit tests so the promise is checked through the shell a reader types
+/// into, not only through the table behind it.
+const KEYWORDS_AND_OPERATORS: &[&str] = &[
+    "func", "return", "if", "else", "unless", "match", "for", "in", "while", "loop", "break",
+    "continue", "fork", "global", "unset", "export", "not", "and", "or", "re", "|", "|&", "&&",
+    "||", ";", "&", ">", "<", ">>", "2>", ">&", "<&", "&>", "<<", "<<<", "=", "+=", "==", "!=",
+    "<=", ">=", "+", "-", "/", "%", "*", "?", "~", "!~", "$", "$(", "...", ":", ".", ",", "(", ")",
+    "[", "]", "{", "}", "..", "..=",
+];
+
+#[test]
+fn help_explains_a_keyword_by_its_syntax() {
+    let out = run_with_input("help for\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Repeat over a list, a range, or a map\n\nSyntax: for NAME in VALUE { … }\n"
+    );
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn help_answers_for_the_other_half_of_a_construct() {
+    // `help else` is a question about `if`; a keyword takes no `--help` of its
+    // own, so `help` is the only way to ask.
+    let out = run_with_input("help else\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Run a body when a condition holds\n\nSyntax: if COND { … } else { … }\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn help_with_a_name_prints_what_that_builtins_help_flag_prints() {
+    let named = run_with_input("help cd\n");
+    let flag = run_with_input("cd --help\n");
+    assert_eq!(named.stdout, flag.stdout);
+    assert!(named.status.success());
+    assert!(named.stderr.is_empty());
+}
+
+#[test]
+fn help_prints_every_name_it_was_given() {
+    let out = run_with_input("help pwd jobs\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Print the working directory\n\nUsage: pwd\n\nOptions:\n  --help  Print help\n\
+         \nList the jobs\n\nUsage: jobs\n\nOptions:\n  --help  Print help\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn help_reports_a_name_that_is_not_a_builtin_and_keeps_the_rest() {
+    // An external command's help is its own; a typo must not cost the names
+    // beside it either.
+    let out = run_with_input("help nosuchbuiltin pwd\nputs \"status $sh.status\"\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Usage: pwd"), "{stdout}");
+    assert!(stdout.contains("status 1"), "{stdout}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("mesh: help: nosuchbuiltin: not a builtin or a keyword"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn help_is_a_builtin_a_pipeline_can_read() {
+    let out = run_with_input("help | grep -c 'Print the working directory'\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
 }
 
 #[test]

@@ -7764,7 +7764,7 @@ struct CompletionState {
 
 impl CompletionState {
     fn from_shell(shell: &Shell) -> Self {
-        let mut commands: Vec<String> = builtins::NAMES.iter().map(|name| (*name).into()).collect();
+        let mut commands: Vec<String> = builtins::names().map(str::to_owned).collect();
         commands.extend(shell.funcs.names().map(str::to_owned));
         if let Some(path) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path) {
@@ -7781,10 +7781,9 @@ impl CompletionState {
         }
         commands.sort();
         commands.dedup();
-        let mut help: HashMap<_, _> = builtins::NAMES
-            .iter()
+        let mut help: HashMap<_, _> = builtins::names()
             .filter_map(|name| {
-                builtins::help(name).map(|text| ((*name).into(), CompletionSpec::from_help(&text)))
+                builtins::help(name).map(|text| (name.into(), CompletionSpec::from_help(&text)))
             })
             .collect();
         help.extend(shell.funcs.names().filter_map(|name| {
