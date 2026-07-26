@@ -513,11 +513,29 @@ file as tasks land.
       **where the record comes from** — the last published snapshot is not it,
       since `wait` removes a job without publishing a `done` record first, so a
       naive retain-on-disappearance would keep a stale `running`.
-- [ ] **The rest of `wait`.** `wait` with **no operand** — bash's "every child,
-      with an aggregate status" — is refused rather than guessed at, since `fg`'s
-      no-operand default means "the most recent one" and the two would read
-      alike. `DESIGN.md` defers the aggregate; deciding it is what unblocks the
-      bare form, along with multiple operands (`wait 1 2`).
+- [x] **The rest of `wait`, and `disown`.** A bare `wait` takes **every job in
+      the table** and several operands wait for each in turn; either way the
+      status is **the last job to fail, or 0** — the pipefail rule mesh already
+      applies to a pipeline, applied to the other place where several things
+      finish at once. bash returns 0 regardless, discarding the one thing the
+      caller waited to find out.
+      "Every job in the table" rather than "every child the shell owns" is what
+      makes `disown` sufficient: a disowned job is gone from the table precisely
+      so nothing waits for it, and a second opt-out would otherwise be needed. A
+      forked stage's background children are owned by the reaper — so they cannot
+      become zombies — but were deliberately never jobs.
+      `disown` drops the job from the table and from the exit hangup while
+      leaving it reaped, which is the `abandon` state the reaper already had;
+      `-h` keeps the job and buys only the hangup exemption `DESIGN.md` promises.
+- [ ] **Should `wait` be able to hand back a list?** The status answers "did
+      anything fail", which is what a script usually branches on, and loses which
+      job failed and with what. `$sh.pipestatus` exists for exactly that reason
+      on the pipeline side, so the shape is already in the language — the
+      question is whether a bare `wait` should fill something like
+      `$sh.jobstatus`, what it holds for jobs that were stopped rather than
+      finished, and whether it is keyed by job id rather than positional (a
+      pipeline's stages have an order; a set of jobs has ids). Worth deciding
+      before anything depends on the scalar being the whole answer.
 - [ ] The rest of `$sh.*`: `$sh.options` and the hook maps.
 
 ## Beyond M3 — Terminal integration
@@ -758,11 +776,10 @@ of each PR had landed by another route, but these pieces had not.
         == running` instead. `background_pipeline_retains_statuses_reaped_on_
         earlier_prompts` and `a_failed_background_redirect_reports_mesh_status_
         one` are both in this class.
-  - [ ] `wait` **takes an explicit job reference**, and the no-operand form is
-        refused on purpose rather than merely unimplemented (`exec.rs:283`):
-        bash's bare `wait` means every child with an aggregate status, which
-        reads like `fg`'s "most recent" default but does something else. So
-        `wait 1` is the spelling, not a stopgap.
+  - [ ] `wait` takes an explicit job reference, several of them, or none — the
+        bare form waits for every job in the table and reports the last failure.
+        A test that wants one job's status should say `wait 1`; a test that wants
+        "everything finished" can now say `wait` instead of sleeping.
   - [ ] Some sleeps guard nothing at all — `a_function_stage_keeps_its_typed_
         arguments` slept 0.1s for a *foreground* stage the shell already waits
         for. Check whether there is a job to wait for before reaching for a

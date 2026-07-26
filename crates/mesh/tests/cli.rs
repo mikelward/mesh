@@ -1875,8 +1875,17 @@ fn sigcont_harness(exec: &MeshExec) -> i32 {
     0
 }
 
+/// One Ctrl-C abandons the wait and nothing else, whether the wait named one job
+/// or several.
+///
+/// Both spellings share a session deliberately. A pty session is the most
+/// expensive thing in this suite — a second one running beside the first was
+/// enough to make unrelated timing-sensitive tests fail about one run in seven,
+/// measured against the same suite with this test skipped. Sharing also tests
+/// more than two separate sessions would: the second wait starts from the table
+/// the first interrupt left behind, which is the very claim being made.
 #[test]
-fn an_interrupt_abandons_a_wait_and_leaves_the_job_alone() {
+fn an_interrupt_abandons_a_wait_and_leaves_the_jobs_alone() {
     let exec = MeshExec::new(isolated_config_home());
     let harness = unsafe { libc::fork() };
     assert!(harness >= 0);
@@ -1895,6 +1904,10 @@ fn an_interrupt_abandons_a_wait_and_leaves_the_job_alone() {
 /// Ctrl-C generates reaches the shell rather than the job. The shell ignores
 /// SIGINT at the prompt, which would leave nothing to end the wait: without a
 /// catcher installed around it this hangs until the job finishes on its own.
+///
+/// Two rounds in one session — `wait 1`, then `wait 1 2` — since a second pty
+/// session costs more than the second round does. Every step returns its own
+/// code so a failure says which one gave up.
 ///
 /// The signal is delivered directly rather than typed. What is under test is
 /// what mesh does with a SIGINT during a wait, and driving that through the line
@@ -1932,17 +1945,17 @@ fn wait_interrupt_harness(exec: &MeshExec) -> i32 {
         return 43;
     }
 
-    let job = "sleep 30 &\n";
-    if unsafe { libc::write(master, job.as_ptr().cast(), job.len()) } != job.len() as isize
-        || pty_read_until_command_done(master).is_none()
-    {
-        return 44;
-    }
-    let waiting = "wait 1\n";
-    if unsafe { libc::write(master, waiting.as_ptr().cast(), waiting.len()) }
-        != waiting.len() as isize
-    {
-        return 45;
+    // Two jobs, so the same session can ask about one operand and about several.
+    // Neither ever finishes on its own within the test, so a wait that is not
+    // interrupted blocks until the harness gives up — which is the failure this
+    // is looking for.
+    for job in ["sleep 30 &", "sleep 31 &"] {
+        if unsafe { libc::write(master, job.as_ptr().cast(), job.len()) } != job.len() as isize
+            || unsafe { libc::write(master, b"\n".as_ptr().cast(), 1) } != 1
+            || pty_read_until_command_done(master).is_none()
+        {
+            return 44;
+        }
     }
 
     let mut ready = libc::pollfd {
@@ -1950,79 +1963,101 @@ fn wait_interrupt_harness(exec: &MeshExec) -> i32 {
         events: libc::POLLIN,
         revents: 0,
     };
-    let mut seen = Vec::new();
-    // Let the line reach the shell before interrupting anything. Until reedline
-    // hands the terminal back, Ctrl-C is a keystroke that cancels the line
-    // rather than a signal, so an eager one would interrupt nothing and leave
-    // the wait unstarted. The repaint stops once the line is submitted, so
-    // silence is the evidence that it has been.
-    loop {
-        if unsafe { libc::poll(&mut ready, 1, 400) } <= 0 {
-            break;
+    // `wait 1` first, then `wait 1 2` against the table the first interrupt left
+    // behind. The second is the case that used to hang: the interruption came
+    // back as an ordinary 130, so the operand loop read it as job 1 merely
+    // failing and blocked on job 2, and the prompt never returned.
+    for waiting in ["wait 1\n", "wait 1 2\n"] {
+        if unsafe { libc::write(master, waiting.as_ptr().cast(), waiting.len()) }
+            != waiting.len() as isize
+        {
+            return 45;
         }
-        let mut chunk = [0_u8; 256];
-        let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
-        if count <= 0 {
-            return 53;
-        }
-        let fresh = seen.len().saturating_sub(3);
-        seen.extend_from_slice(&chunk[..count as usize]);
-        // Answer only queries in the bytes that just arrived. Scanning the whole
-        // buffer re-answers every earlier query on every read, and reedline takes
-        // the replies as *input* — the line stops being empty, so Ctrl-D no
-        // longer exits and a harness waiting on the shell waits forever. The
-        // three-byte overlap is for a query split across two reads.
-        if seen[fresh..].windows(4).any(|part| part == b"\x1b[6n") {
-            unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
-        }
-    }
-    seen.clear();
 
-    // One SIGINT, delivered the way the terminal would deliver it. Nothing is
-    // printed on entering the wait, so the *failed* prompt is the evidence that
-    // the wait came back non-zero — `mesh$` would be repainted on any keystroke,
-    // wait or no wait.
-    if unsafe { libc::kill(mesh, libc::SIGINT) } != 0 {
-        return 46;
-    }
-    let mut abandoned = false;
-    for _ in 0..20 {
-        if unsafe { libc::poll(&mut ready, 1, 500) } > 0 {
+        let mut seen = Vec::new();
+        // Let the line reach the shell before interrupting anything. Until
+        // reedline hands the terminal back, Ctrl-C is a keystroke that cancels
+        // the line rather than a signal, so an eager one would interrupt nothing
+        // and leave the wait unstarted. The repaint stops once the line is
+        // submitted, so silence is the evidence that it has been. This also
+        // drains whatever the previous round left unread.
+        loop {
+            if unsafe { libc::poll(&mut ready, 1, 400) } <= 0 {
+                break;
+            }
             let mut chunk = [0_u8; 256];
             let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
             if count <= 0 {
-                return 47;
+                return 53;
             }
+            let fresh = seen.len().saturating_sub(3);
             seen.extend_from_slice(&chunk[..count as usize]);
-            if seen.windows(4).any(|part| part == b"\x1b[6n") {
+            // Answer only queries in the bytes that just arrived. Scanning the
+            // whole buffer re-answers every earlier query on every read, and
+            // reedline takes the replies as *input* — the line stops being empty,
+            // so Ctrl-D no longer exits and a harness waiting on the shell waits
+            // forever. The three-byte overlap is for a query split across two
+            // reads.
+            if seen[fresh..].windows(4).any(|part| part == b"\x1b[6n") {
                 unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
             }
         }
-        if seen.windows(5).any(|part| part == b"mesh!") {
-            abandoned = true;
-            break;
+        seen.clear();
+
+        // One SIGINT, delivered the way the terminal would deliver it. Nothing
+        // is printed on entering the wait, so the *failed* prompt is the evidence
+        // that the wait came back non-zero — `mesh$` would be repainted on any
+        // keystroke, wait or no wait.
+        if unsafe { libc::kill(mesh, libc::SIGINT) } != 0 {
+            return 46;
+        }
+        let mut abandoned = false;
+        for _ in 0..20 {
+            if unsafe { libc::poll(&mut ready, 1, 500) } > 0 {
+                let mut chunk = [0_u8; 256];
+                let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
+                if count <= 0 {
+                    return 47;
+                }
+                seen.extend_from_slice(&chunk[..count as usize]);
+                if seen.windows(4).any(|part| part == b"\x1b[6n") {
+                    unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
+                }
+            }
+            if seen.windows(5).any(|part| part == b"mesh!") {
+                abandoned = true;
+                break;
+            }
+        }
+        if !abandoned {
+            return 48;
+        }
+
+        // The wait reports the interruption, and the wait is all that was
+        // abandoned: both jobs are still running and still listed, so nothing was
+        // taken out from under a later `fg`.
+        let probe = "puts s=$sh.status\n";
+        if unsafe { libc::write(master, probe.as_ptr().cast(), probe.len()) }
+            != probe.len() as isize
+            || !pty_wait_for_marker(master, b"s=130")
+        {
+            return 49;
+        }
+        // One listing, both markers. Asking twice would leave the first
+        // listing's tail unread — the second wait matches those leftover bytes
+        // and returns before the second listing has even been read — and an
+        // unread listing backs the pty up until the shell blocks writing into
+        // it, which presents as the next line typed being ignored and the
+        // harness waiting on a shell that will never leave.
+        let listing = "jobs\n";
+        if unsafe { libc::write(master, listing.as_ptr().cast(), listing.len()) }
+            != listing.len() as isize
+            || !pty_wait_for_markers(master, &["Running sleep 30", "Running sleep 31"])
+        {
+            return 52;
         }
     }
-    if !abandoned {
-        return 48;
-    }
 
-    // The wait reports the interruption, and the wait is all that was abandoned:
-    // `sleep 30` is still running and still listed, so nothing was taken out
-    // from under a later `fg`.
-    let probe = "puts s=$sh.status\n";
-    if unsafe { libc::write(master, probe.as_ptr().cast(), probe.len()) } != probe.len() as isize
-        || !pty_wait_for_marker(master, b"s=130")
-    {
-        return 49;
-    }
-    let listing = "jobs\n";
-    if unsafe { libc::write(master, listing.as_ptr().cast(), listing.len()) }
-        != listing.len() as isize
-        || !pty_wait_for_marker(master, b"Running sleep 30")
-    {
-        return 52;
-    }
     if unsafe { libc::write(master, b"exit\n".as_ptr().cast(), 5) } != 5 {
         return 50;
     }
@@ -2397,6 +2432,48 @@ fn pty_read_until_command_done(master: std::os::fd::RawFd) -> Option<(Vec<u8>, u
 /// Read from the PTY until `marker` appears, answering cursor-position queries so
 /// reedline keeps going. Used to wait for evidence that a backgrounded body has
 /// actually run, rather than checking the moment the prompt returns.
+/// Read until every marker has been seen, in one buffer.
+///
+/// Not a loop over [`pty_wait_for_marker`]: each call there starts a fresh
+/// buffer and stops on its first match, so a second call would be reading the
+/// leftovers of the first one's output rather than anything new.
+fn pty_wait_for_markers(master: std::os::fd::RawFd, markers: &[&str]) -> bool {
+    let mut ready = libc::pollfd {
+        fd: master,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut seen = Vec::new();
+    let all_present = |seen: &[u8]| {
+        markers.iter().all(|marker| {
+            let marker = marker.as_bytes();
+            seen.windows(marker.len()).any(|part| part == marker)
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if all_present(&seen) {
+            return true;
+        }
+        if unsafe { libc::poll(&mut ready, 1, QUIET) } <= 0 {
+            return false;
+        }
+        let mut chunk = [0_u8; 256];
+        let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if count <= 0 {
+            return false;
+        }
+        let fresh = seen.len().saturating_sub(3);
+        seen.extend_from_slice(&chunk[..count as usize]);
+        // Answer only queries in the bytes that just arrived, for the reason
+        // given on `pty_wait_for_marker`.
+        if seen[fresh..].windows(4).any(|part| part == b"\x1b[6n") {
+            unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
+        }
+    }
+    all_present(&seen)
+}
+
 fn pty_wait_for_marker(master: std::os::fd::RawFd, marker: &[u8]) -> bool {
     let mut ready = libc::pollfd {
         fd: master,
@@ -3151,6 +3228,295 @@ fn a_stopped_job_is_still_watched() {
 }
 
 #[test]
+fn a_bare_wait_reports_the_last_job_to_fail() {
+    // bash returns 0 from a bare `wait` whatever happened, which throws away the
+    // one thing the caller waited to find out. mesh keeps failure visible, by
+    // the rule it already applies to a pipeline: the last failure wins.
+    //
+    // The jobs finish in id order here, so "last to fail" is job 2 and the 0s on
+    // either side of it are what prove a later success does not erase it.
+    let out = run_with_input(
+        "sh -c \"sleep 0.1; exit 0\" &\n\
+         sh -c \"sleep 0.2; exit 5\" &\n\
+         sh -c \"sleep 0.3; exit 0\" &\n\
+         wait\n\
+         puts all=$sh.status\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("all=5"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Nothing failed, so nothing is reported.
+    let clean =
+        run_with_input("sh -c \"exit 0\" &\nsh -c \"exit 0\" &\nwait\nputs ok=$sh.status\n");
+    assert!(
+        String::from_utf8_lossy(&clean.stdout).contains("ok=0"),
+        "{}",
+        String::from_utf8_lossy(&clean.stdout)
+    );
+
+    // Several operands answer by the same rule, so `wait 1 2` and a bare `wait`
+    // cannot disagree about what waiting for two jobs means.
+    let named = run_with_input(
+        "sh -c \"sleep 0.1; exit 3\" &\n\
+         sh -c \"sleep 0.2; exit 0\" &\n\
+         wait 1 2\n\
+         puts multi=$sh.status\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&named.stdout).contains("multi=3"),
+        "{}",
+        String::from_utf8_lossy(&named.stdout)
+    );
+}
+
+#[test]
+fn a_job_exiting_130_is_not_mistaken_for_an_interrupt() {
+    // Ctrl-C during a wait reports 130, and a job is perfectly entitled to
+    // *exit* 130 — a wrapper around something that was itself interrupted does
+    // it routinely. While the interruption travelled back as that number the
+    // two were indistinguishable, so an ordinary exit ended the whole wait: the
+    // status was 130 rather than the later failure, and job 2 was never waited
+    // for at all.
+    let out = run_with_input(
+        "sh -c \"sleep 0.1; exit 130\" &\n\
+         sh -c \"sleep 0.3; exit 4\" &\n\
+         wait\n\
+         puts all=$sh.status\n\
+         jobs\n\
+         puts done\n",
+    );
+    let seen = String::from_utf8_lossy(&out.stdout);
+    assert!(seen.contains("all=4"), "{seen}");
+    // Nothing left listed: the wait ran to the end of the table rather than
+    // stopping at the job that looked like an interrupt.
+    assert!(!seen.contains("Running"), "{seen}");
+}
+
+#[test]
+fn a_bare_wait_reports_a_stopped_job_once() {
+    // Waiting for a stopped job by name reports the stop rather than blocking
+    // for a continue that is not coming. A bare wait used to skip stopped jobs
+    // outright, so the same table answered 0 through one spelling and 147
+    // through the other.
+    let stopped = run_with_input(
+        "sh -c 'kill -STOP $$; sleep 5' &\n\
+         sleep 0.3\n\
+         wait\n\
+         puts all=$sh.status\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&stopped.stdout).contains("all=147"),
+        "{}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
+
+    // Reported, not consumed: the job is still there to be continued, and the
+    // wait did not block on it either.
+    let listed = run_with_input(
+        "sh -c 'kill -STOP $$; sleep 0.3; exit 6' &\n\
+         sleep 0.3\n\
+         wait\n\
+         puts all=$sh.status\n\
+         kill -CONT %1\n\
+         wait 1\n\
+         puts then=$sh.status\n",
+    );
+    let seen = String::from_utf8_lossy(&listed.stdout);
+    assert!(seen.contains("all=147"), "{seen}");
+    assert!(seen.contains("then=6"), "{seen}");
+}
+
+#[test]
+fn a_disowned_job_leaves_the_table_and_the_hangup() {
+    // `disown` means "not my job any more", and that has to be true of every
+    // way the shell would otherwise touch it.
+    let out = run_with_input("sh -c \"sleep 5\" &\ndisown\njobs\nputs after=$sh.status\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("after=0"), "{stdout}");
+    assert!(
+        !stdout.contains("[1] Running"),
+        "a disowned job was still listed: {stdout}"
+    );
+
+    // Including a bare `wait`, which is the reason it is "every job in the
+    // table" rather than "every child the shell owns": disowning is how a script
+    // says "not that one", so it must not need a second way to say it. A 3s job
+    // that was waited for would blow the harness's patience long before this
+    // returns.
+    let skipped = run_with_input("sh -c \"sleep 3; exit 9\" &\ndisown\nwait\nputs w=$sh.status\n");
+    assert!(
+        String::from_utf8_lossy(&skipped.stdout).contains("w=0"),
+        "a bare wait waited for a disowned job: {}",
+        String::from_utf8_lossy(&skipped.stdout)
+    );
+
+    // `-h` is the narrower promise: still the shell's job, just not hung up.
+    let kept = run_with_input(
+        "sh -c \"sleep 0.2; exit 4\" &\ndisown -h\njobs\nwait\nputs kept=$sh.status\n",
+    );
+    let listed = String::from_utf8_lossy(&kept.stdout);
+    assert!(listed.contains("[1] Running"), "{listed}");
+    assert!(listed.contains("kept=4"), "{listed}");
+}
+
+#[test]
+fn disown_r_leaves_a_job_that_already_finished() {
+    // "Running" has to mean not-finished as well as not-stopped. A job whose
+    // process has exited but whose status nobody has collected is still in the
+    // table with an answer to give, and `-r` giving it up throws that answer
+    // away — the `wait` below used to report no such job instead of 7.
+    //
+    // `JobState` alone cannot tell: a poll deliberately sets a finished job back
+    // to `Running` so that a job killed out of a stop reports how it ended
+    // rather than the stop, which is exactly what made this look running.
+    let out = run_with_input(
+        "sh -c \"exit 7\" &\n\
+         sleep 0.2\n\
+         disown -r\n\
+         wait 1\n\
+         puts got=$sh.status\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("got=7"),
+        "stdout {:?} stderr {:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A job that really is running is still given up, so the narrowing did not
+    // just turn `-r` off.
+    let live = run_with_input("sh -c \"sleep 3\" &\ndisown -r\njobs\nputs after=$sh.status\n");
+    let seen = String::from_utf8_lossy(&live.stdout);
+    assert!(seen.contains("after=0"), "{seen}");
+    assert!(!seen.contains("[1] Running"), "{seen}");
+}
+
+#[test]
+fn disown_refuses_both_selectors_at_once() {
+    // `-a` and `-r` name different sets, so together they say nothing. Taking
+    // one silently is how the wrong jobs get given up with no word about it:
+    // this used to behave as `-r`, leaving a stopped job owned despite the `-a`.
+    let out = run_with_input(
+        "sh -c 'kill -STOP $$; sleep 5' &\n\
+         sleep 0.3\n\
+         disown -a -r\n\
+         puts refused=$sh.status\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("disown: -a and -r cannot be combined"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("refused=1"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn disowning_exempts_a_job_from_the_hangup() {
+    // The point of the whole thing: a disowned job outlives the shell. Asserted
+    // by what the job *did* after the shell was gone, since "was it signalled"
+    // is not observable from inside a shell that has exited.
+    let dir = fresh_dir("disown_hangup");
+    let check = |script: &str, name: &str| {
+        let marker = dir.join(name);
+        run_with_input(&format!(
+            "sh -c 'sleep 0.6; echo alive > {}' &\n{script}\n",
+            marker.display()
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(1400));
+        marker.exists()
+    };
+
+    assert!(
+        !check("puts started", "plain.txt"),
+        "an ordinary job survived the shell's hangup"
+    );
+    assert!(
+        check("disown -h", "kept.txt"),
+        "`disown -h` did not exempt the job from the hangup"
+    );
+    assert!(
+        check("disown", "gone.txt"),
+        "a disowned job was hung up anyway"
+    );
+
+    // A job that is *stopped* when it is given up is the case the exemption
+    // cannot cover, under either form. Its group is orphaned once the shell
+    // exits, and POSIX has the kernel — not mesh — send SIGHUP then SIGCONT to
+    // an orphaned group containing a stopped process. mesh could only prevent
+    // that by continuing the group on the way out, which would resume a job the
+    // user stopped on purpose, silently, once they can no longer object. So it
+    // warns while `bg` is still an answer and lets the job go, as bash and zsh
+    // do.
+    let stopped = |script: &str, name: &str| {
+        let marker = dir.join(name);
+        let out = run_with_input(&format!(
+            "sh -c 'kill -STOP $$; sleep 0.5; echo alive > {}' &\nsleep 0.4\n{script}\n",
+            marker.display()
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(1600));
+        (
+            marker.exists(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    for form in ["disown", "disown -h"] {
+        let (survived, stderr) = stopped(form, &format!("stopped_{}.txt", form.replace(' ', "_")));
+        assert!(
+            !survived,
+            "{form}: a stopped job cannot outlive the shell — the kernel hangs up \
+             its orphaned group, so this passing means the test stopped testing that"
+        );
+        assert!(
+            stderr.contains("is stopped and will not survive the shell"),
+            "{form}: gave up a stopped job without warning: {stderr}"
+        );
+    }
+
+    // `disown -h` keeps the job, so it can stop *after* it was given up — and
+    // then the warning at disown time has already been and gone. The exemption
+    // is void just the same, since it only ever covered mesh's own hangup and
+    // never the kernel's, so the shell says so on the way out rather than let
+    // the promise fail in silence.
+    let late = dir.join("late_stop.txt");
+    let out = run_with_input(&format!(
+        "sh -c 'sleep 0.5; echo alive > {}' &\ndisown -h\nkill -STOP %1\nsleep 0.3\n",
+        late.display()
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(1600));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("[1] is stopped, so it will not survive the shell"),
+        "a kept job that stopped after being disowned died without a word: {said}"
+    );
+    assert!(
+        !late.exists(),
+        "the exemption cannot outrank the kernel's hangup — if this survived, \
+         something is continuing the job and the warning is now wrong"
+    );
+
+    // The warning is for the stopped case only: an ordinary disown says nothing.
+    let (_, quiet) = {
+        let marker = dir.join("quiet.txt");
+        let out = run_with_input(&format!(
+            "sh -c 'sleep 0.6; echo alive > {}' &\ndisown\n",
+            marker.display()
+        ));
+        ((), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    assert!(!quiet.contains("will not survive"), "{quiet}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_continued_job_becomes_current_however_it_is_noticed() {
     // A continue makes a job current, and it must not matter whether the table
     // did it itself or found out by polling. `bg %2` moves job 2 to the front,
@@ -3278,6 +3644,103 @@ fn a_forked_stage_reaps_the_background_children_it_abandons() {
         zombies < 50,
         "a stage that only backgrounds left {zombies} zombies behind"
     );
+}
+
+// Killed rather than waited for: this shell is left sitting on an open stdin on
+// purpose, so it never exits on its own.
+#[allow(clippy::zombie_processes)]
+#[test]
+fn a_disowned_child_is_reaped_with_no_job_left_to_notice() {
+    // A plain `disown` empties the table but keeps the child, and nothing was
+    // left to collect it: the SIGCHLD handler only forwards, and the only other
+    // thing that drains is the job table — which the prompt skipped entirely
+    // when there were no jobs. So a disowned child stayed `<defunct>` for the
+    // rest of the session, contradicting the one thing `disown` still promises
+    // about it.
+    //
+    // The commands after the wait are **builtins**, deliberately. Anything that
+    // forks runs the wait path, which drains as a side effect and would hide
+    // this; a shell doing only builtin work is what leaves the child sitting
+    // there.
+    if !Path::new("/proc/self/stat").exists() {
+        return; // reading process state this way is Linux-only
+    }
+    let mut command = mesh_command();
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: `setpgid` only moves this child into a group of its own, and is
+    // async-signal-safe, which is the bar `pre_exec` sets. The group is what
+    // scopes the zombie count to this shell.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn mesh");
+    let group = child.id() as libc::pid_t;
+    let mut stdin = child.stdin.take().expect("mesh stdin");
+
+    let _ = writeln!(stdin, "sh -c \"sleep 0.3\" &");
+    let _ = writeln!(stdin, "disown");
+    let _ = stdin.flush();
+    // Long enough for the child to exit with the table already empty.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    for _ in 0..3 {
+        let _ = writeln!(stdin, "puts .");
+    }
+    let _ = stdin.flush();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    // Counted by parent, not by group: a background job gets a process group of
+    // its own, so the shell's group never contains this zombie and counting that
+    // way would pass whatever the shell did.
+    let zombies = zombie_children_of(group);
+
+    // The group, not just the shell: killing only the shell would reparent
+    // anything it still had running.
+    // SAFETY: a negated pid names its process group, which `pre_exec` created.
+    unsafe { libc::kill(-group, libc::SIGKILL) };
+    let mut status = 0;
+    // SAFETY: reaping the shell this test spawned.
+    unsafe { libc::wait4(group, &mut status, 0, std::ptr::null_mut()) };
+
+    assert_eq!(
+        zombies, 0,
+        "a disowned child was left unreaped by a shell with no jobs"
+    );
+}
+
+/// Zombie *children* of `parent`, read out of `/proc`.
+///
+/// By parent rather than by process group, which is what a disowned job needs:
+/// a background job is given a group of its own, so its zombie is not in the
+/// shell's group and [`zombies_in_group`] cannot see it. Parentage is the thing
+/// that actually says "this is the shell's to reap".
+fn zombie_children_of(parent: libc::pid_t) -> usize {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    let mut zombies = 0;
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, rest)) = text.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let state = fields.next().unwrap_or("");
+        let ppid: libc::pid_t = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+        if state.starts_with('Z') && ppid == parent {
+            zombies += 1;
+        }
+    }
+    zombies
 }
 
 /// Zombies whose process group is `group`, read out of `/proc`.
@@ -3749,18 +4212,26 @@ fn kill_reports_what_it_cannot_do() {
 }
 
 #[test]
-fn wait_needs_a_job_to_wait_for() {
-    // Bare `wait` is bash's "every child"; `fg`'s no-operand "the most recent
-    // one" would read the same and mean something else, so it is refused until
-    // the aggregate form is settled rather than quietly picking one meaning.
+fn wait_takes_a_job_or_all_of_them() {
+    // Bare `wait` used to be refused: it means bash's "every child", `fg`'s
+    // no-operand form means "the most recent one", and the aggregate status was
+    // undecided. It is decided now — every job in the table, last failure wins —
+    // so the bare form waits rather than complaining, and a job that finished
+    // cleanly leaves the status alone.
     let bare = run_with_input("sleep 0.05 &\nwait\nputs $sh.status\n");
     assert!(
-        String::from_utf8_lossy(&bare.stderr).contains("wait: expected a job"),
+        !String::from_utf8_lossy(&bare.stderr).contains("expected a job"),
         "{:?}",
         bare.stderr
     );
-    assert_eq!(String::from_utf8_lossy(&bare.stdout), "1\n");
+    assert_eq!(String::from_utf8_lossy(&bare.stdout), "0\n");
 
+    // With nothing to wait for it is still not an error: "everything finished"
+    // is true of an empty table.
+    let empty = run_with_input("wait\nputs $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&empty.stdout), "0\n");
+
+    // A named job that does not exist is still a mistake worth reporting.
     let unknown = run_with_input("sleep 0.05 &\nwait 9\nputs $sh.status\n");
     assert!(
         String::from_utf8_lossy(&unknown.stderr).contains("wait: 9: no such job"),

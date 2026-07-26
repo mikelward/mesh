@@ -110,6 +110,30 @@ struct Job {
     shell_modes: Option<libc::termios>,
     job_modes: Option<libc::termios>,
     state: JobState,
+    /// Set by `disown -h`: still the shell's job in every other way, but the
+    /// hangup on the way out skips it. `DESIGN.md` promises this exemption
+    /// arrives with `disown`, and it is the whole difference between `-h` and
+    /// the plain form — which drops the job from the table entirely.
+    hup_exempt: bool,
+}
+
+impl Job {
+    /// Whether the job is *running*: some member is still a live process, and
+    /// it is not stopped.
+    ///
+    /// [`JobState`] cannot answer this on its own. It only says stopped or not,
+    /// and a job whose members have all exited but whose status nobody has
+    /// collected yet is certainly not stopped — a poll even sets it back to
+    /// `Running` deliberately, so that a job killed out of a stop reports how it
+    /// ended rather than the stop. Liveness lives in the outcomes, which the
+    /// same poll fills in.
+    fn is_running(&self) -> bool {
+        !matches!(self.state, JobState::Stopped(_))
+            && self
+                .outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, Outcome::Running { .. }))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -303,7 +327,7 @@ impl JobTable {
         }
     }
 
-    /// Wait for a job to finish and report its status, leaving it where it is.
+    /// Wait for the named jobs, or for every job in the table.
     ///
     /// This is [`JobTable::foreground`] without the foreground: no `SIGCONT`,
     /// and the terminal stays with the shell, so a background job keeps running
@@ -311,9 +335,22 @@ impl JobTable {
     /// finished answers from the status its record carries, so waiting after the
     /// fact reports the same thing as waiting through it.
     ///
-    /// The job leaves the table once it is waited for, which is what keeps the
+    /// A job leaves the table once it is waited for, which is what keeps the
     /// prompt from also announcing `[1] Done (0) …` for a status the caller has
     /// already been given.
+    ///
+    /// **The status is the last job to fail, or 0 if none did** — the pipefail
+    /// rule mesh already applies to a pipeline, applied to the other place where
+    /// several things finish at once. bash returns 0 from a bare `wait`
+    /// regardless, which discards exactly the information the caller waited to
+    /// find out; mesh keeps failure visible for the same reason pipefail is
+    /// always on. `TODO.md` carries whether there should also be a way to get
+    /// the statuses back as a list.
+    ///
+    /// "Every job in the table", not every child the shell owns. A forked
+    /// stage's background children are owned — the reaper collects them so they
+    /// cannot become zombies — but were deliberately never jobs, and a disowned
+    /// job is gone from the table precisely so that nothing waits for it.
     ///
     /// `interactive` decides whether Ctrl-C may abandon the wait. Only the
     /// interactive shell ignores SIGINT on its own account, so only there is an
@@ -322,16 +359,36 @@ impl JobTable {
     /// inherited from a batch parent, which is that parent saying interrupts are
     /// not to take effect here.
     pub fn wait(&mut self, args: &[String], interactive: bool) -> u8 {
-        // Bare `wait` means "every child, with an aggregate status" in bash,
-        // while `fg`'s no-operand default means "the most recent one". The two
-        // read alike and differ in what they do, so the operand is required
-        // until `DESIGN.md` settles the aggregate rather than guessing here.
         if args.is_empty() {
-            note!("mesh: wait: expected a job");
-            return 1;
+            return self.wait_for_all(interactive);
         }
+        // Each operand is waited for in turn, and the same rule decides the
+        // answer: the last failure wins.
+        let mut status = 0;
+        for arg in args {
+            match self.wait_one(std::slice::from_ref(arg), interactive) {
+                // One Ctrl-C ends the wait, not just the operand it landed on.
+                // The jobs not reached keep running and keep their places, the
+                // same as the one that was being waited for.
+                Waited::Interrupted => return INTERRUPT_CODE,
+                Waited::Status(each) => {
+                    if each != 0 {
+                        status = each;
+                    }
+                }
+            }
+        }
+        status
+    }
+
+    /// Wait for one job, keeping an interruption apart from a status.
+    ///
+    /// A job may legitimately exit 130, so the two cannot travel back as the
+    /// same number: a caller that has to tell "Ctrl-C" from "the job ended that
+    /// way" — every loop over more than one job — would get it wrong.
+    fn wait_one(&mut self, args: &[String], interactive: bool) -> Waited {
         let Some(index) = self.resolve(args, "wait") else {
-            return 1;
+            return Waited::Status(1);
         };
         // Checked before the cached stop status is trusted: the job may have
         // been killed where it stood, or continued by something other than this
@@ -355,7 +412,7 @@ impl JobTable {
         if let JobState::Stopped(status) = self.jobs[index].state {
             let job = &self.jobs[index];
             note!("[{}] Stopped {}", job.id, job.command);
-            return status;
+            return Waited::Status(status);
         }
         let on_interrupt = if interactive {
             OnInterrupt::Abandon
@@ -367,7 +424,7 @@ impl JobTable {
             Some(WaitResult::Complete(status)) => {
                 let job = self.jobs.remove(index);
                 self.forget(job.id);
-                status
+                Waited::Status(status)
             }
             Some(WaitResult::Stopped(status)) => {
                 let job = &mut self.jobs[index];
@@ -375,14 +432,160 @@ impl JobTable {
                 let id = job.id;
                 note!("[{}] Stopped {}", job.id, job.command);
                 self.mark_current(id);
-                status
+                Waited::Status(status)
             }
             // As in `foreground`: this wait does not ask for `WCONTINUED`.
-            Some(WaitResult::Continued) => 0,
+            Some(WaitResult::Continued) => Waited::Status(0),
             // Ctrl-C gives up on the wait, not on the job: it keeps running and
             // keeps its place in the table.
-            None => INTERRUPT_CODE,
+            None => Waited::Interrupted,
         }
+    }
+
+    /// Wait for every job the table holds, oldest id first.
+    ///
+    /// By id rather than by recency, so the order a script sees does not depend
+    /// on which job happened to stop last. A job that is *stopped* reports its
+    /// stop and is left where it is, exactly as waiting for it by name does —
+    /// waiting on it would block for a continue that is not coming, and skipping
+    /// it would make the bare form disagree with the named one about a table
+    /// they can both see.
+    fn wait_for_all(&mut self, interactive: bool) -> u8 {
+        // A snapshot, oldest first. Waiting removes the jobs that finish and
+        // leaves the ones that are stopped, so a fresh `min()` each time round
+        // would either revisit a stopped job forever or have to skip it; taking
+        // the ids up front reaches each job that was here exactly once. Nothing
+        // a wait does adds a job, so the list cannot go stale in the other
+        // direction — only shorter, which `index_of` catches.
+        let mut ids: Vec<usize> = self.jobs.iter().map(|job| job.id).collect();
+        ids.sort_unstable();
+        let mut status = 0;
+        for id in ids {
+            if self.index_of(id).is_none() {
+                continue;
+            }
+            match self.wait_one(&[id.to_string()], interactive) {
+                // Ctrl-C gives up on the whole wait, not just this job — the
+                // remaining jobs keep running and keep their places.
+                Waited::Interrupted => return INTERRUPT_CODE,
+                Waited::Status(each) => {
+                    if each != 0 {
+                        status = each;
+                    }
+                }
+            }
+        }
+        status
+    }
+
+    /// Give up a job: `disown [-h] [-a | -r] [job …]`.
+    ///
+    /// Plain, the job leaves the table. It is then invisible to `jobs`, cannot
+    /// be named by `fg` / `bg` / `wait`, and is not hung up when the shell
+    /// exits — which is what makes a bare `wait` skip it rather than needing a
+    /// second way to say "not that one".
+    ///
+    /// It stays the shell's *child*, though, so the reaper keeps collecting it;
+    /// dropping the claim outright would leave a zombie for the rest of the
+    /// session. `abandon` is exactly that state — still reaped, status
+    /// discarded — and it is the same one a forked stage's background children
+    /// are left in.
+    ///
+    /// `-h` keeps the job and buys only the hangup exemption, which is the
+    /// narrower thing `DESIGN.md` promises: still the shell's job, just not hung
+    /// up on the way out.
+    ///
+    /// **A stopped job does not outlive the shell either way, and is warned
+    /// about rather than rescued.** Its group is orphaned when the shell exits,
+    /// and the kernel hangs up an orphaned group containing a stopped process,
+    /// so the exemption cannot cover it. Rescuing it would mean continuing a job
+    /// the user stopped on purpose, silently, at the one moment they can no
+    /// longer object — bash and zsh both refuse that and warn instead.
+    pub fn disown(&mut self, args: &[String]) -> u8 {
+        let mut keep = false;
+        let mut all = false;
+        let mut running_only = false;
+        let mut operands: Vec<&String> = Vec::new();
+        let mut rest = args.iter();
+        for arg in rest.by_ref() {
+            match arg.as_str() {
+                "-h" => keep = true,
+                "-a" => all = true,
+                "-r" => running_only = true,
+                "--" => break,
+                // A `%` reference or an id; anything else is reported by
+                // `resolve` in the caller's own words.
+                _ => operands.push(arg),
+            }
+        }
+        operands.extend(rest);
+
+        // They name different sets, so together they say nothing: silently
+        // applying one is a way to give up the wrong jobs and be told nothing
+        // about it.
+        if all && running_only {
+            note!("mesh: disown: -a and -r cannot be combined");
+            return 1;
+        }
+
+        let chosen: Vec<usize> = if all || running_only {
+            if !operands.is_empty() {
+                note!("mesh: disown: -a and -r take no job");
+                return 1;
+            }
+            self.jobs
+                .iter()
+                .filter(|job| !running_only || job.is_running())
+                .map(|job| job.id)
+                .collect()
+        } else if operands.is_empty() {
+            let Some(index) = self.resolve(&[], "disown") else {
+                return 1;
+            };
+            vec![self.jobs[index].id]
+        } else {
+            let mut ids = Vec::new();
+            for operand in operands {
+                let Some(index) = self.resolve(std::slice::from_ref(operand), "disown") else {
+                    return 1;
+                };
+                ids.push(self.jobs[index].id);
+            }
+            ids
+        };
+
+        for id in chosen {
+            let Some(index) = self.index_of(id) else {
+                continue;
+            };
+            // A stopped job will not outlive the shell however it is given up,
+            // and nothing mesh can do at exit changes that: the kernel hangs up
+            // an orphaned group containing a stopped process. So say it now,
+            // while `bg` is still an answer — the moment the shell is gone, so
+            // is the chance to act. bash and zsh both warn here for the same
+            // reason.
+            if matches!(self.jobs[index].state, JobState::Stopped(_)) {
+                note!(
+                    "mesh: disown: [{}] is stopped and will not survive the shell; `bg %{}` first",
+                    id,
+                    id
+                );
+            }
+            if keep {
+                self.jobs[index].hup_exempt = true;
+                continue;
+            }
+            let job = self.jobs.remove(index);
+            self.forget(job.id);
+            // Still reaped, so it cannot become a zombie; its status simply has
+            // nobody left to report to.
+            for outcome in &job.outcomes {
+                if let Outcome::Running { pid, .. } = outcome {
+                    reaper::abandon(*pid);
+                }
+            }
+        }
+        0
     }
 
     /// Signal a job or a pid.
@@ -633,12 +836,47 @@ impl JobTable {
 
 impl Drop for JobTable {
     fn drop(&mut self) {
+        // What the table believes can be one poll out of date, and the exempt
+        // case below turns on whether a job is stopped *now* — `disown -h`, a
+        // stop, and `exit` are three commands, and the stop can land after the
+        // last prompt looked.
+        for index in 0..self.jobs.len() {
+            match poll_outcomes(&mut self.jobs[index].outcomes).map(|polled| polled.result) {
+                Some(WaitResult::Stopped(code)) => {
+                    self.jobs[index].state = JobState::Stopped(code);
+                }
+                Some(WaitResult::Continued | WaitResult::Complete(_)) => {
+                    self.jobs[index].state = JobState::Running;
+                }
+                None => {}
+            }
+        }
         for job in &self.jobs {
+            if job.hup_exempt {
+                // `-h` skips *mesh's* hangup, and that is all it can skip. A
+                // stopped group is hung up by the kernel once orphaned, so the
+                // exemption cannot cover a job that is stopped on the way out —
+                // and the warning at `disown` time cannot cover a job that
+                // stopped afterwards. Say it here rather than let the promise
+                // fail in silence.
+                if matches!(job.state, JobState::Stopped(_)) {
+                    note!(
+                        "mesh: exit: [{}] is stopped, so it will not survive the shell",
+                        job.id
+                    );
+                }
+                continue;
+            }
             hangup_group(job.pgid, libc::SIGHUP);
             if matches!(job.state, JobState::Stopped(_)) {
                 hangup_group(job.pgid, libc::SIGCONT);
             }
         }
+        // Nothing is continued to save it. That would resume a job the user
+        // stopped on purpose, silently, once they can no longer object; bash and
+        // zsh both decline to do that and warn instead, and so does mesh. A job
+        // given up by a *plain* `disown` is past even warning about: it left the
+        // table, so a stop after that point is not something the shell can see.
     }
 }
 
@@ -649,6 +887,18 @@ const SIGPIPE_CODE: u8 = 128 + 13;
 /// `128 + SIGINT(2)` — the status a wait reports when Ctrl-C ended the wait
 /// rather than the job, matching what an interrupted command itself reports.
 const INTERRUPT_CODE: u8 = 128 + 2;
+
+/// How one job's wait ended.
+///
+/// [`INTERRUPT_CODE`] is what a *caller* sees, and it is deliberately the same
+/// number a job killed by SIGINT reports — the shell should not need a second
+/// vocabulary for "interrupted". Inside the wait the two must stay apart, since
+/// a job is free to exit 130 on its own account and only one of the two means
+/// "stop waiting for the rest".
+enum Waited {
+    Status(u8),
+    Interrupted,
+}
 
 /// Run `words[0]` with `words[1..]` as arguments and return its exit status.
 ///
@@ -1262,6 +1512,7 @@ pub fn run_pipeline(
                 shell_modes: None,
                 job_modes: None,
                 state: JobState::Running,
+                hup_exempt: false,
             });
             jobs.mark_current(id);
             return PipelineStatus::whole(0);
@@ -1314,6 +1565,7 @@ pub fn run_pipeline(
                     shell_modes,
                     job_modes,
                     state: JobState::Stopped(status),
+                    hup_exempt: false,
                 });
                 jobs.mark_current(id);
             }
@@ -2922,6 +3174,7 @@ mod tests {
                 shell_modes: None,
                 job_modes: None,
                 state: JobState::Running,
+                hup_exempt: false,
             });
             table.mark_current(id);
         }
