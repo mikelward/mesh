@@ -187,6 +187,41 @@ fn non_interactive_shell_does_not_source_rc_config() {
 /// way.
 const AWAIT_JOB_1: &str = "while $sh.jobs[1].state == running { sleep 0.02 }\n";
 
+/// `openpty` plus `FD_CLOEXEC` on both ends.
+///
+/// Without the flag these descriptors are inherited by every process the suite
+/// spawns *and survive its `exec`* — only `dup2` and an explicit close clear it.
+/// That leaks into unrelated tests rather than staying here: a child exec'd
+/// while a PTY test holds descriptor 3 starts with 3 already taken, and
+/// `run_at_descriptor_limit`'s `RLIMIT_NOFILE` of 4 then leaves the dynamic
+/// loader no descriptor to open a shared library with. It fails before `main`
+/// runs, with `error while loading shared libraries: … Error 24` — `EMFILE` —
+/// which reads as the shell declining a redirection it was never asked about.
+///
+/// The harnesses hand the slave to their child through `dup2`, which clears the
+/// flag on the copy, so nothing that should be inherited stops being.
+fn open_pty_pair(master: &mut i32, slave: &mut i32) -> i32 {
+    let ok = unsafe {
+        // `null_mut` rather than `null` for the termios/winsize arguments: Apple
+        // declares them `*mut` and Linux `*const`, and `*mut T` coerces to
+        // `*const T` but not the reverse — so only this spelling builds on both.
+        libc::openpty(
+            master,
+            slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        for fd in [*master, *slave] {
+            // SAFETY: both descriptors were just returned by `openpty`.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+    }
+    ok
+}
+
 fn run_with_bytes(input: &[u8]) -> Output {
     let mut child = mesh_command()
         .stdin(Stdio::piped())
@@ -1179,15 +1214,7 @@ fn spawn_failure_returns_terminal_to_interactive_shell() {
 fn spawn_failure_harness(exec: &MeshExec) -> i32 {
     let mut master = -1;
     let mut slave = -1;
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    } != 0
+    if open_pty_pair(&mut master, &mut slave) != 0
         || unsafe { libc::setsid() } < 0
         || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
     {
@@ -1254,15 +1281,7 @@ fn spawn_failure_harness(exec: &MeshExec) -> i32 {
 fn sigcont_harness(exec: &MeshExec) -> i32 {
     let mut master = -1;
     let mut slave = -1;
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    } != 0
+    if open_pty_pair(&mut master, &mut slave) != 0
         || unsafe { libc::setsid() } < 0
         || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
     {
@@ -1355,16 +1374,7 @@ fn an_interrupt_abandons_a_wait_and_leaves_the_job_alone() {
 fn wait_interrupt_harness(exec: &MeshExec) -> i32 {
     let mut master = -1;
     let mut slave = -1;
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    } != 0
-    {
+    if open_pty_pair(&mut master, &mut slave) != 0 {
         return 40;
     }
     unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
@@ -1494,15 +1504,7 @@ fn background_startup_harness(exec: &MeshExec) -> i32 {
 
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    } != 0
+    if open_pty_pair(&mut master, &mut slave) != 0
         || unsafe { libc::setsid() } < 0
         || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
     {
@@ -1690,15 +1692,7 @@ fn background_function_terminal_harness(exec: &MeshExec) -> i32 {
 
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    } != 0
+    if open_pty_pair(&mut master, &mut slave) != 0
         || unsafe { libc::setsid() } < 0
         || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
     {
