@@ -178,9 +178,12 @@ There are four kinds of modifier, and the difference matters:
   string. It takes *any* type rather than a category, and its contract is
   **round-trip, not display**: parsing the result yields an equal value, which is
   what forces a string to be quoted even when it would read as a bare word (`42`
-  vs `'42'`) and keeps `[]` and `[:]` apart. That makes it the honest way to look
-  at a collection, since `puts $m` on a map or list is an error — a collection has
-  no argv form. The types with **no** literal form are refused by name rather than
+  vs `'42'`) and keeps `[]` and `[:]` apart. That is what distinguishes it from
+  [`puts`](#builtins), which *displays* a collection — one element or `key: value`
+  per line — and so cannot tell `42` from `'42'` or `[]` from `[:]`. Reach for
+  `:repr` when you need to know what you have rather than read it. A collection
+  still has no **argv** form, so an external command needs a spread or a
+  [`:join`](#spread--flattening). The types with **no** literal form are refused by name rather than
   approximated (a stream handle, a function, a glob — writing the pattern back
   would re-glob it — and, until its flags round-trip, a regex); an approximation
   would read back as a different value, which is the one thing `:repr` must not

@@ -136,7 +136,7 @@ func confirm(question) {
 ```
 
 A handle has **no byte form**, so it never crosses into argv or a string:
-`puts $sh.stdin` is a loud error, the same way a regex or a list is. It exists to
+`puts $sh.stdin` is a loud error, the same way a regex is. It exists to
 be asked questions, and `:tty` is the question — asking it of anything else is
 an error rather than a quiet answer about some unrelated descriptor.
 
@@ -396,7 +396,8 @@ one-MiB output cap.
 
 | Builtin | Effect |
 | --- | --- |
-| `puts [arg …]` | Print the arguments separated by single spaces, then a newline. No arguments prints a blank line. |
+| `puts [arg …]` | Render each argument and print them separated by single spaces, then a newline. No arguments prints a blank line. Rendering is per value: a scalar as itself, a **list** as its elements joined by newlines, a **map** as `key: value` lines. A value with no byte form — a job or stream handle, a function, a pattern — is a loud error rather than a guess, and so is a collection nested inside one. Unlike argv, `puts` sees the real value, so `puts $xs` needs no `...`; a *written* argument keeps its own text, so `puts 007` prints `007`. It takes no flags. |
+| `print [arg …]` | The same as `puts` with **no trailing newline**, for partial lines. No arguments prints nothing. |
 | `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`. |
 | `pwd` | Print the working directory. |
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
@@ -997,8 +998,9 @@ puts $env.PATH:len
 
 The set is fixed for now: `PATH`, `MANPATH`, `CDPATH`, `INFOPATH`,
 `LD_LIBRARY_PATH`, and `PYTHONPATH`. (`export --list NAME`, which would opt an
-arbitrary name in, is not implemented.) Because these read as lists, `puts
-$env.PATH` needs a spread or a join like any other list. Splitting is **exact** —
+arbitrary name in, is not implemented.) Because these read as lists, `$env.PATH`
+needs a spread or a join to reach an external command like any other list
+(`puts $env.PATH` prints one entry per line). Splitting is **exact** —
 every empty component is kept, since `PATH=/usr/bin:` means "…and the cwd", and a
 split/join round trip is byte-faithful.
 
@@ -1016,7 +1018,8 @@ renders it lossily, so `$env.K = $env.K` — an explicit read and write back —
 does not round-trip; that waits on `OsString`-backed words.
 
 Member access and list/map indexing have the same meaning inside `"…"` as they do
-outside it. A slice remains a list and needs `...` in command position; omitted
+outside it. A slice remains a list and needs `...` to reach an external command;
+omitted
 bounds and negative bounds are supported. Use braces to delimit a reference
 before literal text: `${x}.txt`.
 A malformed `${…}` (no closing `}`, or an invalid name inside) is a syntax error.
@@ -1090,8 +1093,9 @@ The contract is round-trip rather than pretty-printing, and that is what the
 quoting is for: `42` and `"42"` are different values, so a string is always
 quoted even when it would read as a bare word, and the empty map keeps its own
 `[:]` spelling so it cannot come back as the empty list `[]`. It is the natural
-way to see what you actually have — `puts $m` on a map or list is an error,
-because a collection has no argv form.
+way to see what you actually *have*, where [`puts`](#builtins) shows you how a
+collection **reads** — one element or `key: value` per line, with `42` and `'42'`
+printing alike.
 
 A value with **no** literal form is a loud error rather than an approximation
 that would read back as something else: a stream handle, a function, a glob

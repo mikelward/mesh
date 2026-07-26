@@ -598,6 +598,43 @@ file as tasks land.
         it. Deciding whether that key is spelled `complete.probe` (flat, with a dot
         in the name) or a real submap is what unblocks it.
 
+## Beyond M3 — Rich output
+
+`DESIGN.md` gives the output builtins a rendering rule richer than argv's, and
+gives the prompt styled values. Both need the builtin to see a **value** rather
+than the string the argv boundary would have produced.
+
+- [x] **`puts` and `print` render values, not words.** Per `DESIGN.md` §"I/O": a
+      scalar as itself, a list as its elements joined by newlines, a map as
+      `key: value` lines, and a value with no byte form (a job or stream handle, a
+      function, a pattern) as a loud error. `print` is the same builtin without the
+      trailing newline. Both are dispatched with typed arguments by
+      `repl::output_builtin_words`, which every command path goes through, so
+      `puts $xs`, `puts $xs > out` and `puts $xs | cat` agree. Only a word ordinary
+      expansion *cannot* render takes the typed route — value typing reads a bare
+      literal as a number, and `puts 007` has to print `007`.
+- [ ] **A builtin's auto-help fires on `--help` that arrived as data.** `x = --help;
+      puts $x` prints the usage screen, and so does `xs = [--help]; puts $xs` —
+      `run_expanded` reads expanded *words*, so nothing distinguishes the flag from
+      a value that spells it. True of every builtin (`cd $x` too) and true before
+      the output builtins rendered values; the list case is one more way to reach
+      it, not a new mechanism. `DESIGN.md` §"Command resolution and help" gives `--`
+      as the escape — and it works for the detection — but a builtin then *prints*
+      the `--`, since none of them consume it. Settling this means deciding whether
+      a builtin parses flags at all: `DESIGN.md` says `puts` "takes no flags", which
+      argues its `--help` is data too, against the "built-ins ship their specs the
+      same way" rule that gives it a usage screen. One answer for all of them, not a
+      carve-out for `puts`.
+- [ ] **Styled values and `style()`** — a `Value::Styled { text, attributes }`
+      that renders as its text everywhere bytes are wanted (argv, `:join`,
+      comparison, interpolation) and emits its attributes only when `puts`/`print`
+      is writing to a color-capable terminal. `NO_COLOR` drops the color and keeps
+      the text. Needs the `DESIGN.md` §"Hooks and the prompt" line that says only
+      the prompt renderer reads the attributes to widen to the output builtins.
+- [ ] **`link(text, url)`** (OSC 8) on the same machinery: a styled value whose
+      attribute is a hyperlink, stripped when stdout is not a terminal and kept
+      under `NO_COLOR` (a link is not color).
+
 ## Beyond M3 — Terminal integration
 
 The escape/OSC surface a modern interactive shell drives, from the TODO block in
@@ -1194,9 +1231,11 @@ reasoning, and the open ones are at the bottom.
 ## Icebox / decide later
 
 - [ ] **`$env.PATH` is one more argument for auto-flattening at the boundary.**
-      Now that path-type entries are lists, `puts $env.PATH` needs `...` or a
-      `:join` like any other list — consistent, and what makes `+=` append an
-      entry rather than concatenate a string. But `PATH` is the list users reach
+      Now that path-type entries are lists, `$env.PATH` needs `...` or a `:join`
+      to reach an external command like any other list — consistent, and what
+      makes `+=` append an entry rather than concatenate a string. (`puts
+      $env.PATH` prints one entry per line; the boundary in question is argv.)
+      But `PATH` is the list users reach
       for by reflex from other shells, where it is plain text, so it sharpens the
       general question already in this icebox: whether list values should flatten
       automatically at the external-command boundary. Decide it there, as one
