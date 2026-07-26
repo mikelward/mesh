@@ -615,9 +615,10 @@ character makes it literal.
 | `'…'` | no | yes | `$` is literal. |
 | `r'…'` `r"…"` | no | no | Fully literal; for backslash-heavy text. |
 
-Escape sequences in `"…"` and `'…'`: `\n \t \r \e \\ \u{HEX}`, plus `\"` in
-double quotes and `\'` in single. `"…"` also takes `\$`. An unknown escape is a
-syntax error.
+Escape sequences in `"…"` and `'…'`: `\n \t \r \e \a \b \f \v \\ \u{HEX}`,
+plus `\"` in double quotes and `\'` in single. `"…"` also takes `\$`. An unknown
+escape is a syntax error — including `\0`, which is not in the set because a NUL
+cannot cross `execve` or the environment.
 
 Adjacent quoted and bare pieces concatenate into one argument: `--flag='a b'` is
 a single argument, `""` is one empty argument.

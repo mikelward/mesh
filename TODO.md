@@ -24,6 +24,13 @@ file as tasks land.
       interpolation), `r'…'`/`r"…"` (raw); unknown escape is an error; backslash
       escapes; concatenation; quoting suppresses tilde/glob expansion. Deferred:
       heredocs, `\`-newline continuation across lines.
+      `\a` (`BEL`) joined the set later, for the title-setting prompt idiom
+      `"\e]0;mesh\a mesh$ "` that every other shell spells that way, with
+      `\b \f \v` alongside it so the set has no arbitrary hole. `\0` stays out: it
+      would build a value `execve` and the environment both refuse. Adding an
+      escape can never change what an existing script means, since an unknown one
+      is an error rather than a literal — which is what keeps this open rather than
+      a one-time decision.
 - [x] Variables (simple): `name = value` / `name=value` assignment (session-
       global), `$name`/`${name}` + `$env.KEY` interpolation (in bare + `"…"`),
       unbound read is a loud error, no word-splitting of interpolated values.
