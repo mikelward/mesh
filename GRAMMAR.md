@@ -79,8 +79,10 @@ raw    = ("r'" <bytes> "'") | ('r"' <bytes> '"')  # no escapes at all
 
 The escape sets (an **unknown escape inside a quote is a syntax error**):
 
-- `"…"` : `\n \t \r \e \\ \" \$` and `\u{HEX}`.
-- `'…'` : `\n \t \r \e \\ \'` and `\u{HEX}`; `$` is always literal (no `\$`).
+- `"…"` : `\n \t \r \e \a \b \f \v \\ \" \$` and `\u{HEX}`.
+- `'…'` : `\n \t \r \e \a \b \f \v \\ \'` and `\u{HEX}`; `$` is always literal
+  (no `\$`). `\0` is deliberately absent from both: a NUL cannot cross `execve` or
+  the environment.
 
 - **Bare words** are expandable; a backslash makes the next char literal
   (`a\ b` is one word; `\*`, `\~` literal).

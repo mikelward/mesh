@@ -863,6 +863,20 @@ impl<'a> Lexer<'a> {
                                 't' => '\t',
                                 'r' => '\r',
                                 'e' => '\u{1b}',
+                                // `BEL`. Not for the bell: it is the terminator
+                                // every shell's title-setting idiom uses, so
+                                // `"\e]0;…\a"` is the form a prompt gets copied in
+                                // as. `\u{7}` spelled it before and still does.
+                                'a' => '\u{7}',
+                                // The rest of C's control escapes, so the set has
+                                // no arbitrary hole for someone to find one at a
+                                // time. `\0` is *not* among them: a NUL cannot
+                                // cross `execve` or the environment, both of which
+                                // mesh refuses it at, so the escape would only
+                                // build values that fail later.
+                                'b' => '\u{8}',
+                                'f' => '\u{c}',
+                                'v' => '\u{b}',
                                 '\\' => '\\',
                                 '\'' if quote == '\'' => '\'',
                                 '"' if quote == '"' => '"',
@@ -4263,6 +4277,36 @@ mod tests {
             panic!()
         };
         assert_eq!(word.text(), "a\nb!");
+
+        // The control escapes, in both quote kinds, and `\u{…}` still spells the
+        // same bytes — each is a second spelling of one that already worked, so a
+        // script written either way behaves the same.
+        for (source, decoded) in [
+            (r#""\a""#, "\u{7}"),
+            (r"'\a'", "\u{7}"),
+            (r#""\u{7}""#, "\u{7}"),
+            (r#""\b""#, "\u{8}"),
+            (r"'\b'", "\u{8}"),
+            (r#""\f""#, "\u{c}"),
+            (r#""\v""#, "\u{b}"),
+            (r#""\a\b\f\v""#, "\u{7}\u{8}\u{c}\u{b}"),
+        ] {
+            let tokens = tokenize(source).unwrap();
+            let TokenKind::Word(word) = &tokens[0].value else {
+                panic!("{source} did not lex to a word")
+            };
+            assert_eq!(word.text(), decoded, "{source}");
+        }
+
+        // `\0` stays out, so it is still a loud error rather than a NUL that
+        // `execve` and the environment would refuse further down.
+        assert!(matches!(
+            tokenize(r#""\0""#),
+            Err(ParseError {
+                kind: ParseErrorKind::UnknownEscape('0'),
+                ..
+            })
+        ));
         assert!(matches!(
             tokenize(r"'\d'"),
             Err(ParseError {

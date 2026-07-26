@@ -8972,16 +8972,17 @@ mod tests {
     fn a_titling_prompt_measures_the_same_through_the_input_path() {
         // The unit tests above hand `escape_stripped_width` bytes directly. This
         // one goes through what a user actually types, because the two are not the
-        // same reach: mesh's escape set is explicit and `\a` is not in it, so
-        // `prompt "\e]0;mesh\a x> "` — the spelling every other shell's `PS1`
-        // uses — is a syntax error before the width scan is ever consulted.
-        // Raised in review on #238.
+        // same reach: mesh's escape set is explicit, so a terminator it cannot
+        // spell is a syntax error long before the width scan is consulted, and a
+        // scan that handles the bytes would never be asked. Raised in review on
+        // #238, when `\a` was that case.
         //
-        // The two spellings mesh does have for a terminator, `ST` (`\e\\`, what
-        // mesh's own OSC 7 and OSC 133 sequences use) and `BEL` (`\u{7}`, what the
-        // scan accepts for compatibility), both reach it and both measure `x> `.
+        // All three spellings of a terminator mesh now has: `ST` (`\e\\`, what
+        // mesh's own OSC 7 and OSC 133 sequences use), and `BEL` as both `\a` (the
+        // idiom, added for exactly this) and `\u{7}` (what spelled it before).
         for prompt_command in [
             r#"prompt "\e]0;mesh\e\\x> ""#,
+            r#"prompt "\e]0;mesh\ax> ""#,
             r#"prompt "\e]0;mesh\u{7}x> ""#,
         ] {
             let mut shell = Shell::new();

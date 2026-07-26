@@ -833,8 +833,15 @@ continuation**.
 
 **Single quotes `'…'` don't interpolate but do escape** — they are `"…"` minus `$`
 interpolation (Python's `str`). The escape set is the double-quote set with the quote
-swapped: `\n \t \r \e \\ \'` and `\u{…}`; `$` is always literal (no `\$` needed), and
-an **unknown escape is an error** (`'\d'` is a mistake, not a literal backslash-d).
+swapped: `\n \t \r \e \a \b \f \v \\ \'` and `\u{…}`; `$` is always literal (no
+`\$` needed), and an **unknown escape is an error** (`'\d'` is a mistake, not a
+literal backslash-d). `\a` is `BEL`, there because it terminates the OSC sequence a
+title-setting prompt carries — `"\e]0;mesh\a mesh$ "` — which is the form such a
+prompt is copied in as from another shell; `\b \f \v` come with it so the set has no
+arbitrary hole. **`\0` is deliberately not one of them**: a NUL cannot cross `execve`
+or the environment, both of which mesh refuses it at, so the escape would only build
+values that fail later. Because an unknown escape is an error rather than a literal,
+another one can always be added without changing what an existing script means.
 So `'can\'t'` → `can't`, `'a\nb'` is two lines, and no variable expands.
 
 **Raw strings `r'…'` / `r"…"` take no escapes at all** — every byte is literal and
@@ -846,8 +853,8 @@ freely — and a string needing **both** quote kinds uses the quoted-delimiter
 
 **Double quotes `"…"` interpolate and escape.** `$name` / `${…}`
 [interpolate](#variables-and-assignment), and a **modern C-style escape set**
-applies — `\n \t \r \e \\ \" \$` and `\u{1F600}` for Unicode — so `"a\nb"` is two
-lines and `"\$5"` is a literal dollar. This is a deliberate break from bash (where
+applies — `\n \t \r \e \a \b \f \v \\ \" \$` and `\u{1F600}` for Unicode — so
+`"a\nb"` is two lines and `"\$5"` is a literal dollar. This is a deliberate break from bash (where
 `"\n"` is a backslash-n and you reach for `$'\n'`): mesh needs no `$'…'` form
 because double quotes already interpret escapes.
 
