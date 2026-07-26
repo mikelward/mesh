@@ -487,17 +487,16 @@ name is unset. Note that a name bound to `""` is *present*, so it wins over the
 default — bash's `${EMPTY:-vim}` substitutes, and this does not.
 
 Strings have an affix family for dropping a known prefix or suffix, and a replace
-family. The pattern matches **verbatim**, so a `.` is a dot rather than "any
-character" — a string never quietly becomes a regex. (`:replaceall` is global;
-`:replacestart` and `:replaceend` act only on a match at that edge.)
+family whose first argument is a **pattern slot**: a string matches verbatim, a
+`/…/` regex matches as a pattern.
 
 <pre>
 mesh$ <strong>puts "report.tar.gz":stripend(".tar.gz")</strong>
 report
 mesh$ <strong>puts "a.b.c":replaceall(".", "-")</strong>
 a-b-c
-mesh$ <strong>puts "one.js":replaceend(".js", ".ts")</strong>
-one.ts
+mesh$ <strong>puts "a.b.c":replaceall(/./, "-")</strong>
+-----
 </pre>
 
 ## Numbers, booleans, and operators

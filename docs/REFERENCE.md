@@ -1387,8 +1387,8 @@ mesh **reserves** for a modifier it has not built yet — `:sort`, `:words`,
 | `:stripstart(P)` / `:stripend(S)` | string or list | Drop the affix once if it is there; a no-op otherwise. |
 | `:trimstart` / `:trimend` | string or list | Peel whitespace from that end, repeatedly. |
 | `:trimstart(CHARS)` / `:trimend(CHARS)` | string or list | Peel any of `CHARS` from that end, repeatedly. |
-| `:replaceall(OLD, NEW)` | string or list | Replace every occurrence of the literal `OLD`. |
-| `:replacestart(OLD, NEW)` / `:replaceend(OLD, NEW)` | string or list | Replace a **leading** / **trailing** occurrence only. |
+| `:replaceall(OLD, NEW)` | string or list | Replace every match. |
+| `:replacestart(OLD, NEW)` / `:replaceend(OLD, NEW)` | string or list | Replace a **leading** / **trailing** match only. |
 | `:map(F)` / `:filter(F)` / `:each(F)` | list | Apply a callable per element — see [Functions](#functions). |
 | `:i` `:m` `:s` `:x` | regex | Pattern flags — see [Operators and matching](#operators-and-matching). |
 | `:capture` | a **call** | Every channel of the call as a record — see [Functions](#functions). |
@@ -1487,28 +1487,47 @@ puts "report.tar.gz":stripend(".zip")      # report.tar.gz — no match, no chan
 puts "///a//":trimend("/")                 # ///a
 ```
 
-The **replace** family matches its pattern **verbatim** — metacharacters and all,
-so a string full of `.` and `*` never quietly becomes one. `:replaceall` is
-global, as its name says; `:replacestart` and `:replaceend` act only on a match at
-that edge, so a pattern that happens to match in the middle leaves the string
-alone.
+The **replace** family takes a **match slot** first: a *string* `OLD` matches
+verbatim, with metacharacters literal, and a *regex* `OLD` (a bare `/…/` here, or
+an `re()` value) matches as a pattern. This is the same no-silent-coercion rule
+`~` and `:int` follow — a string full of `.` and `*` never quietly becomes a
+pattern. `:replaceall` is global, as its name says; `:replacestart` and
+`:replaceend` act only on a match at that edge, so a pattern that happens to match
+in the middle leaves the string alone. The edge is the **subject's**, not a
+line's, so `:m` does not move it. Where several matches reach the edge the
+the match is the **regex engine's**, found in the whole subject with the edge
+requirement compiled into the pattern. At the trailing edge that comes out as the
+longest match, since the engine tries start positions left to right and every
+candidate has to finish at the end: `"abc":replaceend(re("ab|bc"), "X")` is `aX`
+either way round. At the leading edge every candidate starts in the same place,
+so regex's ordinary first-alternative rule decides —
+`"abc":replacestart(re("a|ab"), "X")` is `Xbc` and `re("ab|a")` gives `Xc`. Write
+the alternative you want first, as you would in any regex.
+
+The subject is never sliced to look for a longer match, because a look-around
+assertion reads the bytes around it: `re(r"a\b")` has no match in `"ab"`, and
+cutting the subject down to `"a"` would invent the word boundary it asks for.
 
 ```mesh
-puts "a.b.c":replaceall(".", "-")          # a-b-c   — a literal dot
-puts "one.js":replaceend(".js", ".ts")     # one.ts
-puts "a.b.c":replacestart("b", "Z")        # a.b.c   — no leading match
+puts "a.b.c":replaceall(".", "-")          # a-b-c   — the string is literal
+puts "a.b.c":replaceall(/./, "-")          # -----   — the regex is a pattern
+puts "one.js":replaceend(/\.js/, ".ts")    # one.ts
 ```
 
-A **regex** pattern is not implemented yet, so the pattern is *always* the literal
-string. Two consequences worth knowing until it lands:
+Only a **bare** `/…/` reads as a pattern, and its delimiters have to be written as
+delimiters. A quoted `"/a/"` is the three-character text it looks like, so
+`"x/a/y":replaceall("/a/", "/b/")` is `x/b/y`; so is an escaped delimiter, since
+`\/a/` and `/a\/` are that same text. An escape *inside* is untouched —
+`/a\/b/` is a regex whose pattern contains an escaped slash. The same rule
+decides a `~` right-hand side and a `match` arm.
 
-- An `re()` value is refused, naming the gap.
-- A bare `/a/` is not special here — it is the three-character text `/a/`, and a
-  subject that does not contain it is simply unchanged. That is the reading a
-  quoted `"/a/"` needs (`"x/a/y":replaceall("/a/", "/b/")` is `x/b/y`), and by the
-  time the pattern reaches the modifier the two are the same value, so nothing can
-  tell them apart. Once the `/…/` slot `DESIGN.md` §"String" specifies is built, a
-  bare one reads as a pattern and the quoted form keeps its literal meaning.
+An **empty** pattern is refused whichever way it is written — `""`, `//`, or
+`re("")` — since it matches at every position, so a global replace would
+interleave the replacement through the subject and an anchored one would insert
+it at an edge.
+
+The replacement is **literal text**: `$1`-style capture backreferences are not
+implemented, since their spelling is still provisional in `DESIGN.md`.
 
 Every modifier here is a value modifier, so each **maps element-wise over a
 list** — `$paths:stripend(".js")` rewrites each path — except `:get`, which
@@ -2225,8 +2244,8 @@ affix family (`:stripstart`, `:stripend`, `:trimstart`, `:trimend`), the replace
 family (`:replaceall`, `:replacestart`, `:replaceend`), and `:map` / `:filter` /
 `:each`; the rest of the `DESIGN.md` set (`:match`, `:has`, `:words`, `:lines`,
 the first-only `:replace`, the time and sort families) is not implemented, and
-neither are the regex capture modifiers. The replace family takes a **literal
-string** pattern only — its regex spelling is not built yet. One of them **spread** at a command boundary
+neither are the regex capture modifiers or a capture backreference in a
+replacement. One of them **spread** at a command boundary
 (`puts ...$x:split(":")`) is also not implemented — bind it first.
 `gets` reads a line as a command; the value form `gets()` does not.
 Of heredocs, the command-redirection form documented under

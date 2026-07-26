@@ -903,9 +903,9 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
 - [x] The affix family: `:stripstart(P)` / `:stripend(S)` drop an affix once,
       `:trimstart` / `:trimend` peel whitespace (or a given char set) repeatedly.
 - [x] The replace family: `:replaceall(OLD, NEW)` and the anchored
-      `:replacestart` / `:replaceend`, with a **literal string** pattern —
-      `${x//a/b}` and its anchored kin. The regex spelling of the slot is split
-      out; see below.
+      `:replacestart` / `:replaceend`. `${x//a/b}` and its anchored kin, with a
+      pattern that is a **match slot**: a string matches verbatim, a `/…/` is a
+      regex. See the regex entry below for what that slot has to get right.
 - [x] Argument-taking modifiers in **command-argument** position
       (`puts $env:get(EDITOR, vim)`), which used to be a syntax error: a command
       word stops in front of the `(`, so the arguments arrived glued to it.
@@ -953,26 +953,26 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
         so the binding does not outlive it. Same as any builtin, but worth a line
         in the reference, since `cmd | while gets line { … }` is the shape people
         will reach for (`DESIGN.md`:3462 already flags that form as *planned*).
-- [ ] **A regex pattern for the replace family** — the `/…/` slot `DESIGN.md`
-      §"String" specifies, split into its own change because it is where the
-      difficulty lives. What it has to get right, each of which was a real bug
-      when it was attempted inline:
-  - [ ] **Anchoring, not filtering.** `find_iter` reports non-overlapping
+- [x] **A regex pattern for the replace family** — the `/…/` slot `DESIGN.md`
+      §"String" specifies. Split out of the modifier-arguments change because it
+      is where the difficulty lives; each item below was a real bug caught in
+      review before it was got right:
+  - [x] **Anchoring, not filtering.** `find_iter` reports non-overlapping
         leftmost-first matches, so an earlier match eats the bytes a later
         trailing one needed and `re("ab|bc")` against `abc` never offers the `bc`
         that ends the string.
-  - [ ] **`\A` / `\z`, not `^` / `$`.** The latter move to *line* edges under
+  - [x] **`\A` / `\z`, not `^` / `$`.** The latter move to *line* edges under
         `:m`, and a subject's edge is not a line's.
-  - [ ] **The subject stays whole.** Testing truncated slices to find a longer
+  - [x] **The subject stays whole.** Testing truncated slices to find a longer
         match fabricates context for a look-around: `re(r"a\b")` has no match in
         `ab` but passes against the slice `a`, whose cut end reads as a word
         boundary.
-  - [ ] **Extended mode cannot be read off the flags.** `(?x)` turns it on from
+  - [x] **Extended mode cannot be read off the flags.** `(?x)` turns it on from
         inside the pattern, and a trailing `#` comment then swallows any
         generated `)` and anchor. Retrying the wrap with a closing newline works
         and cannot mask a broken pattern, since a swallowed `)` always leaves the
         group unclosed.
-  - [ ] **A flagged literal is a chain, not a bare regex.** `/a/:i` parses as `:i`
+  - [x] **A flagged literal is a chain, not a bare regex.** `/a/:i` parses as `:i`
         applied to an `Expr::Regex`, so a slot conversion that inspects only the
         top of the tree drops it and leaves `:i` on a string.
   - [x] **The match contract is the engine's** *(decided — mikelward)*. Anchor,
@@ -1003,6 +1003,25 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       does. Not done here because it changes call syntax in *expression* position
       too — `f (1)` currently calls `f` and would stop — which is a language
       decision rather than a bug fix.
+
+- [ ] **A bare `/…/` literal cannot hold a space or an unbalanced paren.** A regex
+      literal is not lexed as a unit — it is an ordinary word that
+      `match_operand` recognizes *after* tokenization, by its shape — so it ends
+      where any word ends. `/foo #bar/:x` is two words and `/foo(/` opens a group,
+      both "unexpected end of input", exactly as `puts a b` and `puts a(b` are.
+      Pre-existing on `main`, and it applies to every match slot alike: the `~`
+      right-hand side, a `match` arm, and the replace family.
+
+      It bites `:x` hardest, since extended mode exists to let a pattern be spaced
+      out and commented, and the spelling that most wants a space is the one that
+      cannot have one. `#` itself is fine — `/foo#bar/:x` works, so a comment with
+      no space before it is writable — and `re(r"…")` takes anything.
+
+      The fix would be lexing `/…/` as a unit, which is exactly what the
+      after-the-fact recognition avoids: a leading `/` is far more often a path
+      than a pattern, so the lexer cannot know. Any change here has to keep
+      `ls /usr/bin` a path and `cat a(b` whatever it is today. Worth a design
+      entry rather than a patch.
 
 - [ ] **How `puts` should render a nested structure.** *(mikelward)* A collection
       inside a collection has no rendering today, so `puts $m` on
