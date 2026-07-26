@@ -3238,6 +3238,21 @@ impl Parser {
                 self.position -= 1;
                 self.range(None)
             }
+            // A lone `*` is the glob, not multiplication. The lexer can only tell
+            // them apart by spacing, so it hands both spellings over as the same
+            // operator token; reaching `primary` settles it, since a binary `*` is
+            // consumed by `binary` before its right operand is parsed and never
+            // arrives here. Yielding the bare word lets the usual expansion glob it,
+            // so `for f in *` and `x = *` mean what `DESIGN.md` §"Loops" says.
+            TokenKind::Operator(op) if op == "*" => Ok(Expr::Scalar(Spanned {
+                value: Word {
+                    pieces: vec![WordPiece::Text {
+                        text: op,
+                        quote: QuoteMode::Bare,
+                    }],
+                },
+                span: token.span,
+            })),
             _ => Err(ParseError {
                 kind: ParseErrorKind::Expected("a value expression"),
                 span: token.span,
@@ -4923,6 +4938,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Spacing is all the lexer has to tell the glob `*` from the multiplication
+    /// `*`, so both spellings arrive as one operator token and the grammar decides:
+    /// an operand slot takes the glob, the slot after a left operand takes the
+    /// operator. A unit test because the two readings are indistinguishable from
+    /// the shell once the glob has expanded.
+    #[test]
+    fn a_lone_star_is_a_glob_in_an_operand_slot_and_multiplication_after_a_value() {
+        let tree = complete("xs = *\nn = 4 * 3\nitems = for f in * { $f }");
+        let Executable::Assignment {
+            value: Expr::Scalar(word),
+            ..
+        } = &tree.statements[0].and_or.first
+        else {
+            panic!("a lone `*` should be the bare glob word")
+        };
+        assert_eq!(
+            word.value.pieces,
+            vec![WordPiece::Text {
+                text: "*".into(),
+                quote: QuoteMode::Bare,
+            }]
+        );
+        assert!(matches!(
+            &tree.statements[1].and_or.first,
+            Executable::Assignment {
+                value: Expr::Binary {
+                    op: BinaryOp::Multiply,
+                    ..
+                },
+                ..
+            }
+        ));
+        let Executable::Assignment {
+            value: Expr::For { iterable, .. },
+            ..
+        } = &tree.statements[2].and_or.first
+        else {
+            panic!()
+        };
+        assert!(matches!(iterable.as_ref(), Expr::Scalar(_)));
     }
 
     #[test]

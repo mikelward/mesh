@@ -1593,6 +1593,20 @@ reasoning, and the open ones are at the bottom.
 - [x] **`return` with no argument — use the last status.** `exit` already does
       this (a bare `exit` leaves the last command's status). Apply the same rule
       to `return` when it lands with function bodies.
+- [ ] **Glob qualifiers and the `glob()` family are still unwritten.** `*(f)` /
+      `*(d)` / `*(size > 1M)`, the `:f` / `:files` modifier shorthand, and
+      `glob()` / `files()` / `dirs()` are specced in `DESIGN.md` §"Globbing" but
+      nothing implements them. Since a lone `*` now parses as a value, `*(d)`
+      reads as a **call on the expanded glob** and fails at run time
+      (`*: a command has no return value`) — the same reading `*.txt(d)` already
+      got. Whatever lands should intercept the `(` after a glob and evaluate the
+      qualifiers per candidate path, and until then the error deserves to name
+      the real cause. Directory-only work has `*/` today.
+- [ ] **A leading `./` does not parse in value position.** `x = ./foo` and
+      `for f in ./* { … }` are syntax errors, because the `.` lexes as its own
+      `Dot` token and nothing starts a value expression with one; the same word
+      is fine as a command argument (`puts ./*`). Sibling of the lone-`*` fix —
+      a shell spelling the expression grammar does not recognize.
 - [ ] **Reserve only bare `_` as discard, allow `_name`.** Today a name must
       start with a letter, so a leading underscore is rejected wholesale (`_` and
       `_x` alike) — `_` is the discard pattern (`DESIGN.md`). Reconsider narrowing
