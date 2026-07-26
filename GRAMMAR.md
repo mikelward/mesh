@@ -59,6 +59,19 @@ After tokenizing, each word is expanded (before dispatch, so `cd ~` and
   args** (the settled empty-list rule). A word with no metacharacter is a
   literal and passes through even if no such file exists. An invalid pattern is
   a literal.
+- **The `glob` family:** `glob(PATTERN)`, `files(DIR=.)` and `dirs(DIR=.)` are
+  the same expansion reached as a **value call**, so they answer with a
+  [list](#m3-list-values) of paths — `for d in dirs() { … }`, `ls ...$found`.
+  `glob` expands a pattern the program built (`ls $p` passes the string verbatim;
+  a value never re-globs), and the two wrappers are `DIR/*` preset to the
+  matching type filter, so a directory's own entries come back sorted, without
+  hidden ones, and prefixed by the directory unless it is `.`. Everything is the
+  word rule above, including **no match → the empty list** — which covers a
+  missing or unreadable directory — with one exception: an invalid pattern is an
+  **error** rather than a literal, since a `glob()` call has nothing else to
+  mean. The argument is a plain string, so it takes no tilde expansion for the
+  same reason `ls $p` takes none; a bare word argument (`dirs(src)`) was already
+  tilde-expanded and globbed as a word before the call saw it.
 
 ## Task 5 — quoting and escapes (the real lexer, **Model B**)
 
@@ -362,9 +375,9 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
 - **Name.** A function name cannot be a reserved word (`func` / `return`) or a
   builtin (`cd` / `pwd` / `puts` / `print` / `exit` / `jobs` / `fg` / `bg`), since
   those resolve first and the definition could never be reached. Nor can it be a
-  built-in **value constructor** (`re` / `style` / `link`), which is the opposite
-  problem: those always build a value, so such a function would be reachable as a
-  command and never as a call.
+  built-in **value call** (`re` / `style` / `link` / `glob` / `files` / `dirs`),
+  which is the opposite problem: those always answer with a value, so such a
+  function would be reachable as a command and never as a call.
 - **Call.** A defined name in command position runs the function. Resolution is
   **builtins → functions → external**; the argument count must match the
   positionals (an arity mismatch is a loud, recoverable error). Arguments bind

@@ -328,6 +328,14 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
         "style(TEXT, fg: NAME, bold: BOOL) · link(TEXT, URL)",
         "Build a styled value; parens, not a command",
     ),
+    // Reserved on the same parser check, and asked about for the same reason: a
+    // reader who typed `dirs()` and got a diagnostic needs `dirs --help` to answer
+    // rather than report a command that does not exist.
+    (
+        &["glob", "files", "dirs"],
+        "glob(PATTERN) · files(DIR=.) · dirs(DIR=.)",
+        "Expand to matching paths; parens, not a command",
+    ),
 ];
 
 /// Return the help text for a syntax entry — the keyword shape of what `help`
@@ -1213,11 +1221,11 @@ mod tests {
         for keyword in [
             "func", "return", "if", "else", "unless", "match", "for", "in", "while", "loop",
             "break", "continue", "fork", "global", "unset", "export", "not", "and", "or", "re",
-            // Reserved as *value constructor* names rather than as statement
+            // Reserved as built-in *value* names rather than as statement
             // keywords, but reserved by the same parser check, so the same rule
             // applies: `func style(…)` is refused, and a reader told `style` is not
             // a keyword has been told something false.
-            "style", "link",
+            "style", "link", "glob", "files", "dirs",
         ] {
             assert!(syntax_help(keyword).is_some(), "{keyword}");
         }

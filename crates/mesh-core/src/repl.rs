@@ -3103,6 +3103,12 @@ fn eval_call(
     if name == "link" {
         return eval_link(arguments, last, in_function, shell);
     }
+    if name == "glob" {
+        return eval_glob(arguments, last, in_function, shell);
+    }
+    if let Some(filter) = entry_filter(&name) {
+        return eval_directory_entries(&name, filter, arguments, last, in_function, shell);
+    }
     if name != "re" {
         // A user function called for its value; an external (or unknown) command
         // has no return value — point at `$(…)` for its output instead.
@@ -3325,6 +3331,123 @@ fn eval_link(
         Err(message) => return runtime_error(format!("link(): {message}")),
     };
     Ok(Value::Styled(Box::new(StyledValue { text, style })))
+}
+
+/// The file-type filter a directory-entry wrapper is `glob` preset to, or `None`
+/// for a name that is not one of them.
+fn entry_filter(name: &str) -> Option<expand::Modifier> {
+    match name {
+        "files" => Some(expand::Modifier::Files),
+        "dirs" => Some(expand::Modifier::Dirs),
+        _ => None,
+    }
+}
+
+/// `glob(PATTERN)` — the paths a pattern matches, as a list, per `DESIGN.md`
+/// §"Globbing".
+///
+/// Not a value *constructor* like `re()`: there is no glob value to build. A glob
+/// is either a literal you write, which expands where you wrote it, or this call,
+/// which expands a pattern the program built at runtime — `ls $p` passes the
+/// string `*.jpg` verbatim, and `glob($p)` is how you ask for its matches instead.
+///
+/// The pattern is a plain string, so it gets no tilde expansion, for the same
+/// reason `ls $p` gets none: `~` is a *word* expansion that runs on what you
+/// typed, and a value never re-expands. A pattern under the home directory says
+/// so with `glob("$env.HOME/…")`, or lets the word form do it — `~/*.txt`.
+fn eval_glob(
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let pattern = glob_path_argument("glob", "pattern", arguments, last, in_function, shell)?;
+    if shell.control.is_some() {
+        return Ok(control_placeholder());
+    }
+    let Some(pattern) = pattern else {
+        return runtime_error("glob() requires one pattern string");
+    };
+    let paths = expand::glob_paths(&pattern)
+        .map_err(|message| runtime_message(format!("glob(): {message}")))?;
+    Ok(Value::List(paths.into_iter().map(Value::String).collect()))
+}
+
+/// `files(DIR=.)` and `dirs(DIR=.)` — a directory's immediate entries of one type,
+/// as a list, per `DESIGN.md` §"Globbing".
+///
+/// The ergonomic half of the family: `glob` preset to `DIR/*` plus the `type:`
+/// filter the name already carries, so the common walk reads as `for d in dirs()`
+/// rather than as a pattern plus a modifier. They reuse the `files` / `dirs` words
+/// for the same filter the `:files` / `:dirs` modifiers name, so the vocabulary is
+/// learned once.
+///
+/// The default is the working directory rather than a required argument because
+/// that is the overwhelming case, and it is spelled `.` — the same directory the
+/// bare `*` those entries come from is relative to.
+fn eval_directory_entries(
+    name: &str,
+    filter: expand::Modifier,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let directory = glob_path_argument(name, "directory", arguments, last, in_function, shell)?;
+    if shell.control.is_some() {
+        return Ok(control_placeholder());
+    }
+    let directory = directory.unwrap_or_else(|| ".".to_string());
+    let paths = expand::directory_entries(&directory, filter)
+        .map_err(|message| runtime_message(format!("{name}(): {message}")))?;
+    Ok(Value::List(paths.into_iter().map(Value::String).collect()))
+}
+
+/// Evaluate the one positional string the glob family takes. `Ok(None)` is "no
+/// argument was written" — which is a default for the wrappers and an error for
+/// `glob` — or an interrupted call, which the caller tells apart by asking the
+/// shell for pending control flow, as every other operand does.
+fn glob_path_argument(
+    name: &str,
+    role: &str,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Option<String>, Step> {
+    let mut path: Option<String> = None;
+    for argument in arguments {
+        match argument {
+            parser::Argument::Positional(expression) if path.is_none() => {
+                let Some(value) = eval_operand(expression, last, in_function, shell)? else {
+                    return Ok(None);
+                };
+                // A bare word argument has already globbed by the time it arrives
+                // (`dirs(src)` is a word, `dirs(*)` is the list `*` matched), so a
+                // list here is a pattern the caller expected to hand over whole.
+                let plain = value.plain();
+                let Value::String(text) = plain else {
+                    return runtime_error(format!(
+                        "{name}(): the {role} must be a string, not {}",
+                        value_kind(&plain)
+                    ));
+                };
+                path = Some(text);
+            }
+            parser::Argument::Positional(_) => {
+                return runtime_error(format!("{name}() takes one {role} argument"));
+            }
+            parser::Argument::Named(named, _) => {
+                return runtime_error(format!(
+                    "{name}(): no `{named}` argument; it takes the {role} positionally"
+                ));
+            }
+            parser::Argument::Spread(_) => {
+                return runtime_error(format!("{name}() does not accept spread arguments"));
+            }
+        }
+    }
+    Ok(path)
 }
 
 /// Is `name` a modifier that requires a parenthesized argument list? Used only to
@@ -4124,7 +4247,10 @@ fn capture_call(
     let command = match callee {
         parser::Expr::Scalar(word) => {
             let name = word.value.text();
-            (name != "re" && shell.funcs.get(&name).is_none()).then_some(name)
+            // Every built-in value name, not just `re`: `glob("*"):capture` asks
+            // what a *call* wrote and returned, and routing it to the command path
+            // would report the command-not-found for a `glob` that isn't one.
+            (!parser::value_builtin(&name) && shell.funcs.get(&name).is_none()).then_some(name)
         }
         _ => None,
     };
