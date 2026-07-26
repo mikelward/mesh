@@ -6471,6 +6471,11 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         // `semantic_mark`. Both halves have to be present for a terminal to make
         // sense of the stream, and only reedline knows where it drew the prompt.
         .with_semantic_markers(Some(Osc133Markers::boxed()))
+        // Bracketed paste (`CSI ?2004 h`), per `DESIGN.md` "terminal control":
+        // pasted text is *inserted*, not executed line by line. reedline's guard
+        // defaults to off, so without this a paste's newlines each arrive as
+        // Enter and every line but the last runs before it can be read.
+        .use_bracketed_paste(true)
         .with_edit_mode(Box::new(Emacs::new(keybindings)))
         .with_quick_completions(true)
         .with_highlighter(Box::new(input_highlighter()))
