@@ -1214,18 +1214,19 @@ fn spawn_failure_returns_terminal_to_interactive_shell() {
 }
 
 #[test]
-fn a_piped_shell_writes_no_semantic_marks() {
-    // The marks are for a terminal that is drawing the session. Everything else
-    // reading mesh's stdout — a pipe, a file, the several hundred assertions in
-    // this file — asked for the command's bytes and nothing else, so a mark that
-    // reached them would be corruption rather than decoration.
+fn a_piped_shell_writes_no_terminal_sequences() {
+    // The marks, the working-directory report and bracketed-paste mode are all for
+    // a terminal that is drawing the session. Everything else reading mesh's
+    // stdout — a pipe, a file, the several hundred assertions in this file — asked
+    // for the command's bytes and nothing else, so any of them reaching those
+    // callers would be corruption rather than decoration.
     //
-    // What this actually pins is *where the marks are written from*. Today no
-    // piped path reaches `semantic_mark` at all: it is called only from the
-    // interactive loop's `handle_signal`, and its `interactive` check is a second
-    // lock on a door that is already shut. So deleting that check does not fail
-    // this test — moving the call somewhere shared, like `run_line`, does, which
-    // is the mistake actually available to make.
+    // What this actually pins is *where they are written from*. Today no piped
+    // path reaches `semantic_mark` or `report_cwd` at all: both are called only
+    // from the interactive loop, and their `interactive` check is a second lock on
+    // a door that is already shut. So deleting that check does not fail this test —
+    // moving a call somewhere shared, like `run_line` or the `cd` builtin, does,
+    // which is the mistake actually available to make.
     //
     // `mesh -s` is the case worth pinning among the three: it reads commands from
     // a terminal without being an interactive session, which is why the shell
@@ -1242,6 +1243,10 @@ fn a_piped_shell_writes_no_semantic_marks() {
                 "a mark escaped to a pipe: {text:?}"
             );
             assert!(!text.contains("133;"), "a mark escaped to a pipe: {text:?}");
+            assert!(
+                !text.contains("\x1b]7;"),
+                "a cwd report escaped to a pipe: {text:?}"
+            );
             assert!(
                 !text.contains("\x1b[?2004"),
                 "bracketed paste escaped to a pipe: {text:?}"
@@ -1458,6 +1463,31 @@ fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
+/// The payload of the last `OSC 7` in `bytes` — the report for wherever the shell
+/// most recently said it was.
+fn last_cwd_report(bytes: &[u8]) -> Option<String> {
+    const OPEN: &[u8] = b"\x1b]7;";
+    let start = bytes.windows(OPEN.len()).rposition(|part| part == OPEN)? + OPEN.len();
+    let rest = &bytes[start..];
+    let end = rest.windows(2).position(|part| part == b"\x1b\\")?;
+    String::from_utf8(rest[..end].to_vec()).ok()
+}
+
+/// Percent-encode a path the way `OSC 7` needs it, spelled out again here so the
+/// expectation is an independent reading of the rule rather than a call into the
+/// code under test.
+fn percent_encoded(path: &Path) -> String {
+    let mut encoded = String::new();
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 #[test]
 fn an_interactive_shell_turns_on_bracketed_paste() {
     let exec = MeshExec::new(isolated_config_home());
@@ -1646,6 +1676,68 @@ fn abandoned_line_harness(exec: &MeshExec) -> i32 {
     }
     if !stop_pty_shell(shell) {
         return 96;
+    }
+    0
+}
+
+#[test]
+fn an_interactive_shell_reports_where_it_is() {
+    // A directory with a space in it, so the encoding is exercised end to end.
+    // Canonical, because `getcwd` answers with symlinks resolved — on macOS the
+    // temp directory is reached through one.
+    let directory = fresh_dir("osc 7 report")
+        .canonicalize()
+        .expect("canonicalize the temp directory");
+    let exec = MeshExec::new(isolated_config_home());
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(cwd_report_harness(&exec, &directory)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// `OSC 7` at the first prompt and again after the shell moves.
+///
+/// The startup report is the half a shell is easiest to leave out: reporting only
+/// on `cd` looks right in the terminal you are sitting in and leaves a fresh
+/// session — an `ssh`, a new tab — with nothing to split from until the user
+/// happens to move.
+fn cwd_report_harness(exec: &MeshExec, directory: &Path) -> i32 {
+    let Some(shell) = start_pty_shell(exec, Some(directory)) else {
+        return 100;
+    };
+    let Some(report) = last_cwd_report(&shell.startup) else {
+        return 101;
+    };
+    let Some(rest) = report.strip_prefix("file://") else {
+        return 102;
+    };
+    let want = percent_encoded(directory);
+    let Some(host) = rest.strip_suffix(&want) else {
+        return 103;
+    };
+    // The host field ends at the path's leading `/`; a hostname that swallowed
+    // part of the path would still have matched the suffix above.
+    if host.contains('/') {
+        return 104;
+    }
+    // And again when the shell moves, with the new directory. `/` needs no
+    // encoding, which is what makes it a clean second reading of the same rule.
+    if !pty_write(shell.master, b"cd /\n") {
+        return 105;
+    }
+    let moved = format!("\x1b]7;file://{host}/\x1b\\");
+    if pty_read_until_one_of(shell.master, &[moved.as_bytes()]).is_none() {
+        return 106;
+    }
+    if !stop_pty_shell(shell) {
+        return 107;
     }
     0
 }
