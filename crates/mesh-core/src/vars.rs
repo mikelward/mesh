@@ -1059,6 +1059,19 @@ impl Vars {
         self.get(name).is_some()
     }
 
+    /// Is the binding a read would find the **function-local** one, rather than a
+    /// global it shadows? `false` at top level, where there is no local scope for
+    /// a binding to be in, and for a name bound nowhere.
+    ///
+    /// Asked by `what`, which reports which scope a name lives in; every other
+    /// caller wants [`get`](Vars::get), whose whole job is to make the two the
+    /// same question.
+    pub(crate) fn is_local(&self, name: &str) -> bool {
+        self.locals
+            .last()
+            .is_some_and(|scope| scope.contains_key(name))
+    }
+
     /// Read `name`: the innermost function-local binding, else the global one.
     /// Returns `None` if unbound — the caller turns that into a loud error, per
     /// the no-null / fail-loud rule.

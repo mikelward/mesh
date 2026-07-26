@@ -2831,6 +2831,40 @@ programs or user functions:
   and **`dirs(DIR=.)`** are the [wrapper](#globbing) expansions — `glob` over a
   directory's immediate entries preset to `type: file` / `type: dir` — returning a
   path [list](#arrays-lists). `style` (above) is the styled-value constructor.
+- **Discovery** — **`whence [--all|--quiet] NAME …`** says what a name *is*:
+  syntax, a built-in, a function, or the executable `PATH` finds — and, because
+  mesh keeps bindings in a namespace of their own, the variable or `$env` entry of
+  that name alongside it. Bare, it reports the **winner** — what a bare `NAME`
+  would run — and names what that shadows (`git is a function (shadowing
+  /usr/bin/git)`), which is the interactive question; **`--all`** lists every match
+  in resolution order instead. **`--quiet`** prints nothing at all and leaves only
+  the status — `0` found, `1` not — so `if whence --quiet fzf { … }` is mesh's
+  `command -v fzf >/dev/null`. A name is given **without a sigil**: `whence xs`
+  asks about the name, where `$xs` would expand before the built-in ever saw it.
+  A word with a `/` in it is a **path operand**, read as command resolution reads
+  it — the file, not a `PATH` search. Because it is the search `execvp` performs,
+  an **unset `PATH`** falls back to the platform's default (`confstr(_CS_PATH)`)
+  rather than reporting nothing, exactly as the exec would.
+
+  **Described is not usable**, and where they part the line still prints and the
+  status still fails, so the report explains it: a path that exists but could not
+  be run (a directory, no execute bit, or a fifo carrying one — all `126`), and a
+  shape the parser does not claim in command position (`127`). Only a word it
+  claims *unconditionally* resolves — `if`, `for`, `func` — because the rest are
+  **contextual**: `fork` is the subshell keyword only before a block, `unless` a
+  postfix guard after a statement, `and` an operator between values, so a bare one
+  is an ordinary command word and a legal function name. A contextual word is
+  therefore reported *beside* the function or executable that a bare one reaches,
+  never as shadowing it.
+
+  It takes **ksh's spelling**, and its `-a` / `-q` with it. `type` is the wider
+  reflex — bash's and fish's — but is the one word mesh cannot spend on a *name*
+  lookup: mesh has real value types and [`:type`](#modifiers) already asks a
+  path's, so `type $x` would read as a question about the value forever. nushell,
+  the closest peer, split the same way (`which` for names, `describe` for values).
+  The reflexes all land here anyway — `type`, `what`, `which` and `where` name
+  `whence` in [command not found](docs/REFERENCE.md#commands). The **value**-side
+  question is [`:repr`](#modifiers), which already answers it.
 - **Session** — `exit [status]`.
 
 **No aliases.** mesh drops the alias mechanism entirely: a **function** is just

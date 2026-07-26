@@ -49,6 +49,10 @@ const TABLE: &[(&str, &str)] = &[
     ),
     ("source FILE", "Run a file's commands in this shell"),
     ("help [NAME ...]", "List the builtins, or explain one"),
+    (
+        "whence [--all|--quiet] NAME ...",
+        "Say what a name is: builtin, function, …",
+    ),
 ];
 
 /// The name a usage line belongs to: its first word.
@@ -82,6 +86,22 @@ pub(crate) fn names() -> impl Iterator<Item = &'static str> {
     TABLE.iter().map(|(usage, _)| name_of(usage))
 }
 
+/// The usage line for a builtin, if `name` is one. `whence` reports it as the
+/// builtin's definition, from the same table `help` reads — so a builtin cannot
+/// be described one way by one and another way by the other.
+pub(crate) fn usage(name: &str) -> Option<&'static str> {
+    entry(name).map(|(usage, _)| *usage)
+}
+
+/// The form a syntax entry is written as, if `name` is one — the [`SYNTAX`]
+/// half of [`usage`], found by any of the words that row answers to.
+pub(crate) fn syntax_form(name: &str) -> Option<&'static str> {
+    SYNTAX
+        .iter()
+        .find(|(names, ..)| names.contains(&name))
+        .map(|(_, form, _)| *form)
+}
+
 /// The table row for `name`, if it names a builtin.
 fn entry(name: &str) -> Option<&'static (&'static str, &'static str)> {
     TABLE.iter().find(|(usage, _)| name_of(usage) == name)
@@ -100,14 +120,30 @@ pub fn is_builtin(name: &str) -> bool {
     entry(name).is_some()
 }
 
-/// Bash builtins mesh renames, mapped to the mesh builtin that replaces them.
+/// The names other shells use for a mesh builtin, mapped to mesh's spelling.
 /// Kept as a *name* rather than prose so `is_builtin` can say whether the
 /// replacement is wired up yet, and the caveat retires itself when it lands.
 ///
 /// `echo` is here for the stripped-`PATH` case only: an external `echo` almost
 /// always shadows this, which is deliberate — `echo -n` / `-e` keep working
 /// through `/bin/echo`, where a mesh builtin would print the flag as text.
-const RENAMED: &[(&str, &str)] = &[("echo", "puts"), ("read", "gets")];
+///
+/// The four spellings of `whence` are the point of those entries rather than a
+/// footnote: the lookup command is the one every shell names differently, so
+/// whichever one the reader's fingers know has to say where it went. `which` and
+/// `where` are externals on many systems, so their notes fire only where the
+/// command really is missing — which is exactly when the pointer is wanted.
+/// `type` is the widest reflex of the four and the one mesh will never take: it
+/// is a question about a *value* in a language that has value types, and `:type`
+/// already asks a path's.
+const RENAMED: &[(&str, &str)] = &[
+    ("echo", "puts"),
+    ("read", "gets"),
+    ("type", "whence"),
+    ("what", "whence"),
+    ("which", "whence"),
+    ("where", "whence"),
+];
 
 const LOCAL: &str = "a plain `x = 5` inside a `func` is already local";
 const NO_ALIASES: &str = "mesh has no aliases; a `func` replaces `alias ll`";
@@ -183,8 +219,53 @@ pub fn print_generated_help(name: &str, help: &str) -> u8 {
 /// The summary leads, as it does in the help clap generates and the completion
 /// parser already reads: a prose line carries no options, so it adds a sentence
 /// for a reader without changing what a spec is built from.
+///
+/// A builtin's **own** options are listed above `--help`, read off the usage line
+/// by [`usage_options`] rather than written a second time. Only `--help` used to
+/// be listed, which made the `Options:` block wrong about every builtin that has
+/// options of its own — `whence --help` did not mention `--all`, and since the
+/// completion tables are built from this text, `whence --a<Tab>` had nothing to
+/// offer either. One block, both readers.
 fn format_help(usage: &str, summary: &str) -> String {
-    format!("{summary}\n\nUsage: {usage}\n\nOptions:\n  --help  Print help\n")
+    let mut options = String::new();
+    for option in usage_options(usage) {
+        options.push_str(&format!("  {option}\n"));
+    }
+    format!("{summary}\n\nUsage: {usage}\n\nOptions:\n{options}  --help  Print help\n")
+}
+
+/// The literal options a usage line offers, in the order written.
+///
+/// Read off the usage line like [`name_of`] and [`reads_options`], so a builtin
+/// cannot document a flag it does not take or take one it does not document.
+/// `[--all|--quiet]` yields both, and `[-a | -r]` likewise: the brackets say
+/// optional and the bar separates alternatives, so neither is part of a name.
+///
+/// Two things that look like options are deliberately excluded:
+///
+/// - A **metavariable**, which is what the case test is for: `kill [-SIGNAL]
+///   JOB|PID` writes a placeholder for whichever signal you name, not a flag
+///   spelled `-SIGNAL`. Usage lines spell placeholders in upper case throughout
+///   (`DIR`, `JOB`, `NAME`, `TEXT`) and mesh's flags are lower case, so the two
+///   are told apart without a second list to maintain.
+/// - The bare **`--` terminator**, which `command [--] NAME` writes to show where
+///   it accepts one. It ends the options rather than being one, and offering it as
+///   a flag would put it in the `Options:` block of every builtin that documents
+///   taking it.
+pub(crate) fn usage_options(usage: &str) -> impl Iterator<Item = &str> {
+    usage
+        .split(' ')
+        .skip(1)
+        .flat_map(|token| token.trim_matches(['[', ']']).split('|'))
+        .map(str::trim)
+        .filter(|token| {
+            let name = token.trim_start_matches('-');
+            token.starts_with('-')
+                // Non-empty rules out a bare `--`; lower case rules out a
+                // metavariable.
+                && !name.is_empty()
+                && name.chars().all(|character| !character.is_ascii_uppercase())
+        })
 }
 
 /// The shape of a line, as `(names, form, summary)`: what to type, and the words
@@ -353,6 +434,52 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
         "Expand to matching paths; parens, not a command",
     ),
 ];
+
+/// Every **word** in [`SYNTAX`] — the entries a reader can complete or type,
+/// as opposed to the operator rows (`+`, `$(`, `"`) and the `command` row for the
+/// generic shape of a line, which are documentation for punctuation and a shape
+/// rather than names.
+///
+/// The set completion offers for a name argument. Being here does *not* mean the
+/// word is unavailable: `fork`, `unless`, `and` are all legal function names.
+/// For "does a bare one do something", see [`COMMAND_KEYWORDS`].
+pub(crate) const SYNTAX_WORDS: &[&str] = &[
+    "func", "return", "if", "else", "unless", "match", "for", "in", "while", "loop", "break",
+    "continue", "fork", "global", "unset", "export", "not", "and", "or",
+    // The built-in *value* names, reserved as function names by the same parser
+    // check but reached as value calls rather than in command position.
+    "re", "style", "link", "glob", "files", "dirs",
+];
+
+/// The words the parser takes **in command position**, so a bare one never
+/// reaches command lookup.
+///
+/// A strict subset of [`SYNTAX_WORDS`], and the distinction is not cosmetic —
+/// most of the rest are **contextual**, claimed only by what follows them:
+/// `fork` is the subshell keyword only before a block, `unless` and `if` are
+/// postfix guards after a statement, `global` / `unset` / `export` need an
+/// assignment, and `and` / `or` / `in` are value operators. Each of those is a
+/// legal command word and a legal function name — the repo's own
+/// `a_command_named_fork_is_still_reachable` covers `fork` — so a bare one is an
+/// ordinary lookup that ends in `command not found` if nothing defines it.
+///
+/// `re`, `style` and `link` are absent for a different reason: the parser refuses
+/// them as *function* names, but a command-position `style …` is still a lookup
+/// that reports `command not found`, since they are value calls.
+///
+/// This is what `whence` asks to decide whether a syntax row is the answer to
+/// "what runs" — a contextual word must not outrank the function or executable
+/// that a bare one would actually reach.
+pub(crate) const COMMAND_KEYWORDS: &[&str] = &[
+    "func", "return", "if", "match", "for", "while", "loop", "break", "continue", "global",
+    "unset", "export", "not",
+];
+
+/// Does the parser take a bare `name` in command position? See
+/// [`COMMAND_KEYWORDS`] for why this is narrower than having a `SYNTAX` row.
+pub(crate) fn is_command_keyword(name: &str) -> bool {
+    COMMAND_KEYWORDS.contains(&name)
+}
 
 /// Return the help text for a syntax entry — the keyword shape of what `help`
 /// prints for a builtin. No `Options:` section, because a keyword takes no
@@ -954,8 +1081,9 @@ fn exit(args: &[String], last: u8) -> Builtin {
 #[cfg(test)]
 mod tests {
     use super::{
-        Decoration, SYNTAX, TABLE, Value, base64, help, is_builtin, names, overview, path_line,
-        reads_options, rename_note, rendered_for_output, syntax_help,
+        COMMAND_KEYWORDS, Decoration, SYNTAX, SYNTAX_WORDS, TABLE, Value, base64, help, is_builtin,
+        is_command_keyword, name_of, names, overview, path_line, reads_options, rename_note,
+        rendered_for_output, syntax_help, usage_options,
     };
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
@@ -1266,19 +1394,102 @@ mod tests {
 
     #[test]
     fn every_keyword_the_parser_reserves_is_explained() {
-        // Mirrors the reserved words `parser.rs` matches on. A keyword the parser
-        // knows and `help` does not is a reader being told, falsely, that a word
-        // they just used is not a keyword.
-        for keyword in [
-            "func", "return", "if", "else", "unless", "match", "for", "in", "while", "loop",
-            "break", "continue", "fork", "global", "unset", "export", "not", "and", "or", "re",
-            // Reserved as built-in *value* names rather than as statement
-            // keywords, but reserved by the same parser check, so the same rule
-            // applies: `func style(…)` is refused, and a reader told `style` is not
-            // a keyword has been told something false.
-            "style", "link", "glob", "files", "dirs",
-        ] {
+        // `SYNTAX_WORDS` mirrors the words `parser.rs` matches on. A keyword the
+        // parser knows and `help` does not is a reader being told, falsely, that a
+        // word they just used is not a keyword.
+        for keyword in SYNTAX_WORDS {
             assert!(syntax_help(keyword).is_some(), "{keyword}");
+        }
+    }
+
+    #[test]
+    fn a_syntax_word_is_a_word_and_not_every_syntax_row() {
+        // The two are for different questions, and conflating them is what made
+        // `whence --quiet +` claim the operator resolved. Every syntax *word* is a
+        // name; `SYNTAX` also documents operators and a `command` row for the shape
+        // of a line, which name nothing.
+        for word in SYNTAX_WORDS {
+            assert!(
+                word.chars().all(|c| c.is_ascii_alphabetic()),
+                "{word} is not a word"
+            );
+        }
+        for documented in ["+", "$(", "\"", ".."] {
+            assert!(syntax_help(documented).is_some(), "{documented}");
+            assert!(!is_command_keyword(documented), "{documented}");
+        }
+    }
+
+    #[test]
+    fn a_builtins_own_options_are_read_off_its_usage_line() {
+        let options = |usage| usage_options(usage).collect::<Vec<_>>();
+        // Brackets say optional and the bar separates alternatives, so neither is
+        // part of a name.
+        assert_eq!(
+            options("whence [--all|--quiet] NAME ..."),
+            ["--all", "--quiet"]
+        );
+        assert_eq!(options("disown [-h] [-a | -r] [JOB …]"), ["-h", "-a", "-r"]);
+        assert_eq!(options("prompt [--reset | TEXT]"), ["--reset"]);
+        // A metavariable is not an option: `-SIGNAL` stands for whichever signal
+        // you name, so offering it as a flag would be offering a word that does
+        // not exist.
+        assert_eq!(options("kill [-SIGNAL] JOB|PID ..."), Vec::<&str>::new());
+        // Nor is the terminator: `command [--]` documents *taking* a `--`, and
+        // listing it would put `--` in the `Options:` block of every builtin that
+        // says so.
+        assert_eq!(options("command [--] NAME [ARG ...]"), Vec::<&str>::new());
+        // Nothing to find where a builtin takes only operands.
+        assert_eq!(options("cd [DIR]"), Vec::<&str>::new());
+        assert_eq!(options("puts [ARG ...]"), Vec::<&str>::new());
+        // The name itself is skipped even when it starts with a dash-like word.
+        assert_eq!(options("pwd"), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn generated_help_lists_a_builtins_own_options() {
+        // The `Options:` block used to name only `--help`, which made it wrong
+        // about every builtin that has options — and, because the completion
+        // tables are built from this text, made those flags uncompletable too.
+        let help = help("whence").expect("whence is a builtin");
+        assert!(
+            help.contains("\nOptions:\n  --all\n  --quiet\n  --help"),
+            "{help}"
+        );
+        // Listing a flag implies reading options — but not the reverse, and the gap
+        // is deliberate. `reads_options` asks "who owns the `--` terminator", which
+        // `kill` does because it reads a leading signal; `usage_options` asks "what
+        // literal flags are there to offer", and a `-SIGNAL` placeholder is none.
+        for (usage, _) in TABLE {
+            let name = name_of(usage);
+            if usage_options(usage).next().is_some() {
+                assert!(reads_options(name), "{name} lists a flag it does not read");
+            }
+        }
+        assert!(reads_options("kill"));
+        assert_eq!(usage_options("kill [-SIGNAL] JOB|PID ...").count(), 0);
+    }
+
+    #[test]
+    fn a_command_keyword_is_a_syntax_word_the_parser_always_takes() {
+        // Every command keyword is a syntax word, so `help` explains it and
+        // completion offers it.
+        for keyword in COMMAND_KEYWORDS {
+            assert!(SYNTAX_WORDS.contains(keyword), "{keyword}");
+            assert!(is_command_keyword(keyword), "{keyword}");
+        }
+        // The contextual words are deliberately *out*. Each is claimed only by what
+        // follows it, so a bare one is an ordinary command word — legal as a
+        // function name, and `command not found` when nothing defines it. Treating
+        // these as keywords made `whence fork` outrank a real `func fork()`.
+        for contextual in ["fork", "unless", "else", "and", "or", "in"] {
+            assert!(SYNTAX_WORDS.contains(&contextual), "{contextual}");
+            assert!(!is_command_keyword(contextual), "{contextual}");
+        }
+        // Refused as *function* names, but a command-position one is still a
+        // lookup that reports `command not found` — they are value calls.
+        for constructor in ["re", "style", "link"] {
+            assert!(!is_command_keyword(constructor), "{constructor}");
         }
     }
 

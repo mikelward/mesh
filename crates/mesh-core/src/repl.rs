@@ -36,7 +36,7 @@ use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
 use crate::options::{Opt, Options};
 use crate::vars::{self, Decoration, RegexValue, Style, StyledValue, Value, Vars};
-use crate::{environ, exec, expand, parser};
+use crate::{environ, exec, expand, parser, whence};
 
 const COMPLETION_MENU: &str = "completion_menu";
 
@@ -5859,6 +5859,9 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
         // `gets` binds a variable in *this* shell, so like `source` it cannot go
         // through `builtins::dispatch`, which sees only words and a status.
         "gets" => return gets(&words[1..], shell),
+        // `whence` reads this shell's functions and bindings, which `builtins::dispatch`
+        // is handed none of.
+        "whence" => return Step::Continue(whence::whence(&words[1..], &shell.funcs, &shell.vars)),
         _ => {}
     }
     // Job control belongs to the shell that owns the jobs. A forked stage is not
@@ -8829,12 +8832,22 @@ struct CompletionState {
     help: HashMap<String, CompletionSpec>,
     cache: CompletionCache,
     variables: Vec<(String, Value)>,
+    /// Every **name** `whence` can answer about, which is a wider set than
+    /// `commands`: the reserved words and the environment are namespaces it
+    /// reports on and no command word lives in. Built once here rather than
+    /// assembled per keystroke.
+    names: Vec<String>,
 }
 
 impl CompletionState {
     fn from_shell(shell: &Shell) -> Self {
         let mut programs: Vec<String> = Vec::new();
-        if let Some(path) = std::env::var_os("PATH") {
+        // The **same** search the lookup performs, `execvp`'s fallback included:
+        // with `PATH` unset a command is still found and run, so scanning nothing
+        // would offer no candidate for a word `whence` reports on and `command`
+        // can reach.
+        {
+            let path = std::env::var_os("PATH").unwrap_or_else(whence::default_path);
             for dir in std::env::split_paths(&path) {
                 let Ok(entries) = std::fs::read_dir(dir) else {
                     continue;
@@ -8865,16 +8878,28 @@ impl CompletionState {
                 .get(name)
                 .map(|def| (name.into(), CompletionSpec::from_help(&def.help(name))))
         }));
+        let variables: Vec<(String, Value)> = shell
+            .vars
+            .visible()
+            .map(|(n, v)| (n.into(), v.clone()))
+            .collect();
+        // Every namespace `whence` reports on, so its argument completion covers
+        // what its answers cover. `commands` is only three of them — a reserved
+        // word is on no `PATH`, and mesh keeps the environment in a namespace of
+        // its own, so both had to be added by name.
+        let mut names = commands.clone();
+        names.extend(variables.iter().map(|(name, _)| name.clone()));
+        names.extend(builtins::SYNTAX_WORDS.iter().map(|word| (*word).to_owned()));
+        names.extend(environ::names());
+        names.sort();
+        names.dedup();
         Self {
             commands,
             programs,
             help,
             cache: CompletionCache::default(),
-            variables: shell
-                .vars
-                .visible()
-                .map(|(n, v)| (n.into(), v.clone()))
-                .collect(),
+            variables,
+            names,
         }
     }
 }
@@ -8975,6 +9000,12 @@ fn segment_completions(state: &CompletionState, words: &[String], word: &str) ->
     }
 }
 
+/// Has a `--` already ended the options in `earlier`? Past one, a flag-looking
+/// word is data — a name, for `whence` — which is the whole point of writing it.
+fn terminated(earlier: &[String]) -> bool {
+    earlier.iter().skip(1).any(|word| word == "--")
+}
+
 fn argument_completions(
     state: &CompletionState,
     words: &[String],
@@ -9004,6 +9035,21 @@ fn argument_completions(
         if let Some(hint) = completion_for(state, context, lookup).value_hint(option) {
             return value_completions(hint, word);
         }
+    }
+    // `whence` takes a **name**, so it completes from every namespace it reports
+    // on rather than from the filesystem — commands, syntax words, the visible
+    // bindings (asked about without the `$`), and the environment. A word with a
+    // `/` in it is a path operand there too, so that one falls through to paths.
+    //
+    // A `-` prefix is an option and goes to the flag candidates — **unless a `--`
+    // came first**, which is exactly what that terminator is for: past it,
+    // `whence` reads every word as a name, so a program really called `--tool`
+    // has to be completable the same way it is lookupable.
+    if words.first().is_some_and(|first| first == "whence")
+        && !word.contains('/')
+        && (!word.starts_with('-') || terminated(&words[..words.len().saturating_sub(1)]))
+    {
+        return rank_candidates(state.names.clone(), word);
     }
     let parent_help = completion_for(state, parent, lookup);
     let paths = parent_help.positional_hint().map_or_else(
@@ -10834,6 +10880,89 @@ mod tests {
         assert_eq!(external_stage(&words("command --help")), None);
         assert_eq!(external_stage(&words("command -v ls")), None);
         assert_eq!(external_stage(&words("ls -l")), Some(words("ls -l")));
+    }
+
+    #[test]
+    fn whence_completes_every_namespace_it_reports_on() {
+        // The promise this path makes is that its candidates cover what `whence`
+        // answers about. `commands` is only three of those namespaces — a reserved
+        // word is on no `PATH`, and the environment is a namespace of its own — so
+        // both have to be in the set or the completion contradicts the command.
+        let state = CompletionState {
+            names: vec!["MESH_WHENCE_ENV".into(), "unless".into(), "xs".into()],
+            ..CompletionState::default()
+        };
+        let whence = |word: &str| {
+            argument_completions(&state, &["whence".into(), word.into()], word, Lookup::Shell)
+        };
+        // Ranking is by subsequence, so assert the best match rather than the set:
+        // what matters is that each namespace is reachable at all.
+        assert_eq!(whence("unl").first().map(String::as_str), Some("unless"));
+        assert_eq!(
+            whence("MESH_WHENCE_").first().map(String::as_str),
+            Some("MESH_WHENCE_ENV")
+        );
+        assert_eq!(whence("xs").first().map(String::as_str), Some("xs"));
+        // A word with a `/` is a path operand for `whence` too, so it falls
+        // through to the filesystem rather than being matched against names.
+        assert!(!whence("./").iter().any(|value| value == "unless"));
+    }
+
+    #[test]
+    fn a_terminator_makes_whence_complete_a_flag_looking_name() {
+        // `whence -- --tool` looks up a program really called `--tool`, so the
+        // completion has to agree: past the terminator every word is a name, and
+        // sending a `-` prefix to the flag candidates there would offer `--help`
+        // for a word that cannot be a flag any more.
+        let state = CompletionState {
+            names: vec!["--tool".into(), "unless".into()],
+            ..CompletionState::default()
+        };
+        let complete = |words: &[&str], word: &str| {
+            let owned: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+            argument_completions(&state, &owned, word, Lookup::Shell)
+        };
+        assert_eq!(
+            complete(&["whence", "--", "--to"], "--to")
+                .first()
+                .map(String::as_str),
+            Some("--tool")
+        );
+        // Without the terminator a `-` prefix is still an option, so the name is
+        // not offered — `whence --to` is a misspelled flag, not a lookup.
+        assert!(
+            !complete(&["whence", "--to"], "--to")
+                .iter()
+                .any(|value| value == "--tool")
+        );
+    }
+
+    #[test]
+    fn a_builtins_own_flags_complete_from_its_generated_help() {
+        // An option prefix is *not* a name, so it goes to the help-derived
+        // candidates — which listed only `--help` until the generated `Options:`
+        // block started naming a builtin's own flags. Built here the way
+        // `CompletionState::from_shell` builds it, so the two cannot drift.
+        let spec = |name: &str| {
+            (
+                name.to_owned(),
+                crate::completion::CompletionSpec::from_help(
+                    &crate::builtins::help(name).expect("a builtin"),
+                ),
+            )
+        };
+        let state = CompletionState {
+            help: [spec("whence"), spec("prompt")].into(),
+            ..CompletionState::default()
+        };
+        let flags = |command: &str, word: &str| {
+            argument_completions(&state, &[command.into(), word.into()], word, Lookup::Shell)
+        };
+        assert_eq!(flags("whence", "--a"), ["--all"]);
+        assert_eq!(flags("whence", "--q"), ["--quiet"]);
+        assert_eq!(flags("prompt", "--r"), ["--reset"]);
+        // `--help` is still there, and still last.
+        assert!(flags("whence", "--").contains(&"--help".to_owned()));
     }
 
     #[test]

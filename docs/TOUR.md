@@ -66,6 +66,48 @@ Every keyword the parser reserves and every operator a line can carry answers to
 half of a construct answers with the construct: `help else` explains `if`, and
 `help continue` explains `break`.
 
+Where `help` explains what mesh has, **`whence`** says what one name *is* —
+bash and fish spell this `type`, nushell `which`, ksh `whence`:
+
+<pre>
+mesh$ <strong>whence ll</strong>
+ll is a function
+    func ll(...args)
+mesh$ <strong>whence cd</strong>
+cd is a builtin
+    cd [DIR]
+mesh$ <strong>whence rg</strong>
+rg is /usr/local/bin/rg
+</pre>
+
+It reports what a bare word would **run**, so when something is shadowed it says
+what it hid — and `--all` lists every match instead:
+
+<pre>
+mesh$ <strong>whence git</strong>
+git is a function (shadowing /usr/bin/git)
+    func git(...args)
+</pre>
+
+Variables answer too, asked for **without the `$`** — `whence xs` is a question
+about the name, where `$xs` would expand before `whence` ever saw it. Bindings
+live in their own namespace, so a name that is both a command and a variable is
+reported as both:
+
+<pre>
+mesh$ <strong>xs = [a b c]</strong>
+mesh$ <strong>whence xs</strong>
+xs is a variable
+    a list of 3: ['a', 'b', 'c']
+</pre>
+
+`whence --quiet NAME` prints nothing and leaves only the status, which is how a
+startup file asks whether something is installed:
+
+```mesh
+if whence --quiet fzf { export FZF_DEFAULT_OPTS = "--height 40%" }
+```
+
 ## Completing what you type
 
 Press Tab while typing the first word of a command to complete builtins,
