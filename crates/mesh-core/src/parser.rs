@@ -3160,7 +3160,8 @@ impl Parser {
         let saved = self.position;
         let claims = match self.expression() {
             Ok(expression) => {
-                outranks_a_command(&expression) && self.value_spans_statement(&expression)
+                let one_word = self.is_one_command_word(saved, self.position);
+                outranks_a_command(&expression) && self.value_spans_statement(&expression, one_word)
             }
             // Text that is not an expression at all is a command — including a partial
             // one, which the command parser reports as incomplete so the reader asks
@@ -3169,6 +3170,32 @@ impl Parser {
         };
         self.position = saved;
         claims
+    }
+
+    /// Is the token run the value parse just consumed spellable as **one command word**?
+    ///
+    /// A command word is an unbroken run of adjacent tokens, so this is a question about
+    /// spans rather than about the tree — and the tree cannot answer it. `${cmd}-1` and
+    /// `$a - 1` are the same `Expr::Binary` over the same `Expr::Variable`; the first is
+    /// one word naming a program and the second is arithmetic, and *only* the whitespace
+    /// says which. The same holds for `${cmd}[0]` against `$xs[0 + 0]`, and for
+    /// `${cmd}..bak` against `$a .. $b`.
+    ///
+    /// A `(` is the one thing an unbroken run still cannot be, since command position has
+    /// no call syntax — which is what keeps `$x:split("-") || puts x` a value even though
+    /// nothing in it is spaced.
+    fn is_one_command_word(&self, start: usize, end: usize) -> bool {
+        let run = &self.tokens[start..end.min(self.tokens.len())];
+        run.windows(2)
+            .all(|pair| pair[0].span.end == pair[1].span.start)
+            // A `(` is the one thing an unbroken run still cannot be, and a newline is
+            // the one whitespace that does *not* break the run by span: a `\n` is a
+            // token of its own, one character wide, so it abuts its neighbors on both
+            // sides. `$a ==` continued on the next line would otherwise measure as one
+            // word.
+            && !run.iter().any(|token| {
+                matches!(token.value, TokenKind::LParen | TokenKind::Newline)
+            })
     }
     /// The token index just past an operand that a **command word** can be: a word —
     /// optionally behind a leading `-`, since `-1` is a name a shell will try to run —
@@ -3280,12 +3307,13 @@ impl Parser {
     /// *starts* the statement is not enough: `$editor file` and `$p:base arg` are
     /// command invocations, and claiming them left the trailing words unconsumed and
     /// reported `expected a statement separator` for lines that should run.
-    fn value_spans_statement(&mut self, expression: &Expr) -> bool {
+    fn value_spans_statement(&mut self, expression: &Expr, one_word: bool) -> bool {
         (self.at_value_statement_end()
                 // A bare variable has a command reading, so shell-list syntax after it
                 // — an argument, a pipe, a redirect, `&&`, `||`, `&` — picks the
                 // command, and the variable alone is the value.
-                && !(defers_to_a_command_list(expression) && self.at_command_list_operator()))
+                && !(defers_to_a_command_list(expression, one_word)
+                    && self.at_command_list_operator()))
                 // An assignment operator counts as the end of it. What follows is a
                 // *place* expression, which the expression side owns whether or not
                 // the place is a legal one, and that is what keeps
@@ -3607,15 +3635,38 @@ fn outranks_a_command(expression: &Expr) -> bool {
 
 /// Does a following `&&` / `||` / `&` make this a **command list** rather than a value?
 ///
-/// Only for an expression leading with a bare variable, which is the one operand that
-/// both is a value and names a command: `$cmd || puts failed` is the shell idiom it
-/// looks like, and reading `$cmd` as the string skipped running the command entirely —
-/// no output, no side effects, and the fallback branch decided by the string's
-/// truthiness instead of the exit status. Nothing else has that second reading to lose,
-/// so `1 == 2 || puts no` compares and `42 &` is the refused backgrounded expression it
-/// should be rather than an attempt to run a program called `42`.
-fn defers_to_a_command_list(expression: &Expr) -> bool {
-    matches!(leading_operand(expression), Expr::Variable(_))
+/// Only when the value *is* a command word: an unbroken run of tokens led by a variable.
+/// That is the one thing which both is a value and names a command — `$cmd || puts
+/// failed` is the shell idiom it looks like, and reading `$cmd` as the string skipped
+/// running the command entirely: no output, no side effects, and the fallback branch
+/// decided by the string's truthiness instead of the exit status. `$p:base ||
+/// puts failed` and `${cmd}.exe || puts failed` are the same idiom with suffixes the
+/// command word keeps.
+///
+/// Two conditions, and `one_word` — from
+/// [`is_one_command_word`](Parser::is_one_command_word) — is the load-bearing one.
+/// Asking instead whether a *variable led* the expression handed the command reading to
+/// text that has none, and the connector then picked a reading that could not work:
+///
+/// ```text
+/// $a == $b && puts eq        # ran the command `5`, while `1 == 2 || puts no` compared
+/// $x ~ /b/ && puts matched   # ran the command `abc`
+/// $a + 1 && puts sum         # ran the command `1`
+/// $x:split("-") || puts x    # syntax error: a command word stops in front of `(`
+/// ```
+///
+/// Narrowing it by *shape* instead does not work, and the shape of a command word's
+/// suffix is the thing to get wrong here: `${cmd}.exe`, `${cmd}[0]`, `${cmd}..bak`, and
+/// `${cmd}-1` are all one word naming a program, and the tree calls them a member
+/// access, an index, a range, and a subtraction. Each is indistinguishable from the
+/// spaced expression of the same shape — `$a - 1` really is arithmetic — so whitespace
+/// is the only thing that separates them, and it lives in the spans.
+///
+/// The leading operand still has to be a **variable**: that is what has both readings.
+/// A numeral has none to lose, so `1..3 || puts x` is the range it looks like, and
+/// `42 &` stays the refused backgrounded expression rather than a program called `42`.
+fn defers_to_a_command_list(expression: &Expr, one_word: bool) -> bool {
+    one_word && matches!(leading_operand(expression), Expr::Variable(_))
 }
 
 /// Is the whole of `name` a name?
@@ -3773,6 +3824,35 @@ mod tests {
             ParseOutcome::Incomplete | ParseOutcome::IncompleteHeredoc(_) => {
                 panic!("unexpected incomplete input")
             }
+        }
+    }
+
+    /// A newline is the one whitespace that does not break a token run by span: it is
+    /// a token of its own, one character wide, so it abuts its neighbors on both sides
+    /// and `$a==` continued on the next line measures as adjacent. A command word
+    /// cannot span lines, so [`Parser::is_one_command_word`] rejects the run outright.
+    ///
+    /// A unit test because there is nothing to observe from the shell: the reader
+    /// splits these statements before the predicate is consulted, so the rule is about
+    /// the predicate keeping its contract rather than about a reading that moves.
+    #[test]
+    fn a_run_spanning_a_newline_is_no_command_word() {
+        for (source, one_word) in [
+            ("$a==$a", true),
+            ("$a==\n$a", false),
+            ("$a:len", true),
+            ("$a:split(\"-\")", false),
+            ("$a == $a", false),
+        ] {
+            let tokens = tokenize(source).unwrap();
+            let parser = Parser {
+                source_len: source.len(),
+                position: 0,
+                tokens,
+            };
+            // The whole source, which is what the value parse would consume here.
+            let end = parser.tokens.len();
+            assert_eq!(parser.is_one_command_word(0, end), one_word, "{source:?}");
         }
     }
 

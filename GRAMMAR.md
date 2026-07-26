@@ -487,9 +487,19 @@ the command reading (`ls / extra` is not a division, `exit -1` not a subtraction
 list, a group, a capture — has no command spelling and takes the value reading. The
 value must also account for the whole statement: `$editor file`, `$editor ...$files`,
 and `$editor | cat` are command lines. So are `$editor || puts oops` and `$editor &`,
-because a connector or a backgrounding `&` after a leading **variable** picks the
-command — that is the `$cmd || fallback` idiom. Nothing else has that second reading,
-so `1 == 2 || puts no` compares and `42 &` is a refused backgrounded expression.
+because a connector or a backgrounding `&` picks the command whenever the value *is* a
+**command word** — an unbroken run of text led by a variable. That is the
+`$cmd || fallback` idiom, and `$p:base || fallback` is the same idiom with a suffix the
+command word keeps. So are the suffixes braced interpolation exists for: `${cmd}.exe`,
+`${cmd}[0]`, and `${cmd}-1` are each one word naming a program, however the expression
+grammar names their parts. **Whitespace** is what separates the two readings rather than
+the shape of the expression — `${cmd}-1` and `$a - 1` are the same subtraction of the
+same variable — so spacing the text apart gives the value reading, and
+`$a - 1 || puts smaller`, `$a == $b || puts ne`, and `$x ~ /b/ && puts matched` all keep
+theirs. A `(` is ruled out whatever the spacing, command position having no call syntax,
+which is why `$x:split("-") || puts x` keeps its value reading too. A numeral leads no
+command word at all, so `1 == 2 || puts no` compares and `42 &` is a refused
+backgrounded expression.
 An assignment operator counts as the end of a value for this purpose, which keeps
 `$xs:dedup = 9` a syntax error about places rather than a command invocation.
 
