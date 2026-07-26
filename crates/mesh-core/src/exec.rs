@@ -3170,7 +3170,10 @@ fn install_descriptors(
 fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
     match err.kind() {
         ErrorKind::NotFound => {
-            note!("mesh: command not found: {name}");
+            match crate::builtins::rename_note(name) {
+                Some(note) => note!("mesh: command not found: {name} ({note})"),
+                None => note!("mesh: command not found: {name}"),
+            }
             127
         }
         ErrorKind::PermissionDenied => {

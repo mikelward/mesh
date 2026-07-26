@@ -41,6 +41,58 @@ pub fn is_builtin(name: &str) -> bool {
     NAMES.contains(&name)
 }
 
+/// Bash builtins mesh renames, mapped to the mesh builtin that replaces them.
+/// Kept as a *name* rather than prose so `is_builtin` can say whether the
+/// replacement is wired up yet, and the caveat retires itself when it lands.
+///
+/// `echo` is here for the stripped-`PATH` case only: an external `echo` almost
+/// always shadows this, which is deliberate — `echo -n` / `-e` keep working
+/// through `/bin/echo`, where a mesh builtin would print the flag as text.
+const RENAMED: &[(&str, &str)] = &[("echo", "puts"), ("read", "gets")];
+
+const LOCAL: &str = "a plain `x = 5` inside a `func` is already local";
+const NO_ALIASES: &str = "mesh has no aliases; a `func` replaces `alias ll`";
+/// `declare` and `typeset` span all three scopes — `-g` asks for a global and
+/// `-x` for an environment entry — and the note sees only the command name, so
+/// it offers the set rather than assuming the bare, local-by-default case.
+const SCOPE: &str = "scope is `x = 5` (local), `global x = 5`, or `export X = value`";
+
+/// Bash builtins whose mesh answer is not a command at all, so the note has to
+/// spell out the replacement instead of naming it.
+///
+/// Everything named here has to *work* when the reader types it: a note that
+/// lands on a second error is worse than the bare message it replaced. That is
+/// what keeps `shopt` / `setopt` out — their answer is `$sh.options.NAME = on`,
+/// which is still unbuilt (`docs/REFERENCE.md`), and unlike the `RENAMED` names
+/// there is nothing here for `is_builtin` to check, so a hand-written "not built
+/// yet" would go stale silently. Add them with `$sh.options`.
+const REPLACED: &[(&str, &str)] = &[
+    ("alias", NO_ALIASES),
+    ("declare", SCOPE),
+    ("function", "functions are `func name(params) { … }`"),
+    ("let", "arithmetic is `n = (1 + 2)`"),
+    ("local", LOCAL),
+    ("typeset", SCOPE),
+    ("unalias", NO_ALIASES),
+];
+
+/// What `command not found` adds for a name bash spells differently, so a bash
+/// reflex lands on mesh's spelling instead of a dead end. `None` for every
+/// other name — a typo gets the plain message.
+pub(crate) fn rename_note(name: &str) -> Option<String> {
+    if let Some((_, mesh)) = RENAMED.iter().find(|(bash, _)| *bash == name) {
+        return Some(if is_builtin(mesh) {
+            format!("mesh spells this `{mesh}`")
+        } else {
+            format!("mesh spells this `{mesh}`, which is not built yet")
+        });
+    }
+    REPLACED
+        .iter()
+        .find(|(bash, _)| *bash == name)
+        .map(|(_, note)| (*note).to_string())
+}
+
 /// Print the canned command-line help for a builtin.
 pub fn print_help(name: &str) -> u8 {
     let Some(help) = help(name) else {
@@ -325,7 +377,7 @@ fn exit(args: &[String], last: u8) -> Builtin {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64, help, is_builtin, path_line};
+    use super::{base64, help, is_builtin, path_line, rename_note};
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -368,6 +420,53 @@ mod tests {
         // alphabet, which a terminal would not accept.
         assert_eq!(base64(b"\xfb\xef\xbe"), "++++");
         assert_eq!(base64(b"\xff\xef\xbf"), "/++/");
+    }
+
+    #[test]
+    fn a_renamed_bash_builtin_names_meshs_spelling() {
+        assert_eq!(
+            rename_note("echo").as_deref(),
+            Some("mesh spells this `puts`")
+        );
+        // `gets` is designed but unbuilt, so the note says so rather than
+        // sending the reader to a second `command not found`.
+        assert_eq!(
+            rename_note("read").as_deref(),
+            Some("mesh spells this `gets`, which is not built yet")
+        );
+        assert_eq!(
+            rename_note("local").as_deref(),
+            Some("a plain `x = 5` inside a `func` is already local")
+        );
+    }
+
+    #[test]
+    fn declare_offers_every_scope_it_could_have_meant() {
+        // `declare -x` exports and `declare -g` makes a global; the note sees
+        // only the name, so pointing at the local case alone would misdirect
+        // two of the three.
+        for name in ["declare", "typeset"] {
+            let note = rename_note(name).expect("a note");
+            assert!(note.contains("global x = 5"), "{note}");
+            assert!(note.contains("export X = value"), "{note}");
+        }
+    }
+
+    #[test]
+    fn a_note_is_only_offered_for_a_replacement_that_works() {
+        // `$sh.options` is unbuilt, so a `shopt` note would trade one error for
+        // another. It joins the table when the options API does.
+        assert_eq!(rename_note("shopt"), None);
+        assert_eq!(rename_note("setopt"), None);
+    }
+
+    #[test]
+    fn an_ordinary_unknown_name_gets_no_note() {
+        // The note is for a bash reflex, not for a typo — anything else keeps
+        // the bare message.
+        assert_eq!(rename_note("nosuchcmd"), None);
+        assert_eq!(rename_note("puts"), None);
+        assert_eq!(rename_note(""), None);
     }
 
     #[test]

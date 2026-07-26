@@ -248,7 +248,23 @@ separated by spaces.
 command arg1 arg2 …
 ```
 
-An unknown command prints `command not found` and sets a failing status.
+An unknown command prints `command not found` and sets a failing status. When
+the name is a bash builtin mesh spells differently, the message names mesh's
+spelling in a parenthetical, so a bash reflex has somewhere to go:
+
+```
+mesh$ read line
+mesh: command not found: read (mesh spells this `gets`, which is not built yet)
+mesh$ local x = 5
+mesh: command not found: local (a plain `x = 5` inside a `func` is already local)
+```
+
+A note only names something that works today, so it never trades one error for
+another; the one exception says so out loud, as `gets` does above.
+
+`echo` is deliberately *not* intercepted — an external `echo` handles `-n` and
+`-e`, which mesh's flag-free [`puts`](#builtins) would print as text; the note
+only appears when `PATH` has no `echo` to run.
 
 ### Redirection
 

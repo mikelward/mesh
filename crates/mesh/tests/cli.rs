@@ -400,6 +400,40 @@ fn missing_command_reports_127() {
 }
 
 #[test]
+fn a_bash_builtin_mesh_renames_points_at_meshs_spelling() {
+    // There is no external `read`, so the bash reflex would otherwise dead-end
+    // on a bare `command not found` with nothing to try next.
+    let out = run_with_input("read line\n");
+    assert_eq!(out.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("command not found: read (mesh spells this `gets`"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_bash_builtin_with_no_mesh_command_spells_out_the_replacement() {
+    let out = run_with_input("local x = 5\n");
+    assert_eq!(out.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("command not found: local (a plain `x = 5`"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn an_ordinary_missing_command_keeps_the_bare_message() {
+    let out = run_with_input("this_command_does_not_exist_42\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("command not found: this_command_does_not_exist_42\n"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn a_failed_exec_reports_itself_rather_than_writing_to_a_target() {
     // `Command::spawn` makes a private close-on-exec pipe for the child to
     // report an `exec` failure on. It takes a low descriptor, and installing a
