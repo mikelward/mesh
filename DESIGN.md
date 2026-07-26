@@ -112,7 +112,10 @@ bash/zsh/fish/nushell setup:
 - **Idempotent, guarded PATH** — a single source of truth, deduped, applied
   once per process tree.
 - **A predicate vocabulary** — `have_command`, `inside_project`,
-  `connected_remotely`, and friends.
+  `connected_remotely`, and friends. Named here as the `shrc` spells them, since
+  the requirement is to replace those 41 guard sites; mesh's own answers are
+  [`:kind` / `:where`](#modifiers) and kebab-case funcs like
+  `inside-project`.
 
 ## Language sketch
 
@@ -291,6 +294,619 @@ This modifier system is the direct answer to
 [fish #4002](https://github.com/fish-shell/fish-shell/issues/4002) ("a
 dead-simple way to strip a suffix"): it is a first-class language feature, not a
 custom function.
+
+**Name resolution** *(proposed — the predicate vocabulary)*. The
+[goals](#goals) name `have_command` and friends, and a port of a real `shrc`
+finds 41 sites reaching for them — nearly all guarding a tool's setup
+(`if have_command fzf`). They are all one question, *what does this name resolve
+to*, which is the shape [`:type`](#modifiers) already has for paths, so they get
+the same spelling:
+
+```
+$name:kind          # keyword | builtin | func | external | false
+$name:where         # an external's path, or false
+```
+
+One primitive answers the whole family, which is why it is a modifier rather than
+five predicates: `have_command` is `$x:kind != false`, `is_builtin` is
+`$x:kind == builtin`, `is_function` is `$x:kind == func`, `is_command` is
+`$x:kind == external`, and `path` is `$x:where`. Only the first needs the
+comparison spelled out — the others already compare — and it is the one the 41
+sites use, so it carries the cost of the rewrite. It maps over a list like any
+value modifier, and reads the way the guards actually appear:
+
+```
+if shpool:kind != false { … }
+for e in [vi vim editline] { if $e:kind != false { export EDITOR = $e; break } }
+```
+
+The `!= false` is not decoration. A condition is [a bool or a
+command](#conditionals), and `:kind` yields a *string* when the name resolves, so
+the comparison is what the written contract asks for. The evaluator happens to
+accept a bare string today, but that is the open
+[condition-truthiness](#conditionals) question rather than a promise — if it
+settles as "truthy values are allowed", `if shpool:kind` becomes available and
+these read shorter. Until then the explicit form is the honest one, and it is now
+the only cost the spelling carries.
+
+**A bare subject takes a modifier** *(decided)*, so the guard is written
+`if shpool:kind != false` and the quoting this entry previously argued for is not
+needed. The rule is that an attached `:name` binds as a modifier wherever a value
+is read — expression and argument context alike — for bare and quoted subjects
+equally, and whether or not the modifier takes arguments.
+
+That is a smaller change than it sounds, because **half of it already shipped**.
+`value_argument_starts` (`parser.rs:2319`) claims a modifier chain that ends in a
+`(`, and it never asked whether the subject was quoted:
+
+```
+puts "a.b":stripend(".b")   # a          — applied
+puts abc:stripend("c")      # ab         — applied, on a bare subject
+puts "abc":upper            # abc:upper  — literal text
+puts abc:upper              # abc:upper  — literal text
+```
+
+So the split was never bare-versus-quoted; it was argument-taking versus
+argument-free, and a bare word already gives its colon up to a modifier call. The
+decision is to make the bottom two rows agree with the top two.
+
+**`:` followed by an identifier is reserved by the grammar** *(decided)* — not
+gated on a list of known modifier names. An attached `:name` is a modifier
+position wherever a value is read, and a name that is not a modifier is an
+*error*, not text.
+
+Half of this is already the rule, which is the main argument for the other half.
+In expression position the grammar claims the chain outright:
+
+```
+x = ubuntu:latest     # syntax error today — `latest` is not a modifier
+puts ubuntu:latest    # ubuntu:latest — argument position falls back to text
+```
+
+`modifier_name` (`parser.rs:4562`) tests `MODIFIER_NAMES` only to decide that
+fallback. So reserving `:ident` in the grammar does not introduce a new rule; it
+makes argument position agree with expression position, which is where the
+inconsistency was.
+
+The alternative — keep gating on the name list — was written into an earlier
+draft of this entry and is worse in the way that matters. Under it the reserved
+vocabulary **grows silently with every modifier added**: `img:raw` is text until
+someone adds `:raw`, and then it quietly stops being. This proposal is itself the
+first instance, since `kind` and `where` are two new names, and the entry had to
+float a deprecation cycle to cope. Reserving the whole shape up front makes that
+class of change a non-event: adding a modifier can no longer break argument text,
+because `:ident` was never argument text.
+
+It also fails loudly. `ubuntu:latest` becomes "unknown modifier" the day the rule
+lands, rather than working for two years and then changing meaning under a
+release note nobody read.
+
+The cost is a one-time, fully-known break rather than a creeping one, and it is
+real: `docker run ubuntu:latest`, `git show HEAD:file`, `rsync host:src dst` and
+`curl -H Accept:application/json` all need quoting — `"ubuntu:latest"`, with the
+colon *inside* the quotes, not `"ubuntu":latest`. When the part before the colon
+comes from a variable, quoting is not enough and braces are what end the name
+(`"${image}:latest"`); see below.
+
+Measured against the `shrc` this vocabulary exists for, that cost is **zero**:
+every `word:identifier` in `shrc`, `config/fish/config.fish` and
+`config/nushell/config.nu` sits inside a single-quoted `LS_COLORS` string or a
+comment, and no unquoted one appears in command-argument position at all. The
+pain lands on interactive typing rather than on configuration, which is worth
+saying plainly because it is the part a repo survey cannot measure.
+
+**Quoting the subject does not preserve the old reading**, and that is the part a
+reader is most likely to get wrong, because quoting is the usual escape from
+shell metacharacters. It does not help here — `"abc":upper` is literal `abc:upper`
+today and becomes `ABC`, exactly as the bare form does. What the quotes have to
+enclose is the **whole token**:
+
+```
+puts "abc":upper      # ABC        — the modifier applies; quoting the subject changes nothing
+puts "abc:upper"      # abc:upper  — literal, because the colon is inside the string
+puts 'abc:upper'      # abc:upper  — likewise
+```
+
+So the escape hatch exists and is cheap, but it is `"img:raw"` rather than the
+`"img":raw` a reader might reach for first.
+
+**And "quote the whole token" is not the rule when the subject is a variable** —
+that phrasing is wrong in the case people will actually hit. A modifier already
+binds inside a double-quoted string, so quoting does not stop it:
+
+```
+x = "abc";    puts "$x:upper"      # ABC          — quoted, and the modifier applies
+x = "abc";    puts "${x}:upper"    # abc:upper    — braces stop it
+x = "ubuntu"; puts "$x:latest"     # ubuntu:latest today; an ERROR under this rule
+x = "ubuntu"; puts "${x}:latest"   # ubuntu:latest — safe either way
+```
+
+Command-word parsing merges a same-quoted suffix into an unbraced variable
+access, so `"$image:latest"` is a modifier chain no matter how much of it is
+inside the quotes. **The literal spelling is `"${image}:latest"`** — braces, not
+quotes — and that is the form a migration note has to give, because dynamically
+assembled Docker tags and `rsync` targets are exactly where this bites and they
+are already fully quoted today.
+
+The rule, stated once and correctly: quotes stop the colon only when the *whole
+token* is literal text (`"img:raw"`); when the subject interpolates, braces are
+what end the name (`"${img}:raw"`).
+
+**Any attached `:identifier` outranks keyword parsing** — an unknown name
+included, since the grammar reserves the shape rather than a list. Neither rule
+above implies this and the parser does not do it. Expression
+position already binds a bare subject — `x = abc:upper` gives `ABC` — so the
+argument rows are most of what changes. But four receivers are claimed before the
+postfix-modifier loop is ever reached, and they fail in *expression* position too:
+
+```
+x = while:upper     # WHILE          — the ordinary path, and most keywords take it
+x = if:upper        # syntax error: expected `{`     claimed by `primary`
+x = match:upper     # syntax error                   likewise
+x = for:upper       # syntax error                   likewise
+x = not:upper       # false          — worst case: no error, silently wrong
+```
+
+`primary` recognizes `if`, `match` and `for` at `parser.rs:3502`, and
+`not_expression` consumes `not` at `3078`, all before any modifier is considered.
+`not` is the one to fix first: it does not fail, it quietly evaluates to `false`,
+so a guard written over it would read as "no such name" forever.
+
+Every other reserved word — `while`, `loop`, `return`, `break`, `continue`,
+`global`, `unset`, `export`, `func`, `and`, `fork` — already takes the ordinary
+path, so this is a four-name carve-out rather than a general keyword problem.
+
+Resolution order is the one command position uses — **keyword → builtin → func →
+external**. mesh has no aliases, so there is no further answer.
+
+The justification usually given for that order — *`:kind` cannot disagree with
+what running the name would do* — does not survive contact with the ways a name
+can be written, because it never says which one it means. There are four
+spellings but only **three** behaviors, since quoting and expanding share one
+path (`expand_stage`, `repl.rs:5521`):
+
+| how the name is written | what happens for `if` |
+|---|---|
+| bare, `if x` | syntax — the parser claims it |
+| quoted `"if" x`, or expanded `n = "if"; $n x` | resolves **func → external**: the function if one is defined, else an `if` program if `PATH` has one, else `command not found` |
+| value call, `x = if()` | syntax error (a func for 7 of the 13) |
+
+Only the first line yields `keyword`. Quoting does not force external lookup —
+with both a `func if` and an `if` executable present, `"if" x` runs the function,
+exactly as `$n` does. The order above is the **bare** one, and it
+is settled for the 13 command-position words only once the open question below is
+answered: option A keeps it exactly and `if:kind` stays `keyword`; option B has
+`:kind` follow the resolving order — builtin → func → external, `keyword` only
+when nothing is found — which is a different contract, not a tweak. Everything
+else in this section holds either way; this paragraph is where the two diverge.
+
+`keyword` is the one that is easy to miss, and it is **defined by the grammar,
+not by a list of favorites**: a keyword is a word the parser claims *in command
+position*, so that a **bare** name of that spelling never reaches resolution —
+`if`, `for`, `while`, `match`, `loop`, `func`, `not`, `return`, `break`,
+`continue`, `global`, `unset`, `export`. *Bare* is load-bearing, and narrower
+than it looks: the parser claims these words only unquoted and unexpanded. A
+**quoted or expanded head resolves normally**, and the quoted spelling is this
+document's own recommended one:
+
+```
+"if" x            # func `if` if defined, else an `if` program, else not found
+n = "if"; $n x    # the same path — quoting and expanding agree
+```
+
+The value call is *not* a third resolving spelling and should not be described as
+one: `x = if()` is a syntax error, and only 7 of the 13 words reach a function
+that way at all (`while`, `loop`, `break`, `continue`, `global`, `unset`,
+`export`). It is name-dependent, so it belongs beside those two rather than with
+them.
+
+That matters here rather than as trivia, because it is the *subject matter* of
+the open question below. What it is **not** is a property of how the guard is
+written: `:kind` receives a string, and the bare-subject rule above makes
+`if:kind`, `"if":kind` and `$n:kind` on a variable holding `"if"` the same call.
+Receiver spelling is invisible to the modifier, so it cannot decide which
+command-head spelling the answer describes.
+
+**Being reserved somewhere is not enough**, and the reserved list is split almost
+evenly on this. Half of it does *not* claim the head of a command:
+
+- **Mid-form syntax.** `in` within `for x in ys`, `and` / `or` as infix, `else`
+  and `unless` within their clauses. They are syntax inside a larger form, never
+  leading one.
+- **`fork`**, which leads a statement only when a block follows.
+- **The built-in value names** — `re`, `style`, `link`, `glob`, `files`, `dirs`.
+  These are reserved from `func` *definitions* only, because `re(x)` must always
+  build a regex rather than call a user function; the parser says so where it
+  refuses them, noting the plain command form stays reachable.
+
+For all of those, `:kind` performs ordinary builtin → func → external resolution.
+Answering `keyword` would mask something real — a defined, callable function, or
+in the case of `link` an actual `/usr/bin/link` — which is the same failure as
+answering it for a name nobody reserves at all.
+
+The test is the whole rule, and it is a probe rather than an opinion: type the
+bare word and ask **whether resolution ran**, not whether the parse failed.
+`command not found`, or the name's own program running, means it ran — the word
+is not a keyword. Anything else means the shell claimed the word first, and a
+parse error is only one of the ways that shows:
+
+```
+if       → syntax error: empty command in a pipeline     claimed
+break    → mesh: break: not inside a loop                claimed — parsed fine, complained at run time
+return   → mesh: return: not inside a function           claimed, likewise
+re       → mesh: command not found: re                   resolution ran
+link     → link: missing operand                         resolution ran — /usr/bin/link
+```
+
+`break`, `continue` and `return` are why the phrasing matters: they parse
+perfectly well and object about *context*, so a "syntax error means keyword" rule
+would file all three under resolution and let `:kind` answer `false` for them —
+the one thing the invariant forbids.
+
+Enumerating that here would be a third copy, and copies drift — this entry
+already got the set wrong twice by trying. The set does exist in the codebase,
+mirroring `parser.rs` and kept honest by a test asserting `help` explains every
+word in it. But it lives *inside* that test, which is the wrong place for
+something a language feature now depends on, and reaching for `help` instead is
+not a substitute: `help` deliberately documents *shapes* as well as words, so it
+answers for `cmd` — a placeholder for an ordinary command line, reserved by
+nobody. A guard asking `cmd:kind` would be told `keyword` and would stop seeing
+a real program of that name.
+
+So the prerequisite is **one table outside the test, and three named views over
+it** — not one predicate, because the three callers are asking three different
+questions and a single answer would have to be wrong for two of them:
+
+| asks | set |
+|---|---|
+| `:kind`, for `keyword` | claims command position |
+| `func`, for its refusal | three parts, none of them derived from deadness: `func`, `not` and `return`, refused today and kept refused as inherited policy; the value-call names — `re(x)` must build a regex; and **every builtin**, via the existing `is_builtin`, since command position reaches a builtin before a func |
+| `help`, for coverage | every reserved word, mid-form ones included |
+
+`and` is the case that separates them: `help and` must answer, `func and()` is
+allowed, and `and:kind` is not `keyword`. Collapsing those into one predicate
+either misclassifies `and` or stops documenting it.
+
+The whole middle row is a *separate* check the table supplements rather than
+replaces, and none of it derives from the reserved-word analysis. Builtins: `pwd`
+is not a reserved word and never appears in the table, but `func pwd()` is
+refused, and must stay refused. `func`, `not` and `return`: refused at
+`repl.rs:1153` today, and kept refused as policy — the probe cannot be run on any
+of them, since `func not()` is rejected before `n = "not"; $n x` can be tried,
+and for `return` the likely answer runs the other way, since only *bare* `return`
+is intercepted as control flow. **No command-position word belongs in this row on
+deadness grounds**, because none of them is dead; see the parenthetical below.
+
+What is worth unifying is the *data*, not the answer. Today the same words are
+written out three times — the parser inline, `func` from a hardcoded
+`func`/`return`/`not` plus builtins, and `help` from a table carrying an extra
+placeholder — so a new keyword has to be added in three places and nothing
+notices when it is not. One table with a row per word, and each view derived from
+it, removes the drift while keeping the three answers distinct. That is exactly
+the divergence this modifier exists to avoid, which makes fixing it part of the
+work rather than a tidy-up alongside it.
+
+The invariant is what earns the answer, and it has to be stated at exactly this
+width: **`:kind` never says `false` for a word the shell claims in command
+position.** Not "a word the shell handles" — `and` is handled, as infix syntax,
+and `and:kind` is quite properly `false` where no such program exists, because
+a guard asking about `and` is asking whether it can *run* one. The wider phrasing
+reads better and is wrong, and it would drive an implementation straight back to
+calling mid-form words `keyword`. Command position is the boundary throughout:
+it is what `:kind` asks about, so it is what the invariant may promise.
+
+**A keyword is syntax, so `:kind` does not promise it is runnable.** Quoted into
+command position, every keyword but one falls through to external lookup — when
+no function of that name is defined:
+
+```
+n = "if"; $n x        # command not found: if   — with no function of that name
+n = "break"; $n x     # command not found: break
+n = "return"; $n x    # returns — the one keyword also caught at run time
+```
+
+The trailing clause on the first line is the whole subtlety, and it is easy to
+read past: those answers hold *because nothing named `if` is defined*. Expansion
+consults `shell.funcs` (`repl.rs:5529`), so a defined function is found:
+
+```
+func if(x) { puts OK }; n = "if"; $n arg     # OK
+```
+
+So a keyword is not runnable **bare**, which is all `:kind` needs to be
+right about `/usr/bin/if`: answering `external` or `false` would send a guard
+looking for a program that does not exist. But "not runnable in any spelling" is
+false, and this document asserted it — see the open question below, which is the
+part that is not yet settled.
+
+`global`, `unset` and `export` look contextual and are not, for this purpose:
+each claims the word wherever an assignment does not follow, so no *literal*
+`global x` reaches a function. (Via an expanded name it does —
+`func global(x) { … }; n = "global"; $n y` runs the function. The qualifier
+matters and is not decoration.) They are keywords. `fork` is the one word
+that genuinely straddles it — `fork { … }` is syntax, `fork arg` calls a function
+— and it lands on the reachable side, because that is where a wrong answer costs
+something: an answer of `keyword` hides a real function or program, while an
+answer of `func` merely fails to mention a syntax the guard was not asking about.
+
+***(Open — what `keyword` should say when the name resolves to something.)*** The
+`fork` decision above rests on a rule: land on the reachable side, because
+answering `keyword` for something callable hides it. Three of the four spellings
+make that rule apply to *every* command-position word, not just `fork`:
+
+```
+func if(x) { … }; "if" arg     # a real function, hidden by `keyword`
+"if" arg                        # a real program,  hidden by `keyword`
+```
+
+(Both spellings resolve func → external, so either can be the thing hidden.)
+
+The second is the harder case. An earlier draft of this entry claimed the
+bare-subject decision softened it — that once the guard reads `if if:kind` the
+subject is bare, and bare is the spelling the parser really does claim. **That
+reasoning is wrong**, and the decision above is what makes it wrong: modifiers
+take values, so `if:kind`, `"if":kind` and `$n:kind` over a variable holding
+`"if"` are one call on one string. How the receiver was spelled never reaches
+`:kind`, and therefore cannot pick which reading it reports.
+
+The question is better stated with the receiver left out of it entirely. `:kind`
+is handed the name `if`. That name behaves one way as a bare command head — the
+parser claims it — and another way through every other route, where it resolves
+func → external. Both are true of the name at once. The open question is which of
+them the taxonomy is *about*, and it would read identically if the only spelling
+in the language were `$n:kind`.
+
+Two consistent answers, and they differ in what `keyword` means:
+
+- **`keyword` is about the word.** `:kind` on the name `if` is always `keyword`,
+  and the guard is told the word is syntax. Simple and stable, but wrong whenever a real
+  function or program of that name exists — and it reports `keyword` for a name
+  the same script could successfully run as `"if" x`.
+- **`:kind` reports what would be found.** `:kind` on `if` is `func` or
+  `external` when one exists and `keyword` otherwise, matching the "report what you find"
+  rule that already governs `pwd:kind == builtin` against `command pwd`.
+  Consistent with the rest of the design, at the cost of an answer that changes
+  under the guard — and it makes `keyword` mean "nothing else claimed this",
+  which is a weaker word than the section above spends its length defining.
+  **`return` needs carving out either way**: `run_expanded` intercepts the bare
+  string before external lookup (`repl.rs:5814`), so `"return" x` performs shell
+  control flow even with a `return` executable on `PATH`. Under this option
+  `return:kind` would answer `external` and be wrong about what the same line
+  does — so either `return` stays `keyword` as a named exception, or removing
+  that interception becomes part of the option.
+
+This is not decided here. Each call form found so far has widened it rather than
+closed it, which is itself the argument for settling it before implementation
+rather than discovering it during.
+
+*(Related, and pre-existing: `func` refuses `func`, `return`, `not`, the value
+names and any builtin, but accepts `func if()`, `func while()`, `func break()`
+and the rest. **None of them is dead.** There are three call forms, not two, and
+the third reaches every one of them:
+
+```
+func while() { return OK }; x = while()        # value call — OK
+func if(x) { puts OK }; n = "if"; $n arg       # expanded name — OK
+```
+
+`repl.rs:5529` looks the expanded head up in `shell.funcs` before anything else,
+so any definition the `func` statement accepts is callable by that route,
+including `if`, `match` and `for`, which are unreachable both as bare commands
+and as value calls. The dead-definition premise for this item is therefore empty:
+there is no set of names that can be reserved as "already unusable". Reserving
+any of them is a deliberate compatibility break, to be argued for on its own
+merits — that a function callable only through `$n` is a trap worth closing — and
+not as a tidy-up.)*
+
+`command NAME` looks past **all** of it — keyword, builtin and func alike —
+because bypassing the wrapper is what it exists for (`func ls() { command ls … }`,
+and `command return` inside a function reports not-found and keeps going rather
+than returning). `:kind` reports what it *finds* rather than where `command`
+would look, so `pwd:kind` is `builtin` while `command pwd` runs `/bin/pwd`. The
+two can disagree in the other direction as well: `command` only *looks* for a
+program, so `command cd` is `command not found` on a system with no `/bin/cd` —
+which is why `:kind` answers about resolution rather than about what `command`
+would do with the name.
+
+**A receiver containing `/` is a path, not a name.** `execvp` treats a word with
+a slash as a direct path and never consults `PATH` (`exec.rs:1061`), which is why
+`./tool` runs today. The modifier binds on such a word already — `./tool:upper`
+gives `./TOOL`, the whole word being the receiver — so `:kind` and `:where` will
+be asked about these and need an answer.
+
+The keyword, builtin and func layers do not apply: no keyword, builtin or `func`
+name can contain a slash, so a slashed receiver is external-or-nothing. That much
+is forced.
+
+**What it resolves to is not.** An earlier draft of this entry recorded a second
+forced result — that `./tool:kind` must be `external` wherever the file is
+executable, since the shell runs it. That is false, and the exec bit is simply
+not the predicate. A script with mode 755 whose shebang names a missing
+interpreter is executable by every permission test and still does not run:
+
+```
+./btool     # mesh: command not found: ./btool     — mode 755, shebang /nonexistent/interp
+```
+
+`execve` fails `ENOENT` on the *interpreter*, and the shell reports it as though
+the command itself were absent. So "executable" and "runnable" come apart a
+second time, in the opposite direction from the `EACCES` rows below: there a file
+exists and cannot run; here a file is executable and still cannot run.
+
+**The same ambiguity exists for a slashless receiver, and `PATH` makes it
+sharper**, because `execvp` does not stop at the first *name* match — it skips a
+candidate it cannot execute and keeps looking. With a non-executable `tool` in
+the first `PATH` entry and an executable one in the second:
+
+```
+tool          # ran-from-d2   — the first candidate is skipped, not an error
+dirtool       # mesh: permission denied: dirtool   — a directory, no later candidate
+tool          # mesh: permission denied: tool      — only the non-executable one on PATH
+```
+
+The bad-shebang file behaves the same way, and this is what makes the point
+general rather than a permissions detail — `execvp` skips it and runs the later
+candidate:
+
+```
+btool         # ran-from-e2   — e1/btool is mode 755 with a missing interpreter
+btool         # mesh: command not found: btool     — only the bad-shebang one on PATH
+```
+
+So an implementation that answers with the first `PATH` entry containing a file
+of that name names something the shell will never run — and so does one that
+answers with the first *executable* file of that name. Neither permission bits
+nor name matching is the predicate.
+
+Note the two failures report differently: the non-executable and directory cases
+are **`EACCES`** ("permission denied"), the bad-interpreter case is **`ENOENT`**
+("command not found"), and `execvp` continues past both.
+
+**The honest position is that exact fidelity is not reachable**, and the earlier
+draft's principle — "`:where` may not disagree with what the shell does" — has to
+be retracted as an absolute. Knowing whether a file will run means reading its
+shebang, resolving that interpreter, and recursing, and the answer can change
+between the query and the command anyway. Every POSIX shell has some version of the gap,
+but **they do not agree on which**, so `command -v` is not a reference behavior
+to copy. With a mode-0644 `ptool` and a mode-0755 `btool2` whose shebang names a
+missing interpreter, both on `PATH`:
+
+```
+bash 5.2.21   command -v ptool  → prints the path, rc 0     no permission check at all
+              command -v btool2 → prints the path, rc 0
+dash          command -v ptool  → rc 127                    checks the bit
+```
+
+So bash reports a bare name match, dash reports an executable match, and neither
+follows the shebang. "Match `command -v`" names two different behaviors depending
+on the shell, and the entry must say which it means.
+
+The choice is therefore which *approximation* to specify, and there are **three**
+— the bash probe above is what makes the first one real rather than a straw man:
+
+**What each shell actually accepts, measured rather than described.** This entry
+has now characterized these rules in prose three times and been wrong three
+times, so the table is the specification and the bullets below are derived from
+it. Each candidate placed alone on `PATH`; `rc` from `command -v NAME`:
+
+| candidate | bash 5.2.21 | dash |
+|---|---|---|
+| regular file, mode 644 | 0 | 127 |
+| regular file, mode 755 | 0 | 0 |
+| **directory**, mode 755 | 1 | 127 |
+| **FIFO**, mode 644 | 0 | 127 |
+| **FIFO**, mode 755 | 0 | 127 |
+| symlink → regular 755 | 0 | 0 |
+| broken symlink | 1 | 127 |
+
+Read off the table rather than from intuition:
+
+- **bash** accepts anything that exists and is **not a directory**. Not "regular
+  file" — a FIFO passes, at either mode — and there is no permission check at
+  all.
+- **dash** requires a **regular file** *and* execute permission for the effective
+  user. A mode-755 FIFO has the bits and is still rejected, so the regular-file
+  test is separate from the permission test and both are needed.
+- Both follow symlinks and both reject a broken one.
+- Neither reads the shebang, so both accept the bad-interpreter file from above.
+
+The exec bit on a directory means "may be traversed", not "may be run", which is
+why every rule has to exclude directories however else it is spelled.
+
+So the three approximations, each stated as the table supports:
+
+- **Name match** — the first candidate of that name that exists and is not a
+  directory. Cheapest, and bash's. Wrong for a non-executable file, a FIFO and a
+  bad interpreter, and it cannot express the `PATH`-skipping behavior at all,
+  since the first match is by definition where it stops.
+- **Permission bits** — the first *regular file* of that name that the effective
+  user may execute. dash's. Handles the `EACCES` rows and the skip, and is
+  knowingly wrong for a bad interpreter.
+- **Shebang-following** — read the interpreter and recurse. Strictly better
+  answers, unbounded work, still racy, and matches no shell here.
+
+Two phrasings in the middle option are load-bearing, and each has already been
+got wrong once: **regular file** (not "not a directory" — a FIFO has exec bits)
+and **effective user** (not the owner's bits).
+
+Whichever is chosen, the promise `:where` makes must be written as "what lookup
+would select", not "what will run".
+
+What stays open is one question, not two, and it is the same question in both
+settings: **when nothing runnable is found but a file of that name exists**, does
+`:kind` answer `false` (nothing here can run) or `external` (a file of that name
+is present)? The rows it covers:
+
+- a file that exists but is not executable, direct (`./notes.txt`) or on `PATH`;
+- a **directory** of that name, which fails identically;
+- and, for `:where`, what to return in those cases.
+
+Separately and still open: whether `:where` gives a direct path **as written**
+(`./tool`, matching what `command -v ./tool` reports in a POSIX shell) or an
+absolutized one.
+
+This is also evidence for the open `:where` question below, in two directions. A
+direct path has no `PATH` answer at all, so "`:where` searches `PATH`" is
+undefined for every receiver containing a slash. And where it *does* search
+`PATH`, "searches `PATH`" is not yet a specification — it has to say "the way
+`execvp` does", or it names the wrong file.
+
+**A name that resolves to nothing is `false`, not an error** *(decided)*. This
+departs from `:type`, which errors on a missing path because a file that is not
+there has no type word — and it is worth stating because the sibling it is
+modeled on goes the other way. Here absence is the *question*: "is this
+installed?" is the whole point of a guard, so it follows `:exists`, `:get`'s
+default, and `gets()` at EOF, all of which answer rather than raise. Erroring
+would make all 41 guard sites defensive.
+
+***(Open — is `:where` about resolution, or about `PATH`?)*** I first wrote
+"`:where` on a builtin or a func is `false`: it asks for a path, and there isn't
+one" as though it settled the matter. It does not, and the gap is not confined to
+keywords — **shadowing is the ordinary case, not the exotic one**:
+
+```
+pwd:where     # builtin, and /bin/pwd exists
+ls:where      # with `func ls() { command ls … }` — the documented wrapper idiom
+if:where      # keyword under option A, and /usr/bin/if may exist
+```
+
+For every one of those the shell resolves to something with no path, while a real
+program of that name sits on `PATH`. Two answers, and the choice is the same one
+each time:
+
+- **`:where` follows resolution.** All three are `false`, because that is what
+  the shell would actually run. The pair never disagrees, and `:where` cannot
+  surface a program `:kind` declined to mention. The cost is that it **stops
+  being `path`**: the `shrc` function it replaces searches `PATH` and would
+  answer `/bin/pwd`, so a port's `path pwd` changes meaning silently.
+- **`:where` answers about the filesystem.** All three give the path, because the
+  question is "where is the program", which is what `path` asks and what the
+  guard sites want when they ask it. The cost is that `:kind` and `:where` openly
+  disagree — `builtin` alongside `/bin/pwd` — which is the divergence the rest of
+  this section works to avoid.
+
+This is **independent of the `keyword` question above**: `pwd:kind` is `builtin`
+under either option, so the builtin and func rows have to be decided on their own
+terms. The keyword row is the only one that also depends on it, and under option B
+it mostly dissolves — `if:kind` is already `external` where only the program
+exists — leaving `return`, which stays `keyword` by carve-out and so takes
+whichever answer is chosen here.
+
+Worth naming plainly: the wrapper idiom this document recommends elsewhere
+(`func ls() { command ls … }`) is exactly the case that makes `ls:where` return
+`false` under the first option. A vocabulary meant to replace `path` would then
+answer `false` for the most common thing a user wraps.
+
+*(Open: the session half of the vocabulary — `connected-remotely`,
+`inside-project`, `in-shpool` — needs no new surface. `$sh.interactive`,
+`$sh.stdin:tty` and `$env:get(SSH_CLIENT, "")` already answer those, so they are
+ordinary `func`s a user writes, not language.)*
+
+*(Implementation note: `:kind` needs the function table, which lives in `Funcs`,
+while string interpolation resolves through `expand.rs` with only `&Vars`.
+Wiring it into one path and not the other would make `y = $x:kind` and
+`"$x:kind"` disagree — the exact split this modifier exists to prevent — so
+whichever way the plumbing goes, both paths land together.)*
 
 **String** *(open — initial set)*: `:replaceall(OLD, NEW)` and its anchored/removal
 kin (`:replacestart` / `:replaceend` / `:stripstart` / `:stripend`, plus
@@ -1622,8 +2238,10 @@ Rules:
   | bool | `true` → `0`, `false` → `1` (the Unix inversion) |
   | string / list / map / styled value / Instant / Duration / regex / stream handle (incl. empty or zero) | `0` — producing a value *is* success |
 
-  So `have_command` ends in a test whose bool becomes the status and
-  `if have_command fzf { … }` reads correctly; `return $cond` exits `0`/`1`;
+  So a session predicate like `connected-remotely` ends in a test whose bool
+  becomes the status and `if connected-remotely { … }` reads correctly — the
+  name-resolution half is the [`:kind` modifier](#modifiers) instead, and yields
+  a value rather than a status; `return $cond` exits `0`/`1`;
   `return 2` exits `2`; and a function that returns a string or a list is a
   success (`0`) when its status is observed. Failure is only ever signaled by a
   command's own status, a `false`, or an explicit nonzero `int` — never by the
@@ -1910,14 +2528,14 @@ whole category of `x = $(if … )` scaffolding.
 
 ```
 # statement position — run a branch for effect
-if have_command fzf {
+if fzf:kind != false {
   bind-key ctrl-r fzf-history
-} else if have_command atuin {
+} else if atuin:kind != false {
   atuin init mesh | source
 }
 
 # expression position — the taken branch's value becomes the result
-glyph = if connected_remotely { "⇄" } else { "•" }
+glyph = if connected-remotely { "⇄" } else { "•" }
 tag   = if $root { "[root]" } else { "" }
 ```
 
@@ -1926,10 +2544,13 @@ Decisions:
 - **The condition is a bool or a command.** A boolean value (`$root`, a
   comparison like `$n > 0`, a `:has` test) branches on its truth; a bare
   command branches on its **exit status** (`0` → true), preserving the
-  `if grep -q foo file { … }` reflex. This is why the [predicate
-  vocabulary](#requirements-carried-over-from-existing-configs)
-  (`have_command`, `inside_project`, …) is just commands/functions — they slot
-  straight into `if` with no `[ … ]` / `test`.
+  `if grep -q foo file { … }` reflex. The [predicate
+  vocabulary](#requirements-carried-over-from-existing-configs) splits across
+  both: the session predicates (`connected-remotely`, `inside-project`, …) are
+  ordinary functions that slot straight into `if` with no `[ … ]` / `test`, while
+  name resolution is the [`:kind` modifier](#modifiers) and so yields a value,
+  compared explicitly (`if fzf:kind != false`) until condition truthiness is
+  settled below.
 - **An assignment may *be* the condition** — `if lhs = rhs { … }`, the `if let`
   shape. The condition is true iff the RHS is **truthy** (a `false` / failed
   command / nonzero int fails it) **and** its shape **fits** `lhs`; on true the
