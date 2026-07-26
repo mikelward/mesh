@@ -694,9 +694,32 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       terminator and CSI with any final byte. Cursor motion is deliberately not
       modeled: reedline lays out the same line with every escape at zero width, and
       the number has to agree with the editor rather than with the terminal.
-- [ ] **OSC 633** — VS Code's extension of 133, which reedline also ships markers
-      for. Picking the dialect from `$env.TERM_PROGRAM` is the same capability
-      question the title sequence asks, so decide them together.
+- [x] **OSC 633** — VS Code's dialect, chosen from `$env.TERM_PROGRAM == vscode`,
+      which is what VS Code and its forks set. The same `A`/`B`/`C`/`D` boundaries
+      under a different number — reedline ships the markers for its half — plus `E`,
+      which hands over the command line. `E` is the reason to bother: VS Code parses
+      plain `133` too, but only from `633;E` does it learn what the command *was*,
+      which its re-run and command-label features need; left to `133` it reads the
+      text back out of the echo and gets it wrong whenever the prompt or the editor
+      is interesting.
+      One dialect, never both — VS Code understands `133` as well, so sending both
+      makes it count every command twice. `E` goes out before `C`, the order VS
+      Code's own integrations use, so the terminal knows what is about to run before
+      any output arrives. The command line is escaped as VS Code requires: `;` as
+      `\x3b` since it delimits the payload (`sleep 1; puts hi` is ordinary to type),
+      the backslash that introduces the escape as `\\`, and control characters as
+      `\xXX` — a pasted two-line command carries a newline, and an `ESC` would start
+      a sequence of its own.
+      Read once per session, like `$env.TERM`: a dialect that changed mid-session
+      would close a region in a language it was not opened in. Both are snapshotted
+      at one point, *after* the startup files and before the first prompt, so an
+      `rc.mesh` that sets either variable is honored — the marks ask for the dialect
+      when they draw rather than holding one from before `rc.mesh` ran.
+      `$sh.options.shell-integration` gates it, as it does `133` — one setting for
+      the feature, not one per dialect. `633;P;Cwd=` is deliberately absent: `OSC 7`
+      already reports the directory and VS Code reads it. The nonce `633;E` can
+      carry is absent too — it exists for a script VS Code injects into a shell it
+      launched, and mesh is not that.
 - [ ] **Hyperlinks** (OSC 8) — a `link(text, url)` sibling to `style()`, per
       `DESIGN.md`, rather than a raw escape.
 - [x] **Clipboard** (OSC 52) — the `clip` builtin. `clip TEXT …` joins its

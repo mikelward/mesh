@@ -61,7 +61,11 @@ impl MeshExec {
         let argv = [arguments[0].as_ptr(), std::ptr::null()];
 
         let mut environment: Vec<_> = std::env::vars_os()
-            .filter(|(name, _)| name != "XDG_CONFIG_HOME")
+            // `TERM_PROGRAM` decides the shell-integration dialect, so a suite run
+            // from inside VS Code's terminal would otherwise flip every `OSC 133`
+            // assertion to `OSC 633`. Never inherited; the one test that wants it
+            // passes it explicitly.
+            .filter(|(name, _)| name != "XDG_CONFIG_HOME" && name != "TERM_PROGRAM")
             .filter(|(name, _)| !extra.iter().any(|(replaced, _)| name == replaced))
             .map(|(name, value)| {
                 let mut entry = name.into_encoded_bytes();
@@ -1525,6 +1529,14 @@ struct PtyShell {
 /// The six harnesses above each open their own pty inline and predate this; they
 /// are left as they are rather than mechanically rewritten here.
 fn start_pty_shell(exec: &MeshExec, cwd: Option<&Path>) -> Option<PtyShell> {
+    start_pty_shell_ready(exec, cwd, INPUT_READY)
+}
+
+/// As [`start_pty_shell`], but waiting for `ready` instead of the `OSC 133` `B`.
+///
+/// A session speaking VS Code's dialect never writes that mark, so "wait for the
+/// prompt" has to name which prompt-end it is waiting for.
+fn start_pty_shell_ready(exec: &MeshExec, cwd: Option<&Path>, ready: &[u8]) -> Option<PtyShell> {
     // Built before the fork: only async-signal-safe calls are allowed between
     // fork and exec, and allocating a `CString` is not one.
     let directory = cwd.map(|path| {
@@ -1567,7 +1579,7 @@ fn start_pty_shell(exec: &MeshExec, cwd: Option<&Path>) -> Option<PtyShell> {
     if unsafe { libc::tcsetpgrp(master, mesh) } < 0 {
         return None;
     }
-    let startup = pty_read_until_one_of(master, &[INPUT_READY])?;
+    let startup = pty_read_until_one_of(master, &[ready])?;
     Some(PtyShell {
         master,
         mesh,
@@ -2536,6 +2548,120 @@ fn clip_harness(exec: &MeshExec) -> i32 {
     }
     if !stop_pty_shell(shell) {
         return 149;
+    }
+    0
+}
+
+#[test]
+fn vs_code_gets_its_own_dialect_and_the_command_line() {
+    let exec = MeshExec::with_environment(
+        isolated_config_home(),
+        &[("TERM", "xterm-256color"), ("TERM_PROGRAM", "vscode")],
+    );
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(vscode_dialect_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// Under `TERM_PROGRAM=vscode` the marks are `OSC 633`, they carry the command
+/// line, and no `OSC 133` goes out beside them.
+///
+/// The last part is the one worth a pty: VS Code parses both dialects, so sending
+/// both would have it count every command twice — and that is invisible in a unit
+/// test of either sequence on its own.
+fn vscode_dialect_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell_ready(exec, None, b"\x1b]633;B\x1b\\") else {
+        return 170;
+    };
+    // A semicolon in the command, since that is what `E` has to escape to survive.
+    if !pty_write(shell.master, b"sh -c 'exit 3; puts unreached'\n") {
+        return 171;
+    }
+    let Some(seen) = pty_read_until_one_of(shell.master, &[b"\x1b]633;D;3\x1b\\"]) else {
+        return 172;
+    };
+    if occurrences(&seen, b"\x1b]633;C\x1b\\") == 0 {
+        return 173;
+    }
+    // `E` carries what was typed, with the `;` as `\x3b` so it cannot end the
+    // sequence, and it arrives before the output it describes.
+    let command_line = b"\x1b]633;E;sh -c 'exit 3\\x3b puts unreached'\x1b\\";
+    let at = |needle: &[u8]| seen.windows(needle.len()).position(|part| part == needle);
+    let (Some(described), Some(output_start)) = (at(command_line), at(b"\x1b]633;C\x1b\\")) else {
+        return 174;
+    };
+    if described >= output_start {
+        return 175;
+    }
+    // One dialect, not both.
+    if occurrences(&seen, b"\x1b]133;") != 0 {
+        return 176;
+    }
+    if !stop_pty_shell(shell) {
+        return 177;
+    }
+    0
+}
+
+#[test]
+fn a_startup_file_can_choose_the_dialect() {
+    // Raised in review on #247: the dialect was snapshotted while the editor was
+    // built, which is *before* the startup files run, so an `rc.mesh` setting
+    // `$env.TERM_PROGRAM` was read too late to matter. `$env.TERM` was already
+    // honored from there, and two neighbouring features reading the environment at
+    // different moments is the kind of difference nobody remembers.
+    let home = fresh_dir("vscode_rc");
+    let config = home.join("mesh");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("rc.mesh"), "$env.TERM_PROGRAM = vscode\n").unwrap();
+
+    // Nothing in the environment says VS Code; only the startup file does.
+    let exec = MeshExec::with_environment(&home, &[("TERM", "xterm-256color")]);
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(startup_dialect_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// The very first prompt already speaks the dialect the startup file asked for.
+fn startup_dialect_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell_ready(exec, None, b"\x1b]633;B\x1b\\") else {
+        return 180;
+    };
+    // The first prompt, before any command: `A` and `B` are reedline's, and they are
+    // the half that was deciding too early.
+    if occurrences(&shell.startup, b"\x1b]633;A;k=i\x1b\\") == 0 {
+        return 181;
+    }
+    if occurrences(&shell.startup, b"\x1b]133;") != 0 {
+        return 182;
+    }
+    if !pty_write(shell.master, b"puts hi\n") {
+        return 183;
+    }
+    let Some(seen) = pty_read_until_one_of(shell.master, &[b"\x1b]633;D;0\x1b\\"]) else {
+        return 184;
+    };
+    if occurrences(&seen, b"\x1b]633;E;puts hi\x1b\\") == 0 {
+        return 185;
+    }
+    if !stop_pty_shell(shell) {
+        return 186;
     }
     0
 }
