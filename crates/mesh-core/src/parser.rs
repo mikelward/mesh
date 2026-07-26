@@ -1499,7 +1499,7 @@ fn token_word_pieces(kind: &TokenKind) -> Option<Vec<WordPiece>> {
 
 /// Names that cannot be user functions because they are built-in **value**
 /// constructors, reachable only through the `name(...)` call form.
-const RESERVED_FUNCTION_NAMES: &[&str] = &["re"];
+const RESERVED_FUNCTION_NAMES: &[&str] = &["re", "style"];
 
 struct Parser {
     tokens: Vec<Token>,
@@ -1907,10 +1907,11 @@ impl Parser {
     fn function(&mut self) -> Result<Executable, ParseError> {
         self.take_word("func");
         let name = self.name()?;
-        // `re(...)` is a built-in value constructor. A function of that name would
-        // be reachable as a command (`re x`) but never as a value call, since
-        // `re(x)` always builds a regex — so reserve the name rather than ship a
-        // function that behaves differently depending on how it is called.
+        // `re(...)` and `style(...)` are built-in value constructors. A function of
+        // either name would be reachable as a command (`re x`) but never as a value
+        // call, since `re(x)` always builds a regex and `style(x)` always builds a
+        // styled value — so reserve the names rather than ship a function that
+        // behaves differently depending on how it is called.
         if RESERVED_FUNCTION_NAMES.contains(&name.as_str()) {
             return Err(self.error(ParseErrorKind::ReservedFunctionName(name)));
         }

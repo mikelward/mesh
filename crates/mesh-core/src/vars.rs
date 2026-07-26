@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::options::Options;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum Value {
     String(String),
     Integer(i64),
@@ -41,6 +41,236 @@ pub enum Value {
     /// the variable (`$double(5)`). It has no byte form, so unlike every other
     /// value it cannot reach a command argument or an interpolation.
     Function(FuncValue),
+    /// A **string carrying display attributes**, from `style("text", fg: blue)`.
+    ///
+    /// Not a new scalar type, per `DESIGN.md` §"Hooks and the prompt": everywhere
+    /// bytes are wanted it behaves exactly as its text — the same argv rule, the
+    /// same `+=` (which yields a plain string, since attributes are
+    /// rendering-only), the same comparisons and interpolation. Only a renderer
+    /// reads the attributes, which today means `puts`/`print` writing to a
+    /// color-capable terminal.
+    ///
+    /// Boxed because it is the largest payload by some way and every `Value`
+    /// would otherwise grow to hold it.
+    Styled(Box<StyledValue>),
+}
+
+/// Equality is **hand-written rather than derived** so that a styled value equals
+/// its text: `style(x, fg: red) == x` is true, per `DESIGN.md` §"Hooks and the
+/// prompt". Deriving it would make styling a value change every comparison it
+/// takes part in, which is exactly what "behaves exactly as its text" forbids.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        if let (Some(left), Some(right)) = (self.as_text(), other.as_text()) {
+            return left == right;
+        }
+        match (self, other) {
+            (Value::Integer(left), Value::Integer(right)) => left == right,
+            (Value::Boolean(left), Value::Boolean(right)) => left == right,
+            (Value::List(left), Value::List(right)) => left == right,
+            (Value::Map(left), Value::Map(right)) => left == right,
+            (Value::Regex(left), Value::Regex(right)) => left == right,
+            (Value::Glob(left), Value::Glob(right)) => left == right,
+            (Value::Stream(left), Value::Stream(right)) => left == right,
+            (Value::Job(left), Value::Job(right)) => left == right,
+            (Value::Function(left), Value::Function(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
+/// Hashed to agree with [`PartialEq`], which is what `:dedup` and a map key
+/// depend on: a styled value and its plain text are one key, not two. The
+/// discriminants are written out because a styled value must land in the *string*
+/// bucket rather than its own.
+impl std::hash::Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        if let Some(text) = self.as_text() {
+            0u8.hash(state);
+            text.hash(state);
+            return;
+        }
+        match self {
+            // Covered by `as_text` above.
+            Value::String(_) | Value::Styled(_) => unreachable!("a text value hashes as its text"),
+            Value::Integer(value) => (1u8, value).hash(state),
+            Value::Boolean(value) => (2u8, value).hash(state),
+            Value::List(values) => (3u8, values).hash(state),
+            Value::Map(entries) => (4u8, entries).hash(state),
+            Value::Regex(value) => (5u8, value).hash(state),
+            Value::Glob(value) => (6u8, value).hash(state),
+            Value::Stream(value) => (7u8, value).hash(state),
+            Value::Job(value) => (8u8, value).hash(state),
+            Value::Function(value) => (9u8, value).hash(state),
+        }
+    }
+}
+
+/// Text plus the attributes a renderer may apply to it.
+///
+/// Equality and hashing are **by text alone**, which is what makes a styled value
+/// compare as its text: `style(x, fg: red) == x` is true, so styling a prompt
+/// segment cannot quietly change a comparison somewhere else.
+#[derive(Debug, Clone)]
+pub struct StyledValue {
+    pub text: String,
+    pub style: Style,
+}
+
+impl PartialEq for StyledValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for StyledValue {}
+
+impl std::hash::Hash for StyledValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.text.hash(state);
+    }
+}
+
+/// The display attributes `style` understands. Color and bold are the MVP set
+/// (`DESIGN.md` §"Hooks and the prompt"); `None` for a color means "leave it
+/// alone" rather than "default", so a nested re-style can add bold without
+/// resetting the color.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Style {
+    pub foreground: Option<Color>,
+    pub background: Option<Color>,
+    pub bold: bool,
+}
+
+/// The eight ANSI colors and their bright forms — the set every terminal that
+/// does color at all agrees on. 256-color and truecolor are deferred: they need a
+/// spelling for the value (`fg: 33`, `fg: "#8be9fd"`) and a downgrade rule for
+/// terminals that cannot show them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Color {
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightBlack,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
+}
+
+impl Color {
+    /// The color named by a `fg:`/`bg:` argument, or `None` if it names nothing.
+    ///
+    /// `grey`/`gray` are accepted for bright black: it is what the color is called
+    /// everywhere outside a terminal spec, and both spellings are in wide use.
+    pub fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "black" => Color::Black,
+            "red" => Color::Red,
+            "green" => Color::Green,
+            "yellow" => Color::Yellow,
+            "blue" => Color::Blue,
+            "magenta" => Color::Magenta,
+            "cyan" => Color::Cyan,
+            "white" => Color::White,
+            "grey" | "gray" | "bright-black" => Color::BrightBlack,
+            "bright-red" => Color::BrightRed,
+            "bright-green" => Color::BrightGreen,
+            "bright-yellow" => Color::BrightYellow,
+            "bright-blue" => Color::BrightBlue,
+            "bright-magenta" => Color::BrightMagenta,
+            "bright-cyan" => Color::BrightCyan,
+            "bright-white" => Color::BrightWhite,
+            _ => return None,
+        })
+    }
+
+    /// Every name `style` accepts, for the diagnostic that lists them.
+    pub const NAMES: &'static [&'static str] = &[
+        "black",
+        "red",
+        "green",
+        "yellow",
+        "blue",
+        "magenta",
+        "cyan",
+        "white",
+        "grey",
+        "bright-red",
+        "bright-green",
+        "bright-yellow",
+        "bright-blue",
+        "bright-magenta",
+        "bright-cyan",
+        "bright-white",
+    ];
+
+    /// The SGR parameter for this color in the foreground.
+    fn foreground_code(self) -> u8 {
+        match self {
+            Color::Black => 30,
+            Color::Red => 31,
+            Color::Green => 32,
+            Color::Yellow => 33,
+            Color::Blue => 34,
+            Color::Magenta => 35,
+            Color::Cyan => 36,
+            Color::White => 37,
+            Color::BrightBlack => 90,
+            Color::BrightRed => 91,
+            Color::BrightGreen => 92,
+            Color::BrightYellow => 93,
+            Color::BrightBlue => 94,
+            Color::BrightMagenta => 95,
+            Color::BrightCyan => 96,
+            Color::BrightWhite => 97,
+        }
+    }
+}
+
+impl Style {
+    /// Does this carry anything to emit? A `style()` call that named nothing
+    /// renders as bare text rather than as an empty `ESC [ m`.
+    pub fn is_plain(&self) -> bool {
+        *self == Style::default()
+    }
+
+    /// The SGR sequence that turns these attributes on, empty when there are
+    /// none. Backgrounds are the foreground codes plus ten, the ANSI offset.
+    pub fn prefix(&self) -> String {
+        if self.is_plain() {
+            return String::new();
+        }
+        let mut parameters = Vec::with_capacity(3);
+        if self.bold {
+            parameters.push(1);
+        }
+        if let Some(color) = self.foreground {
+            parameters.push(color.foreground_code().into());
+        }
+        if let Some(color) = self.background {
+            parameters.push(u16::from(color.foreground_code()) + 10);
+        }
+        let parameters: Vec<String> = parameters.iter().map(u16::to_string).collect();
+        format!("\u{1b}[{}m", parameters.join(";"))
+    }
+
+    /// The reset that ends them. `SGR 0` rather than the targeted off-codes: a
+    /// full reset is what every prompt idiom uses, and it cannot leave an
+    /// attribute set that a partial reset missed.
+    pub fn suffix(&self) -> &'static str {
+        if self.is_plain() { "" } else { "\u{1b}[0m" }
+    }
 }
 
 /// Why a value cannot be written as a literal, in the words a diagnostic wants.
@@ -67,6 +297,44 @@ impl std::fmt::Display for NoLiteral {
 }
 
 impl Value {
+    /// The plain string a **styled** value behaves as; every other value unchanged.
+    ///
+    /// `DESIGN.md` §"Hooks and the prompt" makes a styled value a string carrying
+    /// display attributes, read only by a renderer. So every boundary that wants
+    /// *data* — argv, `+=`, a comparison, an interpolation, an index — calls this
+    /// first and then has one fewer case to think about. Keeping the wrapper past
+    /// such a boundary is the bug this exists to make hard.
+    pub fn plain(self) -> Value {
+        match self {
+            Value::Styled(styled) => Value::String(styled.text),
+            other => other,
+        }
+    }
+
+    /// The text of a styled value, or `None` for anything else — the borrowing
+    /// form of [`plain`](Value::plain), for a match that only needs to route a
+    /// styled value to its own `Value::String` arm.
+    pub fn styled_text(&self) -> Option<&str> {
+        match self {
+            Value::Styled(styled) => Some(&styled.text),
+            _ => None,
+        }
+    }
+
+    /// The text of any value that **is** text — a string or a styled string.
+    ///
+    /// The pair that has to answer alike for equality, hashing and ordering, since
+    /// a styled value is a string carrying attributes and not a kind of its own.
+    /// An integer is deliberately absent: `1 == "1"` is false in mesh and this must
+    /// not be the thing that changes it.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Value::String(text) => Some(text),
+            Value::Styled(styled) => Some(&styled.text),
+            _ => None,
+        }
+    }
+
     /// This value written as the mesh source you would have typed for it.
     ///
     /// The contract is **round-trip, not display**: parsing the result back has to
@@ -90,6 +358,11 @@ impl Value {
     fn write_literal(&self, out: &mut String) -> Result<(), NoLiteral> {
         match self {
             Value::String(text) => quote_into(text, out),
+            // A styled value writes down as its **text**. `:repr`'s contract is
+            // that parsing the result yields an *equal* value, and equality here is
+            // by text — a `style(…)` call is not a literal anyway, so there is
+            // nothing else to write that would read back.
+            Value::Styled(styled) => quote_into(&styled.text, out),
             Value::Integer(number) => out.push_str(&number.to_string()),
             Value::Boolean(flag) => out.push_str(if *flag { "true" } else { "false" }),
             Value::List(values) => {
@@ -736,6 +1009,14 @@ impl Vars {
 /// member assignment (`$m.key += v`) and a whole-variable one go through the same
 /// table rather than two that can drift; `name` labels the target in errors.
 pub fn append_into(current: &mut Value, value: Value, name: &str) -> Result<(), String> {
+    // Appending is a text operation, so attributes do not survive it on either
+    // side — `DESIGN.md` §"Hooks and the prompt" says `+=` on a styled value
+    // yields a plain string. Flattening here rather than in an arm keeps the
+    // table below one case shorter.
+    if current.styled_text().is_some() {
+        *current = std::mem::replace(current, Value::Boolean(false)).plain();
+    }
+    let value = value.plain();
     match (current, value) {
         (Value::String(left), Value::String(right)) => left.push_str(&right),
         (Value::Integer(left), Value::Integer(right)) => {
@@ -776,13 +1057,19 @@ pub fn append_into(current: &mut Value, value: Value, name: &str) -> Result<(), 
         (Value::Function(_), _) => {
             return Err(format!("{name}: cannot append to a function value"));
         }
+        // Flattened above, so this is the exhaustiveness the compiler wants rather
+        // than a reachable case. Answering as the string arm does keeps it honest
+        // if that ever changes.
+        (Value::Styled(_), _) => {
+            return Err(format!("{name}: can only append a string to a string"));
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FuncValue, NoLiteral, RegexValue, Value, Vars};
+    use super::{Color, FuncValue, NoLiteral, RegexValue, Style, StyledValue, Value, Vars};
 
     #[test]
     fn a_scalar_writes_the_literal_you_would_have_typed() {
@@ -958,5 +1245,106 @@ mod tests {
         assert_eq!(vars.get("g"), Some(&Value::String("beforeafter".into())));
         vars.pop_scope();
         assert_eq!(vars.get("g"), Some(&Value::String("before".into())));
+    }
+    /// A styled value with `text` and no attributes but `style`.
+    fn styled(text: &str, style: Style) -> Value {
+        Value::Styled(Box::new(StyledValue {
+            text: text.to_owned(),
+            style,
+        }))
+    }
+
+    #[test]
+    fn a_styled_value_equals_and_hashes_as_its_text() {
+        use std::collections::HashSet;
+
+        let red = Style {
+            foreground: Some(Color::Red),
+            ..Style::default()
+        };
+        let bold = Style {
+            bold: true,
+            ..Style::default()
+        };
+        // Styling must not change what a value *is*, or `==` and `:dedup` would
+        // answer differently depending on how a segment was decorated.
+        assert_eq!(styled("x", red), Value::String("x".into()));
+        assert_eq!(styled("x", red), styled("x", bold));
+        assert_ne!(styled("x", red), Value::String("y".into()));
+        // `1 == "1"` stays false: only the two *text* kinds are unified.
+        assert_ne!(styled("1", red), Value::Integer(1));
+
+        let mut set = HashSet::new();
+        set.insert(Value::String("x".into()));
+        assert!(
+            !set.insert(styled("x", red)),
+            "hashing must agree with `eq`"
+        );
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn a_styled_value_writes_down_as_its_text() {
+        let red = Style {
+            foreground: Some(Color::Red),
+            ..Style::default()
+        };
+        // `:repr` round-trips by equality, and equality is by text — so the text is
+        // the honest thing to write, quoted like any other string.
+        assert_eq!(styled("x", red).to_literal().as_deref(), Ok("'x'"));
+    }
+
+    #[test]
+    fn appending_to_a_styled_value_yields_a_plain_string() {
+        // Attributes are rendering-only, so `+=` drops them on either side.
+        let red = Style {
+            foreground: Some(Color::Red),
+            ..Style::default()
+        };
+        let mut vars = Vars::new();
+        vars.set_value("s", styled("a", red));
+        vars.append("s", styled("b", red)).unwrap();
+        assert_eq!(vars.get("s"), Some(&Value::String("ab".into())));
+        assert!(vars.get("s").unwrap().styled_text().is_none());
+    }
+
+    #[test]
+    fn sgr_carries_bold_then_foreground_then_background() {
+        // One sequence with the parameters in a fixed order, not three sequences:
+        // the order is what a byte-for-byte test can pin.
+        let style = Style {
+            foreground: Some(Color::Blue),
+            background: Some(Color::White),
+            bold: true,
+        };
+        assert_eq!(style.prefix(), "\u{1b}[1;34;47m");
+        assert_eq!(style.suffix(), "\u{1b}[0m");
+        // A bright color is the 90/100 range, not 30/40 with a modifier.
+        let bright = Style {
+            foreground: Some(Color::BrightBlack),
+            ..Style::default()
+        };
+        assert_eq!(bright.prefix(), "\u{1b}[90m");
+        // Nothing named means nothing emitted — never a bare `ESC [ m`, which
+        // some terminals read as a reset.
+        assert!(Style::default().is_plain());
+        assert_eq!(Style::default().prefix(), "");
+        assert_eq!(Style::default().suffix(), "");
+    }
+
+    #[test]
+    fn color_names_cover_both_grey_spellings_and_reject_the_rest() {
+        assert_eq!(Color::named("grey"), Some(Color::BrightBlack));
+        assert_eq!(Color::named("gray"), Some(Color::BrightBlack));
+        assert_eq!(Color::named("bright-black"), Some(Color::BrightBlack));
+        assert_eq!(Color::named("bright-cyan"), Some(Color::BrightCyan));
+        assert_eq!(Color::named("chartreuse"), None);
+        assert_eq!(Color::named("Red"), None, "names are lowercase");
+        assert_eq!(Color::named(""), None);
+        // Every advertised name resolves, so the diagnostic cannot list a name that
+        // then fails.
+        for name in Color::NAMES {
+            assert!(Color::named(name).is_some(), "{name}");
+        }
     }
 }

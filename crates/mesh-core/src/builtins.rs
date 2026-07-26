@@ -233,6 +233,37 @@ fn path_line(path: &OsStr) -> Vec<u8> {
     line
 }
 
+/// May a styled value emit its attributes on **this process's** stdout?
+///
+/// Two conditions, from `DESIGN.md` §"Hooks and the prompt": stdout is a
+/// color-capable terminal, and `NO_COLOR` is unset. That is the whole capability
+/// story — there is no `$color` setting and no probe, because the attributes are
+/// data and dropping them is always available.
+///
+/// `NO_COLOR` follows the [no-color.org](https://no-color.org) rule: **set at all**
+/// disables color, whatever its value, so `NO_COLOR=0` still means no color. An
+/// empty value is the documented exception and does not count as set.
+///
+/// `TERM=dumb` is out because it declares a terminal that renders no attributes —
+/// the one name for which SGR is text rather than styling. Otherwise no allowlist:
+/// SGR is universal in a way `OSC` is not, so the [`OSC_TERMS`](crate::repl)
+/// reasoning does not carry over.
+///
+/// The caller decides where "this command's stdout" actually goes — a redirect or a
+/// pipe replaces it after the words are rendered — so this answers only for the
+/// descriptor as it stands.
+pub(crate) fn colors_wanted() -> bool {
+    use std::io::IsTerminal;
+
+    if env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
+        return false;
+    }
+    if env::var("TERM").is_ok_and(|term| term == "dumb") {
+        return false;
+    }
+    std::io::stdout().is_terminal()
+}
+
 /// Write `bytes` to stdout, returning a builtin status: `0` on success, `1` on
 /// error. An ordinary I/O failure (a full disk, a closed pipe) must report a
 /// failure, never crash the REPL — so this never panics the way `println!` does.
@@ -297,9 +328,22 @@ fn puts(args: &[String], newline: bool) -> u8 {
 /// argv boundary refuses a list outright, since an external command needs bytes
 /// and there is no canonical separator to pick. `puts` is a builtin looking at a
 /// real value, so it can answer — and newline is the answer a list has.
-pub(crate) fn rendered_for_output(value: &Value) -> Result<String, String> {
+///
+/// `decorate` says whether a **styled** value may emit its attributes. This is the
+/// one place they are read, so it is also the one place the color-capability
+/// decision applies — see [`colors_wanted`](colors_wanted). Every element of a
+/// collection is asked the same question, so a list of styled values keeps each
+/// element's own color.
+pub(crate) fn rendered_for_output(value: &Value, decorate: bool) -> Result<String, String> {
     match value {
         Value::String(text) => Ok(text.clone()),
+        Value::Styled(styled) if decorate => Ok(format!(
+            "{}{}{}",
+            styled.style.prefix(),
+            styled.text,
+            styled.style.suffix()
+        )),
+        Value::Styled(styled) => Ok(styled.text.clone()),
         Value::Integer(number) => Ok(number.to_string()),
         Value::Boolean(flag) => Ok(flag.to_string()),
         Value::List(items) => {
@@ -311,7 +355,7 @@ pub(crate) fn rendered_for_output(value: &Value) -> Result<String, String> {
                     // here as it does at every other boundary.
                     Value::List(_) => return Err("a list inside a list has no rendering".into()),
                     Value::Map(_) => return Err("a map inside a list has no rendering".into()),
-                    scalar => rendered_for_output(scalar)?,
+                    scalar => rendered_for_output(scalar, decorate)?,
                 });
             }
             Ok(lines.join("\n"))
@@ -322,7 +366,7 @@ pub(crate) fn rendered_for_output(value: &Value) -> Result<String, String> {
                 let rendered = match entry {
                     Value::List(_) => return Err("a list inside a map has no rendering".into()),
                     Value::Map(_) => return Err("a map inside a map has no rendering".into()),
-                    scalar => rendered_for_output(scalar)?,
+                    scalar => rendered_for_output(scalar, decorate)?,
                 };
                 lines.push(format!("{key}: {rendered}"));
             }
@@ -699,15 +743,15 @@ mod tests {
     #[test]
     fn a_scalar_renders_as_itself() {
         assert_eq!(
-            rendered_for_output(&Value::String("hi".into())).as_deref(),
+            rendered_for_output(&Value::String("hi".into()), false).as_deref(),
             Ok("hi")
         );
         assert_eq!(
-            rendered_for_output(&Value::Integer(-7)).as_deref(),
+            rendered_for_output(&Value::Integer(-7), false).as_deref(),
             Ok("-7")
         );
         assert_eq!(
-            rendered_for_output(&Value::Boolean(true)).as_deref(),
+            rendered_for_output(&Value::Boolean(true), false).as_deref(),
             Ok("true")
         );
     }
@@ -715,15 +759,24 @@ mod tests {
     #[test]
     fn a_collection_renders_one_entry_per_line() {
         let list = Value::List(vec![Value::String("a".into()), Value::Integer(2)]);
-        assert_eq!(rendered_for_output(&list).as_deref(), Ok("a\n2"));
+        assert_eq!(rendered_for_output(&list, false).as_deref(), Ok("a\n2"));
         let map = Value::Map(vec![
             ("k".to_owned(), Value::String("v".into())),
             ("n".to_owned(), Value::Boolean(false)),
         ]);
-        assert_eq!(rendered_for_output(&map).as_deref(), Ok("k: v\nn: false"));
+        assert_eq!(
+            rendered_for_output(&map, false).as_deref(),
+            Ok("k: v\nn: false")
+        );
         // Empty is empty, not a stray separator.
-        assert_eq!(rendered_for_output(&Value::List(vec![])).as_deref(), Ok(""));
-        assert_eq!(rendered_for_output(&Value::Map(vec![])).as_deref(), Ok(""));
+        assert_eq!(
+            rendered_for_output(&Value::List(vec![]), false).as_deref(),
+            Ok("")
+        );
+        assert_eq!(
+            rendered_for_output(&Value::Map(vec![]), false).as_deref(),
+            Ok("")
+        );
     }
 
     #[test]
@@ -737,7 +790,7 @@ mod tests {
             Value::List(vec![Value::List(vec![])]),
             Value::Map(vec![("k".to_owned(), Value::Map(vec![]))]),
         ] {
-            assert!(rendered_for_output(&value).is_err(), "{value:?}");
+            assert!(rendered_for_output(&value, false).is_err(), "{value:?}");
         }
     }
 }

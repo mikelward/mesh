@@ -248,7 +248,8 @@ pub fn expand_call_values(
 fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> {
     match resolve_value(vref, vars)? {
         Value::List(values) => Ok(values),
-        Value::String(_) => Err(ExpandError::Unsupported(format!(
+        // A styled value is a string, so it is not a list for the same reason.
+        Value::String(_) | Value::Styled(_) => Err(ExpandError::Unsupported(format!(
             "...${}: value is not a list",
             vref.name
         ))),
@@ -277,7 +278,7 @@ fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> 
 fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError> {
     match resolve_value(vref, vars)? {
         Value::List(values) => strings(values, &vref.name),
-        Value::String(_) => Err(ExpandError::Unsupported(format!(
+        Value::String(_) | Value::Styled(_) => Err(ExpandError::Unsupported(format!(
             "...${}: value is not a list",
             vref.name
         ))),
@@ -305,6 +306,8 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
         .into_iter()
         .map(|value| match value {
             Value::String(value) => Ok(value),
+            // Its text is what crosses; argv carries bytes, not attributes.
+            Value::Styled(styled) => Ok(styled.text),
             Value::Integer(value) => Ok(value.to_string()),
             Value::Boolean(value) => Ok(value.to_string()),
             Value::List(_) => Err(ExpandError::Unsupported(format!(
@@ -489,6 +492,9 @@ fn glob_pattern(pieces: &Pieces) -> String {
 pub(crate) fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError> {
     match resolve_value(vref, vars)? {
         Value::String(value) => Ok(value),
+        // `"$x"` and an argv word see the text: only a renderer reads the
+        // attributes (`DESIGN.md` §"Hooks and the prompt").
+        Value::Styled(styled) => Ok(styled.text),
         Value::Integer(value) => Ok(value.to_string()),
         Value::Boolean(value) => Ok(value.to_string()),
         Value::List(_) | Value::Map(_) | Value::Regex(_) | Value::Glob(_) => {
@@ -571,7 +577,10 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                             })?
                     }
                     Value::Map(_) => map_value_access(value, &key, &vref.name)?,
+                    // A styled value indexes exactly as its text does — which is
+                    // to say it does not, since mesh has no string subscript.
                     Value::String(_)
+                    | Value::Styled(_)
                     | Value::Integer(_)
                     | Value::Boolean(_)
                     | Value::Regex(_)
@@ -667,12 +676,19 @@ fn decode_subscript_string(value: &str, quote: char) -> Result<String, ExpandErr
 pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, ExpandError> {
     use Modifier::{Dedup, First, Init, Keys, Last, Len, Rest, Values};
     let name = modifier_name(modifier);
+    // A modifier *transforms* a value, and display attributes are rendering-only,
+    // so a styled value is modified as its text and the result is plain — the same
+    // rule `+=` follows (`DESIGN.md` §"Hooks and the prompt"). Flattening here is
+    // what lets every arm below reason about a string; the `Value::Styled` arms in
+    // them are the exhaustiveness the compiler wants, not a reachable case.
+    let value = value.plain();
     match modifier {
         Len => match value {
             Value::String(value) => Ok(Value::Integer(value.chars().count() as i64)),
             Value::List(values) => Ok(Value::Integer(values.len() as i64)),
             Value::Map(values) => Ok(Value::Integer(values.len() as i64)),
-            Value::Integer(_)
+            Value::Styled(_)
+            | Value::Integer(_)
             | Value::Boolean(_)
             | Value::Regex(_)
             | Value::Glob(_)
@@ -722,6 +738,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                     message: "empty list has no element".into(),
                 }),
             Value::String(_)
+            | Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
             | Value::Regex(_)
@@ -747,6 +764,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 Ok(Value::List(values[range].to_vec()))
             }
             Value::String(_)
+            | Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
             | Value::Regex(_)
@@ -773,6 +791,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 ))
             }
             Value::String(_)
+            | Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
             | Value::Regex(_)
@@ -839,6 +858,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::List),
             Value::Map(_)
+            | Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
             | Value::Regex(_)
@@ -873,6 +893,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 Ok(Value::List(kept))
             }
             Value::Map(_)
+            | Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
             | Value::Regex(_)
@@ -895,7 +916,8 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 name: name.into(),
                 message: "cannot map over a map".into(),
             }),
-            Value::Regex(_)
+            Value::Styled(_)
+            | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
             | Value::Job(_)
@@ -960,6 +982,9 @@ pub(crate) fn join_value(value: Value, separator: &str) -> Result<Value, ExpandE
         }
         match item {
             Value::String(s) => out.push_str(&s),
+            // `:join` builds a string, so a styled element contributes its text —
+            // the joined result is plain, as `+=` is.
+            Value::Styled(styled) => out.push_str(&styled.text),
             Value::Integer(n) => out.push_str(&n.to_string()),
             Value::Boolean(b) => out.push_str(&b.to_string()),
             Value::List(_) => {

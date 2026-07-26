@@ -398,6 +398,7 @@ one-MiB output cap.
 | --- | --- |
 | `puts [arg …]` | Render each argument and print them separated by single spaces, then a newline. No arguments prints a blank line. Rendering is per value: a scalar as itself, a **list** as its elements joined by newlines, a **map** as `key: value` lines. A value with no byte form — a job or stream handle, a function, a pattern — is a loud error rather than a guess, and so is a collection nested inside one. Unlike argv, `puts` sees the real value, so `puts $xs` needs no `...`; a *written* argument keeps its own text, so `puts 007` prints `007`. It takes no flags. |
 | `print [arg …]` | The same as `puts` with **no trailing newline**, for partial lines. No arguments prints nothing. |
+| `style(text, fg: …, bg: …, bold: …)` | A [styled value](#styled-values) — text plus display attributes. A **value call**, parens attached, because a command position yields a status. Colors are the sixteen ANSI names: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `grey` (or `gray`, or `bright-black`), and `bright-` forms of the rest. |
 | `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`. |
 | `pwd` | Print the working directory. |
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
@@ -1687,10 +1688,67 @@ Not yet supported: the richer `:capture` fields `DESIGN.md` leaves open (timing,
 list). `.out`/`.err` are strings rather than true byte-strings — mesh has no
 byte-string type yet, so a capture that is not valid UTF-8 is a loud error.
 
+## Styled values
+
+`style` returns a **string carrying display attributes** — not a new type. Only a
+*renderer* reads the attributes, which today means `puts` and `print` writing to a
+color-capable terminal:
+
+```mesh
+danger = style("danger", fg: red, bold: true)
+puts $danger                  # colored at a terminal, plain text anywhere else
+```
+
+Everywhere bytes are wanted it behaves exactly as its text, which is what makes it
+safe to style a value you also compute with:
+
+```mesh
+puts "level: $danger"         # level: danger        — interpolation sees the text
+puts $danger:len              # 6                    — and so does a modifier,
+p = style("a:b", fg: red)     #                        including one taking
+parts = $p:split(":")         # ['a', 'b']             arguments
+if $danger == danger { … }    # true                 — equality is by text
+if $danger ~ re(dang) { … }   # true                 — so is matching
+x = $danger
+x += "!"                      # 'danger!'            — a plain string; attributes
+                              #                        are rendering-only
+/bin/echo $danger             # danger               — argv carries bytes
+```
+
+`style` is a reserved name, like `re`: a `func style(…)` would be reachable as a
+command but never as a value call, so it is refused rather than shipped as a
+function whose meaning depends on how it is called.
+
+Attributes are **added**, not replaced, so a segment can be emphasized without
+knowing its color — and a call naming no attribute is simply a string:
+
+```mesh
+loud = style($danger, bold: true)   # still red, now bold
+style(x)                            # the plain string `x`
+```
+
+**The color drops itself** when it cannot be seen: stdout is not a terminal
+(a pipe, a redirect, a `$(…)` capture, a `:capture` record), `NO_COLOR` is set to
+anything non-empty, or `TERM=dumb`. The decision is per command, so `puts $danger`
+is colored while `puts $danger > log` is not — there is no setting to manage and no
+capability to probe, because dropping the attributes is always available.
+
+A `style(…)` call is a **value call** and mesh has no call-as-argument form yet, so
+write it through a variable or a function's return value rather than inline:
+
+```mesh
+func dir-info() { style(tilde-pwd(), fg: blue) }    # a prompt segment
+r = style(x, fg: red)
+puts $r                                            # not `puts style(x, fg: red)`
+```
+
 ## Not yet implemented
 
 Most modifier arguments (beyond `:split` / `:join`), the command-word form of an
 argument-taking modifier, and regex capture modifiers are not yet implemented.
 Of heredocs, the command-redirection form documented under Commands works, as do
 here-strings; a value-producing heredoc spelling does not.
+A **value call in an argument position** — `puts style(x, fg: red)`, `puts re(a)`,
+`puts $f(1)` — is a syntax error; assign it first. `style` covers the sixteen ANSI
+colors only, and `link` (OSC 8) does not exist yet.
 See [`ROADMAP.md`](../ROADMAP.md).

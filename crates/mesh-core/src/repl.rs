@@ -35,7 +35,7 @@ use crate::completion::{CompletionCache, CompletionSpec, ValueHint, rank_candida
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
 use crate::options::{Opt, Options};
-use crate::vars::{self, RegexValue, Value, Vars};
+use crate::vars::{self, RegexValue, Style, StyledValue, Value, Vars};
 use crate::{environ, exec, expand, parser};
 
 const COMPLETION_MENU: &str = "completion_menu";
@@ -2589,6 +2589,7 @@ fn eval_expr(
                         expand::slice(&values, low, high, *inclusive).to_vec(),
                     )),
                     Value::String(_)
+                    | Value::Styled(_)
                     | Value::Integer(_)
                     | Value::Boolean(_)
                     | Value::Regex(_)
@@ -2620,6 +2621,7 @@ fn eval_expr(
                         })
                 }
                 Value::String(_)
+                | Value::Styled(_)
                 | Value::Integer(_)
                 | Value::Boolean(_)
                 | Value::Regex(_)
@@ -2835,6 +2837,9 @@ fn eval_call(
         );
     };
     let name = word.value.text();
+    if name == "style" {
+        return eval_style(arguments, last, in_function, shell);
+    }
     if name != "re" {
         // A user function called for its value; an external (or unknown) command
         // has no return value — point at `$(…)` for its output instead.
@@ -2886,6 +2891,106 @@ fn eval_call(
     Ok(Value::Regex(value))
 }
 
+/// `style(TEXT, fg: NAME, bg: NAME, bold: BOOL)` — a **styled value**, per
+/// `DESIGN.md` §"Hooks and the prompt".
+///
+/// A value call rather than a command because a structured return value cannot come
+/// out of a command position, which yields a status. It sits beside `re()` for the
+/// same reason: both are builtins whose arguments are *named*, so neither can go
+/// through the argv path that `pwd()` and `puts()` take.
+///
+/// Styling a styled value **adds to** its attributes rather than replacing them, so
+/// `style(style(x, fg: red), bold: true)` is red and bold — a named argument
+/// overrides just that attribute. That is what lets a caller take someone else's
+/// segment and emphasize it without knowing its color.
+///
+/// The text argument is taken from any value that has one, through the same
+/// rendering `puts` uses minus the styling, so `style($n, fg: red)` on an integer
+/// works and `style($j, …)` on a job handle is the same loud error it is everywhere.
+fn eval_style(
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let mut text: Option<String> = None;
+    let mut style = Style::default();
+    let mut inherited = false;
+    for argument in arguments {
+        match argument {
+            parser::Argument::Positional(expression) if text.is_none() => {
+                let Some(value) = eval_operand(expression, last, in_function, shell)? else {
+                    return Ok(control_placeholder());
+                };
+                // A styled argument carries its attributes in as the defaults, which
+                // is what makes re-styling additive.
+                if let Value::Styled(styled) = &value {
+                    style = styled.style;
+                    inherited = true;
+                }
+                match builtins::rendered_for_output(&value, false) {
+                    Ok(rendered) => text = Some(rendered),
+                    Err(message) => return runtime_error(format!("style(): {message}")),
+                }
+            }
+            parser::Argument::Positional(_) => {
+                return runtime_error("style() takes one text argument");
+            }
+            parser::Argument::Named(name, expression) => {
+                let Some(value) = eval_operand(expression, last, in_function, shell)? else {
+                    return Ok(control_placeholder());
+                };
+                match name.as_str() {
+                    "fg" | "bg" => {
+                        let Value::String(named) = value.plain() else {
+                            return runtime_error(format!(
+                                "style() `{name}` must be a color name; one of {}",
+                                vars::Color::NAMES.join(", ")
+                            ));
+                        };
+                        let Some(color) = vars::Color::named(&named) else {
+                            return runtime_error(format!(
+                                "style(): `{named}` is not a color name; one of {}",
+                                vars::Color::NAMES.join(", ")
+                            ));
+                        };
+                        if name == "fg" {
+                            style.foreground = Some(color);
+                        } else {
+                            style.background = Some(color);
+                        }
+                    }
+                    "bold" => {
+                        let Value::Boolean(flag) = value else {
+                            return runtime_error("style() `bold` must be a boolean");
+                        };
+                        style.bold = flag;
+                    }
+                    _ => {
+                        return runtime_error(format!(
+                            "style(): no `{name}` attribute; it takes `fg`, `bg` and `bold`"
+                        ));
+                    }
+                }
+            }
+            parser::Argument::Spread(_) => {
+                return runtime_error("style() does not accept spread arguments");
+            }
+        }
+    }
+    let Some(text) = text else {
+        return runtime_error("style() requires one text argument");
+    };
+    // A call that named no attribute yields a plain string rather than a styled
+    // value with nothing to render — one representation for one meaning, so
+    // `style(x) == x` holds by type as well as by value. Re-styling is exempt: the
+    // attributes came from the argument and must survive.
+    if style.is_plain() && !inherited {
+        return Ok(Value::String(text));
+    }
+    Ok(Value::Styled(Box::new(StyledValue { text, style })))
+}
+
 /// Is `name` a modifier that requires a parenthesized argument list? Used only to
 /// give a clearer error when such a modifier is written bare (`:split` without
 /// arguments) rather than the generic "not implemented yet".
@@ -2931,6 +3036,10 @@ fn eval_modifier_with_arguments(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
+    // A modifier transforms its subject as text, so a styled one is flattened
+    // first — the same thing `apply_modifier` does for the argument-free ones, and
+    // it has to happen on both paths or `$r:upper` and `$r:split(":")` disagree.
+    let value = value.plain();
     match name {
         "split" | "join" => {
             let Some(separator) =
@@ -3054,6 +3163,9 @@ fn single_callable_argument(
 pub(crate) fn value_kind(value: &Value) -> &'static str {
     match value {
         Value::String(_) => "a string",
+        // Named as a string, because that is what it behaves as everywhere a
+        // diagnostic is talking about: only a renderer sees the difference.
+        Value::Styled(_) => "a string",
         Value::Integer(_) => "an integer",
         Value::Boolean(_) => "a boolean",
         Value::List(_) => "a list",
@@ -3591,7 +3703,10 @@ fn channel_record(value: Option<Value>, out: String, err: String, status: u8) ->
 /// command position. Everything else takes the bytes-only argv rule.
 fn capture_argument_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
     if matches!(name, "puts" | "print") {
-        return match builtins::rendered_for_output(value) {
+        // `decorate: false` — a capture's stdout is a pipe into the record, so a
+        // styled value contributes its text. The record holds data, and escape
+        // bytes in it would compare unequal to the text they decorate.
+        return match builtins::rendered_for_output(value, false) {
             Ok(text) => Ok(vec![text]),
             Err(message) => runtime_error(format!("{name}: {message}")),
         };
@@ -3604,6 +3719,8 @@ fn capture_argument_words(value: &Value, name: &str) -> Result<Vec<String>, Step
 fn argv_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
     match value {
         Value::String(text) => Ok(vec![text.clone()]),
+        // An external takes bytes, so the text crosses and the attributes do not.
+        Value::Styled(styled) => Ok(vec![styled.text.clone()]),
         Value::Integer(number) => Ok(vec![number.to_string()]),
         Value::Boolean(flag) => Ok(vec![flag.to_string()]),
         Value::List(_) => runtime_error(format!(
@@ -3894,6 +4011,12 @@ fn eval_body(
 fn truthy(value: &Value) -> bool {
     match value {
         Value::String(s) => !s.is_empty() && s != "false" && s != "0",
+        // Judged on the text: `style("", fg: red)` is as false as `""`, which is
+        // what makes an empty prompt segment collapse whether it is styled or not.
+        Value::Styled(styled) => {
+            let text = &styled.text;
+            !text.is_empty() && text != "false" && text != "0"
+        }
         Value::Integer(value) => *value == 0,
         Value::Boolean(value) => *value,
         Value::List(v) => !v.is_empty(),
@@ -3974,8 +4097,11 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
         Less | LessEqual | Greater | GreaterEqual => {
             let ordering = match (&left, &right) {
                 (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
-                (Value::String(left), Value::String(right)) => left.cmp(right),
-                _ => return Err("comparison requires two integers or two strings".into()),
+                // A styled value orders as its text, the same rule `==` follows.
+                _ => match (left.as_text(), right.as_text()) {
+                    (Some(left), Some(right)) => left.cmp(right),
+                    _ => return Err("comparison requires two integers or two strings".into()),
+                },
             };
             bool_value(match op {
                 Less => ordering.is_lt(),
@@ -3987,30 +4113,39 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
         }
         And => bool_value(truthy(&left) && truthy(&right)),
         Or => bool_value(truthy(&left) || truthy(&right)),
-        In => match right {
-            Value::List(values) => bool_value(values.contains(&left)),
-            Value::Map(values) => match left {
+        // `in` asks about membership and substrings, both of which read the text —
+        // and `Value`'s own equality is by text, so `style(x, fg: red) in $xs`
+        // finds a plain `x`. Flattening both sides says that once.
+        In => match (left.plain(), right.plain()) {
+            (left, Value::List(values)) => bool_value(values.contains(&left)),
+            (left, Value::Map(values)) => match left {
                 Value::String(key) => {
                     bool_value(values.iter().any(|(candidate, _)| candidate == &key))
                 }
                 _ => return Err("map key must be a string".into()),
             },
-            Value::String(text) => match left {
+            (left, Value::String(text)) => match left {
                 Value::String(needle) => bool_value(text.contains(&needle)),
                 _ => return Err("left operand of `in` must be a string".into()),
             },
-            Value::Integer(_)
-            | Value::Boolean(_)
-            | Value::Regex(_)
-            | Value::Glob(_)
-            | Value::Stream(_)
-            | Value::Job(_)
-            | Value::Function(_) => {
+            (
+                _,
+                Value::Styled(_)
+                | Value::Integer(_)
+                | Value::Boolean(_)
+                | Value::Regex(_)
+                | Value::Glob(_)
+                | Value::Stream(_)
+                | Value::Job(_)
+                | Value::Function(_),
+            ) => {
                 return Err("right operand of `in` must be a collection or string".into());
             }
         },
         Match | NotMatch => {
-            let Value::String(text) = left else {
+            // Matching reads the text, as `==` and `<` do, so a styled subject is
+            // matched on its text rather than refused.
+            let Some(text) = left.as_text().map(str::to_owned) else {
                 return Err("left operand of `~` must be a string".into());
             };
             let matched = match right {
@@ -4101,8 +4236,12 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
         };
     }
     // A builtin that reads typed arguments keeps them here too, so a handle or a
-    // list reaches it through a redirection exactly as it does without one.
-    let expanded = match typed_builtin_words(&words, &shell.vars) {
+    // list reaches it through a redirection exactly as it does without one. Styling
+    // is the one thing that *does* change: `> file` means this command's stdout is
+    // not the terminal, whatever the shell's own stdout is. Backgrounding does not
+    // change it — the fork inherits the shell's stdout.
+    let decorate = !redirects_stdout(&redirs) && builtins::colors_wanted();
+    let expanded = match typed_builtin_words(&words, &shell.vars, decorate) {
         Some(words) => words,
         None => expand::expand(words, &shell.vars).map_err(|err| {
             note!("mesh: {err}");
@@ -4171,12 +4310,17 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
 fn run_multi(stages: Vec<Stage>, background: bool, last: u8, shell: &mut Shell) -> Step {
     let mut cmds = Vec::with_capacity(stages.len());
     let mut bodies = Vec::with_capacity(stages.len());
-    for stage in stages {
+    let count = stages.len();
+    for (index, stage) in stages.into_iter().enumerate() {
         let Stage {
             words,
             redirs,
             pipe_stderr,
         } = stage;
+        // Only the last stage can be writing to the terminal; every earlier one has
+        // stdout on a pipe, so a styled value there renders as plain text.
+        let decorate =
+            index + 1 == count && !redirects_stdout(&redirs) && builtins::colors_wanted();
         // Command words expand before the redirect targets, the order `run_single`
         // uses, so a stage reports the same first failure the unpiped command
         // does — and `f * > summary` cannot glob the file the redirection is
@@ -4200,7 +4344,7 @@ fn run_multi(stages: Vec<Stage>, background: bool, last: u8, shell: &mut Shell) 
         } else {
             // A stage expands its own words, so a builtin that reads typed
             // arguments needs the same conversion here as it gets elsewhere.
-            let expanded = match typed_builtin_words(&words, &shell.vars) {
+            let expanded = match typed_builtin_words(&words, &shell.vars, decorate) {
                 Some(words) => words,
                 None => expand::expand(words, &shell.vars).map_err(|err| {
                     note!("mesh: {err}");
@@ -4344,6 +4488,23 @@ fn run_stage_in_shell(body: &StageBody, cmd: &exec::Cmd, last: u8, shell: &mut S
 /// travel that way — arbitrary bytes, a body past the argument limit, an
 /// embedded NUL. The stage forks and `execvp`s itself now, so the body reaches
 /// its own process as memory and the temporary is written there.
+/// Does any of these redirections take stdout somewhere else?
+///
+/// The question a styled value's rendering turns on: a command whose stdout is a
+/// file or another descriptor is not writing to a terminal, whatever the shell's
+/// own stdout happens to be. Only the descriptor is consulted, not the target, so
+/// this is answerable *before* the targets are expanded and opened — which is when
+/// it has to be answered, since the words are rendered first.
+fn redirects_stdout(redirs: &[Redir]) -> bool {
+    redirs.iter().any(|redir| {
+        let fd = redir.fd.unwrap_or(match redir.kind {
+            exec::RedirKind::In => 0,
+            exec::RedirKind::Out | exec::RedirKind::Append => 1,
+        });
+        fd == 1
+    })
+}
+
 fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirection>, String> {
     let mut out = Vec::with_capacity(redirs.len());
     for redir in redirs {
@@ -4469,7 +4630,8 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         };
         return dispatch_function_call(&name, args, shell);
     }
-    if let Some(words) = typed_builtin_words(&tokens, &shell.vars) {
+    // No redirection on this path, so the command's stdout is the shell's.
+    if let Some(words) = typed_builtin_words(&tokens, &shell.vars, builtins::colors_wanted()) {
         return match words {
             Ok(words) => run_expanded(words, last, shell),
             Err(step) => step,
@@ -4491,8 +4653,18 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
 /// Every path that runs a command expands its own words, so they all go through
 /// here: `puts $xs`, `puts $xs > out` and `puts $xs | cat` have to render the list
 /// the same way, just as `kill $j` and `kill $j | cat` have to name the same job.
-fn typed_builtin_words(words: &[Word], vars: &Vars) -> Option<Result<Vec<String>, Step>> {
-    job_builtin_words(words, vars).or_else(|| output_builtin_words(words, vars))
+///
+/// `decorate` is each caller's answer to "does this command's stdout reach a
+/// color-capable terminal", which decides whether a **styled** value emits its
+/// attributes. It has to be the caller's because words are rendered *before* a
+/// redirection is opened or a pipe is attached, so this function's own view of
+/// stdout is the shell's, not the command's.
+fn typed_builtin_words(
+    words: &[Word],
+    vars: &Vars,
+    decorate: bool,
+) -> Option<Result<Vec<String>, Step>> {
+    job_builtin_words(words, vars).or_else(|| output_builtin_words(words, vars, decorate))
 }
 
 /// `puts`/`print`'s words, with their arguments rendered from **values** rather
@@ -4517,14 +4689,18 @@ fn typed_builtin_words(words: &[Word], vars: &Vars) -> Option<Result<Vec<String>
 ///
 /// `--help` survives: the word is still `--help`, which the auto-help check ahead
 /// of dispatch reads the same way it always did.
-fn output_builtin_words(words: &[Word], vars: &Vars) -> Option<Result<Vec<String>, Step>> {
+fn output_builtin_words(
+    words: &[Word],
+    vars: &Vars,
+    decorate: bool,
+) -> Option<Result<Vec<String>, Step>> {
     let name = command_name(words, vars)?;
     if !matches!(name.as_str(), "puts" | "print") {
         return None;
     }
     let mut expanded = vec![name.clone()];
     for word in words.iter().skip(1) {
-        match output_words(word, vars, &name) {
+        match output_words(word, vars, &name, decorate) {
             Ok(rendered) => expanded.extend(rendered),
             Err(step) => return Some(Err(step)),
         }
@@ -4537,8 +4713,11 @@ fn output_builtin_words(words: &[Word], vars: &Vars) -> Option<Result<Vec<String
 /// A word whose values are all plain scalars keeps exactly the text ordinary
 /// expansion gives it, so a glob still contributes one word per match and a bare
 /// `007` still prints as written. Anything else — a list, a map, a value with no
-/// byte form at all — is rendered per `DESIGN.md` §"I/O".
-fn output_words(word: &Word, vars: &Vars, name: &str) -> Result<Vec<String>, Step> {
+/// byte form at all, a styled value — is rendered per `DESIGN.md` §"I/O".
+fn output_words(word: &Word, vars: &Vars, name: &str, decorate: bool) -> Result<Vec<String>, Step> {
+    // A styled value is deliberately *not* a scalar here: its rendering is the
+    // whole point, so it must not fall through to ordinary expansion, which would
+    // hand over the text with the attributes dropped.
     let scalar = |value: &Value| {
         matches!(
             value,
@@ -4549,7 +4728,7 @@ fn output_words(word: &Word, vars: &Vars, name: &str) -> Result<Vec<String>, Ste
         Ok(values) if !values.iter().all(scalar) => values
             .iter()
             .map(|value| {
-                builtins::rendered_for_output(value).map_err(|message| {
+                builtins::rendered_for_output(value, decorate).map_err(|message| {
                     note!("mesh: {name}: {message}");
                     Step::Continue(1)
                 })
