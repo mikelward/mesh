@@ -291,12 +291,28 @@ A value argument is a **whole** argument: text attached to it (`pre$(x)post`, `f
 is a syntax error rather than silently three arguments. Quote the word to glue them —
 `"pre$(x)post"`, which interpolates (see [Quoting](#quoting)).
 
-It cannot be **backgrounded** yet: `puts $(sleep 10) &` is refused, because the
-argument would run in the shell rather than in the job's fork — the prompt would hang
-for ten seconds and the `&` would buy nothing. The same goes for an interpolated
-capture (`puts "$(sleep 10)" &`) and one in a redirect target, which are evaluated in
-the same place. Bind it first (`m = $(…)` then `cmd $m &`). A foreground pipeline is
-fine.
+A stage that carries a value evaluates it **in its own process**. So backgrounding
+one returns at once — `puts $(sleep 10) &` spends the ten seconds in the job, not at
+the prompt — and a call in a piped or backgrounded argument keeps its changes in that
+stage, the same isolation the stage's own body gets:
+
+```mesh
+n = before
+func change() { global n = MUTATED
+  return x }
+puts change() | cat           # x
+puts n=$n                     # n=before
+```
+
+A command that **redirects** is the exception: it keeps evaluating its values in the
+shell, and backgrounding one (`puts $(name) > out &`) is refused. The shell resolves
+every stage's targets before it forks any of them, and resolves them in parallel so
+`cat < fifo | cmd > fifo` cannot deadlock — so handing the words to the stage while
+the targets stayed here would expand the targets *first*, against the order above.
+Bind it first: `m = $(…)` then `cmd $m > out &`.
+
+A job listing shows a value it has not evaluated as `$(…)` — `puts $(pwd) &` lists as
+`puts $(…)` — since printing it would mean running it in the shell.
 
 A following `<` or `>` is still a **redirection**, so `puts (1 + 2) > out` writes the
 file. That is because an argument is parsed just above comparison precedence; a

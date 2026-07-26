@@ -13055,62 +13055,104 @@ fn a_value_argument_needs_a_command_word_before_it() {
 }
 
 #[test]
-fn a_backgrounded_value_argument_is_refused_rather_than_run_in_the_shell() {
-    // The argument is evaluated while the stage is assembled, before the fork, so
-    // backgrounding it would run the work in the shell: `puts $(sleep …) &` would hang
-    // the prompt and the `&` would buy nothing. And a mutating call would change the
-    // parent's globals, where `docs/REFERENCE.md` says a background stage's changes
-    // stay in the child.
-    // An interpolated capture is evaluated in the same place for the same reason, so
-    // it is refused in the same breath — checking only `CommandItem::Value` left
-    // `puts "$(sleep …)" &` hanging the prompt, since the capture rides inside a
-    // *word*. A redirect target counts too.
-    for source in [
-        "puts $(pwd) &\n",
-        "puts \"[$(pwd)]\" &\n",
-        "puts hi > \"o$(pwd).txt\" &\n",
-    ] {
-        let refused = run_with_input(&format!("{source}puts after\n"));
+fn a_stage_evaluates_its_own_value_arguments_in_its_fork() {
+    // A value used to be evaluated while the stage was assembled, before the fork, so
+    // the work landed in the shell: `puts $(sleep …) &` was refused outright because
+    // it would hang the prompt, and a mutating call in a *piped* stage reached the
+    // parent's bindings where `docs/REFERENCE.md` says the fork keeps them.
+
+    // Backgrounding one is ordinary now, and the claim `&` makes is about the
+    // **shell**: it does not wait. Which process reaches stdout first is a race the
+    // background child can legitimately win, so this measures the shell instead —
+    // one that evaluated a five-second value itself could not finish the script in
+    // under five seconds, and one that hands it to the job finishes at once.
+    for source in ["puts $(/bin/sleep 5) &\n", "puts \"[$(/bin/sleep 5)]\" &\n"] {
+        let start = std::time::Instant::now();
+        let backgrounded = run_with_input(&format!("{source}puts after\n"));
+        let elapsed = start.elapsed();
+        // Stderr carries the `[1] <pid>` registration notice, and nothing else: the
+        // command was accepted rather than refused.
+        let stderr = String::from_utf8_lossy(&backgrounded.stderr);
+        assert!(stderr.starts_with("[1] "), "{source:?}: {stderr:?}");
+        assert!(!stderr.contains("mesh:"), "{source:?}: {stderr:?}");
+        assert_eq!(String::from_utf8_lossy(&backgrounded.stdout), "after\n");
         assert!(
-            String::from_utf8_lossy(&refused.stderr).contains("cannot be backgrounded yet"),
-            "{source:?}: {:?}",
-            refused.stderr
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&refused.stdout),
-            "after\n",
-            "{source:?}"
+            elapsed < std::time::Duration::from_secs(3),
+            "{source:?}: the shell waited {elapsed:?} for a backgrounded value"
         );
     }
 
-    // The isolation rule it protects, on the spelling it protects it from: a mutating
-    // call in an interpolated capture reached the parent's globals.
-    let unmutated = run_with_input(
-        "n = before\nfunc change() { global n = MUTATED }\nputs \"[$(change)]\" &\nputs n=$n\n",
-    );
-    assert!(
-        String::from_utf8_lossy(&unmutated.stdout).contains("n=before"),
-        "{:?}",
-        unmutated.stdout
-    );
+    // The isolation the deferral is really about, on both spellings that fork. Piped
+    // left `n=MUTATED` before; backgrounded was refused rather than wrong.
+    for source in ["puts change() | cat\n", "puts change() &\nwait\n"] {
+        let isolated = run_with_input(&format!(
+            "n = before\nfunc change() {{ global n = MUTATED\n  return x }}\n{source}puts n=$n\n"
+        ));
+        let stdout = String::from_utf8_lossy(&isolated.stdout);
+        assert!(stdout.contains('x'), "{source:?}: {stdout:?}");
+        assert!(stdout.contains("n=before"), "{source:?}: {stdout:?}");
+    }
 
-    // The same rule on the spelling that does work: a backgrounded *function* keeps
-    // its changes in the child.
-    let isolated = run_with_input(
-        "n = before\nfunc change() { global n = MUTATED\n  puts ran }\nchange &\nwait\nputs n=$n\n",
+    // A stage that **redirects** cannot defer: the shell resolves every stage's
+    // targets before it forks any of them, in parallel, so deferring the words alone
+    // would put the targets first. Backgrounding one stays refused — whether the
+    // value is in a word or in the target itself.
+    for source in ["puts hi > \"o$(pwd).txt\" &\n", "puts $(pwd) > out.txt &\n"] {
+        let refused = run_with_input(&format!("{source}puts after\n"));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("a value cannot be backgrounded with a redirection yet"),
+            "{source:?}: {:?}",
+            refused.stderr
+        );
+        assert_eq!(String::from_utf8_lossy(&refused.stdout), "after\n");
+    }
+
+    // Each kind of command a deferred stage can turn out to be, since the kind is not
+    // known until the fork expands the words: an external to `exec`, a builtin, a
+    // function — and an external that does not exist, still 127 with the same message.
+    let kinds = run_with_input(
+        "func f(x) { puts f=$x }\n\
+         /bin/echo $(puts ext) | cat\n\
+         puts $(puts builtin) | cat\n\
+         f $(puts fn) | cat\n\
+         nosuchcmd $(pwd) | cat\n\
+         puts status=$sh.status\n",
     );
     assert_eq!(
-        String::from_utf8_lossy(&isolated.stdout),
-        "ran\nn=before\n",
+        String::from_utf8_lossy(&kinds.stdout),
+        "ext\nbuiltin\nf=fn\nstatus=127\n",
         "{:?}",
-        isolated.stderr
+        kinds.stderr
+    );
+    assert!(
+        String::from_utf8_lossy(&kinds.stderr).contains("command not found: nosuchcmd"),
+        "{:?}",
+        kinds.stderr
     );
 
-    // A foreground pipeline is allowed: the stage forks, but the pipeline waits either
-    // way and the result is right.
-    let piped = run_with_input("puts $(puts hi) | cat\n");
-    assert_eq!(String::from_utf8_lossy(&piped.stdout), "hi\n");
-    assert!(piped.stderr.is_empty(), "{:?}", piped.stderr);
+    // What a stage cannot be is still refused in the same terms, now that the words
+    // deciding it are only known in the fork. `return` unwinds a function; reaching it
+    // through a variable is the one way it can land in a stage.
+    let piped_return = run_with_input("c = return\nputs hi | $c $(puts 3)\nputs s=$sh.status\n");
+    assert!(
+        String::from_utf8_lossy(&piped_return.stderr)
+            .contains("return: cannot be used in a pipeline"),
+        "{:?}",
+        piped_return.stderr
+    );
+    assert!(String::from_utf8_lossy(&piped_return.stdout).contains("s=2"));
+
+    // Backgrounded, the refusal comes from the job rather than the prompt — the same
+    // shape any failing background command has (`nosuchcmd &` starts and reports 127).
+    let background_return = run_with_input("c = return\n$c $(puts 3) &\nwait\nputs s=$sh.status\n");
+    assert!(
+        String::from_utf8_lossy(&background_return.stderr)
+            .contains("return: cannot be redirected or backgrounded"),
+        "{:?}",
+        background_return.stderr
+    );
+    assert!(String::from_utf8_lossy(&background_return.stdout).contains("s=2"));
 }
 
 #[test]
@@ -13193,7 +13235,75 @@ fn a_redirect_target_is_expanded_after_every_word() {
         Some("x\n")
     );
 
+    // The order holds for a **piped** stage carrying a value too, which is what stops
+    // such a stage deferring its words to its own fork: deferring the words alone
+    // would leave the target expanded first, and then a failing one stopped the words
+    // from running at all and a glob matched the file its own redirection created.
+    let globbed = fresh_dir("redirect_target_after_words_piped");
+    std::fs::write(globbed.join("a1"), "").unwrap();
+    std::fs::write(globbed.join("a2"), "").unwrap();
+    let counted = run_with_input(&format!(
+        "cd {}\nfunc f(...xs) {{ puts got=$xs:len }}\nf * $(puts x) > summary | cat\n",
+        globbed.display()
+    ));
+    // `a1`, `a2` and the value — not the `summary` the redirection creates.
+    assert_eq!(String::from_utf8_lossy(&counted.stdout), "");
+    assert_eq!(
+        std::fs::read_to_string(globbed.join("summary"))
+            .ok()
+            .as_deref(),
+        Some("got=3\n"),
+        "{:?}",
+        counted.stderr
+    );
+
+    // And a failing target does not stop the words from running.
+    let failing = run_with_input(
+        "func g() { puts G-RAN\n  return x }\nputs g() > $missing | cat\nputs s=$sh.status\n",
+    );
+    let stdout = String::from_utf8_lossy(&failing.stdout);
+    assert!(stdout.contains("G-RAN"), "{stdout:?}");
+    assert!(stdout.contains("s=1"), "{stdout:?}");
+
+    let _ = std::fs::remove_dir_all(&globbed);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_deferred_stage_does_not_reap_a_finished_job_out_from_under_a_later_wait() {
+    // A stage whose words are expanded in its own fork could turn out to be `jobs`,
+    // which needs a refreshed table — but almost every one of them is an ordinary
+    // command, and reaping for those takes a finished job out from under a later
+    // `fg`/`wait`, the very cost the refresh is kept conditional to avoid. So the
+    // command *word* is asked, before anything is expanded.
+    let ordinary = run_with_input(
+        "j = /bin/sh -c \"exit 7\" &\n\
+         /bin/sleep 0.3\n\
+         puts $(puts hi) | cat\n\
+         wait $j\n\
+         puts s=$sh.status\n",
+    );
+    let stdout = String::from_utf8_lossy(&ordinary.stdout);
+    assert!(stdout.contains("hi"), "{stdout:?}");
+    // The handle still names the job, and `wait` gives back its status. Reaping at
+    // the deferred stage left `mesh: wait: no current job` and a status of 1.
+    assert!(stdout.contains("s=7"), "{stdout:?}");
+    assert!(
+        !String::from_utf8_lossy(&ordinary.stderr).contains("no current job"),
+        "{:?}",
+        ordinary.stderr
+    );
+
+    // A deferred stage that *is* `jobs` still refreshes: the command word says so
+    // without anything being expanded.
+    let listing = run_with_input(
+        "/bin/sh -c \"exit 7\" &\n/bin/sleep 0.3\njobs $(puts x) | cat\nputs after\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&listing.stderr).contains("Done"),
+        "{:?}",
+        listing.stderr
+    );
 }
 
 #[test]
