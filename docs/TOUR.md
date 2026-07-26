@@ -219,9 +219,14 @@ mesh$ <strong>jobs</strong>
 mesh$ <strong>wait $j</strong>
 </pre>
 
-`fg`, `bg`, `wait`, and `kill` all take a handle, a `%1`-style reference, or a
-bare job id (`fg 1`). The whole table is a value too — `$sh.jobs` — so a prompt
-can read the live jobs straight out of it instead of scraping `jobs` output.
+`fg`, `bg`, `wait`, and `kill` all take a handle or a `%1`-style reference. The
+first three only ever mean a job, so a bare number is one there too (`fg 1` is
+`fg %1`) — but **`kill` is the exception**: `kill 1` signals *process* 1, as it
+does in every shell, so name the job (`kill %1`, `kill $j`) when that is what you
+mean. That distinction is why a handle has no text form.
+
+The whole table is a value too — `$sh.jobs` — so a prompt can read the live jobs
+straight out of it instead of scraping `jobs` output.
 
 ## Matching filenames
 
