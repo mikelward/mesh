@@ -33,6 +33,7 @@ mod exec;
 mod expand;
 mod funcs;
 pub mod parser;
+mod reaper;
 mod repl;
 mod vars;
 
