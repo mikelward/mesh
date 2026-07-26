@@ -694,6 +694,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `wait job` | Wait for a job to finish and report its status — see [Job control](#job-control). |
 | `kill [-signal] job\|pid …` | Signal a job's process group, or a pid. Default `TERM`. |
 | `disown [-h] [-a \| -r] [job …]` | Stop tracking a job — see [Job control](#job-control). |
+| `command [--] name [arg …]` | Run the **program** `name`, past the builtin or function that name would otherwise reach — which is what makes `func ls() { command ls --color=auto }` safe to write, and what reaches `/usr/bin/env` when a function of that name is in the way. Only the words in front of the program are `command`'s own: `command ls --help` asks `ls` for its help, and `--` ends `command`'s options so the word after it is the program however it reads. `--help` is the only option it has, so any other flag-looking word in front of the program is a usage error (status `2`) rather than a program name — `command -v` / `-V` are held for the unbuilt half, and `command -- -v` runs a program called `-v`. The operand is the program with nothing peeled off it, so `command command x` looks for a program called `command`. A builtin's name finds no program, and says so; with no operand at all the status is `2`. |
 | `source file` | Run a file's mesh code in this shell — see [`source`](#source). |
 
 ### Flags and `--`
@@ -717,8 +718,19 @@ kill -- -9 %1                 # looks for a job named `-9`, not signal 9
 
 Which command consumes it depends on which has options to end. `puts`, `print`, `gets`,
 `clip`, `notify`, `cd`, `source` and `help` have none of their own, so the terminator
-is simply removed. `kill`, `disown`, `prompt` and `prompt-hook` do, so each ends its
-own options at `--` — only they know where those stop.
+is simply removed. `kill`, `disown`, `prompt`, `prompt-hook` and `command` do, so each
+ends its own options at `--` — only they know where those stop.
+
+`command` is also where the `--help` rule stops applying, because the arguments
+after the program name are not mesh's to read:
+
+```mesh
+command grep -- -x file       # `--` reaches grep; it looks for the line `-x`
+command grep --help           # grep's own help, not mesh's
+command --help                # mesh's help for `command` itself
+command -v ls                 # error: `command` has no `-v`; status 2
+command -- -v                 # runs a program called `-v`
+```
 
 ### Job control
 
@@ -1989,7 +2001,10 @@ greet world          # -> hi, world
   session scope on purpose, say `global` (see below).
 - **Resolution.** A name in command position resolves as **builtin → function →
   external**. The supplied arguments must satisfy the signature (a bad count or an
-  unknown/misused flag is a loud, recoverable error).
+  unknown/misused flag is a loud, recoverable error). A function cannot take a
+  builtin's name, and [`command name …`](#builtins) skips the chain entirely to run
+  the program — which is what lets `func ls() { command ls --color=auto }` wrap the
+  command it names instead of calling itself.
 - **Arguments.** A function preserves typed values: a bare list (`f $xs`) arrives
   intact as one list-valued positional, whereas an external command still needs it
   spread (`...$xs`) or joined. A spread contributes one argument per element.
@@ -2299,4 +2314,6 @@ Of heredocs, the command-redirection form documented under
 Commands works, as do here-strings; a value-producing heredoc spelling does not.
 The history designators `!!`, `!string`, and `!n` are not implemented — only
 `!^`, `!$`, and `!*` are. `style` covers the sixteen ANSI colors only.
+`command` runs a program; the `-v` / `-V` half of it — "what would this name
+run?" — is not implemented, and is likely to arrive as a value rather than a flag.
 See [`ROADMAP.md`](../ROADMAP.md).

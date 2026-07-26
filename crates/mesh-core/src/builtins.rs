@@ -43,6 +43,10 @@ const TABLE: &[(&str, &str)] = &[
         "prompt-hook [--remove] [EVENT] NAME [FUNCTION]",
         "Register a function for a prompt event",
     ),
+    (
+        "command [--] NAME [ARG ...]",
+        "Run a program, past builtins and functions",
+    ),
     ("source FILE", "Run a file's commands in this shell"),
     ("help [NAME ...]", "List the builtins, or explain one"),
 ];
@@ -131,10 +135,19 @@ const REPLACED: &[(&str, &str)] = &[
     ("unalias", NO_ALIASES),
 ];
 
-/// What `command not found` adds for a name bash spells differently, so a bash
-/// reflex lands on mesh's spelling instead of a dead end. `None` for every
-/// other name — a typo gets the plain message.
+/// What `command not found` adds for a name mesh has an answer for: one bash
+/// spells differently, so a bash reflex lands on mesh's spelling instead of a
+/// dead end, or one that names a builtin, which only `command` can have looked
+/// past. `None` for every other name — a typo gets the plain message.
 pub(crate) fn rename_note(name: &str) -> Option<String> {
+    // A builtin's name only reaches an external lookup through `command`, which
+    // is defined to look past the builtins. Saying so beats a bare "not found"
+    // for a name the reader can see in `help`.
+    if is_builtin(name) {
+        return Some(format!(
+            "`{name}` is a builtin; `command` looks for a program"
+        ));
+    }
     if let Some((_, mesh)) = RENAMED.iter().find(|(bash, _)| *bash == name) {
         return Some(if is_builtin(mesh) {
             format!("mesh spells this `{mesh}`")
@@ -187,8 +200,11 @@ fn format_help(usage: &str, summary: &str) -> String {
 /// reader who is told "not a keyword" about `unless` has been told something
 /// false. The tests hold both lists against this table.
 const SYNTAX: &[(&[&str], &str, &str)] = &[
+    // Looked up as `cmd`, the word the form is written in, because `command` is
+    // a builtin of its own now — and `help command` is a question about that
+    // builtin, which answers with its usage.
     (
-        &["command"],
+        &["cmd"],
         "cmd arg …",
         "Run a builtin, a function, or a program",
     ),
@@ -939,7 +955,7 @@ fn exit(args: &[String], last: u8) -> Builtin {
 mod tests {
     use super::{
         Decoration, SYNTAX, TABLE, Value, base64, help, is_builtin, names, overview, path_line,
-        rename_note, rendered_for_output, syntax_help,
+        reads_options, rename_note, rendered_for_output, syntax_help,
     };
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
@@ -1025,11 +1041,21 @@ mod tests {
 
     #[test]
     fn an_ordinary_unknown_name_gets_no_note() {
-        // The note is for a bash reflex, not for a typo — anything else keeps
-        // the bare message.
+        // The note is for a bash reflex or a builtin, not for a typo — anything
+        // else keeps the bare message.
         assert_eq!(rename_note("nosuchcmd"), None);
-        assert_eq!(rename_note("puts"), None);
         assert_eq!(rename_note(""), None);
+    }
+
+    #[test]
+    fn a_builtin_that_was_looked_for_as_a_program_says_so() {
+        // Only `command` can have got here: it is defined to look past the
+        // builtins, so "not found" alone would read as a lie about a name the
+        // reader can see in `help`.
+        assert_eq!(
+            rename_note("puts").as_deref(),
+            Some("`puts` is a builtin; `command` looks for a program")
+        );
     }
 
     #[test]
@@ -1041,6 +1067,31 @@ mod tests {
                 "Copy text to the terminal's clipboard\n\nUsage: clip [TEXT ...]\n\nOptions:\n  --help  Print help\n"
             )
         );
+    }
+
+    #[test]
+    fn command_is_a_builtin_that_owns_its_terminator() {
+        assert!(is_builtin("command"));
+        assert_eq!(
+            help("command").as_deref(),
+            Some(
+                "Run a program, past builtins and functions\n\nUsage: command [--] NAME [ARG ...]\n\nOptions:\n  --help  Print help\n"
+            )
+        );
+        // Everything after the program name belongs to the program, so the
+        // terminator cannot be taken out centrally: `command grep -- -x file`
+        // has to reach `grep` as written.
+        assert!(reads_options("command"));
+    }
+
+    #[test]
+    fn a_bare_command_line_is_explained_as_syntax_and_the_builtin_as_itself() {
+        // The word `command` now names a builtin, so `help command` is a question
+        // about it; the shape of a plain command line answers to `cmd`, the word
+        // its form is written in.
+        assert!(help("command").is_some());
+        assert_eq!(syntax_help("command"), None);
+        assert!(syntax_help("cmd").is_some_and(|help| help.contains("cmd arg …")));
     }
 
     #[test]

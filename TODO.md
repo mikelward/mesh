@@ -1099,6 +1099,37 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       the type half is reachable through the `:files` / `:dirs` modifiers and the
       `files()` / `dirs()` wrappers, the size/age/`exec`/`empty` half not at all.
 
+## Beyond M3 — `command` ✅ (landed)
+
+- [x] `command [--] NAME [ARG …]` — run the **program** `NAME`, past the builtin
+      or function the bare name would reach. This is what makes a wrapper
+      writable: `func ls() { command ls --color=auto }` calls the program rather
+      than itself, and there was no other way to say it, since a function is
+      looked up before an external and cannot be spelled around. Only the words in
+      **front of** the program are `command`'s own — everything from the program
+      name on is the program's, so `command ls --help` asks `ls` for its help
+      instead of printing mesh's, which is exactly the interception the builtin
+      exists to escape. `command` owns its `--` for the same reason. The prefix is
+      taken off *before* a stage is built, so a piped, redirected or backgrounded
+      one is the program's own process rather than a forked shell that then runs
+      it, and a job listing names the program. A builtin's name finds no program
+      and says so, rather than reporting a bare "command not found" about a name
+      `help` lists. A flag-looking word in **front of** the program is a usage
+      error rather than a program name, which is what keeps `command -v ls` from
+      answering "command not found: -v" — a true statement about the wrong
+      question — and keeps the option space free for the entry below. Completion
+      follows the same resolution: `command <Tab>` offers `$PATH` alone, and
+      `command NAME --<Tab>` asks the program, not the function wrapping it.
+
+- [ ] **`command -v NAME` / `-V` — what would this name run?** POSIX's other half
+      of the builtin, and the answer to "is this a function, a builtin, or which
+      file on `$PATH`". It is a different job from running something, and it wants
+      a decision first: mesh has typed values, so the useful form may be a
+      `$sh.which(…)`-style **value** (a map naming the kind and the path) rather
+      than a flag that prints a line. Left out rather than half-built — but
+      `command -v` is already refused rather than read as a program name, so
+      building it later cannot change what a working line meant.
+
 ## Loose ends
 
 Small items rescued from pull requests that were closed as superseded — the bulk

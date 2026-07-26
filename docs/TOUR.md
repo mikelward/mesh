@@ -757,6 +757,19 @@ A function is also an ordinary pipeline stage or background job — `f | sort`,
 `echo x | f`, `f &` — each running in its own process, exactly as an external
 command does.
 
+To **wrap** a command, give the function the command's own name and reach the
+program with `command`, which looks past the builtins and functions a bare name
+would find. Without it the body would call the function again:
+
+<pre>
+mesh$ <strong>func ls(...args) { command ls --color=auto ...$args }</strong>
+mesh$ <strong>ls</strong>
+docs  src
+</pre>
+
+Everything after the program name belongs to the program, so `command ls --help`
+asks `ls` for its help rather than printing mesh's.
+
 ## Calling a function for a value
 
 Attach the parentheses and you get the function's **value** rather than its

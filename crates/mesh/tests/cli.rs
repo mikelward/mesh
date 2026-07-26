@@ -479,6 +479,165 @@ fn an_ordinary_missing_command_keeps_the_bare_message() {
 }
 
 #[test]
+fn command_runs_the_program_past_a_function_of_the_same_name() {
+    // The bare name is the function, as always; `command` is how the program it
+    // wraps is still reachable, which is what makes `func ls() { ls --color }`
+    // safe to write.
+    let out = run_with_input("func echo(word) { puts mine }\necho hi\ncommand echo hi\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "mine\nhi\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn command_looks_past_a_builtin_and_says_so_when_there_is_no_program() {
+    // `command` is defined to look for a program, so a builtin's name is not
+    // found — and a bare "command not found: puts" would read as a lie about a
+    // name `help` lists.
+    let out = run_with_input("command puts hi\n");
+    assert_eq!(out.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "command not found: puts (`puts` is a builtin; `command` looks for a program)"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn commands_own_words_are_only_the_ones_in_front_of_the_program() {
+    // Everything from the program name on belongs to the program: `--help` after
+    // it is the program's question, which is the whole point of the builtin.
+    let out = run_with_input("func printf(x) { puts mine }\ncommand printf '%s\\n' --help\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "--help\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Its own `--help` is the first word after it, and prints mesh's help.
+    let out = run_with_input("command --help\n");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Usage: command [--] NAME [ARG ...]"),
+        "{stdout}"
+    );
+
+    // `--` ends those options and is consumed, so the word after it is the
+    // program however it reads.
+    let out = run_with_input("command -- echo dashed\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "dashed\n");
+
+    // Nothing to run is an error rather than a silent success, since a `command`
+    // with no program in it is a line that lost its command.
+    let out = run_with_input("command\nputs $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("command: expected a program to run"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_flag_in_front_of_the_program_is_commands_own() {
+    // The bash reflex. Reading `-v` as a program name would answer "command not
+    // found: -v" — true, and about the wrong question — and would then be the
+    // meaning `command -v` had to keep once the option is built.
+    let out = run_with_input("command -v ls\nputs $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("command: -v: asking what a name would run is not built yet"),
+        "{stderr}"
+    );
+
+    // Any other flag-looking word is simply not an option of `command`'s.
+    let out = run_with_input("command --hepl ls\nputs $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("command: --hepl: not an option of `command`"),
+        "{stderr}"
+    );
+
+    // Both messages point at the escape, and it works: after `--` the word is the
+    // program, so this is an ordinary "no such program" about `-v` itself.
+    let out = run_with_input("command -- -v\n");
+    assert_eq!(out.status.code(), Some(127));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("command not found: -v"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_command_stage_is_the_program_itself() {
+    // Piped, redirected, backgrounded: the prefix comes off before the stage is
+    // built, so each of these is the program's own process rather than a forked
+    // shell that then runs it.
+    let out = run_with_input("func tr() { puts mine }\ncommand echo piped | command tr a-z A-Z\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "PIPED\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let dir = fresh_dir("command_stage");
+    let target = dir.join("out.txt");
+    let out = run_with_input(&format!(
+        "command echo redirected > {}\n",
+        target.to_string_lossy()
+    ));
+    assert!(out.status.success(), "{:?}", out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap_or_default(),
+        "redirected\n"
+    );
+
+    // The job is the program, so that is what the listing names — a `command`
+    // there would mean the shell had forked itself to run one.
+    let out = run_with_input(
+        "command sleep 0.2 &\nwhile $sh.jobs[1].state == running { /bin/sleep 0.02 }\njobs\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("] Done (0) sleep 0.2")),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_deferred_command_stage_joins_the_job_table_as_the_program() {
+    // A value argument defers the stage, which registers its words *before* the
+    // child expands them. Listing that job under `command` would make `%sleep`
+    // find nothing, so the same line would be waitable one way and not the other.
+    let out = run_with_input("command sleep $(printf 0.3) &\njobs\nwait %sleep\nputs $sh.status\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The listing names the program, not the prefix — a value still shows as
+    // `$(…)`, since printing it would run the work the deferral moved.
+    assert!(
+        stdout.lines().any(|line| line.contains("] Running sleep ")),
+        "{stdout}{stderr}"
+    );
+    assert!(!stdout.contains("Running command"), "{stdout}");
+    // And `%sleep` finds it, exactly as it does for the undeferred spelling.
+    assert!(stdout.ends_with("0\n"), "{stdout}{stderr}");
+}
+
+#[test]
 fn a_failed_exec_reports_itself_rather_than_writing_to_a_target() {
     // `Command::spawn` makes a private close-on-exec pipe for the child to
     // report an `exec` failure on. It takes a low descriptor, and installing a
