@@ -3367,6 +3367,22 @@ to avoid" rather than promising the latter as done.
 ## Open questions
 
 - **Name — decided: mesh** ([Name](#name)); smash was the runner-up.
+- **Bash spellings for renamed builtins** — whether `echo` / `read` should be
+  the names for [`puts`](#builtins) / `gets` (or live alongside them) is **open**.
+  The argument for is that mesh already keeps the bash name wherever it can —
+  `cd`, `export`, `source`, `exec`, `jobs`, `fg`, `kill` — and these two are the
+  reflexes people type most. The argument against is that they are also the two
+  bash builtins carrying the most baggage, which is *why* they were renamed:
+  `echo -n` / `-e` would print as text under flag-free `puts` (silently wrong, in
+  a language that is otherwise fail-loud), and `read -r` / `read a b c` have no
+  `gets` equivalent, while `gets` *returns* the line so it composes
+  (`gets():words`, `if line = gets() { … }`) in a way bash's `read` never does.
+  Two spellings for one operation is the worst of the three, so this is a rename
+  or nothing. **MVP answer, not a decision:** `command not found` names mesh's
+  spelling for a renamed bash builtin (`read` → `gets`, `local` → `x = 5`), which
+  buys discoverability without spending the name — see
+  [Reference](docs/REFERENCE.md#commands). `echo` stays unintercepted so an
+  external `echo -n` keeps working.
 - **Exclusion `~` alias** — resolved by elimination: `~` / `!~` is now the
   **pattern-match** operator ([Tests and comparisons](#tests-and-comparisons)),
   so glob exclusion keeps the spaced infix `-` only.
