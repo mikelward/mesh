@@ -1067,10 +1067,37 @@ ls ..             # a command: `..` after a word is not a range
 1..3              # a value: the range, for the same reason
 ```
 
-Only a leading **variable** loses to a following `&&` / `||` / `&`, since only it has
-the command reading the shell idiom is asking for. Everything else keeps its value
-reading and reports its own status — `1 == 2 || puts no` compares, and `42 &` is a
-refused backgrounded expression rather than an attempt to run a program called `42`.
+A value loses to a following `&&` / `||` / `&` only when it *is* a **command word** —
+an unbroken run of text led by a variable — since that is the reading the shell idiom
+is asking for:
+
+```mesh
+cmd = nosuchcmd
+$cmd || puts failed        # runs the command, branches on its status
+p = /x/nosuchcmd
+$p:base || puts failed     # the same idiom, with a suffix the command word keeps
+${cmd}.exe || puts failed  # `.exe` is literal text, which is what the braces are for
+${cmd}[0] || puts failed   # `[0]` globs on it rather than indexing
+${cmd}-1 || puts failed    # `-1` is part of the name, not a subtraction
+```
+
+**Whitespace** is what separates the two readings, not the shape of the expression.
+`${cmd}-1` and `$a - 1` are the same subtraction of the same variable; one is a program
+name and the other is arithmetic, and only the spacing says which. So spacing the same
+text apart gives the value reading, which reports its own status:
+
+```mesh
+a = 5
+b = 6
+$a - 1 || puts smaller     # arithmetic — the spaces make it an expression
+$a == $b || puts ne        # a comparison likewise
+$x ~ /b/ && puts matched   # and a match
+42 &                       # a refused backgrounded expression, not a program `42`
+```
+
+One shape is ruled out whatever the spacing: a `(`, since command position has no call
+syntax. That is why `$x:split("-") || puts x` keeps its value reading even though
+nothing in it is spaced.
 
 A negation is the other kind of operand: `not` is reserved, so it has no command
 reading at all, and `&&` / `||` join the value statement rather than making a command

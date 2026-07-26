@@ -10301,9 +10301,9 @@ fn a_command_line_that_parses_as_an_expression_is_still_a_command() {
     );
     assert_eq!(String::from_utf8_lossy(&spaced.stdout), "after\n");
 
-    // Only a **variable** loses to a following `&&` / `||` / `&`, because only it has
-    // the command reading the shell idiom wants. A comparison has none, so it keeps
-    // its value reading and reports its own status.
+    // Only a **command word** loses to a following `&&` / `||` / `&`, because only it
+    // has the command reading the shell idiom wants — see
+    // `a_value_that_is_no_command_word_keeps_its_connectors`.
     let variable = run_with_input("cmd = nosuchcmd\n$cmd || puts fallback\n");
     assert!(
         String::from_utf8_lossy(&variable.stderr).contains("command not found: nosuchcmd"),
@@ -10316,6 +10316,165 @@ fn a_command_line_that_parses_as_an_expression_is_still_a_command() {
     assert!(compared.stderr.is_empty(), "{:?}", compared.stderr);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `$cmd || puts failed` is the shell idiom, so a value that *is* a command word loses
+/// to a following `&&` / `||` / `&`. The bound was drawn at "a **variable** leads the
+/// expression", which handed the command reading to text that has none — and the
+/// connector then picked a reading that could not work:
+///
+/// ```text
+/// $a == $b && puts eq        # ran the command `5`
+/// $x ~ /b/ && puts matched   # ran the command `abc`
+/// $x:split("-") || puts x    # syntax error: a command word stops in front of `(`
+/// ```
+///
+/// `1 == 2 || puts no` compared throughout, since a numeral leads it — which is what
+/// made the variable cases read as arbitrary rather than as a rule.
+///
+/// What separates the two is **whitespace**, not shape. A command word is an unbroken
+/// run of tokens, and `${cmd}.exe`, `${cmd}[0]`, `${cmd}..bak`, and `${cmd}-1` are each
+/// one word naming a program while the tree calls them a member access, an index, a
+/// range, and a subtraction — each indistinguishable from the spaced expression of the
+/// same shape, since `$a - 1` really is arithmetic. Only `(` is ruled out by shape,
+/// command position having no call syntax.
+#[test]
+fn a_value_that_is_no_command_word_keeps_its_connectors() {
+    // A comparison, a match, and arithmetic on a variable all report their own status.
+    let out = run_with_input(
+        "a = 5\nb = 6\n\
+         $a == $b || puts ne\n\
+         $a != $b && puts also-ne\n\
+         $a >= $b || puts lt\n\
+         x = abc\n\
+         $x ~ /b/ && puts matched\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ne\nalso-ne\nlt\nmatched\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A modifier taking **arguments** reaches past where a command word can end, so
+    // this was a syntax error about a missing command word before.
+    let wide = run_with_input("x = a-b-c\n$x:split(\"-\"):len || puts three\n");
+    assert_eq!(
+        String::from_utf8_lossy(&wide.stdout),
+        "three\n",
+        "{}",
+        String::from_utf8_lossy(&wide.stderr)
+    );
+    assert!(
+        wide.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&wide.stderr)
+    );
+
+    // Every **attached** suffix is command-word text, whatever the tree calls it. Each
+    // of these is one word naming a program, and each was sent to a value operation —
+    // member access, indexing, a string range, a subtraction — when the rule was drawn
+    // by shape instead of by whitespace.
+    let dir = fresh_dir("braced_command_word_suffix");
+    for name in ["tool.exe", "tool..bak", "tool-1", "tool0"] {
+        let script = dir.join(name);
+        std::fs::write(&script, format!("#!/bin/sh\necho ran-{name}\nexit 3\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+    }
+    for (suffix, ran) in [
+        (".exe", "ran-tool.exe"),
+        ("..bak", "ran-tool..bak"),
+        ("-1", "ran-tool-1"),
+    ] {
+        let out = run_with_input(&format!(
+            "cd {}\ncmd = \"./tool\"\n${{cmd}}{suffix} || puts fallback\n",
+            dir.display()
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{ran}\nfallback\n"),
+            "{suffix} is command-word text: {:?}",
+            out.stderr
+        );
+    }
+
+    // `[0]` globs rather than indexing, so it has to match a real name to expand at
+    // all — and the glob drops the leading `./`, which is why this asserts on the
+    // lookup rather than on a run. An index reading says "cannot index a scalar value"
+    // and never looks for a program.
+    let bracketed = run_with_input(&format!(
+        "cd {}\ncmd = \"./tool\"\n${{cmd}}[0] || puts fallback\n",
+        dir.display()
+    ));
+    assert!(
+        String::from_utf8_lossy(&bracketed.stderr).contains("command not found: tool0"),
+        "a braced command word globs its bracket suffix: {:?}",
+        bracketed.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&bracketed.stdout), "fallback\n");
+    let backgrounded_word = run_with_input("cmd = \"./nosuch\"\n${cmd}.exe &\nputs after\n");
+    assert!(
+        !String::from_utf8_lossy(&backgrounded_word.stderr).contains("backgrounding an expression"),
+        "a command word backgrounds rather than being refused: {:?}",
+        backgrounded_word.stderr
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Spacing the same suffixes apart makes them the expressions they look like, which
+    // is the whole rule stated the other way round.
+    // `$a .. $b` yields a range, whose status is 0, so `||` skips it — it is here for
+    // the absence of a `command not found`, not for a branch.
+    let spaced = run_with_input(
+        "a = 5\nb = 3\nxs = [7]\n\
+         $a - 1 || puts minus\n\
+         $a .. $b || puts range\n\
+         $xs[0 + 0] || puts index\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&spaced.stdout),
+        "minus\nindex\n",
+        "{}",
+        String::from_utf8_lossy(&spaced.stderr)
+    );
+    assert!(
+        spaced.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&spaced.stderr)
+    );
+
+    // The bound is the command word, so a variable with *argument-free* suffixes still
+    // defers — `$p:base || puts failed` is the same idiom as `$cmd || puts failed`.
+    for source in ["cmd = nosuchcmd\n$cmd", "p = /x/nosuchcmd\n$p:base"] {
+        let out = run_with_input(&format!("{source} || puts fallback\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("command not found: nosuchcmd"),
+            "{source}: {:?}",
+            out.stderr
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "fallback\n",
+            "{source}"
+        );
+    }
+
+    // `&` follows the same bound: a command word backgrounds, a comparison is refused
+    // like any other non-command statement.
+    let backgrounded = run_with_input("a = 5\n$a == 5 &\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&backgrounded.stderr).contains("backgrounding an expression"),
+        "{:?}",
+        backgrounded.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&backgrounded.stdout), "after\n");
 }
 
 /// The other operands with no command spelling, claimed by the same parse rather than
