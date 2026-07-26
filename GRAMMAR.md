@@ -369,14 +369,15 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
   flag would.
 - **A lone integer literal is a value.** `func answer() { 42 }` yields the integer
   42; before, `42` resolved as a command name and reported "command not found".
-  The rule is the narrowest one that closes the gap: the **whole statement** must
-  be that literal, so `42 foo` and `42 > file` stay the commands they were. The
-  first token is not enough to decide — a word is assembled from adjacent tokens,
-  and `3.5` peeks as `3` — so the check parses the statement and requires a bare
-  scalar whose *whole* text is an `i64`. A bare `-3` therefore does not qualify
-  either: it lexes as the minus operator followed by `3`, and `return -3` or
-  `(-3)` carries it. In statement position the value is discarded and the status
-  is the usual view of an integer — itself — exactly as `41 + 1` already gave.
+  The **whole statement** must be that literal, so `42 foo` and `42 > file` stay
+  the commands they were. The first token is not enough to decide — a word is
+  assembled from adjacent tokens, and `3.5` peeks as `3` — so the check parses the
+  statement and requires a bare scalar whose *whole* text is an `i64`; `3.5` stays
+  a command, since mesh has no float literals. A **signed** literal qualifies on
+  the same terms, the parser folding the sign in, so `func f() { -3 }` yields −3
+  like the `return -3` and `(-3)` spellings beside it. In statement position the
+  value is discarded and the status is the usual view of an integer — itself —
+  exactly as `41 + 1` already gave.
 - **Lambdas.** `func(params) { body }` — the declaration with the name left off —
   is an expression yielding a **function value**. It reuses the signature grammar
   above in full (defaults, `--flags`, `...rest`). Bind it and value-call it
@@ -471,18 +472,31 @@ which leaves `cmd <file` a redirect. Whether one is a redirect is judged after t
 a condition and a redirection in a statement, so `if $xs:len > 5` compares while
 `$p:base > log` redirects.
 
-That rule applies to a bare **word** operand, which is how `$editor` names a command:
-it is a value only when the value is the whole statement, so `$editor file`,
-`$editor ...$files`, `$editor | cat`, `$editor || puts oops`, and `$editor &` are
-command lines — a connector or a backgrounding `&` picks the command, since that is
-the `$cmd || fallback` idiom. A redirect is found by scanning to the end of the
-**command word**, a word plus its *attached* argument-free `:modifier` suffixes (a
-spaced one is the next argument, so `$e :len` runs `echo :len`). That bound is why
-`$x + 1 > 1` and `$xs[0 + 0] > 0` stay comparisons: neither can be a command word,
-since a word cannot contain a nested expression. `$xs[0] > f` does redirect, a
-literal index being part of the word.
+A redirect is found by scanning to the end of the **command word**, a word plus its
+*attached* argument-free `:modifier` suffixes (a spaced one is the next argument, so
+`$e :len` runs `echo :len`). That bound is why `$x + 1 > 1` and `$xs[0 + 0] > 0` stay
+comparisons: neither can be a command word, since a word cannot contain a nested
+expression. `$xs[0] > f` does redirect, a literal index being part of the word.
+
+Everything the redirect and the argument scan do not settle is decided by **parsing**
+the statement and looking at the expression that came out — specifically at its
+**leading operand**, the leftmost thing the expression hangs off, since that is the
+only part of an expression a command line can also be. A bare word leading it keeps
+the command reading (`ls / extra` is not a division, `exit -1` not a subtraction, and
+`ls ..` not a range); anything else — a variable, an integer literal, a quoted word, a
+list, a group, a capture — has no command spelling and takes the value reading. The
+value must also account for the whole statement: `$editor file`, `$editor ...$files`,
+and `$editor | cat` are command lines. So are `$editor || puts oops` and `$editor &`,
+because a connector or a backgrounding `&` after a leading **variable** picks the
+command — that is the `$cmd || fallback` idiom. Nothing else has that second reading,
+so `1 == 2 || puts no` compares and `42 &` is a refused backgrounded expression.
 An assignment operator counts as the end of a value for this purpose, which keeps
 `$xs:dedup = 9` a syntax error about places rather than a command invocation.
+
+Asking the parse is what makes the reading hold for operands no lookahead could reach.
+A modifier that takes **arguments** puts its parentheses past where a command word can
+end, so `if 1:repr:split("x"):len > 0` compares like the argument-free chain beside
+it, instead of reporting "expected a command word".
 
 In statement position, the selected body runs normally and the other body is
 not evaluated. `return` and `exit` in a selected body retain their control-flow

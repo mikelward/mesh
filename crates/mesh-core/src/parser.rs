@@ -3040,9 +3040,27 @@ impl Parser {
 
     /// Does a value start here?
     ///
-    /// `in_condition` is the caller's position: a *spaced* `<` / `>` after a
-    /// value-like operand is a comparison in a condition and a redirection in a
-    /// statement.
+    /// Three questions in order, and the order is the rule.
+    ///
+    /// 1. Is this something a command word cannot be spelled with — `[`, `(`, `$(`,
+    ///    `..`, an attached `:name(`, an attached call, or the reserved `not`? Then
+    ///    there is no command reading to weigh it against.
+    /// 2. Does the *command* reading claim the text, because a redirect or a spaced
+    ///    argument follows the command word? Then the line is a command.
+    /// 3. Otherwise **parse the statement and look at what came out**.
+    ///
+    /// Step 3 is what keeps this from being a list of operand shapes. The predecessor
+    /// enumerated them — variable, quoted word, numeral, signed numeral, attached call
+    /// — and each shape carried its own hand-rolled lookahead for finding the operator
+    /// after it. Every one of those lookaheads was a place to be wrong, and each was:
+    /// a modifier chain moved the operator (`if $x:len > 5`), so did arithmetic
+    /// (`if $x + 1 > 1`), a sign put the operand a token later (`if -1 < 0`), and a
+    /// modifier taking arguments moved it past a `(` no token scan could follow
+    /// (`if 1:repr:split("x"):len > 0`). The parser already knows where every operand
+    /// ends, so asking it answers for shapes nobody enumerated.
+    ///
+    /// `in_condition` survives for step 2 alone: a *spaced* `<` / `>` after a command
+    /// word is a comparison in a condition and a redirection in a statement.
     fn value_start_in(&mut self, in_condition: bool) -> bool {
         // `not` is a **reserved word**, so a leading one always negates a value and
         // never names a command. `DESIGN.md` writes the idiom that way, and the other
@@ -3074,88 +3092,86 @@ impl Parser {
         {
             return true;
         }
-        match self.peek().map(|token| &token.value) {
-            // None of these can name a command in any spelling — `[` always opens a
-            // list literal, so there is no `[1 2]` command the way a shell that lacks
-            // list values would have one — so they stay values and a following
-            // `<` / `>` stays the comparison it reads as. Only a word operand has the
-            // second reading a redirect needs.
+        // None of these can name a command in any spelling — `[` always opens a list
+        // literal, so there is no `[1 2]` command the way a shell that lacks list
+        // values would have one — so they stay values and a following `<` / `>` stays
+        // the comparison it reads as. Only a word operand has the second reading a
+        // redirect needs.
+        if matches!(
+            self.peek().map(|token| &token.value),
             Some(
                 TokenKind::CaptureStart
-                | TokenKind::LParen
-                | TokenKind::LBracket
-                | TokenKind::Range
-                | TokenKind::RangeInclusive,
-            ) => true,
-            // A **signed** numeral reaches here as two tokens, an `Operator("-")` and the
-            // numeral, so the word-shaped clauses below never see it. `negative_literal`
-            // folds the pair into one literal once the expression parser has it; this
-            // only has to agree about where the operand starts.
-            Some(TokenKind::Operator(sign)) if sign == "-" => {
-                self.signed_numeral_takes_a_comparison(in_condition)
-            }
-            Some(TokenKind::Word(word)) => {
-                let variable = matches!(
-                    word.pieces.as_slice(),
-                    [WordPiece::Variable {
-                        quote: QuoteMode::Bare,
-                        ..
-                    }]
-                );
-                let quoted = word_is_quoted(word);
-                let attached_call = self.tokens.get(self.position + 1).is_some_and(|next| {
-                    matches!(next.value, TokenKind::LParen)
-                        && next.span.start == self.peek().unwrap().span.end
-                });
-                let followed_by_operator = self
-                    .tokens
-                    .get(self.position + 1)
-                    .zip(self.tokens.get(self.position + 2))
-                    .is_some_and(|(operator, right)| {
-                        value_operator(&operator.value) && operator.span.end < right.span.start
-                    })
-                    // `value_operator` covers the operators with no redirect spelling to
-                    // rule out — `==`, `+`, `..`. A spaced `<` / `>` in a condition is a
-                    // comparison too, and nothing else was claiming it.
-                    || self.word_takes_a_comparison(in_condition);
-                let numeric = word.text().parse::<i64>().is_ok();
-                // Asked of the *completed* operand rather than of the token after the
-                // one starting it. Only the first token is in hand here, and an operand
-                // can span several: in `$x:len > out.txt` the next token is the `:` of
-                // the modifier, so a one-token lookahead saw no redirect and let the
-                // expression parser swallow the `>` as a comparison.
-                let redirect_follows = self.word_takes_a_redirect(in_condition);
-                // A spaced postfix after the command word is the next *argument*, not
-                // part of the value: `$cmd :len` runs `printf :len` rather than taking
-                // the length of the word `printf`.
-                let argument_follows = self
-                    .command_word_end()
-                    .is_some_and(|end| self.unattached_postfix_at(end));
-                // A variable naming a command is only a *value* when the value is
-                // the whole statement. `$editor file`, `$p:base arg`, and `$e | cat`
-                // are command lines, but the expression parser stops after the
-                // variable, so claiming them left the rest unconsumed and reported
-                // `expected a statement separator` — the `$editor > log` reading this
-                // clause exists to protect, with an argument instead of a redirect.
-                (variable
-                    && !redirect_follows
-                    && !argument_follows
-                    && self.value_is_whole_statement())
-                    || (quoted && !redirect_follows && self.viable_expression())
-                    || attached_call
-                    || (numeric && followed_by_operator)
-                    // A lone numeric literal is a **value**, so a block can yield one:
-                    // `func answer() { 42 }` is 42 rather than "command not found: 42".
-                    // Narrow on purpose — the whole statement must be that literal — so
-                    // `42 foo` and `42 > file` stay the commands they were, and a
-                    // numeral is never a plausible command name anyway (`./42` still
-                    // runs a file called that).
-                    || (numeric && !redirect_follows && self.lone_integer_literal())
-            }
-            _ => false,
+                    | TokenKind::LParen
+                    | TokenKind::LBracket
+                    | TokenKind::Range
+                    | TokenKind::RangeInclusive
+            )
+        ) {
+            return true;
         }
+        // An **attached** call is the one word-initial shape with no command reading:
+        // a command word stops in front of `(`, so `answer()` and `$f()` are calls.
+        // The spacing matters and the tree does not record it, which is why this is
+        // asked here rather than of the parsed expression — `puts (1 + 2)` is `puts`
+        // with an argument, and the parser's `postfix` would happily call it.
+        if let (Some(word), Some(next)) = (self.peek(), self.tokens.get(self.position + 1))
+            && matches!(word.value, TokenKind::Word(_))
+            && matches!(next.value, TokenKind::LParen)
+            && next.span.start == word.span.end
+        {
+            return true;
+        }
+        if self.command_reading_claims_statement(in_condition) {
+            return false;
+        }
+        self.parsed_value_claims_statement()
     }
-    /// The token index just past an operand that a **command word** can be: a word,
+
+    /// Does the **command** reading claim this statement outright, before any parse?
+    ///
+    /// Two shapes only command position has, both measured from the end of the command
+    /// word rather than from the token after the one starting it — an operand can span
+    /// several tokens, and in `$x:len > out.txt` the next token is the `:` of the
+    /// modifier, so a one-token lookahead saw no redirect and let the expression parser
+    /// swallow the `>` as a comparison:
+    ///
+    /// - a **redirect** operator (`if $editor > log`). In a *condition* a spaced
+    ///   `<` / `>` is a comparison instead — `if $xs:len > 5` — and that reading is
+    ///   left alone; `>>` is only ever a redirect and is never spelled spaced.
+    /// - a **spaced postfix**, which is the next *argument*: `$cmd :len` runs
+    ///   `printf :len` rather than taking the length of the word `printf`.
+    fn command_reading_claims_statement(&self, in_condition: bool) -> bool {
+        let Some(end) = self.command_word_end() else {
+            return false;
+        };
+        let redirect = matches!(
+            self.tokens.get(end).map(|token| &token.value),
+            Some(TokenKind::Less | TokenKind::Greater | TokenKind::Append)
+        ) && !(in_condition && self.spaced_operator_at(end));
+        redirect || self.unattached_postfix_at(end)
+    }
+
+    /// Parse the statement as a value and ask whether the value **wins**.
+    ///
+    /// Two conditions, and both are about the parse rather than about the tokens that
+    /// went into it: the expression that came out has to outrank the command reading of
+    /// the same text, and it has to account for the whole statement.
+    fn parsed_value_claims_statement(&mut self) -> bool {
+        let saved = self.position;
+        let claims = match self.expression() {
+            Ok(expression) => {
+                outranks_a_command(&expression) && self.value_spans_statement(&expression)
+            }
+            // Text that is not an expression at all is a command — including a partial
+            // one, which the command parser reports as incomplete so the reader asks
+            // for more instead of erroring.
+            Err(_) => false,
+        };
+        self.position = saved;
+        claims
+    }
+    /// The token index just past an operand that a **command word** can be: a word —
+    /// optionally behind a leading `-`, since `-1` is a name a shell will try to run —
     /// plus any *attached, argument-free* `:modifier` suffixes. `None` when the operand
     /// cannot be a command word at all — anything that is not a word to start with —
     /// because then the line has no command reading and no redirect to find. A nested
@@ -3163,20 +3179,27 @@ impl Parser {
     /// stops in front of and which is not a redirect operator, so `$xs[0 + 0] > 0` and
     /// `$p:pad(3) > 0` fall out as values on their own.
     ///
-    /// A token scan rather than a parse, deliberately. Every parse-based version of
-    /// this check reached too far, because the expression grammar nests whole
-    /// expressions inside a subscript or a call: precedence 5 swallowed the arithmetic
-    /// in `$x + 1 > 1`, and `postfix` swallowed the computed index in
-    /// `$xs[0 + 0] > 0`, each turning a value statement into a command that truncated
-    /// a file. A command word cannot contain either, so this stops where one stops.
+    /// A token scan rather than a parse, deliberately. It answers where the *command*
+    /// reading of the text stops, which is a question the expression parser cannot be
+    /// asked: the expression grammar nests whole expressions inside a subscript or a
+    /// call, so a parse-based version reached past the arithmetic in `$x + 1 > 1` and
+    /// past the computed index in `$xs[0 + 0] > 0`, turning value statements into
+    /// commands that truncated a file. A command word cannot contain either.
     fn command_word_end(&self) -> Option<usize> {
-        self.command_word_end_from(self.position)
-    }
-
-    /// [`command_word_end`](Self::command_word_end) measured from an arbitrary token
-    /// rather than the cursor, for the one operand that does not start at the cursor:
-    /// a **signed** numeral, whose sign is its own token and whose word sits one along.
-    fn command_word_end_from(&self, start: usize) -> Option<usize> {
+        // A leading `-` is part of the command word: `-1` is a name a shell will try to
+        // run, so `-1 < 0` redirects in statement position the way every other command
+        // word does. Spacing is not the test here, even though it is the test for
+        // reading the same `-` as a *sign*, because both spellings run a command called
+        // `-` today and `- 3 > out` should not redirect differently from `-3 > out`.
+        let mut start = self.position;
+        if matches!(self.peek().map(|token| &token.value), Some(TokenKind::Operator(text)) if text == "-")
+            && matches!(
+                self.tokens.get(start + 1).map(|token| &token.value),
+                Some(TokenKind::Word(_))
+            )
+        {
+            start += 1;
+        }
         let word = self.tokens.get(start)?;
         if !matches!(word.value, TokenKind::Word(_)) {
             return None;
@@ -3195,88 +3218,6 @@ impl Parser {
             index += 2;
         }
         Some(index)
-    }
-
-    /// Does a **redirect** immediately follow the command word starting here?
-    ///
-    /// The operand only has a redirect reading if it could be a command word in the
-    /// first place, so this answers `false` for everything
-    /// [`command_word_end`](Self::command_word_end) rejects. In a **condition** a
-    /// *spaced* `<` / `>` is a comparison — `if $xs:len > 5` — and that reading is left
-    /// alone; `>>` is only ever a redirect and is never spelled spaced.
-    fn word_takes_a_redirect(&self, in_condition: bool) -> bool {
-        let Some(end) = self.command_word_end() else {
-            return false;
-        };
-        matches!(
-            self.tokens.get(end).map(|token| &token.value),
-            Some(TokenKind::Less | TokenKind::Greater | TokenKind::Append)
-        ) && !(in_condition && self.spaced_operator_at(end))
-    }
-
-    /// Does a **comparison** follow the command word starting here — a *spaced* `<` or
-    /// `>`, which a condition reads as one?
-    ///
-    /// The counterpart to [`word_takes_a_redirect`](Self::word_takes_a_redirect) on the
-    /// same operator and the same spacing test, asked the other way round. It exists for
-    /// the operand that has to be **claimed** rather than merely not-disclaimed: a
-    /// numeral. A variable or a quoted word carries a clause that claims the whole
-    /// statement once no redirect follows, so ruling the redirect out is enough for
-    /// them. A numeral is claimed only by a leading [`value_operator`] or by being a
-    /// lone literal, and `if 1 < 2` is neither — so it reached the command parser, tried
-    /// to open a file named `2`, and took the `else` branch, while `if 1 == 1` beside it
-    /// compared.
-    ///
-    /// Condition-only, so statement position keeps the redirect reading it has:
-    /// `42 > file` still truncates a file.
-    fn word_takes_a_comparison(&self, in_condition: bool) -> bool {
-        self.comparison_at(self.command_word_end(), in_condition)
-    }
-
-    /// Is a leading `-` the **sign** on a numeral that a spaced `<` / `>` then compares?
-    ///
-    /// A sign is its own token, so every word-shaped clause in [`value_start_in`] starts
-    /// one token too late and none of them ever sees this operand: `if -1 < 0` took the
-    /// `else` branch after failing to open a file named `0`.
-    ///
-    /// Narrow in the two ways the unsigned case is. The sign must **abut** its numeral,
-    /// since a spaced `-` is the infix operator glob exclusion uses rather than a sign;
-    /// and the **signed** text is what has to fit an `i64`, not the magnitude, because
-    /// `i64::MIN` is one further from zero than `i64::MAX` — asking about the magnitude
-    /// rejects the one signed literal with no positive counterpart. That is the same
-    /// text [`negative_literal`] folds, so the two agree on which literals exist.
-    fn signed_numeral_takes_a_comparison(&self, in_condition: bool) -> bool {
-        let (Some(sign), Some(number)) = (
-            self.tokens.get(self.position),
-            self.tokens.get(self.position + 1),
-        ) else {
-            return false;
-        };
-        let TokenKind::Word(word) = &number.value else {
-            return false;
-        };
-        if sign.span.end != number.span.start || format!("-{}", word.text()).parse::<i64>().is_err()
-        {
-            return false;
-        }
-        // Measured past the *completed* operand: a numeral carries attached `:modifier`
-        // suffixes like any other word, and the operator sits after them.
-        self.comparison_at(self.command_word_end_from(self.position + 1), in_condition)
-    }
-
-    /// Is the operator ending an operand at `end` a spaced `<` / `>` that a condition
-    /// compares? Shared by the signed and unsigned numeral clauses so one spacing rule
-    /// answers for both.
-    fn comparison_at(&self, end: Option<usize>, in_condition: bool) -> bool {
-        let Some(end) = end else {
-            return false;
-        };
-        in_condition
-            && matches!(
-                self.tokens.get(end).map(|token| &token.value),
-                Some(TokenKind::Less | TokenKind::Greater)
-            )
-            && self.spaced_operator_at(end)
     }
 
     /// Is the token at `index` a postfix opener that is **not attached** to what comes
@@ -3302,24 +3243,6 @@ impl Parser {
             .checked_sub(1)
             .and_then(|before| self.tokens.get(before))
             .is_some_and(|previous| previous.span.end < token.span.start)
-    }
-
-    /// Is the rest of this statement exactly one integer literal?
-    ///
-    /// The token being peeked is not enough to tell. A word can be assembled from
-    /// several adjacent tokens, and only the *first* is in hand here: `3.5` peeks
-    /// as `3`, which parses as an integer while the word does not. So the check
-    /// parses the statement and looks at what came out, rather than trusting the
-    /// lookahead — and asks [`Word::bare_integer`], since even the assembled text is
-    /// not enough: `4"2"` spells `42` while expanding to the *string*.
-    fn lone_integer_literal(&mut self) -> bool {
-        let saved = self.position;
-        let lone = matches!(
-            self.expression(),
-            Ok(Expr::Scalar(word)) if word.value.bare_integer().is_some()
-        ) && self.at_value_statement_end();
-        self.position = saved;
-        lone
     }
 
     /// Does the statement end here, for a statement that *is* a value?
@@ -3351,22 +3274,18 @@ impl Parser {
         )
     }
 
-    /// Does a value expression starting here span the whole statement?
+    /// Did the expression just parsed account for the **whole** statement?
     ///
-    /// An operand that *starts* a value is not enough on its own. `$editor file` and
-    /// `$p:base arg` are command invocations, but the expression parser stops after the
-    /// operand, so claiming them left the trailing words unconsumed and reported
-    /// `expected a statement separator` for lines that should run. Parsing the statement
-    /// and looking at where it stopped is the same trial the lone-integer rule runs, for
-    /// the same reason.
-    fn value_is_whole_statement(&mut self) -> bool {
-        let saved = self.position;
-        let whole = self.expression().is_ok()
-            && ((self.at_value_statement_end()
+    /// Asked with the cursor left where that parse stopped. An expression that merely
+    /// *starts* the statement is not enough: `$editor file` and `$p:base arg` are
+    /// command invocations, and claiming them left the trailing words unconsumed and
+    /// reported `expected a statement separator` for lines that should run.
+    fn value_spans_statement(&mut self, expression: &Expr) -> bool {
+        (self.at_value_statement_end()
                 // A bare variable has a command reading, so shell-list syntax after it
                 // — an argument, a pipe, a redirect, `&&`, `||`, `&` — picks the
                 // command, and the variable alone is the value.
-                && !self.at_command_list_operator())
+                && !(defers_to_a_command_list(expression) && self.at_command_list_operator()))
                 // An assignment operator counts as the end of it. What follows is a
                 // *place* expression, which the expression side owns whether or not
                 // the place is a legal one, and that is what keeps
@@ -3382,17 +3301,9 @@ impl Parser {
                 // already was, not a command named by `$x`. Checked with the same pair
                 // — the keyword, and a guard that parses — that the command parser uses
                 // to tell a guard from an argument called `if`.
-                || ((self.word("if") || self.word("unless")) && self.viable_guard()));
-        self.position = saved;
-        whole
+                || ((self.word("if") || self.word("unless")) && self.viable_guard())
     }
 
-    fn viable_expression(&mut self) -> bool {
-        let saved = self.position;
-        let viable = self.expression().is_ok() && self.at_command_end();
-        self.position = saved;
-        viable
-    }
     fn amp_before_terminator(&self) -> bool {
         for token in &self.tokens[self.position..] {
             match token.value {
@@ -3647,11 +3558,64 @@ impl Parser {
     }
 }
 
-fn value_operator(kind: &TokenKind) -> bool {
-    matches!(
-        kind,
-        TokenKind::Operator(_) | TokenKind::Range | TokenKind::RangeInclusive
-    )
+/// The **leftmost leaf** of an expression — the operand the command reading would take
+/// as its command word.
+///
+/// Every classification below is about this one operand, because that is the only part
+/// of an expression a command line can also be. `ls / extra` parses as a division and
+/// `exit -1` as a subtraction, and either would outrank a command if the *shape* of the
+/// tree decided; what says they are command lines is that they lead with a bare word.
+/// Prefixes, infixes, and postfixes all wrap the same leading operand, so following
+/// them down is the whole rule.
+fn leading_operand(expression: &Expr) -> &Expr {
+    match expression {
+        Expr::Binary { left: inner, .. }
+        | Expr::Unary {
+            expression: inner, ..
+        }
+        | Expr::Modifier { value: inner, .. }
+        | Expr::Index { value: inner, .. }
+        | Expr::Member { value: inner, .. }
+        | Expr::Call { callee: inner, .. }
+        | Expr::Range {
+            start: Some(inner), ..
+        } => leading_operand(inner),
+        _ => expression,
+    }
+}
+
+/// Does this expression **outrank** the command reading of the same text?
+///
+/// The one shape a command is spelled with is a bare word, so an expression leading
+/// with one leaves the command reading standing: `puts a` is the command, `ls / extra`
+/// is not a division, and the `true` in `if true` runs a program. Everything else — a
+/// list, a capture, a group, a lambda, a variable — has no command spelling at all, so
+/// leading with it is already the answer.
+///
+/// Two words escape. An **integer literal** is never a command name, which is what lets
+/// a block yield one (`func answer() { 42 }` is 42, not "command not found: 42"; `./42`
+/// still runs a file called that) and what makes `1 < 2` a comparison wherever it is
+/// read. A **quoted** word is how a program whose path needs quoting is written, so it
+/// stays a command — but the *evaluator* is what runs it, from a scalar the parser
+/// hands over, which is why it counts as a value here. See `repl::runs_as_command`.
+fn outranks_a_command(expression: &Expr) -> bool {
+    match leading_operand(expression) {
+        Expr::Scalar(word) => word.value.bare_integer().is_some() || word_is_quoted(&word.value),
+        _ => true,
+    }
+}
+
+/// Does a following `&&` / `||` / `&` make this a **command list** rather than a value?
+///
+/// Only for an expression leading with a bare variable, which is the one operand that
+/// both is a value and names a command: `$cmd || puts failed` is the shell idiom it
+/// looks like, and reading `$cmd` as the string skipped running the command entirely —
+/// no output, no side effects, and the fallback branch decided by the string's
+/// truthiness instead of the exit status. Nothing else has that second reading to lose,
+/// so `1 == 2 || puts no` compares and `42 &` is the refused backgrounded expression it
+/// should be rather than an attempt to run a program called `42`.
+fn defers_to_a_command_list(expression: &Expr) -> bool {
+    matches!(leading_operand(expression), Expr::Variable(_))
 }
 
 /// Is the whole of `name` a name?

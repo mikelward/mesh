@@ -1054,14 +1054,34 @@ $ns[0 + 0] > 0    # a comparison: a computed index cannot be one either
 $ns[0] > out.txt  # a command, redirected: a literal index is part of the word
 ```
 
+Which reading a line gets is settled by *parsing* it and looking at the **leading
+operand** — the leftmost thing the expression hangs off. That is the only part of an
+expression a command line can also be, so it is the part that decides, and the shape
+of the rest does not enter into it:
+
+```mesh
+ls / extra        # a command: `/` between words is not a division
+exit -1           # a command: `-` after a word is not a subtraction
+ls ..             # a command: `..` after a word is not a range
+1 == 2            # a value: a numeral leads it, and numerals name no command
+1..3              # a value: the range, for the same reason
+```
+
+Only a leading **variable** loses to a following `&&` / `||` / `&`, since only it has
+the command reading the shell idiom is asking for. Everything else keeps its value
+reading and reports its own status — `1 == 2 || puts no` compares, and `42 &` is a
+refused backgrounded expression rather than an attempt to run a program called `42`.
+
 A negation is the other kind of operand: `not` is reserved, so it has no command
 reading at all, and `&&` / `||` join the value statement rather than making a command
 of it — `not $b && puts x` negates and then branches.
 
-In a condition a spaced comparison still compares, modifiers and all, so
-`if $xs:len > 5 { … }` asks about the length — and that holds for a **numeral** on
-the left too, signed or not: `if 1 < 2`, `if -1 < 0`, and `if 1:repr:len > 0` all
-compare. (Statement position is unchanged: `42 > file` still redirects.) And a *derived* value is not a place:
+In a condition a spaced comparison still compares, modifiers and all — including
+modifiers that take **arguments**, whose parentheses reach past where a command word
+could ever end — so `if $xs:len > 5 { … }` and `if $x:split("b"):len > 1 { … }` both
+ask about a length. That holds for a **numeral** on the left too, signed or not:
+`if 1 < 2`, `if -1 < 0`, and `if 1:repr:len > 0` all compare. (Statement position is
+unchanged: `42 > file` still redirects.) And a *derived* value is not a place:
 `$xs:dedup = 9` is a syntax error saying so, never an attempt to run a command named
 by the value.
 

@@ -4757,20 +4757,29 @@ fn only_a_lone_numeral_becomes_a_value() {
         float.stderr
     );
 
-    // A *negative* literal lexes as the minus operator followed by `3`, not as one
-    // numeric word, so it does not reach this rule; `return -3` and `(-3)` both
-    // carry it, and both are already the documented spellings.
-    let negative = run_with_input("func f() { -3 }\nv = f()\nputs after\n");
-    assert!(
-        String::from_utf8_lossy(&negative.stderr).contains("command not found: -3"),
-        "{:?}",
-        negative.stderr
-    );
+    // A *negative* literal lexes as the minus operator followed by `3` rather than as
+    // one numeric word, so it used to miss this rule and `func f() { -3 }` reported
+    // "command not found: -3" beside a `return -3` that carried the number. The rule
+    // is asked of the parsed expression now, and the parser folds the sign into the
+    // literal, so all three spellings agree.
     let carried = run_with_input(
-        "func f() { return -3 }\nfunc g() { (-3) }\n\
-         a = f()\nb = g()\nputs \"$a $b\"\n",
+        "func f() { -3 }\nfunc g() { return -3 }\nfunc h() { (-3) }\n\
+         a = f()\nb = g()\nc = h()\nputs \"$a $b $c\"\n",
     );
-    assert_eq!(String::from_utf8_lossy(&carried.stdout), "-3 -3\n");
+    assert_eq!(String::from_utf8_lossy(&carried.stdout), "-3 -3 -3\n");
+    assert!(carried.stderr.is_empty(), "{:?}", carried.stderr);
+
+    // Statement position keeps its redirect reading, and keeps it for both spellings
+    // of the sign — `-3 > out` and `- 3 > out` are the same command line.
+    for signed in ["-3 > out", "- 3 > out"] {
+        let out = run_with_input(&format!("cd {}\n{signed}\nputs after\n", dir.display()));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("command not found:"),
+            "{signed} still redirects in statement position: {:?}",
+            out.stderr
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{signed}");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -9262,6 +9271,10 @@ fn a_while_reports_the_status_of_its_last_pass() {
 /// postfix — so it is compared with `< 0` rather than `> 0`. What matters here is that
 /// it *compares at all* instead of reaching the command parser.
 ///
+/// The sign needs no space rule of its own. A leading `-` is unary minus in mesh with
+/// or without a space after it — `x = - 3` is −3 the same as `x = -3` — so `if - 1 < 0`
+/// compares like `if -1 < 0` rather than opening a file named `0`.
+///
 /// In a scratch directory because the `>` forms create the file they compare against.
 #[test]
 fn a_numeral_in_a_condition_compares_rather_than_redirecting() {
@@ -9271,6 +9284,7 @@ fn a_numeral_in_a_condition_compares_rather_than_redirecting() {
         "if 1 < 2 { puts int } else { puts wrong }\n\
          if 1 > 0 { puts int-gt } else { puts wrong }\n\
          if -1 < 0 { puts signed } else { puts wrong }\n\
+         if - 1 < 0 { puts spaced-sign } else { puts wrong }\n\
          if -9223372036854775808 < 0 { puts min } else { puts wrong }\n\
          if -9223372036854775807 < 0 { puts near-min } else { puts wrong }\n\
          if 1:repr:len > 0 { puts modified } else { puts wrong }\n\
@@ -9286,7 +9300,7 @@ fn a_numeral_in_a_condition_compares_rather_than_redirecting() {
         .expect("run");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "int\nint-gt\nsigned\nmin\nnear-min\nmodified\nsigned-modified\neq\n",
+        "int\nint-gt\nsigned\nspaced-sign\nmin\nnear-min\nmodified\nsigned-modified\neq\n",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -9321,6 +9335,97 @@ fn a_numeral_in_a_condition_compares_rather_than_redirecting() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A modifier that takes **arguments** moves the operator past a `(`, and no token
+/// scan can follow it there — a command word stops in front of `(`, which is exactly
+/// why the scan does. So `if 1:repr:split("x"):len > 0` found no comparison, reached
+/// the command parser, and reported "expected a command word" for a line whose
+/// argument-free spelling on the line above it worked.
+///
+/// The fix is to stop scanning for the operator and ask the parse where it landed,
+/// which is why this holds for every chain rather than for the two lengths below.
+#[test]
+fn a_modifier_taking_arguments_still_leaves_a_comparison() {
+    let out = run_with_input(
+        "if 1:repr:split(\"x\"):len > 0 { puts args } else { puts wrong }\n\
+         if -1:repr:split(\"1\"):len < 9 { puts signed-args } else { puts wrong }\n\
+         x = abc\n\
+         if $x:split(\"b\"):len > 1 { puts var-args } else { puts wrong }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "args\nsigned-args\nvar-args\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+/// Reading the statement as a value means *parsing* it, and a command line parses as
+/// an expression more often than it looks: `ls / extra` is a division and `exit -1` a
+/// subtraction. What tells them apart from `1 == 2` is not the shape of the tree but
+/// its **leading operand** — a bare word is what a command is spelled with, so an
+/// expression leading with one stays the command line it is.
+#[test]
+fn a_command_line_that_parses_as_an_expression_is_still_a_command() {
+    let dir = fresh_dir("command_line_parses_as_expression");
+    // Infix operators between a command and its arguments.
+    let divided = run_with_input(&format!("cd {}\nls / extra\n", dir.display()));
+    assert!(
+        String::from_utf8_lossy(&divided.stderr).contains("extra"),
+        "`ls / extra` should reach ls: {:?}",
+        divided.stderr
+    );
+    assert_eq!(run_with_input("exit -1\n").status.code(), Some(255));
+    assert!(
+        String::from_utf8_lossy(&run_with_input("cd / extra\n").stderr).contains("too many"),
+        "`cd / extra` should reach cd"
+    );
+    // `..` is a range operator between values and a directory name after a command.
+    let parent = run_with_input(&format!("cd {}\nls ..\n", dir.display()));
+    assert!(parent.stderr.is_empty(), "`ls ..` should list: {parent:?}");
+
+    // A *spaced* `(` is the next argument, not a call, and the tree does not record
+    // the difference — so the check for it has to happen before the parse.
+    let spaced = run_with_input("puts (1 + 2)\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&spaced.stderr).contains("syntax error"),
+        "{:?}",
+        spaced.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&spaced.stdout), "after\n");
+
+    // Only a **variable** loses to a following `&&` / `||` / `&`, because only it has
+    // the command reading the shell idiom wants. A comparison has none, so it keeps
+    // its value reading and reports its own status.
+    let variable = run_with_input("cmd = nosuchcmd\n$cmd || puts fallback\n");
+    assert!(
+        String::from_utf8_lossy(&variable.stderr).contains("command not found: nosuchcmd"),
+        "{:?}",
+        variable.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&variable.stdout), "fallback\n");
+    let compared = run_with_input("1 == 2 || puts ok\n1 == 1 && puts also\n");
+    assert_eq!(String::from_utf8_lossy(&compared.stdout), "ok\nalso\n");
+    assert!(compared.stderr.is_empty(), "{:?}", compared.stderr);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other operands with no command spelling, claimed by the same parse rather than
+/// by a clause apiece: a range with a start, a modifier chain on a numeral, and a
+/// negation. Each reported "command not found" for text that has exactly one reading.
+#[test]
+fn an_operand_with_no_command_spelling_is_a_value() {
+    let out = run_with_input("1..3\n-1\n1:repr\n- 3\nx = 2\n- $x\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // They are values, not just silence: each one's status is its own.
+    let statuses = run_with_input("1:repr == \"1\" || puts wrong\nr = 1..3\nputs $r:len\n");
+    assert_eq!(String::from_utf8_lossy(&statuses.stdout), "2\n");
+    assert!(statuses.stderr.is_empty(), "{:?}", statuses.stderr);
 }
 
 /// **Statement** position is untouched: a spaced `<` / `>` there is still a redirect,
