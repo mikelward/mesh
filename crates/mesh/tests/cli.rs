@@ -1635,6 +1635,63 @@ fn only_a_bare_glob_takes_qualifiers() {
 }
 
 #[test]
+fn one_dimension_may_be_answered_only_once() {
+    // The comma is an `and`, so a second answer to the same question is a
+    // contradiction or a silent overwrite. A second *type* is neither, since a path
+    // has exactly one — `*(f, d)` can only have meant the alternation, and naming
+    // that is better than quietly reading it as `file|dir`.
+    for (source, wanted) in [
+        ("puts *(f, d)\n", "a glob takes one type"),
+        ("puts *(type: file, type: dir)\n", "a glob takes one type"),
+        (
+            "puts *(exec: true, exec: false)\n",
+            "the glob qualifier `exec` is given twice",
+        ),
+        // `x` and `exec:` are one dimension in two spellings.
+        (
+            "puts *(x, exec: false)\n",
+            "the glob qualifier `exec` is given twice",
+        ),
+        (
+            "puts *(empty: true, empty: false)\n",
+            "the glob qualifier `empty` is given twice",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(wanted),
+            "{source:?} should report {wanted:?}: {:?}",
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn only_a_file_or_a_directory_can_be_empty() {
+    // A fifo reports a zero length without that saying anything about its contents,
+    // as do sockets and most device nodes, so reading the number would sweep every
+    // one of them into `*(empty: true)`. `find -empty` draws the same line.
+    let dir = fresh_dir("glob_qual_empty_kind");
+    std::fs::write(dir.join("empty.txt"), "").unwrap();
+    let fifo = dir.join("pipe");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    assert!(made, "mkfifo is needed to tell the two apart");
+    let out = run_with_input(&format!(
+        "cd {}\nputs *(empty: true)\nputs *(p)\nputs *(p, empty: true)\nputs *(p, empty: false)\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "empty.txt\npipe\n\npipe\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_glob_qualifier_says_what_it_does_not_recognize() {
     for (source, wanted) in [
         ("puts *(q)\n", "`q` is not a glob qualifier"),

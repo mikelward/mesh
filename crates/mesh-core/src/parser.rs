@@ -259,6 +259,11 @@ pub enum ParseErrorKind {
     /// A glob qualifier given a value its name does not take — `*(type: blue)`,
     /// `*(exec: maybe)`. Carries the name and what was written.
     BadGlobQualifier(String, String),
+    /// Two qualifiers for one dimension — `*(f, d)`, `*(exec: true, exec: false)`.
+    /// Carries the dimension. Refused rather than merged: the comma is an **and**,
+    /// so a second answer to the same question either contradicts the first or
+    /// silently overwrites it, and neither is what the reader wrote.
+    DuplicateGlobQualifier(&'static str),
     DuplicateParameter(String),
     RequiredAfterOptional(String),
     ParameterAfterRest(String),
@@ -310,6 +315,14 @@ impl std::fmt::Display for ParseError {
             ParseErrorKind::BadGlobQualifier(name, value) => write!(
                 f,
                 "syntax error: `{value}` is not a value for the glob qualifier `{name}`"
+            ),
+            ParseErrorKind::DuplicateGlobQualifier(dimension) if *dimension == "type" => write!(
+                f,
+                "syntax error: a glob takes one type; write `type: file|dir` for either"
+            ),
+            ParseErrorKind::DuplicateGlobQualifier(dimension) => write!(
+                f,
+                "syntax error: the glob qualifier `{dimension}` is given twice"
             ),
             ParseErrorKind::GluedValueArgument => write!(
                 f,
@@ -3311,6 +3324,12 @@ impl Parser {
     }
 
     /// One qualifier: a bare `find -type` letter, or `name: value`.
+    ///
+    /// Each **dimension** may be answered once. The comma is an `and`, so a second
+    /// answer to the same question is either a contradiction (`exec: true,
+    /// exec: false`) or a silent overwrite, and a second *type* is neither: a path
+    /// has exactly one, so `*(f, d)` can only have meant the `file|dir` alternation
+    /// and saying so is better than quietly reading it as one.
     fn qualifier(&mut self, into: &mut GlobQualifiers) -> Result<(), ParseError> {
         let Some(name) = self.word_text_at(0) else {
             return Err(self.error(ParseErrorKind::Expected("a glob qualifier")));
@@ -3320,16 +3339,29 @@ impl Parser {
             self.tokens.get(self.position + 1).map(|t| &t.value),
             Some(TokenKind::Colon)
         );
+        let taken = |dimension, already: bool, span: Span| {
+            already.then_some(ParseError {
+                kind: ParseErrorKind::DuplicateGlobQualifier(dimension),
+                span,
+            })
+        };
         if !named {
+            let span = self.peek().map_or(0..0, |token| token.span.clone());
             self.position += 1;
             // The letters are shorthands for the two dimensions that have one:
             // a type, and the `exec` test. Anything else is a name the reader
             // expected to mean something, so say so rather than ignore it.
             if let Some(kind) = FileKind::from_letter(&name) {
+                if let Some(error) = taken("type", !into.types.is_empty(), span) {
+                    return Err(error);
+                }
                 into.types.push(kind);
                 return Ok(());
             }
             if name == "x" {
+                if let Some(error) = taken("exec", into.exec.is_some(), span) {
+                    return Err(error);
+                }
                 into.exec = Some(true);
                 return Ok(());
             }
@@ -3338,29 +3370,45 @@ impl Parser {
                 span: self.tokens[self.position - 1].span.clone(),
             });
         }
+        let name_span = self.peek().map_or(0..0, |token| token.span.clone());
         self.position += 2;
         match name.as_str() {
             // Alternation is the type dimension's only spelling for "either", `|`
             // rather than a second `type:` entry, so it is read here rather than
             // by letting the qualifier appear twice.
-            "type" => loop {
-                let span = self.peek().map_or(0..0, |token| token.span.clone());
-                let value = self
-                    .word_text_at(0)
-                    .ok_or_else(|| self.error(ParseErrorKind::Expected("a file type")))?
-                    .to_owned();
-                let kind = FileKind::from_name(&value).ok_or(ParseError {
-                    kind: ParseErrorKind::BadGlobQualifier("type".into(), value),
-                    span,
-                })?;
-                into.types.push(kind);
-                self.position += 1;
-                if self.eat(&TokenKind::Pipe).is_none() {
-                    return Ok(());
+            "type" => {
+                if let Some(error) = taken("type", !into.types.is_empty(), name_span) {
+                    return Err(error);
                 }
-            },
-            "exec" => into.exec = Some(self.qualifier_bool(&name)?),
-            "empty" => into.empty = Some(self.qualifier_bool(&name)?),
+                loop {
+                    let span = self.peek().map_or(0..0, |token| token.span.clone());
+                    let value = self
+                        .word_text_at(0)
+                        .ok_or_else(|| self.error(ParseErrorKind::Expected("a file type")))?
+                        .to_owned();
+                    let kind = FileKind::from_name(&value).ok_or(ParseError {
+                        kind: ParseErrorKind::BadGlobQualifier("type".into(), value),
+                        span,
+                    })?;
+                    into.types.push(kind);
+                    self.position += 1;
+                    if self.eat(&TokenKind::Pipe).is_none() {
+                        return Ok(());
+                    }
+                }
+            }
+            "exec" => {
+                if let Some(error) = taken("exec", into.exec.is_some(), name_span) {
+                    return Err(error);
+                }
+                into.exec = Some(self.qualifier_bool(&name)?);
+            }
+            "empty" => {
+                if let Some(error) = taken("empty", into.empty.is_some(), name_span) {
+                    return Err(error);
+                }
+                into.empty = Some(self.qualifier_bool(&name)?);
+            }
             _ => {
                 return Err(ParseError {
                     kind: ParseErrorKind::UnknownGlobQualifier(name),

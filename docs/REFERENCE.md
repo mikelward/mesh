@@ -1112,7 +1112,7 @@ comma-separated and ANDed — every one has to hold:
 | `type: file` | The same seven, spelled out: `file` `dir` `symlink` `fifo` `socket` `block` `char`. |
 | `type: file\|dir` | Either type. `\|` is how the type dimension says "or". |
 | `x`, `exec: true` | Anything with an execute bit. `exec: false` inverts it. |
-| `empty: true` | A zero-length file, or a directory with no entries. |
+| `empty: true` | A zero-length **regular file**, or a directory with no entries. Nothing else is empty — a fifo, a socket and most device nodes report a zero length without that describing their contents, the line `find -empty` draws. |
 
 ```mesh
 for f in *(f) { process $f }   # plain files, no `if $f:type == dir { continue }`
@@ -1124,6 +1124,11 @@ puts **/*(f, empty: true)      # every empty file below here
 A type is read from the link itself, so `l` means the symlink; `exec` and
 `empty` follow it, since a symlink's own mode is `0777` and would otherwise make
 every link "executable". `*(l, x)` is then "links to something runnable".
+
+Each **dimension** may be answered once, since the comma is an `and`: `*(f, d)`
+and `*(exec: true, exec: false)` are syntax errors rather than one qualifier
+quietly winning. A path has exactly one type, so "either" is spelled with the
+`|` alternation and nothing else.
 
 The `(` opens qualifiers only when it abuts a word that carries an unquoted
 pattern character. Everything else keeps its reading: `style(x, fg: red)` and

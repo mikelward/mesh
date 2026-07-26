@@ -546,13 +546,15 @@ fn qualifies(path: &str, qualifiers: &GlobQualifiers) -> bool {
         }
     }
     if let Some(want) = qualifiers.empty {
-        // A directory is empty when it has no entries; anything else when it has no
-        // bytes. `find -empty` splits the same way, a directory's size being its own
-        // bookkeeping rather than its contents.
+        // A directory is empty when it has no entries, a regular file when it has no
+        // bytes, and **nothing else is empty at all**. `find -empty` draws the same
+        // line, and it matters: a fifo, a socket and most device nodes all report a
+        // zero length without that being a statement about their contents, so
+        // reading the number would put every one of them in `*(empty: true)`.
         let empty = if target.is_dir() {
             fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
         } else {
-            target.len() == 0
+            target.is_file() && target.len() == 0
         };
         if empty != want {
             return false;
