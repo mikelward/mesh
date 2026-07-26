@@ -1722,6 +1722,227 @@ fn blank_line_harness(exec: &MeshExec) -> i32 {
 }
 
 #[test]
+fn a_jobdone_hook_fires_where_the_done_notice_prints() {
+    let exec = MeshExec::new(isolated_config_home());
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(jobdone_hook_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// Submit no-op commands until `marker` has been read, or give up.
+///
+/// For anything the shell reports *between* commands: the notice and hook for a
+/// finished job land at the top of the loop, so reaching them takes one command
+/// to trigger the reap and another to read the result back — but only once the
+/// job has ended, which no fixed number of round trips can promise. Everything
+/// read is appended to `seen`, so a caller can go on counting over the session.
+fn pty_settle_until(master: RawFd, seen: &mut Vec<u8>, marker: &[u8]) -> bool {
+    for _ in 0..40 {
+        if seen.windows(marker.len()).any(|part| part == marker) {
+            return true;
+        }
+        if !pty_write(master, b"puts .\n") {
+            return false;
+        }
+        let Some((window, _)) = pty_read_until_command_done(master) else {
+            return false;
+        };
+        seen.extend_from_slice(&window);
+    }
+    seen.windows(marker.len()).any(|part| part == marker)
+}
+
+/// `jobdone` fires once per finished job, where `[N] Done` is printed.
+///
+/// A pty, because this is a prompt-lifecycle hook: the notice and the hook both
+/// belong to the interactive loop, and a piped script never reaches it. The
+/// job's own status is what the hook is for, so it is one no default produces.
+fn jobdone_hook_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 110;
+    };
+    let mut seen = shell.startup.clone();
+    for line in [
+        "func done(id, cmd, status) { puts JOBDONE=$id/$status }\n",
+        "prompt-hook jobdone j1 done\n",
+    ] {
+        if !pty_write(shell.master, line.as_bytes()) {
+            return 111;
+        }
+        let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+            return 112;
+        };
+        seen.extend_from_slice(&window);
+    }
+    // Backgrounded, so the shell notices it finished rather than waiting through
+    // it — the reap at the top of the loop is the path under test.
+    if !pty_write(shell.master, b"sh -c 'sleep 0.2; exit 6' &\n") {
+        return 113;
+    }
+    let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+        return 114;
+    };
+    seen.extend_from_slice(&window);
+    // Submit until the hook is seen, rather than assuming a fixed number of
+    // round trips outlasts the job's sleep. It takes one command for the loop to
+    // reap and a second for the notice to be read back, but only once the job
+    // has actually ended — and two pty round trips can finish inside 200ms, at
+    // which point a fixed count checks for the hook before there is anything to
+    // find. Bounded, so a hook that never fires still fails rather than hangs.
+    if !pty_settle_until(shell.master, &mut seen, b"JOBDONE=1/6\r\n") {
+        return 115;
+    }
+
+    // The hook ran, with the job's own id and status — not the shell's. As in
+    // `blank_line_harness`, the trailing CRLF is what distinguishes the hook's
+    // *output* from the line editor echoing the `func` that defines it.
+    if occurrences(&seen, b"JOBDONE=1/6\r\n") != 1 {
+        return 119;
+    }
+    // And the notice the hook accompanies is still printed: the hook is an
+    // addition, not a replacement.
+    if occurrences(&seen, b"[1] Done (6)") == 0 {
+        return 120;
+    }
+
+    // A second job, reaped by `jobs` rather than by the top of the loop. `jobs`
+    // reaps before it lists, so it is the path that reports this one — and while
+    // `reap` handed its result back to whoever called it, that meant the hook
+    // fired for jobs the loop noticed and silently not for these.
+    if !pty_write(shell.master, b"sh -c 'sleep 0.4; exit 4' &\n") {
+        return 122;
+    }
+    let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+        return 123;
+    };
+    seen.extend_from_slice(&window);
+    // Waited for *here*, with nothing submitted, so the job ends while the shell
+    // sits in `read_line` — after that iteration's reap has already run. Waiting
+    // with a mesh command instead lets the next top-of-loop reap collect the job
+    // first, which is the path this case exists to avoid: an earlier version did
+    // exactly that and passed with the fix reverted.
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    if !pty_write(shell.master, b"jobs\n") {
+        return 126;
+    }
+    let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+        return 127;
+    };
+    seen.extend_from_slice(&window);
+    // The hook runs at the top of the loop after `jobs` reaped — the point is
+    // that it runs at all, not that it beats the listing.
+    if !pty_settle_until(shell.master, &mut seen, b"JOBDONE=2/4\r\n") {
+        return 128;
+    }
+    if occurrences(&seen, b"JOBDONE=2/4\r\n") != 1 {
+        return 130;
+    }
+
+    // And `fg` on a job that has already finished, which notices and reports it
+    // by a third path of its own — handing back the status the record carries
+    // rather than signaling an empty process group. It printed the notice
+    // without the hook until the two were issued from one place.
+    if !pty_write(shell.master, b"sh -c 'sleep 0.3; exit 5' &\n") {
+        return 131;
+    }
+    let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+        return 132;
+    };
+    seen.extend_from_slice(&window);
+    // Ends while the shell waits for input, so the top-of-loop reap has already
+    // run and `fg` is the first thing to look.
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    if !pty_write(shell.master, b"fg\n") {
+        return 133;
+    }
+    let Some((window, status)) = pty_read_until_command_done(shell.master) else {
+        return 134;
+    };
+    seen.extend_from_slice(&window);
+    // `fg` hands back the finished job's own status.
+    if status != 5 {
+        return 135;
+    }
+    if !pty_settle_until(shell.master, &mut seen, b"JOBDONE=3/5\r\n") {
+        return 136;
+    }
+    if occurrences(&seen, b"JOBDONE=3/5\r\n") != 1 {
+        return 137;
+    }
+
+    // A `preprompt` handler can report a job itself — it need only run `jobs`,
+    // which reaps before it lists. That happens *after* the drain at the top of
+    // the loop, so without a second drain the notice is printed above this
+    // prompt while its hook waits for the user to submit another line. The two
+    // are meant to be one event, so the ordering is the assertion: the hook's
+    // output has to land before the next command starts.
+    if !pty_write(shell.master, b"func pp() { sleep 0.6; jobs }\n") {
+        return 138;
+    }
+    let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+        return 139;
+    };
+    seen.extend_from_slice(&window);
+    if !pty_write(shell.master, b"prompt-hook preprompt p pp\n") {
+        return 140;
+    }
+    let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+        return 141;
+    };
+    seen.extend_from_slice(&window);
+    // Shorter than the handler's sleep, so the job ends while it is running and
+    // its `jobs` is the first thing to notice.
+    if !pty_write(shell.master, b"sh -c 'sleep 0.2; exit 8' &\n") {
+        return 142;
+    }
+    let mut ordering = Vec::new();
+    let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+        return 143;
+    };
+    ordering.extend_from_slice(&window);
+    // One more command. Everything the shell printed between the two `D` marks
+    // belongs to the prompt in between — the notice and, if the ordering holds,
+    // the hook with it.
+    if !pty_write(shell.master, b"puts after\n") {
+        return 144;
+    }
+    let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+        return 145;
+    };
+    ordering.extend_from_slice(&window);
+    let at = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|p| p == needle);
+    let (Some(notice), Some(hook)) = (
+        at(&ordering, b"[4] Done (8)"),
+        at(&ordering, b"JOBDONE=4/8\r\n"),
+    ) else {
+        seen.extend_from_slice(&ordering);
+        return 146;
+    };
+    // The `C` that opens the *next* command: the hook must be before it, or it
+    // ran a whole prompt late.
+    let Some(next) = at(&ordering[notice..], b"\x1b]133;C\x1b\\").map(|at| at + notice) else {
+        return 147;
+    };
+    if hook > next {
+        return 148;
+    }
+    seen.extend_from_slice(&ordering);
+
+    if !stop_pty_shell(shell) {
+        return 121;
+    }
+    0
+}
+
+#[test]
 fn an_abandoned_line_is_closed_without_a_status() {
     let exec = MeshExec::new(isolated_config_home());
     let harness = unsafe { libc::fork() };
@@ -3995,13 +4216,36 @@ fn disowning_exempts_a_job_from_the_hangup() {
     // is void just the same, since it only ever covered mesh's own hangup and
     // never the kernel's, so the shell says so on the way out rather than let
     // the promise fail in silence.
+    //
+    // The job stops *itself*, and the shell then `wait`s for it. That is what
+    // makes this deterministic: a wait blocks until the job changes state and
+    // reports the stop, so by the time it returns the shell has certainly
+    // noticed. Two earlier versions signalled from outside instead — `kill
+    // -STOP %1` returns as soon as the signal is *sent*, so both were really
+    // asserting that the shell happened to look after the process had stopped,
+    // which failed about one run in five and then again once under load with a
+    // `jobs` probe in between.
+    //
+    // The first sleep is what keeps the case honest: the job is still running
+    // when it is disowned, so no warning is issued there, and the one at exit is
+    // the only thing that can report the stop.
     let late = dir.join("late_stop.txt");
     let out = run_with_input(&format!(
-        "sh -c 'sleep 0.5; echo alive > {}' &\ndisown -h\nkill -STOP %1\nsleep 0.3\n",
+        "sh -c 'sleep 0.2; kill -STOP $$; sleep 0.5; echo alive > {}' &\n\
+         disown -h\n\
+         wait 1\n\
+         puts waited=$sh.status\n",
         late.display()
     ));
     std::thread::sleep(std::time::Duration::from_millis(1600));
     let said = String::from_utf8_lossy(&out.stderr);
+    let listed = String::from_utf8_lossy(&out.stdout);
+    // 128 + SIGSTOP(19): the wait reported the stop, so the shell knows.
+    assert!(
+        listed.contains("waited=147"),
+        "the shell never noticed the stop, so the exit notice was never in \
+         question: stdout {listed:?} stderr {said:?}"
+    );
     assert!(
         said.contains("[1] is stopped, so it will not survive the shell"),
         "a kept job that stopped after being disowned died without a word: {said}"

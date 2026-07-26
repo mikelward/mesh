@@ -100,6 +100,12 @@ pub struct JobTable {
     /// supply it once `bg` or a stop has moved a job forward. Ids rather than
     /// indices, so removing a job cannot silently repoint them.
     recency: Vec<usize>,
+    /// Jobs `reap` has reported and nobody has collected yet, oldest first. The
+    /// list is what lets every reap path feed the `jobdone` hook, rather than
+    /// only the one that happens to look at a return value.
+    finished: Vec<Finished>,
+    /// Whether to keep the above at all — see [`JobTable::collect_finished`].
+    collect_finished: bool,
 }
 
 struct Job {
@@ -157,6 +163,16 @@ pub struct JobInfo {
     pub state: &'static str,
     /// The exit status, once the job has finished.
     pub status: Option<u8>,
+}
+
+/// A job [`JobTable::reap`] found finished and took out of the table.
+///
+/// The status is not an `Option` as it is on [`JobInfo`]: a job only appears
+/// here because it ended, so there is always one to report.
+pub struct Finished {
+    pub id: usize,
+    pub command: String,
+    pub status: u8,
 }
 
 impl JobTable {
@@ -254,6 +270,8 @@ impl JobTable {
             jobs: Vec::new(),
             next_id: 1,
             recency: Vec::new(),
+            finished: Vec::new(),
+            collect_finished: false,
         }
     }
 
@@ -274,8 +292,7 @@ impl JobTable {
             poll_outcomes(&mut self.jobs[index].outcomes).map(|polled| polled.result)
         {
             let job = self.jobs.remove(index);
-            self.forget(job.id);
-            note!("[{}] Done ({status}) {}", job.id, job.command);
+            self.report_done(job, status);
             return status;
         }
         // The job leaves the table only once the resume has actually taken.
@@ -715,6 +732,19 @@ impl JobTable {
     }
 
     /// Report jobs which completed since the preceding prompt and remove them.
+    ///
+    /// What it reported is *kept*, for [`JobTable::take_finished`] to hand to the
+    /// `jobdone` hook, rather than returned. Reaping happens from more than one
+    /// place — `jobs` reaps before it lists, and so does the shell before a
+    /// pipeline stage that can look at the table — and a return value those
+    /// callers may drop is a hook that silently never fires for a job reported
+    /// by any path but one. Keeping it means every path feeds the hook by
+    /// construction.
+    ///
+    /// The hook is not run from here: it is arbitrary mesh code and this is the
+    /// job table, which knows nothing about functions — and one of those callers
+    /// is a pipeline stage about to fork, where running a user's function would
+    /// be wrong twice over.
     pub fn reap(&mut self) {
         // Collected rather than marked as they are found, for the reason `info`
         // sorts: a pass can notice several changes at once, and the order they
@@ -728,8 +758,7 @@ impl JobTable {
             {
                 Some((WaitResult::Complete(status), _)) => {
                     let job = self.jobs.remove(index);
-                    self.forget(job.id);
-                    note!("[{}] Done ({status}) {}", job.id, job.command);
+                    self.report_done(job, status);
                     continue;
                 }
                 Some((WaitResult::Stopped(code), seq)) => {
@@ -748,6 +777,44 @@ impl JobTable {
         for (_, id) in newly_current {
             self.mark_current(id);
         }
+    }
+
+    /// Announce a job that has finished, and remember it for the `jobdone` hook.
+    ///
+    /// The notice and the hook are one event, so they are issued together and
+    /// from one place. Anywhere that printed its own `[N] Done` would be a hook
+    /// that silently does not fire — which is what happened to `fg` on an
+    /// already-finished job, and to `jobs`, each having its own way of noticing.
+    ///
+    /// Not every removal comes through here: `wait` takes a finished job out of
+    /// the table without a word, deliberately, having just handed its status to
+    /// the caller that asked for it.
+    fn report_done(&mut self, job: Job, status: u8) {
+        self.forget(job.id);
+        note!("[{}] Done ({status}) {}", job.id, job.command);
+        // Only when someone will ask: a non-interactive shell has no hooks to
+        // run, and would otherwise grow this list for the life of a script that
+        // backgrounds in a loop.
+        if self.collect_finished {
+            self.finished.push(Finished {
+                id: job.id,
+                command: job.command,
+                status,
+            });
+        }
+    }
+
+    /// Start keeping what [`JobTable::reap`] reports, for `take_finished`.
+    ///
+    /// Off until the interactive loop turns it on, since it is the only thing
+    /// that drains the list and the only place a `jobdone` hook can run.
+    pub fn collect_finished(&mut self) {
+        self.collect_finished = true;
+    }
+
+    /// Take the jobs reaped since the last call, oldest report first.
+    pub fn take_finished(&mut self) -> Vec<Finished> {
+        std::mem::take(&mut self.finished)
     }
 
     /// Make `id` the current job, pushing the one it displaces behind it.

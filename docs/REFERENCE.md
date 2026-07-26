@@ -612,6 +612,7 @@ for primary prompts, not multiline continuation prompts.
 | `preprompt` | none | Before each primary prompt is rendered. This is the default event when omitted. |
 | `preexec` | `command` | Immediately before an interactive command runs. |
 | `postexec` | `command, status, elapsed` | After an interactive command; `elapsed` is integer milliseconds. |
+| `jobdone` | `id, command, status` | Once per background job the shell finds finished, alongside its `[N] Done` notice. |
 | `exit` | `status` | Before an interactive shell exits normally. |
 
 ```mesh
@@ -621,6 +622,19 @@ func command-finished(cmd, status, elapsed) {
 }
 prompt-hook preexec log command-started
 prompt-hook postexec log command-finished
+```
+
+`jobdone` runs where the `[N] Done` notice is printed — at the prompt after the
+job ended, not the instant it ended. A job you `wait` for does not reach it: the
+status went to the caller, which is what the hook is there to tell you.
+
+```mesh
+func job-finished(id, cmd, status) {
+  if $status != 0 {
+    puts "job $id failed ($status): $cmd"
+  }
+}
+prompt-hook jobdone report job-finished
 ```
 
 This is the currently implemented prompt API. The structured `$sh.prompt` map,

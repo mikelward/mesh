@@ -160,6 +160,7 @@ enum PromptEvent {
     PrePrompt,
     PreExec,
     PostExec,
+    JobDone,
     Exit,
 }
 
@@ -169,6 +170,7 @@ impl PromptEvent {
             "preprompt" => Some(Self::PrePrompt),
             "preexec" => Some(Self::PreExec),
             "postexec" => Some(Self::PostExec),
+            "jobdone" => Some(Self::JobDone),
             "exit" => Some(Self::Exit),
             _ => None,
         }
@@ -5002,6 +5004,26 @@ fn environment_prompt_title() -> String {
     prompt_title(&user, &hostname(), &cwd, home.as_deref())
 }
 
+/// Run `jobdone` for every job reported since the last drain, oldest first.
+///
+/// Called wherever the shell may have noticed one, because the notice and the
+/// hook are the same event and must not land at different prompts. A job the
+/// user explicitly `wait`ed for never appears here: its status went to the
+/// caller, which is the answer the hook exists to give.
+fn run_jobdone_hooks(shell: &mut Shell) {
+    for job in shell.jobs.take_finished() {
+        run_prompt_hooks(
+            PromptEvent::JobDone,
+            vec![
+                Value::Integer(i64::try_from(job.id).unwrap_or(i64::MAX)),
+                Value::String(job.command),
+                Value::Integer(i64::from(job.status)),
+            ],
+            shell,
+        );
+    }
+}
+
 fn run_prompt_hooks(event: PromptEvent, args: Vec<Value>, shell: &mut Shell) {
     let hooks: Vec<String> = shell
         .prompt
@@ -6936,6 +6958,9 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     // reads commands but is not one, so this is recorded by the loop rather than
     // derived from `isatty`.
     shell.vars.set_interactive(true);
+    // Only this loop drains what `reap` reports, and only here can a `jobdone`
+    // hook run, so only here is it worth remembering.
+    shell.jobs.collect_finished();
     let (origin, source) = options.origin(true);
     shell.vars.set_origin(origin, source);
     let mut last = match run_startup_files(options, true, 0, &mut shell) {
@@ -6951,9 +6976,25 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     let mut gate = HeredocGate::default();
     let mut pending_history_rows = 0;
     loop {
+        // Where `[N] Done` is printed, so the hook fires exactly when the shell
+        // says it noticed — one call per job, in the order they were reported.
+        // A job the user explicitly `wait`ed for does not come through here: its
+        // status went to the caller, which is the answer the hook exists to give.
+        //
+        // `take_finished` rather than this reap's own result: `jobs` reaps before
+        // it lists, and so does the shell before a pipeline stage that can look
+        // at the table, so a job can be reported and removed before this line
+        // runs. Draining the table collects those too.
         shell.jobs.reap();
+        run_jobdone_hooks(&mut shell);
         if pending.is_empty() {
             run_prompt_hooks(PromptEvent::PrePrompt, Vec::new(), &mut shell);
+            // Again, because a `preprompt` handler can report a job itself — it
+            // need only run `jobs`, which reaps before it lists. Without this the
+            // notice would be printed above this prompt while its hook waited
+            // for the user to submit another line, and the two are supposed to
+            // be one event. Cheap when nothing was queued, which is the norm.
+            run_jobdone_hooks(&mut shell);
             // After the hooks, so a `preprompt` handler that cds is reported from
             // where it left the shell rather than from where it found it. Only for
             // a fresh command: a continuation line is the same command line still
