@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read};
 use std::mem::ManuallyDrop;
@@ -14,7 +15,7 @@ use std::os::fd::FromRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::{Arc, OnceLock, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -673,13 +674,17 @@ fn run_startup_files(
 }
 
 fn run_logout(options: &StartupOptions, last: u8, shell: &mut Shell) -> u8 {
-    if !options.login {
-        return last;
+    if options.login
+        && let Some(path) = config_dir().map(|dir| dir.join("logout.mesh"))
+    {
+        let _ = run_config_file(&path, last, shell);
     }
-    let Some(path) = config_dir().map(|dir| dir.join("logout.mesh")) else {
-        return last;
-    };
-    let _ = run_config_file(&path, last, shell);
+    // Clear the title on the way out, and last, so mesh has the final word over a
+    // `logout.mesh` that writes one. Every exit path arrives here, which is what
+    // makes this the place: `exit` would otherwise leave the window named after
+    // that command forever, and Ctrl-D would leave it naming the directory of a
+    // shell that is gone. An empty title is the reset every terminal understands.
+    set_title(shell.vars.interactive(), "");
     last
 }
 
@@ -4684,6 +4689,202 @@ fn hostname() -> Vec<u8> {
     buffer[..end].to_vec()
 }
 
+/// How long a title may get, in characters. A title bar is a handful of
+/// centimetres and every terminal elides what does not fit — but it elides the
+/// *end*, so a long `find` invocation would push what identifies the window off
+/// the edge. Cutting it here keeps the decision with the shell.
+const TITLE_LIMIT: usize = 96;
+
+/// Set the window and tab title, per `DESIGN.md` "terminal control".
+///
+/// Automatic: at the prompt it says where the shell is, and while a command runs
+/// it says what is running, which is what makes a row of tabs readable at a
+/// glance. The off switch that item asks for wants to be
+/// `$sh.options.osc-title`, alongside the `$sh.options.bold-input` already
+/// floated in `TODO.md`, and waits on `$sh` becoming a writable place.
+///
+/// Interactive-only and failure-ignoring, for the same reasons as
+/// [`semantic_mark`] and [`report_cwd`].
+fn set_title(interactive: bool, text: &str) {
+    if !interactive {
+        return;
+    }
+    let Some(sequence) = title_sequence(session_term().as_deref(), text) else {
+        return;
+    };
+    use std::io::Write as _;
+    let mut out = io::stdout();
+    let _ = out.write_all(sequence.as_bytes());
+    let _ = out.flush();
+}
+
+/// `$env.TERM` as it stood at the first title, held for the session.
+///
+/// Read once rather than per title, because the terminal on the other end does not
+/// change: `$env.TERM = dumb` mid-session is a claim about a terminal, not a new
+/// one. Reading it each time let the *clear* at exit consult a different answer
+/// than the title it was clearing, so that assignment left the window holding the
+/// command that made it — raised in review on #238. A startup file's `$env.TERM` is
+/// still honored, since the first title comes after those have run.
+fn session_term() -> Option<OsString> {
+    static TERM: OnceLock<Option<OsString>> = OnceLock::new();
+    TERM.get_or_init(|| std::env::var_os("TERM")).clone()
+}
+
+/// The title sequence for this `$env.TERM`, or `None` for a terminal that has no
+/// title to set.
+///
+/// Three answers rather than one, because the sequence is not portable:
+///
+/// - **screen and tmux** take `ESC k … ST`, naming the *window* inside the
+///   multiplexer. Sent OSC 0 instead, tmux would forward it to the outer terminal
+///   and the pane's own name would never change.
+/// - **A terminal in [`TITLE_TERMS`]** takes OSC 0, which sets the window and the
+///   icon name together.
+/// - **Anything else** is sent nothing.
+///
+/// Terminated with `BEL`, not the `ST` mesh uses elsewhere. The title is the
+/// oldest and most widely implemented of these sequences, every shell's `PS1`
+/// idiom spells it `\e]0;…\a`, and terminals exist that answer to that spelling
+/// alone — so this is the one place where matching the installed base beats
+/// matching the rest of the file.
+fn title_sequence(term: Option<&std::ffi::OsStr>, text: &str) -> Option<String> {
+    let term = term?.to_str()?;
+    if names_terminal(term, "screen") || names_terminal(term, "tmux") {
+        return Some(format!("\x1bk{}\x1b\\", title_text(text)));
+    }
+    TITLE_TERMS
+        .iter()
+        .any(|family| names_terminal(term, family))
+        .then(|| format!("\x1b]0;{}\x07", title_text(text)))
+}
+
+/// The terminal families that take an OSC 0 title.
+///
+/// An allowlist because the two ways of being wrong are not equally bad: a
+/// terminal missing from here quietly has no title, while one wrongly assumed to
+/// take one *prints the title text at every prompt*. `TODO.md` carries the reasons
+/// in full, and terminfo as the follow-up that would replace the list with data.
+const TITLE_TERMS: &[&str] = &[
+    "alacritty",
+    "contour",
+    "foot",
+    "ghostty",
+    "gnome",
+    "iterm",
+    "kitty",
+    "konsole",
+    "mintty",
+    "mlterm",
+    "putty",
+    "rxvt",
+    "st",
+    "stterm",
+    "terminator",
+    "termite",
+    "vte",
+    "wezterm",
+    "xterm",
+];
+
+/// Is `term` this terminal family, or a variant of it?
+///
+/// Terminfo separates a variant from its family with `-` or `.`
+/// (`xterm-256color`, `screen.xterm-256color`), so a family name ends at one of
+/// those or at the end of the string. A bare prefix test would be wrong in the
+/// direction the allowlist exists to avoid: `st52` is an Atari VT52 with no title,
+/// and it starts with `st`.
+fn names_terminal(term: &str, family: &str) -> bool {
+    term.strip_prefix(family)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.']))
+}
+
+/// A string safe to put in a title: control characters replaced by spaces, and no
+/// longer than [`TITLE_LIMIT`] characters.
+///
+/// The stripping is not tidiness. Both things mesh titles — the command line and
+/// the working directory — carry text it did not choose, and a filename may hold
+/// an `ESC`: `touch $'\e]0;x\a'` in a directory the user then `cd`s into would
+/// otherwise close mesh's sequence early and start one of its own, with the rest
+/// of the title as its payload. A control character cannot draw anything in a
+/// title bar, so replacing it costs nothing and ends the question. Spaces rather
+/// than deletion so a pasted two-line command does not read as one joined word.
+fn title_text(text: &str) -> String {
+    let mut title: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(TITLE_LIMIT)
+        .collect();
+    if text.chars().count() > TITLE_LIMIT {
+        // Trim first: a cut that lands mid-word reads better without the space
+        // before the ellipsis.
+        title = title.trim_end().to_string();
+        title.push('…');
+    }
+    title
+}
+
+/// What the title says at the prompt: `user@host: directory`, the form a terminal
+/// window has carried since `xterm` — the shell is idle, so the useful thing to
+/// say is where it is idle. `$HOME` shortens to `~`, as in a prompt.
+///
+/// Assembled from parameters rather than read from the environment so it is
+/// testable without one.
+fn prompt_title(user: &str, host: &[u8], cwd: &Path, home: Option<&Path>) -> String {
+    let mut title = String::new();
+    if !user.is_empty() {
+        title.push_str(user);
+    }
+    if !host.is_empty() {
+        if !title.is_empty() {
+            title.push('@');
+        }
+        title.push_str(&String::from_utf8_lossy(host));
+    }
+    if !title.is_empty() {
+        title.push_str(": ");
+    }
+    title.push_str(&abbreviated_home(cwd, home));
+    title
+}
+
+/// `/home/mikel/src` as `~/src`, when it is under `home`. Whole-component
+/// matching, so `/home/mikelward` is not `~ward` when `$HOME` is `/home/mikel`.
+fn abbreviated_home(cwd: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home.filter(|home| home.as_os_str().len() > 1) else {
+        return cwd.to_string_lossy().into_owned();
+    };
+    match cwd.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.to_string_lossy()),
+        Err(_) => cwd.to_string_lossy().into_owned(),
+    }
+}
+
+/// The title while a command runs: the command line itself, so a tab says what it
+/// is busy with. Where the shell is is *already* on screen in the scrollback above
+/// it; what is running may not be, once the output scrolls.
+fn running_title(command: &str) -> String {
+    command.trim().to_owned()
+}
+
+/// The prompt title, read from the environment. `$env.USER` is consulted for the
+/// user name because that is the name the session was opened under; `getpwuid`
+/// would answer with the account behind a `sudo -u`, which is not what a title is
+/// reporting.
+fn environment_prompt_title() -> String {
+    let user = std::env::var("USER").unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    prompt_title(&user, &hostname(), &cwd, home.as_deref())
+}
+
 fn run_prompt_hooks(event: PromptEvent, args: Vec<Value>, shell: &mut Shell) {
     let hooks: Vec<String> = shell
         .prompt
@@ -6631,6 +6832,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             // a fresh command: a continuation line is the same command line still
             // being typed, and the shell cannot have moved between the two.
             report_cwd(shell.vars.interactive());
+            set_title(shell.vars.interactive(), &environment_prompt_title());
         }
         *completion.write().expect("completion state poisoned") =
             CompletionState::from_shell(&shell);
@@ -7205,6 +7407,11 @@ fn handle_signal(
                 return Some(run_line(&text, last, false, shell));
             }
             let marks = shell.vars.interactive();
+            // Before `C`, since a title is not output: it belongs outside the
+            // region a terminal will offer to fold, next to the submission that
+            // caused it. The prompt's title comes back at the next prompt, so a
+            // command's title lasts exactly as long as the command.
+            set_title(marks, &running_title(&command));
             // Both marks sit outside the hooks, so that everything printed
             // because this command was submitted falls inside the region they
             // bracket. A `preexec` hook that writes before `C` is folded into
@@ -7523,13 +7730,14 @@ impl Prompt for MeshPrompt {
 mod tests {
     use super::{
         ArgumentRecall, CompletionState, HeredocGate, Invocation, MeshPrompt, PromptEvent,
-        PromptHook, Shell, StartupOptions, Step, TimestampedHistory, argument_completions,
-        body_awaits_close, command_position, command_segment_words, command_words,
-        completed_command, cwd_url, escape_stripped_width, eval_binary, expand_history_designators,
-        expansion_word, func_definition_is_open, handle_signal, help_completions,
-        history_designators, history_path_from, input_highlighter, interactive_keybindings,
-        interruptible_task, last_argument, needs_more_input, open_history, path_completions_sync,
-        persist_logical_history, prepare_history_path, run_line, run_prompt_hooks, run_source,
+        PromptHook, Shell, StartupOptions, Step, TITLE_LIMIT, TimestampedHistory,
+        argument_completions, body_awaits_close, command_position, command_segment_words,
+        command_words, completed_command, cwd_url, escape_stripped_width, eval_binary,
+        expand_history_designators, expansion_word, func_definition_is_open, handle_signal,
+        help_completions, history_designators, history_path_from, input_highlighter,
+        interactive_keybindings, interruptible_task, last_argument, needs_more_input, open_history,
+        path_completions_sync, persist_logical_history, prepare_history_path, prompt_title,
+        run_line, run_prompt_hooks, run_source, running_title, title_sequence, title_text,
         variable_completions,
     };
     use crate::parser;
@@ -7538,9 +7746,10 @@ mod tests {
         EditCommand, Highlighter, History, HistoryItem, KeyModifiers, Prompt, PromptEditMode,
         Reedline, ReedlineEvent, SearchDirection, SearchQuery, Signal, SqliteBackedHistory,
     };
+    use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn temporary_history_path(name: &str) -> PathBuf {
@@ -8792,6 +9001,154 @@ mod tests {
                 "{prompt_command} measured its title"
             );
         }
+    }
+
+    #[test]
+    fn the_title_sequence_follows_the_terminal() {
+        let osc = |term: &str| title_sequence(Some(OsStr::new(term)), "t");
+        // OSC 0 sets the window and icon name together, and is what everything
+        // outside a multiplexer takes.
+        assert_eq!(osc("xterm-256color").as_deref(), Some("\x1b]0;t\x07"));
+        assert_eq!(osc("alacritty").as_deref(), Some("\x1b]0;t\x07"));
+        // A variant comes along with its family: kitty names itself after xterm,
+        // and `st-256color` and `stterm-256color` are both suckless `st`.
+        assert_eq!(osc("xterm-kitty").as_deref(), Some("\x1b]0;t\x07"));
+        assert_eq!(osc("foot-extra").as_deref(), Some("\x1b]0;t\x07"));
+        assert_eq!(osc("st-256color").as_deref(), Some("\x1b]0;t\x07"));
+        assert_eq!(osc("stterm-256color").as_deref(), Some("\x1b]0;t\x07"));
+        // Inside screen or tmux the sequence names the *pane*. Sent OSC 0, tmux
+        // forwards it to the outer terminal and the pane's name never changes.
+        assert_eq!(
+            osc("screen.xterm-256color").as_deref(),
+            Some("\x1bkt\x1b\\")
+        );
+        assert_eq!(osc("tmux-256color").as_deref(), Some("\x1bkt\x1b\\"));
+    }
+
+    #[test]
+    fn a_terminal_with_no_title_is_sent_nothing() {
+        let osc = |term: Option<&str>| title_sequence(term.map(OsStr::new), "t");
+        // Not caution about a no-op. The Linux console reads `ESC ]` as the start
+        // of a palette sequence and abandons it at the first non-hex byte, so the
+        // rest of the title prints and the `BEL` beeps; under `dumb` — an Emacs
+        // shell buffer — the whole sequence prints.
+        assert_eq!(osc(Some("linux")), None);
+        assert_eq!(osc(Some("dumb")), None);
+        assert_eq!(osc(Some("cons25")), None);
+        assert_eq!(osc(Some("vt100")), None);
+        // `ansi` and `sun` are the two that fell through this when it was a list of
+        // exclusions rather than a list of what works — raised in review on #238.
+        // Neither has a title, and both would have printed one.
+        assert_eq!(osc(Some("ansi")), None);
+        assert_eq!(osc(Some("sun")), None);
+        // `st52` is an Atari VT52, not suckless `st` — a family name has to end at
+        // a `-`, a `.`, or the end of the string, or the allowlist leaks exactly
+        // the terminals it exists to keep out. Raised in review on #238.
+        assert_eq!(osc(Some("st52")), None);
+        // An unknown terminal is silent rather than assumed to be xterm-like: no
+        // title is a thing nobody has to debug, and a printed one is not.
+        assert_eq!(osc(Some("wy60")), None);
+        assert_eq!(osc(Some("a-terminal-nobody-has-written-yet")), None);
+        assert_eq!(osc(Some("")), None);
+        assert_eq!(osc(None), None);
+    }
+
+    #[test]
+    fn a_title_cannot_carry_an_escape_sequence_of_its_own() {
+        // Both things mesh titles carry text it did not choose. A file named with
+        // an `ESC` — `touch $'\e]0;x\a'`, then `cd` into that directory — would
+        // otherwise close mesh's sequence early and open one of its own.
+        // The `]0;evil` text survives as text, which is the point: without an
+        // `ESC` in front of it, it cannot begin anything.
+        assert_eq!(
+            title_sequence(Some(OsStr::new("xterm")), "a\x1b]0;evil\x07b").as_deref(),
+            Some("\x1b]0;a ]0;evil b\x07")
+        );
+        // A pasted two-line command keeps its word boundary, which deleting the
+        // newline instead of replacing it would lose.
+        assert_eq!(title_text("puts one\nputs two"), "puts one puts two");
+        // Nor can it end the multiplexer's sequence early: `ST` needs the same
+        // `ESC`, so a bare backslash is left as the character it is.
+        assert_eq!(
+            title_sequence(Some(OsStr::new("screen")), "a\x1b\\b").as_deref(),
+            Some("\x1bka \\b\x1b\\")
+        );
+    }
+
+    #[test]
+    fn a_long_title_is_cut_by_the_shell_not_the_title_bar() {
+        // A terminal elides the *end*, which is where the identifying part of a
+        // long command line would be. 96 characters, then an ellipsis.
+        let long = "x".repeat(200);
+        let title = title_text(&long);
+        assert_eq!(title.chars().count(), TITLE_LIMIT + 1);
+        assert!(title.ends_with('…'), "{title}");
+        // The cut counts characters, not bytes, so a multi-byte title is not
+        // truncated early or split down the middle of one.
+        let wide = "日".repeat(200);
+        let wide_title = title_text(&wide);
+        assert_eq!(wide_title.chars().count(), TITLE_LIMIT + 1);
+        assert!(wide_title.starts_with("日日"), "{wide_title}");
+        // A title that fits keeps its exact text, ellipsis and all.
+        assert_eq!(title_text("puts hi"), "puts hi");
+        assert_eq!(
+            title_text(&"y".repeat(TITLE_LIMIT)),
+            "y".repeat(TITLE_LIMIT)
+        );
+    }
+
+    #[test]
+    fn the_prompt_title_says_who_and_where() {
+        let home = PathBuf::from("/home/mikel");
+        assert_eq!(
+            prompt_title(
+                "mikel",
+                b"vm",
+                &PathBuf::from("/home/mikel/src"),
+                Some(&home)
+            ),
+            "mikel@vm: ~/src"
+        );
+        // `$HOME` itself, rather than `~/`.
+        assert_eq!(
+            prompt_title("mikel", b"vm", &home, Some(&home)),
+            "mikel@vm: ~"
+        );
+        // Whole components only: `/home/mikelward` is not `~ward`.
+        assert_eq!(
+            prompt_title(
+                "mikel",
+                b"vm",
+                &PathBuf::from("/home/mikelward"),
+                Some(&home)
+            ),
+            "mikel@vm: /home/mikelward"
+        );
+        // A missing piece drops out with its separator rather than leaving `@` or
+        // `: ` hanging — a title is read at a glance, and `@vm: ~` reads as a
+        // truncation while `vm: ~` reads as a fact.
+        assert_eq!(
+            prompt_title("", b"vm", &PathBuf::from("/tmp"), None),
+            "vm: /tmp"
+        );
+        assert_eq!(
+            prompt_title("mikel", b"", &PathBuf::from("/tmp"), None),
+            "mikel: /tmp"
+        );
+        assert_eq!(prompt_title("", b"", &PathBuf::from("/tmp"), None), "/tmp");
+        // `$HOME=/` would make every path `~`-prefixed, so it is left alone.
+        assert_eq!(
+            prompt_title("", b"", &PathBuf::from("/tmp"), Some(Path::new("/"))),
+            "/tmp"
+        );
+    }
+
+    #[test]
+    fn the_running_title_is_the_command() {
+        assert_eq!(running_title("  cargo test  "), "cargo test");
+        // A multi-line command keeps both lines; `title_text` is what flattens
+        // them, so the two responsibilities stay separable.
+        assert_eq!(running_title("puts one\nputs two"), "puts one\nputs two");
     }
 
     #[test]
