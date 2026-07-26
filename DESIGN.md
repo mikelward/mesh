@@ -3042,6 +3042,12 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
   no `C`/`D` reads everything after the prompt as still being input, which is worse
   than a stream with no marks at all — and is read once per command, before it
   runs, so a command that changes it cannot leave a `C` without its `D`.
+  Under `$env.TERM_PROGRAM == vscode` the marks are **`OSC 633`**, VS Code's dialect:
+  the same boundaries under a different number, plus `E`, which hands over the
+  command line so the terminal can label and re-run it rather than reading the text
+  back out of the echo. One dialect, never both — VS Code parses `133` as well and
+  would count every command twice. `633;P;Cwd=` is left out, since `OSC 7` already
+  reports the directory.
 - ***cwd reporting*** *(OSC 7)* — **decided: automatic, once per prompt** (after the
   `preprompt` hooks), **off switch `$sh.options.cwd-report`**, which covers both the
   startup report a fresh remote shell owes

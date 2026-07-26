@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 use reedline::{
     Color, ColumnarMenu, Completer, EditCommand, Emacs, Highlighter, History, HistoryItem,
     HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, Keybindings, MenuBuilder,
-    Osc133Markers, Prompt, PromptEditMode, PromptHistorySearch, PromptKind, Reedline,
-    ReedlineEvent, ReedlineMenu, SearchDirection, SearchQuery, SemanticPromptMarkers, Signal,
-    SimpleMatchHighlighter, Span, SqliteBackedHistory, StyledText, Suggestion,
+    Osc133Markers, Osc633Markers, Prompt, PromptEditMode, PromptHistorySearch, PromptKind,
+    Reedline, ReedlineEvent, ReedlineMenu, SearchDirection, SearchQuery, SemanticPromptMarkers,
+    Signal, SimpleMatchHighlighter, Span, SqliteBackedHistory, StyledText, Suggestion,
     default_emacs_keybindings,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -4726,6 +4726,94 @@ enum SemanticMark {
     /// no outcome to report, but the input region reedline opened at `B` still
     /// has to be closed.
     CommandAbandoned,
+    /// `E` — the command line as submitted, which lets a terminal label and re-run
+    /// the command instead of guessing it back out of the echo. Only `OSC 633`
+    /// carries it; `OSC 133` has no such sequence, so this writes nothing there.
+    CommandLine(String),
+}
+
+/// Which shell-integration dialect a session speaks.
+///
+/// `OSC 633` is VS Code's superset of `OSC 133`: the same `A`/`B`/`C`/`D`
+/// boundaries under a different number, plus `E`, which hands over the command
+/// line. VS Code understands plain `133` too — but only from `633;E` does it learn
+/// what the command *was*, which is what its re-run and command-label features
+/// need; left to `133` it recovers the text by reading back the echo, and gets it
+/// wrong whenever the prompt or the line editor is interesting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Integration {
+    Osc133,
+    Osc633,
+}
+
+impl Integration {
+    /// The number the dialect's sequences carry.
+    fn code(self) -> &'static str {
+        match self {
+            Integration::Osc133 => "133",
+            Integration::Osc633 => "633",
+        }
+    }
+}
+
+/// The dialect for this session, from `$env.TERM_PROGRAM`, held once.
+///
+/// `vscode` is what VS Code sets, and what its forks set too. One dialect, not
+/// both: VS Code parses `133` as well, so sending both would have it count every
+/// command twice.
+///
+/// Read once for the same reason as [`session_term`] — the terminal on the other
+/// end does not change mid-session, and a dialect that changed under the marks
+/// would close a region in a language it was not opened in. Both are snapshotted
+/// at one point in `run_interactive`, after the startup files, so an `rc.mesh` that
+/// sets either variable is honored and neither read depends on which sequence
+/// happens to be written first.
+fn session_integration() -> Integration {
+    static DIALECT: OnceLock<Integration> = OnceLock::new();
+    *DIALECT.get_or_init(|| match std::env::var("TERM_PROGRAM").as_deref() {
+        Ok("vscode") => Integration::Osc633,
+        _ => Integration::Osc133,
+    })
+}
+
+/// The bytes for one mark in one dialect, or `None` when the dialect has no
+/// sequence for it.
+fn mark_sequence(dialect: Integration, mark: &SemanticMark) -> Option<String> {
+    let code = dialect.code();
+    Some(match mark {
+        SemanticMark::OutputStart => format!("\x1b]{code};C\x1b\\"),
+        SemanticMark::CommandDone(status) => format!("\x1b]{code};D;{status}\x1b\\"),
+        SemanticMark::CommandAbandoned => format!("\x1b]{code};D\x1b\\"),
+        SemanticMark::CommandLine(command) => {
+            if dialect == Integration::Osc133 {
+                return None;
+            }
+            format!("\x1b]{code};E;{}\x1b\\", vscode_escaped(command))
+        }
+    })
+}
+
+/// A command line as `OSC 633;E` must carry it.
+///
+/// The payload is delimited by `;`, so a semicolon in the command would end the
+/// sequence early and leave the rest of the line on screen — `sleep 1; puts hi` is
+/// an ordinary thing to type. VS Code's escape for this is `\xAB`, hex for the
+/// byte, and it wants the same for the control range; the backslash that
+/// introduces it has to be escaped too, or `C:\x3b` in an argument would decode as
+/// a semicolon that was never typed.
+fn vscode_escaped(command: &str) -> String {
+    let mut escaped = String::with_capacity(command.len());
+    for character in command.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            ';' => escaped.push_str("\\x3b"),
+            control if control.is_control() => {
+                escaped.push_str(&format!("\\x{:02x}", control as u32));
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 /// Is an interactive decoration on — the session is interactive *and* the
@@ -4760,10 +4848,8 @@ fn semantic_mark(enabled: bool, mark: SemanticMark) {
     if !enabled {
         return;
     }
-    let sequence = match mark {
-        SemanticMark::OutputStart => "\x1b]133;C\x1b\\".to_string(),
-        SemanticMark::CommandDone(status) => format!("\x1b]133;D;{status}\x1b\\"),
-        SemanticMark::CommandAbandoned => "\x1b]133;D\x1b\\".to_string(),
+    let Some(sequence) = mark_sequence(session_integration(), &mark) else {
+        return;
     };
     use std::io::Write as _;
     let mut out = io::stdout();
@@ -7057,7 +7143,8 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         // `PromptMarkers` rather than deciding whether to install them here.
         .with_semantic_markers(Some(Box::new(PromptMarkers {
             options: Arc::clone(shell.vars.options()),
-            marks: Osc133Markers,
+            plain: Osc133Markers,
+            vscode: Osc633Markers,
         })))
         // Bracketed paste (`CSI ?2004 h`), per `DESIGN.md` "terminal control":
         // pasted text is *inserted*, not executed line by line. reedline's guard
@@ -7116,6 +7203,13 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             return ExitCode::from(run_logout(options, status_of(&value), &mut shell));
         }
     };
+    // Now, and deliberately: the environment the session's sequences are chosen
+    // from is read *after* the startup files have had their say and before the
+    // first prompt draws anything. Leaving it to whichever write happened to come
+    // first made the moment an accident, and put the dialect's read before
+    // `rc.mesh` — see `session_integration`.
+    let _ = session_term();
+    let _ = session_integration();
     let mut pending = String::new();
     let mut gate = HeredocGate::default();
     let mut pending_history_rows = 0;
@@ -7299,8 +7393,8 @@ impl Highlighter for InputHighlighter {
     }
 }
 
-/// The prompt's own OSC 133 marks — `A` and `B` — gated on the same setting as
-/// the `C` and `D` [`semantic_mark`] writes.
+/// The prompt's own marks — `A` and `B` — in the session's dialect, gated on the
+/// same setting as the `C` and `D` [`semantic_mark`] writes.
 ///
 /// Both halves or neither: a terminal that sees `A` and `B` with no `C`/`D` reads
 /// everything after the prompt as still being input, which is worse than a stream
@@ -7309,13 +7403,29 @@ impl Highlighter for InputHighlighter {
 /// install them.
 struct PromptMarkers {
     options: Arc<Options>,
-    marks: Osc133Markers,
+    plain: Osc133Markers,
+    vscode: Osc633Markers,
+}
+
+impl PromptMarkers {
+    /// The dialect's markers, asked for at the moment of drawing rather than held.
+    ///
+    /// reedline is handed this object once, while the editor is built — which is
+    /// *before* the startup files run. Choosing the dialect here instead of there
+    /// is what lets an `rc.mesh` that sets `$env.TERM_PROGRAM` be honored, the same
+    /// as one that sets `$env.TERM`. Raised in review on #247.
+    fn marks(&self) -> &dyn SemanticPromptMarkers {
+        match session_integration() {
+            Integration::Osc133 => &self.plain,
+            Integration::Osc633 => &self.vscode,
+        }
+    }
 }
 
 impl SemanticPromptMarkers for PromptMarkers {
     fn prompt_start(&self, kind: PromptKind) -> Cow<'_, str> {
         if self.options.get(Opt::ShellIntegration) {
-            self.marks.prompt_start(kind)
+            Cow::Owned(self.marks().prompt_start(kind).into_owned())
         } else {
             Cow::Borrowed("")
         }
@@ -7323,7 +7433,7 @@ impl SemanticPromptMarkers for PromptMarkers {
 
     fn command_input_start(&self) -> Cow<'_, str> {
         if self.options.get(Opt::ShellIntegration) {
-            self.marks.command_input_start()
+            Cow::Owned(self.marks().command_input_start().into_owned())
         } else {
             Cow::Borrowed("")
         }
@@ -7807,6 +7917,10 @@ fn handle_signal(
                 decoration(&shell.vars, Opt::OscTitle),
                 &running_title(&command),
             );
+            // `E` first, so a terminal knows what is about to run before any of
+            // its output arrives — the order VS Code's own integrations use.
+            // Nothing is written for `OSC 133`, which has no such sequence.
+            semantic_mark(marks, SemanticMark::CommandLine(command.clone()));
             // Both marks sit outside the hooks, so that everything printed
             // because this command was submitted falls inside the region they
             // bracket. A `preexec` hook that writes before `C` is folded into
@@ -7895,6 +8009,13 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
             return ExitCode::from(run_logout(options, status_of(&value), &mut shell));
         }
     };
+    // Now, and deliberately: the environment the session's sequences are chosen
+    // from is read *after* the startup files have had their say and before the
+    // first prompt draws anything. Leaving it to whichever write happened to come
+    // first made the moment an accident, and put the dialect's read before
+    // `rc.mesh` — see `session_integration`.
+    let _ = session_term();
+    let _ = session_integration();
     let mut pending = String::new();
     let mut gate = HeredocGate::default();
     // Discard a buffered input unit if any of its physical lines was invalid
@@ -8137,16 +8258,17 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgumentRecall, CompletionState, HeredocGate, Invocation, MeshPrompt, NOTIFY_LIMIT,
-        PromptEvent, PromptHook, PromptMarkers, Shell, StartupOptions, Step, TITLE_LIMIT,
-        TimestampedHistory, argument_completions, body_awaits_close, command_notification,
-        command_position, command_segment_words, command_words, completed_command, cwd_url,
-        duration_words, escape_stripped_width, eval_binary, expand_history_designators,
-        expansion_word, func_definition_is_open, handle_signal, help_completions,
-        history_designators, history_path_from, input_highlighter, interactive_keybindings,
-        interruptible_task, last_argument, needs_more_input, open_history, path_completions_sync,
-        persist_logical_history, prepare_history_path, prompt_title, run_line, run_prompt_hooks,
-        run_source, running_title, title_sequence, title_text, variable_completions,
+        ArgumentRecall, CompletionState, HeredocGate, Integration, Invocation, MeshPrompt,
+        NOTIFY_LIMIT, PromptEvent, PromptHook, PromptMarkers, SemanticMark, Shell, StartupOptions,
+        Step, TITLE_LIMIT, TimestampedHistory, argument_completions, body_awaits_close,
+        command_notification, command_position, command_segment_words, command_words,
+        completed_command, cwd_url, duration_words, escape_stripped_width, eval_binary,
+        expand_history_designators, expansion_word, func_definition_is_open, handle_signal,
+        help_completions, history_designators, history_path_from, input_highlighter,
+        interactive_keybindings, interruptible_task, last_argument, mark_sequence,
+        needs_more_input, open_history, path_completions_sync, persist_logical_history,
+        prepare_history_path, prompt_title, run_line, run_prompt_hooks, run_source, running_title,
+        title_sequence, title_text, variable_completions, vscode_escaped,
     };
     use crate::builtins::{Multiplexer, through_multiplexer};
     use crate::options::Options;
@@ -9511,6 +9633,68 @@ mod tests {
     }
 
     #[test]
+    fn the_marks_carry_the_dialect_the_session_speaks() {
+        // The same boundaries under a different number. VS Code parses `133` too,
+        // so one dialect is sent, not both — it would count every command twice.
+        for (dialect, code) in [(Integration::Osc133, "133"), (Integration::Osc633, "633")] {
+            assert_eq!(
+                mark_sequence(dialect, &SemanticMark::OutputStart).as_deref(),
+                Some(format!("\x1b]{code};C\x1b\\").as_str())
+            );
+            assert_eq!(
+                mark_sequence(dialect, &SemanticMark::CommandDone(3)).as_deref(),
+                Some(format!("\x1b]{code};D;3\x1b\\").as_str())
+            );
+            assert_eq!(
+                mark_sequence(dialect, &SemanticMark::CommandAbandoned).as_deref(),
+                Some(format!("\x1b]{code};D\x1b\\").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn only_vs_codes_dialect_carries_the_command_line() {
+        // `OSC 133` has no sequence for it, so there is nothing to send rather than
+        // something to invent.
+        assert_eq!(
+            mark_sequence(
+                Integration::Osc133,
+                &SemanticMark::CommandLine("puts hi".to_owned())
+            ),
+            None
+        );
+        assert_eq!(
+            mark_sequence(
+                Integration::Osc633,
+                &SemanticMark::CommandLine("puts hi".to_owned())
+            )
+            .as_deref(),
+            Some("\x1b]633;E;puts hi\x1b\\")
+        );
+    }
+
+    #[test]
+    fn a_command_line_cannot_end_the_sequence_carrying_it() {
+        // `;` delimits the payload, so an unescaped one would end `E` early and
+        // leave the rest of the command on screen — and `sleep 1; puts hi` is an
+        // ordinary thing to type.
+        assert_eq!(vscode_escaped("sleep 1; puts hi"), "sleep 1\\x3b puts hi");
+        // The backslash that introduces the escape needs escaping itself, or a
+        // literal `\x3b` in an argument would decode as a semicolon nobody typed.
+        assert_eq!(vscode_escaped(r"grep \x3b"), r"grep \\x3b");
+        assert_eq!(vscode_escaped(r"C:\tmp"), r"C:\\tmp");
+        // Control characters go as hex too: a pasted two-line command carries a
+        // newline, and an `ESC` would otherwise start a sequence of its own.
+        assert_eq!(vscode_escaped("puts a\nputs b"), "puts a\\x0aputs b");
+        assert_eq!(
+            vscode_escaped("puts \x1b]0;x\x07"),
+            "puts \\x1b]0\\x3bx\\x07"
+        );
+        // Ordinary text is left alone, including non-ASCII.
+        assert_eq!(vscode_escaped("puts café"), "puts café");
+    }
+
+    #[test]
     fn a_command_earns_a_notification_by_taking_long_enough() {
         let notification = |seconds| {
             command_notification(
@@ -9828,7 +10012,8 @@ mod tests {
         let options = Arc::new(Options::default());
         let markers = PromptMarkers {
             options: Arc::clone(&options),
-            marks: reedline::Osc133Markers,
+            plain: reedline::Osc133Markers,
+            vscode: reedline::Osc633Markers,
         };
 
         assert_eq!(

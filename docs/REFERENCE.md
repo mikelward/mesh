@@ -173,7 +173,7 @@ and each is **on**:
 | `command-notify` | A command that runs longer than ten seconds finishes quietly, instead of raising a desktop notification. `notify` still works — it is called, not drawn |
 | `cwd-report` | No `OSC 7` working-directory report, so a new tab or split opens wherever your terminal would have anyway |
 | `osc-title` | The window and tab title is left alone, for a terminal or multiplexer that sets it itself |
-| `shell-integration` | No `OSC 133` prompt marks, so a terminal cannot tell prompt from input from output |
+| `shell-integration` | No prompt marks, so a terminal cannot tell prompt from input from output. `OSC 133`, or `OSC 633` with the command line under VS Code |
 
 Each governs an **interactive decoration** and nothing else: turning one off never
 changes what a command does or prints, only what the shell draws around it. They
