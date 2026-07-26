@@ -1080,6 +1080,61 @@ A pattern that matches nothing contributes **no arguments**. A word with no
 pattern character is a literal and passes through unchanged. Quoting a pattern
 character makes it literal.
 
+Patterns work the same in a **value** position as in an argument: `xs = *`,
+`for f in *.rs { … }` and `puts (*)` all expand. A lone `*` is the one spelling
+that has to be told apart from multiplication, and spacing does not do it — the
+rule is where it sits. As an operand it is the pattern (`xs = *`); after a value
+it is the operator (`4 * 3`). A relative path is a value too: `./x`, `../x`, `.`
+and `.*` are all words rather than syntax errors, while `1..3` and `..3` stay
+ranges.
+
+### Dotfiles
+
+A `*`, `?` or `[…]` never matches the leading `.` of a name, but a **literal**
+`.` in the pattern does — so `*` skips the dotfiles and `.*` finds them. The rule
+applies per path component, so `sub/.*` finds the dotfiles in `sub`. A
+directory's own `.` and `..` are never matches.
+
+```mesh
+puts *            # a.txt b.txt sub
+puts .*           # .config .hidden      — not `.` or `..`
+puts sub/.*       # sub/.innerdot
+```
+
+### Glob qualifiers
+
+A `(…)` **attached** to a pattern narrows what it matched. The options are
+comma-separated and ANDed — every one has to hold:
+
+| Qualifier | Keeps |
+| --- | --- |
+| `f` `d` `l` `p` `s` `b` `c` | Files, directories, symlinks, fifos, sockets, block and char devices — `find -type` letters. |
+| `type: file` | The same seven, spelled out: `file` `dir` `symlink` `fifo` `socket` `block` `char`. |
+| `type: file\|dir` | Either type. `\|` is how the type dimension says "or". |
+| `x`, `exec: true` | Anything with an execute bit. `exec: false` inverts it. |
+| `empty: true` | A zero-length file, or a directory with no entries. |
+
+```mesh
+for f in *(f) { process $f }   # plain files, no `if $f:type == dir { continue }`
+puts *(d)                      # just the directories
+puts *(f, x)                   # executable files
+puts **/*(f, empty: true)      # every empty file below here
+```
+
+A type is read from the link itself, so `l` means the symlink; `exec` and
+`empty` follow it, since a symlink's own mode is `0777` and would otherwise make
+every link "executable". `*(l, x)` is then "links to something runnable".
+
+The `(` opens qualifiers only when it abuts a word that carries an unquoted
+pattern character. Everything else keeps its reading: `style(x, fg: red)` and
+`pwd()` are calls, `"*"(d)` is a call on a string, and `ls * (1)` is a pattern
+plus a separate value argument.
+
+The `size > 1M` / `age < 1d` comparisons are specified in `DESIGN.md` but **not
+implemented yet**. The same type filtering is also reachable as a call — see
+[the `glob` family](#the-glob-family) below — and as the `:files` / `:dirs`
+[modifiers](#modifiers).
+
 ### The `glob` family
 
 The same expansion, asked for as a [value call](#functions), so it answers with a
@@ -1116,9 +1171,9 @@ a malformed pattern is the one error, since a `glob()` call — unlike a word,
 which can still be a filename — has nothing else to mean. The argument is a plain
 string and so takes no tilde expansion, for the same reason `ls $p` takes none;
 write `~/…` as a bare argument (`dirs(~/src)`), which the *word* rules expand
-before the call sees it, or `glob("$env.HOME/…")`. A path that starts with `.` is
-quoted — `dirs(".")`, `files("../src")` — because bare `.` and `..` are the
-member and range operators.
+before the call sees it, or `glob("$env.HOME/…")`. A path that starts with `.`
+needs no quotes — `dirs(.)` and `files(../src)` read as the paths they look like,
+`..` staying a range only where no `/` is attached to it.
 
 These are calls, never commands: a bare `dirs` is a command-not-found, and the
 names are reserved so `func dirs(…)` is refused.

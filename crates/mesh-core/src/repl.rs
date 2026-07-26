@@ -2027,6 +2027,7 @@ fn run_ast_pipeline(
                 // a call in one argument cannot change what an earlier word read.
                 parser::CommandItem::Value(expression) => words.push(parser::Word {
                     pieces: vec![parser::WordPiece::Value(Box::new(expression.clone()))],
+                    qualifiers: None,
                 }),
                 parser::CommandItem::Redirect {
                     kind,
@@ -2236,7 +2237,10 @@ fn expansion_word(
             }
         });
     }
-    Ok(Word(pieces))
+    Ok(Word {
+        pieces,
+        qualifiers: word.qualifiers.clone(),
+    })
 }
 
 /// One resolved step of an assignment path. A subscript stays text because which
@@ -5459,6 +5463,7 @@ fn one_word(text: &str) -> parser::Word {
             text: text.to_owned(),
             quote: parser::QuoteMode::Single,
         }],
+        qualifiers: None,
     }
 }
 

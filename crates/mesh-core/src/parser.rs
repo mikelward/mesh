@@ -42,9 +42,81 @@ pub enum WordPiece {
     Value(Box<Spanned<Expr>>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Word {
     pub pieces: Vec<WordPiece>,
+    /// The `(…)` that followed a glob, when this word carried one — `*(d)`. Only
+    /// a word whose bare text has glob syntax can take them, so an ordinary word
+    /// followed by `(` is still a call.
+    pub qualifiers: Option<GlobQualifiers>,
+}
+
+/// The options after a glob, narrowing which of its matches survive
+/// (`DESIGN.md` §"Globbing"). ANDed: a path has to satisfy every one.
+///
+/// Syntax only — deciding whether a path qualifies means reading the filesystem,
+/// which belongs to expansion.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GlobQualifiers {
+    /// The types accepted. Empty accepts any; more than one is the `file|dir`
+    /// alternation. One list because the type dimension is mutually exclusive —
+    /// a path has exactly one type, so listing more can only widen.
+    pub types: Vec<FileKind>,
+    /// `exec: true`, or the `x` shorthand.
+    pub exec: Option<bool>,
+    /// `empty: true` — a zero-length file or a directory with no entries.
+    pub empty: Option<bool>,
+}
+
+/// A file's type, spelled as `find -type` spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    File,
+    Dir,
+    Symlink,
+    Fifo,
+    Socket,
+    Block,
+    Char,
+}
+
+impl FileKind {
+    /// The `type:` name and the `find -type` letter that both spell this kind.
+    fn spellings(self) -> (&'static str, &'static str) {
+        match self {
+            FileKind::File => ("file", "f"),
+            FileKind::Dir => ("dir", "d"),
+            FileKind::Symlink => ("symlink", "l"),
+            FileKind::Fifo => ("fifo", "p"),
+            FileKind::Socket => ("socket", "s"),
+            FileKind::Block => ("block", "b"),
+            FileKind::Char => ("char", "c"),
+        }
+    }
+
+    const ALL: [FileKind; 7] = [
+        FileKind::File,
+        FileKind::Dir,
+        FileKind::Symlink,
+        FileKind::Fifo,
+        FileKind::Socket,
+        FileKind::Block,
+        FileKind::Char,
+    ];
+
+    /// The kind a `type:` name spells, e.g. `dir`.
+    fn from_name(name: &str) -> Option<FileKind> {
+        FileKind::ALL
+            .into_iter()
+            .find(|kind| kind.spellings().0 == name)
+    }
+
+    /// The kind a bare shorthand letter spells, e.g. `d`.
+    fn from_letter(letter: &str) -> Option<FileKind> {
+        FileKind::ALL
+            .into_iter()
+            .find(|kind| kind.spellings().1 == letter)
+    }
 }
 
 impl Word {
@@ -179,6 +251,14 @@ pub enum ParseErrorKind {
     /// message names both, and it keeps this the loud error it was before value
     /// arguments existed rather than three arguments where one was written.
     GluedValueArgument,
+    /// A `(…)` after a glob naming something that is not a qualifier — `*(q)`,
+    /// `*(kind: file)`. Carries the spelling so the message can quote it back;
+    /// its own variant because the reader wrote a *glob* option and the fix is
+    /// another option name, not a different kind of expression.
+    UnknownGlobQualifier(String),
+    /// A glob qualifier given a value its name does not take — `*(type: blue)`,
+    /// `*(exec: maybe)`. Carries the name and what was written.
+    BadGlobQualifier(String, String),
     DuplicateParameter(String),
     RequiredAfterOptional(String),
     ParameterAfterRest(String),
@@ -221,6 +301,16 @@ impl std::fmt::Display for ParseError {
                     "syntax error: `{name}` is reserved and cannot be a parameter"
                 )
             }
+            ParseErrorKind::UnknownGlobQualifier(text) => write!(
+                f,
+                "syntax error: `{text}` is not a glob qualifier; the types are \
+                 `f`/`file`, `d`/`dir`, `l`/`symlink`, `p`/`fifo`, `s`/`socket`, \
+                 `b`/`block`, `c`/`char`, and the tests are `x`/`exec:` and `empty:`"
+            ),
+            ParseErrorKind::BadGlobQualifier(name, value) => write!(
+                f,
+                "syntax error: `{value}` is not a value for the glob qualifier `{name}`"
+            ),
             ParseErrorKind::GluedValueArgument => write!(
                 f,
                 "syntax error: a value argument cannot have text attached; separate it \
@@ -790,6 +880,7 @@ fn negative_literal(minus: &Span, operand: &Expr) -> Option<Expr> {
                 text,
                 quote: QuoteMode::Bare,
             }],
+            qualifiers: None,
         },
         // The sign is part of the literal now, so the span covers it.
         span: minus.start..word.span.end,
@@ -1049,7 +1140,10 @@ impl<'a> Lexer<'a> {
                 });
             }
             tokens.push(Spanned {
-                value: TokenKind::Word(Word { pieces }),
+                value: TokenKind::Word(Word {
+                    pieces,
+                    qualifiers: None,
+                }),
                 span: start..self.position,
             });
         }
@@ -1707,6 +1801,21 @@ fn match_pattern_operand(expression: Expr) -> Expr {
     }
 }
 
+/// Does this word carry glob syntax in **bare** text? The test that decides
+/// whether an attached `(…)` is a qualifier list or a call, so `*(d)` qualifies a
+/// glob while `style(x)` and `"*"(d)` stay calls — a quoted star is not a pattern.
+fn word_globs(word: &Word) -> bool {
+    word.pieces.iter().any(|piece| {
+        matches!(
+            piece,
+            WordPiece::Text {
+                text,
+                quote: QuoteMode::Bare,
+            } if text.contains(['*', '?', '['])
+        )
+    })
+}
+
 /// Does this word's text begin with `/`? The test that tells `../x` from a range,
 /// a leading `/` being a spelling no operand has.
 fn word_starts_with_slash(word: &Word) -> bool {
@@ -2104,6 +2213,10 @@ impl Parser {
                 .iter()
                 .any(|item| matches!(item, CommandItem::Word(_)))
                 && self.value_argument_starts()
+                // A glob's attached `(` opens its qualifiers, not an argument
+                // list, so `ls *.rs(f)` must not take the attached-call route
+                // that `style(x)` takes. The word branch below reads both.
+                && !self.qualified_glob_at(0)
             {
                 let start = self.peek().map_or(0, |token| token.span.start);
                 // Parsed **above comparison precedence**, so a following `<` / `>` is
@@ -2151,7 +2264,17 @@ impl Parser {
                     span: start..end,
                 }));
             } else {
-                items.push(CommandItem::Word(self.command_word()?));
+                let mut word = self.command_word()?;
+                // Read after the word rather than before it: `[ab]*(f)` and `*(f)`
+                // start on tokens that are not words at all, so which run is a glob
+                // is only settled once `command_word` has assembled it.
+                if word_globs(&word.value)
+                    && let Some(qualifiers) = self.glob_qualifiers(word.span.end)?
+                {
+                    word.value.qualifiers = Some(qualifiers);
+                    word.span.end = self.tokens[self.position - 1].span.end;
+                }
+                items.push(CommandItem::Word(word));
             }
         }
         if items.is_empty() {
@@ -2290,6 +2413,7 @@ impl Parser {
         Ok(Spanned {
             value: Word {
                 pieces: merge_command_variable_access(pieces),
+                qualifiers: None,
             },
             span: start..end,
         })
@@ -3059,6 +3183,16 @@ impl Parser {
 
     fn postfix(&mut self) -> Result<Expr, ParseError> {
         let mut value = self.primary()?;
+        // A glob's attached `(…)` is its qualifier list, so it is read before the
+        // call loop below ever sees the `(` — `*(d)` narrows the glob rather than
+        // calling its matches. Once, since qualifiers do not chain.
+        if let Expr::Scalar(word) = &mut value
+            && word_globs(&word.value)
+            && let Some(qualifiers) = self.glob_qualifiers(word.span.end)?
+        {
+            word.value.qualifiers = Some(qualifiers);
+            word.span.end = self.tokens[self.position - 1].span.end;
+        }
         loop {
             if self.eat(&TokenKind::LParen).is_some() {
                 self.newlines();
@@ -3127,6 +3261,134 @@ impl Parser {
         Ok(value)
     }
 
+    /// Is the token run at `offset` a glob with an **attached** `(`?
+    ///
+    /// The two signals a qualifier list needs, and both are about the tokens
+    /// rather than a parsed tree: the word has to carry bare glob syntax, which
+    /// is what keeps `style(x)` and `pwd()` ordinary calls, and the `(` has to
+    /// abut it, which is what keeps `ls * (1 + 2)` a glob and a separate value.
+    fn qualified_glob_at(&self, offset: usize) -> bool {
+        let Some(word) = self.tokens.get(self.position + offset) else {
+            return false;
+        };
+        let TokenKind::Word(text) = &word.value else {
+            return false;
+        };
+        word_globs(text)
+            && self
+                .tokens
+                .get(self.position + offset + 1)
+                .is_some_and(|next| {
+                    matches!(next.value, TokenKind::LParen) && next.span.start == word.span.end
+                })
+    }
+
+    /// Read the `(…)` qualifiers sitting at the cursor, if a glob just ended here.
+    ///
+    /// `end` is where that glob's last token stopped: the `(` counts only when it
+    /// abuts, since spacing is what separates an argument from the next one.
+    fn glob_qualifiers(&mut self, end: usize) -> Result<Option<GlobQualifiers>, ParseError> {
+        if !self.peek().is_some_and(|token| {
+            matches!(token.value, TokenKind::LParen) && token.span.start == end
+        }) {
+            return Ok(None);
+        }
+        self.position += 1;
+        let mut qualifiers = GlobQualifiers::default();
+        loop {
+            self.newlines();
+            if self.eat(&TokenKind::RParen).is_some() {
+                break;
+            }
+            self.qualifier(&mut qualifiers)?;
+            self.newlines();
+            if self.eat(&TokenKind::Comma).is_none() {
+                self.expect(&TokenKind::RParen, "`,` or `)`")?;
+                break;
+            }
+        }
+        Ok(Some(qualifiers))
+    }
+
+    /// One qualifier: a bare `find -type` letter, or `name: value`.
+    fn qualifier(&mut self, into: &mut GlobQualifiers) -> Result<(), ParseError> {
+        let Some(name) = self.word_text_at(0) else {
+            return Err(self.error(ParseErrorKind::Expected("a glob qualifier")));
+        };
+        let name = name.to_owned();
+        let named = matches!(
+            self.tokens.get(self.position + 1).map(|t| &t.value),
+            Some(TokenKind::Colon)
+        );
+        if !named {
+            self.position += 1;
+            // The letters are shorthands for the two dimensions that have one:
+            // a type, and the `exec` test. Anything else is a name the reader
+            // expected to mean something, so say so rather than ignore it.
+            if let Some(kind) = FileKind::from_letter(&name) {
+                into.types.push(kind);
+                return Ok(());
+            }
+            if name == "x" {
+                into.exec = Some(true);
+                return Ok(());
+            }
+            return Err(ParseError {
+                kind: ParseErrorKind::UnknownGlobQualifier(name),
+                span: self.tokens[self.position - 1].span.clone(),
+            });
+        }
+        self.position += 2;
+        match name.as_str() {
+            // Alternation is the type dimension's only spelling for "either", `|`
+            // rather than a second `type:` entry, so it is read here rather than
+            // by letting the qualifier appear twice.
+            "type" => loop {
+                let span = self.peek().map_or(0..0, |token| token.span.clone());
+                let value = self
+                    .word_text_at(0)
+                    .ok_or_else(|| self.error(ParseErrorKind::Expected("a file type")))?
+                    .to_owned();
+                let kind = FileKind::from_name(&value).ok_or(ParseError {
+                    kind: ParseErrorKind::BadGlobQualifier("type".into(), value),
+                    span,
+                })?;
+                into.types.push(kind);
+                self.position += 1;
+                if self.eat(&TokenKind::Pipe).is_none() {
+                    return Ok(());
+                }
+            },
+            "exec" => into.exec = Some(self.qualifier_bool(&name)?),
+            "empty" => into.empty = Some(self.qualifier_bool(&name)?),
+            _ => {
+                return Err(ParseError {
+                    kind: ParseErrorKind::UnknownGlobQualifier(name),
+                    span: self.tokens[self.position - 2].span.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The `true` / `false` a boolean qualifier takes.
+    fn qualifier_bool(&mut self, name: &str) -> Result<bool, ParseError> {
+        let span = self.peek().map_or(0..0, |token| token.span.clone());
+        let value = self
+            .word_text_at(0)
+            .ok_or_else(|| self.error(ParseErrorKind::Expected("`true` or `false`")))?
+            .to_owned();
+        self.position += 1;
+        match value.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(ParseError {
+                kind: ParseErrorKind::BadGlobQualifier(name.to_owned(), value),
+                span,
+            }),
+        }
+    }
+
     /// Grow a word rightwards through every **adjacent** token that has a word
     /// spelling, so a run the lexer split on punctuation (`./x`, `a.b`, `x[0]`)
     /// comes back as the one word it looks like. `pieces` is what the leading
@@ -3176,7 +3438,10 @@ impl Parser {
             pieces.extend(next_pieces);
         }
         Expr::Scalar(Spanned {
-            value: Word { pieces },
+            value: Word {
+                pieces,
+                qualifiers: None,
+            },
             span: start..end,
         })
     }
@@ -3309,6 +3574,7 @@ impl Parser {
                         text: op,
                         quote: QuoteMode::Bare,
                     }],
+                    qualifiers: None,
                 },
                 span: token.span,
             })),
@@ -4387,6 +4653,7 @@ mod tests {
                         text: "a b".into(),
                         quote: QuoteMode::Double,
                     }],
+                    qualifiers: None,
                 }),
                 span: 5..10
             }
@@ -4762,7 +5029,7 @@ mod tests {
         ));
         assert!(matches!(
             &tokens[3].value,
-            TokenKind::Word(Word { pieces })
+            TokenKind::Word(Word { pieces, .. })
                 if matches!(pieces.as_slice(), [WordPiece::Text { quote: QuoteMode::Raw, .. }])
         ));
     }
@@ -5039,6 +5306,53 @@ mod tests {
             panic!()
         };
         assert!(matches!(iterable.as_ref(), Expr::Scalar(_)));
+    }
+
+    /// The qualifier list is a fixed grammar rather than a call's arguments, so the
+    /// shorthands, the long `type:` names, the `|` alternation and the boolean tests
+    /// all land in one structure. A unit test because the shell shows only the paths
+    /// that survived, which several different qualifier sets can agree on.
+    #[test]
+    fn a_glob_reads_its_attached_parentheses_as_qualifiers() {
+        let tree = complete("xs = *(f, x)\nys = *(type: file|dir, empty: false)\nzs = f(x)");
+        let Executable::Assignment {
+            value: Expr::Scalar(word),
+            ..
+        } = &tree.statements[0].and_or.first
+        else {
+            panic!()
+        };
+        assert_eq!(
+            word.value.qualifiers,
+            Some(GlobQualifiers {
+                types: vec![FileKind::File],
+                exec: Some(true),
+                empty: None,
+            })
+        );
+        let Executable::Assignment {
+            value: Expr::Scalar(word),
+            ..
+        } = &tree.statements[1].and_or.first
+        else {
+            panic!()
+        };
+        assert_eq!(
+            word.value.qualifiers,
+            Some(GlobQualifiers {
+                types: vec![FileKind::File, FileKind::Dir],
+                exec: None,
+                empty: Some(false),
+            })
+        );
+        // No glob syntax in the word, so the parentheses stay a call's.
+        assert!(matches!(
+            &tree.statements[2].and_or.first,
+            Executable::Assignment {
+                value: Expr::Call { .. },
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -1662,20 +1662,29 @@ reasoning, and the open ones are at the bottom.
 - [x] **`return` with no argument — use the last status.** `exit` already does
       this (a bare `exit` leaves the last command's status). Apply the same rule
       to `return` when it lands with function bodies.
-- [ ] **Glob qualifiers and the `glob()` family are still unwritten.** `*(f)` /
-      `*(d)` / `*(size > 1M)`, the `:f` / `:files` modifier shorthand, and
-      `glob()` / `files()` / `dirs()` are specced in `DESIGN.md` §"Globbing" but
-      nothing implements them. Since a lone `*` now parses as a value, `*(d)`
-      reads as a **call on the expanded glob** and fails at run time
-      (`*: a command has no return value`) — the same reading `*.txt(d)` already
-      got. Whatever lands should intercept the `(` after a glob and evaluate the
-      qualifiers per candidate path, and until then the error deserves to name
-      the real cause. Directory-only work has `*/` today.
-- [ ] **A leading `./` does not parse in value position.** `x = ./foo` and
-      `for f in ./* { … }` are syntax errors, because the `.` lexes as its own
-      `Dot` token and nothing starts a value expression with one; the same word
-      is fine as a command argument (`puts ./*`). Sibling of the lone-`*` fix —
-      a shell spelling the expression grammar does not recognize.
+- [x] **Glob qualifiers — the type and boolean halves.** `*(f)` / `*(d)` / `*(l)`
+      / `*(p s b c)`, the long `type: file` names with their `file|dir`
+      alternation, and the `x` / `exec:` / `empty:` tests, in both command and
+      value position. An attached `(` opens qualifiers only after a word carrying
+      bare glob syntax, which is what keeps `style(x)` a call. Types read `lstat`
+      so `l` means the link; `exec` and `empty` follow it, since a symlink's own
+      mode is `0777` and an `lstat` reading would make `*(x)` list every link.
+- [ ] **Glob qualifiers — the comparison predicates.** `size > 1M` and
+      `age < 1d` (`DESIGN.md` §"Globbing") are the part still missing. They need
+      more than the two above: a size/duration literal grammar (`1M`, `1d`) and a
+      per-candidate predicate context in which `size` and `age` are properties of
+      the path being tested rather than caller-scope names. The qualifier parser
+      is where they attach — `Parser::qualifier` — and `expand::qualifies` is
+      where they would be evaluated.
+- [ ] **The `glob()` family and the `:files` shorthand.** `glob("*")`,
+      `files(DIR=.)`, `dirs(DIR=.)` and the terse `*:f` / `*:files` / `$paths:files`
+      modifier are all specced in `DESIGN.md` §"Globbing" and none exists —
+      `files()` reports `a command has no return value`, and `*:f` is read as a
+      word and globs to nothing. The type filtering they need now exists in
+      `expand::qualifies`, so these are wrappers over machinery that is in place
+      rather than new capability. `DESIGN.md` wants `**:files` *fused* into the
+      match so a recursive walk never materializes non-files, which the current
+      match-then-filter shape does not do.
 - [ ] **A glob inside a list literal nests instead of contributing elements.**
       `GRAMMAR.md` says each scalar element uses the word-expansion rules, "so a
       glob can contribute zero or more elements", but `xs = [*.txt]` is a list of

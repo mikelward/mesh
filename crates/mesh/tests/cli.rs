@@ -1554,6 +1554,109 @@ fn capturing_a_glob_family_call_records_its_value() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A directory holding one of everything the type qualifiers name, so each test
+/// can ask for a slice of it: two plain files (one executable, one empty), a
+/// directory, and a symlink.
+fn qualifier_dir(tag: &str) -> PathBuf {
+    let dir = fresh_dir(tag);
+    std::fs::write(dir.join("plain.txt"), "text").unwrap();
+    std::fs::write(dir.join("empty.txt"), "").unwrap();
+    std::fs::write(dir.join("run.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(
+        dir.join("run.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::os::unix::fs::symlink("plain.txt", dir.join("link")).unwrap();
+    dir
+}
+
+#[test]
+fn glob_qualifiers_filter_by_type() {
+    // `*(d)` is the loop `DESIGN.md` §"Loops" reaches for, and the letters are
+    // `find -type`'s. `lstat`, so the symlink is `l` and never `f`.
+    let dir = qualifier_dir("glob_qual_type");
+    let out = run_with_input(&format!(
+        "cd {}\nputs *(d)\nputs *(f)\nputs *(l)\nputs *(type: dir)\nputs *(type: file|dir)\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "sub\nempty.txt plain.txt run.sh\nlink\nsub\nempty.txt plain.txt run.sh sub\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn glob_qualifiers_filter_by_the_boolean_tests() {
+    // `x` / `exec:` and `empty:` are orthogonal to the type, so they combine with
+    // it rather than replacing it — `*(f, x)` is the executable *files*, which is
+    // what keeps the directory out of the answer.
+    let dir = qualifier_dir("glob_qual_bool");
+    let out = run_with_input(&format!(
+        "cd {}\nputs *(x)\nputs *(f, x)\nputs *(f, empty: true)\nputs *(exec: false)\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "run.sh sub\nrun.sh\nempty.txt\nempty.txt link plain.txt\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn glob_qualifiers_work_in_value_position() {
+    // The whole point of the feature is the loop header, so the expression path
+    // gets the same treatment as the argument one — and a modifier still chains
+    // onto the qualified glob.
+    let dir = qualifier_dir("glob_qual_value");
+    let out = run_with_input(&format!(
+        "cd {}\nfor f in *(d) {{ puts $f }}\nxs = *(f)\nputs $xs:len\nputs (*(d))\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "sub\n3\nsub\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn only_a_bare_glob_takes_qualifiers() {
+    // The attached `(` means qualifiers only when the word is a pattern. A call
+    // keeps its arguments, and a *quoted* star is not a pattern at all, so neither
+    // reading changes.
+    let out = run_with_input("puts style(x, fg: red)\nputs (4 * 3)\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x\n12\n");
+    let quoted = run_with_input("puts \"*\"(d)\n");
+    assert!(
+        !String::from_utf8_lossy(&quoted.stderr).contains("glob qualifier"),
+        "a quoted star is a string, not a glob: {:?}",
+        quoted.stderr
+    );
+}
+
+#[test]
+fn a_glob_qualifier_says_what_it_does_not_recognize() {
+    for (source, wanted) in [
+        ("puts *(q)\n", "`q` is not a glob qualifier"),
+        ("puts *(kind: file)\n", "`kind` is not a glob qualifier"),
+        (
+            "puts *(type: blue)\n",
+            "`blue` is not a value for the glob qualifier `type`",
+        ),
+        (
+            "puts *(exec: maybe)\n",
+            "`maybe` is not a value for the glob qualifier `exec`",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(wanted),
+            "{source:?} should report {wanted:?}: {:?}",
+            out.stderr
+        );
+    }
+}
+
 #[test]
 fn a_dot_led_pattern_finds_the_dotfiles_and_not_the_directory_itself() {
     // The other half of the rule `glob_star_excludes_dotfiles` pins: a wildcard
