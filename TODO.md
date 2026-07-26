@@ -663,10 +663,13 @@ than the string the argv boundary would have produced.
       value (`fg: 33`? `fg: "#8be9fd"`? both?) and a **downgrade** rule to the
       nearest of the sixteen for terminals that cannot show it — otherwise the
       capability question `style` was designed to avoid comes straight back.
-- [ ] **`link(text, url)`** (OSC 8) on the same machinery: a styled value whose
-      attribute is a hyperlink, stripped when stdout is not a terminal and kept
-      under `NO_COLOR` (a link is not color). Tracked with the other terminal
-      sequences under §"Terminal integration".
+- [x] **`link(text, url)`** (OSC 8) landed — see §"Terminal integration", where it
+      is tracked with the other terminal sequences.
+- [ ] **A `file://` helper for a path.** `link` requires a scheme, so linking a local
+      path today means building `file://$host$path` by hand — and getting the host
+      right matters over `ssh`, which is exactly why `link` will not guess it. A
+      modifier (`$path:url`) reusing `cwd_url`'s encoder is the obvious shape; `OSC 7`
+      already builds the same string for the working directory.
 
 ## Beyond M3 — Terminal integration
 
@@ -790,12 +793,26 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       already reports the directory and VS Code reads it. The nonce `633;E` can
       carry is absent too — it exists for a script VS Code injects into a shell it
       launched, and mesh is not that.
-- [ ] **Hyperlinks** (OSC 8) — a `link(text, url)` sibling to `style()`, per
-      `DESIGN.md`, rather than a raw escape. Now unblocked: `Value::Styled` and the
-      per-command "does this stdout reach a terminal" decision are the machinery it
-      needs, so `link` adds an attribute to `Style` rather than a value kind. One
-      difference from color: a link is **kept** under `NO_COLOR`, which is about
-      color and not about escapes.
+- [x] **Hyperlinks** (OSC 8) — `link(text, url)`, a `style` sibling on the same
+      `Value::Styled`, so the two compose in either order and everything that made a
+      styled value safe to compute with holds for a link too. `Style` gained a `link`
+      attribute rather than a value kind gaining a variant. The url is percent-encoded
+      wherever RFC 3986 forbids it raw — which covers the sequence's own guard against
+      an `ESC` ending it early *and* the ordinary case of a space in a path, an
+      invalid URI a terminal may reject the link over — and a **scheme is required**, since
+      a terminal needs an absolute URI and guessing `file://` would need a hostname to
+      be right over `ssh`. `LINK_LIMIT` is 2083 encoded bytes, refused loudly, because
+      past a terminal's own limit the whole sequence is dropped and the link text goes
+      with it. `Decoration` now carries two bits instead of one: a link is **kept**
+      under `NO_COLOR` (that silences the palette, and dropping a link would lose the
+      url) but wants a terminal on the `OSC` allowlist, since `TERM=linux` would print
+      the url. `takes_osc` is that question, now shared with the notification.
+      Inside a multiplexer the sequence goes **raw**, unlike `OSC 9`: measured against
+      tmux 3.4, raw is parsed and stored per cell and re-emitted (so the link survives
+      a repaint tmux does itself), while the `DCS tmux;` envelope forwards its payload
+      instead of drawing it and the link *text* never reaches the pane at all — with
+      or without `allow-passthrough`. `OSC 9` is a point event with nothing on screen,
+      which is why passthrough is right there and wrong here.
 - [x] **Clipboard** (OSC 52) — the `clip` builtin. `clip TEXT …` joins its
       arguments with a space as `puts` does; with no arguments it reads stdin, so
       `puts hi | clip` works. It copies exactly the bytes it was handed — a pipe's

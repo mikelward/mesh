@@ -909,6 +909,63 @@ fn style_with_no_attributes_is_just_the_string() {
 }
 
 #[test]
+fn a_link_is_a_styled_value_and_behaves_as_its_text() {
+    // `link` builds the same value `style` does, so everything that made a styled
+    // value safe to compute with holds for a hyperlink too. Piped, so the escapes
+    // are absent — which is the assertion.
+    let out = run_with_input(
+        "u = link(docs, \"https://x.test/a?b=c\")\n\
+         puts $u\n\
+         puts $u:repr\n\
+         puts $u:len\n\
+         puts \"see $u\"\n\
+         if $u == docs { puts equal }\n\
+         /bin/echo argv: $u\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "docs\n'docs'\n4\nsee docs\nequal\nargv: docs\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn link_needs_a_text_a_url_and_a_scheme() {
+    for (src, needle) in [
+        ("u = link()\n", "link() requires a text and a url argument"),
+        ("u = link(a)\n", "link() requires a text and a url argument"),
+        (
+            "u = link(a, b, c)\n",
+            "link() takes a text and a url argument",
+        ),
+        // A terminal needs an absolute URI, so a bare path is a link that silently
+        // does nothing — said rather than guessed at `file://`.
+        ("u = link(a, \"/etc/passwd\")\n", "has no scheme"),
+        ("u = link(a, \"12://x\")\n", "does not start with a scheme"),
+        (
+            "u = link(a, url: \"https://x.test/\")\n",
+            "no `url` argument",
+        ),
+        ("u = link(...[a b])\n", "does not accept spread arguments"),
+        // A collection as the url almost certainly means the arguments were swapped.
+        ("u = link(a, [x])\n", "the url must be a string, not a list"),
+        (
+            "j = sleep 0.1 &\nu = link($j, \"https://x.test/\")\n",
+            "a job handle has no text form",
+        ),
+    ] {
+        let out = run_with_input(&format!("{src}puts recovered\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{src:?}: {stderr:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).ends_with("recovered\n"),
+            "{src:?}: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+#[test]
 fn puts_does_not_retype_a_written_argument() {
     // Integer parsing governs value positions, not argument words (`DESIGN.md`
     // §"Literals"), so what was written is what is printed — a leading zero and a
@@ -3198,6 +3255,151 @@ fn style_harness(exec: &MeshExec) -> i32 {
     }
     if !stop_pty_shell(shell) {
         return 226;
+    }
+    0
+}
+
+#[test]
+fn a_link_reaches_a_terminal_that_parses_osc() {
+    let exec = MeshExec::with_environment(isolated_config_home(), &[("TERM", "xterm-256color")]);
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(link_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// `OSC 8` on a pty, and the three ways it drops — which are *not* the three ways
+/// color drops, and that difference is the point of the test.
+fn link_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 240;
+    };
+    if !pty_write(shell.master, b"u = link(docs, \"https://x.test/a?b=c\")\n")
+        || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 241;
+    }
+    if !pty_write(shell.master, b"puts $u\n") {
+        return 242;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 243;
+    };
+    // Printable ASCII survives, so `?` and `=` keep the structure that was written.
+    // It closes with the empty URI, which is how `OSC 8` says the link ends.
+    if status != 0
+        || occurrences(
+            &seen,
+            b"\x1b]8;;https://x.test/a?b=c\x1b\\docs\x1b]8;;\x1b\\",
+        ) == 0
+    {
+        return 244;
+    }
+    // Composes with `style` in either order — both set the attributes they name on
+    // the same value — and the link wraps outside the color so the whole run is
+    // clickable.
+    for line in [
+        b"a = link(style(x, fg: blue), \"https://y.test/\")\n".as_slice(),
+        b"b = style(link(x, \"https://y.test/\"), fg: blue)\n".as_slice(),
+    ] {
+        if !pty_write(shell.master, line) || pty_read_until_command_done(shell.master).is_none() {
+            return 245;
+        }
+    }
+    for name in [b"puts $a\n".as_slice(), b"puts $b\n".as_slice()] {
+        if !pty_write(shell.master, name) {
+            return 246;
+        }
+        let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+            return 247;
+        };
+        if status != 0
+            || occurrences(
+                &seen,
+                b"\x1b]8;;https://y.test/\x1b\\\x1b[34mx\x1b[0m\x1b]8;;\x1b\\",
+            ) == 0
+        {
+            return 248;
+        }
+    }
+    // An `ESC` in the URL is percent-encoded rather than ending mesh's own sequence
+    // and leaving the payload on screen — the title guard, in URL form.
+    if !pty_write(
+        shell.master,
+        b"e = link(a, \"https://x.test/\\e]0;pwned\\a\")\n",
+    ) || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 249;
+    }
+    if !pty_write(shell.master, b"puts $e\n") {
+        return 250;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 251;
+    };
+    if status != 0 || occurrences(&seen, b"%1B]0;pwned%07") == 0 {
+        return 252;
+    }
+    if occurrences(&seen, b"\x1b]0;pwned\x07") != 0 {
+        return 253;
+    }
+    // **`NO_COLOR` keeps the link and drops the color.** A hyperlink is not color,
+    // and dropping it would lose the URL rather than make the output plainer. This
+    // is the one place the two bits visibly disagree.
+    if !pty_write(shell.master, b"$env.NO_COLOR = 1\n")
+        || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 254;
+    }
+    if !pty_write(shell.master, b"puts $a\n") {
+        return 255;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 100;
+    };
+    if status != 0
+        || occurrences(&seen, b"\x1b]8;;https://y.test/\x1b\\x\x1b]8;;\x1b\\") == 0
+        || occurrences(&seen, b"\x1b[34m") != 0
+    {
+        return 101;
+    }
+    // A pipe takes neither, since the stage's stdout is not a terminal at all.
+    if !pty_write(shell.master, b"$env.NO_COLOR = ''\n")
+        || pty_read_until_command_done(shell.master).is_none()
+        || !pty_write(shell.master, b"puts $u | cat\n")
+    {
+        return 102;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 103;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b]8;;") != 0 || occurrences(&seen, b"docs") == 0 {
+        return 104;
+    }
+    // `TERM=linux` is why links need the `OSC` allowlist and color does not: it
+    // reads `ESC ]` as the start of a palette sequence and would leave the URL on
+    // screen. The color still goes out — SGR it does parse.
+    if !pty_write(shell.master, b"$env.TERM = linux\n")
+        || pty_read_until_command_done(shell.master).is_none()
+        || !pty_write(shell.master, b"puts $a\n")
+    {
+        return 105;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 106;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b]8;;") != 0 || occurrences(&seen, b"\x1b[34m") == 0 {
+        return 107;
+    }
+    if !stop_pty_shell(shell) {
+        return 108;
     }
     0
 }
@@ -8351,7 +8553,7 @@ fn a_builtin_value_constructor_cannot_be_a_function_name() {
     // either name would be reachable as a command but never as a value call —
     // reserve the names instead of shipping a function whose meaning depends on how
     // it is called. The error is recoverable: the next command still runs.
-    for name in ["re", "style"] {
+    for name in ["re", "style", "link"] {
         let out = run_with_input(&format!("func {name}(x) {{ return $x }}\nputs after\n"));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
