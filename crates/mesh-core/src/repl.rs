@@ -70,6 +70,11 @@ struct Shell {
     /// A counter rather than a list of compound node kinds, so a new kind of
     /// executable cannot forget to be on it.
     status_records: u64,
+    /// Has this session written a window title? The clear on the way out is owed
+    /// to any title mesh put there, so this is remembered rather than re-derived
+    /// from `$sh.options.osc-title`, which may have been turned off since — see
+    /// [`set_title`].
+    title_written: bool,
 }
 
 impl Shell {
@@ -197,6 +202,7 @@ impl Shell {
             result: Value::String(String::new()),
             produced: Produced::Status,
             status_records: 0,
+            title_written: false,
         }
     }
 }
@@ -688,7 +694,13 @@ fn run_logout(options: &StartupOptions, last: u8, shell: &mut Shell) -> u8 {
     // makes this the place: `exit` would otherwise leave the window named after
     // that command forever, and Ctrl-D would leave it naming the directory of a
     // shell that is gone. An empty title is the reset every terminal understands.
-    set_title(shell.vars.interactive(), "");
+    //
+    // Gated on having written one rather than on `$sh.options.osc-title`, so
+    // turning the setting off mid-session still cleans up: the debt is from when
+    // it was on. `true` rather than the setting for the same reason.
+    if shell.title_written {
+        set_title(true, "");
+    }
     last
 }
 
@@ -4818,23 +4830,27 @@ const TITLE_LIMIT: usize = 96;
 ///
 /// Automatic: at the prompt it says where the shell is, and while a command runs
 /// it says what is running, which is what makes a row of tabs readable at a
-/// glance. The off switch that item asks for wants to be
-/// `$sh.options.osc-title`, alongside the `$sh.options.bold-input` already
-/// floated in `TODO.md`, and waits on `$sh` becoming a writable place.
+/// glance. `enabled` is [`decoration`] with [`Opt::OscTitle`]; failure to write is
+/// ignored for the same reason as [`semantic_mark`].
 ///
-/// Interactive-only and failure-ignoring, for the same reasons as
-/// [`semantic_mark`] and [`report_cwd`].
-fn set_title(interactive: bool, text: &str) {
-    if !interactive {
-        return;
+/// **Returns whether a sequence was actually written**, which the caller records
+/// on the [`Shell`]. The clear on the way out is owed to any title this session
+/// put there — including one written before the setting was turned off, since a
+/// shell that stops updating the title still has to stop *owning* it. A terminal
+/// that never took one (`$env.TERM` off the allowlist) is owed nothing, which is
+/// why this answers about the write rather than about the setting.
+fn set_title(enabled: bool, text: &str) -> bool {
+    if !enabled {
+        return false;
     }
     let Some(sequence) = title_sequence(session_term().as_deref(), text) else {
-        return;
+        return false;
     };
     use std::io::Write as _;
     let mut out = io::stdout();
     let _ = out.write_all(sequence.as_bytes());
     let _ = out.flush();
+    true
 }
 
 /// `$env.TERM` as it stood at the first title, held for the session.
@@ -7000,7 +7016,10 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             // a fresh command: a continuation line is the same command line still
             // being typed, and the shell cannot have moved between the two.
             report_cwd(decoration(&shell.vars, Opt::CwdReport));
-            set_title(shell.vars.interactive(), &environment_prompt_title());
+            shell.title_written |= set_title(
+                decoration(&shell.vars, Opt::OscTitle),
+                &environment_prompt_title(),
+            );
         }
         *completion.write().expect("completion state poisoned") =
             CompletionState::from_shell(&shell);
@@ -7642,7 +7661,10 @@ fn handle_signal(
             //
             // Still on `interactive()` rather than a setting of its own:
             // `$sh.options.osc-title` is the next change, not this one.
-            set_title(shell.vars.interactive(), &running_title(&command));
+            shell.title_written |= set_title(
+                decoration(&shell.vars, Opt::OscTitle),
+                &running_title(&command),
+            );
             // Both marks sit outside the hooks, so that everything printed
             // because this command was submitted falls inside the region they
             // bracket. A `preexec` hook that writes before `C` is folded into

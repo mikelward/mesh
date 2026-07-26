@@ -658,10 +658,10 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       is cut at 96 characters: both the command line and the directory carry text
       mesh did not choose, and a filename holding an `ESC` would otherwise end
       mesh's sequence and start one of its own.
-      Remaining: the **off switch**, `$sh.options.osc-title`. `$sh.options` exists
-      now, so it is a matter of adding the `Opt` variant and reading it through
-      `repl::decoration` — deliberately left to its own change rather than folded
-      into the one that made `$sh` writable.
+      `$sh.options.osc-title` turns it off. The clear on the way out is gated on
+      having *written* a title rather than on the setting, so turning it off
+      mid-session still cleans up after the titles already written, and a session
+      that never titled anything emits nothing at all — not even the clear.
 - [ ] **Ask terminfo which sequence the terminal takes**, instead of matching
       `$env.TERM` against a list. `hs`, `tsl` and `fsl` hold exactly the title
       sequence — including screen's `ESC k` form — so reading them would replace
