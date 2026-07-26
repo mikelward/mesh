@@ -4901,8 +4901,9 @@ fn title_sequence(term: Option<&std::ffi::OsStr>, text: &str) -> Option<String> 
 /// terminal missing from here quietly gets neither, while one wrongly assumed to
 /// parse `OSC` *prints the payload*, as the Linux console does. A terminal here
 /// that does not implement a particular sequence discards it, which is what makes
-/// one list serve both. `TODO.md` carries the reasons in full, and terminfo as the
-/// follow-up that would replace the list with data.
+/// one list serve both. `TODO.md` carries the reasons in full, including why
+/// terminfo cannot answer this: `hs`/`tsl`/`fsl` describe a hardware status line,
+/// and almost no modern entry declares them.
 const OSC_TERMS: &[&str] = &[
     "alacritty",
     "contour",

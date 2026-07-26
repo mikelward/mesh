@@ -662,16 +662,30 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       having *written* a title rather than on the setting, so turning it off
       mid-session still cleans up after the titles already written, and a session
       that never titled anything emits nothing at all — not even the clear.
-- [ ] **Ask terminfo which sequence the terminal takes**, instead of matching
-      `$env.TERM` against a list. `hs`, `tsl` and `fsl` hold exactly the title
-      sequence — including screen's `ESC k` form — so reading them would replace
-      both the `OSC_TERMS` allowlist and the multiplexer special case with data,
-      and would answer for terminals nobody has added to a list yet. It needs a
-      terminfo reader mesh does not have: the binary format, the `$TERMINFO` and
-      `/usr/share/terminfo` search path, and the extended-capability section. A
-      dependency decision as much as a feature, and worth taking once rather than
-      per sequence — `hs`/`tsl` is the same question OSC 52 and the notification
-      sequences will ask.
+- [x] **Asking terminfo which sequence the terminal takes — investigated, and it
+      does not work.** The plan was to read `hs`, `tsl` and `fsl` and retire the
+      `OSC_TERMS` allowlist along with the multiplexer special case. The database
+      does not carry the answer. Measured against ncurses 6.4.20240113: of 41 local
+      entries, **five** declare `hs` — `tmux`, `tmux-256color`, `cygwin`,
+      `rxvt-unicode`, `rxvt-unicode-256color` — and `xterm`, `xterm-256color`,
+      `kitty`, `alacritty`, `foot`, `st` and `screen` declare none of the three.
+      `xterm+sl`, the building block that would supply them, is not installed.
+      Driving the title from terminfo would therefore mean **no title on almost
+      every terminal anyone uses**, which is worse than the list by a wide margin.
+      Where `tsl` does exist the values disagree about what a "status line" even
+      is: `rxvt-unicode` says `\E]2;` (window title), `tmux` says `\E]0;`, `cygwin`
+      says `\E];`. Note that tmux's answer is OSC 0 — adopting it would *replace*
+      the `ESC k` mesh sends, which renames the tmux window in the status bar. That
+      is a different target, not a better spelling, so terminfo would also cost the
+      behavior we chose deliberately.
+      The reason is historical rather than an oversight: `hs`/`tsl`/`fsl` model a
+      *hardware status line*, and a title bar set by `OSC` was never retrofitted
+      into that shape. Terminfo answers "how do I address a status line", not "does
+      this terminal parse an `OSC`", which is the question mesh is actually asking.
+      Left as-is: the allowlist is the accurate mechanism, and this entry exists so
+      nobody spends the effort again. Capability *reporting* — `XTVERSION`,
+      `DA1`, the `TERM_PROGRAM` variables — is the direction with something left in
+      it, and would need a reply mesh currently never waits for.
 - [x] **The prompt width scan counted escape sequences as columns.** It
       recognized only SGR, so an OSC title in a custom prompt — `prompt
       "\e]0;mesh\a mesh$ "`, the reachable case — was measured as if it printed and
@@ -731,7 +745,8 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       the way, because `$env.TERM` cannot: tmux is commonly configured to set
       `TERM=screen-256color`.
       Deferred: **screen's** passthrough, whose payload limit and quirks mesh has no
-      way to test against here — and a wrong envelope *prints*, which is the failure
+      way to test against here (and terminfo cannot supply it either — see the
+      entry above) — and a wrong envelope *prints*, which is the failure
       the allowlist exists to avoid; **OSC 777**, whose `notify;title;body` split
       would double up on the terminals that support both; a **configurable
       threshold**, which is a value rather than a flag and so wants more of
