@@ -9059,6 +9059,104 @@ fn a_while_reports_the_status_of_its_last_pass() {
     assert_eq!(out.status.code(), Some(1));
 }
 
+/// A **numeral** operand gets the condition's comparison reading too, and needed
+/// saying separately: a variable or a quoted word is claimed by the clause that takes
+/// the whole statement once no redirect follows, so ruling the redirect out is enough
+/// for them. A numeral is claimed only by a leading operator or by being a lone
+/// literal, and `if 1 < 2` is neither — so it reached the command parser, failed to
+/// open a file named `2`, and took the **else** branch, answering a comparison with
+/// its opposite. `if 1 == 1` beside it compared, since `==` has no redirect spelling.
+///
+/// `-1:repr:len` is `-(1:repr:len)`, i.e. `-1`, since unary minus binds looser than
+/// postfix — so it is compared with `< 0` rather than `> 0`. What matters here is that
+/// it *compares at all* instead of reaching the command parser.
+///
+/// In a scratch directory because the `>` forms create the file they compare against.
+#[test]
+fn a_numeral_in_a_condition_compares_rather_than_redirecting() {
+    let dir = fresh_dir("numeral_condition_comparison");
+    std::fs::write(
+        dir.join("run.mesh"),
+        "if 1 < 2 { puts int } else { puts wrong }\n\
+         if 1 > 0 { puts int-gt } else { puts wrong }\n\
+         if -1 < 0 { puts signed } else { puts wrong }\n\
+         if -9223372036854775808 < 0 { puts min } else { puts wrong }\n\
+         if -9223372036854775807 < 0 { puts near-min } else { puts wrong }\n\
+         if 1:repr:len > 0 { puts modified } else { puts wrong }\n\
+         if -1:repr:len < 0 { puts signed-modified } else { puts wrong }\n\
+         if 1 == 1 { puts eq } else { puts wrong }\n",
+    )
+    .unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "int\nint-gt\nsigned\nmin\nnear-min\nmodified\nsigned-modified\neq\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for name in ["0", "2"] {
+        assert!(
+            !dir.join(name).exists(),
+            "a condition comparison redirected into {name:?}"
+        );
+    }
+
+    // The boundary is "fits an `i64`" on both signs, so an out-of-range literal is not
+    // a numeral and keeps the command reading it had.
+    std::fs::write(
+        dir.join("run.mesh"),
+        "if -9223372036854775809 < 0 { puts x }\n",
+    )
+    .unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).is_empty(),
+        "an out-of-range literal should stay a command"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **Statement** position is untouched: a spaced `<` / `>` there is still a redirect,
+/// numeral or not. Only the condition reading was wrong, so only it changes.
+#[test]
+fn a_numeral_in_a_statement_still_redirects() {
+    let dir = fresh_dir("numeral_statement_redirect");
+    std::fs::write(dir.join("run.mesh"), "42 > out.txt\nputs after\n").unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("command not found: 42"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        dir.join("out.txt").exists(),
+        "the redirect should still open"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_spaced_comparison_in_a_condition_is_not_a_redirection() {
     // `<` and `>` double as redirect operators, so a condition has to tell

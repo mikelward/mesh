@@ -3087,6 +3087,13 @@ impl Parser {
                 | TokenKind::Range
                 | TokenKind::RangeInclusive,
             ) => true,
+            // A **signed** numeral reaches here as two tokens, an `Operator("-")` and the
+            // numeral, so the word-shaped clauses below never see it. `negative_literal`
+            // folds the pair into one literal once the expression parser has it; this
+            // only has to agree about where the operand starts.
+            Some(TokenKind::Operator(sign)) if sign == "-" => {
+                self.signed_numeral_takes_a_comparison(in_condition)
+            }
             Some(TokenKind::Word(word)) => {
                 let variable = matches!(
                     word.pieces.as_slice(),
@@ -3106,7 +3113,11 @@ impl Parser {
                     .zip(self.tokens.get(self.position + 2))
                     .is_some_and(|(operator, right)| {
                         value_operator(&operator.value) && operator.span.end < right.span.start
-                    });
+                    })
+                    // `value_operator` covers the operators with no redirect spelling to
+                    // rule out — `==`, `+`, `..`. A spaced `<` / `>` in a condition is a
+                    // comparison too, and nothing else was claiming it.
+                    || self.word_takes_a_comparison(in_condition);
                 let numeric = word.text().parse::<i64>().is_ok();
                 // Asked of the *completed* operand rather than of the token after the
                 // one starting it. Only the first token is in hand here, and an operand
@@ -3159,12 +3170,19 @@ impl Parser {
     /// `$xs[0 + 0] > 0`, each turning a value statement into a command that truncated
     /// a file. A command word cannot contain either, so this stops where one stops.
     fn command_word_end(&self) -> Option<usize> {
-        let word = self.tokens.get(self.position)?;
+        self.command_word_end_from(self.position)
+    }
+
+    /// [`command_word_end`](Self::command_word_end) measured from an arbitrary token
+    /// rather than the cursor, for the one operand that does not start at the cursor:
+    /// a **signed** numeral, whose sign is its own token and whose word sits one along.
+    fn command_word_end_from(&self, start: usize) -> Option<usize> {
+        let word = self.tokens.get(start)?;
         if !matches!(word.value, TokenKind::Word(_)) {
             return None;
         }
         let mut end = word.span.end;
-        let mut index = self.position + 1;
+        let mut index = start + 1;
         while let (Some(colon), Some(name)) = (self.tokens.get(index), self.tokens.get(index + 1)) {
             let attached = colon.span.start == end && name.span.start == colon.span.end;
             if !matches!(colon.value, TokenKind::Colon)
@@ -3194,6 +3212,71 @@ impl Parser {
             self.tokens.get(end).map(|token| &token.value),
             Some(TokenKind::Less | TokenKind::Greater | TokenKind::Append)
         ) && !(in_condition && self.spaced_operator_at(end))
+    }
+
+    /// Does a **comparison** follow the command word starting here — a *spaced* `<` or
+    /// `>`, which a condition reads as one?
+    ///
+    /// The counterpart to [`word_takes_a_redirect`](Self::word_takes_a_redirect) on the
+    /// same operator and the same spacing test, asked the other way round. It exists for
+    /// the operand that has to be **claimed** rather than merely not-disclaimed: a
+    /// numeral. A variable or a quoted word carries a clause that claims the whole
+    /// statement once no redirect follows, so ruling the redirect out is enough for
+    /// them. A numeral is claimed only by a leading [`value_operator`] or by being a
+    /// lone literal, and `if 1 < 2` is neither — so it reached the command parser, tried
+    /// to open a file named `2`, and took the `else` branch, while `if 1 == 1` beside it
+    /// compared.
+    ///
+    /// Condition-only, so statement position keeps the redirect reading it has:
+    /// `42 > file` still truncates a file.
+    fn word_takes_a_comparison(&self, in_condition: bool) -> bool {
+        self.comparison_at(self.command_word_end(), in_condition)
+    }
+
+    /// Is a leading `-` the **sign** on a numeral that a spaced `<` / `>` then compares?
+    ///
+    /// A sign is its own token, so every word-shaped clause in [`value_start_in`] starts
+    /// one token too late and none of them ever sees this operand: `if -1 < 0` took the
+    /// `else` branch after failing to open a file named `0`.
+    ///
+    /// Narrow in the two ways the unsigned case is. The sign must **abut** its numeral,
+    /// since a spaced `-` is the infix operator glob exclusion uses rather than a sign;
+    /// and the **signed** text is what has to fit an `i64`, not the magnitude, because
+    /// `i64::MIN` is one further from zero than `i64::MAX` — asking about the magnitude
+    /// rejects the one signed literal with no positive counterpart. That is the same
+    /// text [`negative_literal`] folds, so the two agree on which literals exist.
+    fn signed_numeral_takes_a_comparison(&self, in_condition: bool) -> bool {
+        let (Some(sign), Some(number)) = (
+            self.tokens.get(self.position),
+            self.tokens.get(self.position + 1),
+        ) else {
+            return false;
+        };
+        let TokenKind::Word(word) = &number.value else {
+            return false;
+        };
+        if sign.span.end != number.span.start || format!("-{}", word.text()).parse::<i64>().is_err()
+        {
+            return false;
+        }
+        // Measured past the *completed* operand: a numeral carries attached `:modifier`
+        // suffixes like any other word, and the operator sits after them.
+        self.comparison_at(self.command_word_end_from(self.position + 1), in_condition)
+    }
+
+    /// Is the operator ending an operand at `end` a spaced `<` / `>` that a condition
+    /// compares? Shared by the signed and unsigned numeral clauses so one spacing rule
+    /// answers for both.
+    fn comparison_at(&self, end: Option<usize>, in_condition: bool) -> bool {
+        let Some(end) = end else {
+            return false;
+        };
+        in_condition
+            && matches!(
+                self.tokens.get(end).map(|token| &token.value),
+                Some(TokenKind::Less | TokenKind::Greater)
+            )
+            && self.spaced_operator_at(end)
     }
 
     /// Is the token at `index` a postfix opener that is **not attached** to what comes
