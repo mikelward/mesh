@@ -261,8 +261,8 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
         "Guard one line; `unless` is the inverse",
     ),
     (
-        &["match"],
-        "match VALUE { PAT { … } … }",
+        &["match", "=>"],
+        "match VALUE { PAT => … ; … }",
         "Take the first arm whose pattern matches",
     ),
     (
@@ -1209,7 +1209,7 @@ mod tests {
         for operator in [
             "|", "|&", "&&", "||", ";", "&", ">", "<", ">>", "2>", ">&", "<&", "&>", "<<", "<<<",
             "=", "+=", "==", "!=", "<=", ">=", "+", "-", "/", "%", "*", "?", "~", "!~", "$", "$(",
-            "...", ":", ".", ",", "(", ")", "[", "]", "{", "}", "..", "..=",
+            "...", ":", ".", ",", "(", ")", "[", "]", "{", "}", "..", "..=", "=>",
         ] {
             assert!(syntax_help(operator).is_some(), "{operator}");
         }

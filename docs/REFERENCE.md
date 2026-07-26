@@ -1333,8 +1333,8 @@ remain pinned to the end:
 [first ...middle last] = $items
 for [key value] in $pairs { puts $key $value }
 result = match $items {
-  [head ...tail] { [$head ...$tail] }
-  _ { [] }
+  [head ...tail] => [$head ...$tail]
+  _              => []
 }
 ```
 
@@ -1432,10 +1432,33 @@ resume from); and the `fork func name() { … }` form `DESIGN.md` also specifies
 
 ## Match
 
-`match value { pattern { body } ... }` evaluates arms from top to bottom and
+`match value { pattern => body ... }` evaluates arms from top to bottom and
 uses the first match. Patterns may be exact values, globs, regular expressions,
 integer ranges, alternatives separated by `|`, list binding patterns, or `_`.
 Arms may have `if` guards, and an unmatched expression yields `""`.
+
+The `=>` is required, and arms are separated by a newline or `;` — never a comma.
+An arm's body is either a **value** or a `{ }` **block**, and the arrow decides
+how a word reads: `=> markdown` is the string `"markdown"`, while
+`=> { tail -f $file }` is a block whose commands run.
+
+One caveat, inherited from how any block yields a value: a block that is a *single
+bare word* is read as a scalar when the `match` is in **expression** position, so
+`x = match 1 { 1 => { echo } }` binds `"echo"` rather than running it, while the
+same arm in statement position runs `echo`. Give the block more than one word — or
+use a value arm — when you mean one or the other unambiguously.
+
+```mesh
+kind = match $file {
+  *.md | *.markdown => markdown
+  *.txt             => text
+  _                 => other
+}
+match $sig {
+  int  => { cleanup; exit 130 }
+  term => { cleanup; exit 143 }
+}
+```
 
 ## Functions
 

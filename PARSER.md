@@ -19,8 +19,10 @@ bodies are lexical input, not grammar punctuation.
 ## Lexical contract
 
 The lexer emits tokens with byte spans. Longest match wins for punctuation:
-`...`, `<<<`, `..=`, `..`, `<<`, `>>`, `&&`, `||`, and `=>` are each one token.
-Redirections are tokens even without surrounding whitespace. Value operators require surrounding
+`...`, `<<<`, `..=`, `..`, `<<`, `>>`, `&&`, and `||` are each one token.
+Redirections are tokens even without surrounding whitespace. **`=>`** is one token
+too, but only with a boundary on each side, like the other value operators — an
+attached `puts value=>out` stays the word `value=` and a `>out` redirection. Value operators require surrounding
 whitespace when the design calls for it; word operators such as `and`, `or`, and
 `in` also require word boundaries. The token stream retains whitespace boundaries
 so the parser can distinguish an operator from punctuation inside a bare word.

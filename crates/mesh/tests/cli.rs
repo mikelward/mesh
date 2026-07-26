@@ -7804,7 +7804,7 @@ fn help_lists_the_keywords_and_the_shape_of_a_line() {
         "unset NAME",
         "if COND { … } else { … }",
         "cmd if COND",
-        "match VALUE { PAT { … } … }",
+        "match VALUE { PAT => … ; … }",
         "for NAME in VALUE { … }",
         "while COND { … }",
         "loop { … }",
@@ -7851,7 +7851,7 @@ const KEYWORDS_AND_OPERATORS: &[&str] = &[
     "continue", "fork", "global", "unset", "export", "not", "and", "or", "re", "|", "|&", "&&",
     "||", ";", "&", ">", "<", ">>", "2>", ">&", "<&", "&>", "<<", "<<<", "=", "+=", "==", "!=",
     "<=", ">=", "+", "-", "/", "%", "*", "?", "~", "!~", "$", "$(", "...", ":", ".", ",", "(", ")",
-    "[", "]", "{", "}", "..", "..=",
+    "[", "]", "{", "}", "..", "..=", "=>",
 ];
 
 #[test]
@@ -8362,7 +8362,7 @@ fn pending_loop_control_stops_every_statement_consumer() {
         ),
         (
             "match subject",
-            "for a in [1 2] {\n  match id(if true { break }) { _ { puts LEAK } }\n  puts LEAK-AFTER\n}\n",
+            "for a in [1 2] {\n  match id(if true { break }) { _ => { puts LEAK } }\n  puts LEAK-AFTER\n}\n",
         ),
         (
             "guard",
@@ -8387,11 +8387,11 @@ fn pending_loop_control_stops_every_statement_consumer() {
     for (label, source) in [
         (
             "statement mode",
-            "for a in [1 2] {\n  match 7 { 7 if (if true { break }) { puts LEAK } _ { puts LEAK } }\n  puts LEAK-AFTER\n}\n",
+            "for a in [1 2] {\n  match 7 { 7 if (if true { break }) => { puts LEAK }; _ => { puts LEAK } }\n  puts LEAK-AFTER\n}\n",
         ),
         (
             "value mode",
-            "for a in [1 2] {\n  v = match 7 { 7 if (if true { break }) { puts LEAK\n 1 } _ { puts LEAK\n 2 } }\n  puts LEAK-AFTER\n}\n",
+            "for a in [1 2] {\n  v = match 7 { 7 if (if true { break }) => { puts LEAK\n 1 }; _ => { puts LEAK\n 2 } }\n  puts LEAK-AFTER\n}\n",
         ),
     ] {
         let out = run_with_input(&format!("{source}puts done\n"));
@@ -8412,11 +8412,11 @@ fn pending_loop_control_stops_every_statement_consumer() {
     for (label, source) in [
         (
             "statement mode",
-            "for a in [1 2] {\n  match 1 { id(if true { break }) { puts LEAK } _ { puts LEAK } }\n  puts LEAK-AFTER\n}\n",
+            "for a in [1 2] {\n  match 1 { id(if true { break }) => { puts LEAK }; _ => { puts LEAK } }\n  puts LEAK-AFTER\n}\n",
         ),
         (
             "value mode",
-            "for a in [1 2] {\n  v = match 1 { id(if true { break }) { 1 } _ { puts LEAK\n 2 } }\n  puts LEAK-AFTER\n}\n",
+            "for a in [1 2] {\n  v = match 1 { id(if true { break }) => 1; _ => { puts LEAK\n 2 } }\n  puts LEAK-AFTER\n}\n",
         ),
     ] {
         let out = run_with_input(&format!("{call}{source}puts done\n"));
@@ -8471,7 +8471,7 @@ fn a_statements_operands_do_not_become_its_result() {
     // Every header here ends in a truthy value but records a `false` on the way,
     // so a leak shows up as `1` (that `false`'s status) instead of `7`.
     let headers = run_with_input(
-        "func ifc() { 7 + 0\n if (if true { false\n 1 == 1 }) { return } }\n         func whilec() { 7 + 0\n while (if true { false\n 1 == 1 }) { return } }\n         func matchc() { 7 + 0\n match (if true { false\n 9 + 0 }) { _ { return } } }\n         func forc() { 7 + 0\n for i in (if true { false\n [1] }) { return } }\n         a = ifc()\nb = whilec()\nc = matchc()\nd = forc()\n         puts \"[$a][$b][$c][$d]\"\n",
+        "func ifc() { 7 + 0\n if (if true { false\n 1 == 1 }) { return } }\n         func whilec() { 7 + 0\n while (if true { false\n 1 == 1 }) { return } }\n         func matchc() { 7 + 0\n match (if true { false\n 9 + 0 }) { _ => { return } } }\n         func forc() { 7 + 0\n for i in (if true { false\n [1] }) { return } }\n         a = ifc()\nb = whilec()\nc = matchc()\nd = forc()\n         puts \"[$a][$b][$c][$d]\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&headers.stdout),
@@ -8649,7 +8649,7 @@ fn a_bare_return_carries_the_result_so_far() {
     // the result the statement before it recorded, and not its own status. That is
     // what the same construct yields in value position, so the two agree.
     let empty_compound = run_with_input(
-        "func branch() { 5 + 0\n if true { }\n return }\n         func unbranched() { 5 + 0\n if false { 1 + 1 }\n return }\n         func elsewhere() { 5 + 0\n if false { 9 } else { }\n return }\n         func unmatched() { 5 + 0\n match 1 { 2 { 3 + 3 } }\n return }\n         func unlooped() { 5 + 0\n while false { 1 + 1 }\n return }\n         a = branch()\nb = unbranched()\nc = elsewhere()\nd = unmatched()\ne = unlooped()\n         puts \"[$a][$b][$c][$d][$e]\"\n",
+        "func branch() { 5 + 0\n if true { }\n return }\n         func unbranched() { 5 + 0\n if false { 1 + 1 }\n return }\n         func elsewhere() { 5 + 0\n if false { 9 } else { }\n return }\n         func unmatched() { 5 + 0\n match 1 { 2 => { 3 + 3 } }\n return }\n         func unlooped() { 5 + 0\n while false { 1 + 1 }\n return }\n         a = branch()\nb = unbranched()\nc = elsewhere()\nd = unmatched()\ne = unlooped()\n         puts \"[$a][$b][$c][$d][$e]\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&empty_compound.stdout),
@@ -11601,8 +11601,8 @@ fn loops_and_match_arms_share_list_pattern_binding() {
         "rows = [[a b] [c d]]\n\
          for [left right] in $rows { puts $left $right }\n\
          result = match [start x y] {\n\
-           [verb ...args] if $verb == start { [$verb ...$args] }\n\
-           _ { [wrong] }\n\
+           [verb ...args] if $verb == start => [$verb ...$args]\n\
+           _ => [wrong]\n\
          }\n\
          puts ...$result\n",
     );
@@ -11621,14 +11621,14 @@ fn loops_and_match_arms_share_list_pattern_binding() {
 fn match_uses_ordered_literal_glob_regex_range_and_alternative_arms() {
     let out = run_with_input(
         "kind = match README.md {\n\
-           *.txt { text }\n\
-           *.md | *.markdown { markdown }\n\
-           _ { other }\n\
+           *.txt => text\n\
+           *.md | *.markdown => markdown\n\
+           _ => other\n\
          }\n\
-         number = match 7 { 1..=9 { digit } _ { other } }\n\
-         exact = match 42 { 42 { integer } _ { wrong } }\n\
-         regex = match README.md { /^README/ { readme } _ { wrong } }\n\
-         first = match file.txt { * { broad } *.txt { narrow } }\n\
+         number = match 7 { 1..=9 => digit; _ => other }\n\
+         exact = match 42 { 42 => integer; _ => wrong }\n\
+         regex = match README.md { /^README/ => readme; _ => wrong }\n\
+         first = match file.txt { * => broad; *.txt => narrow }\n\
          puts $kind $number $exact $regex $first\n",
     );
     assert_eq!(
@@ -11646,11 +11646,11 @@ fn match_uses_ordered_literal_glob_regex_range_and_alternative_arms() {
 fn match_statement_runs_for_effect_and_guards_continue_to_later_arms() {
     let out = run_with_input(
         "match [skip payload] {\n\
-           [verb value] if $verb == take { puts wrong }\n\
-           [verb value] if $value == payload { puts $verb $value }\n\
-           _ { puts wrong }\n\
+           [verb value] if $verb == take => { puts wrong }\n\
+           [verb value] if $value == payload => { puts $verb $value }\n\
+           _ => { puts wrong }\n\
          }\n\
-         empty = match absent { present { wrong } }\n\
+         empty = match absent { present => wrong }\n\
          puts \"<$empty>\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "skip payload\n<>\n");
@@ -11659,6 +11659,89 @@ fn match_statement_runs_for_effect_and_guards_continue_to_later_arms() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn an_arm_value_is_a_value_but_an_arm_block_runs_commands() {
+    // The arrow decides the context: `=> word` is a value, so a bare word is a
+    // string even when a command of that name exists, while `=> { word }` is a
+    // block, so the same word runs.
+    let out = run_with_input(
+        "label = match 1 { 1 => echo }\n\
+         puts \"<$label>\"\n\
+         match 1 { 1 => { echo ran } }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "<echo>\nran\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn an_attached_redirection_is_not_read_as_a_match_arrow() {
+    // `=>` needs a boundary on each side, like the other value operators, so an
+    // attached redirection keeps parsing as a word and a redirect: `value=>out`
+    // is `value=` written to `out`, not a fat arrow.
+    let dir = fresh_dir("attached_redirect_arrow");
+    let out = run_with_input(&format!("cd {}\nputs value=>out\ncat out\n", dir.display()));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "value=\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_block_arms_value_still_follows_the_block_value_rules() {
+    // A `=> { … }` block yields a value the way any block does, which is the open
+    // value-production question rather than anything the arrow settles: in
+    // expression position a lone bare word is still read as a scalar, while a
+    // longer command runs and its output is captured.
+    let out = run_with_input(
+        "word = match 1 { 1 => { echo } }\n\
+         run = match 1 { 1 => { echo two words } }\n\
+         puts \"<$word>\" \"<$run>\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "<echo> <two words>\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn arms_are_terminator_separated_so_semicolons_put_them_on_one_line() {
+    let out = run_with_input(
+        "one = match 2 { 1 => a; 2 => b; _ => c }\n\
+         two = match 9 { 1 => a; 2 => b; _ => c }\n\
+         guarded = match 7 { n if 1 == 2 => wrong; 7 => right; _ => other }\n\
+         puts $one $two $guarded\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "b c right\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn an_arm_without_an_arrow_or_a_separator_is_a_syntax_error() {
+    // The arrow is mandatory — it is what ends the pattern and its guard — and a
+    // separator between arms is required, so arms cannot run together.
+    for source in ["match 1 { 1 { puts x } }\n", "match 1 { 1 => a 2 => b }\n"] {
+        let out = run_with_input(source);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+            "expected a syntax error for {source:?}, got {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -14285,7 +14368,7 @@ fn sh_status_and_pipestatus_always_describe_the_same_run() {
         "for i in [1 2] { sh -c 'exit 4' | true }",
         "func g() { sh -c 'exit 4' | true }\ng",
         "func g() { if true { sh -c 'exit 4' | true } }\ng",
-        "match 1 { 1 { sh -c 'exit 4' | true } }",
+        "match 1 { 1 => { sh -c 'exit 4' | true } }",
         "true && sh -c 'exit 4' | true",
     ] {
         assert_eq!(status_line(source), "4 | 4 0", "for: {source}");
