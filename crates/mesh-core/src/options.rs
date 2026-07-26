@@ -41,6 +41,11 @@ pub enum Opt {
     /// opens where the shell is. Quiet in a terminal that ignores it, but it is
     /// one more sequence on the wire.
     CwdReport,
+    /// `osc-title` — the window and tab title: where the shell is at the prompt,
+    /// what it is running while a command runs. Off is for anyone whose terminal,
+    /// multiplexer, or window manager sets the title itself and does not want it
+    /// overwritten every prompt.
+    OscTitle,
     /// `shell-integration` — the `OSC 133` semantic prompt marks, which let a
     /// terminal tell prompt from input from output. The half the shell owns (`C`
     /// and `D`); the line editor's `A` and `B` go with it, since half the marks
@@ -55,7 +60,12 @@ impl Opt {
     /// [`Options`] indexes its flags by an `Opt`'s position *here*, which is the
     /// enum's declaration order; `all_options_index_themselves` holds the two
     /// together.
-    pub const ALL: [Opt; 3] = [Opt::BoldInput, Opt::CwdReport, Opt::ShellIntegration];
+    pub const ALL: [Opt; 4] = [
+        Opt::BoldInput,
+        Opt::CwdReport,
+        Opt::OscTitle,
+        Opt::ShellIntegration,
+    ];
 
     /// The key this setting is spelled with under `$sh.options` — kebab-case,
     /// like every other multi-word name in the language.
@@ -63,6 +73,7 @@ impl Opt {
         match self {
             Opt::BoldInput => "bold-input",
             Opt::CwdReport => "cwd-report",
+            Opt::OscTitle => "osc-title",
             Opt::ShellIntegration => "shell-integration",
         }
     }
@@ -234,6 +245,7 @@ mod tests {
             vec![
                 ("bold-input".to_owned(), Value::Boolean(true)),
                 ("cwd-report".to_owned(), Value::Boolean(false)),
+                ("osc-title".to_owned(), Value::Boolean(true)),
                 ("shell-integration".to_owned(), Value::Boolean(true)),
             ]
         );

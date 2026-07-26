@@ -3018,10 +3018,12 @@ expected to drive, rather than leaving each to a hand-emitted `print "\e…"`:*
   the prompt and the command line while one runs, with the sequence chosen from
   `$env.TERM` (xterm `\e]0;…\a`, screen/tmux `\ek…`, nothing for a terminal not known
   to take one — an allowlist, since a terminal wrongly assumed to take a title
-  prints it instead). The off switch wants to be `$sh.options.osc-title`; `$sh` is
-  a writable place now, so it is unblocked but not yet wired. A *replacement* for
-  the text — a `$sh.title` hook — is still open, and is a different question from
-  turning it off.
+  prints it instead). **Off switch `$sh.options.osc-title`**, which silences the
+  title without silencing the *clear* on the way out: that one is owed to any title
+  the session actually wrote, since a shell that stops updating the title still has
+  to stop owning it. A session that never titled anything owes nothing and stays
+  silent to the last byte. A *replacement* for the text — a `$sh.title` hook — is
+  still open, and is a different question from turning it off.
 - ***Bracketed paste*** *(`\e[?2004h/l`)* — **decided: on, always.** Pasted input is
   inserted, not executed line by line, and a lone newline in a paste doesn't submit.
 - ***Shell integration / semantic prompt marks*** *(OSC 133 `A`/`B`/`C`/`D`)* —

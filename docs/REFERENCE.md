@@ -171,6 +171,7 @@ and each is **on**:
 |---|---|
 | `bold-input` | The line you are typing is drawn in the terminal's normal weight, not bold |
 | `cwd-report` | No `OSC 7` working-directory report, so a new tab or split opens wherever your terminal would have anyway |
+| `osc-title` | The window and tab title is left alone, for a terminal or multiplexer that sets it itself |
 | `shell-integration` | No `OSC 133` prompt marks, so a terminal cannot tell prompt from input from output |
 
 Each governs an **interactive decoration** and nothing else: turning one off never
@@ -178,12 +179,18 @@ changes what a command does or prints, only what the shell draws around it. They
 are already off outside an interactive session — `mesh -s` on a terminal and every
 piped run stay byte-exact whatever the settings say.
 
+`osc-title` has one wrinkle worth knowing: mesh clears the title when it exits, so
+a window is not left named after a command that finished. That clear is owed to
+any title mesh actually wrote, so turning the setting off part-way through a
+session still cleans up on the way out — but a session that never wrote one (off
+from the start, or a terminal that takes no title) stays silent to the last byte.
+
 Write one at a time, usually from a startup file:
 
 ```mesh
 $sh.options.bold-input = false          # takes effect at once
 puts $sh.options.bold-input             # false
-puts ...$sh.options:keys                # bold-input cwd-report shell-integration
+puts ...$sh.options:keys                # bold-input cwd-report osc-title shell-integration
 ```
 
 The map is strict in both directions, because a setting that is silently not

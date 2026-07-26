@@ -1976,6 +1976,159 @@ fn title_harness(exec: &MeshExec, directory: &Path) -> i32 {
 }
 
 #[test]
+fn the_title_setting_turns_the_title_off_and_back_on() {
+    let exec = MeshExec::with_environment(
+        isolated_config_home(),
+        &[("TERM", "xterm-256color"), ("USER", "tester")],
+    );
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(title_setting_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// `$sh.options.osc-title` off means *no* title sequence, and on again means the
+/// title comes back — in one session, without restarting the shell.
+///
+/// The last part is the one that needed thought: the clear on the way out is owed
+/// to any title mesh wrote, so turning the setting off does not cancel it. A shell
+/// that stops updating the title still has to stop owning it, or the window keeps
+/// the name of a command that finished long ago.
+fn title_setting_harness(exec: &MeshExec) -> i32 {
+    const OSC_TITLE: &[u8] = b"\x1b]0;";
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 140;
+    };
+    // On to begin with, which is what makes the silence below mean something
+    // rather than being a session that never titled anything.
+    if occurrences(&shell.startup, OSC_TITLE) == 0 {
+        return 141;
+    }
+    if !pty_write(shell.master, b"$sh.options.osc-title = false\n")
+        || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 142;
+    }
+    // A command slow enough that its title would be on the wire before the
+    // prompt's replaced it — so this covers both the running title and the prompt
+    // title that follows it.
+    if !pty_write(shell.master, b"sh -c 'sleep 0.3'\n") {
+        return 143;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 144;
+    };
+    if status != 0 || occurrences(&seen, OSC_TITLE) != 0 {
+        return 145;
+    }
+    // Back on, and the next command titles again.
+    if !pty_write(shell.master, b"$sh.options.osc-title = true\n")
+        || pty_read_until_command_done(shell.master).is_none()
+        || !pty_write(shell.master, b"sh -c 'sleep 0.3'\n")
+    {
+        return 146;
+    }
+    let Some((seen, _)) = pty_read_until_command_done(shell.master) else {
+        return 147;
+    };
+    if occurrences(&seen, b"\x1b]0;sh -c 'sleep 0.3'\x07") == 0 {
+        return 148;
+    }
+    // Off again, then leave: the clear is still written, because this session put
+    // a title there while the setting was on.
+    if !pty_write(shell.master, b"$sh.options.osc-title = false\n")
+        || pty_read_until_command_done(shell.master).is_none()
+        || !pty_write(shell.master, b"exit 0\n")
+    {
+        return 149;
+    }
+    let farewell = pty_read_to_end(shell.master);
+    let cleared = farewell
+        .windows(4)
+        .rposition(|part| part == OSC_TITLE)
+        .is_some_and(|at| farewell.get(at + 4) == Some(&0x07));
+    if !cleared {
+        return 150;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(shell.mesh, &mut status, 0) } != shell.mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 151;
+    }
+    unsafe { libc::close(shell.master) };
+    0
+}
+
+#[test]
+fn a_session_that_never_titles_writes_no_title_at_all() {
+    let home = fresh_dir("options_title_rc");
+    let config = home.join("mesh");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("rc.mesh"), "$sh.options.osc-title = false\n").unwrap();
+
+    let exec = MeshExec::with_environment(&home, &[("TERM", "xterm-256color"), ("USER", "tester")]);
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(no_title_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// Off from the rc file, so the shell never titles anything — **including on the
+/// way out**. The exit clear is owed only for a title actually written, and a
+/// session that wrote none owes none; clearing anyway would put on the wire the
+/// one sequence the setting exists to prevent.
+fn no_title_harness(exec: &MeshExec) -> i32 {
+    const OSC_TITLE: &[u8] = b"\x1b]0;";
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 160;
+    };
+    if occurrences(&shell.startup, OSC_TITLE) != 0 {
+        return 161;
+    }
+    if !pty_write(shell.master, b"sh -c 'sleep 0.3'\n") {
+        return 162;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 163;
+    };
+    if status != 0 || occurrences(&seen, OSC_TITLE) != 0 {
+        return 164;
+    }
+    if !pty_write(shell.master, b"exit 0\n") {
+        return 165;
+    }
+    let farewell = pty_read_to_end(shell.master);
+    if occurrences(&farewell, OSC_TITLE) != 0 {
+        return 166;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(shell.mesh, &mut status, 0) } != shell.mesh
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 167;
+    }
+    unsafe { libc::close(shell.master) };
+    0
+}
+
+#[test]
 fn changing_term_does_not_orphan_the_title() {
     let exec = MeshExec::with_environment(
         isolated_config_home(),
@@ -12830,7 +12983,7 @@ fn the_settings_map_reads_as_booleans_that_start_on() {
     let out = run_with_input("puts ...$sh.options:keys\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "bold-input cwd-report shell-integration\n"
+        "bold-input cwd-report osc-title shell-integration\n"
     );
 
     let out = run_with_input(
@@ -12839,7 +12992,7 @@ fn the_settings_map_reads_as_booleans_that_start_on() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "bold-input true\ncwd-report true\nshell-integration true\ndirect true\n"
+        "bold-input true\ncwd-report true\nosc-title true\nshell-integration true\ndirect true\n"
     );
     assert!(
         out.status.success(),
@@ -12873,7 +13026,10 @@ fn a_setting_can_be_turned_off_and_back_on() {
 
     // One setting at a time: turning one off leaves the others where they were.
     let out = run_with_input("$sh.options.bold-input = false\nputs ...$sh.options:values\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "false true true\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "false true true true\n"
+    );
 }
 
 /// Every way of getting `$sh.options` wrong, and what each one says. A settings
