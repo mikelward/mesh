@@ -1939,27 +1939,36 @@ fn background_pipeline_retains_statuses_reaped_on_earlier_prompts() {
     // collected on the way past, and the test passes without exercising the
     // retention it is named for.
     //
-    // The pipe itself is what closes the window, rather than an interval chosen
-    // to sit inside it. Stage 2's `cat` sees EOF only once every write end is
-    // gone, and stage 1 holds the only one — so the marker it writes afterwards
-    // cannot appear until stage 1 has exited, and the `sleep` that follows it
-    // keeps stage 2 alive across the `jobs` that comes next. Both halves of the
-    // window are then facts about the pipeline rather than guesses about the
-    // scheduler.
+    // Both edges of that window are held open by the pipeline itself, so neither
+    // is a guess about the scheduler:
+    //
+    // - Stage 1 has exited. Stage 2's `cat` sees EOF only once every write end
+    //   is gone and stage 1 holds the only one, so the `gone` marker it writes
+    //   next cannot appear any earlier.
+    // - Stage 2 has not. It then blocks on a `release` marker that only this
+    //   script writes, and only after the first `jobs` has run.
+    //
+    // The second half was a `sleep` first, which is the same bug this file is
+    // full of: descheduled for longer than the sleep, stage 2 finishes early,
+    // the first `jobs` reaps the whole job and the listing it should have shown
+    // is gone.
     //
     // `wait` is not usable here: it takes the job out of the table, so the
     // `Done (7)` this asserts on would never print.
     let dir = fresh_dir("pipeline_retains_status");
-    let marker = dir.join("stage-one-gone");
+    let gone = dir.join("stage-one-gone");
+    let release = dir.join("release");
     let out = run_with_input(&format!(
-        "m = '{}'\n\
-         sh -c 'exit 7' | sh -c 'cat > /dev/null; echo x > {}; sleep 0.3' &\n\
-         while $m:exists == false {{ sleep 0.02 }}\n\
+        "g = '{gone}'\n\
+         sh -c 'exit 7' | sh -c 'cat > /dev/null; echo x > {gone}; \
+         while [ ! -e {release} ]; do sleep 0.02; done' &\n\
+         while $g:exists == false {{ sleep 0.02 }}\n\
          jobs\n\
-         {}jobs\n",
-        marker.to_string_lossy(),
-        marker.to_string_lossy(),
-        await_job(1)
+         puts x > {release}\n\
+         {wait}jobs\n",
+        gone = gone.to_string_lossy(),
+        release = release.to_string_lossy(),
+        wait = await_job(1)
     ));
     // The listing is the `jobs` builtin's own output and goes to stdout; the
     // `Done` notice is the shell's and goes to stderr. Asserting both on one
