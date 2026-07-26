@@ -1578,6 +1578,14 @@ fn match_operand(expression: Expr) -> Expr {
             let clean_regex = text.starts_with('/')
                 && text.ends_with('/')
                 && text.len() >= 2
+                // The delimiters have to be **written** as delimiters. `\/a/` and
+                // `/a\/` come out as the text `/a/`, which begins and ends with a
+                // slash without either one being one — and outside a match slot
+                // that is the ordinary string `/a/`, so reading it as a pattern
+                // here would make identical text mean two different things. An
+                // escape *inside* is untouched: `/a\/b/` is still a regex whose
+                // pattern contains an escaped slash.
+                && bare_delimiters(pieces)
                 && pieces
                     .iter()
                     .enumerate()
@@ -1624,6 +1632,71 @@ fn match_operand(expression: Expr) -> Expr {
         }
         other => other,
     }
+}
+
+/// A **regex** match slot: a clean `/…/` literal becomes a regex, and everything
+/// else is left exactly as written.
+///
+/// Narrower than [`match_operand`], which also turns a bare word into a glob.
+/// The replace family's slot is only ever "a string matches verbatim, a regex
+/// matches as a pattern" (`DESIGN.md` §"String") — there is no glob reading for
+/// it to have — so converting one would make `:replaceall(a, X)` fail on a word
+/// that should have matched itself.
+fn regex_slot_operand(expression: Expr) -> Expr {
+    let original = expression.clone();
+    let converted = match_operand(expression);
+    if became_regex(&converted) {
+        converted
+    } else {
+        original
+    }
+}
+
+/// Did [`match_operand`] turn this into a regex? Asked through any modifiers,
+/// because a **flagged** literal converts to the regex wrapped in its flag chain
+/// (`/a/:i` is `:i` applied to a regex, not a regex). Looking only at the top
+/// would restore the original word and leave `:i` to be applied to a string.
+fn became_regex(expression: &Expr) -> bool {
+    match expression {
+        Expr::Regex(_) => true,
+        // Only through a **regex flag**. Any other modifier means the chain was
+        // never a flagged literal but an ordinary string expression that happens
+        // to start with a slash word: `/a/:upper` is the string `/A/` everywhere
+        // else, and reading it as a regex here would both change its meaning and
+        // fail, since `:upper` is not a flag.
+        Expr::Modifier {
+            value,
+            name,
+            arguments: None,
+        } => regex_flag(name) && became_regex(value),
+        _ => false,
+    }
+}
+
+/// The argument-free modifiers that are regex **flags** rather than transforms.
+/// Kept beside [`became_regex`], the only place that needs to tell them apart —
+/// applying them is the engine's, and it names the same set.
+fn regex_flag(name: &str) -> bool {
+    matches!(
+        name,
+        "i" | "ignorecase" | "m" | "multiline" | "s" | "dotall" | "x" | "extended"
+    )
+}
+
+/// Are this word's outermost slashes bare, rather than escaped? Asked of the
+/// **pieces**, since the reconstructed text cannot tell `\/` from `/` — that
+/// difference is exactly what a quote mode records.
+fn bare_delimiters(pieces: &[WordPiece]) -> bool {
+    let bare_edge = |piece: Option<&WordPiece>, opening: bool| {
+        matches!(
+            piece,
+            Some(WordPiece::Text {
+                text,
+                quote: QuoteMode::Bare,
+            }) if if opening { text.starts_with('/') } else { text.ends_with('/') }
+        )
+    };
+    bare_edge(pieces.first(), true) && bare_edge(pieces.last(), false)
 }
 
 fn match_pattern_operand(expression: Expr) -> Expr {
@@ -3000,7 +3073,27 @@ impl Parser {
                 self.position += 1;
                 let name = self.name()?;
                 let arguments = if self.eat(&TokenKind::LParen).is_some() {
-                    Some(self.arguments()?)
+                    let mut arguments = self.arguments()?;
+                    // The first argument of the replace family is a **regex match
+                    // slot** (`DESIGN.md` §"String"), so a bare `/…/` there reads as
+                    // a pattern rather than an absolute path — the same conversion
+                    // the `~` right-hand side and a `match` arm get. Only the first:
+                    // the replacement is an ordinary value slot, where `/…/` is the
+                    // literal string it looks like.
+                    if matches!(
+                        name.as_str(),
+                        "replaceall" | "replacestart" | "replaceend" | "match" | "matches"
+                    ) && !arguments.is_empty()
+                    {
+                        if let Argument::Positional(first) = arguments.remove(0) {
+                            arguments.insert(0, Argument::Positional(regex_slot_operand(first)));
+                        } else {
+                            return Err(
+                                self.error(ParseErrorKind::Expected("a positional pattern"))
+                            );
+                        }
+                    }
+                    Some(arguments)
                 } else {
                     None
                 };

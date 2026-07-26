@@ -16702,25 +16702,26 @@ puts $spaced:trimstart:replaceall(" ", "_") $spaced:trimend:replaceall(" ", "_")
     );
 }
 
-/// The replace family. The pattern matches **verbatim**, metacharacters and all,
-/// and the anchored forms act only on a leading / trailing match.
+/// The replace family. A **string** pattern matches verbatim and a **regex**
+/// as a pattern — the same no-silent-coercion rule `~` follows — and the
+/// anchored forms act only on a leading / trailing match.
 #[test]
-fn the_replace_modifiers_match_their_pattern_verbatim() {
+fn the_replace_modifiers_take_a_string_verbatim_and_a_regex_as_a_pattern() {
     let out = run_with_input(
         r#"s = "a.b.c"
 puts $s:replaceall(".", "-")
+puts $s:replaceall(/./, "-")
 puts $s:replacestart("a", "Z") $s:replaceend("c", "Z")
 puts $s:replacestart("b", "Z")
+puts "one.js":replaceend(/\.js/, ".ts")
 xs = [x.js y.js]
 ys = $xs:replaceend(".js", ".ts")
 puts ...$ys
 "#,
     );
-    // The `.` is a literal dot, not "any character" — a string pattern never
-    // quietly becomes a regex.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "a-b-c\nZ.b.c a.b.Z\na.b.c\nx.ts y.ts\n"
+        "a-b-c\n-----\nZ.b.c a.b.Z\na.b.c\none.ts\nx.ts y.ts\n"
     );
     assert!(
         out.status.success(),
@@ -16729,21 +16730,165 @@ puts ...$ys
     );
 }
 
-/// Until the regex slot is built the pattern is **always** literal, so a bare
-/// `/a/` is the three-character text rather than a pattern. Pinned because it is
-/// the reading a quoted `"/a/"` requires — by the time the value reaches the
-/// modifier the two are indistinguishable — and because a reader who wrote the
-/// eventual regex spelling gets a no-op rather than an error until then.
+/// The anchored replace spellings must ask the **engine** for a match at the
+/// subject's edge, not filter an unanchored one's matches. `find_iter` reports
+/// non-overlapping leftmost-first matches, so an earlier match eats the bytes a
+/// later trailing one needed: `ab|bc` against `abc` reports only `ab`, and the
+/// `bc` that really does end the string was never offered.
 #[test]
-fn a_slash_literal_in_a_replace_pattern_is_still_literal_text() {
+fn an_anchored_regex_replace_finds_an_overlapped_match_at_the_edge() {
+    let out = run_with_input(
+        r#"puts "abc":replaceend(re("ab|bc"), "X")
+puts "abc":replacestart(re("bc|ab"), "X")
+puts "cab":replaceend(re("b|ab"), "X")
+puts "abc":replacestart(/b/, "X")
+puts "abc":replaceend(/b/, "X")
+"#,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "aX\nXc\ncX\nabc\nabc\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The anchored spellings hand the edge requirement to the **engine** and search
+/// the whole subject, so each edge reads the way regex reads. At the end the
+/// engine tries start positions left to right and every candidate finishes at
+/// `\z`, which makes it the longest trailing match; at the start every candidate
+/// begins at 0, so leftmost cannot choose and regex's first-alternative rule
+/// decides. The asymmetry is the engine's, not an accident of this code.
+#[test]
+fn an_anchored_replace_reads_each_edge_the_way_the_engine_does() {
+    let out = run_with_input(
+        r#"puts "abc":replaceend(re("c|bc"), "X")
+puts "abc":replaceend(re("bc|c"), "X")
+puts "abc":replacestart(re("a|ab"), "X")
+puts "abc":replacestart(re("ab|a"), "X")
+"#,
+    );
+    // The trailing edge is order-independent — both spellings find `bc`. The
+    // leading edge follows the order written, as it does in any regex.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "aX\naX\nXbc\nXc\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A look-around assertion reads the bytes **around** the match, so the subject
+/// has to stay whole. Testing truncated slices to find a longer match invented
+/// context that was never there: `re(r"a\b")` has no match in `ab`, but against
+/// the slice `a` the cut end looked like a word boundary and the assertion passed.
+#[test]
+fn an_anchored_replace_keeps_the_subject_whole_for_look_around() {
+    let out = run_with_input(
+        r#"puts "ab":replacestart(re(r"a\b"), "X")
+puts "ab":replaceend(re(r"\bb"), "X")
+puts "a b":replaceend(re(r"\bb"), "X")
+"#,
+    );
+    // The first two have no match at all; only the third has a real boundary.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ab\nab\na X\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A multi-byte subject is matched and rebuilt on the match's own byte offsets,
+/// so a character can never be split.
+#[test]
+fn an_anchored_replace_handles_a_multibyte_subject() {
+    let out = run_with_input(
+        "puts \"héllo\":replaceend(re(\"llo\"), \"X\")\nputs \"aé\":replaceend(re(\"é\"), \"X\")\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "héX\naX\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A regex literal needs delimiters that were **written** as delimiters. `\/a/`
+/// and `/a\/` come out as the text `/a/` — beginning and ending with a slash
+/// without either one being one — and outside a match slot that is the ordinary
+/// string `/a/`. Reading them as patterns made identical text mean two different
+/// things depending on where it sat.
+///
+/// This is the shared shape rule, so the fix reaches `~` and `match` arms as well
+/// as the replace slot; all three are checked here. It predates the replace slot,
+/// which inherited it by reusing `match_operand`.
+#[test]
+fn a_regex_literal_needs_delimiters_that_were_written_as_delimiters() {
+    let out = run_with_input(
+        r#"puts "x/a/y":replaceall(\/a/, X)
+puts "x/a/y":replaceall(/a\/, X)
+puts (match "xay" { \/a/ => REGEX; _ => LITERAL })
+"#,
+    );
+    // The first two strip the literal three characters `/a/`, leaving `xXy`
+    // rather than treating `a` as a pattern inside the slashes.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "xXy
+xXy
+LITERAL
+"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `~` needs a pattern operand, so an escaped-delimiter word is now refused
+    // by name instead of quietly matching as a regex.
+    let out = run_with_input("if \"xay\" ~ \\/a/ { puts REGEX }\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("must be a regex or bare glob"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // An escape *inside* is untouched: this is a regex whose pattern contains an
+    // escaped slash, and real delimiters still convert everywhere.
+    let out =
+        run_with_input("puts \"a/b\":replaceall(/a\\/b/, X)\nif \"xay\" ~ /a/ { puts REGEX }\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "X
+REGEX
+"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Quoting is what separates a **pattern** from the text it looks like: a bare
+/// `/a/` is a regex here, while `"/a/"` is the three-character string. The
+/// distinction is decided before the value reaches the modifier, which is why the
+/// slot conversion belongs in the parser rather than at the point of use.
+#[test]
+fn quoting_separates_a_regex_literal_from_the_text_it_looks_like() {
     let out = run_with_input(
         r#"puts "abc":replaceall(/a/, X)
 puts "x/a/y":replaceall("/a/", "/b/")
-puts "a/a/b":replaceall(/a/, X)
 "#,
     );
-    // Line 1 finds no `/a/` in `abc`, so nothing changes. Line 3 does contain it.
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "abc\nx/b/y\naXb\n");
+    // The bare one matches `a` as a pattern; the quoted one matches the literal
+    // three characters and leaves the rest of the path alone.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Xbc\nx/b/y\n");
     assert!(
         out.status.success(),
         "{}",
@@ -16751,35 +16896,93 @@ puts "a/a/b":replaceall(/a/, X)
     );
 }
 
-/// An `re()` value names the gap rather than being read as text.
-#[test]
-fn a_regex_value_in_a_replace_pattern_says_it_is_not_built() {
-    let out = run_with_input("puts \"abc\":replaceall(re(\"a\"), X)\n");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("does not take a regex pattern yet"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(!out.status.success());
-}
-
-/// A bare word in a replace pattern is the string it looks like. There is no
-/// glob reading in this slot, so a word that should match itself must not be
-/// turned into one.
+/// The replace family's pattern slot converts a clean `/…/` literal and leaves
+/// **everything else as written**. It is narrower than a `match` arm's slot,
+/// which also reads a bare word as a glob — there is no glob reading here, so
+/// converting one would make a word that should match itself fail instead.
 #[test]
 fn a_bare_word_in_a_replace_pattern_stays_the_string_it_looks_like() {
     let out = run_with_input(
         r#"puts "abc":replaceall(a, "X")
 puts "abc":replacestart(a, "X")
 puts "abc":replaceend(c, "X")
+puts "Ab":replaceall(/a/:i, x)
+puts "Ab":replacestart(/a/:i, x)
+puts "aB":replaceend(/b/:i, x)
+puts "/A/":replaceall(/a/:upper, X)
+puts "/a/":replaceall(/a/:lower, X)
 "#,
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "Xbc\nXbc\nabX\n");
+    // A **flagged** literal converts: `/a/:i` is the regex wrapped in its flag
+    // chain, so a check that only looked at the top of the converted tree
+    // restored the word and left `:i` applied to a string.
+    //
+    // The last two do **not**. Traversal stops at anything that is not a regex
+    // flag, because `/a/:upper` is the ordinary string expression `/A/`
+    // everywhere else — reading it as a regex would both change its meaning and
+    // fail, since `:upper` is not a flag.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Xbc\nXbc\nabX\nxb\nxb\nax\nX\nX\n"
+    );
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// The anchors are the **absolute** ones, not `^` / `$`, which move to line edges
+/// under `:m` — and a subject's edge is not a line's. Regex flags still reach the
+/// anchored form, since it is built from the same value.
+#[test]
+fn an_anchored_replace_uses_the_subject_edge_and_keeps_regex_flags() {
+    let out = run_with_input(
+        "puts \"a\\nb\":replaceend(re(\"b\"):m, \"X\")\nputs \"a.js\":replaceend(re(\"JS\"):i, \"ts\")\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nX\na.ts\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Under `:x` a `#` comment runs to end of line, so the generated `)` and anchor
+/// must not land on that line — they would become part of the comment and the
+/// pattern would fail to compile even though the regex itself is fine.
+#[test]
+fn an_anchored_replace_survives_an_extended_mode_trailing_comment() {
+    let out = run_with_input(
+        r#"puts "abc":replaceend(re("bc # trailing comment"):x, "X")
+puts "abc":replacestart(re("^a # leading"):x, "Z")
+puts "abc":replaceend(re("(?x)bc # trailing comment"), "X")
+puts "abc":replacestart(re("(?x)^a # leading"), "Z")
+"#,
+    );
+    // The last two turn extended mode on from *inside* the pattern, where the
+    // flags cannot see it — the reason the wrap is tried and retried rather than
+    // chosen from `ignore_whitespace`.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "aX\nZbc\naX\nZbc\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The comment fallback must not mask a genuinely broken pattern: a swallowed
+/// `)` always leaves the group unclosed, so a failure of both spellings reports
+/// the original error rather than the retry's.
+#[test]
+fn an_anchored_replace_still_reports_a_genuinely_invalid_pattern() {
+    let out = run_with_input("puts \"abc\":replaceend(re(\"(unclosed\"), \"X\")\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid regex"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success());
 }
 
 /// A modifier's string argument is flattened like its subject: which bytes are
@@ -16817,6 +17020,20 @@ puts $m:get(style(absent, fg: red), fallback)
 "#,
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\nfallback\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A replacement is literal: `regex`'s own `$1` expansion is suppressed, because
+/// the capture-backreference spelling is still provisional in `DESIGN.md` and
+/// taking `$1` now would freeze a syntax the design has not chosen.
+#[test]
+fn a_replacement_is_literal_text_not_a_backreference_template() {
+    let out = run_with_input("puts \"ab\":replaceall(/a/, r\"$0-\")\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "$0-b\n");
     assert!(
         out.status.success(),
         "{}",
@@ -16904,9 +17121,19 @@ fn a_misused_modifier_argument_is_a_loud_error() {
             "replacement must be a string",
         ),
         ("puts \"a\":stripend(\"\")\n", "must not be empty"),
+        // The empty-pattern refusal must not depend on which spelling reached
+        // for it: a regex arrives by a different route than a string, and an
+        // empty one matches at every position.
+        ("puts \"abc\":replaceall(//, X)\n", "must not be empty"),
+        (
+            "puts \"abc\":replaceall(re(\"\"), X)\n",
+            "must not be empty",
+        ),
+        ("puts \"abc\":replacestart(//, X)\n", "must not be empty"),
+        ("puts \"abc\":replaceend(//, X)\n", "must not be empty"),
         (
             "puts \"a\":replaceall([a], \"b\")\n",
-            "pattern must be a string",
+            "pattern must be a string or a regex",
         ),
     ] {
         let out = run_with_input(source);

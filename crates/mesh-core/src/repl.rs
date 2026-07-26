@@ -3605,18 +3605,91 @@ fn replace_modifier(name: &str, subject: Value, old: Value, new: &str) -> Result
                 })
             })
         }
-        // A regex pattern is not wired up yet — it lands with the rest of the
-        // regex match slot. Named rather than lumped in with "wrong type" below,
-        // so a reader who wrote the documented `/…/` spelling is told it is
-        // coming rather than that their value was nonsense.
-        Value::Regex(_) => {
-            return runtime_error(format!(
-                "modifier :{name} does not take a regex pattern yet; use a string"
-            ));
+        Value::Regex(regex) => {
+            // The same refusal the string arm makes, before anything is compiled.
+            // An empty pattern matches at every position, so `:replaceall` would
+            // interleave the replacement through the subject and the anchored pair
+            // would insert it at an edge — surprising enough to refuse, and the
+            // rule must not depend on *which spelling* the caller reached for.
+            if regex.pattern.is_empty() {
+                return runtime_error(format!("modifier :{name} pattern must not be empty"));
+            }
+            // The anchored spellings put the edge requirement *into the pattern*
+            // and search the **whole subject**, rather than filtering an unanchored
+            // pattern's matches or testing truncated slices.
+            //
+            // Filtering cannot work: the iterator reports **non-overlapping,
+            // leftmost-first** matches, so an earlier match consumes the bytes a
+            // later trailing one needed — `re("ab|bc")` against `abc` reports only
+            // `ab`, and the `bc` that really does end the string is never offered.
+            //
+            // Slicing cannot work either, for a subtler reason: a look-around
+            // assertion reads the bytes *around* the match, so cutting the subject
+            // invents context that was never there. `re(r"a\b")` has no match in
+            // `ab`, but against the slice `a` the cut end looks like a word
+            // boundary and the assertion passes. The subject has to stay whole.
+            //
+            // `\A` / `\z` are the absolute anchors on purpose: `^` and `$` move to
+            // line edges under the `:m` flag, and a subject's edge is not a line's.
+            let anchored = |edge: &str| -> Result<regex::Regex, Step> {
+                let wrap = |body: &str| {
+                    let mut anchored = regex.clone();
+                    anchored.pattern = match edge {
+                        "replacestart" => format!(r"\A(?:{body})"),
+                        _ => format!(r"(?:{body})\z"),
+                    };
+                    compile_regex(&anchored)
+                };
+                // Extended mode makes a `#` run to end of line, so a pattern ending
+                // in a comment swallows the `)` and the anchor written after it. A
+                // newline closes the comment — but whether the pattern is *in*
+                // extended mode cannot be read off the flags, since `(?x)` turns it
+                // on from inside the pattern. So the plain wrap is tried first and
+                // the newline is the fallback, rather than a guess either way:
+                // outside extended mode a newline would be one more character the
+                // pattern has to match, and short of parsing the pattern the
+                // compiler is the only thing that actually knows.
+                //
+                // The fallback cannot mask a genuinely broken pattern, because a
+                // swallowed `)` always leaves the group unclosed — failure here
+                // means the wrap broke it, and if both spellings fail the original
+                // error is the one reported.
+                wrap(&regex.pattern)
+                    .or_else(|error| wrap(&format!("{}\n", regex.pattern)).map_err(|_| error))
+                    .map_err(runtime_message)
+            };
+            let compiled = match name {
+                "replacestart" | "replaceend" => anchored(name)?,
+                _ => compile_regex(&regex).map_err(runtime_message)?,
+            };
+            Box::new(move |text: &str| {
+                Ok(match name {
+                    // The match is **the engine's**, found in the whole subject. At
+                    // the end that makes it the longest trailing match, since the
+                    // engine tries start positions left to right and every candidate
+                    // finishes at `\z`; at the start every candidate begins at 0, so
+                    // regex's own first-alternative rule decides and `re("a|ab")`
+                    // takes `a`. The two edges therefore read differently — but that
+                    // difference is the engine's leftmost-first semantics showing
+                    // through, the same rule any regex tool follows, and inventing a
+                    // longest-match search on top of it is what broke look-around.
+                    "replacestart" => match compiled.find(text) {
+                        Some(m) => format!("{new}{}", &text[m.end()..]),
+                        None => text.to_string(),
+                    },
+                    "replaceend" => match compiled.find(text) {
+                        Some(m) => format!("{}{new}", &text[..m.start()]),
+                        None => text.to_string(),
+                    },
+                    _ => compiled
+                        .replace_all(text, regex::NoExpand(new))
+                        .into_owned(),
+                })
+            })
         }
         other => {
             return runtime_error(format!(
-                "modifier :{name} pattern must be a string, got {}",
+                "modifier :{name} pattern must be a string or a regex, got {}",
                 value_kind(&other)
             ));
         }
