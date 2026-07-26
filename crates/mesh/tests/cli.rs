@@ -13114,6 +13114,89 @@ fn a_backgrounded_value_argument_is_refused_rather_than_run_in_the_shell() {
 }
 
 #[test]
+fn a_value_in_a_word_is_evaluated_when_that_word_is_expanded() {
+    // Evaluating every value up front made a call in one argument visible to words
+    // written *earlier* on the line: `$cmd` was expanded after `g()` had already
+    // reassigned it, so this ran `/bin/false` and printed nothing.
+    let selected = run_with_input(
+        "cmd = /bin/echo\n\
+         func g() { global cmd = /bin/false\n  return x }\n\
+         $cmd g()\n\
+         puts status=$sh.status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&selected.stdout),
+        "x\nstatus=0\n",
+        "{:?}",
+        selected.stderr
+    );
+
+    // The general rule, both directions at once: the word before the call reads the
+    // old value and the word after it reads the new one. Up-front evaluation printed
+    // `second x second`.
+    let both =
+        run_with_input("n = first\nfunc g() { global n = second\n  return x }\nputs $n g() $n\n");
+    assert_eq!(String::from_utf8_lossy(&both.stdout), "first x second\n");
+
+    // Word zero is expanded **once**, for all that it is asked several questions —
+    // is it a function, is it a typed builtin, what is its argv entry. A value in it
+    // must not run again for each, so the counter reads 1 on all three paths word
+    // zero can name.
+    for (names, want) in [
+        ("/bin/echo", "hi\nran=1\n"),
+        ("puts", "hi\nran=1\n"),
+        ("f", "f=hi\nran=1\n"),
+    ] {
+        let out = run_with_input(&format!(
+            "n = 0\nfunc f(x) {{ puts f=$x }}\n\
+             func pick() {{ global n = ($n + 1)\n  puts {names} }}\n\
+             \"$(pick)\" hi\nputs ran=$n\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            want,
+            "{names}: {:?}",
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn a_redirect_target_is_expanded_after_every_word() {
+    // The documented order, which a value in a target has to follow too: it used to
+    // be evaluated while the stage was assembled, so `puts $n > "$(g)"` wrote the
+    // value `g` had just assigned rather than the one written on the line.
+    let dir = fresh_dir("redirect_target_after_words");
+    let target = dir.join("out");
+    let out = run_with_input(&format!(
+        "n = first\nfunc g() {{ global n = second\n  puts {} }}\nputs $n > \"$(g)\"\n",
+        target.display()
+    ));
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&target).ok().as_deref(),
+        Some("first\n")
+    );
+
+    // And the target comes after a value *argument*, which is what keeps
+    // `f * > summary` from globbing the file the redirection is about to create.
+    let order = run_with_input(&format!(
+        "order = ''\n\
+         func arg() {{ global order = \"${{order}}arg-\"\n  return x }}\n\
+         func tgt() {{ global order = \"${{order}}tgt\"\n  puts {} }}\n\
+         /bin/echo arg() > \"$(tgt)\"\nputs order=$order\n",
+        target.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&order.stdout), "order=arg-tgt\n");
+    assert_eq!(
+        std::fs::read_to_string(&target).ok().as_deref(),
+        Some("x\n")
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn control_flow_inside_a_value_argument_belongs_to_the_caller() {
     // The argument runs with the caller's `in_function`, so a `return` in one leaves
     // the enclosing function. Evaluated as top-level code it reported "not inside a

@@ -266,6 +266,19 @@ puts f()                      # a function's value
 The result is **literal**, exactly as an interpolated variable is: never re-split,
 never re-globbed, so `puts $(puts '*')` prints `*`.
 
+Each word is evaluated **as it is reached**, left to right, so a call in one argument
+is seen by the words after it and not by the ones before:
+
+```mesh
+n = first
+func g() { global n = second
+  return x }
+puts $n g() $n                # first x second
+```
+
+Redirect targets come after all of them, which is why `f * > summary` cannot match
+the `summary` its own redirection is about to create.
+
 It carries the *value*, not its text. So a builtin that reads values gets one —
 `puts f()` on a list prints one element per line — while a command that needs bytes
 meets the ordinary argv rule and refuses a collection by name:
