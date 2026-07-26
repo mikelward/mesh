@@ -1202,6 +1202,26 @@ fn cd_tilde_goes_home() {
 }
 
 #[test]
+fn a_lone_star_globs_in_value_position() {
+    // A space-delimited `*` lexes as the multiplication operator, so every value
+    // slot — a `for` header, an assignment, a parenthesised value — has to read it
+    // back as the glob it is (`DESIGN.md` §"Loops"). A `*` with a left operand in
+    // front of it is still multiplication.
+    let dir = fresh_dir("bare_star_value");
+    std::fs::write(dir.join("b.ext"), "").unwrap();
+    std::fs::write(dir.join("a.ext"), "").unwrap();
+    let out = run_with_input(&format!(
+        "cd {}\nfor f in * {{ puts $f }}\nxs = *\nputs $xs\nputs (*)\nputs (4 * 3)\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a.ext\nb.ext\na.ext\nb.ext\na.ext\nb.ext\n12\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn glob_star_excludes_dotfiles() {
     let dir = fresh_dir("glob_dot");
     std::fs::write(dir.join("visible.txt"), "").unwrap();
