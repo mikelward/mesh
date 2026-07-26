@@ -653,6 +653,14 @@ prompt-hook postexec log command-finished
 job ended, not the instant it ended. A job you `wait` for does not reach it: the
 status went to the caller, which is what the hook is there to tell you.
 
+On the way out, every job the shell knows about is reported **before** the
+`exit` hook, so a handler that tears down what `jobdone` was writing to can rely
+on having seen them all. The exception is a completion the `exit` handler itself
+brings about — by running `jobs`, or by taking long enough that a job finishes
+while it does. That one is reported after the handler has run, because there is
+no earlier moment to report it in: the alternative is not reporting it at all,
+and a notice without its hook is the one thing `jobdone` is meant to rule out.
+
 ```mesh
 func job-finished(id, cmd, status) {
   if $status != 0 {
