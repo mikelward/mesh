@@ -10,6 +10,7 @@
 //! rendered lossily; the real fix is `OsString` words later.
 
 use std::env;
+use std::fs;
 
 /// One access step applied from left to right to a variable value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,7 +139,15 @@ pub enum Piece {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Word(pub Vec<Piece>);
+pub struct Word {
+    pub pieces: Vec<Piece>,
+    /// The glob's `(…)` options, when the word carried them. Applied after the
+    /// pattern has matched, since every one of them asks the filesystem about a
+    /// path that already exists.
+    pub qualifiers: Option<GlobQualifiers>,
+}
+
+use crate::parser::{FileKind, GlobQualifiers};
 use crate::vars::{Value, Vars};
 
 /// An expansion error — an unbound read fails loud (no null), per `DESIGN.md`.
@@ -261,7 +270,7 @@ pub fn expand_call_values(
             // path the value came from filesystem expansion (like a positional
             // glob), so it stays a string rather than being typed from its bytes.
             let bare = matches!(
-                word.0.as_slice(),
+                word.pieces.as_slice(),
                 [Piece::Text { text, expandable: true }] if !has_glob_meta(text)
             );
             let mut strings = Vec::new();
@@ -393,10 +402,10 @@ fn whole_value(word: &Word, vars: &Vars) -> Option<Result<Value, ExpandError>> {
     // A value argument is already a value; handing it over untouched is what lets
     // `puts style(x, fg: red)` keep its attributes and `puts (…)` on a collection
     // render per-line rather than meeting the argv rule.
-    if let [Piece::Value(value)] = word.0.as_slice() {
+    if let [Piece::Value(value)] = word.pieces.as_slice() {
         return Some(Ok(value.clone()));
     }
-    let [Piece::Var(vref)] = word.0.as_slice() else {
+    let [Piece::Var(vref)] = word.pieces.as_slice() else {
         return None;
     };
     if vref.quoted {
@@ -411,7 +420,7 @@ fn scalar_literal(word: &Word) -> Option<Value> {
             text,
             expandable: true,
         },
-    ] = word.0.as_slice()
+    ] = word.pieces.as_slice()
     else {
         return None;
     };
@@ -442,7 +451,7 @@ pub(crate) fn typed_scalar(text: &str) -> Value {
 /// Recognize the deliberately narrow first spread form: `...$name` as a whole
 /// word. General expression spreading arrives with the parser.
 fn spread_var(word: &Word) -> Option<&VarRef> {
-    match word.0.as_slice() {
+    match word.pieces.as_slice() {
         [
             Piece::Text {
                 text,
@@ -460,7 +469,7 @@ type Pieces = Vec<(String, bool)>;
 fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), ExpandError> {
     // Resolve interpolations first; an interpolated value is literal.
     let mut pieces: Pieces = Vec::new();
-    for piece in word.0 {
+    for piece in word.pieces {
         match piece {
             Piece::Text { text, expandable } => pieces.push((text, expandable)),
             Piece::Var(vref) => pieces.push((resolve(&vref, vars)?, false)),
@@ -471,30 +480,99 @@ fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), Exp
     }
     apply_tilde(&mut pieces);
 
-    let has_meta = pieces.iter().any(|(t, e)| *e && has_glob_meta(t));
-    if !has_meta {
-        out.push(literal(&pieces));
-        return Ok(());
-    }
-
-    // A word globs only if its expandable segments form a valid pattern on their
-    // own (literals stood in by a placeholder), so an escaped literal fragment
-    // can't complete a broken class in an adjacent expandable segment.
+    // A word globs only if it has glob syntax *and* its expandable segments form a
+    // valid pattern on their own (literals stood in by a placeholder), so an escaped
+    // literal fragment can't complete a broken class in an adjacent expandable
+    // segment. Anything else is the literal text it looks like.
     let structure: String = pieces
         .iter()
         .map(|(t, e)| if *e { t.clone() } else { "a".to_string() })
         .collect();
-    if glob::Pattern::new(&structure).is_err() {
-        out.push(literal(&pieces));
-        return Ok(());
+    let matches = if pieces.iter().any(|(t, e)| *e && has_glob_meta(t))
+        && glob::Pattern::new(&structure).is_ok()
+    {
+        glob_matches(&glob_pattern(&pieces))
+    } else {
+        None
+    };
+    let mut matches = matches.unwrap_or_else(|| vec![literal(&pieces)]);
+    // Qualifiers apply to whatever the word produced, including the literal a
+    // pattern `glob` refuses falls back to. Filtering only real matches would let
+    // `*[(f)` drop its `(f)` silently, and a qualifier that is quietly ignored is
+    // worse than one that takes the word down to nothing.
+    if let Some(qualifiers) = &word.qualifiers {
+        matches.retain(|path| qualifies(path, qualifiers));
     }
-
-    let pattern = glob_pattern(&pieces);
-    match glob_matches(&pattern) {
-        Some(paths) => out.extend(paths),
-        None => out.push(literal(&pieces)),
-    }
+    out.extend(matches);
     Ok(())
+}
+
+/// Does this path satisfy every one of a glob's qualifiers?
+///
+/// The tests are ANDed and all of them ask the filesystem, which is why they belong
+/// to globbing rather than to string matching (`DESIGN.md` §"Globbing"). A path that
+/// cannot be stat'd qualifies for nothing: it is a broken symlink or a race, and
+/// there is no evidence it is what was asked for.
+///
+/// **Symlinks are read two ways, because the two questions differ.** A *type* is
+/// about the name, so it comes from `lstat` — that is what makes `l` mean anything
+/// at all, and it is how `find -type` reads without `-L`. `exec` and `empty` are
+/// about the thing you would open, so they follow the link: a symlink's own mode is
+/// `0777` on Linux, so an `lstat` reading of `exec` would answer "yes" for every
+/// symlink in the directory and `*(x)` would be useless. `*(l, x)` is then the
+/// readable spelling of "links to something runnable".
+fn qualifies(path: &str, qualifiers: &GlobQualifiers) -> bool {
+    let Ok(named) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !qualifiers.types.is_empty() && !qualifiers.types.iter().any(|kind| is_kind(*kind, &named)) {
+        return false;
+    }
+    if qualifiers.exec.is_none() && qualifiers.empty.is_none() {
+        return true;
+    }
+    // Following the link can fail where naming it did not — a dangling symlink.
+    // Nothing is known about a target that isn't there, so it satisfies neither test.
+    let Ok(target) = fs::metadata(path) else {
+        return false;
+    };
+    if let Some(want) = qualifiers.exec {
+        use std::os::unix::fs::PermissionsExt;
+        // Any of the three execute bits, as `find -perm -111` asks. Whether *this*
+        // process could run it is a question about uid, gid and the mount, which
+        // neither this nor `find` sets out to answer.
+        if (target.permissions().mode() & 0o111 != 0) != want {
+            return false;
+        }
+    }
+    if let Some(want) = qualifiers.empty {
+        // A directory is empty when it has no entries; anything else when it has no
+        // bytes. `find -empty` splits the same way, a directory's size being its own
+        // bookkeeping rather than its contents.
+        let empty = if target.is_dir() {
+            fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
+        } else {
+            target.len() == 0
+        };
+        if empty != want {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_kind(kind: FileKind, metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let file_type = metadata.file_type();
+    match kind {
+        FileKind::File => file_type.is_file(),
+        FileKind::Dir => file_type.is_dir(),
+        FileKind::Symlink => file_type.is_symlink(),
+        FileKind::Fifo => file_type.is_fifo(),
+        FileKind::Socket => file_type.is_socket(),
+        FileKind::Block => file_type.is_block_device(),
+        FileKind::Char => file_type.is_char_device(),
+    }
 }
 
 /// Every path a pattern matches, with the dotfile rule applied: a `*`, `?` or
