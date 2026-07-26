@@ -8062,12 +8062,29 @@ fn a_script_runs_from_a_shebang_line() {
     std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
     std::fs::set_permissions(&path, permissions).unwrap();
 
-    let out = Command::new(&path)
-        .arg("world")
-        .env("XDG_CONFIG_HOME", isolated_config_home())
-        .stdin(Stdio::null())
-        .output()
-        .expect("run script through its shebang");
+    // `exec` refuses a file any process still holds open for writing, with
+    // `ETXTBSY`. Nothing here holds it — the write is closed above — but a fork
+    // elsewhere in the suite inherits whatever was open at the instant it forked,
+    // and mesh forks in-shell stages that never `exec`, so such a copy can
+    // outlive this file's write by the whole life of a background job. The
+    // condition clears on its own, so wait it out rather than call it a failure.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let out = loop {
+        let attempt = Command::new(&path)
+            .arg("world")
+            .env("XDG_CONFIG_HOME", isolated_config_home())
+            .stdin(Stdio::null())
+            .output();
+        match attempt {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => break other.expect("run script through its shebang"),
+        }
+    };
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hi world\n");
 }
 
@@ -10903,19 +10920,7 @@ fn sh_stream_handles_are_descriptors_with_a_tty_test() {
 fn open_pty() -> (RawFd, RawFd) {
     let mut master = 0;
     let mut slave = 0;
-    let ok = unsafe {
-        // `null_mut` rather than `null` for the termios/winsize arguments: Apple
-        // declares them `*mut` and Linux `*const`, and `*mut T` coerces to
-        // `*const T` but not the reverse — so only this spelling builds on both.
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    assert_eq!(ok, 0, "openpty failed");
+    assert_eq!(open_pty_pair(&mut master, &mut slave), 0, "openpty failed");
     (master, slave)
 }
 
