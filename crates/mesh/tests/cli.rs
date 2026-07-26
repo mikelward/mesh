@@ -3835,7 +3835,29 @@ fn run_at_descriptor_limit(limit: libc::rlim_t, command_line: &str) -> Output {
             Ok(())
         });
     }
-    command.output().expect("run mesh")
+    // At this limit the child can afford 0, 1, 2 and almost nothing else, so it
+    // has to start with exactly those. A descriptor another test had open when
+    // this process forked is inherited here, and one landing on the single free
+    // slot leaves the dynamic loader unable to open a shared library: the
+    // process dies before `main` with `error while loading shared libraries: …
+    // Error 24` — `EMFILE` — which arrives looking like the shell refusing a
+    // redirection it never got to see.
+    //
+    // `open_pty_pair` closes the usual source of those descriptors, but not the
+    // gap between `openpty` returning and the flag being set on its results.
+    // That gap belongs to another test's fork and is not this one's to schedule,
+    // so a run that lands in it is retried rather than reported as a result
+    // about redirection.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let out = command.output().expect("run mesh");
+        let died_before_main =
+            String::from_utf8_lossy(&out.stderr).contains("error while loading shared libraries");
+        if !died_before_main || std::time::Instant::now() > deadline {
+            break out;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 #[test]
