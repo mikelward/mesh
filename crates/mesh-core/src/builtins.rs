@@ -11,10 +11,13 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+use crate::vars::Value;
+
 pub(crate) const NAMES: &[&str] = &[
     "cd",
     "pwd",
     "puts",
+    "print",
     "clip",
     "notify",
     "exit",
@@ -108,6 +111,7 @@ pub(crate) fn help(name: &str) -> Option<String> {
         "cd" => "cd [DIR]",
         "pwd" => "pwd",
         "puts" => "puts [ARG ...]",
+        "print" => "print [ARG ...]",
         "clip" => "clip [TEXT ...]",
         "notify" => "notify [TEXT ...]",
         "exit" => "exit [N]",
@@ -142,7 +146,8 @@ pub fn dispatch(words: &[String], last: u8) -> Option<Builtin> {
     match words[0].as_str() {
         "cd" => Some(Builtin::Status(cd(&words[1..]))),
         "pwd" => Some(Builtin::Status(pwd(&words[1..]))),
-        "puts" => Some(Builtin::Status(puts(&words[1..]))),
+        "puts" => Some(Builtin::Status(puts(&words[1..], true))),
+        "print" => Some(Builtin::Status(puts(&words[1..], false))),
         "clip" => Some(Builtin::Status(clip(&words[1..]))),
         "notify" => Some(Builtin::Status(notify(&words[1..]))),
         "exit" => Some(exit(&words[1..], last)),
@@ -260,13 +265,76 @@ fn pwd(args: &[String]) -> u8 {
     }
 }
 
-/// `puts [ARG ...]` — write the arguments separated by single spaces, followed
-/// by a newline (no args → a blank line). The basic string form; list/value
-/// formatting arrives with the value system.
-fn puts(args: &[String]) -> u8 {
+/// `puts [ARG ...]` and `print [ARG ...]` — write the arguments separated by
+/// single spaces; `puts` appends a newline (no args → a blank line) and `print`
+/// does not (no args → nothing at all).
+///
+/// The arguments arrive already rendered from values by
+/// [`rendered_for_output`](rendered_for_output), joined into a single word, so
+/// the space-joining here is only for the argv path — a piped or forked stage
+/// that hands the builtin plain text.
+fn puts(args: &[String], newline: bool) -> u8 {
+    let name = if newline { "puts" } else { "print" };
     let mut line = args.join(" ").into_bytes();
-    line.push(b'\n');
-    write_stdout("puts", &line)
+    if newline {
+        line.push(b'\n');
+    }
+    if line.is_empty() {
+        return 0;
+    }
+    write_stdout(name, &line)
+}
+
+/// The text `puts` writes for one argument, per `DESIGN.md` §"I/O".
+///
+/// One order-preserving rule: a scalar renders as itself, a **list** as its
+/// elements joined by newlines (a list *is* a sequence of lines), a **map** as
+/// `key: value` entries joined by newlines. A value with no canonical byte form —
+/// a stream or job handle, a function, a pattern — is a **loud error** rather than
+/// a guessed rendering, exactly as at the argv boundary.
+///
+/// This is why `puts` takes its arguments as values rather than as words: the
+/// argv boundary refuses a list outright, since an external command needs bytes
+/// and there is no canonical separator to pick. `puts` is a builtin looking at a
+/// real value, so it can answer — and newline is the answer a list has.
+pub(crate) fn rendered_for_output(value: &Value) -> Result<String, String> {
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        Value::Integer(number) => Ok(number.to_string()),
+        Value::Boolean(flag) => Ok(flag.to_string()),
+        Value::List(items) => {
+            let mut lines = Vec::with_capacity(items.len());
+            for item in items {
+                lines.push(match item {
+                    // A list of lines cannot nest: the rendering would have to
+                    // invent a second separator, and `DESIGN.md` refuses the guess
+                    // here as it does at every other boundary.
+                    Value::List(_) => return Err("a list inside a list has no rendering".into()),
+                    Value::Map(_) => return Err("a map inside a list has no rendering".into()),
+                    scalar => rendered_for_output(scalar)?,
+                });
+            }
+            Ok(lines.join("\n"))
+        }
+        Value::Map(entries) => {
+            let mut lines = Vec::with_capacity(entries.len());
+            for (key, entry) in entries {
+                let rendered = match entry {
+                    Value::List(_) => return Err("a list inside a map has no rendering".into()),
+                    Value::Map(_) => return Err("a map inside a map has no rendering".into()),
+                    scalar => rendered_for_output(scalar)?,
+                };
+                lines.push(format!("{key}: {rendered}"));
+            }
+            Ok(lines.join("\n"))
+        }
+        Value::Regex(_) | Value::Glob(_) => {
+            Err("a pattern has no text form; match with it instead".into())
+        }
+        Value::Stream(_) => Err("a stream handle has no text form".into()),
+        Value::Job(_) => Err("a job handle has no text form; ask it for a member".into()),
+        Value::Function(_) => Err("a function value has no text form; call it".into()),
+    }
 }
 
 /// How much base64 `clip` will send. Terminals bound the sequence they will
@@ -518,7 +586,7 @@ fn exit(args: &[String], last: u8) -> Builtin {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64, help, is_builtin, path_line, rename_note};
+    use super::{Value, base64, help, is_builtin, path_line, rename_note, rendered_for_output};
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -617,5 +685,59 @@ mod tests {
             help("clip").as_deref(),
             Some("Usage: clip [TEXT ...]\n\nOptions:\n  --help  Print help\n")
         );
+    }
+
+    #[test]
+    fn print_is_a_builtin_with_help() {
+        assert!(is_builtin("print"));
+        assert_eq!(
+            help("print").as_deref(),
+            Some("Usage: print [ARG ...]\n\nOptions:\n  --help  Print help\n")
+        );
+    }
+
+    #[test]
+    fn a_scalar_renders_as_itself() {
+        assert_eq!(
+            rendered_for_output(&Value::String("hi".into())).as_deref(),
+            Ok("hi")
+        );
+        assert_eq!(
+            rendered_for_output(&Value::Integer(-7)).as_deref(),
+            Ok("-7")
+        );
+        assert_eq!(
+            rendered_for_output(&Value::Boolean(true)).as_deref(),
+            Ok("true")
+        );
+    }
+
+    #[test]
+    fn a_collection_renders_one_entry_per_line() {
+        let list = Value::List(vec![Value::String("a".into()), Value::Integer(2)]);
+        assert_eq!(rendered_for_output(&list).as_deref(), Ok("a\n2"));
+        let map = Value::Map(vec![
+            ("k".to_owned(), Value::String("v".into())),
+            ("n".to_owned(), Value::Boolean(false)),
+        ]);
+        assert_eq!(rendered_for_output(&map).as_deref(), Ok("k: v\nn: false"));
+        // Empty is empty, not a stray separator.
+        assert_eq!(rendered_for_output(&Value::List(vec![])).as_deref(), Ok(""));
+        assert_eq!(rendered_for_output(&Value::Map(vec![])).as_deref(), Ok(""));
+    }
+
+    #[test]
+    fn a_value_with_no_byte_form_is_a_loud_error() {
+        // Naming the type beats guessing a rendering, the same answer the argv
+        // boundary gives.
+        for value in [
+            Value::Glob("*.rs".into()),
+            Value::Stream(1),
+            Value::Job(1),
+            Value::List(vec![Value::List(vec![])]),
+            Value::Map(vec![("k".to_owned(), Value::Map(vec![]))]),
+        ] {
+            assert!(rendered_for_output(&value).is_err(), "{value:?}");
+        }
     }
 }

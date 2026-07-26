@@ -635,7 +635,9 @@ fn scalar_glob_brackets_do_not_delimit_nested_lists() {
 
 #[test]
 fn a_nested_list_cannot_cross_the_command_boundary_implicitly() {
-    let out = run_with_input("xs = [[one two]]\nputs ...$xs\n");
+    // An external command, because `puts` is a builtin looking at real values and
+    // renders a list rather than refusing it.
+    let out = run_with_input("xs = [[one two]]\n/bin/echo ...$xs\n");
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     assert!(
@@ -735,6 +737,131 @@ fn puts_joins_arguments_with_spaces() {
 fn puts_with_no_arguments_prints_a_blank_line() {
     let out = run_with_input("puts\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "\n");
+}
+
+#[test]
+fn print_writes_the_same_text_without_a_trailing_newline() {
+    let out = run_with_input("print hello   world\nprint '!'\nputs\nprint\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello world!\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn puts_renders_a_list_one_element_per_line() {
+    // A list *is* a sequence of lines, so newline is the separator. `puts` can
+    // answer this where the argv boundary cannot: it is a builtin holding a real
+    // value (`DESIGN.md` §"I/O").
+    let out = run_with_input("xs = [a 'b c' d]\nputs $xs\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb c\nd\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn puts_renders_a_map_as_key_value_lines() {
+    let out = run_with_input("m = [host: build1, port: 22]\nputs $m\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "host: build1\nport: 22\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn puts_keeps_the_order_of_a_mixed_argument_list() {
+    // The rule is per-argument rendering, then a single space between arguments —
+    // so a rendered list's newlines land inside the one line it was joined into.
+    let out = run_with_input("xs = [a b]\nputs head $xs tail\nprint one $xs two\nputs\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "head a\nb tail\none a\nb two\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn puts_renders_a_list_the_same_way_through_a_redirect_and_a_pipe() {
+    // Every path that runs a command expands its own words, so all of them have to
+    // agree on the rendering.
+    let dir = fresh_dir("puts_list_redirect");
+    let file = dir.join("out");
+    let out = run_with_input(&format!(
+        "xs = [a b]\nputs $xs > {}\nputs $xs | cat\n",
+        file.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\n");
+    assert!(out.stderr.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("redirected file"),
+        "a\nb\n"
+    );
+}
+
+#[test]
+fn a_captured_puts_renders_its_values_too() {
+    // `:capture` reaches a builtin as readily as an external, so it is the fourth
+    // entry point that has to agree on the rendering.
+    let out = run_with_input(
+        "xs = [a b]\nr = puts($xs):capture\nputs $r.out:repr\nm = [k: v]\ns = print($m):capture\nputs $s.out:repr\nj = sleep 0.1 &\nt = puts($j):capture\nputs recovered\nwait $j\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("'a\\nb\\n'\n'k: v'\n"), "{stdout:?}");
+    assert!(stdout.contains("recovered\n"), "{stdout:?}");
+    // The no-byte-form refusal is still an error rather than landing in the record
+    // as text.
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("puts: a job handle has no text form"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn puts_does_not_retype_a_written_argument() {
+    // Integer parsing governs value positions, not argument words (`DESIGN.md`
+    // §"Literals"), so what was written is what is printed — a leading zero and a
+    // sign survive. A *variable* holding `007` really is the integer 7.
+    let out = run_with_input("puts 007 -0 +5 1.50\nn = 007\nputs $n\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "007 -0 +5 1.50\n7\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn puts_refuses_a_value_with_no_text_form_and_recovers() {
+    for (src, needle) in [
+        (
+            "j = sleep 0.2 &\nputs $j\n",
+            "a job handle has no text form",
+        ),
+        (
+            "xs = [a [b c]]\nputs $xs\n",
+            "a list inside a list has no rendering",
+        ),
+        (
+            "m = [k: [a b]]\nputs $m\n",
+            "a list inside a map has no rendering",
+        ),
+    ] {
+        let out = run_with_input(&format!("{src}puts recovered\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{src:?}: {stderr:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).ends_with("recovered\n"),
+            "{src:?}: {:?}",
+            out.stdout
+        );
+    }
+}
+
+#[test]
+fn puts_and_print_still_answer_help() {
+    for name in ["puts", "print"] {
+        let out = run_with_input(&format!("{name} --help\n"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!("Usage: {name} [ARG ...]")),
+            "{stdout:?}"
+        );
+    }
 }
 
 #[test]
@@ -1019,7 +1146,10 @@ fn unspaced_append_assignment_and_type_errors_recover() {
 
 #[test]
 fn list_requires_explicit_spread_in_command_arguments() {
-    let out = run_with_input("xs = [a b]\nputs $xs\nputs recovered\n");
+    // The rule is about the *argv* boundary: an external command needs bytes and
+    // there is no canonical separator to pick. `puts` renders instead — see
+    // `puts_renders_a_list_one_element_per_line`.
+    let out = run_with_input("xs = [a b]\n/bin/echo $xs\nputs recovered\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("list value needs `...`"));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "recovered\n");
 }
@@ -1033,7 +1163,7 @@ fn list_indexing_is_zero_based_and_supports_negative_indices() {
 #[test]
 fn list_slices_are_clamped_and_require_spread() {
     let out = run_with_input(
-        "xs = [a b c d]\nputs ...$xs[1..3]\nputs ...$xs[..=1]\nputs ...$xs[-2..]\nputs ...$xs[..=-1]\nputs ...$xs[..=9223372036854775807]\nputs before ...$xs[9..] after\nputs before ...$xs[..=-5] after\nputs before ...$xs[..=-4] after\nputs $xs[1..2]\ns = text\nputs $s[1..]\nputs $missing[1..]\nputs recovered\n",
+        "xs = [a b c d]\nputs ...$xs[1..3]\nputs ...$xs[..=1]\nputs ...$xs[-2..]\nputs ...$xs[..=-1]\nputs ...$xs[..=9223372036854775807]\nputs before ...$xs[9..] after\nputs before ...$xs[..=-5] after\nputs before ...$xs[..=-4] after\n/bin/echo $xs[1..2]\ns = text\nputs $s[1..]\nputs $missing[1..]\nputs recovered\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -8458,13 +8588,18 @@ fn a_function_value_has_no_text_form() {
     for (src, needle) in [
         // A command argument.
         (
-            "f = func() { return 1 }\nputs $f\n",
+            "f = func() { return 1 }\n/bin/echo $f\n",
             "$f: a function value has no text form",
         ),
         // An element of a spread.
         (
-            "f = func() { return 1 }\nxs = [$f]\nputs ...$xs\n",
+            "f = func() { return 1 }\nxs = [$f]\n/bin/echo ...$xs\n",
             "$xs: a function value has no text form",
+        ),
+        // `puts` renders real values, and still has nothing to render here.
+        (
+            "f = func() { return 1 }\nputs $f\n",
+            "puts: a function value has no text form",
         ),
         // The environment, which is bytes by definition.
         (

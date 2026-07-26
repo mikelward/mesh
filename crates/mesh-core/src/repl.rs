@@ -3515,7 +3515,7 @@ fn capture_command(
                     let Some(value) = eval_operand(expression, last, in_function, shell)? else {
                         return Ok(None);
                     };
-                    words.extend(argv_words(&value, name)?);
+                    words.extend(capture_argument_words(&value, name)?);
                 }
                 parser::Argument::Spread(expression) => {
                     let Some(value) = eval_operand(expression, last, in_function, shell)? else {
@@ -3524,7 +3524,7 @@ fn capture_command(
                     match value {
                         Value::List(values) => {
                             for value in &values {
-                                words.extend(argv_words(value, name)?);
+                                words.extend(capture_argument_words(value, name)?);
                             }
                         }
                         _ => {
@@ -3582,6 +3582,21 @@ fn channel_record(value: Option<Value>, out: String, err: String, status: u8) ->
     entries.push(("err".to_string(), Value::String(err)));
     entries.push(("status".to_string(), Value::Integer(status.into())));
     Value::Map(entries)
+}
+
+/// The words one captured argument contributes.
+///
+/// `:capture` reaches a builtin as readily as an external — `run_expanded` resolves
+/// either — so `puts`/`print` render their values here exactly as they do in
+/// command position. Everything else takes the bytes-only argv rule.
+fn capture_argument_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
+    if matches!(name, "puts" | "print") {
+        return match builtins::rendered_for_output(value) {
+            Ok(text) => Ok(vec![text]),
+            Err(message) => runtime_error(format!("{name}: {message}")),
+        };
+    }
+    argv_words(value, name)
 }
 
 /// The argv tokens a value contributes to an external's command line — the same
@@ -4085,9 +4100,9 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
             }
         };
     }
-    // A job builtin keeps its arguments typed here too, so a handle reaches it
-    // through a redirection exactly as it does without one.
-    let expanded = match job_builtin_words(&words, &shell.vars) {
+    // A builtin that reads typed arguments keeps them here too, so a handle or a
+    // list reaches it through a redirection exactly as it does without one.
+    let expanded = match typed_builtin_words(&words, &shell.vars) {
         Some(words) => words,
         None => expand::expand(words, &shell.vars).map_err(|err| {
             note!("mesh: {err}");
@@ -4183,9 +4198,9 @@ fn run_multi(stages: Vec<Stage>, background: bool, last: u8, shell: &mut Shell) 
             // words a job listing echoes back.
             (vec![name], StageBody::Function(args))
         } else {
-            // A stage expands its own words, so a job builtin needs the same
-            // handle-preserving conversion here as it gets elsewhere.
-            let expanded = match job_builtin_words(&words, &shell.vars) {
+            // A stage expands its own words, so a builtin that reads typed
+            // arguments needs the same conversion here as it gets elsewhere.
+            let expanded = match typed_builtin_words(&words, &shell.vars) {
                 Some(words) => words,
                 None => expand::expand(words, &shell.vars).map_err(|err| {
                     note!("mesh: {err}");
@@ -4454,7 +4469,7 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         };
         return dispatch_function_call(&name, args, shell);
     }
-    if let Some(words) = job_builtin_words(&tokens, &shell.vars) {
+    if let Some(words) = typed_builtin_words(&tokens, &shell.vars) {
         return match words {
             Ok(words) => run_expanded(words, last, shell),
             Err(step) => step,
@@ -4468,6 +4483,86 @@ fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
         }
     };
     run_expanded(words, last, shell)
+}
+
+/// The words for a builtin whose arguments have to arrive **typed**, or `None`
+/// when this command is not one of them.
+///
+/// Every path that runs a command expands its own words, so they all go through
+/// here: `puts $xs`, `puts $xs > out` and `puts $xs | cat` have to render the list
+/// the same way, just as `kill $j` and `kill $j | cat` have to name the same job.
+fn typed_builtin_words(words: &[Word], vars: &Vars) -> Option<Result<Vec<String>, Step>> {
+    job_builtin_words(words, vars).or_else(|| output_builtin_words(words, vars))
+}
+
+/// `puts`/`print`'s words, with their arguments rendered from **values** rather
+/// than from text. `None` when this is neither of them.
+///
+/// The same shape as [`job_builtin_words`], and for a related reason: what the
+/// builtin needs is not what the argv boundary produces. That boundary refuses a
+/// list outright — an external command needs bytes and there is no canonical
+/// separator to choose — while `puts` is a builtin holding a real value, so it can
+/// answer, and `DESIGN.md` says newline is the answer for a list and `key: value`
+/// for a map.
+///
+/// A rendered collection becomes **one** word, never one word per element, since
+/// the builtin joins its words with a single space: `[a b c]` has to arrive as the
+/// single word `"a\nb\nc"` or the newlines would come back out as spaces.
+///
+/// Only a word that expands to something ordinary expansion *cannot* render takes
+/// the typed route — the same discipline [`job_builtin_words`] uses, and for the
+/// same reason. Value typing reads a bare literal as a number, so typing every
+/// word would make `puts 007` print `7`; DESIGN.md §"Literals" keeps integer
+/// parsing to value positions, and an argument word is not one.
+///
+/// `--help` survives: the word is still `--help`, which the auto-help check ahead
+/// of dispatch reads the same way it always did.
+fn output_builtin_words(words: &[Word], vars: &Vars) -> Option<Result<Vec<String>, Step>> {
+    let name = command_name(words, vars)?;
+    if !matches!(name.as_str(), "puts" | "print") {
+        return None;
+    }
+    let mut expanded = vec![name.clone()];
+    for word in words.iter().skip(1) {
+        match output_words(word, vars, &name) {
+            Ok(rendered) => expanded.extend(rendered),
+            Err(step) => return Some(Err(step)),
+        }
+    }
+    Some(Ok(expanded))
+}
+
+/// The word(s) one `puts`/`print` argument contributes.
+///
+/// A word whose values are all plain scalars keeps exactly the text ordinary
+/// expansion gives it, so a glob still contributes one word per match and a bare
+/// `007` still prints as written. Anything else — a list, a map, a value with no
+/// byte form at all — is rendered per `DESIGN.md` §"I/O".
+fn output_words(word: &Word, vars: &Vars, name: &str) -> Result<Vec<String>, Step> {
+    let scalar = |value: &Value| {
+        matches!(
+            value,
+            Value::String(_) | Value::Integer(_) | Value::Boolean(_)
+        )
+    };
+    match expand::expand_values(vec![word.clone()], vars) {
+        Ok(values) if !values.iter().all(scalar) => values
+            .iter()
+            .map(|value| {
+                builtins::rendered_for_output(value).map_err(|message| {
+                    note!("mesh: {name}: {message}");
+                    Step::Continue(1)
+                })
+            })
+            .collect(),
+        // Either every value was a scalar, or the value pass failed; ordinary
+        // expansion renders the first and reports the second in the terms the
+        // rest of the shell uses.
+        _ => expand::expand(vec![word.clone()], vars).map_err(|err| {
+            note!("mesh: {err}");
+            Step::Continue(1)
+        }),
+    }
 }
 
 /// A job builtin's words, with any **handle** argument turned into the `%id`
