@@ -1555,6 +1555,76 @@ fn capturing_a_glob_family_call_records_its_value() {
 }
 
 #[test]
+fn a_dot_led_pattern_finds_the_dotfiles_and_not_the_directory_itself() {
+    // The other half of the rule `glob_star_excludes_dotfiles` pins: a wildcard
+    // never matches a leading dot, but a literal `.` in the pattern does. `.` and
+    // `..` are excluded whatever the pattern — they are the directory's own
+    // entries, never what a loop over `.*` is after.
+    let dir = fresh_dir("glob_dotfiles");
+    std::fs::write(dir.join("visible.txt"), "").unwrap();
+    std::fs::write(dir.join(".hidden"), "").unwrap();
+    std::fs::write(dir.join(".config"), "").unwrap();
+    let out = run_with_input(&format!(
+        "cd {}\nputs .*\nputs .h*\nputs .[hc]*\nputs ./.*\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        ".config .hidden\n.hidden\n.config .hidden\n.config .hidden\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_dot_led_pattern_finds_dotfiles_in_a_named_directory() {
+    // The same rule one component in, where `.` and `..` are spelled `sub/.` and
+    // `sub/..` — a form `Path` normalizes away, so the exclusion cannot lean on it.
+    let dir = fresh_dir("glob_dotfiles_sub");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub/.innerdot"), "").unwrap();
+    std::fs::write(dir.join("sub/inner.txt"), "").unwrap();
+    let out = run_with_input(&format!("cd {}\nputs sub/.*\nputs sub/*\n", dir.display()));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "sub/.innerdot\nsub/inner.txt\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_relative_path_word_parses_in_value_position() {
+    // `.` and `..` lex as their own tokens, so a value slot has to stitch the run
+    // back into the one word it looks like — `puts ./x` always worked while
+    // `x = ./x` was a syntax error.
+    let dir = fresh_dir("dot_value");
+    std::fs::write(dir.join("a.ext"), "").unwrap();
+    std::fs::write(dir.join(".hidden"), "").unwrap();
+    let out = run_with_input(&format!(
+        "cd {}\nx = ./a.ext\nputs $x\nfor f in ./* {{ puts $f }}\nd = .\nputs $d\nputs ../{}\nu = ../{}\nputs $u\ny = .*\nputs $y\n",
+        dir.display(),
+        dir.file_name().unwrap().to_string_lossy(),
+        dir.file_name().unwrap().to_string_lossy(),
+    ));
+    let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("./a.ext\na.ext\n.\n../{name}\n../{name}\n.hidden\n")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_range_still_wins_the_spellings_it_owns() {
+    // The `../x` reading keys off the attached `/`, which no operand can start
+    // with, so every range spelling is untouched.
+    let out = run_with_input("puts (1..3)\nputs (..3)\nxs = [9 8 7]\nputs $xs[1..]\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1\n2\n0\n1\n2\n8\n7\n"
+    );
+}
+
+#[test]
 fn tilde_preserves_home_bytes_including_trailing_slash() {
     // With a trailing slash in $HOME, `~/child` keeps the bytes verbatim
     // (`.../child` with the double slash), not a normalized single slash.
