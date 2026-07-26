@@ -10756,6 +10756,7 @@ mod tests {
                         text: word.to_owned(),
                         quote: parser::QuoteMode::Bare,
                     }],
+                    qualifiers: None,
                 })
                 .collect()
         };

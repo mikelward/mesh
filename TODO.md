@@ -1676,15 +1676,25 @@ reasoning, and the open ones are at the bottom.
       the path being tested rather than caller-scope names. The qualifier parser
       is where they attach — `Parser::qualifier` — and `expand::qualifies` is
       where they would be evaluated.
-- [ ] **The `glob()` family and the `:files` shorthand.** `glob("*")`,
-      `files(DIR=.)`, `dirs(DIR=.)` and the terse `*:f` / `*:files` / `$paths:files`
-      modifier are all specced in `DESIGN.md` §"Globbing" and none exists —
-      `files()` reports `a command has no return value`, and `*:f` is read as a
-      word and globs to nothing. The type filtering they need now exists in
-      `expand::qualifies`, so these are wrappers over machinery that is in place
-      rather than new capability. `DESIGN.md` wants `**:files` *fused* into the
-      match so a recursive walk never materializes non-files, which the current
-      match-then-filter shape does not do.
+- [ ] **Fuse `**:files` into the match rather than filtering after it.**
+      `glob()` / `files()` / `dirs()` and the `:files` / `:dirs` modifiers landed
+      separately, and the qualifiers here are a third path to the same question,
+      each filtering paths the walk has already produced. `DESIGN.md` §"Globbing"
+      wants the type filter *fused* into matching so `**:files` never materializes
+      the non-files, which none of the three does. Worth folding the three type
+      filters (`expand::qualifies`, `matches_file_filter`, `directory_entries`)
+      into one while doing it.
+- [ ] **Make `GRAMMAR.md` the current grammar.** Its header says it is a
+      task-by-task record of the pre-M3 language and "**not** the current
+      execution grammar", pointing at `PARSER.md` for the parser and
+      `docs/REFERENCE.md` for the user-facing surface. That leaves a file named
+      after the grammar that nobody should read for the grammar, and it catches
+      people out — two changes in this area have now documented current behavior
+      into it by mistake. Either rewrite it as the M3 grammar it is named for,
+      folding in what `PARSER.md` and the reference already state, or retire it to
+      `docs/history/` so the name stops promising something it does not deliver.
+      Rewriting is the better end state: a single EBNF for the implemented
+      language is the thing neither of the other two documents provides.
 - [ ] **A glob inside a list literal nests instead of contributing elements.**
       `GRAMMAR.md` says each scalar element uses the word-expansion rules, "so a
       glob can contribute zero or more elements", but `xs = [*.txt]` is a list of
