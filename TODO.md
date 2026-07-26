@@ -566,6 +566,32 @@ that could change a command's status would be worse than a missing decoration.
       is Emacs-only today.
 - [ ] **Synchronized output** (DEC 2026) — belongs around reedline's repaint
       rather than in mesh.
+- [ ] **Input arriving in the same burst as a submission is dropped, not queued.**
+      Two command lines written to the terminal together run only the first; the
+      rest of the burst is discarded rather than left for the next prompt.
+      Measured boundary: with no gap between the two writes the second line never
+      runs, and with a 10ms gap it always does, so this is about bytes already in
+      the buffer when the `Enter` is processed — not about how long the first
+      command takes. It predates the bracketed-paste work (the pre-`OSC 7`
+      binary drops it identically) and reproduces with builtins alone, so no
+      child and no terminal handoff are involved.
+      Bracketed paste covers the common case, since a paste from a terminal that
+      supports it arrives wrapped and becomes one buffer to edit; what is left
+      exposed is a paste from a terminal without it and anything feeding mesh a
+      scripted burst.
+      Ruled out so far: mesh never flushes terminal input (the foreground
+      handoff at `exec.rs:1598` restores modes with `TCSADRAIN`, which does not
+      discard), and crossterm's filtered read — the `ESC[6n` cursor-position
+      wait, the obvious suspect for eating queued keys — puts every skipped
+      event back. What is left is reedline's batch loop, which stops collecting
+      at the `Enter` (`engine.rs:943`) and hands the batch off; where the bytes
+      after it go needs instrumenting to say, and the fix may belong upstream.
+      What it is *not*: input typed while a command runs survives and runs at the
+      next prompt, which is the case that would matter most — as long as that
+      command does not read the terminal itself. One that does (`cat`, a REPL)
+      consumes what is typed at it, which is the foreground process group owning
+      the terminal working correctly and is not this bug; a regression test for
+      this has to use a command that leaves stdin alone.
 
 ## Loose ends
 
