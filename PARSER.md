@@ -19,8 +19,8 @@ bodies are lexical input, not grammar punctuation.
 ## Lexical contract
 
 The lexer emits tokens with byte spans. Longest match wins for punctuation:
-`...`, `<<<`, `..=`, `..`, `<<`, `>>`, `&&`, and `||` are each one token. Redirections are
-tokens even without surrounding whitespace. Value operators require surrounding
+`...`, `<<<`, `..=`, `..`, `<<`, `>>`, `&&`, `||`, and `=>` are each one token.
+Redirections are tokens even without surrounding whitespace. Value operators require surrounding
 whitespace when the design calls for it; word operators such as `and`, `or`, and
 `in` also require word boundaries. The token stream retains whitespace boundaries
 so the parser can distinguish an operator from punctuation inside a bare word.
@@ -99,9 +99,11 @@ conditional-assignment
                 = binding "=" value-expression ;
 for-expression  = "for" pattern "in" value-expression block ;
 match-expression
-                = "match" value-expression "{" match-arm* "}" ;
-match-arm       = match-pattern ("|" match-pattern)* match-guard? block
-                  terminator* ;
+                = "match" value-expression "{" terminator* match-arms? terminator*
+                  "}" ;
+match-arms      = match-arm (terminator+ match-arm)* ;
+match-arm       = match-pattern ("|" match-pattern)* match-guard? "=>" match-body ;
+match-body      = value-expression | block ;
 match-guard     = "if" value-expression ;
 match-pattern   = "_" | list-pattern | value-pattern ;
 value-pattern   = value-expression | "*" ;
