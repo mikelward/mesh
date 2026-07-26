@@ -7371,7 +7371,7 @@ impl MeshPrompt {
             self.custom
                 .as_deref()
                 .unwrap_or(if self.failed { "mesh! " } else { "mesh$ " });
-        let width = sgr_stripped_width(prompt.rsplit('\n').next().unwrap_or_default());
+        let width = escape_stripped_width(prompt.rsplit('\n').next().unwrap_or_default());
 
         if width == 0 {
             String::new()
@@ -7381,35 +7381,91 @@ impl MeshPrompt {
     }
 }
 
-fn sgr_stripped_width(text: &str) -> usize {
+/// The printed width of `text`, with the escape sequences that draw nothing
+/// discounted — the number of columns the continuation dots have to fill.
+///
+/// Two kinds of sequence reach a prompt, and neither is glyphs:
+///
+/// **CSI** (`ESC [ … final`), which is what styling emits. Every final byte is
+/// skipped, not only SGR's `m`: a clear-to-end-of-line or a cursor save in a
+/// prompt draws nothing either, and counting `ESC [ K` as three columns is worse
+/// than treating a cursor movement as zero.
+///
+/// **OSC** (`ESC ] … BEL` or `… ST`), which is a prompt that sets the window
+/// title — the classic `PS1` idiom, and what mesh users hand-roll until
+/// `DESIGN.md`'s title item lands. Counting the payload is how a two-glyph prompt
+/// grows a forty-dot continuation line.
+///
+/// An unterminated sequence keeps counting from the byte after the `ESC`, which is
+/// what the previous SGR-only version did with anything it did not recognize.
+/// Nothing better is available: where the sequence was meant to end is exactly
+/// what is missing.
+///
+/// Cursor motion is *not* modeled: `ESC [ 2 C` advances the cursor two columns and
+/// this counts it as none. Deliberate, because the number has to agree with the
+/// line editor rather than with the terminal — reedline lays the line out with
+/// `strip_ansi_escapes::strip(line).width()`, which is zero for every sequence
+/// including that one, so dots measured against the real cursor would be aligned
+/// to a column reedline does not believe the prompt ends at. The SGR-only rule was
+/// wrong here too, by four columns rather than two, in the other direction.
+/// Accounting for motion properly — `ESC [ G`, save and restore, what happens at
+/// the right margin — is emulating a terminal.
+fn escape_stripped_width(text: &str) -> usize {
     let bytes = text.as_bytes();
     let mut width = 0;
     let mut visible_start = 0;
     let mut index = 0;
 
     while index + 1 < bytes.len() {
-        if bytes[index] != b'\x1b' || bytes[index + 1] != b'[' {
+        if bytes[index] != b'\x1b' {
             index += 1;
             continue;
         }
-
-        let mut end = index + 2;
-        while end < bytes.len() && (0x30..=0x3f).contains(&bytes[end]) {
-            end += 1;
-        }
-        while end < bytes.len() && (0x20..=0x2f).contains(&bytes[end]) {
-            end += 1;
-        }
-        if end < bytes.len() && bytes[end] == b'm' {
+        // `ESC` and the introducer are ASCII, and every `end` lands just past an
+        // ASCII byte, so both slice ends are always char boundaries.
+        let end = match bytes[index + 1] {
+            b'[' => control_sequence_end(bytes, index + 2),
+            b']' => operating_system_command_end(bytes, index + 2),
+            _ => None,
+        };
+        if let Some(end) = end {
             width += text[visible_start..index].width();
-            visible_start = end + 1;
-            index = end + 1;
+            visible_start = end;
+            index = end;
         } else {
             index += 1;
         }
     }
 
     width + text[visible_start..].width()
+}
+
+/// One past the end of the CSI sequence whose parameters start at `start`, or
+/// `None` when it is unterminated: parameter and intermediate bytes, then a final
+/// byte in `0x40..=0x7e`.
+fn control_sequence_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    while index < bytes.len() && (0x20..=0x3f).contains(&bytes[index]) {
+        index += 1;
+    }
+    let final_byte = *bytes.get(index)?;
+    (0x40..=0x7e).contains(&final_byte).then_some(index + 1)
+}
+
+/// One past the end of the OSC whose payload starts at `start`, or `None` when it
+/// is unterminated. Both terminators are accepted — `BEL` is what a hand-written
+/// prompt uses and `ST` is what mesh's own sequences use — so a prompt carrying
+/// either measures the same.
+fn operating_system_command_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            0x07 => return Some(index + 1),
+            0x1b if bytes.get(index + 1) == Some(&b'\\') => return Some(index + 2),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 impl Prompt for MeshPrompt {
@@ -7459,10 +7515,10 @@ mod tests {
         ArgumentRecall, CompletionState, HeredocGate, Invocation, MeshPrompt, PromptEvent,
         PromptHook, Shell, StartupOptions, Step, TimestampedHistory, argument_completions,
         body_awaits_close, command_position, command_segment_words, command_words,
-        completed_command, cwd_url, eval_binary, expand_history_designators, expansion_word,
-        func_definition_is_open, handle_signal, help_completions, history_designators,
-        history_path_from, input_highlighter, interactive_keybindings, interruptible_task,
-        last_argument, needs_more_input, open_history, path_completions_sync,
+        completed_command, cwd_url, escape_stripped_width, eval_binary, expand_history_designators,
+        expansion_word, func_definition_is_open, handle_signal, help_completions,
+        history_designators, history_path_from, input_highlighter, interactive_keybindings,
+        interruptible_task, last_argument, needs_more_input, open_history, path_completions_sync,
         persist_logical_history, prepare_history_path, run_line, run_prompt_hooks, run_source,
         variable_completions,
     };
@@ -8676,6 +8732,97 @@ mod tests {
             ""
         );
         assert_eq!(styling_only_prompt.render_prompt_multiline_indicator(), "");
+
+        // A prompt that sets the window title on its way past — the `PS1` idiom,
+        // and what mesh users reach for until the title item in `DESIGN.md`
+        // lands. The dots answer for `λ> `, not for the title.
+        let titling_prompt = MeshPrompt {
+            failed: false,
+            continuation: true,
+            custom: Some("\x1b]0;mesh\x07λ> ".into()),
+        };
+
+        assert_eq!(
+            titling_prompt.render_prompt_indicator(PromptEditMode::Default),
+            ".. "
+        );
+        assert_eq!(titling_prompt.render_prompt_multiline_indicator(), ".. ");
+    }
+
+    #[test]
+    fn a_titling_prompt_measures_the_same_through_the_input_path() {
+        // The unit tests above hand `escape_stripped_width` bytes directly. This
+        // one goes through what a user actually types, because the two are not the
+        // same reach: mesh's escape set is explicit and `\a` is not in it, so
+        // `prompt "\e]0;mesh\a x> "` — the spelling every other shell's `PS1`
+        // uses — is a syntax error before the width scan is ever consulted.
+        // Raised in review on #238.
+        //
+        // The two spellings mesh does have for a terminator, `ST` (`\e\\`, what
+        // mesh's own OSC 7 and OSC 133 sequences use) and `BEL` (`\u{7}`, what the
+        // scan accepts for compatibility), both reach it and both measure `x> `.
+        for prompt_command in [
+            r#"prompt "\e]0;mesh\e\\x> ""#,
+            r#"prompt "\e]0;mesh\u{7}x> ""#,
+        ] {
+            let mut shell = Shell::new();
+            assert_eq!(
+                run_line(prompt_command, 0, false, &mut shell),
+                Step::Continue(0),
+                "{prompt_command} did not run"
+            );
+            let prompt = MeshPrompt {
+                failed: false,
+                continuation: true,
+                custom: shell.prompt.text.clone(),
+            };
+            assert_eq!(
+                prompt.render_prompt_indicator(PromptEditMode::Default),
+                ".. ",
+                "{prompt_command} measured its title"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_width_discounts_an_osc_sequence() {
+        // Either terminator: `BEL` is what a hand-written prompt uses, `ST` what
+        // mesh's own sequences use, and a prompt carrying either measures the same.
+        assert_eq!(escape_stripped_width("\x1b]0;title\x07mesh$ "), 6);
+        assert_eq!(escape_stripped_width("\x1b]0;title\x1b\\mesh$ "), 6);
+        // A payload holding what would otherwise end a *CSI* is still payload.
+        assert_eq!(escape_stripped_width("\x1b]2;a;b[0m\x07>"), 1);
+        // And an OSC on its own leaves nothing to fill, rather than 9 columns of it.
+        assert_eq!(escape_stripped_width("\x1b]0;title\x07"), 0);
+    }
+
+    #[test]
+    fn prompt_width_discounts_a_csi_that_is_not_styling() {
+        // The old rule accepted only SGR's `m`, so each of these was counted as
+        // visible: a clear, a cursor hide, a cursor save, a cursor movement.
+        assert_eq!(escape_stripped_width("\x1b[Kmesh$ "), 6);
+        assert_eq!(escape_stripped_width("\x1b[?25lmesh$ "), 6);
+        assert_eq!(escape_stripped_width("\x1b[smesh$ \x1b[u"), 6);
+        // A cursor movement counts as nothing, not as the columns it moves —
+        // raised in review on #238. This agrees with how reedline measures the
+        // same line for layout; see the note on `escape_stripped_width`.
+        assert_eq!(escape_stripped_width("\x1b[2Cmesh$ "), 6);
+        // Styling itself is unchanged, including a multi-parameter form.
+        assert_eq!(escape_stripped_width("\x1b[1;31mmesh$ \x1b[0m"), 6);
+    }
+
+    #[test]
+    fn prompt_width_measures_what_is_left_after_the_escapes() {
+        // Wide and combining characters still go through the width table rather
+        // than being counted per byte or per `char`.
+        assert_eq!(escape_stripped_width("\x1b[32m日本\x1b[0m> "), 6);
+        // An unterminated sequence keeps its bytes, `ESC` included — where it was
+        // meant to end is exactly what is missing, so there is nothing better to do
+        // than count on, which is what the SGR-only version did too.
+        assert_eq!(escape_stripped_width("\x1b]0;title"), 9);
+        assert_eq!(escape_stripped_width("\x1b[1;31"), 6);
+        assert_eq!(escape_stripped_width("mesh$ "), 6);
+        assert_eq!(escape_stripped_width(""), 0);
     }
 
     #[test]
