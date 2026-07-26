@@ -935,29 +935,49 @@ of each PR had landed by another route, but these pieces had not.
       would cost `puts $(pwd) | cat`. A mutating call as an argument to a piped stage
       does reach the parent's globals, which the restructure below fixes.
 
-      The fix is for the *stage* to evaluate its own arguments, which needs
-      `exec::Cmd`'s words to stop being final at assembly time — they feed the job
-      listing and `exec::run` today. That also fixes the ordering item and unblocks
-      glued text, so the three want one change.
-- [ ] **A value argument is evaluated before any word is expanded, not in source
-      order.** Raised in review on the PR above. Value arguments run while the stage is
-      assembled in `run_ast_pipeline`, and the words are expanded later as a batch in
-      `run_command`, so a value argument that mutates shell state is observed by words
-      written *earlier* on the line:
+      The fix is for the *stage* to evaluate its own arguments. A `Stage` now carries
+      its words parsed all the way down and `repl::expand_stage` is the one place that
+      expands them (see the item below), so what is left is moving that call **past the
+      fork** — into `run_stage_in_shell`, which already runs in the child.
+
+      Two things in `exec.rs` hold it in the parent, and neither is incidental:
+
+      - `Program::new(&cmd.words)` is built before forking (`exec.rs:1491`), so a
+        "command not found" is the shell's report rather than a child's. A stage whose
+        argv is not known until the fork would have to `exec` from inside the child —
+        `in_shell` for every such stage, with the body ending in an exec.
+      - Redirect targets are resolved in the parent, **concurrently across stages**
+        (`exec.rs:1367`), which is what keeps `cat < fifo | cmd > fifo` from
+        deadlocking. So a value in a *target* (`> "o$(n).txt"`) stays the parent's
+        either way, and backgrounding one stays refused.
+- [x] **A value in a word is evaluated when that word is expanded.** Raised in review
+      on the PR above. Value arguments used to run while the stage was assembled in
+      `run_ast_pipeline`, with the words expanded later as a batch, so a value that
+      mutated shell state was observed by words written *earlier* on the line:
 
       ```
       cmd = /bin/echo
       func g() { global cmd = /bin/false; return x }
-      $cmd g()            # runs /bin/false, not the /bin/echo that was selected first
+      $cmd g()            # ran /bin/false, not the /bin/echo that was selected first
       ```
 
-      Narrow to trigger — it needs a call in an argument that reassigns a `global` a
-      preceding word reads — but it is the wrong answer, and `capture_command`
-      evaluates its arguments in order, so the two paths disagree. Fixing it properly
-      means interleaving evaluation with expansion, which today cannot happen: the
-      expander takes `&Vars` while a value argument needs `&mut Shell`. Expanding the
-      earlier words eagerly instead would strip the typed path that lets `puts f()`
-      render a list per line, so it is not a shortcut. Deferred rather than half-done.
+      A `Stage` now carries its words **parsed**, and `repl::expand_stage` walks them
+      one at a time — evaluating each word's values as it reaches that word, then
+      expanding it — so `puts $n g() $n` reads `first x second`. Word zero is expanded
+      once and first, since it decides how every other word expands and a value in it
+      (`"$(pick)" arg`) must not run again for each question asked.
+
+      A value argument became a *word* with a value piece in it on the way, which is
+      what let one code path replace three: `expand_stage` is now the single expansion
+      for `run_command`, `run_single` and `run_multi`, and the whole-command
+      `typed_builtin_words` / `output_builtin_words` / `job_builtin_words` collapsed
+      into the per-word `stage_argument`.
+
+      Redirect targets follow the same rule one level down: they stay parsed too, and
+      `expand_redirs` evaluates each as it reaches it — after **all** the words, which
+      is what keeps `f * > summary` from globbing the file the redirection is about to
+      create. Evaluated at assembly time they ran *before* every word, so
+      `puts $n > "$(g)"` wrote what `g` had just assigned.
 - [ ] **`$( … )` around a value-producing statement fails with the value as a status.**
       Pre-existing, and surfaced by review on the value-argument PR. The capture reads
       the inner statement's status, and an expression statement's status is derived from

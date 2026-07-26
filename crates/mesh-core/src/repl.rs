@@ -1146,18 +1146,15 @@ fn run_executable(
             if runs_as_command(expression)
                 && let parser::Expr::Scalar(word) = expression
             {
-                let word = match expansion_word(&word.value, last, in_function, shell) {
-                    Ok(word) => word,
-                    Err(step) => return step,
-                };
                 return run_pipeline(
                     vec![Stage {
-                        words: vec![word],
+                        words: vec![word.value.clone()],
                         redirs: Vec::new(),
                         pipe_stderr: false,
                     }],
                     background,
                     last,
+                    in_function,
                     shell,
                 );
             }
@@ -1772,7 +1769,9 @@ fn commit_bindings(bindings: Vec<(String, Value)>, vars: &mut Vars) {
 }
 
 struct Stage {
-    words: Vec<Word>,
+    /// The stage's words, still **parsed**: a value in one is evaluated by the
+    /// code that expands that word, in word order — see [`expand_stage`].
+    words: Vec<parser::Word>,
     redirs: Vec<Redir>,
     pipe_stderr: bool,
 }
@@ -1784,7 +1783,9 @@ struct Redir {
     /// What [`Redir::target`] names — the four readings are mutually exclusive,
     /// so they are one choice rather than a set of flags to keep consistent.
     means: Means,
-    target: Word,
+    /// Still **parsed**, like a stage's words: a value in a target is evaluated by
+    /// [`expand_redirs`], which runs after every word of the command.
+    target: parser::Word,
 }
 
 /// What a redirection's target word names once expanded.
@@ -1848,51 +1849,26 @@ fn run_ast_pipeline(
         let mut redirs = Vec::new();
         for item in &command.items {
             match item {
-                parser::CommandItem::Word(word) => {
-                    match expansion_word(&word.value, last, in_function, shell) {
-                        Ok(word) => words.push(word),
-                        Err(step) => return step,
-                    }
-                }
-                // A value argument is evaluated **here**, where the shell is: a
-                // `$(…)` launches a command and a call runs a function, neither of
-                // which the expander can do. The result rides into expansion as a
-                // literal piece, exactly as an interpolated variable does.
-                //
-                // In argument order, so `f (a()) (b())` runs `a` before `b`, and
-                // before the redirect targets are opened — the order every other
-                // argument already follows.
-                parser::CommandItem::Value(expression) => {
-                    // Through `eval_operand_of`, which puts `shell.result` /
-                    // `shell.produced` back: an argument is an *operand*, so whatever it
-                    // produced along the way must not be left standing as the enclosing
-                    // command's result. The same treatment `eval_call` gives a callee and
-                    // an assignment gives its right-hand side.
-                    //
-                    // `in_function` is the caller's, so a `return` inside an argument
-                    // belongs to the enclosing function rather than reporting "not
-                    // inside a function" and carrying on.
-                    match eval_operand_of(&expression.value, last, in_function, shell) {
-                        Ok(value) if shell.control.is_some() => {
-                            // Control flow is unwinding (a `return`/`break` inside the
-                            // argument); the statement layer acts on `shell.control`.
-                            let _ = value;
-                            return Step::Continue(last);
-                        }
-                        Ok(value) => words.push(Word(vec![Piece::Value(value)])),
-                        Err(step) => return step,
-                    }
-                }
+                parser::CommandItem::Word(word) => words.push(word.value.clone()),
+                // A value argument **is** a word with a value in it, so it becomes
+                // one: `puts (1 + 2)` and `puts "$(pwd)"` then travel as the same
+                // thing and expand by the same rule. Evaluating it is the job of
+                // whoever expands that word, which is what puts it in word order —
+                // a call in one argument cannot change what an earlier word read.
+                parser::CommandItem::Value(expression) => words.push(parser::Word {
+                    pieces: vec![parser::WordPiece::Value(Box::new(expression.clone()))],
+                }),
                 parser::CommandItem::Redirect {
                     kind,
                     fd,
                     target,
                     body,
                 } => {
-                    let target = match expansion_word(&target.value, last, in_function, shell) {
-                        Ok(target) => target,
-                        Err(step) => return step,
-                    };
+                    // Still parsed, like a command word: a value in a target is
+                    // evaluated by `expand_redirs`, which runs after every word — so
+                    // `puts $n > "$(g)"` reads the `$n` the reader sees, and
+                    // `f * > summary` cannot glob the file it is about to create.
+                    let target = target.value.clone();
                     match kind {
                         // `&> file` is defined as `> file 2>&1`, so desugar it
                         // into exactly that pair rather than carrying a third
@@ -1962,7 +1938,7 @@ fn run_ast_pipeline(
             pipe_stderr: node.pipe_stderr.get(index).copied().unwrap_or(false),
         });
     }
-    run_pipeline(stages, background, last, shell)
+    run_pipeline(stages, background, last, in_function, shell)
 }
 
 /// Adapt a parser word at the expansion boundary without recreating source text.
@@ -4387,11 +4363,17 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
 /// Run one pipeline. A single stage keeps the full command surface (assignments,
 /// builtins, functions). A multi-stage pipeline (`|`) is external commands only
 /// for now.
-fn run_pipeline(mut stages: Vec<Stage>, background: bool, last: u8, shell: &mut Shell) -> Step {
+fn run_pipeline(
+    mut stages: Vec<Stage>,
+    background: bool,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
     if stages.len() == 1 {
-        run_single(stages.pop().unwrap(), background, last, shell)
+        run_single(stages.pop().unwrap(), background, last, in_function, shell)
     } else {
-        run_multi(stages, background, last, shell)
+        run_multi(stages, background, last, in_function, shell)
     }
 }
 
@@ -4401,60 +4383,20 @@ fn run_pipeline(mut stages: Vec<Stage>, background: bool, last: u8, shell: &mut 
 /// applied to its own descriptors around the call, since there is no child to
 /// configure. Backgrounding needs a child, so it goes through the pipeline path,
 /// which forks the stage.
-fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> Step {
+fn run_single(
+    stage: Stage,
+    background: bool,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
     let Stage {
         words,
         redirs,
         pipe_stderr: _,
     } = stage;
     if redirs.is_empty() && !background {
-        return run_command(words, last, shell);
-    }
-    // A function takes typed arguments in every position, so it is resolved before
-    // the external argv rule turns a bare list into an error. Foreground: the
-    // redirection applies to the shell's own descriptors around the in-process
-    // call, since there is no child to configure. Background: there *is* a child —
-    // the fork the pipeline path makes.
-    if let Some(name) = command_name(&words, &shell.vars)
-        && shell.funcs.get(&name).is_some()
-    {
-        // Expand the arguments *before* the targets are opened: `f * > summary`
-        // must not see the `summary` the redirection is about to create. (The
-        // external path likewise builds its argv before opening.)
-        let arg_words: Vec<Word> = words.into_iter().skip(1).collect();
-        let args = match expand_function_args(arg_words, &shell.vars) {
-            Ok(args) => args,
-            Err(step) => return step,
-        };
-        let opened = match expand_redirs(redirs, &shell.vars) {
-            Ok(redirs) => redirs,
-            Err(err) => {
-                note!("mesh: {err}");
-                return Step::Continue(1);
-            }
-        };
-        if background {
-            return Step::Continue(run_stages(
-                vec![exec::Cmd {
-                    words: vec![name],
-                    redirs: opened,
-                    pipe_stderr: false,
-                    in_shell: true,
-                }],
-                vec![StageBody::Function(args)],
-                background,
-                last,
-                shell,
-            ));
-        }
-        return match exec::with_redirections(&opened, || dispatch_function_call(&name, args, shell))
-        {
-            Ok(step) => step,
-            Err((path, err)) => {
-                note!("mesh: {path}: {err}");
-                Step::Continue(1)
-            }
-        };
+        return run_command(&words, last, in_function, shell);
     }
     // A builtin that reads typed arguments keeps them here too, so a handle or a
     // list reaches it through a redirection exactly as it does without one. Styling
@@ -4466,15 +4408,44 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
     } else {
         stdout_decoration()
     };
-    let expanded = match typed_builtin_words(&words, &shell.vars, decoration) {
-        Some(words) => words,
-        None => expand::expand(words, &shell.vars).map_err(|err| {
-            note!("mesh: {err}");
-            Step::Continue(1)
-        }),
-    };
-    let argv = match expanded {
-        Ok(argv) => argv,
+    // The words expand *before* the targets are opened: `f * > summary` must not
+    // see the `summary` the redirection is about to create.
+    let argv = match expand_stage(&words, decoration, last, in_function, shell) {
+        // A function is resolved by the expansion, since it takes typed arguments in
+        // every position. Foreground: the redirection applies to the shell's own
+        // descriptors around the in-process call, since there is no child to
+        // configure. Background: there *is* a child — the fork the pipeline path
+        // makes.
+        Ok(Expanded::Function { name, args }) => {
+            let opened = match expand_redirs(redirs, last, in_function, shell) {
+                Ok(redirs) => redirs,
+                Err(step) => return step,
+            };
+            if background {
+                return Step::Continue(run_stages(
+                    vec![exec::Cmd {
+                        words: vec![name],
+                        redirs: opened,
+                        pipe_stderr: false,
+                        in_shell: true,
+                    }],
+                    vec![StageBody::Function(args)],
+                    background,
+                    last,
+                    shell,
+                ));
+            }
+            return match exec::with_redirections(&opened, || {
+                dispatch_function_call(&name, args, shell)
+            }) {
+                Ok(step) => step,
+                Err((path, err)) => {
+                    note!("mesh: {path}: {err}");
+                    Step::Continue(1)
+                }
+            };
+        }
+        Ok(Expanded::Argv(argv)) => argv,
         Err(step) => return step,
     };
     if argv.is_empty() {
@@ -4492,12 +4463,9 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
     // targets apply to the shell's own descriptors around the call, so there is
     // nothing to configure on a child.
     let builtin = builtins::is_builtin(&argv[0]);
-    let opened = match expand_redirs(redirs, &shell.vars) {
+    let opened = match expand_redirs(redirs, last, in_function, shell) {
         Ok(redirs) => redirs,
-        Err(err) => {
-            note!("mesh: {err}");
-            return Step::Continue(1);
-        }
+        Err(step) => return step,
     };
     if builtin && !background {
         return match exec::with_redirections(&opened, || run_expanded(argv, last, shell)) {
@@ -4532,7 +4500,13 @@ fn run_single(stage: Stage, background: bool, last: u8, shell: &mut Shell) -> St
 /// Run a multi-stage pipeline (`a | b | c`). Each stage is an external command, a
 /// builtin, or a function; the in-shell ones run in a forked stage so all the
 /// stages run concurrently.
-fn run_multi(stages: Vec<Stage>, background: bool, last: u8, shell: &mut Shell) -> Step {
+fn run_multi(
+    stages: Vec<Stage>,
+    background: bool,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
     let mut cmds = Vec::with_capacity(stages.len());
     let mut bodies = Vec::with_capacity(stages.len());
     let count = stages.len();
@@ -4553,60 +4527,35 @@ fn run_multi(stages: Vec<Stage>, background: bool, last: u8, shell: &mut Shell) 
         // uses, so a stage reports the same first failure the unpiped command
         // does — and `f * > summary` cannot glob the file the redirection is
         // about to create.
-        //
-        // Resolve a function *before* expanding for argv, exactly as
-        // `run_command` does, so a bare list argument reaches it as one typed
-        // value rather than meeting the external-command rule.
-        let function =
-            command_name(&words, &shell.vars).filter(|name| shell.funcs.get(name).is_some());
-        let (stage_words, body) = if let Some(name) = function {
-            let arg_words: Vec<Word> = words.into_iter().skip(1).collect();
-            let args = match expand_function_args(arg_words, &shell.vars) {
-                Ok(args) => args,
-                Err(step) => return step,
-            };
+        let (stage_words, body) = match expand_stage(&words, decoration, last, in_function, shell) {
             // The arguments are typed values, and mesh has no implicit
             // stringification for a list or map, so only the name goes into the
             // words a job listing echoes back.
-            (vec![name], StageBody::Function(args))
-        } else {
-            // A stage expands its own words, so a builtin that reads typed
-            // arguments needs the same conversion here as it gets elsewhere.
-            let expanded = match typed_builtin_words(&words, &shell.vars, decoration) {
-                Some(words) => words,
-                None => expand::expand(words, &shell.vars).map_err(|err| {
-                    note!("mesh: {err}");
-                    Step::Continue(1)
-                }),
-            };
-            let argv = match expanded {
-                Ok(argv) => argv,
-                Err(step) => return step,
-            };
-            if argv.is_empty() {
-                note!("mesh: empty command in a pipeline");
-                return Step::Continue(1);
+            Ok(Expanded::Function { name, args }) => (vec![name], StageBody::Function(args)),
+            Err(step) => return step,
+            Ok(Expanded::Argv(argv)) => {
+                if argv.is_empty() {
+                    note!("mesh: empty command in a pipeline");
+                    return Step::Continue(1);
+                }
+                // `return` unwinds the enclosing function; it has no meaning as a
+                // pipeline stage, so reject it rather than launch an external
+                // `return`.
+                if argv[0] == "return" {
+                    note!("mesh: return: cannot be used in a pipeline");
+                    return Step::Continue(2);
+                }
+                let body = if builtins::is_builtin(&argv[0]) {
+                    StageBody::Builtin
+                } else {
+                    StageBody::External
+                };
+                (argv, body)
             }
-            // `return` unwinds the enclosing function; it has no meaning as a
-            // pipeline stage, so reject it rather than launch an external
-            // `return`.
-            if argv[0] == "return" {
-                note!("mesh: return: cannot be used in a pipeline");
-                return Step::Continue(2);
-            }
-            let body = if builtins::is_builtin(&argv[0]) {
-                StageBody::Builtin
-            } else {
-                StageBody::External
-            };
-            (argv, body)
         };
-        let opened = match expand_redirs(redirs, &shell.vars) {
+        let opened = match expand_redirs(redirs, last, in_function, shell) {
             Ok(redirs) => redirs,
-            Err(err) => {
-                note!("mesh: {err}");
-                return Step::Continue(1);
-            }
+            Err(step) => return step,
         };
         cmds.push(exec::Cmd {
             words: stage_words,
@@ -4733,7 +4682,23 @@ fn redirects_stdout(redirs: &[Redir]) -> bool {
     })
 }
 
-fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirection>, String> {
+/// Expand each redirection target, evaluating any value in one on the way.
+///
+/// Called **after** every command word is expanded, which is the documented order:
+/// `f * > summary` must not glob the file the redirection is about to create, and a
+/// call in a target must not change what a word written before it reads.
+fn expand_redirs(
+    redirs: Vec<Redir>,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Vec<exec::Redirection>, Step> {
+    // Every "what is wrong with this target" answer is a message the caller used to
+    // report; reported here instead, so the caller has one thing to propagate.
+    let bad = |message: String| {
+        note!("mesh: {message}");
+        Step::Continue(1)
+    };
     let mut out = Vec::with_capacity(redirs.len());
     for redir in redirs {
         if let Means::Document(body) = redir.means {
@@ -4745,7 +4710,7 @@ fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirectio
             let text = if body.raw {
                 body.text
             } else {
-                interpolate_heredoc(&body.text, vars)?
+                interpolate_heredoc(&body.text, &shell.vars).map_err(bad)?
             };
             out.push(exec::Redirection {
                 fd: libc::STDIN_FILENO,
@@ -4754,12 +4719,16 @@ fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirectio
             });
             continue;
         }
-        let mut words = expand::expand(vec![redir.target], vars).map_err(|e| e.to_string())?;
+        // Each target in turn: a value in one is evaluated as that target is
+        // reached, the rule a command word already follows.
+        let target = expansion_word(&redir.target, last, in_function, shell)?;
+        let mut words =
+            expand::expand(vec![target], &shell.vars).map_err(|e| bad(e.to_string()))?;
         if words.len() != 1 {
-            return Err(format!(
+            return Err(bad(format!(
                 "ambiguous redirect: target expanded to {} words",
                 words.len()
-            ));
+            )));
         }
         let word = words.pop().unwrap();
         let target = match redir.means {
@@ -4770,10 +4739,12 @@ fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirectio
             Means::Descriptor => {
                 // `2>&1`: the target names a descriptor, so it must read as one.
                 let from = word.parse::<i32>().map_err(|_| {
-                    format!("`>&{word}`: the target of a duplication must be a descriptor")
+                    bad(format!(
+                        "`>&{word}`: the target of a duplication must be a descriptor"
+                    ))
                 })?;
                 if from < 0 {
-                    return Err(format!("`>&{from}`: a descriptor cannot be negative"));
+                    return Err(bad(format!("`>&{from}`: a descriptor cannot be negative")));
                 }
                 exec::RedirTarget::Descriptor(from)
             }
@@ -4799,27 +4770,123 @@ fn expand_redirs(redirs: Vec<Redir>, vars: &Vars) -> Result<Vec<exec::Redirectio
     Ok(out)
 }
 
-/// A single bare literal word, for a desugaring that needs one.
-fn one_word(text: &str) -> Word {
-    Word(vec![Piece::Text {
-        text: text.to_owned(),
-        expandable: false,
-    }])
+/// A single literal word, for a desugaring that needs one. Quoted, so the text a
+/// desugaring wrote is the text that arrives — never a glob, never a `~`.
+fn one_word(text: &str) -> parser::Word {
+    parser::Word {
+        pieces: vec![parser::WordPiece::Text {
+            text: text.to_owned(),
+            quote: parser::QuoteMode::Single,
+        }],
+    }
 }
 
 /// Run one command with no redirections: classify it as an assignment or a
 /// command and act. `last` is the previous status (the default for a bare `exit`
 /// or `return`).
-/// Expand a function call's argument words into typed values. Each is tagged with
-/// whether it came from a bare literal word, so an attached `--flag=value` types
-/// its value the same way the token would type positionally (see
-/// [`expand::expand_call_values`]).
+/// What a stage's words came to, once the command they name is known.
+enum Expanded {
+    /// An in-shell **function** and its typed arguments. Resolved here because a
+    /// function takes typed arguments in every position, so it has to be settled
+    /// before the external argv rule turns a bare list into an error
+    /// (`DESIGN.md` §"Arguments do not word-split").
+    Function {
+        name: String,
+        args: Vec<(Value, bool)>,
+    },
+    /// argv for a builtin or an external program.
+    Argv(Vec<String>),
+}
+
+/// Expand a stage's words into the form its command takes.
 ///
-/// Kept separate from [`dispatch_function_call`] because a redirected call must
-/// expand its arguments *before* the redirection targets are opened: creating or
-/// truncating a target must not change what a glob argument matches.
-fn expand_function_args(arg_words: Vec<Word>, vars: &Vars) -> Result<Vec<(Value, bool)>, Step> {
-    expand::expand_call_values(arg_words, vars).map_err(|err| {
+/// **One word at a time, in order**, because a word can carry a *value* — a
+/// `$(…)` that launches a command, a call that runs a function — and evaluating
+/// one can change what a later word reads. Doing it up front made the change
+/// visible to words written *earlier* on the line:
+///
+/// ```text
+/// cmd = /bin/echo
+/// func g() { global cmd = /bin/false; return x }
+/// $cmd g()            # ran /bin/false, not the /bin/echo that was selected first
+/// ```
+///
+/// Word zero is expanded once and first: it decides how every other word expands,
+/// and a value in it (`"$(pick)" arg`) must not run again for each question asked
+/// of it. Redirect targets are still expanded after **all** the words, which is
+/// the documented order — `f * > summary` must not glob the file the redirection
+/// is about to create.
+///
+/// `decoration` is the caller's answer to "which escapes does this command's own
+/// stdout take", which decides what a **styled** value emits. It has to be the
+/// caller's because words are expanded *before* a redirection is opened or a pipe
+/// is attached, so this function's own view of stdout is the shell's, not the
+/// command's.
+fn expand_stage(
+    words: &[parser::Word],
+    decoration: Decoration,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Expanded, Step> {
+    let Some((first, rest)) = words.split_first() else {
+        return Ok(Expanded::Argv(Vec::new()));
+    };
+    let head = expansion_word(first, last, in_function, shell)?;
+    let mut argv = expand::expand(vec![head], &shell.vars).map_err(|err| {
+        note!("mesh: {err}");
+        Step::Continue(1)
+    })?;
+    // A word that expanded to several (a glob) or to none names no command; those
+    // fall through to the plain argv rule, which reports what is wrong with them.
+    let name = (argv.len() == 1).then(|| argv[0].clone());
+    if let Some(name) = name.clone().filter(|name| shell.funcs.get(name).is_some()) {
+        let mut args = Vec::new();
+        for word in rest {
+            let word = expansion_word(word, last, in_function, shell)?;
+            args.extend(
+                expand::expand_call_values(vec![word], &shell.vars).map_err(|err| {
+                    note!("mesh: {err}");
+                    Step::Continue(1)
+                })?,
+            );
+        }
+        return Ok(Expanded::Function { name, args });
+    }
+    for word in rest {
+        let word = expansion_word(word, last, in_function, shell)?;
+        argv.extend(stage_argument(&word, name.as_deref(), decoration, shell)?);
+    }
+    Ok(Expanded::Argv(argv))
+}
+
+/// The argv entries one already-evaluated argument word contributes.
+///
+/// Most words take ordinary expansion. Two builtin families read **values**
+/// instead, because what they need is not what the argv boundary produces — and
+/// each does so per word, so a word with nothing special in it keeps exactly the
+/// text ordinary expansion gives it. Every path that runs a command comes through
+/// here, since they expand separately: `puts $xs`, `puts $xs > out` and
+/// `puts $xs | cat` have to render the list the same way, just as `kill $j` and
+/// `kill $j | cat` have to name the same job.
+fn stage_argument(
+    word: &Word,
+    name: Option<&str>,
+    decoration: Decoration,
+    shell: &Shell,
+) -> Result<Vec<String>, Step> {
+    match name {
+        Some(name @ ("fg" | "bg" | "wait" | "kill" | "disown")) => {
+            if let Some(references) = job_reference_word(word, &shell.vars, name)? {
+                return Ok(references);
+            }
+        }
+        Some(name @ ("puts" | "print")) => {
+            return output_words(word, &shell.vars, name, decoration);
+        }
+        _ => {}
+    }
+    expand::expand(vec![word.clone()], &shell.vars).map_err(|err| {
         note!("mesh: {err}");
         Step::Continue(1)
     })
@@ -4841,99 +4908,17 @@ fn dispatch_function_call(name: &str, args: Vec<(Value, bool)>, shell: &mut Shel
     call_func(name, args, true, shell)
 }
 
-fn run_command(tokens: Vec<Word>, last: u8, shell: &mut Shell) -> Step {
-    // Resolve an in-shell function *before* the external-argv rule turns a
-    // bare list argument into an error, so an unspread list reaches the
-    // function intact as one typed value (`DESIGN.md` §"Arguments do not
-    // word-split"). Functions can never share a name with a builtin or the
-    // `return`/job control words (definition rejects those), so resolving
-    // one here does not reorder the builtins → functions → external chain.
-    if let Some(name) = command_name(&tokens, &shell.vars)
-        && shell.funcs.get(&name).is_some()
-    {
-        let arg_words: Vec<Word> = tokens.into_iter().skip(1).collect();
-        let args = match expand_function_args(arg_words, &shell.vars) {
-            Ok(args) => args,
-            Err(step) => return step,
-        };
-        return dispatch_function_call(&name, args, shell);
-    }
+fn run_command(tokens: &[parser::Word], last: u8, in_function: bool, shell: &mut Shell) -> Step {
     // No redirection on this path, so the command's stdout is the shell's.
-    if let Some(words) = typed_builtin_words(&tokens, &shell.vars, stdout_decoration()) {
-        return match words {
-            Ok(words) => run_expanded(words, last, shell),
-            Err(step) => step,
-        };
+    //
+    // Functions can never share a name with a builtin or the `return`/job control
+    // words (definition rejects those), so resolving one in `expand_stage` does not
+    // reorder the builtins → functions → external chain.
+    match expand_stage(tokens, stdout_decoration(), last, in_function, shell) {
+        Ok(Expanded::Function { name, args }) => dispatch_function_call(&name, args, shell),
+        Ok(Expanded::Argv(words)) => run_expanded(words, last, shell),
+        Err(step) => step,
     }
-    let words = match expand::expand(tokens, &shell.vars) {
-        Ok(words) => words,
-        Err(err) => {
-            note!("mesh: {err}");
-            return Step::Continue(1);
-        }
-    };
-    run_expanded(words, last, shell)
-}
-
-/// The words for a builtin whose arguments have to arrive **typed**, or `None`
-/// when this command is not one of them.
-///
-/// Every path that runs a command expands its own words, so they all go through
-/// here: `puts $xs`, `puts $xs > out` and `puts $xs | cat` have to render the list
-/// the same way, just as `kill $j` and `kill $j | cat` have to name the same job.
-///
-/// `decoration` is each caller's answer to "which escapes does this command's own
-/// stdout take", which decides what a **styled** value emits. It has to be the
-/// caller's because words are rendered *before* a redirection is opened or a pipe is
-/// attached, so this function's own view of stdout is the shell's, not the
-/// command's.
-fn typed_builtin_words(
-    words: &[Word],
-    vars: &Vars,
-    decoration: Decoration,
-) -> Option<Result<Vec<String>, Step>> {
-    job_builtin_words(words, vars).or_else(|| output_builtin_words(words, vars, decoration))
-}
-
-/// `puts`/`print`'s words, with their arguments rendered from **values** rather
-/// than from text. `None` when this is neither of them.
-///
-/// The same shape as [`job_builtin_words`], and for a related reason: what the
-/// builtin needs is not what the argv boundary produces. That boundary refuses a
-/// list outright — an external command needs bytes and there is no canonical
-/// separator to choose — while `puts` is a builtin holding a real value, so it can
-/// answer, and `DESIGN.md` says newline is the answer for a list and `key: value`
-/// for a map.
-///
-/// A rendered collection becomes **one** word, never one word per element, since
-/// the builtin joins its words with a single space: `[a b c]` has to arrive as the
-/// single word `"a\nb\nc"` or the newlines would come back out as spaces.
-///
-/// Only a word that expands to something ordinary expansion *cannot* render takes
-/// the typed route — the same discipline [`job_builtin_words`] uses, and for the
-/// same reason. Value typing reads a bare literal as a number, so typing every
-/// word would make `puts 007` print `7`; DESIGN.md §"Literals" keeps integer
-/// parsing to value positions, and an argument word is not one.
-///
-/// `--help` survives: the word is still `--help`, which the auto-help check ahead
-/// of dispatch reads the same way it always did.
-fn output_builtin_words(
-    words: &[Word],
-    vars: &Vars,
-    decoration: Decoration,
-) -> Option<Result<Vec<String>, Step>> {
-    let name = command_name(words, vars)?;
-    if !matches!(name.as_str(), "puts" | "print") {
-        return None;
-    }
-    let mut expanded = vec![name.clone()];
-    for word in words.iter().skip(1) {
-        match output_words(word, vars, &name, decoration) {
-            Ok(rendered) => expanded.extend(rendered),
-            Err(step) => return Some(Err(step)),
-        }
-    }
-    Some(Ok(expanded))
 }
 
 /// The word(s) one `puts`/`print` argument contributes.
@@ -4977,42 +4962,14 @@ fn output_words(
     }
 }
 
-/// A job builtin's words, with any **handle** argument turned into the `%id`
-/// reference the builtin understands. `None` when this is not a job builtin.
-///
-/// Each argument is expanded on its own, and only a handle takes the typed
-/// route: everything else keeps exactly the text ordinary expansion produces.
-/// That distinction is load-bearing, because a job builtin's options are not
-/// just data. Expanding them as values types `-0` as the integer `0` and drops
-/// the sign along with it, which turns `kill -0 $pid` — ask whether it is
-/// alive — into `kill 0 $pid`, and pid 0 is *the caller's own process group*.
-///
-/// Shared by every path that runs a command, since they expand separately:
-/// `kill $j`, `kill $j 2>/dev/null` and `kill $j | cat` have to agree.
-fn job_builtin_words(words: &[Word], vars: &Vars) -> Option<Result<Vec<String>, Step>> {
-    let name = command_name(words, vars)?;
-    if !matches!(name.as_str(), "fg" | "bg" | "wait" | "kill" | "disown") {
-        return None;
-    }
-    let mut expanded = vec![name];
-    for word in words.iter().skip(1) {
-        match job_reference_word(word, vars, &expanded[0]) {
-            Ok(Some(references)) => expanded.extend(references),
-            Ok(None) => match expand::expand(vec![word.clone()], vars) {
-                Ok(strings) => expanded.extend(strings),
-                Err(err) => {
-                    note!("mesh: {err}");
-                    return Some(Err(Step::Continue(1)));
-                }
-            },
-            Err(step) => return Some(Err(step)),
-        }
-    }
-    Some(Ok(expanded))
-}
-
 /// The `%id` this word names, if it is a job handle; `None` leaves it to
 /// ordinary expansion.
+///
+/// Only a handle takes this route: everything else keeps exactly the text ordinary
+/// expansion produces. That distinction is load-bearing, because a job builtin's
+/// options are not just data. Expanding them as values types `-0` as the integer
+/// `0` and drops the sign along with it, which turns `kill -0 $pid` — ask whether
+/// it is alive — into `kill 0 $pid`, and pid 0 is *the caller's own process group*.
 ///
 /// A handle becomes **`%id`** rather than a bare id on purpose: `fg 2` and
 /// `fg %2` mean the same job, but for `kill` a bare number is a *pid*, and `$j`
@@ -5873,18 +5830,6 @@ fn run_prompt_hooks(event: PromptEvent, args: Vec<Value>, shell: &mut Shell) {
         let _ = call_func(&function, args.clone(), false, shell);
     }
     shell.vars.restore_status(saved);
-}
-
-/// Expand just the command word to its name, if it resolves to a single string —
-/// used to look up an in-shell function before the arguments are expanded. A word
-/// that expands to zero or several words (an empty glob, a multi-match glob, a
-/// bare list) is not a function name, so this returns `None` and the byte-string
-/// path takes over.
-fn command_name(tokens: &[Word], vars: &Vars) -> Option<String> {
-    let first = tokens.first()?;
-    let cloned = first.clone();
-    let mut argv = expand::expand(vec![cloned], vars).ok()?;
-    (argv.len() == 1).then(|| argv.pop().unwrap())
 }
 
 /// Build the [`Step::Return`] for a `return` command word: no argument uses the
