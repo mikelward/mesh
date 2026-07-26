@@ -1242,6 +1242,10 @@ fn a_piped_shell_writes_no_semantic_marks() {
                 "a mark escaped to a pipe: {text:?}"
             );
             assert!(!text.contains("133;"), "a mark escaped to a pipe: {text:?}");
+            assert!(
+                !text.contains("\x1b[?2004"),
+                "bracketed paste escaped to a pipe: {text:?}"
+            );
         }
     }
 }
@@ -1361,6 +1365,156 @@ fn semantic_mark_harness(exec: &MeshExec) -> i32 {
         return 52;
     }
     unsafe { libc::close(master) };
+    0
+}
+
+/// A mesh session on its own controlling terminal.
+struct PtyShell {
+    master: RawFd,
+    mesh: libc::pid_t,
+    /// Everything the shell wrote before its first prompt was ready. The
+    /// sequences it emits per *session* rather than per command — the working
+    /// directory report, bracketed-paste mode — are only ever here.
+    startup: Vec<u8>,
+}
+
+/// Start mesh on a fresh pty (in `cwd`, when given) and read up to the first
+/// prompt.
+///
+/// The six harnesses above each open their own pty inline and predate this; they
+/// are left as they are rather than mechanically rewritten here.
+fn start_pty_shell(exec: &MeshExec, cwd: Option<&Path>) -> Option<PtyShell> {
+    // Built before the fork: only async-signal-safe calls are allowed between
+    // fork and exec, and allocating a `CString` is not one.
+    let directory = cwd.map(|path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a cwd without a NUL")
+    });
+    let mut master = -1;
+    let mut slave = -1;
+    if open_pty_pair(&mut master, &mut slave) != 0
+        || unsafe { libc::setsid() } < 0
+        || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
+    {
+        return None;
+    }
+    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    let mesh = unsafe { libc::fork() };
+    if mesh < 0 {
+        return None;
+    }
+    if mesh == 0 {
+        unsafe {
+            libc::setpgid(0, 0);
+            if let Some(directory) = &directory
+                && libc::chdir(directory.as_ptr()) != 0
+            {
+                libc::_exit(126);
+            }
+            libc::dup2(slave, libc::STDIN_FILENO);
+            libc::dup2(slave, libc::STDOUT_FILENO);
+            libc::dup2(slave, libc::STDERR_FILENO);
+            libc::close(master);
+            libc::close(slave);
+            libc::_exit(exec_mesh(exec));
+        }
+    }
+    // Set the group from both sides of fork so tcsetpgrp cannot race the child.
+    if unsafe { libc::setpgid(mesh, mesh) } < 0 && unsafe { libc::getpgid(mesh) } != mesh {
+        return None;
+    }
+    unsafe { libc::close(slave) };
+    if unsafe { libc::tcsetpgrp(master, mesh) } < 0 {
+        return None;
+    }
+    let startup = pty_read_until_one_of(master, &[INPUT_READY])?;
+    Some(PtyShell {
+        master,
+        mesh,
+        startup,
+    })
+}
+
+/// Send `exit 0` and require the shell to leave cleanly, so a harness that ends
+/// happily also proves the session survived what it did to it.
+fn stop_pty_shell(shell: PtyShell) -> bool {
+    if !pty_write(shell.master, b"exit 0\n") {
+        return false;
+    }
+    let mut status = 0;
+    let reaped = unsafe { libc::waitpid(shell.mesh, &mut status, 0) } == shell.mesh;
+    unsafe { libc::close(shell.master) };
+    reaped && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+}
+
+fn pty_write(master: RawFd, bytes: &[u8]) -> bool {
+    let written = unsafe { libc::write(master, bytes.as_ptr().cast(), bytes.len()) };
+    written == bytes.len() as isize
+}
+
+fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|part| *part == needle)
+        .count()
+}
+
+#[test]
+fn an_interactive_shell_turns_on_bracketed_paste() {
+    let exec = MeshExec::new(isolated_config_home());
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(bracketed_paste_harness(&exec)) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "PTY harness failed with status {status:#x}"
+    );
+}
+
+/// Pasted text is *inserted*, not executed line by line.
+fn bracketed_paste_harness(exec: &MeshExec) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 60;
+    };
+    // The mode being set is what this test pins. reedline's guard defaults to
+    // off, so without asking for it nothing writes `CSI ?2004 h` and a real
+    // terminal never wraps a paste at all — every newline in it arrives as Enter
+    // and every line but the last runs before it can be read.
+    if occurrences(&shell.startup, b"\x1b[?2004h") == 0 {
+        return 61;
+    }
+    // The behavior it buys, from this side of the pty: two lines wrapped in the
+    // paste markers become one buffer, submitted once. This part would pass
+    // without the fix — crossterm parses the markers whether or not the mode was
+    // set — so it documents the result rather than proving the cause.
+    if !pty_write(shell.master, b"\x1b[200~puts one\nputs two\x1b[201~") {
+        return 62;
+    }
+    if !pty_write(shell.master, b"\n") {
+        return 63;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 64;
+    };
+    if status != 0 {
+        return 65;
+    }
+    // Both lines' output before the *first* `D`: run line by line, `puts one`
+    // would have ended a command of its own and the read would have stopped there
+    // with `two` still unwritten.
+    if occurrences(&seen, b"one\r\n") == 0 || occurrences(&seen, b"two\r\n") == 0 {
+        return 66;
+    }
+    // And one command, not two.
+    if occurrences(&seen, b"\x1b]133;C\x1b\\") != 1 {
+        return 67;
+    }
+    if !stop_pty_shell(shell) {
+        return 68;
+    }
     0
 }
 
