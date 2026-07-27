@@ -257,6 +257,11 @@ file as tasks land.
       time, and subcommand arguments; regenerate stale or corrupt entries.
 - [x] Add typed file, directory, and enum values to completion specs.
 - [x] Add fuzzy and case-insensitive candidate ranking with `nucleo`.
+- [x] Read the help real programs print: git's sentence-shaped table caption,
+      cargo's `build, b` aliases and next-line value lists, docker's starred
+      plugin commands, and the punctuation usage lines wrap their flags and
+      operands in. Parser tests run against `--help` output captured verbatim
+      under `crates/mesh-core/tests/help/`.
 - [ ] Load curated completion specs, then add man-page-derived specs.
 - [ ] Expose static and dynamic completion overrides through `$sh.complete`.
 
