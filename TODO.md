@@ -262,6 +262,8 @@ file as tasks land.
       plugin commands, and the punctuation usage lines wrap their flags and
       operands in. Parser tests run against `--help` output captured verbatim
       under `crates/mesh-core/tests/help/`.
+- [x] Complete a `PAGE` operand from the installed manual — `man l<Tab>` offers
+      pages, not the current directory's files.
 - [ ] Load curated completion specs, then add man-page-derived specs.
 - [ ] Expose static and dynamic completion overrides through `$sh.complete`.
 

@@ -31,7 +31,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::builtins::{self, Builtin, Multiplexer, NOTIFY_LIMIT};
-use crate::completion::{CompletionCache, CompletionSpec, ValueHint, rank_candidates};
+use crate::completion::{CompletionCache, CompletionSpec, ValueHint, man_pages, rank_candidates};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
 use crate::options::{Opt, Options};
@@ -8837,6 +8837,11 @@ struct CompletionState {
     /// reports on and no command word lives in. Built once here rather than
     /// assembled per keystroke.
     names: Vec<String>,
+    /// The manual pages, filled the first time a `PAGE` argument is completed.
+    /// The scan walks every `man` section directory — thousands of entries — so
+    /// it is not paid by a prompt that never asks for one, and the state is
+    /// rebuilt each prompt, so a page installed mid-session still shows up.
+    man_pages: OnceLock<Vec<String>>,
 }
 
 impl CompletionState {
@@ -8900,7 +8905,12 @@ impl CompletionState {
             cache: CompletionCache::default(),
             variables,
             names,
+            man_pages: OnceLock::new(),
         }
+    }
+
+    fn man_pages(&self) -> &[String] {
+        self.man_pages.get_or_init(man_pages)
     }
 }
 
@@ -9015,7 +9025,7 @@ fn argument_completions(
     if let Some((option, prefix)) = word.split_once('=') {
         let context = &words[..words.len().saturating_sub(1)];
         if let Some(hint) = completion_for(state, context, lookup).value_hint(option) {
-            return value_completions(hint, prefix)
+            return value_completions(state, hint, prefix)
                 .into_iter()
                 .map(|value| format!("{option}={value}"))
                 .collect();
@@ -9033,7 +9043,7 @@ fn argument_completions(
     {
         let context = &parent[..parent.len() - 1];
         if let Some(hint) = completion_for(state, context, lookup).value_hint(option) {
-            return value_completions(hint, word);
+            return value_completions(state, hint, word);
         }
     }
     // `whence` takes a **name**, so it completes from every namespace it reports
@@ -9054,7 +9064,7 @@ fn argument_completions(
     let parent_help = completion_for(state, parent, lookup);
     let paths = parent_help.positional_hint().map_or_else(
         || path_completions(word),
-        |hint| value_completions(hint, word),
+        |hint| value_completions(state, hint, word),
     );
     let mut parent_values = parent_help.matching(word);
 
@@ -9092,10 +9102,11 @@ fn argument_completions(
     values
 }
 
-fn value_completions(hint: &ValueHint, prefix: &str) -> Vec<String> {
+fn value_completions(state: &CompletionState, hint: &ValueHint, prefix: &str) -> Vec<String> {
     match hint {
         ValueHint::File => path_completions_with(prefix, false),
         ValueHint::Directory => path_completions_with(prefix, true),
+        ValueHint::ManPage => rank_candidates(state.man_pages().to_vec(), prefix),
         ValueHint::Enum(values) => rank_candidates(values.clone(), prefix),
     }
 }
@@ -10880,6 +10891,38 @@ mod tests {
         assert_eq!(external_stage(&words("command --help")), None);
         assert_eq!(external_stage(&words("command -v ls")), None);
         assert_eq!(external_stage(&words("ls -l")), Some(words("ls -l")));
+    }
+
+    #[test]
+    fn a_page_operand_completes_from_the_manual_not_the_directory() {
+        // `man l<Tab>` was offering the files in the current directory, because a
+        // command with no subcommands and no typed positional falls through to
+        // paths. `man`'s operand is a `PAGE`, so the manual is what it lists.
+        let state = CompletionState {
+            help: [(
+                "man".into(),
+                "Usage: man [OPTION...] [SECTION] PAGE...\n\n -w, --path  print location\n".into(),
+            )]
+            .into(),
+            man_pages: vec!["ls".into(), "less".into(), "git-add".into()].into(),
+            ..CompletionState::default()
+        };
+
+        assert_eq!(
+            argument_completions(&state, &["man".into(), "l".into()], "l", Lookup::Shell),
+            ["ls", "less"]
+        );
+        // A flag is still a flag: the operand's type does not swallow the
+        // options the same help declares.
+        assert_eq!(
+            argument_completions(
+                &state,
+                &["man".into(), "--pa".into()],
+                "--pa",
+                Lookup::Shell
+            ),
+            ["--path"]
+        );
     }
 
     #[test]
