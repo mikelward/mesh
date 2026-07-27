@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher};
 
-const CACHE_VERSION: &str = "mesh-completion-v4";
+const CACHE_VERSION: &str = "mesh-completion-v5";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ValueHint {
@@ -49,6 +49,7 @@ impl CompletionSpec {
         let mut values = HashMap::new();
         let mut positional = None;
         let mut commands = false;
+        let mut entry_column = None;
         let mut current_options = Vec::new();
         let mut pending_values = None;
         for line in help.lines() {
@@ -88,18 +89,19 @@ impl CompletionSpec {
                     }
                 }
             }
-            let heading = trimmed.trim_end_matches(':').to_ascii_lowercase();
             if line == trimmed && trimmed.ends_with(':') {
                 current_options.clear();
             }
-            if matches!(
-                heading.as_str(),
-                "commands" | "subcommands" | "available commands"
-            ) {
+            if commands_heading(trimmed) {
                 commands = true;
+                entry_column = None;
                 continue;
             }
-            if trimmed.ends_with(':') || trimmed.is_empty() {
+            // Only the next heading closes the table. Git separates its groups
+            // with blank lines and captions them at column 0 ("work on the
+            // current change (see also: git help everyday)"), so ending the
+            // section at either would stop the table at its first group.
+            if trimmed.ends_with(':') {
                 commands = false;
             }
             candidates.extend(options.iter().cloned());
@@ -107,13 +109,22 @@ impl CompletionSpec {
                 current_options.clone_from(&options);
             }
             if let Some((enum_values, complete)) = inline_possible_values(trimmed) {
+                // Cargo puts the description on its own line under the option
+                // ("--color <WHEN>" then "Coloring [possible values: auto,
+                // always, never]"), so a list on a line that names no option
+                // belongs to the last option named.
+                let described = if options.is_empty() {
+                    &current_options
+                } else {
+                    &options
+                };
                 if complete {
-                    for option in &options {
+                    for option in described {
                         values.insert(option.clone(), ValueHint::Enum(enum_values.clone()));
                     }
-                } else if !options.is_empty() {
+                } else if !described.is_empty() {
                     pending_values = Some(PendingValues::Wrapped {
-                        options: options.clone(),
+                        options: described.clone(),
                         values: enum_values,
                     });
                 }
@@ -128,13 +139,22 @@ impl CompletionSpec {
                     values: Vec::new(),
                 });
             }
-            if commands
-                && let Some(command) = trimmed.split_whitespace().next()
-                && command
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                candidates.push(command.to_owned());
+            // An entry in the table is indented under it; the caption of a group
+            // and the prose that follows the table are not. That indentation is
+            // what keeps "concept guides. See 'git help <command>' …" out of the
+            // candidates now that a blank line no longer ends the section.
+            //
+            // The description of an entry wraps to a *deeper* column than the
+            // entry itself — `rustup --help` in a narrow terminal breaks
+            // "Generate tab-completion scripts for / your shell" — so an entry
+            // has to start where the first one did. `command_names` rules out
+            // the rest by shape.
+            if commands && let Some(indent) = indentation(line) {
+                let names = command_names(trimmed);
+                if !names.is_empty() && indent <= *entry_column.get_or_insert(indent) {
+                    entry_column = Some(indent);
+                    candidates.extend(names);
+                }
             }
         }
         finish_pending_values(&mut values, pending_values);
@@ -179,18 +199,7 @@ impl CompletionSpec {
         for (option, hint) in values {
             encoded.push_str("value\t");
             encoded.push_str(option);
-            match hint {
-                ValueHint::File => encoded.push_str("\tfile\n"),
-                ValueHint::Directory => encoded.push_str("\tdirectory\n"),
-                ValueHint::Enum(values) => {
-                    encoded.push_str("\tenum");
-                    for value in values {
-                        encoded.push('\t');
-                        encoded.push_str(value);
-                    }
-                    encoded.push('\n');
-                }
-            }
+            encode_hint(&mut encoded, hint);
         }
         if let Some(hint) = &self.positional {
             encoded.push_str("positional");
@@ -289,11 +298,87 @@ pub(crate) fn rank_candidates(candidates: Vec<String>, query: &str) -> Vec<Strin
     ranked
 }
 
+/// Does this line open a table of subcommands?
+///
+/// `Commands:` and `Available Commands:` are the common spellings, but git
+/// captions its table with a whole sentence — "These are common Git commands
+/// used in various situations:" — so a heading counts when any of its words is
+/// "commands". Without the colon the line has to be little else, since an
+/// ordinary sentence mentioning commands is not a heading.
+fn commands_heading(line: &str) -> bool {
+    let heading = line.strip_suffix(':');
+    let words: Vec<_> = heading.unwrap_or(line).split_whitespace().collect();
+    (heading.is_some() || words.len() <= 2)
+        && words.iter().any(|word| {
+            let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            word.eq_ignore_ascii_case("commands") || word.eq_ignore_ascii_case("subcommands")
+        })
+}
+
+/// How far a line is indented, or `None` for one that is blank or starts at
+/// column 0.
+fn indentation(line: &str) -> Option<usize> {
+    let indent = line.len() - line.trim_start().len();
+    (indent > 0 && !line.trim().is_empty()).then_some(indent)
+}
+
+/// The commands one entry of a table introduces, or nothing if the line is not
+/// an entry.
+///
+/// An entry is a name — or several, since cargo writes `build, b` for a
+/// subcommand and its alias — set off from its description by two spaces or a
+/// tab, or standing alone on the line. Docker stars a command that comes from a
+/// plugin (`buildx*  Docker Buildx`); the star is a footnote mark, not part of
+/// the name.
+///
+/// Prose does not have that shape, which is what a section has to be told by:
+/// rustup captions its worked examples "Common commands:", and reading
+/// "Update Rust toolchains and rustup" as a table entry offers `Update` as a
+/// subcommand you could run.
+fn command_names(entry: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = entry;
+    loop {
+        let (token, tail) = rest.split_at(rest.find(char::is_whitespace).unwrap_or(rest.len()));
+        let name = token.trim_end_matches(['*', ',']);
+        let named = !name.is_empty()
+            && !name.starts_with('-')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !named {
+            return Vec::new();
+        }
+        names.push(name.to_owned());
+        // Only a trailing comma promises another name; after the last one comes
+        // the description, and a single space between them means this was a
+        // sentence rather than a table.
+        if !token.ends_with(',') {
+            let separated =
+                tail.trim().is_empty() || tail.starts_with('\t') || tail.starts_with("  ");
+            return if separated { names } else { Vec::new() };
+        }
+        rest = tail.trim_start();
+        if rest.is_empty() {
+            return names;
+        }
+    }
+}
+
 fn option_names(tokens: &[&str]) -> Vec<String> {
     tokens
         .iter()
+        // A bar separates alternatives, spaced or not: `[-p | --paginate]` is
+        // three tokens but `[--all|--quiet]` is one, and both name two flags.
+        .flat_map(|token| token.split('|'))
         .filter_map(|token| {
-            let option = token.trim_end_matches([',', ';']);
+            // Help text writes an option inside whatever punctuation the
+            // sentence or usage line needs — `[-v | --version]`,
+            // `'git help -a'`, `(-vv very verbose)`, `-v, --verbose...`, `with
+            // -lt:`, ``rustup doc --book``. None of it is part of the name, and
+            // leaving it on offers `--version]` as a flag.
+            let option =
+                token.trim_matches(['[', ']', '(', ')', ',', ';', ':', '.', '\'', '"', '`']);
             (option.starts_with('-') && option.len() > 1).then(|| {
                 option
                     .split(['=', '[', '<'])
@@ -336,14 +421,61 @@ fn value_hint(tokens: &[&str]) -> Option<ValueHint> {
     None
 }
 
+/// The value type of a usage line's *operands*, skipping the metavars that
+/// belong to an option.
+///
+/// `usage: git [-v | --version] [-C <path>] … <command> [<args>]` names a file
+/// only inside `[-C <path>]`, which is `-C`'s value — reading it as git's
+/// operand had `git a<Tab>` offering the files in the current directory.
 fn positional_hint(tokens: &[&str]) -> Option<ValueHint> {
-    let hints: Vec<_> = tokens
-        .iter()
-        .filter_map(|token| value_hint(&[*token]))
-        .collect();
+    let mut hints = Vec::new();
+    let mut option_group = false;
+    for token in tokens {
+        if token.starts_with(['[', '(']) {
+            option_group = false;
+        }
+        if token.trim_start_matches(['[', '(']).starts_with('-') {
+            option_group = true;
+        }
+        if !option_group
+            && let Some(hint) = value_hint(&[*token]).or_else(|| bare_metavar_hint(token))
+        {
+            hints.push(hint);
+        }
+        if token.ends_with([']', ')']) {
+            option_group = false;
+        }
+    }
     if hints.contains(&ValueHint::File) {
         Some(ValueHint::File)
     } else if hints.contains(&ValueHint::Directory) {
+        Some(ValueHint::Directory)
+    } else {
+        None
+    }
+}
+
+/// The value type of an unbracketed metavar — the `FILE...` of
+/// `Usage: tool [OPTION]... FILE...`.
+///
+/// Only a usage line is read this way. An all-caps word elsewhere is prose
+/// ("suppress FILE output"), and taking that for a metavar would hang a value
+/// type on whichever option the sentence happens to describe.
+fn bare_metavar_hint(token: &str) -> Option<ValueHint> {
+    let metavar = token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+    let shaped = metavar.chars().all(|character| {
+        character.is_ascii_uppercase()
+            || character.is_ascii_digit()
+            || matches!(character, '-' | '_')
+    }) && metavar
+        .chars()
+        .any(|character| character.is_ascii_uppercase());
+    if !shaped {
+        return None;
+    }
+    if file_metavar(metavar) {
+        Some(ValueHint::File)
+    } else if directory_metavar(metavar) {
         Some(ValueHint::Directory)
     } else {
         None
@@ -745,6 +877,220 @@ mod tests {
             CompletionSpec::decode(&spec.encode("vim"), "vim"),
             Some(spec)
         );
+    }
+
+    #[test]
+    fn parses_git_style_command_tables() {
+        let spec = CompletionSpec::from_help(
+            "usage: git [-v | --version] [-h | --help] [-C <path>]\n\
+             \x20          [--git-dir=<path>] <command> [<args>]\n\
+             \n\
+             These are common Git commands used in various situations:\n\
+             \n\
+             start a working area (see also: git help tutorial)\n\
+             \x20  clone     Clone a repository into a new directory\n\
+             \x20  init      Create an empty Git repository\n\
+             \n\
+             work on the current change (see also: git help everyday)\n\
+             \x20  add       Add file contents to the index\n\
+             \x20  restore   Restore working tree files\n\
+             \n\
+             'git help -a' and 'git help -g' list available subcommands and some\n\
+             concept guides. See 'git help <command>' or 'git help <concept>'\n",
+        );
+
+        // A blank line separates the groups, so the table has to survive one.
+        assert_eq!(spec.matching("a")[0], "add");
+        assert_eq!(spec.matching("res"), ["restore"]);
+        assert!(spec.matching("").iter().any(|value| value == "init"));
+        // The group captions and the closing prose sit at column 0, which is
+        // what keeps them out of the table.
+        for prose in ["start", "work", "concept"] {
+            assert!(
+                !spec.matching("").iter().any(|value| value == prose),
+                "{prose} was taken for a subcommand"
+            );
+        }
+        // Both ends of a usage line's brackets come off, so the flag inside is
+        // offered under its own name.
+        assert_eq!(spec.matching("--v"), ["--version"]);
+        assert_eq!(spec.matching("--git"), ["--git-dir"]);
+    }
+
+    #[test]
+    fn bar_separated_alternatives_name_each_option() {
+        // Git spaces its alternatives out (`[-v | --version]`), but mesh's own
+        // builtin help writes them in one token. Both name two flags, not one
+        // flag spelled `--all|--quiet`.
+        let spec = CompletionSpec::from_help("Usage: whence [--all|--quiet] NAME ...\n");
+
+        assert_eq!(spec.matching("--a"), ["--all"]);
+        assert_eq!(spec.matching("--q"), ["--quiet"]);
+        // `NAME` is an operand of no known type, so completion falls back to
+        // paths rather than claiming one.
+        assert_eq!(spec.positional_hint(), None);
+    }
+
+    #[test]
+    fn command_headings_need_more_than_the_word() {
+        // A colon makes a caption a heading; without one it has to be a heading
+        // and nothing more, or every sentence about commands opens a table.
+        let spec = CompletionSpec::from_help(
+            "Run 'tool help' to list the commands\n  notacommand  prose under prose\n\nCommands\n  real  a command\n",
+        );
+
+        assert_eq!(spec.matching(""), ["real"]);
+    }
+
+    #[test]
+    fn unbracketed_usage_operands_are_read_as_metavars() {
+        // A usage line's bare operand is a metavar; the same word in a
+        // description is prose, and must not type the option it describes.
+        let spec = CompletionSpec::from_help(
+            "Usage: tool [OPTION]... FILE...\n\nOptions:\n  --quiet  suppress FILE output\n",
+        );
+
+        assert_eq!(spec.positional_hint(), Some(&ValueHint::File));
+        assert_eq!(spec.value_hint("--quiet"), None);
+    }
+
+    /// Specs parsed from **real** `--help` output, captured verbatim under
+    /// `tests/help/` — see the README there for the commands and versions, and
+    /// for how to re-capture. Hand-written help exercises one parsing rule at a
+    /// time; these say what the parser does with what commands actually print.
+    mod captured {
+        use super::super::{CompletionSpec, ValueHint};
+
+        const GIT: &str = include_str!("../tests/help/git.txt");
+        const CARGO: &str = include_str!("../tests/help/cargo.txt");
+        const DOCKER: &str = include_str!("../tests/help/docker.txt");
+        const LS: &str = include_str!("../tests/help/ls.txt");
+        const RUSTUP: &str = include_str!("../tests/help/rustup.txt");
+
+        #[test]
+        fn git_offers_subcommands_not_the_prose_around_them() {
+            let spec = CompletionSpec::from_help(GIT);
+
+            // The bug: `git a<Tab>` completed filenames, because git captions
+            // its table with a sentence rather than `Commands:`.
+            assert_eq!(spec.matching("a")[0], "add");
+            let commands = spec.matching("");
+            for command in ["clone", "init", "restore", "switch", "rebase", "tag"] {
+                assert!(commands.contains(&command.to_owned()), "missing {command}");
+            }
+            // Group captions and the closing paragraph are not commands.
+            for prose in ["start", "work", "examine", "grow", "collaborate", "concept"] {
+                assert!(
+                    !commands.contains(&prose.to_owned()),
+                    "{prose} is not a command"
+                );
+            }
+            // Flags come off the usage line with their brackets removed.
+            // Ranking is fuzzy, so assert the best match: `--git` is a
+            // subsequence of `--paginate` too.
+            assert_eq!(spec.matching("--git")[0], "--git-dir");
+            assert_eq!(spec.matching("--vers")[0], "--version");
+            // `[-C <path>]` is `-C`'s value, not git's operand: reading it as
+            // one is what put the current directory's files in front of the
+            // subcommands.
+            assert_eq!(spec.positional_hint(), None);
+            assert_eq!(spec.value_hint("--git-dir"), Some(&ValueHint::File));
+        }
+
+        #[test]
+        fn cargo_offers_aliases_and_values_described_on_the_next_line() {
+            let spec = CompletionSpec::from_help(CARGO);
+
+            assert_eq!(spec.matching("bui")[0], "build");
+            let commands = spec.matching("");
+            // `build, b` names two ways to run the same subcommand, and both
+            // are things you can type.
+            for command in ["build", "b", "check", "c", "clean", "publish"] {
+                assert!(commands.contains(&command.to_owned()), "missing {command}");
+            }
+            // `...  See all commands with --list` ends the table without
+            // naming a command.
+            assert!(!commands.contains(&"...".to_owned()));
+            // Cargo puts the description under the option, so the value list
+            // arrives on a line that names no option.
+            assert_eq!(
+                spec.value_hint("--color"),
+                Some(&ValueHint::Enum(vec![
+                    "auto".into(),
+                    "always".into(),
+                    "never".into()
+                ]))
+            );
+            assert_eq!(spec.value_hint("-C"), Some(&ValueHint::Directory));
+            assert_eq!(spec.value_hint("--config"), Some(&ValueHint::File));
+            assert_eq!(spec.positional_hint(), None);
+        }
+
+        #[test]
+        fn docker_offers_every_one_of_its_command_tables() {
+            let spec = CompletionSpec::from_help(DOCKER);
+            let commands = spec.matching("");
+
+            // Four tables — Common, Management, Swarm, and plain `Commands:` —
+            // each of which has to open a section of its own.
+            for command in ["run", "network", "swarm", "attach"] {
+                assert!(commands.contains(&command.to_owned()), "missing {command}");
+            }
+            // `buildx*` is starred as a plugin; the star is a footnote mark.
+            assert!(commands.contains(&"buildx".to_owned()));
+            assert!(!commands.iter().any(|command| command.contains('*')));
+            // "Run 'docker COMMAND --help' …" closes the output at column 0.
+            assert!(!commands.contains(&"Run".to_owned()));
+            assert_eq!(spec.matching("--tlsc"), ["--tlscacert", "--tlscert"]);
+        }
+
+        #[test]
+        fn rustup_offers_neither_wrapped_descriptions_nor_worked_examples() {
+            // Captured at 50 columns on purpose: rustup wraps its descriptions
+            // there, and it heads its worked examples "Common commands:" — a
+            // section whose lines are indented and mention commands without
+            // being a table.
+            let spec = CompletionSpec::from_help(RUSTUP);
+            let commands = spec.matching("");
+
+            for command in ["install", "toolchain", "completions", "self", "which"] {
+                assert!(commands.contains(&command.to_owned()), "missing {command}");
+            }
+            // A flag quoted in prose (``rustup doc --book``) keeps neither its
+            // backticks nor the rest of the sentence's punctuation.
+            assert_eq!(spec.matching("--b")[0], "--book");
+            // `completions  Generate tab-completion scripts for / your shell`
+            // continues at a deeper column, and "Update Rust toolchains and
+            // rustup" is a sentence, not `name  description`.
+            for prose in [
+                "your",
+                "Update",
+                "Install",
+                "toolchains",
+                "or",
+                "active",
+                "command",
+                "the",
+            ] {
+                assert!(
+                    !commands.contains(&prose.to_owned()),
+                    "{prose} is not a command"
+                );
+            }
+        }
+
+        #[test]
+        fn ls_takes_files_and_has_no_subcommands() {
+            let spec = CompletionSpec::from_help(LS);
+
+            assert_eq!(spec.positional_hint(), Some(&ValueHint::File));
+            assert_eq!(spec.matching("--col")[0], "--color");
+            // Paragraphs of prose about SIZE, TIME_STYLE and exit status must
+            // not turn into subcommands — with no `Commands:` heading anywhere,
+            // nothing but options is on offer.
+            assert!(spec.matching("a").is_empty());
+            assert!(spec.matching("").iter().all(|value| value.starts_with('-')));
+        }
     }
 
     #[test]
