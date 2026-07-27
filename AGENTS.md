@@ -56,6 +56,10 @@ apply throughout.
   branch from it. When continuing an existing task branch, rebase it onto the
   latest `origin/main` before the first new commit, resolving any conflicts
   rather than abandoning the branch or working from an older base.
+- **One commit per logical change.** Rewrite unmerged commits freely — amend,
+  `git commit --fixup` + autosquash, squash, reorder, split — so each commit
+  that lands is one coherent change, with fix-ups and review responses folded
+  into the commit they belong to.
 - Clean up the branch history before requesting review and again before merge —
   no `wip` / `fix typo` / `address review` churn shipping to `main`.
 - After rewriting history, push with `git push --force-with-lease`, never a bare
