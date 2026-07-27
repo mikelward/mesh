@@ -33,3 +33,8 @@ A re-capture from a different version is expected to move some of the details
 the tests assert on (a subcommand added, a flag renamed). Update the assertions
 to what the new output says rather than editing a fixture to keep a test green —
 the point of these files is that nobody wrote them.
+
+There is deliberately no `man.txt`: `man --help` is the case that motivated the
+`PAGE` operand rule, but man-db is not installed in the container these were
+captured in, so the man usage line in the tests is transcribed rather than
+captured. Replace it with a real capture when one is available.

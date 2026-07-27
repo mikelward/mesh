@@ -21,6 +21,9 @@ const CACHE_VERSION: &str = "mesh-completion-v5";
 pub(crate) enum ValueHint {
     File,
     Directory,
+    /// A name from the manual, not from the filesystem: `man PAGE` takes
+    /// `git-add`, which is no file in the directory you are standing in.
+    ManPage,
     Enum(Vec<String>),
 }
 
@@ -235,6 +238,7 @@ fn encode_hint(encoded: &mut String, hint: &ValueHint) {
     match hint {
         ValueHint::File => encoded.push_str("\tfile\n"),
         ValueHint::Directory => encoded.push_str("\tdirectory\n"),
+        ValueHint::ManPage => encoded.push_str("\tmanpage\n"),
         ValueHint::Enum(values) => {
             encoded.push_str("\tenum");
             for value in values {
@@ -250,6 +254,7 @@ fn decode_hint<'a>(fields: &mut impl Iterator<Item = &'a str>) -> Option<ValueHi
     match fields.next()? {
         "file" => Some(ValueHint::File),
         "directory" => Some(ValueHint::Directory),
+        "manpage" => Some(ValueHint::ManPage),
         "enum" => Some(ValueHint::Enum(fields.map(str::to_owned).collect())),
         _ => None,
     }
@@ -450,13 +455,15 @@ fn positional_hint(tokens: &[&str]) -> Option<ValueHint> {
         Some(ValueHint::File)
     } else if hints.contains(&ValueHint::Directory) {
         Some(ValueHint::Directory)
+    } else if hints.contains(&ValueHint::ManPage) {
+        Some(ValueHint::ManPage)
     } else {
         None
     }
 }
 
-/// The value type of an unbracketed metavar — the `FILE...` of
-/// `Usage: tool [OPTION]... FILE...`.
+/// The value type of an unbracketed metavar — the `PAGE...` of
+/// `Usage: man [OPTION...] [SECTION] PAGE...`.
 ///
 /// Only a usage line is read this way. An all-caps word elsewhere is prose
 /// ("suppress FILE output"), and taking that for a metavar would hang a value
@@ -477,6 +484,8 @@ fn bare_metavar_hint(token: &str) -> Option<ValueHint> {
         Some(ValueHint::File)
     } else if directory_metavar(metavar) {
         Some(ValueHint::Directory)
+    } else if man_page_metavar(metavar) {
+        Some(ValueHint::ManPage)
     } else {
         None
     }
@@ -543,6 +552,10 @@ fn directory_metavar(value: &str) -> bool {
 fn file_metavar(value: &str) -> bool {
     metavar_words(value)
         .any(|word| word.eq_ignore_ascii_case("FILE") || word.eq_ignore_ascii_case("PATH"))
+}
+
+fn man_page_metavar(value: &str) -> bool {
+    metavar_words(value).any(|word| word.eq_ignore_ascii_case("PAGE"))
 }
 
 fn metavar_words(value: &str) -> impl Iterator<Item = &str> {
@@ -691,6 +704,92 @@ fn resolve_command(command: &str) -> Option<PathBuf> {
     })
 }
 
+/// Every manual page installed on this system, named the way `man` takes it:
+/// `ls`, `git-add`, `CPAN::Meta`.
+///
+/// The scan reads directories only — no `man`, `manpath`, or `apropos` is run,
+/// so a `PAGE` argument completes without executing anything and without a
+/// `mandb` index having been built.
+pub(crate) fn man_pages() -> Vec<String> {
+    let mut roots = man_roots();
+    roots.sort();
+    roots.dedup();
+    let mut pages: Vec<String> = roots.iter().flat_map(|root| pages_in(root)).collect();
+    pages.sort();
+    pages.dedup();
+    pages
+}
+
+fn man_roots() -> Vec<PathBuf> {
+    let manpath = env::var_os("MANPATH").unwrap_or_default();
+    let configured: Vec<PathBuf> = env::split_paths(&manpath)
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect();
+    // A `MANPATH` with no empty entry replaces the search path outright, which
+    // is `man`'s own rule; an empty entry — a leading, trailing, or doubled `:`
+    // — asks for the derived path to be spliced in, and so does no `MANPATH`.
+    let replaces = !configured.is_empty()
+        && env::split_paths(&manpath).all(|path| !path.as_os_str().is_empty());
+    if replaces {
+        return configured;
+    }
+    let mut roots = configured;
+    roots.extend(derived_man_roots());
+    roots
+}
+
+/// Where `man` looks when `MANPATH` does not say: the manual tree beside each
+/// `$PATH` directory — `/opt/pkg/bin` is documented in `/opt/pkg/share/man` —
+/// plus the system trees, which stay in the list for a `$PATH` that misses them.
+fn derived_man_roots() -> Vec<PathBuf> {
+    let path = env::var_os("PATH").unwrap_or_default();
+    let mut roots: Vec<PathBuf> = env::split_paths(&path)
+        .filter_map(|directory| directory.parent().map(Path::to_path_buf))
+        .flat_map(|prefix| [prefix.join("share/man"), prefix.join("man")])
+        .collect();
+    roots.extend(
+        ["/usr/share/man", "/usr/local/share/man", "/usr/local/man"]
+            .into_iter()
+            .map(PathBuf::from),
+    );
+    roots
+}
+
+/// The pages under one manual tree. Only its own `man<section>` directories are
+/// read: a translated tree (`.../man/fr/man1`) names the same pages again.
+fn pages_in(root: &Path) -> Vec<String> {
+    let Ok(sections) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    sections
+        .flatten()
+        .filter(|section| section.file_name().as_encoded_bytes().starts_with(b"man"))
+        .filter_map(|section| fs::read_dir(section.path()).ok())
+        .flat_map(|pages| {
+            pages
+                .flatten()
+                .filter_map(|page| page_name(&page.file_name().to_string_lossy()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The name a page file answers to: `ls.1.gz` is `ls`, `git-add.1` is `git-add`,
+/// `CPAN::Meta.3pm.gz` is `CPAN::Meta`. A file with no section suffix is not a
+/// page, so it contributes no name.
+fn page_name(file: &str) -> Option<String> {
+    const COMPRESSED: [&str; 6] = ["gz", "bz2", "xz", "zst", "lzma", "Z"];
+    let stem = match file.rsplit_once('.') {
+        Some((stem, suffix)) if COMPRESSED.contains(&suffix) => stem,
+        _ => file,
+    };
+    let (name, section) = stem.rsplit_once('.')?;
+    let sectioned = section.starts_with(|character: char| {
+        character.is_ascii_digit() || matches!(character, 'n' | 'l')
+    });
+    (!name.is_empty() && sectioned).then(|| name.to_owned())
+}
+
 pub(crate) fn command_help(words: &[String]) -> String {
     let Some((command, args)) = words.split_first() else {
         return String::new();
@@ -776,7 +875,8 @@ fn join_reader(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionCache, CompletionSpec, ValueHint, cache_name, command_help, rank_candidates,
+        CompletionCache, CompletionSpec, ValueHint, cache_name, command_help, pages_in,
+        rank_candidates,
     };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -943,6 +1043,25 @@ mod tests {
     }
 
     #[test]
+    fn man_usage_positionals_are_manual_pages() {
+        let spec = CompletionSpec::from_help(
+            "Usage: man [OPTION...] [SECTION] PAGE...\n\
+             \n\
+             \x20-C, --config-file=FILE     use this user configuration file\n\
+             \x20-w, --path                 print physical location of man page(s)\n",
+        );
+
+        // `PAGE` is the operand, and it names the manual rather than the
+        // directory you happen to be standing in.
+        assert_eq!(spec.positional_hint(), Some(&ValueHint::ManPage));
+        assert_eq!(spec.value_hint("--config-file"), Some(&ValueHint::File));
+        assert_eq!(
+            CompletionSpec::decode(&spec.encode("man"), "man"),
+            Some(spec)
+        );
+    }
+
+    #[test]
     fn unbracketed_usage_operands_are_read_as_metavars() {
         // A usage line's bare operand is a metavar; the same word in a
         // description is prose, and must not type the option it describes.
@@ -1091,6 +1210,27 @@ mod tests {
             assert!(spec.matching("a").is_empty());
             assert!(spec.matching("").iter().all(|value| value.starts_with('-')));
         }
+    }
+
+    #[test]
+    fn names_pages_by_section_and_compression_suffix() {
+        let root = fresh_temp_dir("mesh-man");
+        for (section, files) in [
+            ("man1", ["ls.1.gz", "git-add.1", "notes.txt"].as_slice()),
+            ("man3", ["CPAN::Meta.3pm.gz"].as_slice()),
+            // Not a section directory, so its pages are not this tree's.
+            ("notman", ["hidden.1"].as_slice()),
+        ] {
+            fs::create_dir_all(root.join(section)).unwrap();
+            for file in files {
+                fs::write(root.join(section).join(file), "").unwrap();
+            }
+        }
+
+        let mut pages = pages_in(&root);
+        pages.sort();
+        assert_eq!(pages, ["CPAN::Meta", "git-add", "ls"]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
