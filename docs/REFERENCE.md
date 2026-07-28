@@ -735,7 +735,8 @@ argument by hand, and repeating it walks back through earlier commands.
 | `pwd` | Print the working directory. |
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
 | `notify [text …]` | Raise a desktop notification through the terminal with `OSC 9`. Arguments or stdin, like `clip`. A command that runs for more than ten seconds notifies on its own, with its outcome and duration — `$sh.options.command-notify = false` turns that off. Inside tmux the sequence is wrapped for passthrough, which tmux forwards only with `allow-passthrough` set. Support is uneven and unreportable — iTerm2, WezTerm, Ghostty, kitty and ConEmu raise these; xterm and Alacritty discard them; tmux needs `allow-passthrough` — so success means "asked". |
-| `exit [n]` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). |
+| `exit [n]` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). Leaves the **whole shell**; to leave only the current function with a status, use `fail`. |
+| `fail [n]` | Leave the current function (or sourced file) with a nonzero status — `1` by default, `n` when given — and `false` as its value. The status channel's counterpart to `return`. `fail 0` is refused; `return true` is how a function leaves with success. |
 | `prompt [text]` | Set the interactive prompt to `text`. With no arguments, print the current prompt; `--reset` restores the status-sensitive default, and `prompt -- --reset` sets that literal text. |
 | `prompt-hook [event] name function` | Register a named function for a prompt lifecycle event. The default event is `preprompt`. Reusing `name` within an event replaces that hook without changing its order. |
 | `jobs` | List the jobs, one `[id] State command` per line. |
@@ -1213,10 +1214,12 @@ own exit code at end of input.
 | `128 + n` | Killed by signal `n`. |
 | `2` | Syntax error (the shell recovers and continues). |
 
-A **value** used as a statement reports the status *view* of that value: an
-integer is its own status (masked to 0–255), a boolean inverts (`true` is `0`),
-and anything else is `0`. So `1 == 2 || puts nope` prints, and a function whose
-body ends in a boolean fails when that boolean is false.
+A **value** used as a statement reports the status *view* of that value, and only
+`false` fails — `false` is mesh's "no result", while every other value *is* a
+result and producing one is success. So `1 == 2 || puts nope` prints, a function
+whose body ends in a boolean fails when that boolean is false, and a body ending
+in an integer, string or list succeeds. Naming a status is [`fail`](#fail)'s job,
+not `return`'s.
 
 ### `$sh.status` and `$sh.pipestatus`
 
@@ -2387,13 +2390,21 @@ greet world          # -> hi, world
   spread (`...$xs`) or joined. A spread contributes one argument per element.
 - **Result.** A function's status is its last statement's status, or `0` for an
   empty body — and when that last statement is an expression, its status is the
-  view of the resulting value, so a body ending in `1 == 2` fails. `return expr`
-  exits early carrying a value (viewed the same way: `return 3` is status `3`,
-  masked to 0–255, like `exit`); a bare `return` carries the **result so far** —
-  the last value the body produced, or the status of a command that produced
-  none, or the empty string if nothing ran. Both stop the rest of the body. At a
-  top level `return` is a recoverable error, **except** in a sourced file, which it
-  leaves the way it leaves a function body — see [`source`](#source).
+  view of the resulting value, so a body ending in `1 == 2` fails.
+
+  **Value and status are separate channels.** `return expr` exits early carrying a
+  **value**, and succeeds (status `0`) unless that value is `false` — so
+  `return 3` is the integer three with status `0`, not exit code 3. `fail` is the
+  status channel's verb: bare `fail` is status `1`, `fail 123` names a code, and
+  the value it leaves behind is `false`. `fail 0` is refused — the spelling for
+  leaving with success is `return true`.
+
+  A bare `return` carries the **result so far** — the last value the body produced,
+  or the empty string if nothing ran — with the **last status**, so it means "stop
+  here, as if the body ended at this line" and propagates a failure as readily as a
+  success. All three stop the rest of the body. At a top level `return` and `fail`
+  are a recoverable error, **except** in a sourced file, which they leave the way
+  they leave a function body — see [`source`](#source).
 
 - **Redirection.** A function takes `>`, `>>`, `<`, `2>`, and `2>&1` like any command
   (`f > out.txt`, `r < input`). Because a function runs inside the shell, the
