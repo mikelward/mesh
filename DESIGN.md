@@ -2538,7 +2538,17 @@ open:*
     the real need; if a general escape hatch is wanted, prefer a **scoped**
     primitive over bash's
     string-concatenating `eval`. Leaning: a forwarding-wrapper shorthand with
-    transparent flag passthrough, defer general dynamic definition.)*
+    transparent flag passthrough, defer general dynamic definition.*
+
+    *Deferred, and noted only so the constraint is written down: a name
+    containing a **dot** cannot be defined at all — `func a.b()` is a syntax
+    error in every spelling, quoted included. bash, zsh and fish all accept one,
+    which is how their `set_up_ssh_aliases` loops give an FQDN `Host` entry a
+    command. Command position looks unambiguous (a bare word there is already a
+    command name, and dotted program names are ordinary), so the parser change
+    would be narrow; the question is value-call position against member access.
+    Low priority — the motivating case, FQDN ssh aliases, is not actually
+    wanted, and the config that raised it filters those names out deliberately.)*
 
 ### Isolation and subshells
 
