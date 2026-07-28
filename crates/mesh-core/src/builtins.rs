@@ -622,7 +622,7 @@ pub(crate) struct CdTarget {
     /// Absolute, with symlinks and `..` already resolved: what `$env.PWD` will
     /// read after the move, which is what a `precd` handler is told.
     path: std::path::PathBuf,
-    /// `cd -` prints where it landed, as POSIX does.
+    /// `cd -`, and a `CDPATH` hit, print where they landed, as POSIX does.
     echo: bool,
 }
 
@@ -634,15 +634,16 @@ impl CdTarget {
 }
 
 /// Resolve `cd`'s operand without moving: no argument → `$HOME`; `cd -` →
-/// `$OLDPWD`. `Err` carries the status, its diagnostic already reported.
+/// `$OLDPWD`; a plain relative name → the first `$CDPATH` entry that holds it.
+/// `Err` carries the status, its diagnostic already reported.
 ///
 /// Resolution is `canonicalize`, so the path handed on is the physical one
 /// `$PWD` will hold, and a destination that does not exist is reported here —
 /// before any hook has run for a move that was never going to happen.
 ///
-/// Not yet implemented (deferred to the language layer): `CDPATH`, `--physical`,
-/// autocd, and a shell-maintained *logical* cwd — `$PWD` is the physical
-/// `getcwd` path for now.
+/// Not yet implemented (deferred to the language layer): `--physical`, autocd,
+/// and a shell-maintained *logical* cwd — `$PWD` is the physical `getcwd` path
+/// for now.
 pub(crate) fn cd_target(args: &[String]) -> Result<CdTarget, u8> {
     if args.len() > 1 {
         note!("mesh: cd: too many arguments");
@@ -669,7 +670,13 @@ pub(crate) fn cd_target(args: &[String]) -> Result<CdTarget, u8> {
                 return Err(1);
             }
         },
-        Some(dir) => dir.into(),
+        Some(dir) => match cdpath_hit(dir) {
+            Some((found, announce)) => {
+                echo = announce;
+                found
+            }
+            None => dir.into(),
+        },
     };
 
     let path = Path::new(&target);
@@ -685,6 +692,50 @@ pub(crate) fn cd_target(args: &[String]) -> Result<CdTarget, u8> {
             Err(1)
         }
     }
+}
+
+/// Search `$CDPATH` for `operand`, yielding the directory found and whether the
+/// move should announce itself.
+///
+/// `CDPATH` is a search path for `cd` the way `PATH` is one for commands, and
+/// mesh already carries it as a [path-type list][crate::environ] — so it was
+/// splittable, appendable, and exported, while `cd` itself ignored it. Entries
+/// are tried in order and the first that *holds a directory* of that name wins;
+/// with no hit the caller falls back to resolving against the current directory,
+/// so setting `CDPATH` never breaks a plain `cd subdir`.
+///
+/// Two conventions come from POSIX, and bash reads them the same way:
+///
+/// - **A dot-relative or absolute operand never searches.** `.`, `..`, `./x`,
+///   `../x`, and `/x` resolve from where you are, so `cd ../` cannot land in a
+///   `CDPATH` entry. An **empty** operand does not search either — `entry/""` is
+///   the entry itself, which would turn `cd ""` into a jump.
+/// - **A hit through a non-empty entry prints where it landed**, since the
+///   destination is not the one the operand appears to name. An empty entry *is*
+///   the current directory, so that one is silent.
+fn cdpath_hit(operand: &str) -> Option<(OsString, bool)> {
+    if operand.is_empty() || resolves_from_here(operand) {
+        return None;
+    }
+    let cdpath = env::var_os("CDPATH")?;
+    env::split_paths(&cdpath).find_map(|entry| {
+        let candidate = entry.join(operand);
+        // `is_dir` follows symlinks, so a link to a directory is one — the same
+        // answer `cd` itself would give.
+        candidate
+            .is_dir()
+            .then(|| (candidate.into_os_string(), !entry.as_os_str().is_empty()))
+    })
+}
+
+/// Is this operand one that always resolves from the current directory? An
+/// absolute path, or the dot-relative forms — including bare `.` and `..`, which
+/// name the same places their slashed spellings do.
+fn resolves_from_here(operand: &str) -> bool {
+    Path::new(operand).is_absolute()
+        || matches!(operand, "." | "..")
+        || operand.starts_with("./")
+        || operand.starts_with("../")
 }
 
 /// Move to an already-resolved target, updating `$PWD` and `$OLDPWD` so child
