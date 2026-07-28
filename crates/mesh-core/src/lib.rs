@@ -36,6 +36,7 @@ mod options;
 pub mod parser;
 mod reaper;
 mod repl;
+mod stack;
 mod vars;
 mod whence;
 

@@ -258,6 +258,13 @@ pub enum ParseErrorKind {
     /// says *unknown* rather than *unimplemented*: a name the vocabulary reserves but
     /// the engine cannot apply yet (`:sort`) parses fine and reports at run time.
     UnknownModifier(String),
+    /// Input nested past [`MAX_DEPTH`]. Its own variant because the failure is a
+    /// *resource* limit rather than a shape the grammar rejects: the source may be
+    /// perfectly well formed, and the honest report is that mesh will not go that
+    /// deep, not that the reader wrote something wrong. Without it the recursive
+    /// descent runs out of stack and the process aborts, which turns malformed
+    /// input into a dead shell.
+    TooDeep,
     /// A `(…)` after a glob naming something that is not a qualifier — `*(q)`,
     /// `*(kind: file)`. Carries the spelling so the message can quote it back;
     /// its own variant because the reader wrote a *glob* option and the fix is
@@ -313,6 +320,10 @@ impl std::fmt::Display for ParseError {
                     "syntax error: `{name}` is reserved and cannot be a parameter"
                 )
             }
+            ParseErrorKind::TooDeep => write!(
+                f,
+                "syntax error: nested too deeply; mesh parses at most {MAX_DEPTH} levels"
+            ),
             ParseErrorKind::UnknownModifier(name) => write!(
                 f,
                 "syntax error: `:{name}` is not a modifier; quote the whole word to \
@@ -826,6 +837,7 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
         tokens,
         position: 0,
         source_len: source.len(),
+        depth: 0,
     };
     match parser.source(None) {
         Ok(tree) => Ok(ParseOutcome::Complete(tree)),
@@ -875,6 +887,7 @@ pub(crate) fn params_prefix_status(list: &str) -> PrefixStatus {
         tokens,
         position: 0,
         source_len: list.len(),
+        depth: 0,
     }
     .parameters_prefix()
 }
@@ -925,6 +938,12 @@ fn is_incomplete(kind: &ParseErrorKind) -> bool {
 struct Lexer<'a> {
     source: &'a str,
     position: usize,
+    /// How many `"$( … )"` the lexer is currently *inside*. A capture in a string is
+    /// lexed and parsed where it is found, so `"$(puts "$(…)")"` recurses through
+    /// the lexer, not the parser — [`Parser::depth`] alone never sees it. The two
+    /// counters share [`MAX_DEPTH`] rather than each getting their own: the frames
+    /// sit on one stack, so it is the total that has to be bounded.
+    capture_depth: usize,
 }
 
 impl<'a> Lexer<'a> {
@@ -932,6 +951,7 @@ impl<'a> Lexer<'a> {
         Self {
             source,
             position: 0,
+            capture_depth: 0,
         }
     }
 
@@ -1106,8 +1126,11 @@ impl<'a> Lexer<'a> {
                             // piece rather than text, so its output crosses whole:
                             // quoted, so never split and never globbed.
                             if self.source[self.position..].starts_with("$(") {
-                                let (expression, end) =
-                                    capture_in_string(self.source, self.position)?;
+                                let (expression, end) = capture_in_string(
+                                    self.source,
+                                    self.position,
+                                    self.capture_depth + 1,
+                                )?;
                                 pieces.push(WordPiece::Value(Box::new(Spanned {
                                     value: expression,
                                     span: self.position..end,
@@ -1401,16 +1424,31 @@ fn push_variable(pieces: &mut Vec<WordPiece>, variable: &str, quote: QuoteMode) 
 /// grammar answers — `"$(puts "a)b")"` closes on the second `)`, not the first. So
 /// the body is lexed and parsed here and now, which is also what keeps a syntax
 /// error inside it a *parse* error rather than a surprise at run time.
-fn capture_in_string(source: &str, dollar: usize) -> Result<(Expr, usize), ParseError> {
+fn capture_in_string(
+    source: &str,
+    dollar: usize,
+    depth: usize,
+) -> Result<(Expr, usize), ParseError> {
+    if depth > MAX_DEPTH {
+        return Err(ParseError {
+            kind: ParseErrorKind::TooDeep,
+            span: dollar..dollar + 2,
+        });
+    }
     let (tokens, end) = Lexer {
         source,
         position: dollar + 2,
+        capture_depth: depth,
     }
     .capture_body()?;
+    // The inner parse starts where the lexer left off rather than at zero, so a
+    // shape that alternates the two — a capture in a string holding a group holding
+    // a capture in a string — is bounded by the sum instead of by neither.
     let mut parser = Parser {
         tokens,
         position: 0,
         source_len: end,
+        depth,
     };
     Ok((Expr::Capture(parser.source(Some(TokenKind::RParen))?), end))
 }
@@ -1903,7 +1941,26 @@ struct Parser {
     tokens: Vec<Token>,
     position: usize,
     source_len: usize,
+    /// How many nested constructs deep [`Parser::primary`] currently is, so that
+    /// input can be *refused* before the recursive descent runs out of stack.
+    depth: usize,
 }
+
+/// How deep a nesting the parser accepts before reporting [`ParseErrorKind::TooDeep`].
+///
+/// Far past anything written by hand — input nested 100 deep is generated, or
+/// pathological, or a paste that went wrong — and comfortably under what the
+/// stack holds. The shapes cost different amounts per level; measured on a debug
+/// build a chain of `$( … )` captures is the most expensive, overflowing the
+/// usual 8 MiB at 253 levels, so this leaves room to spare on the stack a shell
+/// actually starts with.
+///
+/// It cannot leave room on *every* stack, which is the limitation to know about:
+/// under `ulimit -s 1024` that same shape overflows at 30, below this limit, and
+/// the check never gets to fire. That case is why [`crate::stack`] exists — the
+/// fault is reported rather than aborted — but the honest summary is that the
+/// limit is the fix for the common stack and the handler is the net for the rest.
+const MAX_DEPTH: usize = 100;
 
 impl Parser {
     fn source(&mut self, closer: Option<TokenKind>) -> Result<Source, ParseError> {
@@ -2715,7 +2772,11 @@ impl Parser {
         let else_branch = if self.take_word("else") {
             self.newlines();
             Some(if self.word("if") {
-                ElseBranch::If(Box::new(self.if_expr()?))
+                // Counted, because an `else if` chain recurses *here* and nowhere
+                // the other counters can see: `then_body` above has already given
+                // its level back by the time this runs, so a chain of them would
+                // otherwise descend at a constant depth of zero.
+                ElseBranch::If(Box::new(self.deeper(Self::if_expr)?))
             } else {
                 ElseBranch::Block(self.block()?)
             })
@@ -3045,9 +3106,21 @@ impl Parser {
         Ok(Executable::Control { kind, value, guard })
     }
 
+    /// Counted like [`Parser::primary`], and separately from it, because a
+    /// statement-position `if` never descends through `primary` — it is read by
+    /// the statement path directly, so guarding the expression side alone left
+    /// `if true { if true { … } }` aborting at a few thousand levels. An
+    /// expression-position `if` passes both counters and so is held to half the
+    /// depth, which is the right way round: its frames are the larger pair.
     fn block(&mut self) -> Result<Source, ParseError> {
         self.expect(&TokenKind::LBrace, "`{`")?;
-        self.source(Some(TokenKind::RBrace))
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(self.error(ParseErrorKind::TooDeep));
+        }
+        let body = self.source(Some(TokenKind::RBrace));
+        self.depth -= 1;
+        body
     }
 
     fn expression(&mut self) -> Result<Expr, ParseError> {
@@ -3194,11 +3267,16 @@ impl Parser {
         Ok(left)
     }
 
+    /// Counted around the *recursive* calls rather than around the whole function,
+    /// which matters: `prefix` is on the path to every operand, so counting on
+    /// entry would spend a level on each one and halve what the limit means for
+    /// ordinary nesting. A prefix chain is the only thing here that recurses, so
+    /// it is the only thing that costs.
     fn prefix(&mut self) -> Result<Expr, ParseError> {
         if self.operator("-") {
             let minus = self.peek().expect("the operator just peeked").span.clone();
             self.position += 1;
-            let operand = self.prefix()?;
+            let operand = self.deeper(Self::prefix)?;
             if let Some(literal) = negative_literal(&minus, &operand) {
                 return Ok(literal);
             }
@@ -3210,10 +3288,27 @@ impl Parser {
         if self.eat(&TokenKind::Spread).is_some() {
             return Ok(Expr::Unary {
                 op: UnaryOp::Spread,
-                expression: Box::new(self.prefix()?),
+                expression: Box::new(self.deeper(Self::prefix)?),
             });
         }
         self.postfix()
+    }
+
+    /// Run `step` one level deeper, reporting [`ParseErrorKind::TooDeep`] rather
+    /// than descending past [`MAX_DEPTH`].
+    ///
+    /// The depth is left incremented when the limit is hit, on purpose: the error
+    /// unwinds the whole descent, so nothing below will parse anyway, and putting
+    /// the count back would only let a sibling construct start another run just as
+    /// deep.
+    fn deeper<T>(&mut self, step: fn(&mut Self) -> Result<T, ParseError>) -> Result<T, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(self.error(ParseErrorKind::TooDeep));
+        }
+        let parsed = step(self);
+        self.depth -= 1;
+        parsed
     }
 
     fn postfix(&mut self) -> Result<Expr, ParseError> {
@@ -3244,7 +3339,14 @@ impl Parser {
                 self.newlines();
                 value = Expr::Call {
                     callee: Box::new(value),
-                    arguments: self.arguments()?,
+                    // Counted, for the same reason the `else if` arm is: `primary`
+                    // has already given its level back by the time the trailer loop
+                    // runs, so `f(f(f(…)))` would otherwise nest at a constant depth
+                    // of zero. Counted here rather than around the whole loop so
+                    // that a trailer which does *not* descend — `a.b`, or a chain of
+                    // indexes — stays free, and ordinary nesting keeps its full
+                    // budget.
+                    arguments: self.deeper(Self::arguments)?,
                 };
             } else if self.eat(&TokenKind::Dot).is_some() {
                 value = Expr::Member {
@@ -3258,7 +3360,7 @@ impl Parser {
             {
                 self.position += 1;
                 self.newlines();
-                let index = self.expression()?;
+                let index = self.deeper(Self::expression)?;
                 self.newlines();
                 self.expect(&TokenKind::RBracket, "`]`")?;
                 value = Expr::Index {
@@ -3308,7 +3410,7 @@ impl Parser {
                         .is_some_and(|token| token.span.start == self.previous_end())
                 {
                     self.position += 1;
-                    let mut arguments = self.arguments()?;
+                    let mut arguments = self.deeper(Self::arguments)?;
                     // The first argument of the replace family is a **regex match
                     // slot** (`DESIGN.md` §"String"), so a bare `/…/` there reads as
                     // a pattern rather than an absolute path — the same conversion
@@ -3564,7 +3666,21 @@ impl Parser {
         })
     }
 
+    /// Most nested constructs descend through here — a parenthesized group, a list
+    /// or map literal, a capture, and the block of an expression-position `if` /
+    /// `match` / `for` — so one counter on this call covers all of those. The ones
+    /// it does not see have counters of their own: [`Parser::block`] for a
+    /// statement-position `if`, [`Parser::prefix`] for a chain of `-` or `...`,
+    /// and the `else if` arm of [`Parser::if_expr`].
+    ///
+    /// Counted rather than measured against the real stack: a limit that depended
+    /// on how much stack happened to be left would accept a script one day and
+    /// refuse it the next.
     fn primary(&mut self) -> Result<Expr, ParseError> {
+        self.deeper(Self::primary_inner)
+    }
+
+    fn primary_inner(&mut self) -> Result<Expr, ParseError> {
         if self.eat(&TokenKind::CaptureStart).is_some() {
             self.newlines();
             return Ok(Expr::Capture(self.source(Some(TokenKind::RParen))?));
@@ -4813,6 +4929,7 @@ mod tests {
                 source_len: source.len(),
                 position: 0,
                 tokens,
+                depth: 0,
             };
             // The whole source, which is what the value parse would consume here.
             let end = parser.tokens.len();
