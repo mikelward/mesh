@@ -4591,6 +4591,21 @@ to avoid" rather than promising the latter as done.
   no precedent either) and `value` (reads as a noun, weak as a verb). Whichever wins is
   **contextual**, like `fork` / `global` / `unset`, so a program or variable of that
   name stays reachable.)*
+
+  *(**Considered and deferred: dropping implicit stdout capture in value position.**
+  Not being pursued, recorded in case the remaining sharp edges make it worth
+  revisiting. Today a value-position block whose tail is a command runs the body and
+  yields its **captured stdout**, gated on exit 0 — see
+  [Matching](#matching-match). The alternative is that a value comes only from a
+  **value expression**: `{ wc -l < $f }` would then have no value at all, only a
+  status, and you would write `{ $(wc -l < $f) }` to ask for the output. What it
+  buys is that capture stops being invisible, and two surprises go with it — the
+  gate swallowing a nonzero result (`x = if true { puts a; false }` leaves `x`
+  unbound), and the capture including **every** statement's stdout rather than the
+  tail's, so `{ puts a; some-cmd }` yields the `a` too. What it costs is typing, felt
+  most in match arms, where a captured command is the common case. Bare-vs-quoted was
+  taken without it, so the two are independent: this one is purely about whether an
+  implicit capture should remain reachable without `$( … )`.)*
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
