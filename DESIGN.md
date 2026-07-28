@@ -3704,7 +3704,18 @@ file / dir / enum value. A spec is found by a layered resolver:
    associated with the resolved executable* (same package / install). It needs
    *no execution*, so it is preferred; but a system page is **not** trusted for a
    `PATH`-shadowing local binary (a project-local `./tool` must not inherit
-   `/usr/bin/tool`'s page), which instead falls through to the probe;
+   `/usr/bin/tool`'s page), which instead falls through to the probe. The
+   association is the **install prefix**: the page is looked for beside the
+   executable — `<prefix>/bin/tool` is documented under `<prefix>/share/man` —
+   rather than through `MANPATH` or `$PATH`, since those say where pages *are*
+   and the question is which page belongs to *this* binary. Formatting is left to
+   **`man -l <path>`**, which decompresses the page and handles every roff dialect;
+   read through a pipe it returns plain text, so nothing has to be unescaped. That
+   makes this layer "runs a **formatter over a data file**" rather than literally
+   no execution — a different bet from running the user's command, and the reason
+   it still outranks the probe. A page yields **options only**; subcommands are
+   left to the probe, since a page documents them in prose with none of the table
+   structure a help listing has;
 3. else a spec **auto-generated from `cmd --help`** — the executing probe, for
    external commands only;
 4. else plain **file / dir** completion — the universal fallback.
