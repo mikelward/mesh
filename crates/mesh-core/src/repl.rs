@@ -4684,22 +4684,20 @@ fn eval_value_body(
             shell,
         );
     }
-    let value_final = body.statements.last().is_some_and(|statement| {
-        !statement.background
-            && statement.and_or.rest.is_empty()
-            && matches!(
-                statement.and_or.first,
-                parser::Executable::Expression { .. }
-                    | parser::Executable::If(_)
-                    | parser::Executable::Match(_)
-                    | parser::Executable::For { .. }
-            )
-    });
-    if value_final {
-        eval_body(body, last, in_function, shell)
-    } else {
-        capture_source(body, last, in_function, shell)
-    }
+    // No capture. A block is not a `$(…)`: its commands stream to wherever stdout
+    // goes, in value position exactly as in statement position, and its value is
+    // the last thing that *produced* one. That is what `func` has always done, so
+    // routing `if` and `match` through the same `eval_body` is what makes the three
+    // agree.
+    //
+    // Capturing here meant the same block text either streamed or was silently
+    // eaten depending on whether anyone bound the result — `x = if true { echo hi }`
+    // swallowed `hi` and handed back the bytes, while the bare statement printed
+    // them — and the whole block was captured, not just its tail. The exit-0 gate
+    // that came with it failed silently too: a failing command left the binding
+    // unmade, so the error surfaced as an "unbound variable" on a later line.
+    // Bytes come from `$(…)`, which is the thing that means "capture".
+    eval_body(body, last, in_function, shell)
 }
 
 fn eval_for_expr(
@@ -7677,7 +7675,18 @@ fn evaluate_default(
     default: &parser::Expr,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    eval_expr(default, 0, true, shell).map_err(|step| match step {
+    let evaluated = eval_expr(default, 0, true, shell);
+    // A `break`/`continue` the default raised has already been reported as outside
+    // a loop; it produced no value, so the binding fails rather than binding the
+    // placeholder and running the body. The flag is cleared here because it belongs
+    // to no loop — leaving it set would break the *caller's* loop, which is the
+    // escape this exists to stop.
+    if shell.control.is_some() {
+        shell.control = None;
+        note!("mesh: {name}: could not evaluate default for `{param}`");
+        return Err(Step::Continue(2));
+    }
+    evaluated.map_err(|step| match step {
         exit @ Step::Exit(_) => exit,
         ret @ Step::Return(..) => ret,
         _ => {

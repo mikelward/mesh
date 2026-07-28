@@ -9634,6 +9634,53 @@ fn return_carries_a_typed_value_whose_status_is_a_view_of_it() {
 }
 
 #[test]
+fn a_value_block_streams_its_commands_instead_of_capturing_them() {
+    // The three value-producing blocks agree: output streams, and the block's value
+    // is the last thing that *produced* one. Capturing here meant the same text
+    // either streamed or was silently eaten depending on whether anyone bound the
+    // result.
+    let out = run_with_input(
+        "a = if true { echo from-if }\n\
+         b = match 1 { 1 => { echo from-match } }\n\
+         func f() { echo from-func }\n\
+         c = f()\n\
+         puts \"<$a> <$b> <$c>\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "from-if\nfrom-match\nfrom-func\n<0> <0> <0>\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // A value expression in the tail still yields its value, in every one of them.
+    let valued = run_with_input(
+        "a = if true { \"x\" }\n\
+         b = match 1 { 1 => { \"y\" } }\n\
+         func f() { \"z\" }\n\
+         c = f()\n\
+         puts \"<$a> <$b> <$c>\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&valued.stdout), "<x> <y> <z>\n");
+}
+
+#[test]
+fn a_failing_command_in_a_value_block_no_longer_skips_the_binding() {
+    // The exit-0 gate that came with the capture failed *silently*: the assignment
+    // was skipped entirely, so the error surfaced as an "unbound variable" on a
+    // later line with nothing to say why. The status is now just the block's value.
+    let out = run_with_input("x = if true { sh -c 'exit 3' }\nputs \"x=$x\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x=3\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn only_an_explicit_capture_takes_a_blocks_bytes() {
+    // `$(…)` is the thing that means "capture", and it still does.
+    let out = run_with_input("x = $(echo hi)\nputs \"<$x>\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "<hi>\n");
+}
+
+#[test]
 fn a_condition_is_a_bool_or_a_command_and_nothing_else() {
     // Every other type is refused by name, with the comparison to write instead.
     // Each of these used to branch, under a different rule per type.
@@ -9875,15 +9922,16 @@ fn a_bare_word_is_a_command_and_a_quoted_one_is_a_string() {
     // argument flipped a literal into an execution, and `x = if true { pwd }`
     // silently bound the wrong thing with no error to show for it.
     let out = run_with_input(
-        "bare = if true { pwd }\n\
-         quoted = if true { \"pwd\" }\n\
+        "quoted = if true { \"pwd\" }\n\
          args = if true { echo hi }\n\
-         puts \"<$quoted>\" \"<$args>\"\n\
-         puts eq if $bare == $(pwd)\n",
+         puts \"<$quoted>\" \"<$args>\"\n",
     );
+    // `pwd` and `echo hi` are commands, so they *run* and their output streams;
+    // the block's value is the status they left, not their bytes. Only the quoted
+    // word is a string literal.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "<pwd> <hi>\neq\n",
+        "hi\n<pwd> <0>\n",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -12827,11 +12875,15 @@ fn multiple_quoted_glob_hyphens_stay_literal() {
 }
 
 #[test]
-fn command_branch_output_becomes_the_if_expression_value() {
+fn a_command_branch_streams_rather_than_becoming_the_if_expression_value() {
+    // A block is not a `$(…)`. The branch's output goes where stdout goes — in
+    // value position exactly as in statement position — and the `if` yields the
+    // status of the command that produced no value, the same answer a `func` body
+    // ending in a command gives. Bytes come from an explicit capture.
     let out = run_with_input(
-        "french = true\ngreeting = if $french { printf bonjour } else { hi }\nputs $greeting\n",
+        "french = true\ngreeting = if $french { printf bonjour } else { hi }\nputs \"<$greeting>\"\n",
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "bonjour\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bonjour<0>\n");
     assert!(
         out.status.success(),
         "{}",
@@ -13943,10 +13995,9 @@ fn an_attached_redirection_is_not_read_as_a_match_arrow() {
 #[test]
 fn a_block_arms_value_still_follows_the_block_value_rules() {
     // A `=> { … }` block yields a value the way any block does. Inside braces a
-    // bare word is a command whatever its arity, so `{ echo }` runs `echo` and
-    // captures its (empty) output rather than yielding the string "echo" — the
-    // one-word case no longer disagrees with the longer one. A quoted word is the
-    // string literal.
+    // bare word is a command whatever its arity, so `{ echo }` *runs* `echo` — its
+    // output streams and the block's value is the status, not the bytes — while a
+    // quoted word is the string literal.
     let out = run_with_input(
         "word = match 1 { 1 => { echo } }\n\
          run = match 1 { 1 => { echo two words } }\n\
@@ -13955,7 +14006,7 @@ fn a_block_arms_value_still_follows_the_block_value_rules() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "<> <two words> <echo>\n"
+        "\ntwo words\n<0> <0> <echo>\n"
     );
     assert!(
         out.status.success(),

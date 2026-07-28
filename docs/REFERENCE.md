@@ -2252,10 +2252,11 @@ how a word reads: `=> markdown` is the string `"markdown"`, while
 `=> { tail -f $file }` is a block whose commands run.
 
 Inside a block a bare word is a command whatever its arity, so
-`x = match 1 { 1 => { echo } }` runs `echo` and takes its output, exactly as
-`{ echo two words }` does. Quote the word when you mean the string:
-`1 => { "echo" }`. Outside a block the arrow already gives you the terse value
-form, `=> echo`.
+`x = match 1 { 1 => { echo } }` *runs* `echo` — its output streams and the block
+yields the status, since a block is not a capture — exactly as `{ echo two words }`
+does. Quote the word when you mean the string: `1 => { "echo" }`, or capture the
+bytes explicitly with `{ $(echo) }`. Outside a block the arrow already gives you
+the terse value form, `=> echo`.
 
 ```mesh
 kind = match $file {
