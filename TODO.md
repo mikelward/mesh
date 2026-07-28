@@ -1482,8 +1482,8 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       colon grab has therefore already happened** — this item completes its
       remaining half rather than opening a new one.
 
-  - [ ] **`:` + identifier is reserved by the grammar, not gated on a name list**
-        *(decided)*. An unknown modifier is an **error**, not text. Half of this
+  - [x] **`:` + identifier is reserved by the grammar, not gated on a name list**
+        *(decided; shipped)*. An unknown modifier is an **error**, not text. Half of this
         already holds — expression position claims the chain outright
         (`x = ubuntu:latest` is a syntax error today), and `modifier_name`
         (`parser.rs:4562`) consults `MODIFIER_NAMES` only to decide the

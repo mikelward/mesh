@@ -251,6 +251,13 @@ pub enum ParseErrorKind {
     /// message names both, and it keeps this the loud error it was before value
     /// arguments existed rather than three arguments where one was written.
     GluedValueArgument,
+    /// An attached `:name` naming no modifier — `ubuntu:latest`, `host:port`. Its
+    /// own variant because `:` + identifier is reserved by the grammar rather than
+    /// gated on a name list, so this is the diagnostic that replaces the old silent
+    /// fallback to literal text. Carries the name so the message can quote it, and
+    /// says *unknown* rather than *unimplemented*: a name the vocabulary reserves but
+    /// the engine cannot apply yet (`:sort`) parses fine and reports at run time.
+    UnknownModifier(String),
     /// A `(…)` after a glob naming something that is not a qualifier — `*(q)`,
     /// `*(kind: file)`. Carries the spelling so the message can quote it back;
     /// its own variant because the reader wrote a *glob* option and the fix is
@@ -306,6 +313,12 @@ impl std::fmt::Display for ParseError {
                     "syntax error: `{name}` is reserved and cannot be a parameter"
                 )
             }
+            ParseErrorKind::UnknownModifier(name) => write!(
+                f,
+                "syntax error: `:{name}` is not a modifier; quote the whole word to \
+                 keep it as text (`\"x:{name}\"`), or brace the name when it comes \
+                 from a variable (`\"${{x}}:{name}\"`)"
+            ),
             ParseErrorKind::UnknownGlobQualifier(text) => write!(
                 f,
                 "syntax error: `{text}` is not a glob qualifier; the types are \
@@ -2377,8 +2390,7 @@ impl Parser {
                 self.tokens.get(self.position + 1).map(|t| &t.value),
                 Some(TokenKind::Colon)
             ) && abuts(self, 1)
-                && let Some(name) = self.word_text_at(2)
-                && modifier_name(name)
+                && self.word_text_at(2).is_some()
                 && abuts(self, 2)
             {
                 return true;
@@ -3243,7 +3255,7 @@ impl Parser {
                     index: Box::new(index),
                 };
             } else if self.same(&TokenKind::Colon)
-                && self.word_text_at(1).is_some_and(modifier_name)
+                && self.word_text_at(1).is_some()
                 // Both halves have to **abut**, which is what keeps a map literal's
                 // `key: value` out of the chain: `[host: upper]` is a map, not the
                 // string `HOST`. Without it any map whose value word happened to name
@@ -3260,7 +3272,19 @@ impl Parser {
                     .is_some_and(|(name, colon)| name.span.start == colon.span.end)
             {
                 self.position += 1;
+                let start = self.previous_end();
                 let name = self.name()?;
+                // `:` + identifier is reserved by the grammar, so a name the
+                // vocabulary does not hold is an error rather than falling back to
+                // literal text. A name it *does* hold but the engine cannot apply yet
+                // (`:sort`) parses fine and reports at run time, which is why this
+                // asks `modifier_name` rather than whether it can be applied.
+                if !modifier_name(&name) {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::UnknownModifier(name),
+                        span: start..self.previous_end(),
+                    });
+                }
                 // The `(` has to **abut** the name, exactly as it must for an attached
                 // call and an index. Command position separates arguments by spacing,
                 // so `puts $x:upper (1)` is the chain plus a separate `(1)`; that used
@@ -5043,7 +5067,10 @@ mod tests {
 
     #[test]
     fn assembles_adjacent_punctuation_into_command_words() {
-        let tree = complete("echo file.txt ./tool key:value xs[0]");
+        // `key:2` rather than `key:value`: a colon followed by a bare *identifier* is
+        // a reserved modifier chain, so only a non-identifier keeps the old
+        // punctuation-glues-into-a-word reading. `key:/path` and `a:$b` do too.
+        let tree = complete("echo file.txt ./tool key:2 xs[0]");
         let Executable::Pipeline(pipeline) = &tree.statements[0].and_or.first else {
             panic!()
         };
@@ -5055,7 +5082,7 @@ mod tests {
                 CommandItem::Redirect { .. } | CommandItem::Value(_) => panic!(),
             })
             .collect();
-        assert_eq!(words, ["echo", "file.txt", "./tool", "key:value", "xs[0]"]);
+        assert_eq!(words, ["echo", "file.txt", "./tool", "key:2", "xs[0]"]);
     }
 
     #[test]
