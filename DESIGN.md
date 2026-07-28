@@ -1611,6 +1611,36 @@ instead. Kept as the record and as possible future sugar:
   non-interpolating string (so `\'` is simply part of a full escape set), and rawness
   lives in `r'…'`. No longer open.
 
+#### Bare words and quoted values — decided
+
+**A bare word is a command; a quoted word is a string literal.** One sentence, and it
+holds in every position a statement is read — including the tail of a block, which is
+where it used to stop holding.
+
+```mesh
+x = if true { pwd }        # runs pwd, yields its output
+x = if true { "pwd" }      # the string "pwd"
+"foo"                      # a string statement — nothing is run
+```
+
+Two bare spellings escape, because neither can name a command: an **integer literal**
+and **`true`/`false`**. That is what keeps `func answer() { 42 }` the integer and
+`{ false }` the boolean, and it is a lexical fact about the word rather than a coercion.
+
+What this replaced was a **single-bare-word block-tail coercion**: a one-word block was
+read as a scalar literal, so `{ pwd }` was the string `"pwd"` while `{ pwd . }` ran.
+Three footguns came out of that, and the worst was silent — `x = if true { pwd }` bound
+`"pwd"` with no error to show for it. Adding an argument flipped a literal into an
+execution, and the same block text meant different things in statement and expression
+position. Quoting was inert in the tail (`{ pwd }` and `{ "pwd" }` agreed), so there was
+no reliable way to *ask* for either reading.
+
+The cost is one spelling: a lone quoted word no longer runs, so a program whose path
+needs quoting is reached through **`command -- "/opt/my program"`**. Quoting a command
+name that *takes arguments* is unaffected — `"if" x` still resolves func → external, as
+[Command resolution](#command-resolution-and-help) specifies, because that is a
+multi-word command rather than a lone scalar.
+
 ### Arrays (lists)
 
 The list is mesh's core value — command substitutions already produce lists
@@ -2928,15 +2958,12 @@ and it behaves as it always has — by position, exactly like an `if` branch:
 - **Expression position** — `y = match $x { … }`, or nested in another value expression
   — resolves the block to a value by its tail (`eval_value_body`): (1) a
   **value-expression tail** (`=> { "text" }`, `{ $v }`, `{ [a b] }`, nested `if`/`match`)
-  yields that value; (2) a block that is a **single bare word** (`=> { markdown }`) is read
-  as a **scalar literal** — usually the string `"markdown"`, but a numeric or boolean
-  spelling types accordingly (`{ 7 }` is integer `7`, `{ false }` is boolean `false`),
-  and only when that word is the whole body (`{ puts x; text }` runs `text`); (3) a body
-  ending in a **command** (`{ wc -l < $f }`) runs the **whole
+  yields that value; (2) a body ending in a **command** (`{ wc -l < $f }`, and
+  `{ markdown }` — see the bare/quoted rule below) runs the **whole
   body** and yields its captured stdout **only on exit 0** — note this captures *every*
   statement's stdout, not just the tail's, so `{ puts a; some-cmd }` includes the `a`
-  (nonzero aborts; a bare `$(…)` shares the exit-0 gate). To return a string reliably
-  today, quote it: `{ "text" }`.
+  (nonzero aborts; a bare `$(…)` shares the exit-0 gate). To yield a string, quote it:
+  `{ "text" }`.
   *(A function's value-return is **not** yet an expression context — a `match` as a
   function's last statement runs in statement position and the value is discarded;
   structured value-return / value-calls beyond `re(…)` are unbuilt.)*
@@ -4544,10 +4571,12 @@ to avoid" rather than promising the latter as done.
   dynamic) scope against the lexical default; and an **open value-production
   question** *(from the match-syntax exploration — see [Matching](#matching-match))*:
   whether functions/blocks should require an **explicit value keyword** instead of the
-  settled implicit **last-expression** rule, which would also
-  make `{ … }` blocks pure command-context (dropping the **single-bare-word block-tail**
-  coercion — *not* the general assignment-RHS rule, which stays). Language-wide — it
+  settled implicit **last-expression** rule. Language-wide — it
   touches every value-producing block: `if`, `match`, `for`, and `func` alike.
+  *(The **single-bare-word block-tail coercion** this used to be bundled with is
+  **gone** — settled independently by
+  [Bare words and quoted values](#bare-words-and-quoted-values--decided), which did not
+  need a value keyword to get there. The general assignment-RHS rule stays either way.)*
 
   *(**Spelling, if one is ever needed: `result`, not `yield`.** The two are not
   interchangeable names for one thing. `yield` means **generator** in every language a

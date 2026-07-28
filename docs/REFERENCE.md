@@ -2241,11 +2241,11 @@ An arm's body is either a **value** or a `{ }` **block**, and the arrow decides
 how a word reads: `=> markdown` is the string `"markdown"`, while
 `=> { tail -f $file }` is a block whose commands run.
 
-One caveat, inherited from how any block yields a value: a block that is a *single
-bare word* is read as a scalar when the `match` is in **expression** position, so
-`x = match 1 { 1 => { echo } }` binds `"echo"` rather than running it, while the
-same arm in statement position runs `echo`. Give the block more than one word — or
-use a value arm — when you mean one or the other unambiguously.
+Inside a block a bare word is a command whatever its arity, so
+`x = match 1 { 1 => { echo } }` runs `echo` and takes its output, exactly as
+`{ echo two words }` does. Quote the word when you mean the string:
+`1 => { "echo" }`. Outside a block the arrow already gives you the terse value
+form, `=> echo`.
 
 ```mesh
 kind = match $file {
