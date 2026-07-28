@@ -1162,6 +1162,7 @@ fn run_executable(
             name,
             parameters,
             body,
+            wrapper,
         } => {
             if name == "func" || name == "return" || name == "not" || builtins::is_builtin(name) {
                 note!("mesh: func: `{name}` is a reserved name and cannot be a function name");
@@ -1174,6 +1175,7 @@ fn run_executable(
                 FuncDef {
                     params: parameters.clone(),
                     body: body.clone(),
+                    wrapper: *wrapper,
                 },
             );
             Step::Continue(0)
@@ -3129,11 +3131,13 @@ fn eval_call(
         let (params, body) = function
             .as_lambda()
             .expect("a callable is a lambda or a modifier reference");
+        // A lambda has no `wrapper` marker to carry, so it always parses flags.
         return call_signature_for_value(
             &callee_description(callee),
             params,
             body,
             arguments,
+            true,
             last,
             in_function,
             shell,
@@ -5595,17 +5599,23 @@ fn stage_argument(
 /// Run an in-shell function call whose arguments are already expanded: generated
 /// `--help` first, then the call itself.
 fn dispatch_function_call(name: &str, args: Vec<(Value, bool)>, shell: &mut Shell) -> Step {
+    // A `wrapper func` reads no flags at all: `--help` belongs to whatever it
+    // forwards to, so answering it here would hide the callee's own help — the
+    // whole point of `wrapper func g(...args) { command grep ...$args }` is that
+    // `g --help` is grep's help.
+    let wrapper = shell.funcs.get(name).is_some_and(|def| def.wrapper);
     // Intercept `--help` only when the signature does not claim it; a function
     // that declares a `--help` flag observes the switch itself (`DESIGN.md`
     // §"Command resolution and help").
     let declares_help = shell.funcs.get(name).is_some_and(|def| def.declares_help());
-    if !declares_help && auto_help_requested(&args) {
+    if !wrapper && !declares_help && auto_help_requested(&args) {
         let help = shell.funcs.get(name).expect("declared function").help(name);
         return Step::Continue(builtins::print_generated_help(name, &help));
     }
     // The `--` terminator and flag parsing are handled during argument binding in
-    // `call_func`. A command-position call parses flags.
-    call_func(name, args, true, shell)
+    // `call_func`. A command-position call parses flags, unless this is a wrapper
+    // — then every argument binds positionally, `--flag` and `--` included.
+    call_func(name, args, !wrapper, shell)
 }
 
 fn run_command(tokens: &[parser::Word], last: u8, in_function: bool, shell: &mut Shell) -> Step {
@@ -6797,14 +6807,25 @@ fn call_func_for_value(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    let Some((params, body)) = shell
+    let Some((params, body, wrapper)) = shell
         .funcs
         .get(name)
-        .map(|def| (def.params.clone(), def.body.clone()))
+        .map(|def| (def.params.clone(), def.body.clone(), def.wrapper))
     else {
         unreachable!("call_func_for_value is only reached for a declared function");
     };
-    call_signature_for_value(name, &params, &body, arguments, last, in_function, shell)
+    // A `wrapper func` parses no flags of its own in either call form, so the
+    // value spelling forwards `--flag` verbatim just as command position does.
+    call_signature_for_value(
+        name,
+        &params,
+        &body,
+        arguments,
+        !wrapper,
+        last,
+        in_function,
+        shell,
+    )
 }
 
 /// The body of [`call_func_for_value`], over a signature and body rather than a
@@ -6819,6 +6840,7 @@ fn call_signature_for_value(
     params: &[parser::Param],
     body: &parser::Source,
     arguments: &[parser::Argument],
+    flags_enabled: bool,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
@@ -6838,7 +6860,15 @@ fn call_signature_for_value(
     // rather than entering the callee cleanup below, which would normalize a
     // `return` into this call's value. Loop state stays the caller's until the
     // call itself begins, so an argument's `break` belongs to the caller's loop.
-    let scanned = evaluate_value_arguments(name, params, arguments, last, in_function, shell);
+    let scanned = evaluate_value_arguments(
+        name,
+        params,
+        arguments,
+        flags_enabled,
+        last,
+        in_function,
+        shell,
+    );
     // A `break`/`continue` an argument raised belongs to the caller's loop, so it
     // is checked before the argument outcome — an out-of-loop one arrives as an
     // error *and* leaves the flag set, and both need answering together.
@@ -6988,7 +7018,7 @@ fn call_modifier_ref(
     // is written out rather than left to `run_call_body_for_value`.
     let caller_result = shell.result.clone();
     let caller_produced = shell.produced;
-    let scanned = evaluate_value_arguments(&label, &[], arguments, last, in_function, shell);
+    let scanned = evaluate_value_arguments(&label, &[], arguments, true, last, in_function, shell);
     // A `break`/`continue` an argument raised belongs to the caller's loop, and is
     // answered before the argument outcome — an out-of-loop one arrives as an error
     // *and* leaves the flag set. Leaving it set stops the enclosing function where
@@ -7191,11 +7221,18 @@ fn bind_scanned<'p>(
 /// `tag: v2` ≡ `--tag=v2`); a spread contributes a list's elements as positionals
 /// or a map's entries as options. Positionals are positional-only, so a `key:` on
 /// a positional parameter — or an unknown name — is an error.
+///
+/// `flags_enabled` gates the dashed forms exactly as it does in command mode: a
+/// `wrapper func` parses no flags of its own, so `g(--color=never)` forwards the
+/// token as a positional instead of failing on an option the wrapper never
+/// declared. An explicit `key: value` still binds by name — that is the caller
+/// naming a parameter, not a flag being passed through.
 #[allow(clippy::type_complexity)]
 fn evaluate_value_arguments<'p>(
     name: &str,
     params: &'p [parser::Param],
     arguments: &[parser::Argument],
+    flags_enabled: bool,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
@@ -7236,6 +7273,7 @@ fn evaluate_value_arguments<'p>(
                 params,
                 value,
                 bare,
+                flags_enabled,
                 &mut flags_ended,
                 &mut positionals,
                 &mut switches_on,
@@ -7257,6 +7295,7 @@ fn evaluate_value_arguments<'p>(
                             params,
                             item,
                             false,
+                            flags_enabled,
                             &mut flags_ended,
                             &mut positionals,
                             &mut switches_on,
@@ -7304,19 +7343,24 @@ fn reject_option_after_terminator(name: &str, key: &str, flags_ended: bool) -> R
 /// parsing (everything after it is positional, even if it looks like a flag), a
 /// `--name`/`--name=value` string binds that option, and anything else is a
 /// positional. Shared by direct positional arguments and spread elements so both
-/// follow the command-mode rules (`DESIGN.md` §"Functions").
+/// follow the command-mode rules (`DESIGN.md` §"Functions"), including the
+/// `flags_enabled` gate a `wrapper func` turns off.
 #[allow(clippy::too_many_arguments)]
 fn scan_call_value<'p>(
     name: &str,
     params: &'p [parser::Param],
     value: Value,
     bare: bool,
+    flags_enabled: bool,
     flags_ended: &mut bool,
     positionals: &mut Vec<Value>,
     switches_on: &mut std::collections::HashSet<&'p str>,
     flag_values: &mut std::collections::HashMap<&'p str, Value>,
 ) -> Result<(), Step> {
-    if !*flags_ended && let Value::String(text) = &value {
+    if flags_enabled
+        && !*flags_ended
+        && let Value::String(text) = &value
+    {
         if text == "--" {
             *flags_ended = true;
             return Ok(());
@@ -7486,14 +7530,18 @@ enum Pending {
 }
 
 fn pending_input(text: &str) -> Pending {
-    let trimmed = text.trim_start();
+    // `wrapper func …` is a function header too, and everything below has to see
+    // it as one: without the strip, a malformed `wrapper func f(') {` was
+    // dispatched on the spot and the commands in its body ran at top level,
+    // where the plain `func` spelling quarantines them through the closing `}`.
+    let trimmed = strip_wrapper_marker(text.trim_start());
     let func_header = trimmed.strip_prefix("func").is_some_and(|rest| {
         rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
     });
     // A `func` header is judged by the brace scanner rather than the parser, so
     // that a malformed one is dispatched (and diagnosed) instead of buffering.
     let by_braces = || {
-        if func_definition_is_open(text) {
+        if func_definition_is_open(trimmed) {
             Pending::Other
         } else {
             Pending::Complete
@@ -7506,6 +7554,26 @@ fn pending_input(text: &str) -> Pending {
         Err(_) if func_header => by_braces(),
         Ok(parser::ParseOutcome::Complete(_)) | Err(_) => Pending::Complete,
     }
+}
+
+/// Drop a leading `wrapper` marker so the `func` header scanners see the header
+/// they know. Only `wrapper` immediately before `func` on the *same line* is the
+/// marker — matching the parser's own contextual test — so `wrapper = 1`, a
+/// command named `wrapper`, and a `wrapper` on a line of its own are returned
+/// untouched and go on reading as ordinary input.
+fn strip_wrapper_marker(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("wrapper") else {
+        return text;
+    };
+    let after = rest.trim_start_matches([' ', '\t']);
+    if after.len() == rest.len() {
+        // No separator: this is a longer word, e.g. `wrappers`.
+        return text;
+    }
+    let is_func = after
+        .strip_prefix("func")
+        .is_some_and(|tail| tail.is_empty() || tail.starts_with([' ', '\t']));
+    if is_func { after } else { text }
 }
 
 /// Does the buffered `func` definition in `text` need more input lines?

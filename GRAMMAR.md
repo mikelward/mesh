@@ -350,13 +350,18 @@ A `func` definition binds a named callable. v1 covers **required named
 positionals** only:
 
 ```
-func-def = "func" ws name ws? "(" params? ")" ws? "{" body "}"
+func-def = ("wrapper" ws)? "func" ws name ws? "(" params? ")" ws? "{" body "}"
 params   = param ((ws | ",") param)*        # names, comma- and/or space-separated
 param    = name                             # required positional only, for now
 call     = name (ws word)*                  # a defined name in command position
 return   = "return" (ws signed-integer)?    # early exit, inside a body only
 ```
 
+- **`wrapper` marker.** `wrapper func g(...args) { … }` defines a function that
+  parses no flags of its own, so an undeclared `--flag`, a bare `--`, and
+  `--help` all reach its positionals and `...rest` verbatim. Contextual like
+  `fork`: the word leads a definition only where `func` follows it, so a
+  command, variable, or function named `wrapper` is unaffected.
 - **Definition.** `func greet(name) { … }` — parameters are named, referenced as
   `$name` in the body (never `$1`). Bodies may span **multiple input lines**: the
   reader buffers input until the body's `{ … }` braces balance (a brace inside a

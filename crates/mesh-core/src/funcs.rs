@@ -13,6 +13,10 @@ use crate::parser::{Param, ParamKind, Source};
 pub struct FuncDef {
     pub params: Vec<Param>,
     pub body: Source,
+    /// Defined as `wrapper func` — it parses no flags of its own, so every
+    /// argument reaches its positionals and `...rest` verbatim and `--help` is
+    /// forwarded rather than answered here.
+    pub wrapper: bool,
 }
 
 impl FuncDef {
@@ -29,6 +33,12 @@ impl FuncDef {
     /// `Usage:` line with positionals (optionals bracketed, a rest `...`), an
     /// `Arguments:` list, and an `Options:` block of the declared flags plus a
     /// synthesized `--help` (unless the signature declares its own).
+    ///
+    /// A wrapper gets no `Options:` block at all. It can declare no flags (the
+    /// parser refuses that), and the synthesized `--help` would be a lie twice
+    /// over: the token is forwarded rather than answered, and this text is what
+    /// completion is built from, so `g --<Tab>` would offer a flag that goes
+    /// straight to `...rest`.
     pub fn help(&self, name: &str) -> String {
         let mut usage = format!("Usage: {name}");
         let mut arguments = String::new();
@@ -60,6 +70,12 @@ impl FuncDef {
         if !arguments.is_empty() {
             help.push_str("\nArguments:\n");
             help.push_str(&arguments);
+        }
+        if self.wrapper {
+            // No literal flag in this line: completion is built from this text,
+            // so naming one here would put it back in the candidate list.
+            help.push_str("\nParses no flags; every argument is forwarded verbatim.\n");
+            return help;
         }
         help.push_str("\nOptions:\n");
         help.push_str(&options);
@@ -94,5 +110,66 @@ impl Funcs {
 
     pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
         self.map.keys().map(String::as_str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::completion::CompletionSpec;
+    use crate::parser::Source;
+
+    fn def(params: Vec<Param>, wrapper: bool) -> FuncDef {
+        FuncDef {
+            params,
+            body: Source {
+                statements: Vec::new(),
+                span: 0..0,
+            },
+            wrapper,
+        }
+    }
+
+    fn param(name: &str, kind: ParamKind) -> Param {
+        Param {
+            name: name.into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_plain_func_advertises_a_generated_help_flag() {
+        let help = def(vec![param("xs", ParamKind::Rest)], false).help("g");
+        assert!(help.contains("--help"), "{help}");
+        assert_eq!(CompletionSpec::from_help(&help).matching("--"), ["--help"]);
+    }
+
+    #[test]
+    fn a_wrapper_advertises_no_options_at_all() {
+        // The help text is what completion is built from, so a synthesized
+        // `--help` here would make `g --<Tab>` offer a flag that the call
+        // forwards to `...rest` instead of answering.
+        let help = def(vec![param("xs", ParamKind::Rest)], true).help("g");
+        assert!(!help.contains("--help"), "{help}");
+        assert!(!help.contains("Options:"), "{help}");
+        assert!(help.contains("Parses no flags"), "{help}");
+        assert!(
+            CompletionSpec::from_help(&help).matching("--").is_empty(),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn a_wrapper_still_documents_its_positionals() {
+        let help = def(
+            vec![
+                param("first", ParamKind::Required),
+                param("xs", ParamKind::Rest),
+            ],
+            true,
+        )
+        .help("g");
+        assert!(help.contains("Usage: g <FIRST> [<XS>...]"), "{help}");
+        assert!(help.contains("Arguments:"), "{help}");
     }
 }
