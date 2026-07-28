@@ -33,13 +33,22 @@ pub enum WordPiece {
         name: String,
         quote: QuoteMode,
     },
-    /// A **value** spliced into the word — `"at $(pwd) now"`.
+    /// A **value** spliced into the word — `"at $(pwd) now"`, `"${greeting()}"`.
     ///
-    /// Evaluating it needs the shell (a `$(…)` launches a command), so it happens
-    /// where the shell is — [`crate::repl::expansion_word`] — and rides into
-    /// expansion as a literal piece, exactly as an interpolated variable does:
-    /// never re-split, never re-globbed.
-    Value(Box<Spanned<Expr>>),
+    /// Evaluating it needs the shell (a `$(…)` launches a command, a call runs
+    /// mesh), so it happens where the shell is — [`crate::repl::expansion_word`] —
+    /// and rides into expansion as a literal piece, exactly as an interpolated
+    /// variable does: never re-split, never re-globbed.
+    ///
+    /// `quote` is what the piece was written inside, and it decides whether the
+    /// value stays a value. Inside `"…"` the quotes say "make this text", so the
+    /// result is rendered by the same rule an interpolated `$x` obeys — a list or
+    /// a map is the same loud error there as it is for `"$xs"`, rather than a
+    /// collection quietly surviving a pair of quotes.
+    Value {
+        expression: Box<Spanned<Expr>>,
+        quote: QuoteMode,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -132,7 +141,7 @@ impl Word {
             .map(|piece| match piece {
                 WordPiece::Text { text, .. } => text.as_str(),
                 WordPiece::Variable { name, .. } => name.as_str(),
-                WordPiece::Value(_) => "",
+                WordPiece::Value { .. } => "",
             })
             .collect()
     }
@@ -1103,7 +1112,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn run(mut self) -> Result<Vec<Token>, ParseError> {
-        Ok(self.lex(false)?.0)
+        Ok(self.lex(None)?.0)
     }
 
     /// Lex the body of a `$( … )` whose `$(` sits just before `self.position`,
@@ -1114,10 +1123,19 @@ impl<'a> Lexer<'a> {
     /// capture's `)` is string content, and lexing it as code would report the
     /// string's own closing quote as an unterminated one.
     fn capture_body(mut self) -> Result<(Vec<Token>, usize), ParseError> {
-        self.lex(true)
+        self.lex(Some(TokenKind::RParen))
     }
 
-    fn lex(&mut self, until_close: bool) -> Result<(Vec<Token>, usize), ParseError> {
+    /// The same, for the body of a `${ … }` holding an expression rather than a
+    /// plain variable access. Stops at the `}` that closes it.
+    fn braced_body(mut self) -> Result<(Vec<Token>, usize), ParseError> {
+        self.lex(Some(TokenKind::RBrace))
+    }
+
+    /// `close` is the delimiter that ends this lex, or `None` to run to the end of
+    /// the source. Nesting is tracked for whichever delimiter that is, so a `)` or
+    /// `}` belonging to something inside the body is not mistaken for the end of it.
+    fn lex(&mut self, close: Option<TokenKind>) -> Result<(Vec<Token>, usize), ParseError> {
         let body_start = self.position;
         let mut depth = 0_usize;
         let mut tokens = Vec::new();
@@ -1152,13 +1170,18 @@ impl<'a> Lexer<'a> {
             }
             if let Some((text, kind)) = self.punctuation() {
                 self.position += text.len();
-                // A `)` at depth zero is the one that closes the capture being lexed.
-                // Only parens count: a `)` inside a quoted word (`$(puts "a)b")`) is
-                // part of that word's token and never reaches here.
-                let closes = until_close && depth == 0 && kind == TokenKind::RParen;
-                match kind {
-                    TokenKind::LParen | TokenKind::CaptureStart => depth += 1,
-                    TokenKind::RParen => depth = depth.saturating_sub(1),
+                // A closer at depth zero is the one that ends the body being lexed.
+                // Only the matching delimiter counts: a `)` inside a quoted word
+                // (`$(puts "a)b")`) is part of that word's token and never reaches
+                // here.
+                let closes = close.as_ref() == Some(&kind) && depth == 0;
+                match (&close, &kind) {
+                    (Some(TokenKind::RBrace), TokenKind::LBrace) => depth += 1,
+                    (Some(TokenKind::RBrace), TokenKind::RBrace) => {
+                        depth = depth.saturating_sub(1);
+                    }
+                    (_, TokenKind::LParen | TokenKind::CaptureStart) => depth += 1,
+                    (_, TokenKind::RParen) => depth = depth.saturating_sub(1),
                     _ => {}
                 }
                 tokens.push(Spanned {
@@ -1282,10 +1305,33 @@ impl<'a> Lexer<'a> {
                                     self.position,
                                     self.capture_depth + 1,
                                 )?;
-                                pieces.push(WordPiece::Value(Box::new(Spanned {
-                                    value: expression,
-                                    span: self.position..end,
-                                })));
+                                pieces.push(WordPiece::Value {
+                                    expression: Box::new(Spanned {
+                                        value: expression,
+                                        span: self.position..end,
+                                    }),
+                                    quote: QuoteMode::Double,
+                                });
+                                self.position = end;
+                                continue;
+                            }
+                            // `"… ${ expr } …"` — a braced body that is not a plain
+                            // access is an expression, and needs the shell for the
+                            // same reason a capture does, so it rides in the same
+                            // value piece rather than through `expand`.
+                            if braced_is_access(self.source, self.position) == Some(false) {
+                                let (expression, end) = braced_expression_in_string(
+                                    self.source,
+                                    self.position,
+                                    self.capture_depth + 1,
+                                )?;
+                                pieces.push(WordPiece::Value {
+                                    expression: Box::new(Spanned {
+                                        value: expression,
+                                        span: self.position..end,
+                                    }),
+                                    quote: QuoteMode::Double,
+                                });
                                 self.position = end;
                                 continue;
                             }
@@ -1347,18 +1393,20 @@ impl<'a> Lexer<'a> {
                 span: start..self.position,
             });
         }
-        // Ran out of input with the capture still open. Reported as an unterminated
-        // `(` so it reads like the open delimiter it is, rather than as whatever the
-        // string's own quote would have been blamed for.
-        if until_close {
-            // Innermost first, as everywhere else: the capture's own `(` is the
+        // Ran out of input with the body still open. Reported as its own unterminated
+        // open delimiter so it reads like the thing that was left open, rather than
+        // as whatever the string's own quote would have been blamed for.
+        if let Some(kind) = &close {
+            let opener = if *kind == TokenKind::RBrace { '{' } else { '(' };
+            // Innermost first, as everywhere else: the body's own opener is the
             // outermost thing still open, so a delimiter opened *inside* it has to
-            // be closed before the capture can be. Without asking the body's
-            // tokens, `"$(x = [1"` blamed the `(` while the unquoted spelling of
-            // the same text correctly named the `[`.
+            // be closed before the body can be. Without asking the body's tokens,
+            // `"$(x = [1"` blamed the `(` while the unquoted spelling of the same
+            // text correctly named the `[`.
             let (delimiter, span) = unclosed_opener(&tokens).unwrap_or((
-                '(',
-                // The body starts after `$(`, and the delimiter named is the paren.
+                opener,
+                // The body starts after `$(` or `${`, and the delimiter named is
+                // that opener.
                 body_start.saturating_sub(1)..self.source.len(),
             ));
             return Err(ParseError {
@@ -1396,7 +1444,7 @@ impl<'a> Lexer<'a> {
                 if word
                     .pieces
                     .iter()
-                    .any(|piece| matches!(piece, WordPiece::Value(_)))
+                    .any(|piece| matches!(piece, WordPiece::Value { .. }))
                 {
                     return Err(ParseError {
                         kind: ParseErrorKind::Expected("a heredoc delimiter without a capture"),
@@ -1614,6 +1662,61 @@ fn capture_in_string(
     Ok((Expr::Capture(parser.source(Some(TokenKind::RParen))?), end))
 }
 
+/// For a `${…}` at `start`: whether its body is a plain variable access, or
+/// `None` when this is not a braced reference (or is unterminated, which
+/// [`variable_end`] reports).
+fn braced_is_access(source: &str, start: usize) -> Option<bool> {
+    let braced = source[start..].strip_prefix("${")?;
+    let close = braced.find('}')?;
+    Some(valid_variable_access(&braced[..close]))
+}
+
+/// Parse the `${ … }` starting at `dollar` as an **expression**, for a body that
+/// is not a plain variable access — `"${greeting()}"`, `"${$n + 1}"`.
+///
+/// `DESIGN.md` §"Variables and assignment" puts general expressions in `${…}`;
+/// [`valid_variable_access`] covers the cheap majority (a name, member, index, or
+/// modifier chain) which [`crate::expand`] resolves with only `&Vars`, and this
+/// covers the rest, which needs the shell and so rides in as a
+/// [`WordPiece::Value`] exactly as a `$(…)` capture does.
+fn braced_expression_in_string(
+    source: &str,
+    dollar: usize,
+    depth: usize,
+) -> Result<(Expr, usize), ParseError> {
+    if depth > MAX_DEPTH {
+        return Err(ParseError {
+            kind: ParseErrorKind::TooDeep,
+            span: dollar..dollar + 2,
+        });
+    }
+    let (tokens, end) = Lexer {
+        source,
+        position: dollar + 2,
+        capture_depth: depth,
+    }
+    .braced_body()?;
+    let mut parser = Parser {
+        tokens,
+        position: 0,
+        source_len: end,
+        depth,
+    };
+    // A newline inside the braces is layout, not a terminator — the body is one
+    // expression, so it wraps the way a `( … )` group does. Without this the
+    // trailing `Newline` sat where the `}` was expected and a body that merely
+    // broke across lines was a syntax error, while `$( … )` and a bare group both
+    // took it.
+    parser.newlines();
+    let expression = parser.expression()?;
+    parser.newlines();
+    // The lexer stopped *past* the `}`, so the parser must find it where the body
+    // ends — anything else means the body held more than one expression, and
+    // reporting that here beats letting the trailing text vanish.
+    parser.expect(&TokenKind::RBrace, "`}`")?;
+    Ok((expression, end))
+}
+
 pub(crate) fn variable_end(source: &str, start: usize) -> Result<usize, ParseError> {
     let rest = &source[start..];
     if let Some(braced) = rest.strip_prefix("${") {
@@ -1802,7 +1905,7 @@ fn word_is_quoted(word: &Word) -> bool {
         WordPiece::Text { quote, .. } | WordPiece::Variable { quote, .. } => {
             *quote != QuoteMode::Bare
         }
-        WordPiece::Value(_) => true,
+        WordPiece::Value { .. } => true,
     })
 }
 
@@ -5618,7 +5721,10 @@ mod tests {
                 text: before,
                 quote: QuoteMode::Double,
             },
-            WordPiece::Value(capture),
+            WordPiece::Value {
+                expression: capture,
+                ..
+            },
             WordPiece::Text {
                 text: after,
                 quote: QuoteMode::Double,
@@ -5651,7 +5757,7 @@ mod tests {
                 word.pieces.as_slice(),
                 [
                     WordPiece::Text { text: open, .. },
-                    WordPiece::Value(_),
+                    WordPiece::Value { .. },
                     WordPiece::Text { text: close, .. },
                 ] if open == "[" && close == "]"
             ),

@@ -1592,6 +1592,44 @@ designed, and the cross-references say where the fuller note lives.
       `command -v` is already refused rather than read as a program name, so
       building it later cannot change what a working line meant.
 
+## Beyond M3 — Interpolation
+
+- [x] **A call, and any expression, in `${…}`** — *landed*. `DESIGN.md`
+      §"Variables and assignment" already said "General expressions also use
+      `${…}`"; only a variable access parsed there, so `"${host-info()}"` was a
+      syntax error and every segment had to bind its calls to names first. It
+      surfaced porting a real zsh prompt (`docs/PROMPT.md`), where composing three
+      helper calls into one line is the whole job.
+
+      Mechanism: the braced body keeps the cheap path when it is a plain access —
+      [`valid_variable_access`], resolved by `expand` with only `&Vars` — and is
+      otherwise lexed and parsed as an expression and carried as a
+      `WordPiece::Value`, the same piece a `$(…)` capture rides in. `Lexer::lex`
+      grew a closing-delimiter parameter so a `${…}` body can stop at its `}` the
+      way a capture body stops at its `)`.
+
+      `WordPiece::Value` also grew a `quote`, and that is the part worth keeping in
+      mind: inside `"…"` the quotes mean *make this text*, so the value is rendered
+      by the rule `"$xs"` obeys — a scalar renders, a collection is a loud error.
+      Without it a call returning a list smuggled the list out through a pair of
+      quotes and quoting stopped meaning "one string".
+- [ ] **`${…}` in a bare word still rejects an expression.** `"${f()}"` works;
+      `${f()}` unquoted reports "expected a variable name or access". Held back
+      deliberately rather than forgotten: a value piece in a *bare* word raises the
+      whole-argument rule `DESIGN.md` states for captures — `pre$(x)post` and
+      `f()x` are syntax errors, not three arguments — and honoring that needs a
+      decision rather than an accident.
+- [ ] **A modifier's arguments flip the reading of a braced body.** `${xs:len}` is
+      the *reference* (sigil-less, resolved as the binding), but `${xs:join(" ")}`
+      is not a valid access, so it falls to the expression path where a bare `xs`
+      is the **word** `xs` — and `:join` then reports "requires a list" rather than
+      joining the list. `${$xs:join(" ")}` is the working spelling and is what
+      `docs/REFERENCE.md` now documents, but the seam is a trap: adding an argument
+      to a modifier silently changes what the body means. The fix is to teach
+      `valid_variable_access` argument-taking modifiers so the reference reading
+      extends to them, which needs paren matching beside the existing
+      `subscript_end`.
+
 ## Beyond M3 — The predicate vocabulary
 
 - [ ] **`:kind` and `:where`** — the name-resolution half of the predicate
