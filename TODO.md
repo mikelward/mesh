@@ -358,21 +358,40 @@ file as tasks land.
       leaves only the status (`0` found, `1` not), which is `command -v`.
       `type` is deliberately not taken: mesh has value types and `:type` already
       asks a path's, so it stays free for the value question — which is `:repr`.
-- [ ] **Reconsider the name: `type`, `which`, or `whence`.** Shipped as `whence`
-      (ksh's, and the one word with no collision), but the choice is not closed —
-      it is the command every shell spells differently, and the two commoner
-      spellings each have a real case. **`type`** is the widest reflex by far
-      (bash, zsh, fish, POSIX); against it, mesh has value types and `$p:type`
-      already asks a path's, so the name is the obvious future spelling for the
-      *value* question, and spending it here forecloses that. **`which`** is
-      nushell's, is what fingers reach for interactively, and would shadow the
-      external harmlessly the way any builtin does; against it, the external
-      `which` is famous for *not* knowing about builtins and functions, so the
-      name says the opposite of what mesh's does, and `which -a foo` typed from
-      habit would hit mesh's option parsing rather than the external's. Decide
-      before the name is load-bearing in anyone's config; today the cost of a
-      change is the `RENAMED` table, one module, and the docs, since all four
-      spellings already point at whichever one wins.
+- [ ] **Rename `whence` to `type`, with `-t` / `-P` / `-a`** *(decided)*. Bash's
+      name, bash's flags, bash's words. `whence` stays reachable as a rename
+      pointer, as do `what` and `where`; none is reserved, so a user function may
+      take any of them (`func what()` works today and must keep working). **Do not
+      claim `which`** — in bash it is an external program that cannot see builtins
+      or functions, and mesh keeps that, so `which cd` finds nothing here exactly
+      as it finds nothing there. It is also the only one of the five with a real
+      binary on disk, so claiming it would mean shadowing a program rather than
+      improving a not-found message.
+
+  - [ ] **`-t` prints one word**: `function`, `builtin`, `file`, `keyword`,
+        `variable`. Bash's tokens, because this output is *compared*, not read —
+        `case "$(type -t "$1")" in function)` is the shape a port carries over.
+        `variable` is the one addition; bash's `type` does not see bindings.
+        Nothing printed and status `1` when the name is not found.
+  - [ ] **`-P` prints only a `PATH` hit**, ignoring functions and builtins, and
+        nothing with status `1` otherwise. This retires the hand-rolled
+        `for d in $PATH` loop an `shrc` carries because `type -P` is not portable.
+  - [ ] **`-a` as the short form of the existing `--all`.** `--quiet` stays a mesh
+        convenience over `>/dev/null`.
+  - [ ] **One vocabulary in every form** — the prose says `if is a shell keyword`,
+        never "is syntax", so the sentence and `-t` cannot disagree. Follow bash's
+        wording wherever there is no reason to differ (`cd is a shell builtin`,
+        `ls is /usr/bin/ls`); keep what mesh has a reason for — the detail line,
+        the variable row, and naming what a winner shadows.
+  - [ ] `func type()` stops being definable once `type` is a builtin, the way
+        `func whence()` is refused today. Worth a test pinning that, and one
+        pinning that `func what()` / `func where()` still work.
+  - [ ] **This likely closes the `:kind` / `:where` question** in the predicate
+        vocabulary: `type -t` *is* `:kind` and `type -P` *is* `:where`. What a
+        modifier would still add is use in expression position without a capture,
+        which `whence(NAME)` returning a map already covers. Re-read that item
+        once this lands.
+
 - [ ] **`whence(NAME)` as a value call**, returning the report as a map
       (`[kind: external, path: /usr/bin/git, shadows: […]]`) rather than text, so
       a script can branch on the kind instead of matching prose — the shape
