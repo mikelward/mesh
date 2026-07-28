@@ -64,11 +64,13 @@ its usage, then every keyword and operator with the shape it is written in.
 Interactive Tab completion covers builtins, defined functions, commands on
 `PATH`, filesystem paths, variables, and map keys, ranked with fuzzy, smart-case
 matching (all-lowercase ignores case; any uppercase makes the query
-case-sensitive, and exact-case matches rank first). After a command, completion
-passes the words already entered to `COMMAND --help` and extracts options and
-subcommands from both output streams; builtins and defined functions use their
-generated help in the same way. File, directory, and enumerated option values
-narrow argument completion to the expected type. A growing slice of the language
+case-sensitive, and exact-case matches rank first). After a command, mesh works
+out its subcommands and flags for itself — there are no completion scripts to
+install. It takes the first of four sources that answers: a curated file under
+`~/.local/share/mesh/completions/`, else the command's manual page, else a
+bounded `--help` probe of the command, else files and directories. Builtins and
+defined functions use their generated help the same way. File, directory, and
+enumerated option values narrow argument completion to the expected type. A growing slice of the language
 is in place: quoting and escapes, `~` and filename globs, captures and heredocs,
 typed scalar/list/map values, arithmetic and comparisons, regex and glob matching
 with `~`, collection iteration and destructuring, `while`/`loop`, `if`/`match`

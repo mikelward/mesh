@@ -159,11 +159,18 @@ mesh$ <strong>puts $site.tls.enabled</strong>
 true
 </pre>
 
-For external commands, mesh lazily reads bounded `--help` output to complete
-subcommands and flags, then caches the resulting completion spec by executable
-path and modification time. Files and directories remain available as the
-fallback. Help-derived file, directory, and enumerated argument types narrow
-suggestions to values that fit.
+For external commands, mesh works out the subcommands and flags for itself —
+there are no completion scripts to install. It looks for a spec in four places
+and takes the first that answers: a curated file you wrote under
+`~/.local/share/mesh/completions/`, else the command's manual page, else a
+bounded `--help` probe, else plain files and directories. Generated specs are
+cached, and re-derived when their own source changes.
+
+The file, directory, and enumerated argument types that come out of it narrow
+suggestions to values that fit, so `--color <Tab>` offers only the colors that
+command accepts. When you disagree with what mesh guessed, the curated file is
+the override — see [Where a command's completions come
+from](REFERENCE.md#where-a-commands-completions-come-from).
 
 ## Printing with `puts`
 
