@@ -11641,6 +11641,135 @@ fn a_wrapper_cannot_declare_a_flag_of_its_own() {
 }
 
 #[test]
+fn an_alias_is_a_wrapper_func_that_forwards() {
+    // The whole feature in one line: `alias co = …` is sugar for the wrapper you
+    // would otherwise write out, so it takes arguments and forwards flags.
+    // `--color=never` names no parameter of the generated `co(...args)`, so a
+    // plain `func` would have rejected it here. (`puts` reads the `--` itself,
+    // so the terminator is left out of this one — `a_wrapper_func_forwards_the
+    // _terminator_too` covers it on the underlying form.)
+    let out = run_with_input("alias g = puts grep\ng --color=never x\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "grep --color=never x\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn type_reports_an_alias_as_the_wrapper_it_desugars_to() {
+    // Sugar, not a second mechanism: what is defined is a function, and `type`
+    // says so rather than inventing an alias namespace to report from.
+    let out = run_with_input("alias co = puts checkout\ntype co\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "co is a function\n    wrapper func co(...args)\n"
+    );
+}
+
+#[test]
+fn a_self_naming_alias_reaches_the_program() {
+    // `alias grep = grep --color=auto` is the commonest alias there is, and a
+    // literal desugaring would recurse forever, so a leading word equal to the
+    // alias's own name is emitted as `command NAME`.
+    let out = run_with_input("alias true = true\ntrue\nputs $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    // Quoting is not part of the question: a quoted command head still resolves
+    // functions, so a bare-text-only check here recursed to the stack limit.
+    for source in [
+        "alias true = \"true\"\ntrue\nputs ok\n",
+        "alias true = 'true'\ntrue\nputs ok\n",
+    ] {
+        let quoted = run_with_input(source);
+        assert_eq!(String::from_utf8_lossy(&quoted.stdout), "ok\n");
+        assert!(quoted.stderr.is_empty(), "{:?}", quoted.stderr);
+    }
+    // Only the *first* word: a later occurrence is an ordinary argument.
+    let arg = run_with_input("alias e = puts e\ne x\n");
+    assert_eq!(String::from_utf8_lossy(&arg.stdout), "e x\n");
+}
+
+#[test]
+fn an_alias_cannot_take_a_reserved_name() {
+    // `alias re = …` would define a command-position `re` while `re(x)` still
+    // built a regex — the syntax-dependent meaning `func` refuses outright.
+    for name in ["re", "style", "link", "glob", "files", "dirs"] {
+        let out = run_with_input(&format!("alias {name} = puts wrapped\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cannot be a function name"),
+            "{name}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn alias_is_contextual_not_reserved() {
+    // Like `wrapper` and `fork`, `alias` leads a definition only in the shape
+    // that claims it, so the word stays free everywhere else.
+    let out =
+        run_with_input("alias = 1\nputs $alias\nfunc alias(x) { puts \"got $x\" }\nalias y\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\ngot y\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_bare_alias_points_at_the_spelling_that_works() {
+    // The bash reflex lands here, and the note has to name the form that works
+    // rather than the old "mesh has no aliases".
+    let out = run_with_input("alias\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("alias ll = ls -l"), "{stderr}");
+    let unalias = run_with_input("unalias ll\n");
+    assert!(
+        String::from_utf8_lossy(&unalias.stderr).contains("wrapper func"),
+        "{:?}",
+        unalias.stderr
+    );
+}
+
+#[test]
+fn a_quoted_alias_command_says_to_drop_the_quotes() {
+    // bash needs `alias ll='ls -l'` because its body is a string; mesh's is
+    // syntax, so the quotes make one word naming no program. Diagnosed rather
+    // than left to `command not found: ls -l`, which reports the odd name
+    // without saying the quotes caused it.
+    for source in ["alias ll = 'ls -l'\n", "alias ll = \"ls -l\"\n"] {
+        let out = run_with_input(source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("alias NAME = ls -l"), "{stderr}");
+    }
+    // A quoted single word is fine — nothing is being run through a shell.
+    let ok = run_with_input("alias e = \"puts\" hi\ne there\n");
+    assert_eq!(String::from_utf8_lossy(&ok.stdout), "hi there\n");
+    // So is a quoted argument.
+    let arg = run_with_input("alias say = puts \"two words\"\nsay now\n");
+    assert_eq!(String::from_utf8_lossy(&arg.stdout), "two words now\n");
+}
+
+#[test]
+fn an_alias_needs_a_command_after_the_equals() {
+    let out = run_with_input("alias co =\n");
+    assert!(!out.stderr.is_empty(), "{:?}", out.stderr);
+    // A guard belongs in a body, not on the definition.
+    let guard = run_with_input("alias co = puts hi if true\n");
+    let stderr = String::from_utf8_lossy(&guard.stderr);
+    assert!(stderr.contains("wrapper func"), "{stderr}");
+}
+
+#[test]
+fn help_explains_the_alias_shorthand() {
+    let out = run_with_input("help alias\n");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("alias NAME = CMD ARG"),
+        "{:?}",
+        out.stdout
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
 fn help_explains_the_wrapper_marker() {
     // A word the parser takes and `help` does not know is a reader being told,
     // falsely, that the word they just used is not syntax.

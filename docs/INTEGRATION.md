@@ -396,7 +396,7 @@ mise completely.
 | iTerm2 / VS Code / WezTerm shell integration | **Already shipped** — `OSC 133`, `OSC 633`, `OSC 7`, titles, and hyperlinks |
 | thefuck, mcfly | Class 5 — same keybinding and buffer gap as atuin |
 | zsh-autosuggestions, fast-syntax-highlighting | Not external tools, but the experience users expect. reedline has both a hint provider and a highlighter hook; mesh exposes neither |
-| oh-my-zsh, prezto, plugin frameworks | **Non-goal.** No aliases, no plugin loader, no completion scripts — that is the premise, not a gap |
+| oh-my-zsh, prezto, plugin frameworks | **Non-goal.** No alias mechanism (`alias` defines a `wrapper func`), no plugin loader, no completion scripts — that is the premise, not a gap |
 | keychain, ssh-agent | Class 6, environment diff |
 | asdf, fnm, volta, jenv | Class 6, environment diff |
 

@@ -182,6 +182,16 @@ impl Word {
     }
 }
 
+/// The text of a word that is one literal run and nothing else — `ls`, `'ls -l'`,
+/// `"ls -l"` — with how it was written. `None` for anything with a variable, a
+/// capture, or more than one piece, since those are not known until run time.
+fn single_text(word: &Word) -> Option<(&str, QuoteMode)> {
+    match word.pieces.as_slice() {
+        [WordPiece::Text { text, quote }] => Some((text, *quote)),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeredocBody {
     pub text: String,
@@ -246,6 +256,10 @@ pub enum ParseErrorKind {
     Expected(&'static str),
     ReservedParameter(String),
     ReservedFunctionName(String),
+    /// A quoted command after `alias NAME =` — `alias ll = 'ls -l'`. bash needs
+    /// the quotes because its alias body is a *string*; mesh's is real syntax,
+    /// so they turn the command into one word naming no program.
+    QuotedAliasCommand(String),
     /// A `wrapper func` that declares a `--flag`. The marker's whole content is
     /// "parses no flags of its own", so the two cannot both be true: the flag
     /// would be listed in help and offered by completion while every
@@ -364,6 +378,11 @@ impl std::fmt::Display for ParseError {
                     "syntax error: `{name}` is a built-in value call and cannot be a function name"
                 )
             }
+            ParseErrorKind::QuotedAliasCommand(text) => write!(
+                f,
+                "syntax error: an alias takes a command, not a string; write it \
+                 unquoted -- `alias NAME = {text}`"
+            ),
             ParseErrorKind::WrapperDeclaresFlag(name) => write!(
                 f,
                 "syntax error: a `wrapper func` parses no flags, so it cannot declare \
@@ -1952,6 +1971,11 @@ fn token_word_pieces(kind: &TokenKind) -> Option<Vec<WordPiece>> {
 /// answers with a value all the same.
 pub const RESERVED_FUNCTION_NAMES: &[&str] = &["re", "style", "link", "glob", "files", "dirs"];
 
+/// The rest parameter an `alias` desugars to. Not a name a user can collide
+/// with: it only ever appears inside the generated body, which nothing else can
+/// see.
+const ALIAS_REST: &str = "args";
+
 /// Does this name call a built-in **value** rather than a command? Asked wherever
 /// a call has to be told apart from a command that merely shares the call spelling
 /// — `f(…):capture` is one, since a command's record has no `.value` to fill in.
@@ -2062,6 +2086,12 @@ impl Parser {
     }
 
     fn executable(&mut self) -> Result<Executable, ParseError> {
+        // Contextual too: `alias` leads a definition only in the shape
+        // `alias NAME = …`, so a command called `alias` and a variable of that
+        // name are both still reachable.
+        if self.word("alias") && self.alias_definition_follows() {
+            return self.alias_def();
+        }
         // Contextual, like `fork`: `wrapper` leads a definition only where `func`
         // follows it, so a command or variable of that name is still reachable as
         // `wrapper`, `wrapper --flag`, or `wrapper = 1`.
@@ -2551,6 +2581,147 @@ impl Parser {
             unless,
             condition: self.expression()?,
         }))
+    }
+
+    /// Is this `alias NAME = …`? The shape that claims the word, checked before
+    /// committing so `alias`, `alias --help`, and `alias = 1` keep their ordinary
+    /// readings. bash's unspaced `alias NAME=VALUE` is *not* matched here: it
+    /// tokenizes as one word, and [`alias_def`](Self::alias_def) reports it with
+    /// the spelling mesh wants rather than letting it fall through to a
+    /// command-not-found.
+    fn alias_definition_follows(&self) -> bool {
+        matches!(
+            self.tokens.get(self.position + 1).map(|t| &t.value),
+            Some(TokenKind::Word(_))
+        ) && matches!(
+            self.tokens.get(self.position + 2).map(|t| &t.value),
+            Some(TokenKind::Equal)
+        )
+    }
+
+    /// `alias NAME = COMMAND [ARG …]` — the terse forwarding wrapper.
+    ///
+    /// Sugar over [`wrapper func`](Self::function), not a mechanism of its own:
+    /// it builds exactly the definition you would have written by hand,
+    ///
+    /// ```text
+    /// alias co = vcs checkout
+    /// wrapper func co(...args) { vcs checkout ...$args }
+    /// ```
+    ///
+    /// so an alias resolves, scopes and takes arguments like any function, and
+    /// there is no second resolution stage and no parse-time textual expansion —
+    /// the things `DESIGN.md` dropped when it dropped the alias *mechanism*.
+    ///
+    /// **A self-naming alias reaches the program, not itself.** `alias grep =
+    /// grep --color=auto` is the commonest alias there is, and desugared
+    /// literally it would recurse forever, so a first word equal to the alias's
+    /// own name is emitted as `command grep` — the same escape `func ls() {
+    /// command ls --color=auto }` uses, and the same no-self-expansion rule bash
+    /// applies to aliases.
+    fn alias_def(&mut self) -> Result<Executable, ParseError> {
+        let start = self.peek().map(|t| t.span.start).unwrap_or_default();
+        self.take_word("alias");
+        let name = self.name()?;
+        // The same names `function` refuses, and for the same reason: `re x`
+        // would run this definition while `re(x)` still built a regex, so the
+        // name would mean different things depending on how it was called.
+        if RESERVED_FUNCTION_NAMES.contains(&name.as_str()) {
+            return Err(self.error(ParseErrorKind::ReservedFunctionName(name)));
+        }
+        self.expect(&TokenKind::Equal, "`=`")?;
+        self.newlines();
+        let mut command = self.command()?;
+        if command.items.is_empty() {
+            return Err(self.error(ParseErrorKind::Expected("a command after `alias NAME =`")));
+        }
+        if command.guard.is_some() {
+            return Err(self.error(ParseErrorKind::Expected(
+                "a plain command after `alias NAME =`; a guard belongs in a `wrapper func` body",
+            )));
+        }
+        // `alias ll = 'ls -l'` is the bash reflex, and here the quotes make one
+        // word: it would look for a program whose name contains a space. Caught
+        // by hand rather than left to `command not found`, which reports the odd
+        // name without saying the quotes are what did it.
+        if let Some(CommandItem::Word(first)) = command.items.first()
+            && let Some((text, quote)) = single_text(&first.value)
+            && quote != QuoteMode::Bare
+            && text.contains(char::is_whitespace)
+        {
+            return Err(self.error(ParseErrorKind::QuotedAliasCommand(text.to_owned())));
+        }
+        let end = self.peek().map(|t| t.span.start).unwrap_or(start);
+        let span = start..end;
+
+        // A first word naming the alias itself means the program, not a call
+        // back into this definition. Quoting is not part of the question: a
+        // quoted command head still resolves functions, so `alias true = "true"`
+        // would recurse to the stack limit without this.
+        if let Some(CommandItem::Word(first)) = command.items.first()
+            && single_text(&first.value).is_some_and(|(text, _)| text == name)
+        {
+            command.items.insert(
+                0,
+                CommandItem::Word(Spanned {
+                    value: Word {
+                        pieces: vec![WordPiece::Text {
+                            text: "command".to_owned(),
+                            quote: QuoteMode::Bare,
+                        }],
+                        qualifiers: None,
+                    },
+                    span: span.clone(),
+                }),
+            );
+        }
+
+        // `...$args`, the forwarded rest — built rather than parsed, since there
+        // is no source text for it. A command-position spread is a *word* whose
+        // pieces are the bare `...` and the variable, which is the shape
+        // `expand::spread_var` recognizes; a `UnaryOp::Spread` expression is the
+        // value-position form and reaches argv as an unspreadable list.
+        command.items.push(CommandItem::Word(Spanned {
+            value: Word {
+                pieces: vec![
+                    WordPiece::Text {
+                        text: "...".to_owned(),
+                        quote: QuoteMode::Bare,
+                    },
+                    // Stored with the `$`, as the lexer stores it: the raw name
+                    // is what the job list renders a backgrounded call from.
+                    WordPiece::Variable {
+                        name: format!("${ALIAS_REST}"),
+                        quote: QuoteMode::Bare,
+                    },
+                ],
+                qualifiers: None,
+            },
+            span: span.clone(),
+        }));
+
+        Ok(Executable::Function {
+            name,
+            parameters: vec![Param {
+                name: ALIAS_REST.to_owned(),
+                kind: ParamKind::Rest,
+            }],
+            body: Source {
+                statements: vec![Statement {
+                    and_or: AndOr {
+                        first: Executable::Pipeline(Pipeline {
+                            stages: vec![command],
+                            pipe_stderr: Vec::new(),
+                        }),
+                        rest: Vec::new(),
+                    },
+                    background: false,
+                    span: span.clone(),
+                }],
+                span,
+            },
+            wrapper: true,
+        })
     }
 
     fn function(&mut self, wrapper: bool) -> Result<Executable, ParseError> {
@@ -5035,6 +5206,65 @@ mod tests {
 
         // A bare `wrapper` is still a command word, not a malformed definition.
         let command = complete("wrapper --flag x");
+        assert!(matches!(
+            command.statements[0].and_or.first,
+            Executable::Pipeline(_)
+        ));
+    }
+
+    /// The word pieces of a single-command body, span-free so a synthesized body
+    /// can be compared against a parsed one.
+    fn body_words(body: &Source) -> Vec<Vec<WordPiece>> {
+        let Executable::Pipeline(pipeline) = &body.statements[0].and_or.first else {
+            panic!("expected a pipeline")
+        };
+        pipeline.stages[0]
+            .items
+            .iter()
+            .map(|item| match item {
+                CommandItem::Word(word) => word.value.pieces.clone(),
+                other => panic!("expected a word, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_alias_desugars_to_a_wrapper_func() {
+        // The claim the whole feature rests on: `alias` builds the definition you
+        // would have written by hand, so it is checked against exactly that tree
+        // rather than against its own shape.
+        let sugar = complete("alias co = vcs checkout");
+        let Executable::Function {
+            name,
+            parameters,
+            body,
+            wrapper,
+        } = &sugar.statements[0].and_or.first
+        else {
+            panic!("expected a function definition")
+        };
+        assert!(wrapper);
+        assert_eq!(name, "co");
+        assert_eq!(parameters.len(), 1);
+        assert_eq!(parameters[0].name, ALIAS_REST);
+        assert_eq!(parameters[0].kind, ParamKind::Rest);
+
+        let written = complete("wrapper func co(...args) { vcs checkout ...$args }");
+        let Executable::Function { body: expected, .. } = &written.statements[0].and_or.first
+        else {
+            panic!("expected a function definition")
+        };
+        // Compared by word pieces rather than whole nodes: the spans differ by
+        // construction, since the desugared body has no source text of its own.
+        assert_eq!(body_words(body), body_words(expected));
+
+        // `alias` leads a definition only in the shape that claims it.
+        let assignment = complete("alias = 1");
+        assert!(matches!(
+            assignment.statements[0].and_or.first,
+            Executable::Assignment { .. }
+        ));
+        let command = complete("alias --help");
         assert!(matches!(
             command.statements[0].and_or.first,
             Executable::Pipeline(_)

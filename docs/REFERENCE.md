@@ -2343,6 +2343,33 @@ greet world          # -> hi, world
   `wrapper` is **contextual, not reserved**: it leads a definition only where
   `func` follows it, so the word is still free as a variable, a function name,
   and a command. It does not combine with `fork func`.
+- **`alias NAME = COMMAND [ARG …]`** — the terse spelling of the above. Sugar
+  over `wrapper func`, not a mechanism of its own:
+
+  ```mesh
+  alias co = vcs checkout
+  # exactly the same definition as
+  wrapper func co(...args) { vcs checkout ...$args }
+  ```
+
+  So an alias resolves, scopes, and takes arguments like any function, and
+  `type co` reports the `wrapper func` it is. There is **no alias mechanism** —
+  no parse-time textual expansion and no separate resolution stage; what mesh
+  drops is that machinery, not the familiar name for "give this command a
+  shorter one."
+
+  A first word equal to the alias's own name reaches the **program**, not the
+  definition: `alias grep = grep --color=auto` is the commonest alias there is,
+  and it desugars with `command grep` so it cannot recurse — the same escape
+  `func ls() { command ls … }` uses, and the same no-self-expansion rule bash
+  applies.
+
+  The right-hand side is **a command, not a string**. bash needs
+  `alias ll='ls -l'` because its alias body is text; here the quotes would make
+  one word naming no program, so that spelling is a syntax error pointing at the
+  unquoted form. `alias` is contextual in the same way `wrapper` is: only the
+  `alias NAME =` shape claims the word, so `alias = 1` and a function called
+  `alias` still work.
 - **Body.** May span multiple lines; the shell keeps reading until the `{ … }`
   braces balance. Interactively, the continuation prompt is `...`.
 - **Scope.** Each call gets a fresh **function-local** scope: `x = 5` in a body
