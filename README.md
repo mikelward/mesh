@@ -82,6 +82,9 @@ output. For a hands-on walk through the main features, see
 [`docs/REFERENCE.md`](docs/REFERENCE.md). That covers the completed M3 language
 surface and the work since; later design work remains tracked in
 [`ROADMAP.md`](ROADMAP.md) and [`TODO.md`](TODO.md).
+[`docs/INTEGRATION.md`](docs/INTEGRATION.md) works through the external tools a
+bash or zsh user arrives with — starship, atuin, fzf, carapace, zoxide, direnv —
+saying which already work, which are blocked, and on what.
 
 ## Name
 

@@ -192,7 +192,8 @@ mesh/
 ├── GRAMMAR.md              # the grammar actually implemented so far (grows per task)
 ├── ROADMAP.md              # milestones M0 → beyond
 ├── TODO.md                 # current-milestone checklist
-└── docs/                   # TOUR.md, REFERENCE.md (implemented), INTRO/PROMPT (design)
+└── docs/                   # TOUR.md, REFERENCE.md (implemented), INTRO/PROMPT (design),
+                            # INTEGRATION.md (external tools)
 ```
 
 ### How the code fits together
