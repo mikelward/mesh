@@ -170,7 +170,8 @@ There are four kinds of modifier, and the difference matters:
   long," "the last one," and "flatten to a string." `:join(SEP)` is the fold
   that turns a list back into bytes (`$dirs:join(":")`); it stringifies each
   element and errors on a nested list or map (there is no implicit deep
-  flattening — spell it out). **`:dedup`** returns the list with duplicate
+  flattening — spell it out; the modifier to spell it *with* is the open `:flat`
+  under [Spread](#spread--flattening)). **`:dedup`** returns the list with duplicate
   elements removed — **keep-first, order-preserving**, equality by value — so
   `$env.PATH:dedup` is the guarded, deduped PATH; unlike Unix `uniq(1)` it drops
   *non-adjacent* duplicates and needs no prior sort. It is **pure** (returns a new
@@ -1810,6 +1811,31 @@ Insertion order is **preserved** (like Python dict / a `Vec<(K,V)>` behind the
 scenes) so `for k in $m:keys` is deterministic — important for an rc file that
 builds, say, an ordered alias table.
 
+*(open — **`[key=value]` as the literal spelling**, in place of `key: value`. The
+draw is that it would retire the one collision this section has to legislate
+around: the pair `:` versus the modifier `:`, which today costs a quoting rule
+(`["http:" 80]`) and a lookahead to keep `[:]` apart from `[:stem]`. `=` has no
+such clash. Three things have to land before it is a candidate:*
+
+- ***The `env FOO=1` case is narrower than it first appears.*** The pair syntax
+  is already **bracket-scoped** — a bare `key: value` in space-separated command
+  position is not map grammar (see
+  [Calling for a value](#calling-for-a-value-and-lambdas)) — so `env FOO=1 cmd`
+  never enters the map rule under either spelling. What changes is only
+  `[CFLAGS=-O2]`, which would flip from a one-element list of an argv token to a
+  one-entry map.
+- ***Map spread would want a canonical argv encoding after all,*** which the
+  bullet below currently refuses. `--key=value` is the wanted rendering; note it
+  is *not* the same as the literal's own spelling, so the tidy "the literal is
+  the wire format" argument (the `KEY=bytes` environment table being the one map
+  every process already carries) does **not** close the case, and picking
+  `--k=v` over `k=v` is back to a guess between plausible encodings.
+- ***Whether named options follow.*** A value call's options **are** a map
+  literal, so `deploy(prod, region: us-west)` would become `region=us-west` —
+  which then collides with the dashed `--region=us-west` spelling *and* with a
+  literal `f(CC=gcc)` positional. Deciding maps without deciding options would
+  split the two shapes that are deliberately one.)*
+
 ### Spread / flattening
 
 `...` is the one operator that moves between "a list" and "several arguments,"
@@ -1843,10 +1869,30 @@ external program is bytes, not mesh values:
   callee sees a real list and can index it, `:len` it, spread it onward.
 - **To an external program**, there is no list-shaped argv slot, so passing an
   un-spread list is a **hard error** (`git log $flags` → *"$flags is a list;
-  spread it with ...$flags or join it with $flags:join"*). mesh refuses to
-  silently pick a separator — that guess is exactly the bash footgun. The two
+  spread it with ...$flags or join it with $flags:join"*). The two
   explicit outs are `...$flags` (one argv entry per element) and
-  `$flags:join(SEP)` (one byte-string).
+  `$flags:join(SEP)` (one byte-string). Note that this is a **stricter** rule
+  than the bytes boundary alone forces — a flat list *does* have a canonical argv
+  form — so it is argued on its own terms under "Implicit flattening at argv"
+  below rather than inherited from the no-word-splitting promise.
+
+**Two boundaries, not one.** It is tempting to justify all of this with "mesh
+will not guess a separator," but that reason only holds at *one* of the two
+places a value turns into bytes, and conflating them muddies both:
+
+| Boundary | Shape it lands in | Does a list need a *guess*? |
+| --- | --- | --- |
+| **argv** (`cmd $x`) | a **vector** of byte-strings | **No.** argv is already a sequence of independent strings, so a list maps onto it losslessly — one element per slot, no separator anywhere |
+| **interpolation** (`"$x"`) | **one** byte-string | **Yes.** Collapsing many elements into one string requires picking a separator (space? tab? `,`?), and there is no right answer |
+
+So the "no canonical separator" argument is an **interpolation** argument. It is
+the whole story for `"$xs"`, and it is *not* why a bare `$xs` is refused at
+argv — a list has a perfectly canonical argv form. The argv rule rests on two
+different legs, spelled out under "Implicit flattening at argv" at the end of
+this section: **nesting** (a list *element* that is itself a list has no argv
+form) and **decidability** (whether a line works should be readable from the
+line, not dependent on what a variable happens to hold at run time). Both are
+good reasons; neither is about separators.
 
 The general rule at the bytes boundary — **a value renders to argv iff it has a
 *canonical* byte form; if rendering it would require a *guess*, that is an
@@ -1859,15 +1905,19 @@ error**:
 | bool (a switch, a comparison) | `true` / `false` | two fixed spellings, unambiguous |
 | styled value (from `style`) | its **text** (attributes dropped), then the string rows apply | a styled value *is* a string with display metadata, so an embedded NUL in its text is the same hard error as below |
 | **string with embedded NUL** | **error** | argv entries are NUL-terminated; the OS cannot carry it (same limit as `export`) |
-| **list** | **error** — spread or `:join` | no canonical separator (space? tab? `,`?) |
-| **map** | **error** — render it explicitly | no canonical flattening at all |
+| **list** | **error** — spread or `:join` | *not* a separator problem here (see above): a **nested** element has no argv form, and implicitly flattening the flat case would make a line's meaning depend on run-time contents |
+| **map** | **error** — render it explicitly | here the guess is real — `--k=v` vs `--k v` vs `k=v` are all plausible and mesh will not pick |
 | Duration | its canonical spelling (`3s`, `1m30s`) | it has a canonical form |
 | **Instant / regex / stream handle** | **error** — no canonical byte form | an Instant needs `:iso`/`:epoch`/`:format`; a regex (it carries flags) and a stream handle have no byte form at all |
 
-String interpolation uses this same rendering table. Interpolating a list, map,
-Instant, regex, stream handle, embedded-NUL string, or any future value without a
-canonical byte form is a loud error; `${…}` is not an alternate serialization
-mechanism.
+String interpolation uses this same rendering table, and reaches the same verdict
+on every row — but for a **list** it gets there by the separator argument above
+rather than by the argv one. Interpolating a list, map, Instant, regex, stream
+handle, embedded-NUL string, or any future value without a canonical byte form is
+a loud error; `${…}` is not an alternate serialization mechanism. The practical
+consequence of the split is that `...` and `:join` are **not** interchangeable
+fixes: `cmd ...$xs` passes `$xs:len` separate arguments and needs no separator,
+while `$xs:join(",")` makes one string and must name one.
 
 An embedded NUL (which a `$(cmd):raw` capture can hold) is the one place a
 *string* fails to cross — argv, like the environment, is NUL-terminated, so it
@@ -1875,8 +1925,76 @@ is a hard error at both boundaries, never a silent truncation.
 
 So `echo $xs:len` prints `4` and `echo $found` prints `true`, but `echo $xs`
 (a list) and `echo $m` (a map) are errors that name the fix. The dividing line
-is "is there one obviously-right rendering?" — ints and bools have one, a list's
-separator and a map's shape do not.
+is "is there one obviously-right rendering?" — ints and bools have one, and a
+map's shape does not. A **list** is the row where the answer differs by
+boundary, per the split above: no for interpolation, yes for argv, where it is
+refused on the separate grounds below.
+
+**Implicit flattening at argv.**
+*(open — the rule above is **not** in question for maps or for interpolation;
+what is open is whether a **flat list** should reach argv without a written
+`...`.)*
+
+**What is settled.** Implicit flattening here is **not** the bash footgun, and
+the goals' "no implicit word splitting, ever" should not be read as settling it
+by itself. bash's bug is *string → many words*: arity is inferred from the
+**bytes** of a value at run time, on `IFS`, which is why `rm $file` breaks on a
+space. A mesh list carries its arity in its **type** — nothing is inferred from
+whitespace, and `$file` (a string) stays one argv entry under every option
+below. "Does a **string** split?" is closed — no, permanently. "Does a **list**
+flatten?" is a separate question that the first one does not answer.
+
+**The live costs.** The `...` requirement is not free, because
+[command substitution](#command-substitution) newline-splits by default: `$(…)`
+already *is* a list, so the most common idiom in shell owes a spread —
+`wc -l ...$(ls)`, `grep foo ...$(find . -name '*.rs')`. Every capture used as an
+argument pays a token, which is a large surface for a rule whose stated
+justification (the separator guess) turns out not to apply at argv.
+
+The options, cheapest-to-change first:
+
+| Option | `cmd $xs` where `xs = [a b]` | Nested `[a [b c]]` | Trade |
+| --- | --- | --- | --- |
+| **A. Status quo** — always `...` | **error**, names the fix | error either way | Rule is **syntactic**: readable from the line, never data-dependent. Costs a token on every capture |
+| **B. Flatten flat, error on nested** | `cmd a b` | **error** | Terse where it matters; puts the loud failure exactly where the real ambiguity is. But whether a line works now depends on **run-time contents** — the regression that matters |
+| **C. Deep flatten** | `cmd a b` | `cmd a b c` | Never errors, never surprises with an error. Silently erases the distinction `+=` is built to preserve (`xs += [$ys]` appends whole vs `xs += $ys` extends), so a value's argv arity stops being predictable from its structure. This is **Perl's** auto-flattening list wart, which is why Perl needs `\@a` refs to nest at all |
+| **D. Flatten only a `$( )` capture** | `cmd a b` | n/a — captures are flat | Buys back the whole ergonomic cost above with no nesting question, since a split always yields a flat list of strings. But it makes the rule depend on a value's **provenance**, not its type — `xs = $(ls)` then `cmd $xs` would have to decide whether the property survives the binding, and "it does not" is a nasty wrinkle |
+
+**Leaning A or D.** B's data-dependence is a real regression over a rule you can
+check by reading, and C is a known wart in the one language that shipped it. D is
+the interesting one precisely because it is *not* about lists at all — it is
+about whether `$(…)`-in-argument-position should keep bash's shape while keeping
+mesh's safety, and it needs the binding question answered before it is a real
+candidate.
+
+*(TODO — **a `:flat` modifier**, which is wanted under **every** option above and
+is a gap today: [`:join`](#modifiers) already promises "there is no implicit deep
+flattening — spell it out" and then supplies no spelling. Nesting arises in mesh
+more readily than in most languages, because value modifiers **auto-map over a
+list**: a split applied to a list of lines (`$lines:words`) or any
+`:map` whose lambda returns a list yields a list of lists, and there is currently
+no way back.*
+
+- ***Depth default — one level, not deep.*** The split across languages is even —
+  one-level in **JavaScript** (`flat()`, depth defaulting to `1`), **Rust**
+  (`flatten`), **Haskell** (`concat`), **Clojure** (`mapcat`), and **nushell**
+  (`flatten`, with `--all` for deep); deep in **Ruby** (`flatten`), **jq**,
+  **Elixir**, and Clojure's own `flatten` — which the Clojure community warns off
+  for exactly the structure-loss reason. One level is the better fit here because
+  it matches the level `...` already spreads and the level `+=` already
+  distinguishes, and because the shell cases that produce nesting produce exactly
+  one level of it. **Python** is worth noting for having *no* built-in at all
+  (`itertools.chain.from_iterable`), which is a mild vote that this is less
+  load-bearing than it looks.
+- ***Name and depth argument.*** `:flat` matches the terse modifier vocabulary
+  (`:len`, `:keys`, `:dedup`) and JavaScript's spelling; `:flat(n)` for an
+  explicit depth follows `:get(i, default)` / `:split(SEP)`. Whether the deep
+  case earns a spelling at all (`:flat(999)` is ugly; nushell's `--all` needs
+  option syntax on a modifier) is open.
+- ***Skip `:flatmap`.*** Rust and JavaScript ship `flat_map` / `flatMap` largely
+  for iterator fusion, which a shell does not care about; `$xs:map(f):flat` says
+  the same thing in one more token and composes with the existing chain grammar
+  rather than adding a second name for `map`.)*
 
 ### Destructuring
 
