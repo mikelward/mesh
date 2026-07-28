@@ -1256,21 +1256,11 @@ fn run_executable(
                 }
                 Err(step) => return step,
             }
-            if runs_as_command(expression)
-                && let parser::Expr::Scalar(word) = expression
-            {
-                return run_pipeline(
-                    vec![Stage {
-                        words: vec![word.value.clone()],
-                        redirs: Vec::new(),
-                        pipe_stderr: false,
-                    }],
-                    background,
-                    last,
-                    in_function,
-                    shell,
-                );
-            }
+            // A lone quoted scalar used to run here, the spelling that reached a
+            // program whose path needs quoting (`"/opt/my program"`). It is a string
+            // literal now: quoting makes a value, and `command -- "…"` is how a path
+            // like that is run (`DESIGN.md` §"Bare words and quoted values").
+            //
             // An expression used as a statement reports the status *view* of its
             // value (`DESIGN.md` §"Results and status"): an integer is its own
             // status, a boolean inverts, anything else is 0. That is what lets
@@ -1309,9 +1299,6 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
     use parser::Executable::*;
     Some(match node {
         Pipeline(_) => return None,
-        // A lone quoted scalar is a command, so it becomes a pipeline stage and
-        // is backgrounded like any other command.
-        Expression { expression, .. } if runs_as_command(expression) => return None,
         Expression { .. } => "an expression",
         Assignment { .. } => "an assignment",
         Unset { .. } => "an `unset`",
@@ -1437,20 +1424,29 @@ fn carries_a_value(items: &[parser::CommandItem]) -> bool {
         })
 }
 
-/// Whether an expression statement is really a **command**: a lone scalar word
-/// carrying a quoted piece, the spelling that runs a program whose path needs
-/// quoting (`"/opt/my program"`). Such a statement produces a status, not a
-/// value, which is why its result is recorded like any other command's.
-fn runs_as_command(expression: &parser::Expr) -> bool {
-    matches!(expression, parser::Expr::Scalar(word)
-    if word.value.pieces.iter().any(|piece| match piece {
-        parser::WordPiece::Text { quote, .. } | parser::WordPiece::Variable { quote, .. } => {
-            !matches!(quote, parser::QuoteMode::Bare)
-        }
-        // A value only reaches a word from inside quotes, so `"$(which ls)"` is
-        // the same spelling with the path computed — still a command.
-        parser::WordPiece::Value(_) => true,
-    }))
+/// Does this one-word body name a **command**?
+///
+/// Inside braces a bare word is a command, exactly as it is anywhere else a
+/// statement is read: `{ pwd }` runs `pwd` rather than yielding the string
+/// `"pwd"`. Two bare spellings escape, because neither can name a command — an
+/// integer literal and `true`/`false`, which is what keeps `func answer() { 42 }`
+/// the integer and `{ false }` the boolean. A **quoted** word is a string literal
+/// and never a command (`DESIGN.md` §"Bare words and quoted values"), so it is not
+/// one here either.
+///
+/// This is the whole of the bare-vs-quoted rule for a block tail. Anything that is
+/// not a single bare `Text` piece — an interpolation, a computed value — keeps the
+/// reading it has elsewhere and is not claimed here.
+fn bare_word_names_a_command(word: &parser::Word) -> bool {
+    matches!(
+        word.pieces.as_slice(),
+        [
+            parser::WordPiece::Text {
+                text,
+                quote: parser::QuoteMode::Bare,
+            },
+        ] if matches!(expand::typed_scalar(text), Value::String(_))
+    )
 }
 
 fn guard_allows(
@@ -4622,6 +4618,7 @@ fn eval_value_body(
             &statement.and_or.first
         && let [parser::Command { items, guard: None }] = stages.as_slice()
         && let [parser::CommandItem::Word(word)] = items.as_slice()
+        && !bare_word_names_a_command(&word.value)
     {
         return eval_expr(
             &parser::Expr::Scalar(word.clone()),

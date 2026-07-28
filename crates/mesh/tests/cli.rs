@@ -9697,6 +9697,42 @@ fn a_lone_numeric_literal_is_a_value_not_a_command() {
 }
 
 #[test]
+fn a_bare_word_is_a_command_and_a_quoted_one_is_a_string() {
+    // The rule in one line: inside braces a bare word is a command, a quoted word
+    // is a string literal. Before this, a *one-word* block tail was coerced to a
+    // scalar — `{ pwd }` was the string "pwd" while `{ pwd . }` ran — so adding an
+    // argument flipped a literal into an execution, and `x = if true { pwd }`
+    // silently bound the wrong thing with no error to show for it.
+    let out = run_with_input(
+        "bare = if true { pwd }\n\
+         quoted = if true { \"pwd\" }\n\
+         args = if true { echo hi }\n\
+         puts \"<$quoted>\" \"<$args>\"\n\
+         puts eq if $bare == $(pwd)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "<pwd> <hi>\neq\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The carve-out: a numeral and a boolean can never name a command, so they stay
+    // literals. This is what keeps `func answer() { 42 }` the integer.
+    let literals = run_with_input(
+        "func answer() { 42 }\nfunc no() { false }\n\
+         puts answer():repr\nx = if true { false }\nputs $x:repr\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&literals.stdout), "42\nfalse\n");
+
+    // And a quoted word as a whole statement is a value, so it is what a bare
+    // `return` carries — it no longer looks for a program of that name.
+    let statement = run_with_input("func f() { \"foo\"\n return }\nputs f():repr\n");
+    assert_eq!(String::from_utf8_lossy(&statement.stdout), "'foo'\n");
+    assert!(statement.stderr.is_empty(), "{:?}", statement.stderr);
+}
+
+#[test]
 fn only_a_lone_numeral_becomes_a_value() {
     // The rule is deliberately the narrowest one that closes the gap: the *whole*
     // statement must be the literal, the same shape a quoted literal already had.
@@ -10307,12 +10343,13 @@ fn a_bare_return_carries_the_result_so_far() {
     );
     assert_eq!(String::from_utf8_lossy(&skipped.stdout), "[false][]\n");
 
-    // A quoted scalar statement is a *command* — the spelling that runs a path
-    // with spaces — so its result is its status, not the string.
-    let quoted = run_with_input(
-        "func f() { \"false\"\n return }\nf && puts bad\nf || puts ok\nv = f()\nputs \"v=[$v]\"\n",
-    );
-    assert_eq!(String::from_utf8_lossy(&quoted.stdout), "ok\nv=[1]\n");
+    // A quoted scalar statement is a string *literal*, so the result it leaves for
+    // a bare `return` is that string — status 0, since producing a value is
+    // success. Quoting makes a value; `command -- "…"` is how a path with spaces
+    // is run.
+    let quoted =
+        run_with_input("func f() { \"false\"\n return }\nf && puts ok\nv = f()\nputs \"v=[$v]\"\n");
+    assert_eq!(String::from_utf8_lossy(&quoted.stdout), "ok\nv=[false]\n");
 
     // A compound that ran but produced no value results in the empty string — not
     // the result the statement before it recorded, and not its own status. That is
@@ -10531,9 +10568,10 @@ fn a_backgrounded_non_command_is_refused() {
     assert_eq!(refused.status.code(), Some(2));
     assert!(refused.stdout.is_empty(), "{:?}", refused.stdout);
 
-    // A command *is* backgroundable, including the lone quoted spelling that runs
-    // a path needing quotes — that stays a job, not an error.
-    let command = run_with_input("\"/bin/true\" &\nputs after\n");
+    // A command *is* backgroundable, and a path needing quotes reaches one through
+    // `command --` now that a lone quoted word is a string literal rather than a
+    // command — that stays a job, not an error.
+    let command = run_with_input("command -- \"/bin/true\" &\nputs after\n");
     assert_eq!(
         String::from_utf8_lossy(&command.stdout),
         "after\n",
@@ -12501,7 +12539,10 @@ fn remainder_overflow_is_not_reported_as_division_by_zero() {
 }
 
 #[test]
-fn quoted_path_with_spaces_runs_in_command_position() {
+fn quoted_path_with_spaces_runs_through_command() {
+    // A quoted word is a string literal, so writing the path alone binds it rather
+    // than running it. `command --` is the spelling that runs a path needing
+    // quotes, and it is the escape hatch the bare/quoted rule leaves in place.
     let dir = fresh_dir("quoted command");
     let command = dir.join("say hello");
     std::fs::write(&command, "#!/bin/sh\nprintf 'ran\\n'\n").unwrap();
@@ -12509,12 +12550,19 @@ fn quoted_path_with_spaces_runs_in_command_position() {
     use std::os::unix::fs::PermissionsExt;
     permissions.set_mode(0o755);
     std::fs::set_permissions(&command, permissions).unwrap();
-    let out = run_with_input(&format!("\"{}\"\n", command.display()));
+    let out = run_with_input(&format!("command -- \"{}\"\n", command.display()));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Written alone it is the string, and nothing runs.
+    let bound = run_with_input(&format!("p = \"{}\"\nputs $p:repr\n", command.display()));
+    assert_eq!(
+        String::from_utf8_lossy(&bound.stdout),
+        format!("'{}'\n", command.display())
     );
 }
 
@@ -13695,16 +13743,21 @@ fn an_attached_redirection_is_not_read_as_a_match_arrow() {
 
 #[test]
 fn a_block_arms_value_still_follows_the_block_value_rules() {
-    // A `=> { … }` block yields a value the way any block does, which is the open
-    // value-production question rather than anything the arrow settles: in
-    // expression position a lone bare word is still read as a scalar, while a
-    // longer command runs and its output is captured.
+    // A `=> { … }` block yields a value the way any block does. Inside braces a
+    // bare word is a command whatever its arity, so `{ echo }` runs `echo` and
+    // captures its (empty) output rather than yielding the string "echo" — the
+    // one-word case no longer disagrees with the longer one. A quoted word is the
+    // string literal.
     let out = run_with_input(
         "word = match 1 { 1 => { echo } }\n\
          run = match 1 { 1 => { echo two words } }\n\
-         puts \"<$word>\" \"<$run>\"\n",
+         quoted = match 1 { 1 => { \"echo\" } }\n\
+         puts \"<$word>\" \"<$run>\" \"<$quoted>\"\n",
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "<echo> <two words>\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "<> <two words> <echo>\n"
+    );
     assert!(
         out.status.success(),
         "{}",
