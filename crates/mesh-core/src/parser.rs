@@ -2101,7 +2101,12 @@ impl Parser {
     fn command(&mut self) -> Result<Command, ParseError> {
         let mut items = Vec::new();
         while !self.at_command_end() {
-            if (self.word("if") || self.word("unless")) && !items.is_empty() && self.viable_guard()
+            // An attached `:modifier` outranks the guard keyword too, so
+            // `puts if:upper` is an argument rather than `puts` guarded by `:upper`.
+            if (self.word("if") || self.word("unless"))
+                && !self.carries_attached_modifier()
+                && !items.is_empty()
+                && self.viable_guard()
             {
                 break;
             }
@@ -3068,7 +3073,8 @@ impl Parser {
     /// does not depend on where the line sits.
     fn not_expression(&mut self) -> Result<Expr, ParseError> {
         let mut negations = 0_usize;
-        while self.take_word("not") {
+        // `not:upper` is a chain on the text `not`, not a negation of `:upper`.
+        while !self.carries_attached_modifier() && self.take_word("not") {
             negations += 1;
         }
         let mut expression = self.binary(4)?;
@@ -3514,13 +3520,16 @@ impl Parser {
             self.newlines();
             return Ok(Expr::Capture(self.source(Some(TokenKind::RParen))?));
         }
-        if self.word("if") {
+        // An attached `:modifier` outranks all three: these arms return before the
+        // postfix loop, so without the guard the chain is never reached.
+        let keyword = !self.carries_attached_modifier();
+        if keyword && self.word("if") {
             return Ok(Expr::If(Box::new(self.if_expr()?)));
         }
-        if self.word("match") {
+        if keyword && self.word("match") {
             return Ok(Expr::Match(Box::new(self.match_expr()?)));
         }
-        if self.word("for") {
+        if keyword && self.word("for") {
             self.take_word("for");
             let bindings = self.for_bindings()?;
             if !self.take_word("in") {
@@ -4348,6 +4357,30 @@ impl Parser {
 
     fn word(&self, expected: &str) -> bool {
         matches!(self.peek().map(|t| &t.value), Some(TokenKind::Word(word)) if word.is_bare_text(expected))
+    }
+    /// Does the word at the cursor carry an **attached** `:modifier`?
+    ///
+    /// A keyword is claimed only as a *bare* word, so `if:upper` is a chain on the
+    /// text `if` rather than the start of a conditional. Without this the keyword
+    /// arms run first and never reach the postfix loop, which made `if:upper`,
+    /// `match:upper` and `for:upper` syntax errors and — worse, because it is silent
+    /// — `not:upper` the value `false`, since `not` took the negation and left
+    /// `:upper` to fold away.
+    ///
+    /// Spacing is the signal, exactly as it is wherever else a chain is recognized:
+    /// `if :upper` keeps the keyword and reads `:upper` as a modifier reference.
+    fn carries_attached_modifier(&self) -> bool {
+        let (Some(word), Some(colon)) = (self.peek(), self.tokens.get(self.position + 1)) else {
+            return false;
+        };
+        matches!(word.value, TokenKind::Word(_))
+            && matches!(colon.value, TokenKind::Colon)
+            && colon.span.start == word.span.end
+            && self
+                .tokens
+                .get(self.position + 2)
+                .is_some_and(|name| name.span.start == colon.span.end)
+            && self.word_text_at(2).is_some_and(modifier_name)
     }
     fn take_word(&mut self, expected: &str) -> bool {
         if self.word(expected) {
