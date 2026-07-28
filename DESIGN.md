@@ -3027,11 +3027,10 @@ and it behaves as it always has — by position, exactly like an `if` branch:
   — resolves the block to a value by its tail (`eval_value_body`): (1) a
   **value-expression tail** (`=> { "text" }`, `{ $v }`, `{ [a b] }`, nested `if`/`match`)
   yields that value; (2) a body ending in a **command** (`{ wc -l < $f }`, and
-  `{ markdown }` — see the bare/quoted rule below) runs the **whole
-  body** and yields its captured stdout **only on exit 0** — note this captures *every*
-  statement's stdout, not just the tail's, so `{ puts a; some-cmd }` includes the `a`
-  (nonzero aborts; a bare `$(…)` shares the exit-0 gate). To yield a string, quote it:
-  `{ "text" }`.
+  `{ markdown }` — see the bare/quoted rule below) **runs and streams**, exactly as
+  it does in statement position, and yields the **status** that command left — there
+  is no implicit capture. To yield a string, quote it: `{ "text" }`; to yield the
+  bytes, capture them explicitly: `{ $(wc -l < $f) }`.
   *(A function's value-return is **not** yet an expression context — a `match` as a
   function's last statement runs in statement position and the value is discarded;
   structured value-return / value-calls beyond `re(…)` are unbuilt.)*
@@ -4660,20 +4659,20 @@ to avoid" rather than promising the latter as done.
   **contextual**, like `fork` / `global` / `unset`, so a program or variable of that
   name stays reachable.)*
 
-  *(**Considered and deferred: dropping implicit stdout capture in value position.**
-  Not being pursued, recorded in case the remaining sharp edges make it worth
-  revisiting. Today a value-position block whose tail is a command runs the body and
-  yields its **captured stdout**, gated on exit 0 — see
-  [Matching](#matching-match). The alternative is that a value comes only from a
-  **value expression**: `{ wc -l < $f }` would then have no value at all, only a
-  status, and you would write `{ $(wc -l < $f) }` to ask for the output. What it
-  buys is that capture stops being invisible, and two surprises go with it — the
-  gate swallowing a nonzero result (`x = if true { puts a; false }` leaves `x`
-  unbound), and the capture including **every** statement's stdout rather than the
-  tail's, so `{ puts a; some-cmd }` yields the `a` too. What it costs is typing, felt
-  most in match arms, where a captured command is the common case. Bare-vs-quoted was
-  taken without it, so the two are independent: this one is purely about whether an
-  implicit capture should remain reachable without `$( … )`.)*
+  *(**Implicit stdout capture in value position is gone** *(decided; shipped)*. A
+  value-position block used to run its body under a capture and yield the bytes,
+  gated on exit 0. It was never intended — `func` never did it, and the rule was
+  always that a block streams unless something explicitly captures or calls it — and
+  three sharp edges came out of it. The **same block text** either streamed or was
+  silently eaten depending on whether anyone bound the result, so
+  `x = if true { echo hi }` swallowed `hi` while the bare statement printed it. The
+  capture took **every** statement's stdout rather than the tail's, so
+  `{ puts a; some-cmd }` yielded the `a` too. And the exit-0 gate failed **silently**:
+  `x = if true { grep -q zzz f }` left `x` unbound, surfacing as an "unbound variable"
+  on a later line with nothing to say why. `eval_value_body` (repl.rs) now routes
+  `if` and `match` through the same `eval_body` a `func` body uses, so the three
+  agree: output streams, and the value is the last thing that produced one. `$(…)` is
+  the thing that means "capture", and it still does.)*
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
