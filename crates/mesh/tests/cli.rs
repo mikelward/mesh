@@ -9634,6 +9634,92 @@ fn return_carries_a_typed_value_whose_status_is_a_view_of_it() {
 }
 
 #[test]
+fn a_condition_is_a_bool_or_a_command_and_nothing_else() {
+    // Every other type is refused by name, with the comparison to write instead.
+    // Each of these used to branch, under a different rule per type.
+    for (source, expected) in [
+        (
+            "if 0 { puts t } else { puts f }",
+            "an int is not a condition",
+        ),
+        (
+            "if \"0\" { puts t } else { puts f }",
+            "a string is not a condition",
+        ),
+        (
+            "if [] { puts t } else { puts f }",
+            "a list is not a condition",
+        ),
+        (
+            "if [:] { puts t } else { puts f }",
+            "a map is not a condition",
+        ),
+    ] {
+        let out = run_with_input(&format!("{source}\nputs after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(expected), "{source}: {stderr}");
+        // Recoverable: the shell reports and carries on.
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{source}");
+    }
+
+    // A bool and a command are the two that work, and both still do.
+    let ok = run_with_input(
+        "if true { puts bool }\n\
+         if 1 == 1 { puts comparison }\n\
+         if sh -c 'exit 0' { puts command }\n\
+         if sh -c 'exit 1' { puts wrong } else { puts command-failed }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ok.stdout),
+        "bool\ncomparison\ncommand\ncommand-failed\n"
+    );
+    assert!(ok.stderr.is_empty(), "{:?}", ok.stderr);
+}
+
+#[test]
+fn a_length_in_condition_position_is_refused_rather_than_inverted() {
+    // The footgun this rule exists for: `:len` returned an int, and an int read as
+    // an exit status, so `if $xs:len` fired on the **empty** list and stayed quiet
+    // on a full one. Both directions are now a diagnostic naming the comparison.
+    let out = run_with_input("xs = []\nif $xs:len { puts has } else { puts empty }\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("an int is not a condition"), "{stderr}");
+    assert!(
+        stderr.contains(":len > 0") || stderr.contains("`… > 0`"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // Spelled as the comparison, both directions read the way they look.
+    let compared = run_with_input(
+        "xs = []\nys = [a b]\n\
+         if $xs:len > 0 { puts wrong } else { puts empty }\n\
+         if $ys:len > 0 { puts full } else { puts wrong }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&compared.stdout), "empty\nfull\n");
+}
+
+#[test]
+fn and_or_and_not_refuse_the_same_values_a_condition_does() {
+    // They ask the same question, so they refuse the same answers.
+    for source in ["x = true and 1", "x = 0 or true", "x = not \"abc\""] {
+        let out = run_with_input(&format!("{source}\nputs after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("is not a condition"), "{source}: {stderr}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{source}");
+    }
+
+    // Short-circuiting still happens, and still yields a bool.
+    let out = run_with_input(
+        "puts (false and true)\nputs (true or false)\nputs (true and true)\nputs (not false)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "false\ntrue\ntrue\ntrue\n"
+    );
+}
+
+#[test]
 fn fail_names_a_status_and_return_names_a_value() {
     // The two channels, spelled apart. `return` fills the value channel and leaves
     // the status at 0 — a result is success, whatever its type. `fail` fills the
@@ -9876,12 +9962,13 @@ fn only_a_lone_numeral_becomes_a_value() {
     assert_eq!(String::from_utf8_lossy(&or.stdout), "end\n");
 
     // Two places where the classification *does* show through, both consistent with
-    // rules that already existed. In condition position the literal is a value whose
-    // status is itself, so a nonzero one takes `else` — the same branch as before,
-    // without the spurious "command not found" on the way.
-    let condition = run_with_input("if 42 { puts t } else { puts f }\n");
-    assert_eq!(String::from_utf8_lossy(&condition.stdout), "f\n");
-    assert!(condition.stderr.is_empty(), "{:?}", condition.stderr);
+    // rules that already existed. In condition position the literal is a *value*,
+    // and a condition is a bool or a command — so it is refused by type rather than
+    // silently branching, and the diagnostic names the fix.
+    let condition = run_with_input("if 42 { puts t } else { puts f }\nputs after\n");
+    let stderr = String::from_utf8_lossy(&condition.stderr);
+    assert!(stderr.contains("an int is not a condition"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&condition.stdout), "after\n");
 
     // And `&` on an expression is refused, as it is for any non-command statement,
     // rather than backgrounding a command named `42`. Recoverable either way.
@@ -16347,7 +16434,7 @@ fn a_run_of_nots_keeps_its_parity() {
          c = not not not $x\n\
          d = not not not not $x\n\
          puts $a $b $c $d\n\
-         y = \"abc\"\n\
+         y = 1 == 1\n\
          e = not $y\n\
          f = not not $y\n\
          g = not not not $y\n\

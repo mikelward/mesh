@@ -1214,6 +1214,13 @@ own exit code at end of input.
 | `128 + n` | Killed by signal `n`. |
 | `2` | Syntax error (the shell recovers and continues). |
 
+A **condition** — the subject of `if` / `while`, a `stmt if cond` guard, a `match`
+arm guard, or an operand of `and` / `or` / `not` — is a **bool or a command**, and
+nothing else. A command branches on its exit status (`0` is true); a bool branches
+on itself. Any other type is a loud error naming the comparison to write instead,
+so `if $xs:len` is refused and `if $xs:len > 0` is what you write. There are no
+truthy values.
+
 A **value** used as a statement reports the status *view* of that value, and only
 `false` fails — `false` is mesh's "no result", while every other value *is* a
 result and producing one is success. So `1 == 2 || puts nope` prints, a function
