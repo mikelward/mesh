@@ -1785,9 +1785,46 @@ outside it. A slice remains a list and needs `...` to reach an external command;
 omitted
 bounds and negative bounds are supported. Use braces to delimit a reference
 before literal text: `${x}.txt`.
-A malformed `${…}` (no closing `}`, or an invalid name inside) is a syntax error.
-A `$` not followed by a name (`$5`) is a literal `$`; a literal `$` in a string
-is `\$`.
+
+**`${…}` also takes an expression**, not only a reference — a call, or arithmetic:
+
+```mesh
+func host-info() { "host" }
+puts "${host-info()} at ${$n + 1}"
+```
+
+This is what lets a function compose into a string without being bound to a name
+first. Two things follow from the quotes:
+
+- **A call is a call, not a command.** `"${f()}"` takes `f`'s **value**, while
+  `"$(f)"` *runs* `f` and captures what it **printed**. For a segment-style
+  function that returns rather than prints, the two differ silently rather than
+  loudly:
+
+  ```mesh
+  func host-info() { "host" }
+  puts "[${host-info()}]"      # [host]  — the value
+  puts "[$(host-info)]"        # []      — it printed nothing
+  ```
+- **The quotes mean "one string".** A scalar renders — an integer and a boolean
+  included — while a list, map, or handle is a loud error, the same answer `"$xs"`
+  gives. Spell the join (`"${$xs:join(" ")}"`) when the elements are what you want.
+  A [styled value](#styled-values) contributes its text and leaves its attributes
+  behind, exactly as `"$styled"` does — quote it and you have asked for the text.
+
+**The expression form is ordinary mesh, so a variable keeps its `$`.** That is the
+one seam worth knowing, because the sigil-less *reference* form covers a name, its
+members, its indices, and its **argument-free** modifiers — so `${xs:len}` is the
+variable, while `${xs:join(" ")}` is read as an expression, where a bare `xs` is
+the *word* `xs` rather than the binding. Write `${$xs:join(" ")}` for the value.
+
+**An expression body may wrap**, the way a `( … )` group or a `$( … )` body does —
+a newline inside the braces is layout, not a terminator. It still holds exactly one
+expression, so a second one is a syntax error however it is spaced.
+
+A malformed `${…}` (no closing `}`, or a body that is neither a reference nor an
+expression) is a syntax error. A `$` not followed by a name (`$5`) is a literal
+`$`; a literal `$` in a string is `\$`.
 
 ## Modifiers
 

@@ -1470,7 +1470,7 @@ fn can_defer(words: &[parser::Word], redirs: &[Redir]) -> bool {
 fn word_carries_a_value(word: &parser::Word) -> bool {
     word.pieces
         .iter()
-        .any(|piece| matches!(piece, parser::WordPiece::Value(_)))
+        .any(|piece| matches!(piece, parser::WordPiece::Value { .. }))
 }
 
 /// What a job listing shows for a stage that has not expanded its words yet.
@@ -1488,7 +1488,7 @@ fn display_words(words: &[parser::Word]) -> Vec<String> {
                 match piece {
                     parser::WordPiece::Text { text: piece, .. } => text.push_str(piece),
                     parser::WordPiece::Variable { name, .. } => text.push_str(name),
-                    parser::WordPiece::Value(_) => text.push_str("$(…)"),
+                    parser::WordPiece::Value { .. } => text.push_str("$(…)"),
                 }
             }
             text
@@ -2267,7 +2267,10 @@ fn run_ast_pipeline(
                 // whoever expands that word, which is what puts it in word order —
                 // a call in one argument cannot change what an earlier word read.
                 parser::CommandItem::Value(expression) => words.push(parser::Word {
-                    pieces: vec![parser::WordPiece::Value(Box::new(expression.clone()))],
+                    pieces: vec![parser::WordPiece::Value {
+                        expression: Box::new(expression.clone()),
+                        quote: parser::QuoteMode::Bare,
+                    }],
                     qualifiers: None,
                 }),
                 parser::CommandItem::Redirect {
@@ -2463,7 +2466,7 @@ fn expansion_word(
             parser::WordPiece::Variable { name, quote } => {
                 Piece::Var(expansion_variable(name, *quote))
             }
-            parser::WordPiece::Value(expression) => {
+            parser::WordPiece::Value { expression, quote } => {
                 // Through `eval_operand_of`, which puts `shell.result` /
                 // `shell.produced` back: a piece of a word is an *operand*, so what
                 // it produced must not stand as the enclosing command's result.
@@ -2474,7 +2477,15 @@ fn expansion_word(
                 if shell.control.is_some() {
                     return Err(Step::Continue(last));
                 }
-                Piece::Value(value)
+                // Inside `"…"` the quotes say "make this text", so the same rule
+                // `"$xs"` obeys applies here: a scalar renders, a collection is a
+                // loud error. Without this a `"${f()}"` whose call returned a list
+                // would smuggle the list out through a pair of quotes, and quoting
+                // would have stopped meaning "one string".
+                match quote {
+                    parser::QuoteMode::Double => Piece::Value(interpolated_value(value)?),
+                    _ => Piece::Value(value),
+                }
             }
         });
     }
@@ -2482,6 +2493,34 @@ fn expansion_word(
         pieces,
         qualifiers: word.qualifiers.clone(),
     })
+}
+
+/// What a `${ … }` expression contributes to a **double-quoted** word: its text.
+///
+/// The rule is [`expand`]'s for `"$x"`, kept in step deliberately — a string or a
+/// styled value is its text, an integer and a boolean render, and anything with no
+/// single byte form is an error rather than a guessed separator or a lossy shape.
+/// A caller wanting the elements spells the join (`:join(" ")`).
+fn interpolated_value(value: Value) -> Result<Value, Step> {
+    let kind = match value {
+        Value::String(_) => return Ok(value),
+        // Its *text*, not itself. Returning the styled value unchanged let it stay
+        // styled when it was the word's only piece, so `x = "${style(…)}"` kept
+        // attributes that `x = "$styled"` and `x = "pre${…}"` both drop — the same
+        // leak through a pair of quotes the list arm above exists to close.
+        Value::Styled(styled) => return Ok(Value::String(styled.text)),
+        Value::Integer(n) => return Ok(Value::String(n.to_string())),
+        Value::Boolean(b) => return Ok(Value::String(b.to_string())),
+        Value::List(_) => "list",
+        Value::Map(_) => "map",
+        Value::Regex(_) => "pattern",
+        Value::Glob(_) => "glob",
+        Value::Stream(_) => "stream handle",
+        Value::Job(_) => "job handle",
+        Value::Function(_) => "function",
+    };
+    note!("mesh: a {kind} has no text form to interpolate into a string");
+    Err(Step::Continue(1))
 }
 
 /// One resolved step of an assignment path. A subscript stays text because which
@@ -4733,7 +4772,7 @@ fn runs_nothing(expr: &parser::Expr) -> bool {
         // A word runs something only if a spliced value does.
         parser::Expr::Scalar(word) => word.value.pieces.iter().all(|piece| match piece {
             parser::WordPiece::Text { .. } | parser::WordPiece::Variable { .. } => true,
-            parser::WordPiece::Value(inner) => runs_nothing(&inner.value),
+            parser::WordPiece::Value { expression, .. } => runs_nothing(&expression.value),
         }),
         parser::Expr::Group(inner) => runs_nothing(inner),
         // Reaching into a value runs nothing of its own, so `($m).sep` is as inert
@@ -4801,7 +4840,9 @@ fn capture_tail(expr: &parser::Expr) -> bool {
             .iter()
             .rev()
             .find_map(|piece| match piece {
-                parser::WordPiece::Value(inner) => Some(capture_tail(&inner.value)),
+                parser::WordPiece::Value { expression, .. } => {
+                    Some(capture_tail(&expression.value))
+                }
                 // Runs nothing, so it records no status and the scan continues.
                 parser::WordPiece::Text { .. } | parser::WordPiece::Variable { .. } => None,
             })

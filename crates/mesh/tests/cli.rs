@@ -2465,6 +2465,84 @@ fn unterminated_braced_interpolation_is_a_syntax_error() {
 }
 
 #[test]
+fn a_braced_interpolation_takes_a_call() {
+    // `DESIGN.md` puts general expressions in `${…}`; until now only a variable
+    // access parsed there, so composing segments meant binding every call first.
+    let out = run_with_input(
+        "func host-info() { \"host\" }\n\
+         func dir-info() { \"~/src\" }\n\
+         puts \"${host-info()} ${dir-info()}\"\n\
+         puts \"pre${host-info()}post\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "host ~/src\nprehostpost\n"
+    );
+}
+
+#[test]
+fn a_braced_interpolation_takes_an_expression() {
+    let out = run_with_input("n = 2\nputs \"n+1 = ${$n + 1}\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "n+1 = 3\n");
+}
+
+#[test]
+fn a_braced_interpolation_takes_an_expression_across_lines() {
+    // A newline inside the braces is layout: the body is one expression, so it
+    // wraps the way a `( … )` group and a `$( … )` body already do. Needs a script
+    // rather than stdin, where each line is its own submission and no `${…}` of
+    // any kind can span two. A second expression is still refused — wrapping is
+    // what became legal, not a statement list.
+    let dir = fresh_dir("braced_multiline");
+    let script = dir.join("wrap.mesh");
+    std::fs::write(
+        &script,
+        "func f() { \"v\" }\nputs \"${1 +\n2\n} ${\nf()\n}\"\n",
+    )
+    .expect("write script");
+    let out = run_script_with_stdin(&script, isolated_config_home(), b"");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3 v\n");
+
+    let crowded = dir.join("crowded.mesh");
+    std::fs::write(&crowded, "puts \"${1 +\n2\n3\n}\"\n").expect("write script");
+    let out = run_script_with_stdin(&crowded, isolated_config_home(), b"");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("expected `}`"),
+        "stderr was {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_plain_access_still_takes_the_variable_path() {
+    // The cheap path — a name, member, index, or modifier chain — is resolved by
+    // `expand` with no shell, and must not be diverted through the expression
+    // parser now that one exists.
+    let out =
+        run_with_input("m = [key: v]\nxs = [a b]\nputs \"${m.key} ${xs[0]} ${sh.jobs:len}\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v a 0\n");
+}
+
+#[test]
+fn a_quoted_call_returning_a_collection_is_refused() {
+    // The quotes say "make this text", so the rule is `"$xs"`'s: a scalar renders
+    // and a collection is a loud error. Without this a list would leave the call
+    // still a list, and quoting would stop meaning "one string".
+    let out = run_with_input("func f() { [a b] }\nx = \"${f()}\"\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no text form to interpolate"),
+        "stderr was {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
 fn leading_underscore_is_a_variable_name() {
     // Bare `_` remains reserved, while longer names beginning with an underscore
     // can be bound and read like names with an alphabetic head.
@@ -4246,6 +4324,24 @@ fn style_harness(exec: &MeshExec) -> i32 {
     };
     if status != 0 || occurrences(&seen, b"\x1b[1;31mdanger\x1b[0m") == 0 {
         return 212;
+    }
+    // Quotes mean "make this text", so a `${…}` expression yielding a styled value
+    // contributes its text — even as the word's only piece, where the value could
+    // otherwise have travelled out whole. `"$r"` and `"pre${$r}"` already drop the
+    // attributes, and this is the spelling that used to keep them.
+    if !pty_write(shell.master, b"q = \"${style(\"danger\", fg: red)}\"\n")
+        || pty_read_until_command_done(shell.master).is_none()
+    {
+        return 227;
+    }
+    if !pty_write(shell.master, b"puts $q\n") {
+        return 228;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 229;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b[31m") != 0 || occurrences(&seen, b"danger") == 0 {
+        return 230;
     }
     // A pipe means this stage's stdout is not the terminal, so the text goes
     // through plain even though the shell's own stdout is one.
