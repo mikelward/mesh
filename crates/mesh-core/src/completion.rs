@@ -222,6 +222,62 @@ impl CompletionSpec {
         Some(spec)
     }
 
+    /// A spec read from a manual page, as `man` renders it.
+    ///
+    /// Formatting is left to `man`: it decompresses the page, picks the right
+    /// macro package, and — because mesh reads it through a pipe rather than a
+    /// terminal — hands back plain text with no escapes or overstrike in it. That
+    /// is one process per page instead of a roff implementation here, and it is
+    /// what makes every dialect and every compression scheme work alike.
+    ///
+    /// Deliberately narrower than [`from_help`]. Help output puts an option and
+    /// its description on one line; a rendered page puts the description in a
+    /// *deeper* indented block under it. That difference is the whole rule here —
+    /// declarations sit at one column, and everything indented past it is prose:
+    ///
+    /// ```text
+    ///        -l locale
+    ///        --locale=locale
+    ///            Specifies the locale ... This is equivalent to specifying
+    ///            --lc-collate, --lc-ctype, and --icu-locale to the same value.
+    /// ```
+    ///
+    /// A page cites options in its prose constantly, and at some widths a citation
+    /// wraps to the start of its line — which reads exactly like a declaration
+    /// unless the column is what decides. Taking only the shallowest column that
+    /// declares anything is what keeps `--lc-collate` above out of the candidates.
+    ///
+    /// Subcommands are left to the probe. A page documents them in whatever prose
+    /// shape its author chose, with none of the table structure `command_names`
+    /// keys on, so guessing at them would cost more than it found.
+    fn from_man(page: &str) -> Self {
+        let declared: Vec<(usize, &str)> = page
+            .lines()
+            .filter_map(|line| {
+                let text = line.trim_end();
+                let indent = text.len() - text.trim_start().len();
+                declares_option(text.trim_start()).then_some((indent, text.trim_start()))
+            })
+            .collect();
+        let mut spec = Self::default();
+        let Some(column) = declared.iter().map(|(indent, _)| *indent).min() else {
+            return spec;
+        };
+        for (_, line) in declared.iter().filter(|(indent, _)| *indent == column) {
+            let tokens: Vec<_> = line.split_whitespace().collect();
+            let options = option_names(&tokens);
+            if let Some(hint) = value_hint(&tokens) {
+                for option in &options {
+                    spec.values.insert(option.clone(), hint.clone());
+                }
+            }
+            spec.candidates.extend(options);
+        }
+        spec.candidates.sort();
+        spec.candidates.dedup();
+        spec
+    }
+
     pub(crate) fn matching(&self, prefix: &str) -> Vec<String> {
         let candidates = self
             .candidates
@@ -750,6 +806,12 @@ impl CompletionCache {
             metadata.len(),
             args.join("\0")
         );
+        // A page runs nothing, so it is preferred to the probe — but only when
+        // it yields something; an unreadable or unparseable page falls through
+        // rather than answering with less than the probe would.
+        if let Some(spec) = self.man_spec(command, &executable, args) {
+            return spec;
+        }
         let cache_name = cache_name(&executable, args);
 
         if let Some(spec) = self
@@ -772,6 +834,61 @@ impl CompletionCache {
         self.write(&cache_name, &fingerprint, &spec);
         self.remember(fingerprint, spec.clone());
         spec
+    }
+
+    /// The spec a manual page yields, when one documents this executable.
+    ///
+    /// Keyed on the page rather than the binary — its own path, size and mtime —
+    /// so a docs-only package update re-parses, and on `MANPATH`, since that is
+    /// what chose the page among the trees. A parse that finds nothing is not
+    /// cached: it is indistinguishable from a page this parser cannot read, and
+    /// the probe is a better answer than an empty spec.
+    fn man_spec(
+        &self,
+        command: &str,
+        executable: &Path,
+        args: &[String],
+    ) -> Option<CompletionSpec> {
+        // A subcommand has its own page under its own name — `git commit` is
+        // `git-commit` — and finding it is a lookup this layer does not do yet,
+        // so anything past the command word goes to the probe.
+        if !args.is_empty() {
+            return None;
+        }
+        let page = associated_page(command, executable)?;
+        let metadata = fs::metadata(&page).ok()?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos());
+        let fingerprint = format!(
+            "man\0{}\0{modified}\0{}\0{}",
+            page.display(),
+            metadata.len(),
+            env::var_os("MANPATH").unwrap_or_default().to_string_lossy()
+        );
+        let name = cache_name(&page, &[]);
+        if let Some(spec) = self
+            .memory
+            .lock()
+            .expect("completion cache poisoned")
+            .get(&fingerprint)
+            .cloned()
+        {
+            return Some(spec);
+        }
+        if let Some(spec) = self.read(&name, &fingerprint) {
+            self.remember(fingerprint, spec.clone());
+            return Some(spec);
+        }
+        let spec = CompletionSpec::from_man(&rendered_page(&page)?);
+        if spec.candidates.is_empty() {
+            return None;
+        }
+        self.write(&name, &fingerprint, &spec);
+        self.remember(fingerprint, spec.clone());
+        Some(spec)
     }
 
     /// The curated spec for these words, if the user wrote one.
@@ -819,6 +936,85 @@ impl CompletionCache {
         }
         let _ = fs::remove_file(temporary);
     }
+}
+
+/// A page as `man` renders it, or nothing if `man` produced nothing usable.
+///
+/// `man -l` names the page by path, which is what keeps the trust rule intact:
+/// the page has already been chosen by [`associated_page`], and `man` is asked to
+/// format *that file* rather than to go looking for one by name.
+///
+/// Bounded the way the `--help` probe is, and for a weaker reason: `man` is a
+/// formatter being handed a data file, not the user's command being run. It is
+/// still a process, so it gets no stdin, its own process group, a deadline, and
+/// the same output cap.
+///
+/// `MANWIDTH` is pinned so a page wraps the same way wherever the terminal
+/// happens to be, since the column a declaration sits at is what the parser reads.
+/// Output goes to a pipe, and `man` renders plain text when it is not writing to a
+/// terminal — no escapes, no overstrike — so nothing has to be stripped here.
+///
+/// A `man` that is missing, or is the advisory stub a minimized image ships
+/// (which prints its notice and exits 0), yields no options and so falls through
+/// to the probe. Nothing distinguishes those from a page this cannot read, and
+/// none of them should answer.
+fn rendered_page(path: &Path) -> Option<String> {
+    rendered_page_with("man", path)
+}
+
+fn rendered_page_with(program: &str, path: &Path) -> Option<String> {
+    let mut process = Command::new(program);
+    process
+        .arg("-l")
+        .arg(path)
+        .env("MANWIDTH", "80")
+        .env("MAN_KEEP_FORMATTING", "")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // SAFETY: only async-signal-safe process-group and signal calls run between
+    // fork and exec, and a formatter must not inherit the shell's ignored signals.
+    unsafe {
+        process.pre_exec(|| {
+            if libc::setpgid(0, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = process.spawn().ok()?;
+    let group = child.id() as libc::pid_t;
+    let stdout = pipe_reader(child.stdout.take());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                // SAFETY: scalar arguments naming the child's own group.
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+                let _ = child.wait();
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    // Unconditionally, not only on the deadline: `man` is a *pipeline* —
+    // `preconv | tbl | nroff | col` — and every stage inherits the write end of
+    // this pipe. `man` exiting says nothing about them, and a single stage still
+    // holding the pipe open means the read below never sees EOF and waits
+    // forever. Killing the group is what closes the last copy. This is why the
+    // probe does the same, and why a stub `man` that spawns nothing hid it.
+    //
+    // SAFETY: scalar arguments naming the child's own group, which `pre_exec`
+    // made it the leader of, so the shell's own group cannot be signalled.
+    unsafe { libc::kill(-group, libc::SIGKILL) };
+    Some(String::from_utf8_lossy(&join_reader(stdout)).into_owned())
 }
 
 /// The value type a curated line spells out.
@@ -880,6 +1076,64 @@ fn resolve_command(command: &str) -> Option<PathBuf> {
             .map(|directory| directory.join(command))
             .find(|candidate| candidate.is_file())
             .map(|candidate| fs::canonicalize(&candidate).unwrap_or(candidate))
+    })
+}
+
+/// The manual page documenting this executable, when the two come from the same
+/// install.
+///
+/// The trust rule is `DESIGN.md`'s: a system page is not trusted for a
+/// `PATH`-shadowing local binary, since a project-local `./tool` must not
+/// inherit `/usr/bin/tool`'s page. The test is the install prefix — `/usr/bin/git`
+/// is documented by `/usr/share/man/man1/git.1`, and a `tool` in `~/bin` is not
+/// documented by anything under `/usr`. A page that fails the test is not read at
+/// all, so the probe answers instead.
+///
+/// The search starts from the *executable*, not from `MANPATH` or `$PATH`: those
+/// say where pages are, and the question here is which page belongs to this
+/// binary. A tool resolved through a directory neither of them lists — an
+/// absolute path, or `./tool` — is documented beside itself or not at all.
+/// `MANPATH` is still part of the cache key, since changing it can change which
+/// page `man` would show for the same name.
+fn associated_page(command: &str, executable: &Path) -> Option<PathBuf> {
+    // `<prefix>/bin/tool` is documented under `<prefix>/share/man`, so the
+    // prefix is the executable's directory's parent.
+    let prefix = executable.parent()?.parent()?;
+    [prefix.join("share/man"), prefix.join("man")]
+        .iter()
+        .find_map(|root| page_under(root, command))
+}
+
+/// The page file for a name under one manual tree, preferring the sections a
+/// command is looked up in before any others.
+fn page_under(root: &Path, command: &str) -> Option<PathBuf> {
+    let mut sections: Vec<PathBuf> = fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|section| section.path())
+        .filter(|section| {
+            section
+                .file_name()
+                .is_some_and(|name| name.as_encoded_bytes().starts_with(b"man"))
+        })
+        .collect();
+    // `man`'s own order: an executable is documented in 1, then 8 for the ones
+    // that live in `sbin`, then the rest in whatever order the tree lists them.
+    sections.sort_by_key(|section| {
+        let name = section.file_name().unwrap_or_default().to_string_lossy();
+        match name.as_ref() {
+            "man1" => 0,
+            "man8" => 1,
+            "man6" => 2,
+            _ => 3,
+        }
+    });
+    sections.iter().find_map(|section| {
+        fs::read_dir(section)
+            .ok()?
+            .flatten()
+            .find(|page| page_name(&page.file_name().to_string_lossy()) == Some(command.to_owned()))
+            .map(|page| page.path())
     })
 }
 
@@ -1054,8 +1308,8 @@ fn join_reader(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionCache, CompletionSpec, ValueHint, cache_name, command_help, pages_in,
-        rank_candidates, resolve_command,
+        CompletionCache, CompletionSpec, ValueHint, associated_page, cache_name, command_help,
+        pages_in, rank_candidates, rendered_page_with, resolve_command,
     };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1253,6 +1507,117 @@ mod tests {
     }
 
     #[test]
+    fn a_man_that_renders_nothing_useful_yields_no_spec() {
+        let root = fresh_temp_dir("mesh-man-run");
+        let page = root.join("tool.1");
+        fs::write(&page, ".TH TOOL 1\n").unwrap();
+
+        // What `man` prints for a page it rendered.
+        let renders = root.join("man-renders");
+        helper(
+            &renders,
+            "printf '%s\\n' 'OPTIONS' '       -v, --verbose' '           Say more.'",
+        );
+        let text = rendered_page_with(&renders.to_string_lossy(), &page).expect("man ran");
+        let spec = CompletionSpec::from_man(&text);
+        assert_eq!(spec.matching("-"), ["--verbose", "-v"]);
+
+        // A minimized image ships a `man` that prints an advisory and exits 0,
+        // so success says nothing about whether a page was rendered. It yields
+        // no options, which is what sends the caller on to the probe.
+        let stub = root.join("man-stub");
+        helper(
+            &stub,
+            "printf '%s\\n' 'This system has been minimized by removing packages' \\
+                 'and content. To restore this content, run unminimize.'",
+        );
+        let advisory = rendered_page_with(&stub.to_string_lossy(), &page).expect("the stub ran");
+        assert!(CompletionSpec::from_man(&advisory).candidates.is_empty());
+
+        // No `man` at all is the same answer, not a panic.
+        let spec = rendered_page_with(&root.join("absent").to_string_lossy(), &page);
+        assert!(spec.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_renderer_that_outlives_itself_does_not_hold_the_read_open() {
+        let root = fresh_temp_dir("mesh-man-pipeline");
+        let page = root.join("tool.1");
+        fs::write(&page, ".TH TOOL 1\n").unwrap();
+
+        // `man` is a pipeline — `preconv | tbl | nroff | col` — and every stage
+        // inherits the write end of the pipe mesh reads. This stand-in is the
+        // same shape: it leaves a child behind and exits. Reading to EOF then
+        // waits on the child, not on `man`, so the read has to be ended by
+        // killing the group rather than by the parent's exit.
+        let lingering = root.join("man-pipeline");
+        helper(
+            &lingering,
+            "sleep 120 &\nprintf '%s\\n' 'OPTIONS' '       -v, --verbose' '           Say more.'",
+        );
+
+        let started = Instant::now();
+        let text = rendered_page_with(&lingering.to_string_lossy(), &page).expect("man ran");
+        let waited = started.elapsed();
+
+        assert_eq!(
+            CompletionSpec::from_man(&text).matching("-"),
+            ["--verbose", "-v"]
+        );
+        // The renderer's own work takes milliseconds. Anything near the child's
+        // lifetime means the read was waiting on it.
+        assert!(
+            waited < Duration::from_secs(15),
+            "waited {waited:?} for a renderer that had already exited"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_declaration_column_keeps_a_wrapped_citation_out() {
+        // At a narrow width a cited option can wrap to the start of its line,
+        // which reads exactly like a declaration. The column is what separates
+        // them: a description is always indented past what it describes.
+        let spec = CompletionSpec::from_man(concat!(
+            "OPTIONS\n",
+            "       -l locale\n",
+            "       --locale=locale\n",
+            "           Specifies the locale. This is equivalent to specifying\n",
+            "           --lc-collate, --lc-ctype, and --icu-locale to the same\n",
+            "           value.\n",
+            "       --quiet\n",
+            "           Say less.\n",
+        ));
+
+        assert_eq!(spec.matching("-"), ["--locale", "--quiet", "-l"]);
+    }
+
+    #[test]
+    fn a_page_is_only_trusted_from_the_executables_own_prefix() {
+        let root = fresh_temp_dir("mesh-man-trust");
+        let prefix = root.join("usr");
+        let binary = prefix.join("bin/tool");
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/man/man1")).unwrap();
+        helper(&binary, "true");
+        fs::write(prefix.join("share/man/man1/tool.1"), ".TH TOOL 1\n").unwrap();
+
+        // The page sits beside the binary, under the same prefix.
+        assert_eq!(
+            associated_page("tool", &binary),
+            Some(prefix.join("share/man/man1/tool.1")),
+        );
+        // The same page must not document a binary installed somewhere else —
+        // a project-local `./tool` does not inherit `/usr/bin/tool`'s page.
+        let local = root.join("project/tool");
+        fs::create_dir_all(root.join("project")).unwrap();
+        helper(&local, "true");
+        assert_eq!(associated_page("tool", &local), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_curated_spec_says_its_candidates_and_their_types() {
         let spec = CompletionSpec::parse_curated(concat!(
             "# mesh completions for demo\n",
@@ -1432,6 +1797,43 @@ mod tests {
     /// time; these say what the parser does with what commands actually print.
     mod captured {
         use super::super::{CompletionSpec, ValueHint};
+
+        const CREATEDB: &str = include_str!("../tests/man/createdb.1.txt");
+        const JAR: &str = include_str!("../tests/man/jar.1.txt");
+
+        /// A page whose descriptions cite other options constantly.
+        #[test]
+        fn createdb_offers_its_flags_and_not_the_ones_its_prose_cites() {
+            let spec = CompletionSpec::from_man(CREATEDB);
+            let options = spec.matching("-");
+
+            for declared in ["--echo", "--tablespace", "--locale-provider", "-D", "-e"] {
+                assert!(options.contains(&declared.to_owned()), "missing {declared}");
+            }
+            // `--locale`'s description reads "equivalent to specifying
+            // --lc-collate, --lc-ctype, and --icu-locale". All three are real
+            // options declared elsewhere on the page, so a citation leaking in
+            // would not show up as a new name — it shows up as the punctuation
+            // the sentence left on it.
+            assert!(!options.iter().any(|option| option.ends_with(',')));
+            assert!(options.iter().all(|option| option.starts_with('-')));
+            // The whole page, so a column rule that drifted would show here.
+            assert_eq!(options.len(), 34);
+        }
+
+        /// The other renderer, and the other layout `.TP` produces.
+        #[test]
+        fn jar_offers_the_flags_behind_its_operation_modifiers() {
+            let spec = CompletionSpec::from_man(JAR);
+            let options = spec.matching("-");
+
+            for declared in ["--create", "--generate-index", "--main-class", "-c", "-x"] {
+                assert!(options.contains(&declared.to_owned()), "missing {declared}");
+            }
+            // `-i FILE or --generate-index=FILE` types both spellings from the
+            // one metavar the line carries.
+            assert_eq!(spec.value_hint("--generate-index"), Some(&ValueHint::File));
+        }
 
         const GIT: &str = include_str!("../tests/help/git.txt");
         const CARGO: &str = include_str!("../tests/help/cargo.txt");

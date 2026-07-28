@@ -275,12 +275,35 @@ file as tasks land.
       says nothing falls through to the generated spec rather than answering with
       an empty one. A command word is a file name, never a path — one with a
       separator in it is refused rather than joined.
-- [ ] Add man-page-derived specs, the layer between curated and the `--help`
-      probe: parse the page for the *resolved* executable when it can be
-      associated with it, keyed by the selected page's path and mtime plus the
-      `MANPATH` / locale that selected it. Needs no execution, so `DESIGN.md`
-      prefers it to the probe; a system page is not trusted for a
-      `PATH`-shadowing local binary, which falls through to the probe instead.
+- [x] Add man-page-derived specs, the layer between curated and the `--help`
+      probe. The page is looked for beside the *executable* — `<prefix>/bin/tool`
+      is documented under `<prefix>/share/man` — rather than through `MANPATH` or
+      `$PATH`, which is what makes a system page untrusted for a `PATH`-shadowing
+      local binary: `./tool` is documented beside itself or not at all. Cached on
+      the page's own path, size and mtime plus `MANPATH`, so a docs-only package
+      update re-parses. A parse that finds nothing is not cached and does not
+      answer, so an unreadable page falls through to the probe rather than
+      replacing it with less.
+
+      Declarations are taken only *outside* an `.RS` block. A page cites options
+      in its prose constantly, each on a line of its own, which opens with an
+      option exactly the way a declaration does; the block is what tells them
+      apart. Subcommands are left to the probe — a page documents them in
+      whatever prose shape its author chose, with none of the table structure
+      `command_names` keys on. Both roff dialects are covered by fixtures under
+      `crates/mesh-core/tests/man/`.
+      Formatting is `man`'s job, not mesh's: `man -l <path>` decompresses the
+      page, picks its macro package, and — read through a pipe rather than a
+      terminal — returns plain text with no escapes or overstrike to strip. That
+      is one process per page against a roff implementation here, and it is what
+      makes every dialect and every compression scheme work alike. It also means
+      this layer is not quite "runs nothing" any more; it runs a *formatter over a
+      data file*, which is a different bet from running the user's command.
+
+      A `man` that is absent, or is the advisory stub a minimized image ships
+      (which prints its notice and exits 0), yields no options and falls through
+      to the probe. A zero exit status does not mean a page was rendered, so
+      nothing keys on it.
 - [ ] Expose static and dynamic completion overrides through `$sh.complete`.
 
 ## Beyond M3 — The environment
