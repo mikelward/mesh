@@ -133,7 +133,8 @@ far, each documented in [`docs/REFERENCE.md`](docs/REFERENCE.md):
   what it offers: a curated spec file, else the command's manual page, else a
   bounded `--help` probe, else files and directories.
 - **The status-sensitive prompt** with composable lifecycle hooks
-  (`prompt`, `prompt-hook`).
+  (`prompt`, `prompt-hook`), including the **directory pair** `precd` / `postcd`
+  that brackets every actual `cd`.
 - **Regex and glob `~` tests**, and `match` with regex arms.
 - **The environment as values** — `$env.KEY`, `export`, and the path-type entries
   that split on `:` and rejoin exactly.

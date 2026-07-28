@@ -599,7 +599,8 @@ fn run_help(args: &[String]) -> u8 {
 /// previous command, used as the default for a bare `exit`.
 pub fn dispatch(words: &[String], last: u8) -> Option<Builtin> {
     match words[0].as_str() {
-        "cd" => Some(Builtin::Status(cd(&words[1..]))),
+        // `cd` is absent on purpose: it is dispatched by the REPL, which owns the
+        // `precd` / `postcd` hooks that bracket the move.
         "pwd" => Some(Builtin::Status(pwd(&words[1..]))),
         "puts" => Some(Builtin::Status(puts(&words[1..], true))),
         "print" => Some(Builtin::Status(puts(&words[1..], false))),
@@ -611,47 +612,93 @@ pub fn dispatch(words: &[String], last: u8) -> Option<Builtin> {
     }
 }
 
-/// `cd [DIR]` — change directory. No argument → `$HOME`; `cd -` → `$OLDPWD`
-/// (and prints the destination, as POSIX does). Updates `$PWD` and `$OLDPWD` on
-/// success so child processes that read them see the new directory.
+/// Where a pending `cd` is headed.
+///
+/// Split out from the move itself so the REPL can run the `precd` hooks between
+/// the two — `DESIGN.md` requires the target to be **absolute before `precd`**,
+/// so that a handler which itself `cd`s elsewhere cannot make a *relative* outer
+/// `cd` land somewhere unintended.
+pub(crate) struct CdTarget {
+    /// Absolute, with symlinks and `..` already resolved: what `$env.PWD` will
+    /// read after the move, which is what a `precd` handler is told.
+    path: std::path::PathBuf,
+    /// `cd -` prints where it landed, as POSIX does.
+    echo: bool,
+}
+
+impl CdTarget {
+    /// The resolved destination, for the `precd` hook argument.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Resolve `cd`'s operand without moving: no argument → `$HOME`; `cd -` →
+/// `$OLDPWD`. `Err` carries the status, its diagnostic already reported.
+///
+/// Resolution is `canonicalize`, so the path handed on is the physical one
+/// `$PWD` will hold, and a destination that does not exist is reported here —
+/// before any hook has run for a move that was never going to happen.
 ///
 /// Not yet implemented (deferred to the language layer): `CDPATH`, `--physical`,
 /// autocd, and a shell-maintained *logical* cwd — `$PWD` is the physical
 /// `getcwd` path for now.
-fn cd(args: &[String]) -> u8 {
+pub(crate) fn cd_target(args: &[String]) -> Result<CdTarget, u8> {
     if args.len() > 1 {
         note!("mesh: cd: too many arguments");
-        return 1;
+        return Err(1);
     }
     // Keep targets as `OsString` so a non-UTF-8 `$HOME`/`$OLDPWD` reaches the OS
     // unchanged rather than being mangled by lossy UTF-8 conversion.
-    let mut echo_destination = false;
+    let mut echo = false;
     let target: OsString = match args.first().map(String::as_str) {
         None => match env::var_os("HOME") {
             Some(home) => home,
             None => {
                 note!("mesh: cd: HOME not set");
-                return 1;
+                return Err(1);
             }
         },
         Some("-") => match env::var_os("OLDPWD") {
             Some(old) => {
-                echo_destination = true; // `cd -` prints where it landed
+                echo = true;
                 old
             }
             None => {
                 note!("mesh: cd: OLDPWD not set");
-                return 1;
+                return Err(1);
             }
         },
         Some(dir) => dir.into(),
     };
 
-    let previous = env::current_dir().ok();
     let path = Path::new(&target);
-    if let Err(err) = env::set_current_dir(path) {
-        note!("mesh: cd: {}: {err}", path.display());
-        return 1;
+    match path.canonicalize() {
+        Ok(resolved) => Ok(CdTarget {
+            path: resolved,
+            echo,
+        }),
+        // Reported against the operand as written, not the resolution attempt,
+        // so `cd nope` still says `nope`.
+        Err(err) => {
+            note!("mesh: cd: {}: {err}", path.display());
+            Err(1)
+        }
+    }
+}
+
+/// Move to an already-resolved target, updating `$PWD` and `$OLDPWD` so child
+/// processes that read them see the new directory.
+///
+/// `previous` is the directory to record as `$OLDPWD`; the caller captures it
+/// *before* the `precd` hooks run, so a handler that `cd`s away cannot become
+/// what `cd -` comes back to. `Err` is the move failing — canonicalizing does
+/// not prove the directory can be entered — and is the caller's signal that no
+/// `postcd` is owed.
+pub(crate) fn cd_change(target: &CdTarget, previous: Option<&Path>) -> Result<u8, u8> {
+    if let Err(err) = env::set_current_dir(&target.path) {
+        note!("mesh: cd: {}: {err}", target.path.display());
+        return Err(1);
     }
 
     let mut status = 0;
@@ -663,12 +710,12 @@ fn cd(args: &[String]) -> u8 {
         }
         if let Ok(current) = env::current_dir() {
             env::set_var("PWD", &current);
-            if echo_destination {
+            if target.echo {
                 status = write_stdout("cd", &path_line(current.as_os_str()));
             }
         }
     }
-    status
+    Ok(status)
 }
 
 /// Print `line` and a newline on stdout as a builtin does: `0` on success, `1`

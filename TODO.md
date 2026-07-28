@@ -1017,16 +1017,35 @@ produced. Several entries overlap with items elsewhere in this file
 here because the integration case is what makes them urgent rather than merely
 designed, and the cross-references say where the fuller note lives.
 
-- [ ] **`precd` / `postcd` hooks.** Specified in `DESIGN.md`
-      ("Hooks and the prompt"), unbuilt. The highest-value missing hook of the
-      set: zoxide's directory recording, direnv, mise, autoenv, and a background
-      fetch on arrival all want it. Unlike the keybinding gap it has **no
-      workaround** — a function cannot shadow a builtin (`func cd` is refused as
-      a reserved name, `whence.rs:348`), so the zsh trick of wrapping `cd` is
-      unavailable by design. The closest thing today is a `preprompt` hook
-      comparing `$env.PWD` against a stashed global, which is exactly the
-      hand-rolled check `DESIGN.md` cites `postcd` as replacing, and which misses
-      a `cd` that returns to where it started.
+- [x] **`precd` / `postcd` hooks** — *landed*. `prompt-hook precd NAME FUNC`
+      runs before the move, still in the old directory, given the target;
+      `postcd` runs after, in the new one, given the previous directory. They
+      were the highest-value missing hook of the set — zoxide's directory
+      recording, direnv, mise, autoenv, and a background fetch on arrival all
+      want them — and the only one with **no workaround**, since a function
+      cannot shadow a builtin (`func cd` is refused as a reserved name,
+      `whence.rs:348`) so the zsh trick of wrapping `cd` is unavailable by
+      design.
+
+      Three contracts, each from `DESIGN.md` §"Hooks and the prompt", each
+      covered by a test in `crates/mesh/tests/cli.rs`:
+  - **Per actual move**, a `cd` inside a function included. Deferring to
+        function return would run `precd` somewhere other than the directory it
+        promises to run in, which is the whole reason for the `pre`/`post` split.
+  - **The target is resolved before `precd`**, so a handler that `cd`s away
+        itself cannot make a *relative* outer `cd` land somewhere unintended.
+        Resolution is `canonicalize`, which also means a destination that does
+        not exist is reported before any hook runs for a move that was never
+        going to happen; `$env.OLDPWD` is captured on the same side of the hooks,
+        so `cd -` is unaffected by a wandering handler.
+  - **A handler's own `cd` does not re-dispatch** (`Shell::in_cd_hooks`),
+        or `$sh.postcd.track = func(from) { cd $from }` would recurse until the
+        stack ran out. A failed move owes no `postcd`.
+
+      Mechanism: `cd` moved out of `builtins::dispatch` into the REPL's
+      shell-aware match beside `source` / `gets` / `type`, since the hooks are
+      the shell's; `builtins::cd` split into `cd_target` (resolve, no move) and
+      `cd_change` (move) so the hooks can run between them.
 - [ ] **Keybindings from `rc.mesh`.** Deferred in `DESIGN.md` (§"Line editing"),
       and the reason reedline was chosen. Nothing binds Ctrl-R to atuin, Ctrl-T
       to fzf, or anything to anything.

@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read};
@@ -75,6 +76,11 @@ struct Shell {
     /// from `$sh.options.osc-title`, which may have been turned off since — see
     /// [`set_title`].
     title_written: bool,
+    /// Inside a `precd` / `postcd` handler. A handler may `cd` — the design
+    /// allows it — but that move must not dispatch the hooks again, or
+    /// `$sh.postcd.track = func(from) { cd $from }` would recurse until the
+    /// stack ran out.
+    in_cd_hooks: bool,
 }
 
 impl Shell {
@@ -165,6 +171,8 @@ enum PromptEvent {
     PrePrompt,
     PreExec,
     PostExec,
+    PreCd,
+    PostCd,
     JobDone,
     Exit,
 }
@@ -175,6 +183,8 @@ impl PromptEvent {
             "preprompt" => Some(Self::PrePrompt),
             "preexec" => Some(Self::PreExec),
             "postexec" => Some(Self::PostExec),
+            "precd" => Some(Self::PreCd),
+            "postcd" => Some(Self::PostCd),
             "jobdone" => Some(Self::JobDone),
             "exit" => Some(Self::Exit),
             _ => None,
@@ -203,6 +213,7 @@ impl Shell {
             produced: Produced::Status,
             status_records: 0,
             title_written: false,
+            in_cd_hooks: false,
         }
     }
 }
@@ -5856,6 +5867,9 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     match words[0].as_str() {
         "prompt" => return configure_prompt(&words[1..], shell),
         "prompt-hook" => return configure_prompt_hook(&words[1..], shell),
+        // `cd` fires the `precd` / `postcd` hooks, which are this shell's, so it
+        // cannot go through `builtins::dispatch` either.
+        "cd" => return change_directory(&words[1..], shell),
         // `source` runs mesh code in *this* shell, so it belongs here rather than
         // in `builtins::dispatch`, which is handed only words and a status.
         "source" => return source_file(&words[1..], last, shell),
@@ -5901,6 +5915,55 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
         Some(Builtin::Status(code)) => Step::Continue(code),
         None => Step::Continue(exec::run(&words, &mut shell.jobs)),
     }
+}
+
+/// `cd [DIR]`, with the directory hooks around it: `precd` before the move
+/// (still in the old directory, given the resolved destination), `postcd` after
+/// (in the new one, given where it came from).
+///
+/// The hooks fire around **each actual move**, a `cd` inside a function
+/// included, which is what makes `precd`'s "old directory" contract hold —
+/// deferring to function return would run it somewhere else. A handler that
+/// `cd`s itself does not re-dispatch them (`Shell::in_cd_hooks`), and a move
+/// that fails owes no `postcd`.
+fn change_directory(args: &[String], shell: &mut Shell) -> Step {
+    let target = match builtins::cd_target(args) {
+        Ok(target) => target,
+        Err(code) => return Step::Continue(code),
+    };
+    // Captured before `precd`, so a handler that wanders cannot become what
+    // `$env.OLDPWD` and `postcd` report as where this move started.
+    let previous = env::current_dir().ok();
+    let hooks = !shell.in_cd_hooks;
+    if hooks {
+        run_cd_hooks(PromptEvent::PreCd, target.path(), shell);
+    }
+    let status = match builtins::cd_change(&target, previous.as_deref()) {
+        Ok(status) => status,
+        Err(code) => return Step::Continue(code),
+    };
+    if hooks && let Some(previous) = previous {
+        run_cd_hooks(PromptEvent::PostCd, &previous, shell);
+    }
+    Step::Continue(status)
+}
+
+/// Dispatch one directory event with `path` as its single argument, holding the
+/// re-entrancy guard for the length of the handlers.
+///
+/// The path is passed lossily: a hook takes mesh values, and a mesh string is
+/// UTF-8. A directory whose name is not valid UTF-8 therefore reaches a handler
+/// with replacement characters rather than not at all — the alternative,
+/// skipping the event, would hide the move entirely from something like a
+/// directory tracker.
+fn run_cd_hooks(event: PromptEvent, path: &Path, shell: &mut Shell) {
+    if !shell.prompt.hooks.iter().any(|hook| hook.event == event) {
+        return;
+    }
+    let argument = Value::String(path.to_string_lossy().into_owned());
+    shell.in_cd_hooks = true;
+    run_prompt_hooks(event, vec![argument], shell);
+    shell.in_cd_hooks = false;
 }
 
 fn auto_help_requested(args: &[(Value, bool)]) -> bool {

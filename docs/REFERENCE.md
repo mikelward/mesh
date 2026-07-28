@@ -731,7 +731,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `style(text, fg: …, bg: …, bold: …)` | A [styled value](#styled-values) — text plus display attributes. A **value call**, parens attached, because a command position yields a status. Colors are the sixteen ANSI names: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `grey` (or `gray`, or `bright-black`), and `bright-` forms of the rest. |
 | `link(text, url)` | A [styled value](#styled-values) carrying an `OSC 8` hyperlink, so `text` is clickable. The url needs a **scheme** (`https://…`, `file://host/path`) and anything RFC 3986 forbids raw is percent-encoded, a space included; over 2083 encoded bytes is refused, since past a terminal's own limit the whole sequence — link text included — is dropped. |
 | `glob(pattern)` · `files(dir = ".")` · `dirs(dir = ".")` | The paths a pattern matches, and a directory's immediate files or subdirectories — a **list**, since these are [value calls](#the-glob-family) rather than commands. |
-| `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`. `CDPATH` and autocd are not implemented, so a bare directory name is a command, not a `cd`. |
+| `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`, and runs the [`precd` / `postcd` hooks](#custom-prompts-and-hooks) around the move. `CDPATH` and autocd are not implemented, so a bare directory name is a command, not a `cd`. |
 | `pwd` | Print the working directory. |
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
 | `notify [text …]` | Raise a desktop notification through the terminal with `OSC 9`. Arguments or stdin, like `clip`. A command that runs for more than ten seconds notifies on its own, with its outcome and duration — `$sh.options.command-notify = false` turns that off. Inside tmux the sequence is wrapped for passthrough, which tmux forwards only with `allow-passthrough` set. Support is uneven and unreportable — iTerm2, WezTerm, Ghostty, kitty and ConEmu raise these; xterm and Alacritty discard them; tmux needs `allow-passthrough` — so success means "asked". |
@@ -1137,6 +1137,8 @@ for primary prompts, not multiline continuation prompts.
 | `preprompt` | none | Before each primary prompt is rendered. This is the default event when omitted. |
 | `preexec` | `command` | Immediately before an interactive command runs. |
 | `postexec` | `command, status, elapsed` | After an interactive command; `elapsed` is integer milliseconds. |
+| `precd` | `target` | Before the working directory changes, still in the old one. `target` is where it is about to go. |
+| `postcd` | `previous` | After it has changed, in the new directory. `previous` is where it came from. |
 | `jobdone` | `id, command, status` | Once per background job the shell finds finished, alongside its `[N] Done` notice. |
 | `exit` | `status` | Before an interactive shell exits normally. |
 
@@ -1170,9 +1172,32 @@ func job-finished(id, cmd, status) {
 prompt-hook jobdone report job-finished
 ```
 
+The **directory hooks fire around each actual move**, a `cd` inside a function
+included — that is what makes `precd`'s promise to run in the old directory hold,
+where waiting for the function to return would not. A handler that only cares
+about net movement compares `$env.PWD` itself.
+
+```mesh
+global last-visit = ""
+func remember(previous) { global last-visit = $previous }
+prompt-hook postcd history remember
+```
+
+Three rules make them predictable:
+
+- **The target is resolved before `precd` runs**, to the absolute, physical path
+  `$env.PWD` will hold. So a handler that changes directory itself cannot make a
+  *relative* outer `cd` land somewhere unintended, and `$env.OLDPWD` still names
+  where the move began rather than wherever a handler wandered to.
+- **A handler's own `cd` does not fire them again.** Changing directory from a
+  handler is allowed; re-dispatching would recurse without end.
+- **A `cd` that fails runs neither.** A destination that does not exist is
+  reported before `precd`; if the move itself then fails — a directory that
+  cannot be entered — the failure is reported and no `postcd` is owed.
+
 This is the currently implemented prompt API. The structured `$sh.prompt` map,
-styled segments, `fill`/`rule`, and the `precd`/`postcd` events described as the
-eventual prompt design in `DESIGN.md` are not implemented yet.
+styled segments, and `fill`/`rule`, described as the eventual prompt design in
+`DESIGN.md`, are not implemented yet.
 
 ## Exit status
 
