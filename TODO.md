@@ -1007,6 +1007,119 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       the terminal working correctly and is not this bug; a regression test for
       this has to use a command that leaves stdin alone.
 
+## Beyond M3 — External tool integration
+
+The hooks and surfaces a bash/zsh user's toolbox plugs into — starship, atuin,
+fzf, carapace, zoxide, direnv, mise. The full write-up, tool by tool, is
+[`docs/INTEGRATION.md`](docs/INTEGRATION.md); this is the checkable list it
+produced. Several entries overlap with items elsewhere in this file
+(`$sh.complete`, `precd`/`postcd`, the keybinding surface); they are named again
+here because the integration case is what makes them urgent rather than merely
+designed, and the cross-references say where the fuller note lives.
+
+- [ ] **`precd` / `postcd` hooks.** Specified in `DESIGN.md`
+      ("Hooks and the prompt"), unbuilt. The highest-value missing hook of the
+      set: zoxide's directory recording, direnv, mise, autoenv, and a background
+      fetch on arrival all want it. Unlike the keybinding gap it has **no
+      workaround** — a function cannot shadow a builtin (`func cd` is refused as
+      a reserved name, `whence.rs:348`), so the zsh trick of wrapping `cd` is
+      unavailable by design. The closest thing today is a `preprompt` hook
+      comparing `$env.PWD` against a stashed global, which is exactly the
+      hand-rolled check `DESIGN.md` cites `postcd` as replacing, and which misses
+      a `cd` that returns to where it started.
+- [ ] **Keybindings from `rc.mesh`.** Deferred in `DESIGN.md` (§"Line editing"),
+      and the reason reedline was chosen. Nothing binds Ctrl-R to atuin, Ctrl-T
+      to fzf, or anything to anything.
+- [ ] **A line-buffer API, and the widget concept it implies.** Required
+      *together with* the binding above: a binding that cannot touch the line
+      being edited is useless to every tool that wants one. fzf's Ctrl-T
+      *inserts at the cursor* and runs nothing; atuin's Ctrl-R *replaces the
+      buffer* and leaves it editable. Needs deciding: how a mesh function runs
+      **during** line editing rather than as a command, and what it may do —
+      read the buffer and cursor, replace them, insert at point, accept the
+      line, and force a redraw after a full-screen program has scribbled on the
+      screen. Related: the `$sh.keymap` gap for a vi-mode indicator
+      (§"Beyond M3 — Terminal integration") is the same missing "the editor's
+      live state is not a value" hole seen from the other side.
+- [ ] **`$sh.complete`, with the parts a *bridge* needs.** The map itself is
+      already tracked under "Beyond M3 — Interactive completion"; carapace adds
+      three requirements the design does not state:
+  - [ ] a **fallback key** (`*`, or a documented default entry) — a bridge
+        answers for every command, not one named one;
+  - [ ] a defined **callable contract**: the words so far, the cursor's word
+        index, the partial word, and the cwd (bash's `COMP_WORDS` / `COMP_CWORD`
+        in mesh shapes), plus where a dynamic provider sits in the four-layer
+        resolver — the argument for carapace is *between* the curated file and
+        the man page, since it is curated data but must never outrank the user's
+        own file;
+  - [ ] **descriptions alongside candidates**, since a description is most of
+        what carapace is for and the menu shows bare candidates today. A dynamic
+        provider must also be exempt from the mtime-keyed spec cache, which has
+        no key for a per-word answer.
+- [ ] **Reading structured output.** carapace exports JSON, `direnv export json`
+      is a JSON env diff, `mise env --json` the same, and atuin's search output
+      likewise. mesh cannot parse any of it. Decide between a JSON reader and a
+      mesh-defined line format that upstreams are asked to emit; the former needs
+      no upstream cooperation, which is most of its case. Doing each bridge in
+      Rust instead sidesteps the parser at the cost of building per-tool
+      knowledge into the shell.
+      **Cost: none in dependency terms.** `serde_json` is already in the tree —
+      reedline depends on it, so it is compiled into every build today
+      (`cargo tree -i serde_json`). No new crate, no added build time, no
+      measurable binary growth. What is left to decide is the *mapping*: how a
+      JSON null, a nested array, and a non-integer number become mesh values,
+      which is the same question a `:json` modifier or a `from-json` builtin
+      would have to answer anyway.
+- [ ] **`$env` writes under a computed key, and a bulk env-diff apply.** Only a
+      literal `$env.KEY` is an assignment target today (§"The environment" in
+      `docs/REFERENCE.md`), so a loop over a computed diff cannot write it — the
+      narrowest blocker in the integration document and probably the easiest to
+      lift. The tool-facing shape worth considering is applying a **map** as one
+      transaction (a key set, a null unset), so a malformed payload is a
+      diagnostic rather than a half-applied environment.
+- [ ] **Decide the stance on generated code.** Every tool ships
+      `eval "$(tool init zsh)"`. mesh has no `eval`, and `source` takes exactly
+      one file operand — no pipe, no string, no `-` — so the published install
+      line cannot work. `DESIGN.md` sketches `atuin init mesh | source`
+      (§"Conditionals"), which would need `source -` or a `run TEXT` builtin.
+      The three options and the argument for the third (exchange **data**, not
+      code — which needs no `eval` and no upstream change for direnv, mise, and
+      carapace) are written up in `docs/INTEGRATION.md`. This decision gates the
+      one below.
+- [ ] **Publish an integration contract**, so an upstream can add a `mesh`
+      target to `atuin init` / `starship init` / `zoxide init` / `direnv hook` /
+      `carapace`. Deliberately *after* the hooks and the decision above: a
+      `tool init mesh` emitting registrations mesh cannot parse is worse than no
+      target at all, since it looks supported and is not.
+- [ ] **A name cannot start with `_`** (`parser.rs:1440`, `:4651` require an
+      alphabetic first character), so the private-global convention every shell
+      config uses is a syntax error in exactly the variables these hooks ask
+      users to create. Already tracked — see "Reserve only bare `_` as discard,
+      allow `_name`" under "Icebox / decide later", where the integration case
+      and the two follow-ons (the diagnostic, and the design-doc examples that do
+      not parse) are recorded.
+- [ ] **Hint and highlighter hooks.** Not external tools, but the
+      zsh-autosuggestions / syntax-highlighting experience users arrive
+      expecting. reedline supports both and mesh exposes neither.
+- [ ] **The history question atuin forces.** mesh's SQLite store already carries
+      most of atuin's schema, so "integrate atuin" splits in two: *atuin's UI
+      over mesh's store* (needs `$sh.history` or a documented on-disk contract)
+      versus *atuin as the store* (needs the recall motions — Up, Ctrl-R, `!$` —
+      to read a pluggable backend, a much deeper change nobody has asked for).
+      Decide before either is built: the answer determines whether
+      `--no-save-history` is the integration point or a workaround. Adjacent and
+      already deferred: importing bash/zsh/atuin history, and secret redaction.
+- [ ] **`$sh.options.complete.probe`** — a session with carapace probably wants
+      mesh's own `--help` probe off. Blocked on nested keys in the flat settings
+      map, tracked under "Beyond M3 — The environment".
+- [ ] **The prompt-segment items starship exercises**, all tracked under the
+      prompt design and listed here for the integration case: the `$sh.prompt`
+      map (so an external renderer is *one* segment rather than the whole line),
+      multi-line raw external output, `fill` for a right prompt, and a redraw
+      hook for a transient prompt. What works today is
+      `prompt "$(starship prompt …)"` from a `preprompt` hook, with `$sh.status`,
+      `$sh.jobs:len`, and `postexec`'s `elapsed` supplying its arguments.
+
 ## Beyond M3 — Modifier arguments and `gets` ✅ (landed)
 
 - [x] `:get(KEY, DEFAULT)` — the total accessor, on maps and lists, plus a bare
@@ -2376,6 +2489,25 @@ reasoning, and the open ones are at the bottom.
       be a valid identifier, the common "intentional / private / unused-but-named"
       convention. Would touch `read_name` (allow a `_` head as long as the whole
       token isn't just `_`) and the `GRAMMAR.md` name rule.
+
+      **A motivating case, from `docs/INTEGRATION.md`:** every hook-based
+      integration with an external tool needs a private global to carry state
+      from `preexec` to `postexec` or across a prompt — atuin's row id,
+      starship's command duration, a `cd` tracker's previous `$PWD` — and
+      `_atuin_id` is what every bash/zsh config in the world calls that. So this
+      is not only a "unused-but-named" nicety; it is the naming convention users
+      arrive with for exactly the variables mesh's hook API asks them to create.
+      Two further notes:
+  - [ ] **The diagnostic hides the rule.** `_x = 1` parses as a *command* and
+        reports `command not found: _x`; `global _x = 1` reports
+        `syntax error: expected a name`. Neither says a name cannot start with
+        `_`, so the reader looks for a missing program or a typo. Worth fixing
+        even if the reservation stands — the rule should name itself.
+  - [ ] **Two design docs already assume it works.** `docs/PROMPT.md` and
+        `docs/INTRO.md` both write `global _cmd_time = 0s`, which today's parser
+        rejects. PROMPT.md is labeled a design target, but the naming is not one
+        of the things it flags as unbuilt, so the example reads as writable and
+        is not. Either fix the examples or allow the name.
 - [ ] **Optional commas + word×list distribution in list literals.** Two related
       list ergonomics, motivated by the bash `mv foo{,bak}` idiom (rename
       `foo` → `foobak` in one word):
