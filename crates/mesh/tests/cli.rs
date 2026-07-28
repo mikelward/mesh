@@ -12123,12 +12123,11 @@ fn a_modifier_reference_rejects_what_it_cannot_apply() {
          puts ...$m:keys\n\
          a = 1\n\
          b = 2\n\
-         puts $a:$b\n\
-         puts hi:there\n",
+         puts $a:$b\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&untouched.stdout),
-        "stem dir\n1:2\nhi:there\n"
+        "stem dir\n1:2\n"
     );
     assert!(
         untouched.status.success(),
@@ -12259,10 +12258,16 @@ fn a_modifier_reference_call_can_open_a_condition() {
 
     // Unattached, the colon is still command-word text — the reading `puts :stem`
     // and `$host:$port` depend on.
-    let words = run_with_input("puts :stem\na = 1\nb = 2\nputs $a:$b\nputs hi:there\n");
-    assert_eq!(
-        String::from_utf8_lossy(&words.stdout),
-        ":stem\n1:2\nhi:there\n"
+    let words = run_with_input("puts :stem\na = 1\nb = 2\nputs $a:$b\n");
+    assert_eq!(String::from_utf8_lossy(&words.stdout), ":stem\n1:2\n");
+    // `hi:there` is no longer among them: `:` + identifier is reserved by the
+    // grammar, so an unknown name is refused rather than falling back to text.
+    // `$a:$b` still reads as text because `$b` is not an identifier.
+    let reserved = run_with_input("puts hi:there\n");
+    assert!(
+        String::from_utf8_lossy(&reserved.stderr).contains("`:there` is not a modifier"),
+        "{}",
+        String::from_utf8_lossy(&reserved.stderr)
     );
 }
 
@@ -12372,10 +12377,44 @@ fn join_of_a_nested_list_fails_loud() {
     assert!(!out.status.success());
 }
 
+/// `:` + identifier is reserved by the **grammar**, not gated on a name list, so a
+/// name the vocabulary does not hold is refused rather than falling back to literal
+/// text. The old fallback made the reserved set grow silently with every modifier
+/// added — `img:raw` was text until `:raw` existed, then quietly was not — and the
+/// failure landed on whoever upgraded rather than on whoever wrote the line.
 #[test]
-fn unknown_modifier_names_remain_literal_suffixes() {
+fn an_unknown_modifier_name_is_refused_rather_than_literal() {
     let out = run_with_input("host = example\nputs $host:port\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "example:port\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("`:port` is not a modifier"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success());
+    // The message names both escapes, because quoting the *subject* is the reflex and
+    // it does not work: the colon has to be inside the quotes, or the name braced.
+    let out = run_with_input(
+        "host = example\n\
+         puts \"host:port\"\n\
+         puts \"${host}:port\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "host:port\nexample:port\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A name the vocabulary *does* hold but the engine cannot apply yet is a
+    // different thing, and still reports at run time rather than at parse time.
+    let out = run_with_input("xs = [a b]\ny = $xs:map(:sort)\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not implemented yet"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -18064,6 +18103,30 @@ fn a_map_literal_value_is_not_read_as_a_modifier_on_the_key() {
     // Abutting on both sides is still the chain, so nothing about `$x:upper` moved.
     let out = run_with_input("x = abc\nputs $x:upper\nputs $x:split(\"b\"):len\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ABC\n2\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The reservation is of the **shape**, so only a bare identifier after the colon is
+/// claimed. Everything else keeps the old punctuation reading, which is what leaves
+/// `http://x`, `key:2` and `a:$b` alone.
+#[test]
+fn only_a_bare_identifier_after_the_colon_is_reserved() {
+    let out = run_with_input(
+        "b = z\n\
+         puts key:2\n\
+         puts key:/path\n\
+         puts key:\n\
+         puts http://x\n\
+         puts a:$b\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "key:2\nkey:/path\nkey:\nhttp://x\na:z\n"
+    );
     assert!(
         out.status.success(),
         "{}",

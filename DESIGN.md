@@ -350,18 +350,28 @@ So the split was never bare-versus-quoted; it was argument-taking versus
 argument-free, and a bare word already gives its colon up to a modifier call. The
 decision is to make the bottom two rows agree with the top two.
 
-**`:` followed by an identifier is reserved by the grammar** *(decided)* — not
-gated on a list of known modifier names. An attached `:name` is a modifier
+**`:` followed by an identifier is reserved by the grammar** *(decided; shipped)* —
+not gated on a list of known modifier names. An attached `:name` is a modifier
 position wherever a value is read, and a name that is not a modifier is an
 *error*, not text.
 
-Half of this is already the rule, which is the main argument for the other half.
-In expression position the grammar claims the chain outright:
+Half of it was already the rule, which was the main argument for the other half:
+expression position claimed the chain outright while argument position fell back to
+text. Both now refuse an unknown name, and the diagnostic names both escapes:
 
 ```
-x = ubuntu:latest     # syntax error today — `latest` is not a modifier
-puts ubuntu:latest    # ubuntu:latest — argument position falls back to text
+puts ubuntu:latest    # syntax error: `:latest` is not a modifier; quote the whole
+                      # word to keep it as text (`"x:latest"`), or brace the name
+                      # when it comes from a variable (`"${x}:latest"`)
 ```
+
+**Only a bare identifier after the colon is claimed** — the reservation is of the
+shape, not of the colon. `key:2`, `key:/path`, `key:`, `http://x` and `a:$b` all keep
+the punctuation reading they had, so the break is narrower than "colons are taken".
+
+A name the vocabulary *does* hold but the engine cannot apply yet (`:sort`) parses
+and reports at run time, which is a different failure from an unknown one and stays
+worded that way.
 
 `modifier_name` (`parser.rs:4562`) tests `MODIFIER_NAMES` only to decide that
 fallback. So reserving `:ident` in the grammar does not introduce a new rule; it

@@ -9792,9 +9792,10 @@ mod tests {
             last_argument("one ignored | puts '$dir'/'sub dir' >out").as_deref(),
             Some("'$dir'/'sub dir'")
         );
+        // `key:2`, since a colon before a bare identifier is now a modifier chain.
         assert_eq!(
-            last_argument("puts old; puts key:value").as_deref(),
-            Some("key:value")
+            last_argument("puts old; puts key:2").as_deref(),
+            Some("key:2")
         );
         assert_eq!(last_argument("puts"), None);
     }
