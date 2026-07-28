@@ -2799,7 +2799,7 @@ accepted: adding braces around a **bare** word changes it from a string to a com
 (`=> markdown` vs `=> { markdown }`) — a divergence from Rust, where the two agree.
 Whether a *quoted* value is identical in both (`=> "md"` ≡ `=> { "md" }`) depends on the
 still-open block-value rule: it holds under an implicit-tail rule, but under an explicit
-value keyword the block form would be `=> { yield "md" }`.
+value keyword the block form would be `=> { result "md" }`.
 
 **`if` keeps block-only branches** — `if c { … } else { … }`, no arrow — so the terse
 value form (`=> markdown`) exists only on arms. That asymmetry is deliberate and is
@@ -2950,11 +2950,11 @@ settled and one stays open:
    separated by a **terminator** (newline or `;`), **not** comma-separated — a separator
    between arms is required, so `a => {} b => {}` does not parse. Declined alternatives: today's
    tail-coercion (the sharp-edge source), an arrow-free `pattern value` form (no boundary
-   for guards), and an explicit `yield`/`return` in *place* of `=>`.
+   for guards), and an explicit `result`/`return` in *place* of `=>`.
 
    **Residual, and it is not match-specific:** a `=> { … }` block is statement context, so
    *how a statement-context block produces a value* — implicit tail expression, or an
-   explicit `yield`/`return` — is the same open question as for `func` bodies, and is
+   explicit `result`/`return` — is the same open question as for `func` bodies, and is
    tracked there (see [Functions](#functions) and the value-production item in
    [Open questions](#open-questions)). Whatever `func` does, arms do.
 
@@ -4519,11 +4519,25 @@ to avoid" rather than promising the latter as done.
   letting an extracted helper see the caller's locals — weigh dynamic (or opt-in
   dynamic) scope against the lexical default; and an **open value-production
   question** *(from the match-syntax exploration — see [Matching](#matching-match))*:
-  whether functions/blocks should require an **explicit value keyword** (`yield` /
-  `return`) instead of the settled implicit **last-expression** rule, which would also
+  whether functions/blocks should require an **explicit value keyword** instead of the
+  settled implicit **last-expression** rule, which would also
   make `{ … }` blocks pure command-context (dropping the **single-bare-word block-tail**
   coercion — *not* the general assignment-RHS rule, which stays). Language-wide — it
   touches every value-producing block: `if`, `match`, `for`, and `func` alike.
+
+  *(**Spelling, if one is ever needed: `result`, not `yield`.** The two are not
+  interchangeable names for one thing. `yield` means **generator** in every language a
+  reader is likely to arrive from — Python, JavaScript, Ruby, C# — where it emits *many*
+  values lazily and suspends between them. That is a real feature a shell could want,
+  and one mesh may eventually want at the value channel: a `func` that emits a stream of
+  values into a pipe is the typed analogue of a stage emitting lines. Spending the word
+  on "send back one value" trades a feature's natural name for a synonym of `return`.
+  `result` is already mesh's own vocabulary for exactly this — "a function's **result**
+  is its last expression", above — so it names the thing the language already calls it,
+  and it carries no suspension baggage. Runners-up: `give` (unclaimed, no baggage, but
+  no precedent either) and `value` (reads as a noun, weak as a verb). Whichever wins is
+  **contextual**, like `fork` / `global` / `unset`, so a program or variable of that
+  name stays reachable.)*
 - **Hook API — decided** ([Hooks and the prompt](#hooks-and-the-prompt)): hook
   points are insertion-ordered maps of named callables (the key is the handler's
   identity → re-source-safe, individually removable). Events `preprompt`,
