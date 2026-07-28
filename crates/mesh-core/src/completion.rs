@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher};
 
-const CACHE_VERSION: &str = "mesh-completion-v6";
+const CACHE_VERSION: &str = "mesh-completion-v7";
 
 thread_local! {
     /// How long a `--help` probe may run before it is killed and its answer given
@@ -591,7 +591,13 @@ fn value_hint(tokens: &[&str]) -> Option<ValueHint> {
             .split_once('=')
             .map(|(_, value)| value)
             .or_else(|| (token.starts_with(['<', '[', '{'])).then_some(token))
-    })?;
+    });
+    if metavar.is_none()
+        && let Some(hint) = tokens.iter().find_map(|token| bare_metavar_hint(token))
+    {
+        return Some(hint);
+    }
+    let metavar = metavar?;
     let metavar = metavar.trim_matches(['<', '>', '[', ']', '{', '}']);
     let alternatives: Vec<_> = metavar
         .split(['|', ','])
@@ -754,13 +760,20 @@ fn metavar_words(value: &str) -> impl Iterator<Item = &str> {
 }
 
 fn enum_literal(value: &str) -> bool {
-    value.chars().all(|character| {
+    let word = value.chars().all(|character| {
         character.is_ascii_lowercase()
             || character.is_ascii_digit()
             || matches!(character, '-' | '_')
     }) && value
         .chars()
-        .any(|character| character.is_ascii_lowercase())
+        .any(|character| character.is_ascii_lowercase());
+    let number = value
+        .strip_prefix('-')
+        .unwrap_or(value)
+        .chars()
+        .all(|character| character.is_ascii_digit())
+        && value.chars().any(|character| character.is_ascii_digit());
+    word || number
 }
 
 impl From<&str> for CompletionSpec {
@@ -1822,6 +1835,86 @@ mod tests {
         assert_eq!(spec.value_hint("-c"), None);
     }
 
+    #[test]
+    fn parses_python_argparse_layout() {
+        let spec = CompletionSpec::from_help(concat!(
+            "usage: painter [-h] [-o FILE] [--mode {fast,careful}] [--level {-1,0,1}]\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -o FILE, --output FILE\n",
+            "                        write the rendered image to FILE; see --help\n",
+            "  --mode {fast,careful}\n",
+            "                        choose how carefully to render\n",
+            "  --level {-1,0,1}      permit negative values such as -1\n",
+        ));
+
+        assert_eq!(
+            spec.matching("-"),
+            ["--help", "--level", "--mode", "--output", "-h", "-o"]
+        );
+        assert_eq!(spec.value_hint("-o"), Some(&ValueHint::File));
+        assert_eq!(spec.value_hint("--output"), Some(&ValueHint::File));
+        assert_eq!(
+            spec.value_hint("--mode"),
+            Some(&ValueHint::Enum(vec!["fast".into(), "careful".into()]))
+        );
+        assert_eq!(
+            spec.value_hint("--level"),
+            Some(&ValueHint::Enum(vec!["-1".into(), "0".into(), "1".into()]))
+        );
+    }
+
+    #[test]
+    fn parses_clap_layout_without_promoting_option_like_prose() {
+        let spec = CompletionSpec::from_help(concat!(
+            "Commands:\n",
+            "  build, b  Build the project\n",
+            "  check      Check it\n",
+            "\n",
+            "Options:\n",
+            "  -v, --verbose...       Increase verbosity\n",
+            "  -o, --output <FILE>    Write output; use --help, not -1\n",
+            "      --color <WHEN>     Coloring [possible values: auto, always, never]\n",
+        ));
+
+        for candidate in ["build", "b", "check", "-v", "--verbose", "-o", "--output"] {
+            assert!(
+                spec.matching("").contains(&candidate.to_owned()),
+                "missing {candidate}"
+            );
+        }
+        assert!(!spec.matching("-").contains(&"--help".to_owned()));
+        assert!(!spec.matching("-").contains(&"-1".to_owned()));
+        assert_eq!(spec.value_hint("--output"), Some(&ValueHint::File));
+        assert_eq!(
+            spec.value_hint("--color"),
+            Some(&ValueHint::Enum(vec![
+                "auto".into(),
+                "always".into(),
+                "never".into()
+            ]))
+        );
+    }
+
+    #[test]
+    fn parses_gnu_tab_aligned_aliases_without_promoting_prose() {
+        let spec = CompletionSpec::from_help(concat!(
+            "Options:\n",
+            "\t-h\t\t--help\tshow help\n",
+            "\t-o FILE\t--output=FILE\twrite output\n",
+            "\t-n\t\t--number\tallow -1; see --help for details\n",
+        ));
+
+        assert_eq!(
+            spec.matching("-"),
+            ["--help", "--number", "--output", "-h", "-n", "-o"]
+        );
+        assert_eq!(spec.value_hint("-o"), Some(&ValueHint::File));
+        assert_eq!(spec.value_hint("--output"), Some(&ValueHint::File));
+        assert!(!spec.matching("-").contains(&"-1".to_owned()));
+    }
+
     /// Specs parsed from **real** `--help` output, captured verbatim under
     /// `tests/help/` — see the README there for the commands and versions, and
     /// for how to re-capture. Hand-written help exercises one parsing rule at a
@@ -2155,7 +2248,7 @@ mod tests {
 
     #[test]
     fn rejects_specs_generated_with_older_parser_semantics() {
-        let encoded = "mesh-completion-v2\ntest\ncandidate\t--profile\nvalue\t--profile\tfile\n";
+        let encoded = "mesh-completion-v6\ntest\ncandidate\t--profile\nvalue\t--profile\tfile\n";
 
         assert_eq!(CompletionSpec::decode(encoded, "test"), None);
     }
