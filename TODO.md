@@ -1968,25 +1968,72 @@ of each PR had landed by another route, but these pieces had not.
       reject it with a message naming the real problem ("a value cannot be
       redirected"), or let a value statement be redirected and write its text form,
       which is the same question as displaying a value at the prompt (below).
-- [ ] **The parser has no recursion-depth limit.** Deeply nested input aborts the
+- [x] **The parser has no recursion-depth limit.** Deeply nested input aborted the
       whole shell with `thread 'main' has overflowed its stack` instead of reporting
-      a syntax error. Not new — on `main`, before any of #215, both of these already
-      abort:
+      a syntax error — a dead shell from a paste. Fixed by a counter shared between
+      the parser and the lexer, reporting `nested too deeply` past 100 levels. The
+      counter has to sit at each place the grammar *descends*, not on the way in:
+      several shapes (`else if` chains, `-` / `...` prefix chains, and the trailer
+      loop's call arguments, index expressions and modifier arguments) recurse only
+      after `primary` has given its level back, and each bypassed the guard until
+      counted where it descends. Counting on entry instead would charge every
+      operand a level and halve what the limit means. The
+      `not` chain the entry originally named turned out to be iterative already and
+      parses at 20000 deep. Measured per shape on a debug build, the most expensive
+      (a chain of `$( … )` captures) overflows at 253 levels on the usual 8 MiB, so
+      100 leaves room to spare on the stack a shell actually starts with.
+- [x] **A stack overflow aborts instead of reporting.** `crates/mesh-core/src/stack.rs`
+      now catches `SIGSEGV`/`SIGBUS` on an alternate stack and exits 70 with
+      `mesh: fatal: out of stack …`, where before the process died on Rust's
+      `has overflowed its stack` abort. This is the net under the limit above, not
+      a replacement for it: it covers the cases a parse-time counter cannot see —
+      the evaluator below, and a stack so small (`ulimit -s 512`) that the parser's
+      own ceiling falls under `MAX_DEPTH`. Deliberately not a *recovery*: the shell
+      still exits, since unwinding out of a signal handler is not safe.
+- [ ] **Evaluating a long operator chain still overflows the stack.** The parser's
+      depth limit does not cover this one, and the distinction is worth keeping
+      straight: `1 + 1 + …` parses *iteratively* into a left-leaning `Expr::Binary`
+      spine, so nothing is deeply nested at parse time — it is `eval_expr` walking
+      that spine that recurses. Around 1000 terms is enough:
 
       ```
-      x = ((((… 20000 deep … ))))     → stack overflow
-      x = [[[[… 20000 deep … ]]]]     → stack overflow
-      x = not not not … $b            → stack overflow
+      x = 1 + 1 + … x1000 …           → mesh: fatal: out of stack (was an abort)
+      x = 1 * 1 * … x1000 …           → mesh: fatal: out of stack (was an abort)
+      if false { x = 1 + … x20000 … } → fine, because it is never evaluated
       ```
 
-      #215 removed the one case where its own lookahead recursed (a command-shaped
-      run of `not`s, now iterative and covered by a test), but a genuine *value*
-      chain — `if not not not … $b`, around 1000 deep — still reaches the shared
-      expression recursion and dies there, where before #215 that line was
-      command-shaped and merely reported `command not found: not`. The fix is a
-      depth counter in the expression parser that raises a syntax error at some
-      generous limit; it belongs with the general error model rather than with any
-      one operator, since parens and lists get there without `not` at all.
+      That last line is the proof it is evaluation and not parsing or `Drop`. The
+      fault handler makes this legible but it still ends the shell, which for an
+      interactive session is not good enough. Two ways out: a depth counter in
+      `eval_expr` raising a runtime error, or making the walk over a binary spine
+      iterative so a chain of any length just works. The second is the better answer
+      for `+` specifically — the spine is left leaning, so it unrolls into a loop —
+      but a counter is what covers the general case, since a deep tree can be built
+      by nesting rather than chaining.
+- [ ] **Three flaky tests, all pre-existing and all timing-dependent.** None is
+      caused by the depth work, and each was checked against an unmodified tree;
+      recorded here rather than fixed because each needs its own change. Two of the
+      three surfaced only in CI, which is the slower and more loaded machine — the
+      suite's PTY and subprocess-probe tests race real deadlines against real
+      output, so a busy runner is where they show.
+  - [ ] `ctrl_c_cancels_an_interactive_gets` fails around 10% of the time, on
+        `main` as much as on a branch — measured by interleaving the two binaries
+        over 60 alternating runs, 7 failures against 6. It times out at 11s waiting
+        for the shell to come back to a prompt after the Ctrl-C. Beware measuring
+        this by running one build and then the other: the rate drifts with machine
+        conditions enough to invent a difference that is not there.
+  - [ ] `notify_reaches_the_terminal_and_a_quick_command_does_not` failed once in
+        CI with harness code 150 — `pty_read_until_command_done` timing out after
+        `prompt-hook --remove`. Not reproducible locally at all: 30 interleaved
+        pairs against an unmodified tree failed 0 times on both sides, so this one
+        appears to need a loaded runner. It is built on real sleeps (`sleep 0.2`,
+        a `preprompt` handler that sleeps) raced against prompt output, which is
+        the thing to fix rather than the deadline.
+  - [ ] `separated_typed_completion_probes_the_option_context_first` failed once in
+        CI, expecting `["auto", "always"]` and getting a filename. The `--help`
+        probe it depends on has a 2-second deadline (`completion.rs:993`, `:1268`);
+        exceeding it falls back to file completion. The fix is to stop the test
+        depending on wall-clock — inject the deadline rather than raise it.
 - [ ] **Math at the prompt.** The goal (mikelward): type `1 + 2` at the prompt and
       get `3`, so the shell is usable as a calculator without `expr`, `bc`, or
       `$((…))`. Not supported today, and deliberately not part of #215 — recorded

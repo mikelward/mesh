@@ -262,6 +262,44 @@ fn run_with_bytes(input: &[u8]) -> Output {
     child.wait_with_output().expect("wait for mesh")
 }
 
+/// Run mesh with `RLIMIT_STACK` lowered to `bytes`, to reach the cases that only
+/// happen on a stack smaller than the usual one.
+///
+/// The limit is applied in the child between `fork` and `exec` — `pre_exec` — so
+/// it lands on mesh and not on the test process, which needs its own stack intact
+/// to go on running the rest of the suite.
+fn run_with_input_and_stack_limit(input: &str, bytes: u64) -> Output {
+    let mut command = mesh_command();
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    // SAFETY: `setrlimit` is async-signal-safe, which is the bar for anything run
+    // between `fork` and `exec` in a process that may be threaded.
+    unsafe {
+        command.pre_exec(move || {
+            // Cast rather than take an `rlim_t` argument: the type is `u64` on
+            // some targets and `i64` on others, so spelling it at the call site
+            // would make callers unportable too.
+            let limit = libc::rlimit {
+                rlim_cur: bytes as libc::rlim_t,
+                rlim_max: bytes as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_STACK, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for mesh")
+}
+
 /// Run mesh in its own session, so it has no controlling terminal at all.
 ///
 /// Whether the test runner has one is not something the suite can assume — it does
@@ -8765,6 +8803,161 @@ fn type_is_reserved_against_func_but_the_pointers_are_not() {
         String::from_utf8_lossy(&out.stdout),
         "mine a\nmine b\nmine c\n"
     );
+}
+
+/// Deeply nested input is refused, not fatal. Every one of these aborted the whole
+/// shell with `thread 'main' has overflowed its stack` — a `SIGABRT`, no output, no
+/// diagnostic — which turns malformed input into a dead shell. The shapes descend
+/// by two different paths: a group, a list and a capture reach `primary`, while a
+/// statement-position `if` does not and needs `block` counted separately.
+#[test]
+fn nesting_past_the_limit_is_an_error_not_an_abort() {
+    for source in [
+        format!("x = {}1{}\n", "(".repeat(5000), ")".repeat(5000)),
+        format!("x = {}1{}\n", "[".repeat(5000), "]".repeat(5000)),
+        format!("puts {}pwd{}\n", "$(".repeat(2000), ")".repeat(2000)),
+        format!("{}puts x{}\n", "if true { ".repeat(2000), " }".repeat(2000)),
+        format!("x = {}1{}\n", "if true { ".repeat(2000), " }".repeat(2000)),
+        // A capture inside a string is lexed where it is found, so this one recurses
+        // through the *lexer* and needs its own counter — the parser never sees it.
+        format!("puts {}x{}\n", "\"$(puts ".repeat(2000), ")\"".repeat(2000)),
+        // Alternating the two paths, which is what says they share one budget rather
+        // than each having a full one.
+        format!(
+            "puts {}1{}\n",
+            "\"$(puts ((".repeat(1000),
+            "))\")\"".repeat(1000)
+        ),
+        // The shapes below recurse *after* `primary` has given its level back, so
+        // each needs counting where it descends rather than on the way in. Every
+        // one of them exhausted the stack while the three counters above were in
+        // place, which is the whole reason they are listed separately.
+        //
+        // An `else if` chain: the preceding block has returned before the tail
+        // recurses, so `block`'s counter is already back to where it started.
+        format!(
+            "if false {{ puts a }} {}\n",
+            "else if false { puts x } ".repeat(5000)
+        ),
+        // Prefix chains, which recurse in `prefix` on the way *to* `primary`.
+        format!("x = {}1\n", "- ".repeat(20000)),
+        format!("x = {}[1]\n", "...".repeat(20000)),
+        // The trailer loop's own descents — call arguments, an index expression,
+        // and a modifier's arguments all reparse from the top.
+        format!("x = {}1{}\n", "f(".repeat(3000), ")".repeat(3000)),
+        format!("x = $a{}[0]{}\n", "[$a".repeat(3000), "]".repeat(3000)),
+        format!("x = $x{}$x{}\n", ":upper(".repeat(3000), ")".repeat(3000)),
+    ] {
+        let out = run_with_input(&source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("nested too deeply"), "{stderr}");
+        // A parse error, not a crash: `134` is the abort this replaces.
+        assert_eq!(out.status.code(), Some(2), "{stderr}");
+    }
+}
+
+/// The limit is only worth having if it is *reachable* — if the stack runs out
+/// first it is decoration, and the abort it was meant to replace happens anyway.
+/// So this parses right up to the ceiling as well as at ordinary depths.
+#[test]
+fn nesting_within_the_limit_still_parses() {
+    let out = run_with_input(
+        "x = ((((1 + 2))))\n\
+         puts $x\n\
+         puts [[1 2] [3 [4 5]]]\n\
+         y = if true { if false { 1 } else { if true { 2 } else { 3 } } } else { 4 }\n\
+         puts $y\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3\n[[1 2] [3 [4 5]]]\n2\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Ordinary nesting of a capture in a string is untouched by the lexer's counter.
+    let out = run_with_input("puts \"a$(puts \"b$(puts c)b\")a\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "abcba\n");
+
+    // One level under the ceiling, for the most expensive shape the parser has.
+    // A capture costs the most stack per level, so if anything reaches the limit
+    // by running out of stack first it is this.
+    let source = format!("puts {}pwd{}\n", "$(".repeat(99), ")".repeat(99));
+    let out = run_with_input(&source);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let source = format!("x = {}1{}\nputs $x\n", "(".repeat(99), ")".repeat(99));
+    let out = run_with_input(&source);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+
+    // A trailer that descends is counted where it descends, so a nesting of calls
+    // costs one level each and not two. Counting the trailer loop as a whole would
+    // have charged every operand a second level and quietly halved the limit; this
+    // is what would catch that. It parses — the failure is at run time, about the
+    // undefined `f`, which is proof enough that the parse got through.
+    let source = format!("x = {}1{}\n", "f(".repeat(99), ")".repeat(99));
+    let out = run_with_input(&source);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("nested too deeply"), "{stderr}");
+
+    // Chains that do *not* descend stay free: an index chain reparses nothing, so
+    // its length is not nesting and must not be charged as if it were.
+    let out = run_with_input(&format!(
+        "a = [[1 2] [3 4]]\nputs $a[0]{}\n",
+        "[0]".repeat(97)
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("nested too deeply"), "{stderr}");
+}
+
+/// The last resort, for the recursion no parse-time limit can see.
+///
+/// `1 + 1 + …` parses *iteratively* into a left-leaning spine, so it is never
+/// deep at parse time and the nesting limit never fires — it is the evaluator
+/// walking that spine that runs out of stack. Before the fault handler this was
+/// a `SIGABRT` with Rust's own `has overflowed its stack` on stderr: nothing a
+/// script could test, and an interactive session that simply vanished.
+///
+/// This is deliberately not a *recovery*. The shell still exits; what changed is
+/// that it says why and leaves a status behind. Fixing the evaluator so the case
+/// does not arise is tracked separately in `TODO.md`.
+#[test]
+fn running_out_of_stack_reports_instead_of_aborting() {
+    let source = format!("x = {}1\nputs unreachable\n", "1 + ".repeat(20000));
+    let out = run_with_input(&source);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("mesh: fatal: out of stack"), "{stderr}");
+    // Distinct from the `2` a syntax error uses: the input was well formed and it
+    // was the shell that could not continue. `134` is the abort this replaces.
+    assert_eq!(out.status.code(), Some(70), "{stderr}");
+    // Nothing after the failure ran.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+/// The other case the nesting limit cannot cover: a stack too small for the limit
+/// to be reachable at all.
+///
+/// Under a small `ulimit -s` the parser runs out of stack *below* `MAX_DEPTH`, so
+/// the check never fires — the limit is sized for the stack a shell normally
+/// starts with, and this is the shape of input that gets under it. The handler is
+/// the whole reason this is a message rather than the abort it used to be.
+#[test]
+fn a_stack_too_small_for_the_limit_still_reports() {
+    let source = format!("puts {}pwd{}\n", "$(".repeat(90), ")".repeat(90));
+    let out = run_with_input_and_stack_limit(&source, 512 * 1024);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mesh: fatal: out of stack"),
+        "expected a diagnostic, got {stderr}"
+    );
+    assert_eq!(out.status.code(), Some(70), "{stderr}");
+    // Specifically not Rust's abort, which is what this replaces.
+    assert!(!stderr.contains("has overflowed its stack"), "{stderr}");
 }
 
 /// `-t` prints bash's one word, because this output is *compared* rather than read:

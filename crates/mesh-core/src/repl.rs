@@ -218,6 +218,9 @@ impl Shell {
 /// even when stdout is redirected would need reedline to write to `/dev/tty`;
 /// that refinement is deferred.)
 pub fn run() -> ExitCode {
+    // Before anything can recurse. Turns running off the end of the stack from an
+    // abort into a diagnostic; see [`crate::stack`].
+    crate::stack::install_fault_reporting();
     let options = match StartupOptions::parse(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(message) => {
