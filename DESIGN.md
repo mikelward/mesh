@@ -323,12 +323,11 @@ for e in [vi vim editline] { if $e:kind != false { export EDITOR = $e; break } }
 
 The `!= false` is not decoration. A condition is [a bool or a
 command](#conditionals), and `:kind` yields a *string* when the name resolves, so
-the comparison is what the written contract asks for. The evaluator happens to
-accept a bare string today, but that is the open
-[condition-truthiness](#conditionals) question rather than a promise — if it
-settles as "truthy values are allowed", `if shpool:kind` becomes available and
-these read shorter. Until then the explicit form is the honest one, and it is now
-the only cost the spelling carries.
+the comparison is what the written contract asks for — and it is now the only form
+that works, since condition truthiness settled as **no truthy values**: a bare
+`if shpool:kind` is a loud "a string is not a condition" rather than a shorter
+spelling. The explicit form is the honest one, and it is the only cost the
+spelling carries.
 
 **A bare subject takes a modifier** *(decided; shipped)*, so the guard is written
 `if shpool:kind != false` and the quoting this entry argued for through its first
@@ -2776,16 +2775,45 @@ tag   = if $root { "[root]" } else { "" }
 
 Decisions:
 
-- **The condition is a bool or a command.** A boolean value (`$root`, a
-  comparison like `$n > 0`, a `:has` test) branches on its truth; a bare
-  command branches on its **exit status** (`0` → true), preserving the
-  `if grep -q foo file { … }` reflex. The [predicate
+- **The condition is a bool or a command — and nothing else** *(decided;
+  shipped)*. A boolean value (`$root`, a comparison like `$n > 0`, a `:has` test)
+  branches on its truth; a bare command branches on its **exit status** (`0` →
+  true), preserving the `if grep -q foo file { … }` reflex. Every other type is a
+  **loud error** naming the comparison to write instead. The [predicate
   vocabulary](#requirements-carried-over-from-existing-configs) splits across
   both: the session predicates (`connected-remotely`, `inside-project`, …) are
   ordinary functions that slot straight into `if` with no `[ … ]` / `test`, while
   name resolution is the [`:kind` modifier](#modifiers) and so yields a value,
-  compared explicitly (`if fzf:kind != false`) until condition truthiness is
-  settled below.
+  compared explicitly (`if fzf:kind != false`).
+
+  **Truthiness is settled, and the answer is that there isn't any.** Which world
+  a condition branches on is decided by **where the subject is written** — command
+  position means exit status — not by what type it evaluates to. So no value is
+  coerced into a truth:
+
+  ```
+  if 0 { … }          # error: an int is not a condition; compare it (`… > 0`)
+  if "" { … }         # error: a string is not a condition; compare it (`… != ""`)
+  if $xs { … }        # error: a list is not a condition; test its length (`…:len > 0`)
+  if $xs:len > 0 { … }  # the comparison, which is what you meant
+  ```
+
+  What this replaces was three different rules wearing one name, and they
+  disagreed with each other: an **int** read as an exit status (`0` true — the
+  inversion of every other language), a **string** read for emptiness *and*
+  sniffed against the literal texts `"false"` and `"0"`, a **collection** read for
+  emptiness. Together they made `if 0` true while `if "0"` was false — the same
+  number, opposite answers, decided by type — and since `$(…)` yields strings,
+  `if $(echo 0)` disagreed with `if 0` too.
+
+  The case that forced it is `:len`. It returns a count, counts are ints, and ints
+  read as statuses, so **`if $xs:len` fired on the empty list and stayed quiet on a
+  full one**. No local fix helps: any rule that makes counts work breaks statuses,
+  and vice versa, because they are different things that happen to share a type.
+  Refusing both is what makes `$xs:len > 0` the thing you write.
+
+  `and`, `or` and `not` ask the same question and refuse the same values, since
+  they are boolean operators rather than a second truthiness system.
 - **An assignment may *be* the condition** — `if lhs = rhs { … }`, the `if let`
   shape. The condition is true iff the RHS is **truthy** (a `false` / failed
   command / nonzero int fails it) **and** its shape **fits** `lhs`; on true the
@@ -3053,14 +3081,15 @@ to mean "did X succeed" whether `X` is `grep -q …` or a mesh function, a funct
 The residual (an int whose masked status is nonzero can't be returned as successful data)
 is narrow and accepted. Two live scraps this left, both pointed at their canonical homes:
 
-- **Empty `""` / `[]` truthiness** — part of the open **condition-truthiness**
-  question (whose leaning treats empties as **true**; see that entry for the full rule).
-  Note `gets()` pins `""` **truthy** — a
-  blank line must not end a read loop — which pulls `[]` toward truthy too, for
-  consistency; making `[]` **falsy** would split it from the pinned-truthy `""`. (Where a
-  value's truthiness is even consulted — the assignment-condition RHS, `if xs = f() { … }`,
-  not a bare `if $xs`, since ordinary `if`/`while` take a bool or command — is the
-  canonical entry's to specify.)
+- **Empty `""` / `[]` truthiness** — **closed** by
+  [condition truthiness](#conditionals-if-is-an-expression) settling as *no truthy
+  values*: a bare `if $xs` is an error whether the list is empty or not, so there
+  is no emptiness rule left to decide. The question survives only for the
+  **assignment-condition RHS** (`if xs = f() { … }`), which tests *presence* rather
+  than truth — and there the answer follows from `false` being mesh's "no result":
+  only `false` is absent, so `""`, `[]` and `0` all bind and take the branch. That
+  also keeps `gets()`'s pinned contract, where a blank line must not end a read
+  loop.
 - **An explicit coded-failure spelling** *(deferred)* — any such value must stay a
   **channel-1** failure (a testable value) and so **cannot** reuse the name "error"
   (channel-2: fail-loud, no value, aborts); defining it touches the two-channel

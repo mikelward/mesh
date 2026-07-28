@@ -1491,8 +1491,14 @@ fn guard_allows(
         // A guard that raised `break`/`continue` produced no truth value, so the
         // statement it guards does not run: the caller reports it as skipped and
         // the flag travels on to the loop it belongs to.
-        Some(guard) => eval_operand_of(&guard.condition, last, in_function, shell)
-            .map(|value| shell.control.is_none() && truthy(&value) != guard.unless),
+        Some(guard) => {
+            let value = eval_operand_of(&guard.condition, last, in_function, shell)?;
+            if shell.control.is_some() {
+                return Ok(false);
+            }
+            let truth = condition_bool(&value).map_err(runtime_message)?;
+            Ok(truth != guard.unless)
+        }
     }
 }
 
@@ -1578,11 +1584,17 @@ fn run_ast_match(node: &parser::MatchExpr, last: u8, in_function: bool, shell: &
                     shell.produced = Produced::Nothing;
                     return Step::Continue(last);
                 }
-                Ok(value) if truthy(&value) => {}
-                Ok(_) => {
-                    shell.vars.restore_active(snapshot);
-                    continue;
-                }
+                Ok(value) => match condition_bool(&value) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        shell.vars.restore_active(snapshot);
+                        continue;
+                    }
+                    Err(message) => {
+                        shell.vars.restore_active(snapshot);
+                        return runtime_message(message);
+                    }
+                },
                 Err(step) => return step,
             }
         }
@@ -1657,10 +1669,11 @@ fn condition_status(
     } = condition
     {
         let value = eval_operand_of(expression, last, in_function, shell)?;
-        return Ok(shell
-            .control
-            .is_none()
-            .then(|| if truthy(&value) { 0 } else { 1 }));
+        if shell.control.is_some() {
+            return Ok(None);
+        }
+        let truth = condition_bool(&value).map_err(runtime_message)?;
+        return Ok(Some(u8::from(!truth)));
     }
     match run_executable(condition, false, last, in_function, shell) {
         Step::Continue(_) if shell.control.is_some() => Ok(None),
@@ -2820,12 +2833,14 @@ fn eval_expr(
         E::Unary {
             op: U::Not,
             expression,
-        } => Ok(bool_value(!truthy(&eval_expr(
-            expression,
-            last,
-            in_function,
-            shell,
-        )?))),
+        } => {
+            let value = eval_expr(expression, last, in_function, shell)?;
+            if shell.control.is_some() {
+                return Ok(control_placeholder());
+            }
+            let truth = condition_bool(&value).map_err(runtime_message)?;
+            Ok(bool_value(!truth))
+        }
         E::Unary {
             op: U::Negate,
             expression,
@@ -2850,11 +2865,15 @@ fn eval_expr(
         } => eval_expr(expression, last, in_function, shell),
         E::Binary { left, op, right } => {
             let l = eval_expr(left, last, in_function, shell)?;
-            if *op == B::And && !truthy(&l) {
-                return Ok(bool_value(false));
-            }
-            if *op == B::Or && truthy(&l) {
-                return Ok(bool_value(true));
+            // `and` / `or` are boolean operators, so they ask the same question a
+            // condition does — and refuse the same values. Short-circuiting has to
+            // read the left operand's truth to decide, so the refusal lands here
+            // rather than in `eval_binary`, which never sees a short circuit.
+            if matches!(op, B::And | B::Or) && shell.control.is_none() {
+                let truth = condition_bool(&l).map_err(runtime_message)?;
+                if (*op == B::And) != truth {
+                    return Ok(bool_value(truth));
+                }
             }
             let r = eval_expr(right, last, in_function, shell)?;
             // An operand that raised `break`/`continue` produced no real value, so
@@ -4566,7 +4585,9 @@ fn eval_match_expr(
         validate_bindings(&bindings).map_err(runtime_message)?;
         commit_bindings(bindings, &mut shell.vars);
         if let Some(guard) = &arm.guard {
-            let passed = truthy(&eval_operand_of(guard, last, in_function, shell)?);
+            let guard_value = eval_operand_of(guard, last, in_function, shell)?;
+            let passed =
+                shell.control.is_some() || condition_bool(&guard_value).map_err(runtime_message)?;
             // As in `run_ast_match`: a guard that raised `break`/`continue`
             // produced no truth value, so no later arm may be tried.
             if shell.control.is_some() {
@@ -4784,26 +4805,54 @@ fn eval_body(
     }
 }
 
-fn truthy(value: &Value) -> bool {
+/// Is this value true, as a **condition**?
+///
+/// A condition is a bool or a command, and nothing else: a command branches on
+/// its exit status because of *where it is written*, and a value branches on its
+/// truth because it is a `Boolean`. There is no third rule, so no value type is
+/// coerced into one.
+///
+/// The coercions this replaces were three different rules wearing one name — an
+/// integer read as an exit status (`0` true, the inversion of every other
+/// language), a string read for emptiness *and* sniffed against the literal texts
+/// `"false"` and `"0"`, a collection read for emptiness. Together they made `if 0`
+/// true while `if "0"` was false, and `if $xs:len` fire on the **empty** list and
+/// stay quiet on a full one. Refusing is what makes `$xs:len > 0` the thing you
+/// write.
+fn condition_bool(value: &Value) -> Result<bool, String> {
     match value {
-        Value::String(s) => !s.is_empty() && s != "false" && s != "0",
-        // Judged on the text: `style("", fg: red)` is as false as `""`, which is
-        // what makes an empty prompt segment collapse whether it is styled or not.
-        Value::Styled(styled) => {
-            let text = &styled.text;
-            !text.is_empty() && text != "false" && text != "0"
-        }
-        Value::Integer(value) => *value == 0,
-        Value::Boolean(value) => *value,
-        Value::List(v) => !v.is_empty(),
-        Value::Map(v) => !v.is_empty(),
-        // A handle exists, which is all truthiness asks; `$j.state` is the
-        // question to ask about a job, not whether the handle is "set".
-        Value::Regex(_)
-        | Value::Glob(_)
-        | Value::Stream(_)
-        | Value::Job(_)
-        | Value::Function(_) => true,
+        Value::Boolean(value) => Ok(*value),
+        other => Err(format!(
+            "{} is not a condition; {}",
+            type_phrase(other),
+            condition_hint(other)
+        )),
+    }
+}
+
+/// How to turn the value you have into the condition you meant.
+fn condition_hint(value: &Value) -> &'static str {
+    match value {
+        Value::Integer(_) => "compare it (`… > 0`), or use `fail` to report a status",
+        Value::String(_) | Value::Styled(_) => "compare it (`… != \"\"`)",
+        Value::List(_) | Value::Map(_) => "test its length (`…:len > 0`)",
+        _ => "compare it",
+    }
+}
+
+/// A value's type, with its article, for a diagnostic that reads as a sentence.
+fn type_phrase(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) | Value::Styled(_) => "a string",
+        Value::Integer(_) => "an int",
+        Value::Boolean(_) => "a bool",
+        Value::List(_) => "a list",
+        Value::Map(_) => "a map",
+        Value::Regex(_) => "a regex",
+        Value::Glob(_) => "a glob",
+        Value::Stream(_) => "a stream handle",
+        Value::Job(_) => "a job handle",
+        Value::Function(_) => "a function",
     }
 }
 
@@ -4887,8 +4936,9 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
                 _ => unreachable!(),
             })
         }
-        And => bool_value(truthy(&left) && truthy(&right)),
-        Or => bool_value(truthy(&left) || truthy(&right)),
+        // The left operand's truth was settled by the short circuit above, so the
+        // result is the right operand's — and it faces the same refusal.
+        And | Or => bool_value(condition_bool(&right)?),
         // `in` asks about membership and substrings, both of which read the text —
         // and `Value`'s own equality is by text, so `style(x, fg: red) in $xs`
         // finds a plain `x`. Flattening both sides says that once.
