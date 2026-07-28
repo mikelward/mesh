@@ -3598,15 +3598,15 @@ programs or user functions:
   and **`dirs(DIR=.)`** are the [wrapper](#globbing) expansions — `glob` over a
   directory's immediate entries preset to `type: file` / `type: dir` — returning a
   path [list](#arrays-lists). `style` (above) is the styled-value constructor.
-- **Discovery** — **`whence [--all|--quiet] NAME …`** says what a name *is*:
-  syntax, a built-in, a function, or the executable `PATH` finds — and, because
+- **Discovery** — **`type [-t|-P|-a|--quiet] NAME …`** says what a name *is*:
+  a keyword, a built-in, a function, or the executable `PATH` finds — and, because
   mesh keeps bindings in a namespace of their own, the variable or `$env` entry of
   that name alongside it. Bare, it reports the **winner** — what a bare `NAME`
   would run — and names what that shadows (`git is a function (shadowing
-  /usr/bin/git)`), which is the interactive question; **`--all`** lists every match
-  in resolution order instead. **`--quiet`** prints nothing at all and leaves only
-  the status — `0` found, `1` not — so `if whence --quiet fzf { … }` is mesh's
-  `command -v fzf >/dev/null`. A name is given **without a sigil**: `whence xs`
+  /usr/bin/git)`), which is the interactive question; **`-a` / `--all`** lists
+  every match in resolution order instead. **`--quiet`** prints nothing at all and leaves only
+  the status — `0` found, `1` not — so `if type --quiet fzf { … }` is mesh's
+  `command -v fzf >/dev/null`. A name is given **without a sigil**: `type xs`
   asks about the name, where `$xs` would expand before the built-in ever saw it.
   A word with a `/` in it is a **path operand**, read as command resolution reads
   it — the file, not a `PATH` search. Because it is the search `execvp` performs,
@@ -3624,14 +3624,37 @@ programs or user functions:
   therefore reported *beside* the function or executable that a bare one reaches,
   never as shadowing it.
 
-  It takes **ksh's spelling**, and its `-a` / `-q` with it. `type` is the wider
-  reflex — bash's and fish's — but is the one word mesh cannot spend on a *name*
-  lookup: mesh has real value types and [`:type`](#modifiers) already asks a
-  path's, so `type $x` would read as a question about the value forever. nushell,
-  the closest peer, split the same way (`which` for names, `describe` for values).
-  The reflexes all land here anyway — `type`, `what`, `which` and `where` name
-  `whence` in [command not found](docs/REFERENCE.md#commands). The **value**-side
-  question is [`:repr`](#modifiers), which already answers it.
+  **Two flags carry the shapes a script consumes**, and both are bash's, because
+  their output is compared rather than read. **`-t`** prints one word —
+  `function`, `builtin`, `file`, `keyword` or `variable` — which is what a guard
+  wants instead of matching prose: a port that writes
+  `case "$(type -t "$1")" in function)` keeps working, where matching
+  `*" shell builtin"` against the sentence breaks the moment the wording moves.
+  **`-P`** prints only the path a `PATH` search finds, ignoring functions and
+  built-ins, and retires the hand-rolled `for d in $PATH` loop an `shrc` carries
+  because `type -P` is not portable. Both print nothing and exit `1` when there is
+  nothing to print. `variable` is the one word bash has no use for, since its
+  `type` does not see bindings.
+
+  **One vocabulary, bash's, everywhere.** The prose says `if is a shell keyword`,
+  never "is syntax", so the sentence and `-t` cannot disagree about what a thing
+  is, and it follows bash's wording wherever there is no reason to differ — `cd is
+  a shell builtin`, `ls is /usr/bin/ls`. Where mesh has a reason it says more: the
+  detail line under each finding, the variable row, and naming what a winner
+  shadows are all things bash has nothing to say about. A sentence is *read* while
+  `-t` and `-P` are *consumed*, so only the consumed shapes owe anyone byte
+  compatibility.
+
+  It takes **bash's spelling**. `whence` is ksh's and stays reachable, as do
+  `what` and `where`, which no shell defines as this; none of the three is
+  reserved, so a user function may still take those names. **`which` is left
+  alone** — in bash it is an external program that cannot see built-ins or
+  functions, and mesh keeps that rather than shadowing a binary, so `which cd`
+  finds nothing here exactly as it finds nothing there. The earlier objection to
+  `type` — that mesh has real value types and [`:type`](#modifiers) already asks a
+  path's — does not survive contact: `type foo` is a command and `$p:type` a
+  modifier on a value, and neither can be written where the other is meant. The
+  **value**-side question is [`:repr`](#modifiers), which already answers it.
 - **Session** — `exit [status]`.
 
 **No aliases.** mesh drops the alias mechanism entirely: a **function** is just
