@@ -3721,6 +3721,28 @@ spec's arguments point at (`cd` completes dirs; a `--output FILE` flag completes
 files). Every source — curated file, man page, `--help` — writes a spec of the
 **same shape**, so there is one format and one resolver.
 
+A **curated file** is named the way the manual names the same thing — `git`,
+`git-commit` — so a subcommand's spec sits beside its command's, and a command
+word is a file name rather than a path. One candidate per line, with a value type
+spelled out rather than inferred:
+
+```text
+# mesh completions for demo
+--verbose
+--output file            # file, dir, page, or a | list of literal values
+--color auto|always|never
+build
+positional dir
+```
+
+The generated sources read whatever a program happens to print, so they are
+heuristic by nature; a curated spec exists for when that guess was wrong, which is
+why it *says* its types instead of having them deduced from a metavar's name. It
+is read before anything is resolved or run — so one holds for a command that is
+not on `PATH` at all — and read afresh each time rather than cached, so editing one
+takes effect at the next Tab. A file that says nothing (empty, or only comments)
+falls through to the generated spec rather than answering with an empty one.
+
 **In command position (word 0)** completion offers PATH executables, functions,
 and built-ins. After that the spec drives it: subcommands, flags (`-x` / `--long`),
 a flag's value (file / dir / enum), or a positional file / dir.
