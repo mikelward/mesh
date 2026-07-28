@@ -351,6 +351,7 @@ positionals** only:
 
 ```
 func-def = ("wrapper" ws)? "func" ws name ws? "(" params? ")" ws? "{" body "}"
+alias-def = "alias" ws name ws? "=" ws? command   # sugar for a `wrapper func`
 params   = param ((ws | ",") param)*        # names, comma- and/or space-separated
 param    = name                             # required positional only, for now
 call     = name (ws word)*                  # a defined name in command position

@@ -149,7 +149,12 @@ const RENAMED: &[(&str, &str)] = &[
 ];
 
 const LOCAL: &str = "a plain `x = 5` inside a `func` is already local";
-const NO_ALIASES: &str = "mesh has no aliases; a `func` replaces `alias ll`";
+/// A bare `alias` is not the definition form, so it lands here. The spelling it
+/// points at is the one that works: `alias NAME = COMMAND`, spaces and all,
+/// since the bash-style `alias NAME=VALUE` tokenizes as a single word.
+const ALIAS_SPELLING: &str = "an alias is `alias ll = ls -l` -- spaces around the `=`";
+const NO_UNALIAS: &str =
+    "an alias is a `wrapper func`; redefine the name to replace one, there is no `unalias`";
 /// `declare` and `typeset` span all three scopes — `-g` asks for a global and
 /// `-x` for an environment entry — and the note sees only the command name, so
 /// it offers the set rather than assuming the bare, local-by-default case.
@@ -165,13 +170,13 @@ const SCOPE: &str = "scope is `x = 5` (local), `global x = 5`, or `export X = va
 /// there is nothing here for `is_builtin` to check, so a hand-written "not built
 /// yet" would go stale silently. Add them with `$sh.options`.
 const REPLACED: &[(&str, &str)] = &[
-    ("alias", NO_ALIASES),
+    ("alias", ALIAS_SPELLING),
     ("declare", SCOPE),
     ("function", "functions are `func name(params) { … }`"),
     ("let", "arithmetic is `n = (1 + 2)`"),
     ("local", LOCAL),
     ("typeset", SCOPE),
-    ("unalias", NO_ALIASES),
+    ("unalias", NO_UNALIAS),
 ];
 
 /// What `command not found` adds for a name mesh has an answer for: one bash
@@ -421,6 +426,11 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
         "Define a function that parses no flags of its own",
     ),
     (
+        &["alias"],
+        "alias NAME = CMD ARG …",
+        "Shorthand for a `wrapper func` that forwards to CMD",
+    ),
+    (
         &["return"],
         "return [VALUE]",
         "Leave a function, or a sourced file",
@@ -455,8 +465,8 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
 /// word is unavailable: `fork`, `unless`, `and` are all legal function names.
 /// For "does a bare one do something", see [`COMMAND_KEYWORDS`].
 pub(crate) const SYNTAX_WORDS: &[&str] = &[
-    "func", "wrapper", "return", "if", "else", "unless", "match", "for", "in", "while", "loop",
-    "break", "continue", "fork", "global", "unset", "export", "not", "and", "or",
+    "func", "wrapper", "alias", "return", "if", "else", "unless", "match", "for", "in", "while",
+    "loop", "break", "continue", "fork", "global", "unset", "export", "not", "and", "or",
     // The built-in *value* names, reserved as function names by the same parser
     // check but reached as value calls rather than in command position.
     "re", "style", "link", "glob", "files", "dirs",
@@ -1591,7 +1601,9 @@ mod tests {
         // follows it, so a bare one is an ordinary command word — legal as a
         // function name, and `command not found` when nothing defines it. Treating
         // these as keywords made `whence fork` outrank a real `func fork()`.
-        for contextual in ["fork", "wrapper", "unless", "else", "and", "or", "in"] {
+        for contextual in [
+            "fork", "wrapper", "alias", "unless", "else", "and", "or", "in",
+        ] {
             assert!(SYNTAX_WORDS.contains(&contextual), "{contextual}");
             assert!(!is_command_keyword(contextual), "{contextual}");
         }

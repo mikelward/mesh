@@ -486,7 +486,8 @@ Every other reserved word — `while`, `loop`, `return`, `break`, `continue`,
 path, so this is a four-name carve-out rather than a general keyword problem.
 
 Resolution order is the one command position uses — **keyword → builtin → func →
-external**. mesh has no aliases, so there is no further answer.
+external**. mesh has no alias stage, so there is no further answer: what `alias`
+defines is a `func`, and it resolves at that step like any other.
 
 The justification usually given for that order — *`:kind` cannot disagree with
 what running the name would do* — does not survive contact with the ways a name
@@ -2418,9 +2419,10 @@ PowerShell `param()` with `[Parameter(ValueFromRemainingArguments)]`. mesh
 takes the *semantics* these agree on and dresses them in the `func name(...)`
 syntax above.
 
-*(TODO: **wrappers, forwarding, and dynamic definition.** [No aliases](#built-ins)
-is *decided* — a `func` replaces `alias ll`. But real configs still need things a
-plain `func` doesn't yet give cleanly; these are open:*
+*(TODO: **wrappers, forwarding, and dynamic definition.** [No alias
+mechanism](#built-ins) is *decided* — what `alias ll` defines is a `func`. But
+real configs still need things a plain `func` doesn't yet give cleanly; these are
+open:*
   - *A **terse forwarding wrapper.** ~~Open.~~ **Settled, and built:
     [`wrapper func`](#functions).** Even `func co(...args) { vcs checkout ...$args }`
     was not a fully transparent baseline: under the settled function rules an
@@ -2442,15 +2444,18 @@ plain `func` doesn't yet give cleanly; these are open:*
     keyword. `wrapped` was rejected on its own terms too — it is an adjective
     describing the **callee**, and the callee is not what the marker sits on.*
 
-    *Still to come: the **shorthand**. `wrapper func co(...args) { vcs checkout
-    ...$args }` is transparent but not terse, and the everyday case is a name plus a
-    command prefix. That gets its own spelling — **`alias co = vcs checkout`**,
-    sugar over the marker rather than a competing mechanism — which also carries the
-    loop-friendly definer over `$(vcs --list-commands)` that the dynamic-definition
-    note below wants. Reusing the word `alias` needs the "No aliases" text under
-    [Built-ins](#built-ins) reworded: what is being dropped is the alias
-    **mechanism** — parse-time textual expansion, its own resolution stage — not the
-    familiar name for "give this command a shorter one."*
+    *The **shorthand** is settled and built too: **`alias co = vcs checkout`**,
+    sugar over the marker rather than a competing mechanism. `wrapper func
+    co(...args) { vcs checkout ...$args }` is transparent but not terse, and the
+    everyday case is a name plus a command prefix. The word `alias` is reused
+    because it is the one every shell user reaches for; the "No aliases" text
+    under [Built-ins](#built-ins) is reworded to say what is actually dropped —
+    the **mechanism** (parse-time textual expansion, its own resolution stage) —
+    rather than the name. A self-naming alias desugars through `command`, so
+    `alias grep = grep --color=auto` reaches the program instead of recursing,
+    and the right-hand side is a **command, not a string**: bash's quoted
+    `alias ll='ls -l'` is diagnosed rather than left to become one word naming no
+    program.*
   - ***Running a wrapper under `sudo` / `xargs` / `watch`.** Because mesh commands
     are functions, not aliases or `PATH` binaries, `sudo ll` can't see `ll` — bash
     papers over this with the invisible `alias sudo='sudo '` trailing-space trick.
@@ -3671,11 +3676,16 @@ programs or user functions:
   **value**-side question is [`:repr`](#modifiers), which already answers it.
 - **Session** — `exit [status]`.
 
-**No aliases.** mesh drops the alias mechanism entirely: a **function** is just
-as terse (`func ll(...args) { ls -l --color ...$args }`), and it composes, scopes,
-and takes arguments properly, so there's no second half-language of "short
-names." A bare word that is neither a function nor a built-in is a
-command-not-found error, never a silently-expanded alias.
+**No alias *mechanism*.** What mesh drops is the machinery — parse-time textual
+expansion and a resolution stage of its own — not the familiar name. A bare word
+that is neither a function nor a built-in is a command-not-found error, never a
+silently-expanded alias, and there is no second half-language of "short names":
+what `alias` defines is a [`wrapper func`](#functions), so it composes, scopes,
+and takes arguments properly, and `type` reports it as the function it is.
+
+The word is kept because it is the one every shell user already reaches for, and
+[`alias ll = ls -l --color`](#functions) is exactly as terse as bash's while
+being real syntax rather than a stored string.
 
 ### Line editing
 
