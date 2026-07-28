@@ -2142,30 +2142,56 @@ of each PR had landed by another route, but these pieces had not.
       for `+` specifically — the spine is left leaning, so it unrolls into a loop —
       but a counter is what covers the general case, since a deep tree can be built
       by nesting rather than chaining.
-- [ ] **Three flaky tests, all pre-existing and all timing-dependent.** None is
-      caused by the depth work, and each was checked against an unmodified tree;
-      recorded here rather than fixed because each needs its own change. Two of the
-      three surfaced only in CI, which is the slower and more loaded machine — the
-      suite's PTY and subprocess-probe tests race real deadlines against real
-      output, so a busy runner is where they show.
-  - [ ] `ctrl_c_cancels_an_interactive_gets` fails around 10% of the time, on
-        `main` as much as on a branch — measured by interleaving the two binaries
-        over 60 alternating runs, 7 failures against 6. It times out at 11s waiting
-        for the shell to come back to a prompt after the Ctrl-C. Beware measuring
-        this by running one build and then the other: the rate drifts with machine
-        conditions enough to invent a difference that is not there.
-  - [ ] `notify_reaches_the_terminal_and_a_quick_command_does_not` failed once in
-        CI with harness code 150 — `pty_read_until_command_done` timing out after
-        `prompt-hook --remove`. Not reproducible locally at all: 30 interleaved
-        pairs against an unmodified tree failed 0 times on both sides, so this one
-        appears to need a loaded runner. It is built on real sleeps (`sleep 0.2`,
-        a `preprompt` handler that sleeps) raced against prompt output, which is
-        the thing to fix rather than the deadline.
-  - [ ] `separated_typed_completion_probes_the_option_context_first` failed once in
-        CI, expecting `["auto", "always"]` and getting a filename. The `--help`
-        probe it depends on has a 2-second deadline (`completion.rs:993`, `:1268`);
-        exceeding it falls back to file completion. The fix is to stop the test
-        depending on wall-clock — inject the deadline rather than raise it.
+- [x] **Two of three flaky tests fixed; one still unexplained.** All three were
+      pre-existing and timing-dependent. Both fixes attack the *dependence on
+      timing*, not the deadline — a bigger number would have moved the failure
+      rate without changing what the test rests on.
+  - [x] `ctrl_c_cancels_an_interactive_gets` — failed around 10% of the time, on
+        `main` as much as on a branch. The cause was in the test, and the comment
+        asserting otherwise was wrong: waiting for `puts BLOCKING` proved the
+        command *before* the read had ended, which is the near side of a gap, not
+        the far one. An interactive shell ignores SIGINT except where it has armed
+        itself to catch it, so a keystroke landing between the two commands is
+        discarded by design and `gets` then blocks forever — the 11s failures were
+        `QUIET` expiring on a shell that was never going to answer. Nothing the
+        shell writes marks the moment a read begins, so the keystroke now repeats
+        until it lands (`pty_interrupt_until_command_done`). What repeats is the
+        stimulus; the assertions on status and variable are untouched, and a shell
+        that ignored a properly-blocked Ctrl-C still fails on the deadline.
+        0 failures in 120 runs, from ~10%.
+  - [x] `separated_typed_completion_probes_the_option_context_first` — the `--help`
+        probe's 2-second budget, confirmed by slowing the fake tool to 3s and
+        reproducing the CI failure byte for byte (`["Cargo.toml"]` against
+        `["auto", "always"]`). The budget is now a thread-local so a test can say
+        how long it is willing to wait: this one allows 60s, because it asserts on
+        what the probe *found* and should not also be asserting that a loaded
+        machine ran it in time. `times_out_nonterminating_help` sets 200ms instead,
+        which turns a 2x margin into 25x and takes ~1.3s off the unit suite.
+        Beware the obvious disproof: shortening the budget does *not* make the
+        probe fail, because killing the child does not discard what it already
+        wrote to the pipe.
+  - [ ] `notify_reaches_the_terminal_and_a_quick_command_does_not` — **still open,
+        and not reproduced.** Failed once in CI with harness code 150,
+        `pty_read_until_command_done` timing out after `prompt-hook --remove`.
+        75 local runs found nothing: 30 interleaved pairs against an unmodified
+        tree, 25 with the machine loaded to a load average of 4.7 on 4 cores, and
+        20 pinned to a single contended core. Deliberately left alone rather than
+        given a longer deadline — without a reproduction that would only move the
+        rate. Worth knowing for whoever picks it up: the harness writes the next
+        command while a `preprompt` hook is still sleeping 0.6s, so type-ahead
+        crossing a hook is the first thing to suspect, and `QUIET` is 10s, so a
+        code-150 failure means a full ten seconds of silence rather than a near
+        miss.
+- [ ] **Unit tests write to the real `$HOME/.cache`.** Found while chasing the
+      above, and unrelated to any of them. Nothing in the suite sets
+      `XDG_CACHE_HOME`, so `cache_directory` (`completion.rs:1051`) falls back to
+      `$HOME/.cache/mesh/completions` and the completion tests leave `.spec` files
+      in the developer's own cache — 147 of them on this machine. They are keyed by
+      a hash of the executable's path, which for these tests contains the process
+      id, so a reused pid could match a stale entry; the stored fingerprint
+      (mtime and size) saves it in practice, which is luck rather than isolation.
+      The fix is to point `XDG_CACHE_HOME` at a temporary directory for the test
+      run.
 - [ ] **Math at the prompt.** The goal (mikelward): type `1 + 2` at the prompt and
       get `3`, so the shell is usable as a calculator without `expr`, `bc`, or
       `$((…))`. Not supported today, and deliberately not part of #215 — recorded

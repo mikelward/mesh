@@ -17,6 +17,37 @@ use nucleo_matcher::{Config, Matcher};
 
 const CACHE_VERSION: &str = "mesh-completion-v6";
 
+thread_local! {
+    /// How long a `--help` probe may run before it is killed and its answer given
+    /// up on, falling back to whatever completion can offer without it.
+    ///
+    /// Two seconds is the budget a *prompt* can afford: completion happens while
+    /// someone waits on a keystroke, and a program that will not answer must not
+    /// hold the line hostage.
+    ///
+    /// It is a thread-local rather than a constant so a test can say how long it
+    /// is willing to wait. A probe is a real subprocess, so a test that asserts on
+    /// its result is asserting that the machine scheduled it in time — which on a
+    /// loaded CI runner is not something the test can know. Raising the constant
+    /// would trade one arbitrary deadline for another; letting the caller choose
+    /// takes the machine's load out of the assertion entirely. Thread-local
+    /// because unit tests share a process and run in parallel, where a global
+    /// would put one test's choice into another test's probe.
+    static PROBE_BUDGET: std::cell::Cell<Duration> = const {
+        std::cell::Cell::new(Duration::from_secs(2))
+    };
+}
+
+fn probe_budget() -> Duration {
+    PROBE_BUDGET.with(std::cell::Cell::get)
+}
+
+/// Choose this thread's probe budget. See [`PROBE_BUDGET`].
+#[cfg(test)]
+pub(crate) fn set_probe_budget(budget: Duration) {
+    PROBE_BUDGET.with(|budget_cell| budget_cell.set(budget));
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ValueHint {
     File,
@@ -990,7 +1021,7 @@ fn rendered_page_with(program: &str, path: &Path) -> Option<String> {
     let mut child = process.spawn().ok()?;
     let group = child.id() as libc::pid_t;
     let stdout = pipe_reader(child.stdout.take());
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + probe_budget();
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -1265,7 +1296,7 @@ pub(crate) fn command_help(words: &[String]) -> String {
     }
     let stdout = pipe_reader(child.stdout.take());
     let stderr = pipe_reader(child.stderr.take());
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + probe_budget();
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -2262,9 +2293,14 @@ mod tests {
         let root = fresh_temp_dir("mesh-timeout");
         let command = root.join("helper");
         helper(&command, "sleep 10");
+        // A short budget, so what is measured is that the probe is *bounded* — the
+        // property under test — rather than how close two seconds is to the four
+        // this used to allow. The margin is now 25x instead of 2x, which is the
+        // difference between a test of the timeout and a race with it.
+        super::set_probe_budget(Duration::from_millis(200));
         let started = Instant::now();
         assert!(command_help(&[command.to_string_lossy().into_owned()]).is_empty());
-        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(started.elapsed() < Duration::from_secs(5));
         fs::remove_dir_all(root).unwrap();
     }
 }
