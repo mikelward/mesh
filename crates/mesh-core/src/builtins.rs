@@ -50,7 +50,7 @@ const TABLE: &[(&str, &str)] = &[
     ("source FILE", "Run a file's commands in this shell"),
     ("help [NAME ...]", "List the builtins, or explain one"),
     (
-        "whence [--all|--quiet] NAME ...",
+        "type [-t|-P|-a|--quiet] NAME ...",
         "Say what a name is: builtin, function, …",
     ),
 ];
@@ -128,21 +128,24 @@ pub fn is_builtin(name: &str) -> bool {
 /// always shadows this, which is deliberate — `echo -n` / `-e` keep working
 /// through `/bin/echo`, where a mesh builtin would print the flag as text.
 ///
-/// The four spellings of `whence` are the point of those entries rather than a
+/// The other spellings of `type` are the point of those entries rather than a
 /// footnote: the lookup command is the one every shell names differently, so
-/// whichever one the reader's fingers know has to say where it went. `which` and
-/// `where` are externals on many systems, so their notes fire only where the
-/// command really is missing — which is exactly when the pointer is wanted.
-/// `type` is the widest reflex of the four and the one mesh will never take: it
-/// is a question about a *value* in a language that has value types, and `:type`
-/// already asks a path's.
+/// whichever one the reader's fingers know has to say where it went. `whence` is
+/// ksh's and `where` zsh's; `what` is nobody's, and is here because it reads like
+/// the question. None of them is reserved, so a user function may still take the
+/// name — the pointer only fires when nothing else answers.
+///
+/// **`which` is deliberately absent.** In bash it is an external program that
+/// cannot see builtins or functions, and mesh keeps that rather than shadowing a
+/// binary, so `which cd` finds nothing here exactly as it finds nothing there. It
+/// is also the only one of these names with a file on disk, so a pointer would
+/// never fire for it anyway.
 const RENAMED: &[(&str, &str)] = &[
     ("echo", "puts"),
     ("read", "gets"),
-    ("type", "whence"),
-    ("what", "whence"),
-    ("which", "whence"),
-    ("where", "whence"),
+    ("whence", "type"),
+    ("what", "type"),
+    ("where", "type"),
 ];
 
 const LOCAL: &str = "a plain `x = 5` inside a `func` is already local";
@@ -245,9 +248,11 @@ fn format_help(usage: &str, summary: &str) -> String {
 ///
 /// - A **metavariable**, which is what the case test is for: `kill [-SIGNAL]
 ///   JOB|PID` writes a placeholder for whichever signal you name, not a flag
-///   spelled `-SIGNAL`. Usage lines spell placeholders in upper case throughout
-///   (`DIR`, `JOB`, `NAME`, `TEXT`) and mesh's flags are lower case, so the two
-///   are told apart without a second list to maintain.
+///   spelled `-SIGNAL`. Usage lines spell placeholders as upper-case *words*
+///   (`DIR`, `JOB`, `NAME`, `TEXT`), so length tells them apart from a flag
+///   without a second list to maintain: `-P` is `type`'s, taken from bash along
+///   with the rest of its surface, while `-SIGNAL` stands for whichever signal
+///   you name. A one-character name is a flag whatever its case.
 /// - The bare **`--` terminator**, which `command [--] NAME` writes to show where
 ///   it accepts one. It ends the options rather than being one, and offering it as
 ///   a flag would put it in the `Options:` block of every builtin that documents
@@ -261,10 +266,11 @@ pub(crate) fn usage_options(usage: &str) -> impl Iterator<Item = &str> {
         .filter(|token| {
             let name = token.trim_start_matches('-');
             token.starts_with('-')
-                // Non-empty rules out a bare `--`; lower case rules out a
-                // metavariable.
+                // Non-empty rules out a bare `--`; a multi-character upper-case
+                // word rules out a metavariable, while leaving `-P` a flag.
                 && !name.is_empty()
-                && name.chars().all(|character| !character.is_ascii_uppercase())
+                && (name.chars().count() == 1
+                    || name.chars().all(|character| !character.is_ascii_uppercase()))
         })
 }
 
@@ -1426,8 +1432,8 @@ mod tests {
         // Brackets say optional and the bar separates alternatives, so neither is
         // part of a name.
         assert_eq!(
-            options("whence [--all|--quiet] NAME ..."),
-            ["--all", "--quiet"]
+            options("type [-t|-P|-a|--quiet] NAME ..."),
+            ["-t", "-P", "-a", "--quiet"]
         );
         assert_eq!(options("disown [-h] [-a | -r] [JOB …]"), ["-h", "-a", "-r"]);
         assert_eq!(options("prompt [--reset | TEXT]"), ["--reset"]);
@@ -1451,9 +1457,9 @@ mod tests {
         // The `Options:` block used to name only `--help`, which made it wrong
         // about every builtin that has options — and, because the completion
         // tables are built from this text, made those flags uncompletable too.
-        let help = help("whence").expect("whence is a builtin");
+        let help = help("type").expect("type is a builtin");
         assert!(
-            help.contains("\nOptions:\n  --all\n  --quiet\n  --help"),
+            help.contains("\nOptions:\n  -t\n  -P\n  -a\n  --quiet\n  --help"),
             "{help}"
         );
         // Listing a flag implies reading options — but not the reverse, and the gap

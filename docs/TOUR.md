@@ -66,46 +66,61 @@ Every keyword the parser reserves and every operator a line can carry answers to
 half of a construct answers with the construct: `help else` explains `if`, and
 `help continue` explains `break`.
 
-Where `help` explains what mesh has, **`whence`** says what one name *is* —
-bash and fish spell this `type`, nushell `which`, ksh `whence`:
+Where `help` explains what mesh has, **`type`** says what one name *is* — bash's
+name, bash's flags, bash's words. `whence` is ksh's spelling and `where` zsh's;
+both point here:
 
 <pre>
-mesh$ <strong>whence ll</strong>
+mesh$ <strong>type ll</strong>
 ll is a function
     func ll(...args)
-mesh$ <strong>whence cd</strong>
-cd is a builtin
+mesh$ <strong>type cd</strong>
+cd is a shell builtin
     cd [DIR]
-mesh$ <strong>whence rg</strong>
+mesh$ <strong>type rg</strong>
 rg is /usr/local/bin/rg
 </pre>
 
-It reports what a bare word would **run**, so when something is shadowed it says
-what it hid — and `--all` lists every match instead:
+It reports what a bare word would **run** — the winner, and nothing about what it
+displaced. `-a` is where every match lives:
 
 <pre>
-mesh$ <strong>whence git</strong>
-git is a function (shadowing /usr/bin/git)
+mesh$ <strong>type git</strong>
+git is a function
     func git(...args)
+mesh$ <strong>type -a git</strong>
+git is a function
+    func git(...args)
+git is /usr/bin/git
 </pre>
 
-Variables answer too, asked for **without the `$`** — `whence xs` is a question
-about the name, where `$xs` would expand before `whence` ever saw it. Bindings
+Two flags answer in a shape a script can compare rather than read. `-t` gives one
+word, and `-P` only a <code>PATH</code> hit — so a guard never has to match prose:
+
+<pre>
+mesh$ <strong>type -t git</strong>
+function
+mesh$ <strong>type -P git</strong>
+/usr/bin/git
+</pre>
+
+Variables answer too, asked for **without the `$`** — `type xs` is a question
+about the name, where `$xs` would expand before `type` ever saw it. Bindings
 live in their own namespace, so a name that is both a command and a variable is
 reported as both:
 
 <pre>
 mesh$ <strong>xs = [a b c]</strong>
-mesh$ <strong>whence xs</strong>
+mesh$ <strong>type xs</strong>
 xs is a variable
     a list of 3: ['a', 'b', 'c']
 </pre>
 
-`whence --quiet NAME` prints nothing and leaves only the status, which is how a
+`type --quiet NAME` prints nothing and leaves only the status, which is how a
 startup file asks whether something is installed:
 
 ```mesh
-if whence --quiet fzf { export FZF_DEFAULT_OPTS = "--height 40%" }
+if type --quiet fzf { export FZF_DEFAULT_OPTS = "--height 40%" }
 ```
 
 ## Completing what you type

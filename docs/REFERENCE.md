@@ -441,11 +441,11 @@ mesh: command not found: read (mesh spells this `gets`)
 mesh$ local x = 5
 mesh: command not found: local (a plain `x = 5` inside a `func` is already local)
 mesh$ type ls
-mesh: command not found: type (mesh spells this `whence`)
+mesh: command not found: whence (mesh spells this `type`)
 ```
 
 The name-lookup command draws four of these — `type`, `what`, `which` and
-`where` all point at [`whence`](#whence) — because it is the one command every
+`where` all point at [`type`](#type) — because it is the one command every
 shell names differently. `which` and `where` are real externals on many systems,
 so those two notes appear only where the command is genuinely missing.
 
@@ -703,7 +703,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `disown [-h] [-a \| -r] [job …]` | Stop tracking a job — see [Job control](#job-control). |
 | `command [--] name [arg …]` | Run the **program** `name`, past the builtin or function that name would otherwise reach — which is what makes `func ls() { command ls --color=auto }` safe to write, and what reaches `/usr/bin/env` when a function of that name is in the way. Only the words in front of the program are `command`'s own: `command ls --help` asks `ls` for its help, and `--` ends `command`'s options so the word after it is the program however it reads. `--help` is the only option it has, so any other flag-looking word in front of the program is a usage error (status `2`) rather than a program name — `command -v` / `-V` are held for the unbuilt half, and `command -- -v` runs a program called `-v`. The operand is the program with nothing peeled off it, so `command command x` looks for a program called `command`. A builtin's name finds no program, and says so; with no operand at all the status is `2`. |
 | `source file` | Run a file's mesh code in this shell — see [`source`](#source). |
-| `whence [--all\|--quiet] name …` | Say what each name is — see [`whence`](#whence). |
+| `type [-t\|-P\|-a\|--quiet] name …` | Say what each name is — see [`type`](#type). |
 
 ### Flags and `--`
 
@@ -715,7 +715,7 @@ expansion safety is about never *splitting* or *globbing* a value; it was never 
 promise to launder a word that is a flag.
 
 A builtin's `Options:` block lists **its own flags** alongside `--help`, read off
-the usage line rather than written twice — so `whence --help` names `--all` and
+the usage line rather than written twice — so `type --help` names `-t` and
 `--quiet`, and `disown --help` names `-h` / `-a` / `-r`. Tab completion is built
 from that same text, so those flags complete too. A *metavariable* is not a flag:
 `kill [-SIGNAL]` stands for whichever signal you name, so nothing is listed for
@@ -733,7 +733,7 @@ kill -- -9 %1                 # looks for a job named `-9`, not signal 9
 
 Which command consumes it depends on which has options to end. `puts`, `print`, `gets`,
 `clip`, `notify`, `cd`, `source` and `help` have none of their own, so the terminator
-is simply removed. `kill`, `disown`, `prompt`, `prompt-hook`, `command` and `whence`
+is simply removed. `kill`, `disown`, `prompt`, `prompt-hook`, `command` and `type`
 do, so each ends its own options at `--` — only they know where those stop.
 
 `command` is also where the `--help` rule stops applying, because the arguments
@@ -747,47 +747,72 @@ command -v ls                 # error: `command` has no `-v`; status 2
 command -- -v                 # runs a program called `-v`
 ```
 
-### `whence`
+### `type`
 
-`whence name …` says what each name **is**, which is the question `type` answers
-in bash and fish, `which` in nushell, and `whence` in ksh — mesh takes the ksh
-spelling, and its `-a` / `-q` arrive as `--all` / `--quiet`. `type` stays free
-because mesh has real value types and `$p:type` already asks a path's; the
-value-side question — what a value is, written back as source — is
-[`:repr`](#modifiers).
+`type name …` says what each name **is** — bash's name, bash's flags, and bash's
+words. `whence` is ksh's spelling and `where` zsh's; both, and `what`, point here.
+`which` does **not**: in bash it is an external program that cannot see builtins
+or functions, and mesh keeps that, so `which cd` finds nothing here exactly as it
+finds nothing there.
+
+The value-side question — what a value is, written back as source — is
+[`:repr`](#modifiers), and `$p:type` still asks a path's type. Those are modifiers
+on a value; `type` is a command, and neither can be written where the other is
+meant.
 
 ```mesh
-whence ll          # ll is a function
+type ll            # ll is a function
                    #     func ll(...args)
-whence cd          # cd is a builtin
+type cd            # cd is a shell builtin
                    #     cd [DIR]
-whence unless      # unless is syntax
+type unless        # unless is a shell keyword
                    #     cmd if COND
-whence rg          # rg is /usr/local/bin/rg
-whence xs          # xs is a variable
+type rg            # rg is /usr/local/bin/rg
+type xs            # xs is a variable
                    #     a list of 3: ['a', 'b', 'c']
 ```
 
-A name is given **without a sigil**. `whence xs` asks about the *name* `xs`;
-`whence $xs` would expand first, so the built-in would never see the name at all.
-Because bindings live in their own namespace, a name that is both a command and a
-variable is reported as **both** — neither shadows the other — and an `$env` entry
-is reported the same way (`whence PATH`).
-
-What a name resolves to is reported in **resolution order**: syntax, then a
-builtin, then a function, then the executables `PATH` holds. Bare, `whence`
-reports the winner and names what it hides; `--all` lists every match instead:
+**Two flags carry the shapes a script consumes**, and both are bash's, because
+their output is compared rather than read. `-t` prints one word; `-P` prints only
+a `PATH` hit, ignoring functions and builtins:
 
 ```mesh
-whence git         # git is a function (shadowing /usr/bin/git)
+type -t ll         # function
+type -t cd         # builtin
+type -t rg         # file
+type -t unless     # keyword
+type -t xs         # variable        — the one word bash has no use for
+type -P rg         # /usr/local/bin/rg
+type -P ll         # (nothing, status 1) — a function has no path
+```
+
+`-t` is what a guard should compare against instead of matching prose, and `-P`
+retires the hand-rolled `for d in $PATH` loop a portable script carries because
+`type -P` is not available everywhere. Both print nothing and exit `1` when there
+is no answer.
+
+A name is given **without a sigil**. `type xs` asks about the *name* `xs`;
+`type $xs` would expand first, so the built-in would never see the name at all.
+Because bindings live in their own namespace, a name that is both a command and a
+variable is reported as **both** — neither shadows the other — and an `$env` entry
+is reported the same way (`type PATH`).
+
+What a name resolves to is reported in **resolution order**: a keyword, then a
+builtin, then a function, then the executables `PATH` holds. Bare, `type` reports
+the **winner** and says nothing about what it displaced — describing what a name
+could have matched but did not is not worth a line. `-a` is where every match
+lives, as in bash:
+
+```mesh
+type git           # git is a function
                    #     func git(...args)
-whence --all git   # git is a function
+type -a git        # git is a function
                    #     func git(...args)
                    # git is /usr/bin/git
 ```
 
 A word with a `/` in it is a **path operand**, read the way command resolution
-reads it — the file itself, with no `PATH` search (`whence ./build.mesh` →
+reads it — the file itself, with no `PATH` search (`type ./build.mesh` →
 `./build.mesh is an executable file`).
 
 **Described is not the same as usable**, and where the two part the report says
@@ -795,7 +820,7 @@ what it found and the status still fails — so the printed line explains the
 failure rather than contradicting it. Two cases:
 
 - A path that exists but could not be run: a directory, a file without the
-  execute bit, or a special file (`whence ./p` → `./p is a named pipe`).
+  execute bit, or a special file (`type ./p` → `./p is a named pipe`).
   Executing any of them is a `126`, so an execute bit on a fifo does not make it
   a command.
 - A shape the parser does not claim in command position. `help` documents three
@@ -807,7 +832,7 @@ failure rather than contradicting it. Two cases:
     values. A bare one is an ordinary command word, so `unless` on its own is
     `command not found`. These are described but do not resolve — and, because a
     bare one really does reach a lookup, a function or executable of that name is
-    the answer to "what runs": `func fork() { … }` then `whence fork` reports the
+    the answer to "what runs": `func fork() { … }` then `type fork` reports the
     function, with the keyword beside it and neither shadowing the other.
 
     `if` is **both**, and lands in the group above: it is the postfix guard after
@@ -815,7 +840,7 @@ failure rather than contradicting it. Two cases:
     role is unconditional, so a bare `if` is a syntax error rather than a lookup.
     Sharing a spelling with a guard does not make a word contextual — where it
     stands in command position is the whole of what decides it.
-  - **Punctuation and shapes** — every operator a line can carry. `whence +` says
+  - **Punctuation and shapes** — every operator a line can carry. `type +` says
     what `+` is; it names nothing.
 
   `re`, `style`, `link`, `glob`, `files` and `dirs` sit with the contextual group
@@ -828,14 +853,14 @@ misuse. **`--quiet`** leaves only that status — no report, and no not-found no
 either — which is mesh's `command -v fzf >/dev/null`:
 
 ```mesh
-if whence --quiet fzf { export FZF_DEFAULT_OPTS = "--height 40%" }
+if type --quiet fzf { export FZF_DEFAULT_OPTS = "--height 40%" }
 ```
 
-Without `--quiet` it is an ordinary command that writes, so a bare `whence` in a
+Without `--quiet` it is an ordinary command that writes, so a bare `type` in a
 condition still prints its report. A missing name is reported on stderr and the
 names beside it still print, so one typo does not cost the rest. Where the name
-is one another shell spells differently, the note says so — `whence type`,
-`whence what`, and typing `type` itself all point at `whence`.
+is one another shell spells differently, the note says so — `type whence`,
+`type what`, and typing `whence` itself all point at `type`.
 
 A bound value's detail line names its shape and, when the literal fits on the
 line, shows it. That literal is **exact or absent, never shortened**: an elided
