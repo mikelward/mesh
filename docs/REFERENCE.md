@@ -1574,13 +1574,37 @@ is `\$`.
 
 ## Modifiers
 
-Recognized postfix modifiers apply from left to right after a variable, member,
-or list access. They work in bare and double-quoted interpolation; braced form
-puts the modifier inside the braces (`${file:stem}`). An unrecognized `:name`
-is literal text, so `$host:$port` is not mistaken for a modifier chain. A name
-mesh **reserves** for a modifier it has not built yet — `:sort`, `:words`,
-`:lines`, `:replace`, and the rest of the `DESIGN.md` set — is a loud
-`not implemented yet` in a value context rather than a silent no-op.
+Postfix modifiers apply from left to right after a variable, member, list access,
+or a **literal** — `abc:upper` is `ABC`, the same as `$x:upper`. They work in bare
+and double-quoted interpolation; braced form puts the modifier inside the braces
+(`${file:stem}`).
+
+**`:` followed by an identifier is reserved by the grammar**, so a name that is not
+a modifier is a syntax error rather than literal text:
+
+```
+puts ubuntu:latest
+mesh: syntax error: `:latest` is not a modifier; quote the whole word to keep it
+as text (`"x:latest"`), or brace the name when it comes from a variable
+(`"${x}:latest"`)
+```
+
+Quoting the *subject* does not help — `"ubuntu":latest` is the same chain. The
+colon has to be inside the quotes (`"ubuntu:latest"`), or the name braced when it
+interpolates (`"${image}:latest"`).
+
+Only a **bare identifier** after the colon is claimed, so ordinary punctuation is
+untouched: `key:2`, `key:/path`, `key:`, `http://x` and `$host:$port` all keep
+reading as text. A `[…]` literal's `key:` is a map key, not a chain on the key, so
+`[host:upper, port:22]` is a map.
+
+The chain also outranks keyword parsing, so `if:upper` is `IF` rather than the
+start of a conditional; `if :upper` — with the space — is still the keyword.
+
+A name mesh **reserves** for a modifier it has not built yet — `:sort`, `:words`,
+`:lines`, `:replace`, and the rest of the `DESIGN.md` set — parses, then reports a
+loud `not implemented yet` in a value context rather than a silent no-op. That is
+a different failure from an unknown name, which never parses.
 
 | Modifier | Input | Result |
 | --- | --- | --- |

@@ -1182,6 +1182,35 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       external's path, which between them are `have_command` (`$x:kind != false`),
       `is_builtin`, `is_function`, `is_command` and `path` — 41 guard sites in the
       `shrc` this is for, nearly all `if have_command X`.
+
+  - [ ] **First: does this need to exist at all, now that `whence` has shipped?**
+        Everything below is downstream of the answer, including both items marked
+        "open and blocking".
+
+        `whence --quiet` already answers the 41 guard sites, and answers them as a
+        *command condition*, which is mesh's natural form — no comparison, no
+        quoting, no taxonomy:
+
+        ```
+        if whence --quiet fzf { … }        # against  if have_command fzf
+        if shpool:kind != false { … }      # what this item proposes
+        ```
+
+        It also settles, by reporting **both** rather than choosing, the two
+        questions this item cannot: what to say about a keyword that is also a
+        program, and whether a path or a kind is the answer. And it already builds
+        the prerequisite this item asked for — `COMMAND_KEYWORDS` split from
+        `SYNTAX` / `SYNTAX_WORDS` (`builtins.rs:473`).
+
+        What a modifier would still add is **structured output in expression
+        position**: `$x:kind == builtin` branches on a value where `whence` writes
+        a report and sets a status. That gap is already tracked as `whence(NAME)`
+        returning a map, which would close it without a new modifier.
+
+        So the live question is whether `:kind` / `:where` earn a second surface
+        over the name lookup, or whether this item should be closed as answered by
+        `whence` plus its value-call follow-up. Not decided.
+
   - [ ] Decide the plumbing first. `:kind` needs the function table from `Funcs`,
         but string interpolation resolves through `expand.rs`, which is handed
         only `&Vars` — so a naive implementation works in `y = $x:kind` and not
@@ -1352,6 +1381,19 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
         executable on `PATH` — so it stays `keyword` as a named exception, or
         removing that interception is part of the option. Settle before
         implementing; it changes what the modifier means.
+
+        **`whence` has since answered this with a third option neither bullet
+        offered: report both.** `whence if` gives `if is syntax (shadowing
+        /usr/bin/if)` and `whence --all if` lists the two findings separately, so
+        it never picks between "the word is syntax" and "a program exists". The
+        either/or was an artifact of `:kind` returning a single value, not of the
+        question. It also draws the contextual distinction this entry argued for:
+        with a real program on `PATH`, `and` / `fork` / `else` / `in` / `unless`
+        report the program and no "syntax" at all, while `if` reports syntax plus
+        the shadow.
+
+        So this survives **only if `:kind` exists as a single-valued modifier**,
+        which is itself open below. Do not settle it before that.
   - [ ] **Open, and blocking: is `:where` about resolution or about `PATH`?**
         Separate from the `keyword` question — shadowing is ordinary, not exotic:
         `pwd:where` (builtin, `/bin/pwd` exists), `ls:where` with the
@@ -1363,6 +1405,14 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
         under both `keyword` options, so the builtin and func rows must be
         decided on their own terms. Test whichever is chosen on all three rows,
         since the wrapper idiom makes `ls:where` the common case.
+
+        **`whence` answers this the same way — both at once.** `whence pwd` gives
+        `pwd is a builtin (shadowing /usr/bin/pwd)`: the kind and the path in one
+        report, so "resolution or `PATH`" never arises. Its `PATH` scan follows
+        `execvp` (skipping a candidate it cannot execute rather than stopping at
+        the first name match), which is the behavior this item's probes established
+        was required. Like the `keyword` question, it survives only if a
+        single-valued `:kind` / `:where` pair exists.
   - [ ] Resolution order is command position's — keyword → builtin → func →
         external — **for the bare form, and pending the open question above**.
         "Cannot disagree with what running the name would do" does not name a

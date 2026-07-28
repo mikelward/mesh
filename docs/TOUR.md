@@ -506,8 +506,13 @@ two
 
 A list-returning modifier remains a real list, so spread it with `...` in
 command arguments or assign it intact (`ys = $xs:rest`). Path and case
-modifiers map over a list element by element. An unknown name is not consumed as
-a modifier, which keeps constructions such as `$host:$port` working literally.
+modifiers map over a list element by element. A modifier applies to a literal as
+much as to a variable, so `abc:upper` is `ABC`.
+
+`:` followed by an identifier is reserved, so an unknown name is a syntax error
+rather than literal text — `ubuntu:latest` has to be written `"ubuntu:latest"`, or
+`"${image}:latest"` when the name comes from a variable. Only a bare identifier is
+claimed, which is what keeps `$host:$port`, `http://x` and `key:2` reading as text.
 
 A modifier that takes an argument spells it in parentheses. `:join(SEP)` folds a
 list back into a string and `:split(SEP)` unfolds a string into a list:
