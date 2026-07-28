@@ -175,8 +175,13 @@ impl CompletionSpec {
         let candidates = self
             .candidates
             .iter()
+            // A leading `-` says which kind of candidate is wanted, so the two
+            // kinds do not cross: `-p` must not reach `cherry-pick`, which the
+            // fuzzy matcher happily finds by its `-` and its `p`, and which is
+            // not a thing you could run with a dash in front of it. An empty
+            // prefix has said nothing yet, so it offers both.
             .filter(|candidate| {
-                prefix.is_empty() || prefix.starts_with('-') || !candidate.starts_with('-')
+                prefix.is_empty() || prefix.starts_with('-') == candidate.starts_with('-')
             })
             .cloned()
             .collect();
@@ -1138,6 +1143,30 @@ mod tests {
         // The description still ends the declaration once a column stops
         // declaring options — `read the program from there` types nothing.
         assert_eq!(spec.value_hint("--file"), None);
+    }
+
+    #[test]
+    fn a_dashed_prefix_offers_options_and_nothing_else() {
+        let spec = CompletionSpec::from_help(concat!(
+            "Commands:\n",
+            "   cherry-pick   Apply changes from commits\n",
+            "   push          Update remote refs\n",
+            "\n",
+            "Options:\n",
+            "  --pretty <FMT>   Pretty-print\n",
+            "  -q, --quiet      Be quiet\n",
+        ));
+
+        // Nucleo matches noncontiguously, so `-p` finds the `-` and the `p` of
+        // `cherry-pick` — a subcommand you could never run dash-first.
+        assert_eq!(spec.matching("-p"), ["--pretty"]);
+        // A bare prefix is the mirror image: subcommands only.
+        assert_eq!(spec.matching("p"), ["push", "cherry-pick"]);
+        // Nothing typed yet says nothing about which kind is wanted.
+        assert_eq!(
+            spec.matching(""),
+            ["--pretty", "--quiet", "-q", "cherry-pick", "push"]
+        );
     }
 
     #[test]
