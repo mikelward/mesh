@@ -11209,6 +11209,11 @@ mod tests {
         .unwrap();
         fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
         let command = command.to_string_lossy().into_owned();
+        // This asserts on what the probe *found*, so it must not also be asserting
+        // that a loaded machine got round to running it within the budget a prompt
+        // uses. Generous rather than raised for everyone: the shell still gives up
+        // after two seconds, this test just refuses to call that a result.
+        crate::completion::set_probe_budget(Duration::from_secs(60));
         let state = CompletionState::default();
 
         assert_eq!(

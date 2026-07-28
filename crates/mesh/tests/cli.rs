@@ -3207,10 +3207,11 @@ fn gets_interrupt_harness(exec: &MeshExec) -> i32 {
     if pty_read_until_command_done(shell.master).is_none() {
         return 92;
     }
-    // `gets` is reached only after the `puts`, so waiting for that marker is what
-    // guarantees the read is actually blocked before Ctrl-C arrives. Sent blind,
-    // the keystroke can beat the command to the terminal and cancel the *line*
-    // instead, which tests nothing.
+    // The marker is what keeps the keystroke from beating the command to the
+    // terminal and cancelling the *line* instead, which would test nothing. It is
+    // not evidence that the read has begun, though — only that the command before
+    // it ended — so it is the near side of the gap described on
+    // `pty_interrupt_until_command_done`, which is why the keystroke repeats.
     if !pty_write(shell.master, b"puts BLOCKING; gets x\n") {
         return 93;
     }
@@ -3219,10 +3220,7 @@ fn gets_interrupt_harness(exec: &MeshExec) -> i32 {
     }
     // Ctrl-C while the read blocks. The shell must come back to a prompt rather
     // than sit waiting for a line.
-    if !pty_write(shell.master, b"\x03") {
-        return 101;
-    }
-    let Some((_, code)) = pty_read_until_command_done(shell.master) else {
+    let Some((_, code)) = pty_interrupt_until_command_done(shell.master) else {
         return 95;
     };
     // The status any interrupted foreground command reports.
@@ -5002,6 +5000,19 @@ fn pty_wait_for_prompt(master: std::os::fd::RawFd) -> bool {
 /// ends, so there is nothing to mistake it for, and it carries the status —
 /// which the prompt only ever hinted at through its glyph.
 fn pty_read_until_command_done(master: std::os::fd::RawFd) -> Option<(Vec<u8>, u8)> {
+    pty_read_until_command_done_within(master, QUIET)
+}
+
+/// [`pty_read_until_command_done`], with the wait for the *first* byte bounded by
+/// `quiet` rather than by [`QUIET`].
+///
+/// Only for a caller that has something else to try when nothing arrives — see
+/// [`pty_interrupt_until_command_done`]. Everything else wants the long budget,
+/// because for those a silent shell is the failure rather than a cue.
+fn pty_read_until_command_done_within(
+    master: std::os::fd::RawFd,
+    quiet: libc::c_int,
+) -> Option<(Vec<u8>, u8)> {
     let mut ready = libc::pollfd {
         fd: master,
         events: libc::POLLIN,
@@ -5025,7 +5036,7 @@ fn pty_read_until_command_done(master: std::os::fd::RawFd) -> Option<(Vec<u8>, u
         // on it. What follows is the next prompt, and leaving it unread backs the
         // pty up until the shell blocks writing into it — which presents as the
         // shell ignoring whatever is typed next.
-        let timeout = if done.is_some() { 50 } else { QUIET };
+        let timeout = if done.is_some() { 50 } else { quiet };
         if unsafe { libc::poll(&mut ready, 1, timeout) } <= 0 {
             return done.map(|status| (seen, status));
         }
@@ -5051,6 +5062,41 @@ fn pty_read_until_command_done(master: std::os::fd::RawFd) -> Option<(Vec<u8>, u
 /// Read from the PTY until `marker` appears, answering cursor-position queries so
 /// reedline keeps going. Used to wait for evidence that a backgrounded body has
 /// actually run, rather than checking the moment the prompt returns.
+/// Send Ctrl-C until the shell reports a command ending, and return that ending.
+///
+/// One keystroke is not enough, and the reason is a genuine gap rather than a
+/// slow machine. An interactive shell ignores SIGINT except where it has armed
+/// itself to catch it — around a foreground job, or around an interruptible read
+/// — so a keystroke that lands *between* those windows is discarded by design.
+/// Nothing the shell writes marks the moment a read begins: the output of the
+/// command before it proves only that the command before it finished, which is
+/// the near side of the gap and not the far one.
+///
+/// So the keystroke repeats until it lands. What is retried is the **stimulus**,
+/// not the assertion — the caller still checks the status and the variable
+/// exactly as before, and a shell that ignored Ctrl-C properly blocked would
+/// keep ignoring it and still fail here on the deadline. A keystroke that
+/// arrives once the prompt is back merely cancels an empty line, which is why
+/// repeating is safe.
+fn pty_interrupt_until_command_done(master: std::os::fd::RawFd) -> Option<(Vec<u8>, u8)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut seen = Vec::new();
+    while std::time::Instant::now() < deadline {
+        if !pty_write(master, b"\x03") {
+            return None;
+        }
+        // Short, because a keystroke that fell in the gap produces *nothing* and
+        // the answer is to send another rather than to keep waiting. The overall
+        // budget is the deadline above, so this is not a shorter timeout for the
+        // test — only a shorter one per attempt.
+        if let Some((window, status)) = pty_read_until_command_done_within(master, 250) {
+            seen.extend_from_slice(&window);
+            return Some((seen, status));
+        }
+    }
+    None
+}
+
 /// Read until every marker has been seen, in one buffer.
 ///
 /// Not a loop over [`pty_wait_for_marker`]: each call there starts a fresh
