@@ -599,7 +599,7 @@ In an interactive shell, Tab completes according to the cursor's current word:
 | --- | --- |
 | First word, or a whitespace-separated word after `;`, `|`, `&&`, `||`, `&`, or `{` | Builtins, defined functions, and executable files found on `PATH` |
 | Command argument | Files and directories; directory suggestions have a trailing `/` |
-| A subcommand or flag described by `command --help` | Lazily generated suggestions, cached under `$XDG_CACHE_HOME/mesh/completions/` (or `~/.cache/mesh/completions/`) |
+| A subcommand or flag of an external command | Whatever the layered spec for that command says — see [Where a command's completions come from](#where-a-commands-completions-come-from) |
 | A word beginning with `$` | Visible variable names |
 | After `$map.` | Keys in that map; nested map paths such as `$config.user.` are followed recursively |
 
@@ -614,6 +614,49 @@ to suitable values. File and directory positionals inferred from `Usage:` lines,
 including Vim's `[file ..]`, do the same for ordinary command arguments.
 External-command help probes have null stdin, a two-second timeout, and a
 one-MiB output cap.
+
+#### Where a command's completions come from
+
+For an external command, the subcommands and flags on offer come from a **spec**,
+and mesh looks for one in four places. The first that answers wins:
+
+| Order | Source | Runs anything? |
+| --- | --- | --- |
+| 1 | A **curated file** you wrote, in `$XDG_DATA_HOME/mesh/completions/` (or `~/.local/share/mesh/completions/`) | No |
+| 2 | The command's **manual page**, rendered with `man` | A formatter, over a data file |
+| 3 | A bounded **`--help` probe** of the command itself | Yes — the command runs |
+| 4 | Files and directories | No |
+
+A generated spec — 2 or 3 — is cached under `$XDG_CACHE_HOME/mesh/completions/`
+(or `~/.cache/mesh/completions/`), keyed so it regenerates when *its own* source
+changes: a `--help` spec by the binary's path, size and mtime, a man-page spec by
+the page's. A source that yields nothing falls through to the next rather than
+answering with an empty list.
+
+**A curated file** is named the way the manual names the same thing — `git`,
+`git-commit` — so a subcommand's spec sits beside its command's. One candidate
+per line, with a value type spelled out rather than guessed:
+
+```text
+# ~/.local/share/mesh/completions/demo
+--verbose
+--output file            # file, dir, page, or a | list of literal values
+--color auto|always|never
+build
+positional dir
+```
+
+Because it is read before the command is even resolved, a curated file works for
+something that is not on `PATH`, and it is re-read on every Tab, so editing one
+takes effect immediately. A file that says nothing — empty, or only comments —
+falls through instead of suppressing what would otherwise be offered.
+
+**A manual page** is only trusted when it belongs to the same install as the
+binary: mesh looks beside the executable, so `<prefix>/bin/tool` is documented by
+`<prefix>/share/man`. A project-local `./tool` therefore does not inherit
+`/usr/bin/tool`'s page — that case falls through to the probe. A page contributes
+flags only; subcommands are left to the probe, since pages describe them in prose
+rather than in a table.
 
 ### Line editing
 

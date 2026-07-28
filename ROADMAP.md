@@ -45,7 +45,7 @@ and `puts`) subsequently landed in M1.
 
 ---
 
-## M1 — A shell you'd actually sit in
+## M1 — A shell you'd actually sit in ✅
 
 **Goal:** replace the bare stdin reader with a real interactive line editor, and
 the placeholder tokenizer with the first real slice of the mesh lexer.
@@ -56,10 +56,11 @@ the placeholder tokenizer with the first real slice of the mesh lexer.
 - Prefix completion ✅ landed — commands and builtins in command position,
   filesystem paths in argument position, and visible variables including nested
   map keys after `$map.`.
-- Lexer v1: quoting (`'…'`, `"…"`) and escaping, so arguments with spaces work.
+- Lexer v1 ✅ landed — quoting (`'…'`, `"…"`) and escaping, so arguments with
+  spaces work.
 - Promote the shell internals into a `crates/mesh-core` library ✅ landed; the
   binary is a thin `main` (enables direct unit tests of the lexer).
-- `&&` / `||` sequencing and `;` — the smallest useful control flow.
+- `&&` / `||` sequencing and `;` ✅ landed — the smallest useful control flow.
 - `cd`/`pwd`/`puts` builtins ✅ landed — basic `cd` (`$HOME`, `cd -`, updates
   `$env.PWD`/`OLDPWD`). Remaining for `cd`: `CDPATH`, `--physical`, autocd,
   logical cwd.
@@ -69,7 +70,7 @@ argument; `false || echo ok` prints `ok`.
 
 ---
 
-## M2 — Pipes, redirection, and job control
+## M2 — Pipes, redirection, and job control ✅
 
 **Goal:** the headline feature — real POSIX job control — plus the plumbing that
 makes a shell a shell.
@@ -122,14 +123,24 @@ that depend on those later features are not an M3 compatibility promise.
 
 ## Beyond
 
-Fuzzy + case-insensitive completion (`nucleo`), the status-dashboard prompt with
-composable hooks, session management (shpool/tmux), regex/`~`, and the rest of
-the `DESIGN.md` surface. Sequenced when the milestones above make them reachable.
+Work continues past M3 on this track rather than as a new milestone. Landed so
+far, each documented in [`docs/REFERENCE.md`](docs/REFERENCE.md):
 
-Script invocation has since landed on this track — `mesh script.mesh a b c`,
-`mesh -c "…"`, `mesh -s`, shebangs, and the `$sh.args` / `$sh.name` slice of the
-`$sh` namespace — so mesh is no longer stdin-only. See
-[`docs/REFERENCE.md`](docs/REFERENCE.md) §"Invocation".
+- **Script invocation** — `mesh script.mesh a b c`, `mesh -c "…"`, `mesh -s`,
+  shebangs, and the `$sh.args` / `$sh.name` slice of the `$sh` namespace, so mesh
+  is no longer stdin-only.
+- **Fuzzy, case-insensitive completion** (`nucleo`), and a four-layer source for
+  what it offers: a curated spec file, else the command's manual page, else a
+  bounded `--help` probe, else files and directories.
+- **The status-sensitive prompt** with composable lifecycle hooks
+  (`prompt`, `prompt-hook`).
+- **Regex and glob `~` tests**, and `match` with regex arms.
+- **The environment as values** — `$env.KEY`, `export`, and the path-type entries
+  that split on `:` and rejoin exactly.
+- **`type`** — the name lookup every shell spells differently, with bash's flags.
+
+Still ahead: `$sh.complete` for programmable completion, session management
+(shpool/tmux), and the rest of the `DESIGN.md` surface.
 
 ---
 

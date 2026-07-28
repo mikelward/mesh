@@ -8,14 +8,16 @@ The clean-break M3 parser target and precedence rules live in
 [`PARSER.md`](PARSER.md). [`GRAMMAR.md`](GRAMMAR.md) continues to describe only
 the subset accepted by the current implementation.
 
-> **Status:** the implementation is a read/tokenize/exec loop that launches
-> external commands plus the builtins `help` lists — run it, or see
-> [`docs/REFERENCE.md`](docs/REFERENCE.md#builtins). Interactive
-> input uses `reedline` line editing (history, Ctrl-C/Ctrl-D, and session-aware
-> Tab completion) behind a two-glyph
-> prompt that can be customized with lifecycle hooks; piped input uses a std-only reader. None of the mesh *language* is
-> implemented yet. Treat the current code as a seed, not a foundation to build
-> features on before the real lexer/parser land.
+> **Status:** M0–M3 have landed, so this is a working shell with a working
+> language — typed values, functions, `if` / `for` / `match`, pipelines,
+> redirection, and POSIX job control. Run it, or read
+> [`docs/TOUR.md`](docs/TOUR.md) for the guided version and
+> [`docs/REFERENCE.md`](docs/REFERENCE.md) for what is actually implemented.
+> Interactive input uses `reedline` line editing (history, Ctrl-C/Ctrl-D, and
+> session-aware Tab completion) behind a prompt customizable with lifecycle
+> hooks; piped input uses a std-only reader. Work now continues past M3 —
+> [`ROADMAP.md`](ROADMAP.md) holds the arc and [`TODO.md`](TODO.md) the working
+> front.
 
 Interactive startup follows Unix job-control rules: a mesh launched as a
 background job stops before reading its terminal and can be resumed with `fg`.
@@ -78,16 +80,26 @@ integration tests need no terminal. The rest of the interactive stack named in
 | Crate | Purpose | License | Status |
 | --- | --- | --- | --- |
 | `reedline` | interactive line editing, history, Ctrl-C/D, completion | MIT | **in use** |
+| `rusqlite` | the persisted-history backend `reedline`'s `sqlite` feature uses | MIT | **in use** |
 | `glob` | filesystem glob expansion | MIT/Apache-2.0 | **in use** |
+| `regex` | the `~` tests and `match`'s regex arms | MIT/Apache-2.0 | **in use** |
 | `libc` | process groups and foreground-terminal handoff | MIT/Apache-2.0 | **in use** |
+| `chrono` | timestamps for history and the prompt | MIT/Apache-2.0 | **in use** |
+| `nu-ansi-term` | color for the prompt and the completion menu | MIT | **in use** |
+| `unicode-segmentation` | grapheme-aware string handling | MIT/Apache-2.0 | **in use** |
+| `unicode-width` | display width, so a prompt lines up | MIT/Apache-2.0 | **in use** |
 | `crossterm` | terminal control (pulled in by `reedline`) | MIT | transitive |
 | `nucleo-matcher` | fuzzy completion | MPL-2.0 | **in use** |
 
 Add a dependency only when a milestone calls for it; prefer a small, focused
 crate over a framework. The repo is licensed `MIT OR Apache-2.0`; keep the
-license column permissive-compatible. All planned deps are permissive except
-`nucleo`, which is MPL-2.0 (weak, file-level copyleft — compatible with a
+license column permissive-compatible. Everything here is permissive except
+`nucleo-matcher`, which is MPL-2.0 (weak, file-level copyleft — compatible with a
 permissive project).
+
+Note the MSRV floor is set from *inside* this table: `rusqlite` reaches
+`libsqlite3-sys`, whose build script needs Rust 1.95. Dropping persisted history
+would drop the floor with it.
 
 ## Testing
 
@@ -155,16 +167,23 @@ mesh/
 │   │   └── tests/cli.rs    # end-to-end tests driving the built binary
 │   ├── mesh-core/          # reusable shell implementation
 │   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs      # public run entry point and parser module
-│   │       ├── repl.rs     # read / tokenize / dispatch loop
-│   │       ├── parser.rs   # span-carrying M3 tokens and command/value AST
-│   │       ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
-│   │       ├── vars.rs     # variable store: global scope + function-local scopes
-│   │       ├── options.rs  # $sh.options — the settings, shared with the line editor
-│   │       ├── funcs.rs    # user-defined function store (name → params + body)
-│   │       ├── builtins.rs # cd, pwd, puts, exit + job-builtin recognition
-│   │       └── exec.rs     # launch external commands + pipelines/redirection
+│   │   ├── src/
+│   │   │   ├── lib.rs      # public run entry point and parser module
+│   │   │   ├── repl.rs     # read / tokenize / dispatch loop
+│   │   │   ├── parser.rs   # span-carrying M3 tokens and command/value AST
+│   │   │   ├── expand.rs   # interpolation resolve + tilde/glob (respects quoting)
+│   │   │   ├── vars.rs     # variable store: global scope + function-local scopes
+│   │   │   ├── environ.rs  # $env.KEY, and the path-type entries that split on `:`
+│   │   │   ├── options.rs  # $sh.options — the settings, shared with the line editor
+│   │   │   ├── funcs.rs    # user-defined function store (name → params + body)
+│   │   │   ├── whence.rs   # what a name is — the report `type` prints
+│   │   │   ├── completion.rs # the layered spec resolver behind Tab
+│   │   │   ├── reaper.rs   # the one place that calls waitpid; SIGCHLD handling
+│   │   │   ├── builtins.rs # cd, pwd, puts, type, … + job-builtin recognition
+│   │   │   └── exec.rs     # launch external commands + pipelines/redirection
+│   │   └── tests/
+│   │       ├── help/       # captured `--help` output, verbatim (see its README)
+│   │       └── man/        # captured `man` output, verbatim (see its README)
 │   └── mesh-platform/      # libc constants/types that differ across platforms
 │       ├── Cargo.toml
 │       └── src/lib.rs      # e.g. TIOCSCTTY, typed for libc::ioctl per platform

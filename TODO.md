@@ -412,14 +412,14 @@ file as tasks land.
   - [ ] **This likely closes the `:kind` / `:where` question** in the predicate
         vocabulary: `type -t` *is* `:kind` and `type -P` *is* `:where`. What a
         modifier would still add is use in expression position without a capture,
-        which `whence(NAME)` returning a map already covers. Re-read that item
+        which `type(NAME)` returning a map already covers. Re-read that item
         once this lands.
 
-- [ ] **`whence(NAME)` as a value call**, returning the report as a map
+- [ ] **`type(NAME)` as a value call**, returning the report as a map
       (`[kind: external, path: /usr/bin/git, shadows: […]]`) rather than text, so
       a script can branch on the kind instead of matching prose — the shape
       nushell's `which` returns as a table. It retires the last `command -v`
-      idiom: `whence --quiet` answers "is it there", but not "where, and as
+      idiom: `type --quiet` answers "is it there", but not "where, and as
       what". Needs the map's key set settled (one entry per `Finding` kind, and
       whether a name in two namespaces yields a list) and builtins to reach
       value-call position, which today only `style` / `link` / `re` do.
@@ -1257,16 +1257,16 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       `is_builtin`, `is_function`, `is_command` and `path` — 41 guard sites in the
       `shrc` this is for, nearly all `if have_command X`.
 
-  - [ ] **First: does this need to exist at all, now that `whence` has shipped?**
+  - [ ] **First: does this need to exist at all, now that `type` has shipped?**
         Everything below is downstream of the answer, including both items marked
         "open and blocking".
 
-        `whence --quiet` already answers the 41 guard sites, and answers them as a
+        `type --quiet` already answers the 41 guard sites, and answers them as a
         *command condition*, which is mesh's natural form — no comparison, no
         quoting, no taxonomy:
 
         ```
-        if whence --quiet fzf { … }        # against  if have_command fzf
+        if type --quiet fzf { … }          # against  if have_command fzf
         if shpool:kind != false { … }      # what this item proposes
         ```
 
@@ -1277,13 +1277,13 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
         `SYNTAX` / `SYNTAX_WORDS` (`builtins.rs:473`).
 
         What a modifier would still add is **structured output in expression
-        position**: `$x:kind == builtin` branches on a value where `whence` writes
-        a report and sets a status. That gap is already tracked as `whence(NAME)`
+        position**: `$x:kind == builtin` branches on a value where `type` writes
+        a report and sets a status. That gap is already tracked as `type(NAME)`
         returning a map, which would close it without a new modifier.
 
         So the live question is whether `:kind` / `:where` earn a second surface
         over the name lookup, or whether this item should be closed as answered by
-        `whence` plus its value-call follow-up. Not decided.
+        `type` plus its value-call follow-up. Not decided.
 
   - [ ] Decide the plumbing first. `:kind` needs the function table from `Funcs`,
         but string interpolation resolves through `expand.rs`, which is handed
@@ -1456,9 +1456,9 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
         removing that interception is part of the option. Settle before
         implementing; it changes what the modifier means.
 
-        **`whence` has since answered this with a third option neither bullet
-        offered: report both.** `whence if` gives `if is syntax (shadowing
-        /usr/bin/if)` and `whence --all if` lists the two findings separately, so
+        **`type` has since answered this with a third option neither bullet
+        offered: report both.** `type if` gives `if is syntax (shadowing
+        /usr/bin/if)` and `type --all if` lists the two findings separately, so
         it never picks between "the word is syntax" and "a program exists". The
         either/or was an artifact of `:kind` returning a single value, not of the
         question. It also draws the contextual distinction this entry argued for:
@@ -1480,7 +1480,7 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
         decided on their own terms. Test whichever is chosen on all three rows,
         since the wrapper idiom makes `ls:where` the common case.
 
-        **`whence` answers this the same way — both at once.** `whence pwd` gives
+        **`type` answers this the same way — both at once.** `type pwd` gives
         `pwd is a builtin (shadowing /usr/bin/pwd)`: the kind and the path in one
         report, so "resolution or `PATH`" never arises. Its `PATH` scan follows
         `execvp` (skipping a candidate it cannot execute rather than stopping at
