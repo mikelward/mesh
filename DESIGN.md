@@ -1623,9 +1623,30 @@ x = if true { "pwd" }      # the string "pwd"
 "foo"                      # a string statement — nothing is run
 ```
 
-Two bare spellings escape, because neither can name a command: an **integer literal**
-and **`true`/`false`**. That is what keeps `func answer() { 42 }` the integer and
-`{ false }` the boolean, and it is a lexical fact about the word rather than a coercion.
+Three bare spellings escape and are **literals everywhere**, in statement position as
+much as in a block tail: an **integer literal** and **`true`** / **`false`**.
+
+```mesh
+func answer() { 42 }       # the integer
+func no() { false }        # the boolean — not /usr/bin/false's status
+if true { … }              # a literal condition; nothing is forked
+```
+
+For a numeral the reason is that it could never name a command. `true` and `false` are
+different — a program of each name exists on every system — so this is a genuine
+choice rather than a fact about the words. It was taken because `if true` and
+`while true` are written far more often than `true` is invoked for its exit status,
+and reading `true` as a boolean surprises nobody; the shell also stops forking
+`/usr/bin/true` to learn what it already knows. The program stays reachable by any
+spelling that is not a lone bare word — `./true`, `command -- true` — exactly as `./42`
+still runs a file called that.
+
+Getting here took two steps. The bare/quoted rule below settled the *block tail*, which
+left `true`/`false` split by position: `x = if true { false }` was the boolean while
+`func no() { false }` ran the program and resulted in `1`, because
+`parser::outranks_a_command` excused only integers and quoted words while the block-tail
+rule also excused booleans. Both are falsy, so no condition could tell them apart and
+the difference showed only in the *value*. The two carve-outs now match.
 
 What this replaced was a **single-bare-word block-tail coercion**: a one-word block was
 read as a scalar literal, so `{ pwd }` was the string `"pwd"` while `{ pwd . }` ran.
@@ -4577,7 +4598,6 @@ to avoid" rather than promising the latter as done.
   **gone** — settled independently by
   [Bare words and quoted values](#bare-words-and-quoted-values--decided), which did not
   need a value keyword to get there. The general assignment-RHS rule stays either way.)*
-
   *(**Spelling, if one is ever needed: `result`, not `yield`.** The two are not
   interchangeable names for one thing. `yield` means **generator** in every language a
   reader is likely to arrive from — Python, JavaScript, Ruby, C# — where it emits *many*
