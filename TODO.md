@@ -342,6 +342,32 @@ file as tasks land.
       shifts what follows. Names and places mix in one statement. `$env` and `$sh`
       are not places here either, so removing an environment entry still has no
       spelling.
+- [ ] **Exporting a function to a child mesh (`export -f`).** No spelling today.
+      The cases that already work need none: a `fork` block, a pipeline stage, and
+      a backgrounded function all inherit the func table as a memory copy, so the
+      gap is only a *new* mesh process — `mesh -c`, a `#!/usr/bin/env mesh`
+      script, `find -exec mesh -c`, `xargs mesh -c`, `sudo mesh`. Bash's answer is
+      `export -f name`, which puts the body in the environment as
+      `BASH_FUNC_name%%=() { … }` for every child bash to reparse. Weigh three
+      channels rather than copying that one. **(a) The environment**, bash's:
+      inherited by every process rather than just mesh, so a definition rides into
+      programs with no use for it; it spends the `ARG_MAX` budget argv shares; and
+      reparsing environment text at startup is where Shellshock lived — the bug
+      was the *parse*, not the export, but the parse existed only because the
+      environment was the channel. Taking it means the reader accepts a
+      **definition and nothing else**, never arbitrary source, the same discipline
+      the value channel's one-literal reader needs. **(b) A startup file**, which
+      needs no new mechanism at all: a func in `env.mesh` is already in every
+      mesh, so "export" may just be "put it where every mesh reads it" — paid for
+      by parsing it on every invocation, including the ones that never call it.
+      **(c) An explicit flag or fd** (`mesh --with f -c …`), where the definition
+      crosses only where asked and nothing inherits it silently. Two questions any
+      of them must answer: a func's source text becomes a **compatibility
+      surface** between mesh versions, which a fork never had since it shares the
+      binary; and a func closes over bindings that do not cross, which is exactly
+      why `:repr` refuses to write one and why a func cannot ride the value
+      channel either. No new dependency, so the cost is startup parse time and
+      environment size rather than build or binary size.
 
 ## Beyond M3 — Invocation
 
