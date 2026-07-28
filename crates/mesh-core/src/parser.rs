@@ -2334,15 +2334,19 @@ impl Parser {
         {
             return true;
         }
-        // A modifier chain that ends in a **parenthesized argument list** is a value,
-        // not a word: a command word stops in front of the `(`, so the arguments
-        // would otherwise arrive as a separate argument glued to it. Recognizing the
-        // whole chain here is what lets `puts $env:get(EDITOR, vim)` read in command
-        // position exactly as it does on the right of an `=`.
+        // An attached modifier chain is a value, not a word, so `puts $env:get(EDITOR,
+        // vim)` and `puts abc:upper` both read in command position exactly as they do
+        // on the right of an `=`. A command word stops in front of a `(`, so without
+        // this an argument list would arrive glued on as a separate argument.
+        //
+        // One `:name` is enough — a trailing `(` is *not* required. Requiring it split
+        // a chain by whether its last step happened to take arguments, so
+        // `puts abc:stripend("c")` was `ab` while `puts abc:upper` was the literal text
+        // `abc:upper`. Only a *literal* subject was ever affected: `$x:upper` carries
+        // its chain on the `VarRef` and expansion applies it (`expand.rs:863`).
         //
         // Asked of the tokens, like the attached-call check above, because the signal
-        // is the shape of the run rather than anything a parsed word records. A chain
-        // with no argument list (`puts $x:upper`) falls through and stays a word.
+        // is the shape of the run rather than anything a parsed word records.
         // A leading `...` is deliberately *not* skipped here: `CommandItem::Value`
         // has no spread variant, so routing `...$x:split(":")` through the
         // expression parser would build a `UnaryOp::Spread` nothing consumes and
@@ -2364,26 +2368,15 @@ impl Parser {
                     .zip(this.tokens.get(this.position + offset - 1))
                     .is_some_and(|(token, previous)| token.span.start == previous.span.end)
             };
-            let mut offset = 1;
-            while matches!(
-                self.tokens.get(self.position + offset).map(|t| &t.value),
+            if matches!(
+                self.tokens.get(self.position + 1).map(|t| &t.value),
                 Some(TokenKind::Colon)
-            ) && abuts(self, offset)
+            ) && abuts(self, 1)
+                && let Some(name) = self.word_text_at(2)
+                && modifier_name(name)
+                && abuts(self, 2)
             {
-                let Some(name) = self.word_text_at(offset + 1) else {
-                    break;
-                };
-                if !modifier_name(name) || !abuts(self, offset + 1) {
-                    break;
-                }
-                offset += 2;
-                if matches!(
-                    self.tokens.get(self.position + offset).map(|t| &t.value),
-                    Some(TokenKind::LParen)
-                ) && abuts(self, offset)
-                {
-                    return true;
-                }
+                return true;
             }
         }
         // An attached modifier-reference call — `:exists("Cargo.toml")` — the same
@@ -3207,7 +3200,18 @@ impl Parser {
             word.span.end = self.tokens[self.position - 1].span.end;
         }
         loop {
-            if self.eat(&TokenKind::LParen).is_some() {
+            // A `(` after a **modifier chain** has to abut it, so command position
+            // keeps `puts $x:upper (1)` a chain plus a separate `(1)` argument rather
+            // than calling the chain's result. Narrow to `Expr::Modifier` on purpose:
+            // a modifier yields a string, list or bool and is never callable, so
+            // nothing legal is refused, while `y = f (1)` keeps its spacing freedom.
+            if self.same(&TokenKind::LParen)
+                && (!matches!(value, Expr::Modifier { .. })
+                    || self
+                        .peek()
+                        .is_some_and(|token| token.span.start == self.previous_end()))
+            {
+                self.position += 1;
                 self.newlines();
                 value = Expr::Call {
                     callee: Box::new(value),
@@ -3237,7 +3241,18 @@ impl Parser {
             {
                 self.position += 1;
                 let name = self.name()?;
-                let arguments = if self.eat(&TokenKind::LParen).is_some() {
+                // The `(` has to **abut** the name, exactly as it must for an attached
+                // call and an index. Command position separates arguments by spacing,
+                // so `puts $x:upper (1)` is the chain plus a separate `(1)`; that used
+                // to be enforced only by `value_argument_starts` declining to claim an
+                // argument-free chain, which stopped being available once it claims
+                // them. Enforcing it here keeps the rule where the chain is read.
+                let arguments = if self.same(&TokenKind::LParen)
+                    && self
+                        .peek()
+                        .is_some_and(|token| token.span.start == self.previous_end())
+                {
+                    self.position += 1;
                     let mut arguments = self.arguments()?;
                     // The first argument of the replace family is a **regex match
                     // slot** (`DESIGN.md` §"String"), so a bare `/…/` there reads as

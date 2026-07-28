@@ -17991,6 +17991,51 @@ fn a_modifier_argument_list_must_abut_the_modifier_name() {
     );
 }
 
+/// An **argument-free** modifier applies to a literal subject in command-argument
+/// position, exactly as an argument-taking one already did. Requiring a trailing `(`
+/// split one chain by whether its last step happened to take arguments, so
+/// `puts abc:stripend("c")` was `ab` while `puts abc:upper` was the text `abc:upper`.
+/// A `$`-prefixed subject never had the split — expansion applies its chain — so
+/// only a literal one was affected.
+#[test]
+fn an_argument_free_modifier_applies_to_a_literal_in_command_position() {
+    let out = run_with_input(
+        "puts abc:upper\n\
+         puts \"abc\":upper\n\
+         puts abc:upper:lower\n\
+         puts \"a.b\":stem\n\
+         puts abc:stripend(\"c\")\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ABC\nABC\nabc\na\nab\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The spacing rule survives claiming the chain: a non-abutting `(` is still a
+    // separate argument, for a literal subject as much as an expanded one.
+    let out = run_with_input("puts abc:upper (1)\nx = hi\nputs $x:upper (1)\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ABC 1\nHI 1\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A *bare* dotted subject is a separate, preexisting limitation: the word ends at
+    // the `.`, so the chain is never seen. Unchanged here — it does not resolve with
+    // an argument list either, which is what shows this is not the split above.
+    let out = run_with_input("puts a.b:stem\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.b:stem\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A bare `:name` after a value is still literal text when it names no modifier,
 /// so recognizing an argument list cannot have changed `$host:$port`.
 #[test]
