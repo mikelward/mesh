@@ -330,26 +330,44 @@ settles as "truthy values are allowed", `if shpool:kind` becomes available and
 these read shorter. Until then the explicit form is the honest one, and it is now
 the only cost the spelling carries.
 
-**A bare subject takes a modifier** *(decided)*, so the guard is written
-`if shpool:kind != false` and the quoting this entry previously argued for is not
-needed. The rule is that an attached `:name` binds as a modifier wherever a value
-is read — expression and argument context alike — for bare and quoted subjects
-equally, and whether or not the modifier takes arguments.
+**A bare subject takes a modifier** *(decided; shipped)*, so the guard is written
+`if shpool:kind != false` and the quoting this entry argued for through its first
+twenty-two rounds is not needed. An attached `:name` binds as a modifier wherever a
+value is read — expression and argument context alike — for bare and quoted
+subjects equally, and whether or not the modifier takes arguments.
 
-That is a smaller change than it sounds, because **half of it already shipped**.
-`value_argument_starts` (`parser.rs:2319`) claims a modifier chain that ends in a
-`(`, and it never asked whether the subject was quoted:
+It was a smaller change than it sounded, because half of it had already shipped.
+`value_argument_starts` (`parser.rs:2319`) claimed a chain that ended in a `(` and
+never asked whether the subject was quoted, so the split was never
+bare-versus-quoted — it was argument-taking versus argument-free:
 
 ```
-puts "a.b":stripend(".b")   # a          — applied
-puts abc:stripend("c")      # ab         — applied, on a bare subject
-puts "abc":upper            # abc:upper  — literal text
-puts abc:upper              # abc:upper  — literal text
+puts "a.b":stripend(".b")   # a     — applied before and after
+puts abc:stripend("c")      # ab    — applied before and after, on a bare subject
+puts "abc":upper            # ABC   — was the text `abc:upper`
+puts abc:upper              # ABC   — was the text `abc:upper`
 ```
 
-So the split was never bare-versus-quoted; it was argument-taking versus
-argument-free, and a bare word already gives its colon up to a modifier call. The
-decision is to make the bottom two rows agree with the top two.
+A `$`-prefixed subject was never affected at all: it carries its chain on the
+`VarRef` and expansion applies it (`expand.rs:863`), so only a *literal* subject
+saw the split.
+
+**An attached `:identifier` outranks keyword parsing** *(shipped)*, which neither
+rule above implies and the parser did not do. The keyword arms in `primary` return
+before the postfix loop, so `if:upper`, `match:upper` and `for:upper` were syntax
+errors and `not:upper` was silently `false` — `not` took the negation and `:upper`
+folded away. In command position `if` and `unless` also lead a trailing guard, so
+`puts if:upper` parsed as a guarded `puts` and printed nothing. `while`, `loop`,
+`return`, `break`, `continue`, `global`, `unset`, `export`, `func`, `and` and
+`fork` always took the ordinary path, so it was a four-name carve-out.
+
+**A map literal's key is settled before the key is parsed** *(shipped)*. The key
+goes through `expression`, whose postfix loop claimed the colon first, so
+`[host:upper]` built the string `HOST` and `[host:upper, port:22]` was a hard
+"consistent map entries" error — silently, and only for values that happened to
+name a modifier. A bare identifier with an attached `:` is now a map key.
+Deliberately narrow: `["abc":upper]`, `[$x:upper]` and `[(host:upper)]` are all
+still chains, because none of them is a bare word.
 
 **`:` followed by an identifier is reserved by the grammar** *(decided; shipped)* —
 not gated on a list of known modifier names. An attached `:name` is a modifier
