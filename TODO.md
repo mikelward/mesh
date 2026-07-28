@@ -41,8 +41,8 @@ file as tasks land.
       status; quoted/escaped operators literal). `&`/`|` deferred to job
       control/pipes.
 - [x] `cd` builtin (basic): `$HOME` default, `cd -`, updates `$PWD`/`$OLDPWD`,
-      rejects surplus operands. Still deferred: `CDPATH`, `--physical`, autocd,
-      logical cwd.
+      rejects surplus operands. `CDPATH` search landed later — see
+      "Beyond M3 — Navigation". Still deferred: `--physical`, autocd, logical cwd.
 - [x] `pwd` and `puts` builtins
 - [x] Globs + `~` expansion (glob no-match → **empty**). `~user` and expansion
       suppression (quoting) still to come; non-UTF-8 lossy under String words.
@@ -1006,6 +1006,41 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       consumes what is typed at it, which is the foreground process group owning
       the terminal working correctly and is not this bug; a regression test for
       this has to use a command that leaves stdin alone.
+
+## Beyond M3 — Navigation
+
+- [x] **`CDPATH` search in `cd`** — *landed*. A plain relative operand is looked
+      for in each `$env.CDPATH` entry in order, first hit wins; a miss falls back
+      to the current directory, so setting it never breaks a plain `cd subdir`.
+      An empty entry is the current directory, and a hit through a **non-empty**
+      entry prints where it landed (POSIX, and the same rule `cd -` already
+      followed). `.`, `..`, `./x`, `../x`, and an absolute path never search — the
+      POSIX dot exemption — and neither does an empty operand, since `entry/""` is
+      the entry itself and would turn `cd ''` into a jump.
+
+      This closed a real inconsistency rather than adding a feature: `CDPATH` was
+      already one of mesh's **path-type** names (`environ.rs:21`), so it split on
+      `:`, took `+=`, round-tripped exactly, and was exported — everything except
+      being *read*. Setting it configured every shell except this one.
+- [ ] **Should `CDPATH` be exported at all?** Now that `cd` reads it, where it
+      lives is a real question. In bash it is a **shell** variable, not an
+      environment one, and deliberately: exported, it changes what `cd src` means
+      inside every script the shell starts, which is the classic footgun — a
+      script that means `./src` can land in a `CDPATH` entry. mesh has no
+      unexported-but-special namespace today: `$env.X` *is* the environment
+      (that is the point of the namespace split, `docs/REFERENCE.md`
+      §"The environment"), and an ordinary binding is invisible to `cd`. The
+      shapes:
+  - [ ] **Keep `$env.CDPATH`** — one place, inherits from a parent shell, passes
+        to children, interoperates with bash/zsh either way. Keeps the footgun.
+  - [ ] **Move it to `$sh`** (`$sh.cdpath`, or a settings entry) — not exported,
+        so a script's `cd` is never redirected by the parent's convenience. Costs
+        the inheritance, and forces `$sh.options` open to non-boolean values,
+        which is the nested/typed-settings TODO under "Beyond M3 — The
+        environment".
+  - [ ] **Read `$sh` first, `$env` as the fallback** — inherit when wanted,
+        override locally. Two sources for one answer, which is the shape mesh
+        avoids elsewhere.
 
 ## Beyond M3 — External tool integration
 

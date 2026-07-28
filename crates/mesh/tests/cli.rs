@@ -1344,6 +1344,124 @@ fn cd_rejects_surplus_operands() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("too many arguments"));
 }
 
+/// A canonical temp root holding `one/proj`, `two/proj`, `two/only`, and
+/// `here/mine` — enough to test search order, a miss, and the dot exemption.
+fn cdpath_tree(tag: &str) -> PathBuf {
+    let root = fresh_dir(tag)
+        .canonicalize()
+        .expect("canonicalize temp dir");
+    for path in ["one/proj", "two/proj", "two/only", "here/mine"] {
+        std::fs::create_dir_all(root.join(path)).expect("create tree");
+    }
+    root
+}
+
+#[test]
+fn cd_searches_cdpath_and_announces_where_it_landed() {
+    // `$env.CDPATH` was already a path-type list — splittable, appendable, and
+    // exported — while `cd` ignored it, so setting it configured every shell but
+    // this one. A hit through a non-empty entry prints, as POSIX asks, because
+    // the destination is not the one the operand appears to name.
+    let root = cdpath_tree("cdpath_search");
+    let out = run_with_input(&format!(
+        "cd {root}/here\n$env.CDPATH = [{root}/one, {root}/two]\ncd only\npwd\n",
+        root = root.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{root}/two/only\n{root}/two/only\n", root = root.display()),
+        "the announcement, then pwd"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cd_takes_the_first_cdpath_entry_that_holds_the_name() {
+    let root = cdpath_tree("cdpath_order");
+    let out = run_with_input(&format!(
+        "cd {root}/here\n$env.CDPATH = [{root}/two, {root}/one]\ncd proj\npwd\n",
+        root = root.display()
+    ));
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .ends_with(&format!("{root}/two/proj\n", root = root.display())),
+        "the earlier entry wins: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cd_falls_back_to_the_current_directory_and_stays_quiet() {
+    // A miss must not break a plain `cd subdir`, and the fallback is not a
+    // `CDPATH` hit, so it announces nothing.
+    let root = cdpath_tree("cdpath_miss");
+    let out = run_with_input(&format!(
+        "cd {root}/here\n$env.CDPATH = [{root}/one]\ncd mine\npwd\n",
+        root = root.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{root}/here/mine\n", root = root.display())
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_empty_cdpath_entry_is_the_current_directory_and_is_silent() {
+    // The way to say "prefer where I am": a leading empty entry, which is the
+    // current directory and therefore announces nothing.
+    let root = cdpath_tree("cdpath_empty_entry");
+    let out = run_with_input(&format!(
+        "cd {root}/here\n$env.CDPATH = ['', {root}/one]\nmkdir proj\ncd proj\npwd\n",
+        root = root.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{root}/here/proj\n", root = root.display())
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_dot_relative_cd_never_searches_cdpath() {
+    // The POSIX exemption: `.`, `..`, `./x` and `../x` resolve from where you
+    // are, so `cd ../` cannot land in a `CDPATH` entry.
+    let root = cdpath_tree("cdpath_dot_exempt");
+    let out = run_with_input(&format!(
+        "cd {root}/here\n$env.CDPATH = [{root}/two]\ncd ./only\npwd\n",
+        root = root.display()
+    ));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("./only"),
+        "the dot-relative form should not find two/only: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{root}/here\n", root = root.display())
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_empty_cd_operand_does_not_jump_to_a_cdpath_entry() {
+    // `entry/""` is the entry itself, so searching would turn `cd ""` into a
+    // jump to the first entry rather than the error it is.
+    let root = cdpath_tree("cdpath_empty_operand");
+    let out = run_with_input(&format!(
+        "cd {root}/here\n$env.CDPATH = [{root}/two]\ncd ''\npwd\n",
+        root = root.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{root}/here\n", root = root.display()),
+        "an empty operand must not move: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A temp directory with a `sub/` inside it, both canonical — a `cd` reports the
 /// physical path, so the expectations have to be physical too (the temp dir sits
 /// under a symlink on macOS).

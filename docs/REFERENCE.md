@@ -731,7 +731,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `style(text, fg: …, bg: …, bold: …)` | A [styled value](#styled-values) — text plus display attributes. A **value call**, parens attached, because a command position yields a status. Colors are the sixteen ANSI names: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `grey` (or `gray`, or `bright-black`), and `bright-` forms of the rest. |
 | `link(text, url)` | A [styled value](#styled-values) carrying an `OSC 8` hyperlink, so `text` is clickable. The url needs a **scheme** (`https://…`, `file://host/path`) and anything RFC 3986 forbids raw is percent-encoded, a space included; over 2083 encoded bytes is refused, since past a terminal's own limit the whole sequence — link text included — is dropped. |
 | `glob(pattern)` · `files(dir = ".")` · `dirs(dir = ".")` | The paths a pattern matches, and a directory's immediate files or subdirectories — a **list**, since these are [value calls](#the-glob-family) rather than commands. |
-| `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. Updates `$env.PWD` and `$env.OLDPWD`, and runs the [`precd` / `postcd` hooks](#custom-prompts-and-hooks) around the move. `CDPATH` and autocd are not implemented, so a bare directory name is a command, not a `cd`. |
+| `cd [dir]` | Change directory. No argument goes to `$env.HOME`; `cd -` returns to the previous directory and prints it. A plain relative name is searched in [`$env.CDPATH`](#cdpath). Updates `$env.PWD` and `$env.OLDPWD`, and runs the [`precd` / `postcd` hooks](#custom-prompts-and-hooks) around the move. Autocd is not implemented, so a bare directory name is a command, not a `cd`. |
 | `pwd` | Print the working directory. |
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
 | `notify [text …]` | Raise a desktop notification through the terminal with `OSC 9`. Arguments or stdin, like `clip`. A command that runs for more than ten seconds notifies on its own, with its outcome and duration — `$sh.options.command-notify = false` turns that off. Inside tmux the sequence is wrapped for passthrough, which tmux forwards only with `allow-passthrough` set. Support is uneven and unreportable — iTerm2, WezTerm, Ghostty, kitty and ConEmu raise these; xterm and Alacritty discard them; tmux needs `allow-passthrough` — so success means "asked". |
@@ -1642,6 +1642,36 @@ needs a spread or a join to reach an external command like any other list
 (`puts $env.PATH` prints one entry per line). Splitting is **exact** —
 every empty component is kept, since `PATH=/usr/bin:` means "…and the cwd", and a
 split/join round trip is byte-faithful.
+
+#### `CDPATH`
+
+`CDPATH` is a search path for [`cd`](#builtins) the way `PATH` is one for
+commands: a plain relative operand is looked for in each entry, in order, and the
+first entry that holds a directory of that name wins.
+
+```mesh
+$env.CDPATH = ['', ~/src, ~/work]
+cd mesh                        # ~/src/mesh, if that is where it lives
+/home/user/src/mesh
+```
+
+Four rules, all of them POSIX's:
+
+- **The first hit wins**, and entries are tried in the order written.
+- **A hit through a non-empty entry prints where it landed**, as above, because
+  the destination is not the one the operand appears to name. An **empty entry
+  is the current directory** — the leading `''` above — so a match there is
+  silent. That empty entry is how you say "prefer where I am"; without it, a
+  `CDPATH` entry that holds `sub` beats a `./sub` under your feet.
+- **A miss falls back to the current directory**, so setting `CDPATH` never
+  breaks a plain `cd subdir`.
+- **A dot-relative or absolute operand never searches.** `.`, `..`, `./x`,
+  `../x`, and `/x` resolve from where you are, so `cd ../` cannot jump to a
+  `CDPATH` entry. Neither does an empty operand: `cd ''` is an error, not a jump
+  to the first entry.
+
+`$env.CDPATH` is in the environment, so a child process inherits it — a mesh
+script, and a `bash` or `zsh` started from here, all search the same path.
 
 Only a plain `$env.KEY` is an assignment target *here* — any name you can read you
 can also assign, including a kebab name like `$env.MY-VAR`. `$env.PATH[0] = …` and
