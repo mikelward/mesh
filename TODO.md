@@ -1062,8 +1062,9 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
         calls the spelling (`${1}` vs `$1`) provisional.
 - [ ] **`:has(VALUE)`.** The parser knows the name; the engine does not.
 
-- [ ] **`postfix` consumes a *spaced* call suffix, so a following group is
-      stolen.** `y = $x:upper (1)` reports "modifier :upper does not take
+- [x] **`postfix` consumes a *spaced* call suffix, so a following group is
+      stolen** *(landed — narrowed to `Expr::Modifier`, so `f (1)` still calls
+      `f` and the language decision this was blocked on was not needed)*. `y = $x:upper (1)` reports "modifier :upper does not take
       arguments" and `puts $x:split (":") (1)` reports "value is not callable",
       because `postfix` eats a `(` whether or not it abuts. Pre-existing — both
       reproduce on `origin/main` — but argument-taking modifiers in command
@@ -1120,7 +1121,10 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       rule of its own — a listing whose entries are typed the way every other read
       types them is the point of it being an ordinary map.
 
-- [ ] **A modifier chain in `"…"` is dropped when punctuation abuts it.**
+- [x] **A modifier chain in `"…"` is dropped when punctuation abuts it**
+      *(landed — the name now stops at the first character that cannot be in one;
+      the command-word half was already fixed by the binding work, so
+      `puts $x:split` reports the missing separator)*.
       `puts "$x:upper"` renders `AB`, but `puts "[$x:upper]"` renders
       `[ab:upper]` — the closing bracket is scanned into the modifier name, the
       name then matches nothing, and the whole chain silently reverts to literal
@@ -1542,9 +1546,8 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
         pins it beside `:type`'s error, since the two siblings deliberately
         differ.
 
-- [ ] **Claim both: a modifier chain binds in expression *and* argument context,
-      argument-free or not, on bare and quoted subjects alike** *(decided —
-      `puts abc:upper` must print `ABC`)*. On `main` today the four cases split
+- [x] **Claim both: a modifier chain binds in expression *and* argument context,
+      argument-free or not, on bare and quoted subjects alike** *(landed)*. On `main` today the four cases split
       two ways, and the axis is not the one the old note assumed:
 
       ```
@@ -1879,7 +1882,13 @@ of each PR had landed by another route, but these pieces had not.
       length-prefixing so a grandchild holding the write end open cannot hang the
       read. Decide before `fork func`, since a value call on one is the case that
       needs it.
-- [ ] **Two modifier tables, one of them quietly stale.** `lexer::Modifier`
+- [ ] **Two modifier tables, one of them quietly stale.** *(Stale as written:
+      `lexer.rs` no longer exists, so `lexer::Modifier` is gone. The live pair is
+      now `parser::MODIFIER_NAMES` and `expand::Modifier`, and the reservation
+      change raised the stakes — `MODIFIER_NAMES` decides a **syntax error**, so a
+      name implemented but missing from it would be refused outright. Checked: no
+      implemented modifier is missing from it today. Re-scope or close.)*
+      `lexer::Modifier`
       (`lexer.rs:36`) and `expand::Modifier` (`expand.rs:27`) are separate enums
       with separate `from_name` tables, and the lexer's has not been extended
       since the initial path set: `Keys`, `Values`, `Int`, `Type`, `Exists`,
