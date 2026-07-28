@@ -49,10 +49,11 @@ a newly installed `rg` or `fd` completes its own flags with no completion script
 to install and nothing to source. The zsh user's `fpath` juggling has no mesh
 equivalent because it has no mesh problem.
 
-Classes 2 and 3 mostly work **today**. Class 4 waits on `$sh.complete`. Class 5
-is the big hole: mesh has no configurable keybindings and no way for code to
-read or replace the line being edited. Class 6 waits on a way to apply a
-computed set of environment changes.
+Classes 2 and 3 work **today** — the directory hooks class 3 was waiting on have
+landed. Class 4 waits on `$sh.complete`. Class 5 is the big hole: mesh has no
+configurable keybindings and no way for code to read or replace the line being
+edited. Class 6 has its hook now and waits on a way to apply a computed set of
+environment changes.
 
 ## The bootstrap problem
 
@@ -330,42 +331,30 @@ func zi() { cd $(zoxide query -i) }        # the fzf picker; full-screen handoff
 A no-match exits nonzero, so the capture aborts the statement and `cd` does not
 run — the right behavior, with zoxide's own message as the report.
 
-**The recording half is blocked, and there is no workaround.** zoxide learns by
-being told about every directory you visit. In bash and zsh it hooks `chpwd` or
-wraps `cd`. In mesh:
-
-- `precd` / `postcd` are designed and **not implemented**;
-- **a function cannot shadow a builtin**, so the zsh trick of wrapping `cd` is
-  unavailable *by design*:
-
-  ```
-  mesh$ func cd(dir) { zoxide add $dir }
-  mesh: func: `cd` is a reserved name and cannot be a function name
-  ```
-
-The closest thing today is a `preprompt` hook that watches `$env.PWD`:
+**The recording half works today too**, since `postcd` landed:
 
 ```mesh
-global last-pwd = ""
-func track-dir() {
-  if $env.PWD != $last-pwd {
-    global last-pwd = $env.PWD
-    zoxide add $env.PWD
-  }
-}
-prompt-hook zoxide track-dir
+func track-dir(previous) { zoxide add $env.PWD }
+prompt-hook postcd zoxide track-dir
 ```
 
-That is precisely the hand-rolled PWD-check `DESIGN.md` cites as the thing
-`postcd` exists to replace. It works, and it costs a string compare per prompt
-plus a process spawn per actual directory change (~2 ms, only on a real `cd`) —
-but it misses a `cd` inside a function that returns to where it started, and
-every tool in this class re-implements the same guard.
+That is the whole integration. The hook fires around **each actual move**, a
+`cd` inside a function included, so nothing is missed and nothing needs the
+`$env.PWD` guard every bash and zsh config hand-rolls.
 
-**`postcd` is the single highest-value missing hook in this document**: zoxide,
-direnv, autoenv, mise, a background `git fetch`, and per-project environment
-switching all want it, and unlike the keybinding gap it has no workaround for a
-tool that needs to *see* the `cd` rather than notice it later.
+It matters that this is a real hook rather than a `preprompt` check, because the
+zsh workaround is not available here: **a function cannot shadow a builtin**, so
+wrapping `cd` — what every directory-tracking tool does under zsh — is refused
+by design.
+
+```
+mesh$ func cd(dir) { zoxide add $dir }
+mesh: func: `cd` is a reserved name and cannot be a function name
+```
+
+The same hook is what direnv, autoenv, mise, and a background `git fetch` on
+arrival all want; the rest of what those need is in
+[the environment section](#direnv-mise-nvm--the-environment).
 
 ## direnv, mise, nvm — the environment
 
@@ -379,10 +368,11 @@ are shell functions rather than binaries and are the hardest of the set — pyen
 at least degrades to its `PATH` shims, which need no integration at all since
 `$env.PATH` is already a real list.
 
-**What is missing** — three things, all small, none of them present:
+**What is missing** — two things, both small:
 
-- **A hook that fires at the right time.** `preprompt` works and is what direnv
-  itself uses under bash; `precd` is better and does not exist.
+- ~~A hook that fires at the right time.~~ **Landed:** `precd` runs before the
+  move and `postcd` after it, around every actual `cd`. direnv hooks `PROMPT_COMMAND`
+  under bash because bash has nothing better; here it can hook the move itself.
 - **Writing `$env` under a computed key.** Only a literal `$env.KEY` is an
   assignment target today, so a loop over a diff cannot write it
   (`k = FOO; $env[$k] = bar` → `syntax error: expected a statement separator`).
@@ -393,8 +383,8 @@ at least degrades to its `PATH` shims, which need no integration at all since
 A plausible end state is an `env-apply` that takes a map and applies it as one
 transaction (set, and unset for a null), so the tool-facing contract is "print a
 map" and the failure mode is a diagnostic rather than a half-applied
-environment. That, plus `precd`, plus a JSON reader, covers direnv and mise
-completely.
+environment. That plus a JSON reader — the hook half is done — covers direnv and
+mise completely.
 
 ## Everything else, briefly
 
@@ -418,7 +408,7 @@ matching entry under "Beyond M3 — External tool integration" in
 
 | # | Missing | Unblocks | Status |
 | --- | --- | --- | --- |
-| 1 | **`precd` / `postcd` hooks** | zoxide, direnv, mise, autoenv, background fetch | Designed in `DESIGN.md`, unbuilt. No workaround: `func cd` is refused |
+| ~~1~~ | ~~**`precd` / `postcd` hooks**~~ | zoxide, direnv, mise, autoenv, background fetch | **Landed.** Around every actual `cd`, target resolved before `precd`, a handler's own `cd` does not re-dispatch |
 | 2 | **Keybindings from `rc.mesh`** | atuin, fzf, thefuck, any widget | Deferred in `DESIGN.md` (§Line editing) |
 | 3 | **A line-buffer API for widgets** | Same, and required *with* (2) — a binding that cannot touch the buffer is useless to fzf | Not designed. Needs: read buffer and cursor, replace, insert at cursor, accept-line, redraw after a full-screen program |
 | 4 | **`$sh.complete`, extended** | carapace, fzf-tab, dynamic completers | Map is a known TODO; the fallback key, the callable contract, and candidate descriptions are not specified |
@@ -443,8 +433,8 @@ because it looks supported and is not.
 
 The order that works:
 
-1. Build the hooks (1) and the buffer/keybinding surface (2, 3) — the tools that
-   need them cannot be integrated any other way.
+1. Build the hooks (1 — **done**) and the buffer/keybinding surface (2, 3) — the
+   tools that need them cannot be integrated any other way.
 2. Decide (8), then specify (12): what an `init mesh` output may contain, and
    which integrations are data rather than code.
 3. Ship the data path (5, 6) so direnv, mise, and carapace need no upstream

@@ -1344,6 +1344,141 @@ fn cd_rejects_surplus_operands() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("too many arguments"));
 }
 
+/// A temp directory with a `sub/` inside it, both canonical — a `cd` reports the
+/// physical path, so the expectations have to be physical too (the temp dir sits
+/// under a symlink on macOS).
+fn cd_hook_dirs(tag: &str) -> (PathBuf, PathBuf) {
+    let root = fresh_dir(tag)
+        .canonicalize()
+        .expect("canonicalize temp dir");
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).expect("create sub");
+    (root, sub)
+}
+
+#[test]
+fn cd_hooks_run_on_each_side_of_the_move() {
+    // `precd` is still in the old directory and is told where it is going;
+    // `postcd` is in the new one and is told where it came from.
+    let (root, sub) = cd_hook_dirs("cd_hooks_sides");
+    let out = run_with_input(&format!(
+        "func leaving(to) {{ puts \"leaving $(pwd) for $to\" }}\n\
+         func arrived(from) {{ puts \"arrived $(pwd) from $from\" }}\n\
+         prompt-hook precd trace leaving\n\
+         prompt-hook postcd trace arrived\n\
+         cd {}\n\
+         cd sub\n",
+        root.display()
+    ));
+    let seen = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        seen.contains(&format!(
+            "leaving {} for {}\n",
+            root.display(),
+            sub.display()
+        )),
+        "precd should run in the old directory with the target: {seen}"
+    );
+    assert!(
+        seen.contains(&format!(
+            "arrived {} from {}\n",
+            sub.display(),
+            root.display()
+        )),
+        "postcd should run in the new directory with the previous one: {seen}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cd_hooks_fire_per_move_inside_a_function() {
+    // Per move, not per function call: deferring to return would run `precd`
+    // somewhere other than the directory it promises to run in.
+    let (root, sub) = cd_hook_dirs("cd_hooks_function");
+    let out = run_with_input(&format!(
+        "func note(to) {{ puts \"-> $to\" }}\n\
+         prompt-hook precd n note\n\
+         func visit() {{ cd {}\n cd sub }}\n\
+         visit\n\
+         pwd\n",
+        root.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "-> {}\n-> {}\n{}\n",
+            root.display(),
+            sub.display(),
+            sub.display()
+        )
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_cd_inside_a_hook_does_not_dispatch_the_hooks_again() {
+    // A handler may `cd` — but re-dispatching would recurse until the stack ran
+    // out, so its own move is silent: one hook line, not two.
+    let (root, sub) = cd_hook_dirs("cd_hooks_reentrant");
+    let other = root.join("other");
+    std::fs::create_dir_all(&other).expect("create other");
+    let out = run_with_input(&format!(
+        "cd {root}\n\
+         func arrived(from) {{ puts \"hook $from\"\n cd {other} }}\n\
+         prompt-hook postcd a arrived\n\
+         cd sub\n\
+         pwd\n",
+        root = root.display(),
+        other = other.display(),
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("hook {}\n{}\n", root.display(), other.display()),
+        "the handler's own cd must not re-enter the hooks"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = sub;
+}
+
+#[test]
+fn a_failed_cd_runs_neither_hook() {
+    let out = run_with_input(
+        "func p(to) { puts \"precd $to\" }\n\
+         func q(from) { puts \"postcd $from\" }\n\
+         prompt-hook precd p p\n\
+         prompt-hook postcd q q\n\
+         cd /nonexistent-mesh-test-directory\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nonexistent-mesh-test-directory"),
+        "the failure is still reported"
+    );
+}
+
+#[test]
+fn a_precd_hook_that_wanders_cannot_redirect_the_move() {
+    // The target is resolved to an absolute path *before* `precd` runs, so a
+    // handler that changes directory itself cannot make a relative outer `cd`
+    // land somewhere else — and `$env.OLDPWD` still names where the move began,
+    // so `cd -` comes back to the right place.
+    let (root, sub) = cd_hook_dirs("cd_hooks_wander");
+    let out = run_with_input(&format!(
+        "cd {}\n\
+         func wander(to) {{ cd sub }}\n\
+         prompt-hook precd w wander\n\
+         cd sub\n\
+         pwd\n\
+         puts $env.OLDPWD\n",
+        root.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n{}\n", sub.display(), root.display())
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn glob_expands_and_sorts_matches() {
     let dir = fresh_dir("glob_match");
