@@ -18071,6 +18071,46 @@ fn a_map_literal_value_is_not_read_as_a_modifier_on_the_key() {
     );
 }
 
+/// A **compact** map literal is a map, whatever its value word names. The key is
+/// otherwise parsed by `expression`, whose postfix loop claims the colon first, so
+/// `[host:upper]` built the string `HOST` and `[host:upper, port:22]` was a hard
+/// "consistent map entries" error — silently, and only for the values that happened
+/// to name a modifier.
+#[test]
+fn a_compact_map_literal_is_a_map_whatever_the_value_names() {
+    let out = run_with_input(
+        "a = [host:upper]\n\
+         b = [host:upper, port:22]\n\
+         c = [host:build1]\n\
+         d = [a:1, b:2]\n\
+         puts $a\nputs $b\nputs $c\nputs $d\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "host: upper\nhost: upper\nport: 22\nhost: build1\na: 1\nb: 2\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Only a **bare** word is claimed as a key, so every spelling that means a chain
+    // inside a list still is one.
+    let out = run_with_input(
+        "x = abc\n\
+         e = [\"abc\":upper]\n\
+         f = [$x:upper]\n\
+         g = [(host:upper)]\n\
+         puts $e\nputs $f\nputs $g\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ABC\nABC\nHOST\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// An attached `:modifier` outranks keyword parsing. A keyword is claimed only as a
 /// *bare* word, so `if:upper` is a chain on the text `if`. The keyword arms return
 /// before the postfix loop, so without the guard `if` / `match` / `for` were syntax

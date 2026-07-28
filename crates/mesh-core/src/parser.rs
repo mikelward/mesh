@@ -3692,7 +3692,24 @@ impl Parser {
         let mut is_map = false;
         loop {
             let spread = self.eat(&TokenKind::Spread).is_some();
-            let key = self.expression()?;
+            // A bare identifier with an attached `:` is a **map key**, settled before
+            // descending. The key is otherwise parsed by `expression`, whose postfix
+            // loop claims the colon first, so `[host:upper]` built the string `HOST`
+            // and `[host:upper, port:22]` was a hard "consistent map entries" error —
+            // silently, and only for values that happened to name a modifier.
+            //
+            // Nothing that really wants a chain here is a bare word, so every spelling
+            // that means one is untouched: `["abc":upper]`, `[$x:upper]`,
+            // `[(host:upper)]`.
+            let key = if !spread && self.bare_map_key() {
+                let token = self.next().expect("`bare_map_key` peeked one");
+                let TokenKind::Word(word) = token.value else {
+                    unreachable!("`bare_map_key` checked the token kind")
+                };
+                self.word_run(word.pieces, token.span)
+            } else {
+                self.expression()?
+            };
             if spread {
                 if is_map {
                     pairs.push(MapItem::Spread(key));
@@ -4371,6 +4388,22 @@ impl Parser {
 
     fn word(&self, expected: &str) -> bool {
         matches!(self.peek().map(|t| &t.value), Some(TokenKind::Word(word)) if word.is_bare_text(expected))
+    }
+    /// Is the cursor on a bare identifier with an **attached** `:` — a map key?
+    ///
+    /// Narrow on purpose: only a bare word qualifies, so a quoted, expanded or
+    /// parenthesized subject keeps its modifier chain inside a `[…]` literal. The
+    /// colon must abut the name, which is the same signal a chain uses, so
+    /// `[host : x]` is unaffected either way — it was already a pair.
+    fn bare_map_key(&self) -> bool {
+        self.word_text_at(0).is_some()
+            && self
+                .tokens
+                .get(self.position + 1)
+                .zip(self.peek())
+                .is_some_and(|(colon, word)| {
+                    matches!(colon.value, TokenKind::Colon) && colon.span.start == word.span.end
+                })
     }
     /// Does the word at the cursor carry an **attached** `:modifier`?
     ///
