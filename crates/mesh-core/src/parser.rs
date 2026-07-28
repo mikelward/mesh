@@ -1657,9 +1657,20 @@ pub(crate) fn variable_access_prefix(text: &str) -> usize {
             }
             consumed += close;
         } else if let Some(value) = rest.strip_prefix(':') {
+            // Stop at the first character that cannot be *in* a modifier name, then
+            // ask whether the name read is one — rather than scanning to a fixed list
+            // of delimiters. Every modifier name is alphanumeric, so anything else
+            // ends it. A delimiter list silently loses the whole chain to whatever it
+            // forgets: `]`, `)` and `,` were all absent, so `"[$x:upper]"` scanned
+            // `upper]`, matched no modifier, and reverted to the literal text
+            // `[ab:upper]` with no error — while `"$x:upper."` worked, because `.`
+            // happened to be listed.
             let length = value
-                .find(['.', '[', ':', '!', '/', ' '])
-                .unwrap_or(value.len());
+                .char_indices()
+                .take_while(|(_, ch)| ch.is_alphanumeric())
+                .map(|(offset, ch)| offset + ch.len_utf8())
+                .last()
+                .unwrap_or(0);
             if length == 0 || !modifier_name(&value[..length]) {
                 break;
             }

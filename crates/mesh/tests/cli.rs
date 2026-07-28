@@ -18134,6 +18134,41 @@ fn only_a_bare_identifier_after_the_colon_is_reserved() {
     );
 }
 
+/// A modifier chain in `"…"` survives punctuation abutting it. The name was scanned
+/// to a fixed list of delimiters (`. [ : ! /` and space), so anything absent from
+/// that list was read *into* the name, matched no modifier, and reverted the whole
+/// chain to literal text with no error — `"[$x:upper]"` rendered `[ab:upper]` while
+/// `"$x:upper."` worked, purely because `.` happened to be listed.
+#[test]
+fn a_modifier_chain_survives_punctuation_after_it() {
+    let out = run_with_input(
+        "x = ab\n\
+         puts \"[$x:upper]\"\n\
+         puts \"($x:upper)\"\n\
+         puts \"$x:upper,\"\n\
+         puts \"$x:upper]\"\n\
+         puts \"$x:upper}\"\n\
+         puts \"$x:upper.\"\n\
+         puts \"$x:upper:lower\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[AB]\n(AB)\nAB,\nAB]\nAB}\nAB.\nab\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A name that is not a modifier still ends the chain and stays text, and a name
+    // run together with following letters is not a modifier at all.
+    let out = run_with_input("x = ab\nputs \"$x:nosuch\"\nputs \"a$x:upperb\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ab:nosuch\naab:upperb\n"
+    );
+}
+
 /// A **compact** map literal is a map, whatever its value word names. The key is
 /// otherwise parsed by `expression`, whose postfix loop claims the colon first, so
 /// `[host:upper]` built the string `HOST` and `[host:upper, port:22]` was a hard
