@@ -1033,6 +1033,159 @@ with its switch: add an `Opt` variant in `options.rs` and read it through
       the terminal working correctly and is not this bug; a regression test for
       this has to use a command that leaves stdin alone.
 
+## Beyond M3 — The prompt
+
+The layout half is designed (`DESIGN.md` §"Hooks and the prompt") and unbuilt.
+What is *not* designed is everything that makes a prompt worth arranging — where
+its facts come from and what they cost. The reasoning is written up in
+[`docs/PROMPT.md`](docs/PROMPT.md) §"What it takes to not need starship"; this is
+the checkable list.
+
+- [ ] **The `$sh.prompt` segment map**, with `rule`, `newline`, and the inline
+      `fill`. Designed in full; nothing of it is built, so a prompt is one string
+      today. Everything below assumes it.
+  - [ ] **`prompt TEXT` writes one entry, not the map.** Decide it now rather
+        than at implementation time, because the wrong answer is a footgun: if
+        `prompt` replaced the map, the *beginner* command would silently destroy
+        the *advanced* config. It should be sugar for `$sh.prompt.char = TEXT`,
+        `prompt --reset` for `unset $sh.prompt.char`, and bare `prompt` prints
+        what `prompt TEXT` sets — the char — leaving `prompt --show` to render
+        the whole map. This is what the builtin already does rather than a new
+        rule: it feeds `render_prompt_indicator` while every line above comes
+        from `preprompt` hooks, which `docs/REFERENCE.md` already spells out as
+        "controls only the input indicator". Writing one key also keeps one
+        meaning per key — `$sh.prompt.char = func() { … }` and `prompt "$ "` are
+        the same slot, last write wins, with no second mechanism to reason about.
+        The continuation prompt derives from `char` as it derives from the custom
+        text today.
+  - [ ] **Evaluate and snapshot the map before `read_line`** — an explicit
+        requirement, not something the map gives you. reedline calls a `Prompt`'s
+        render methods on **every repaint**: each edit, each menu movement, a
+        resize, the submission itself. Evaluating segments inside those methods —
+        the tempting design, since rendering is what they are for — would re-run
+        `git` and `ssh-add` on every keystroke, which is worse than the
+        double-running it was meant to fix. Today's code already has the right
+        shape: `MeshPrompt` carries a `custom: Option<String>` cloned from
+        `shell.prompt.text` before `editor.read_line` (`repl.rs:8655`), and
+        `render_prompt_indicator` only borrows it. The async repaint needs the
+        same boundary from the other side — a segment landing means *replacing
+        the snapshot* and redrawing, which is only coherent because one exists.
+- [ ] **A fact map, starting with `$sh.vcs`.** The prompt design claims "you read
+      real values, not scraped text", and that is true of `$sh.status` and
+      `$sh.jobs` and false of everything else: `docs/PROMPT.md`'s own example
+      forks `git` twice per prompt and then parses the text. `branch`, `dirty`,
+      `ahead`, `behind`, `stash`, `state` as a map is what ends that, and it is
+      the piece segments get written against — so the **shape** matters more than
+      the source, which can change underneath it.
+  - [ ] Decide the source on measurement, not taste. `git` (2–4 forks, no new
+        dependency), a helper binary (one fork, and this author's config already
+        uses `vcs prompt-info`, plus hg/jj through one interface), or in-process
+        `gix`/`git2` (no fork, fastest, but dozens of crates, tens of seconds of
+        clean build, megabytes of binary, and mesh then owns worktrees,
+        submodules, and sparse checkouts). Leaning: helper or `git` behind the
+        cached map, native only if measurement demands it.
+  - [ ] **Cache it per directory**, invalidated by `postcd` (which now exists)
+        and after a command that could have touched the repository. A prompt in a
+        directory you have not left should do no work. Those two are **not
+        sufficient**: `git fetch &` returns to the prompt before it updates a ref,
+        and a rebase in another terminal never touches this shell at all, so the
+        cache would sit on stale `ahead`/`behind` indefinitely. Two more
+        triggers, and the first is **not** free today:
+    - [ ] **`jobdone`**, once it fires at completion. The hook exists but runs
+          from the `reap` at the top of the REPL loop, before `read_line`, so a
+          fetch finishing while you sit at the prompt is not noticed until the
+          next line is submitted — the same timing the `[N] Done` notice has, as
+          "Notify about a finished job when it finishes" above records. Fixing
+          that means waking the editor on a child's state change, which is the
+          **same wake** the async repaint needs: one mechanism, three features.
+    - [ ] **Metadata**, but only for the fields it can answer for — **the map
+          does not share one invalidation story**, and splitting it by class is
+          the design decision here:
+      - [ ] **Ref-derived** (`branch`, `ahead`, `behind`, `state`, `stash`)
+            change only when something under `.git/` does, so stat'ing
+            `.git/HEAD`, the index, and the refs is exact and cheap. This is what
+            covers a rebase in *another* terminal, which fires nothing in this
+            shell at all.
+      - [ ] **Worktree-derived** (`dirty`) has **no cheap trigger**. An editor
+            writing a tracked file changes that file's mtime and nothing under
+            `.git/`; creating an untracked file changes a directory's mtime and
+            nothing under `.git/`. So metadata says "still valid" while `dirty` is
+            wrong. Watching the worktree means a recursive filesystem watcher over
+            a tree of unknown size — inotify watch limits, network filesystems,
+            and a whole class of failure a prompt should not own — so the
+            realistic answer is an **unconditional TTL** for this field, with an
+            explicit refresh for anyone who wants certainty.
+      - [ ] Note the two properties point the same way: `dirty` is also the
+            **most expensive** fact (a full worktree scan, where the others are
+            a couple of ref reads). The field that cannot be invalidated cheaply
+            is the field that most wants to arrive late — which makes it the
+            first candidate for an async segment rather than an argument against
+            caching the rest.
+  - [ ] **Every fact source needs a timeout**, the bet the completion probe
+        already makes: a `git` call on a dead mount should cost a missing segment,
+        not a hung terminal.
+- [ ] **Async segments, via a prompt repaint.** Draw immediately from what is
+      in-process (status, jobs, cwd — free) and repaint the slow segments when
+      they land. This is the one thing an external prompt structurally cannot do:
+      starship is handed a moment, prints, and exits; mesh owns the editor and can
+      revise. It is also the honest answer to "starship's information without
+      starship's latency".
+  - [ ] **Not `external_printer`.** That prints a *line above* the prompt, which
+        is right for the background-job notice and wrong here: in the locked
+        0.49.0 the repaint is gated on having a message to print
+        (`if !messages.is_empty()` → `print_external_message` → `repaint`), and an
+        empty message is discarded without repainting (`"".lines()` yields no
+        items). Every resolved segment would either leave a stray scrollback line
+        or not repaint. A prompt needs a **silent wake-and-redraw**.
+  - [ ] **The shape already exists upstream, ungeneralized.** reedline's
+        `repaint` is private, but `engine.rs` does exactly this for background
+        completions — `if completer_pending && self.completer.check_pending() { …
+        self.repaint(prompt) }` — an async producer finishing, noticed on the
+        poll, redrawn with nothing printed. The ask, upstream or in a fork, is
+        narrow: let something other than the completer say "I have new material,
+        redraw."
+  - [ ] **The polling cost recorded under "Beyond M3 — Terminal integration"
+        stands** — reedline's two async paths are not treated alike, and only one
+        of them is scoped. `needs_polling` is recomputed each iteration, and the
+        completer's contribution is conditional (`result |= completer_pending`),
+        so that path polls only while a completion is outstanding. The printer's
+        is unconditional — `if self.external_printer.is_some() { result = true }`
+        — so a printer attached for the life of the editor polls for the life of
+        the editor, exactly as that entry warns. What the completer shows is that
+        reedline is willing to scope polling where the producer says so; the
+        attach/detach shape remains **mesh's to implement**, with the completer as
+        the precedent rather than an existing implementation.
+  - [ ] Two rules that are not obvious: a repaint must never move the cursor or
+        eat a keystroke (it rewrites the prompt region, not the buffer), and a
+        segment that resolves *after* the command was submitted is discarded — it
+        is answering about a prompt that is now scrollback.
+- [ ] **A default prompt map that is the dashboard.** starship's headline is that
+      it looks good with an empty config; mesh's default is `mesh$ `, so every
+      good thing in the design is available only to someone who already sat down
+      and wrote a config. The default should be the *same map a user writes*,
+      pre-populated and printable (`prompt --show`), so "replace one segment" is
+      the first thing learned rather than "throw it away and start over".
+- [ ] **The transient prompt** — the collapse-to-one-line rewrite of the previous
+      prompt, named in the carried-over requirements. **Independent of the async
+      repaint work**, and the cheapest item here: reedline already implements it.
+      `Reedline::with_transient_prompt` takes a second `Prompt` and `submit_buffer`
+      repaints with it the moment a line is accepted (`engine.rs:605`, `:2340`),
+      so there is no async producer and nothing to wake for — submission is
+      already an event the editor handles. What it needs from mesh is a second
+      prompt to hand over, which the segment map makes natural: the transient form
+      is a map too, usually a shorter one. Sequence it any time after the map.
+- [ ] **Display width in the segment renderer** — reusing what is already there,
+      not adding it. `unicode-width` is already a dependency
+      (`crates/mesh-core/Cargo.toml:24`) and already measures the prompt:
+      `escape_stripped_width` (`repl.rs:9710`) strips escapes and runs the rest
+      through the width table, with a CJK regression test asserting `日本> ` is
+      six columns (`repl.rs:11861`). What is open is the segment-level use —
+      `fill` splitting slack across pieces, and a `rule` that reaches the margin,
+      both need a per-piece width rather than one for the finished line — and the
+      policy question the table cannot answer: a nerd-font glyph or an emoji ZWJ
+      sequence whose width the *terminal* disagrees about, where being right by
+      the standard still leaves the cursor in the wrong column.
+
 ## Beyond M3 — Navigation
 
 - [x] **`CDPATH` search in `cd`** — *landed*. A plain relative operand is looked
