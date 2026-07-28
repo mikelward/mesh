@@ -876,7 +876,7 @@ fn join_reader(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
 mod tests {
     use super::{
         CompletionCache, CompletionSpec, ValueHint, cache_name, command_help, pages_in,
-        rank_candidates,
+        rank_candidates, resolve_command,
     };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1432,7 +1432,14 @@ mod tests {
             );
             let words = vec![command.to_string_lossy().into_owned()];
             CompletionCache::new(Some(cache_dir.clone())).spec_for(&words);
-            let entry = cache_dir.join(cache_name(&command, &[]));
+            // Name the entry the way `spec_for` does — through `resolve_command`,
+            // which canonicalizes. Hashing the raw path instead corrupts a file
+            // nothing reads whenever the temporary directory is reached through a
+            // symlink (macOS `/var` → `/private/var`), and the second probe then
+            // reads its own valid cache rather than re-probing.
+            let resolved = resolve_command(&command.to_string_lossy())
+                .expect("helper must resolve the way spec_for resolves it");
+            let entry = cache_dir.join(cache_name(&resolved, &[]));
             fs::write(entry, "not a completion cache").unwrap();
 
             let spec = CompletionCache::new(Some(cache_dir)).spec_for(&words);
