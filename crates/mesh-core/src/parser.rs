@@ -3244,6 +3244,20 @@ impl Parser {
                 };
             } else if self.same(&TokenKind::Colon)
                 && self.word_text_at(1).is_some_and(modifier_name)
+                // Both halves have to **abut**, which is what keeps a map literal's
+                // `key: value` out of the chain: `[host: upper]` is a map, not the
+                // string `HOST`. Without it any map whose value word happened to name
+                // a modifier was silently read as a chain on the key — `[host: len]`
+                // gave `4`, `[host: keys]` an error — and the wrongness scaled with
+                // the vocabulary rather than being one reserved word.
+                && self
+                    .peek()
+                    .is_some_and(|colon| colon.span.start == self.previous_end())
+                && self
+                    .tokens
+                    .get(self.position + 1)
+                    .zip(self.peek())
+                    .is_some_and(|(name, colon)| name.span.start == colon.span.end)
             {
                 self.position += 1;
                 let name = self.name()?;
