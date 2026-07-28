@@ -54,9 +54,9 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 /// A state change the kernel reported for one child, and where it sits in the
 /// order they arrived.
@@ -101,7 +101,58 @@ struct Reaper {
 
 fn reaper() -> &'static Mutex<Reaper> {
     static REAPER: OnceLock<Mutex<Reaper>> = OnceLock::new();
-    REAPER.get_or_init(Mutex::default)
+    REAPER.get_or_init(|| {
+        guard_the_store_across_forks();
+        Mutex::default()
+    })
+}
+
+/// The store, held from before a `fork` until after it, so that no child ever
+/// inherits it locked.
+///
+/// `fork` copies the lock but not the thread holding it. A child that inherits a
+/// held store waits on a thread that does not exist in it, forever — and the
+/// first thing a forked child does is [`forget_all`]. The parent's blocking
+/// `waitpid` then never returns either, which is how one stranded child hangs a
+/// whole test run.
+///
+/// Taking the lock in the `prepare` handler makes the fork wait for whoever
+/// holds it, so the copy the child gets is always free. Both sides then release
+/// it: the handlers run on the thread that called `fork`, which is the thread
+/// that took it, so the guard is dropped by its own owner in each process.
+static HELD_ACROSS_FORK: AtomicPtr<MutexGuard<'static, Reaper>> =
+    AtomicPtr::new(std::ptr::null_mut());
+
+extern "C" fn take_store_for_fork() {
+    // A poisoned store still has to be held across the fork; the panic that
+    // poisoned it says nothing about whether a child may inherit the lock.
+    let guard = reaper().lock().unwrap_or_else(|held| held.into_inner());
+    HELD_ACROSS_FORK.store(Box::into_raw(Box::new(guard)), Ordering::SeqCst);
+}
+
+extern "C" fn release_store_after_fork() {
+    let held = HELD_ACROSS_FORK.swap(std::ptr::null_mut(), Ordering::SeqCst);
+    if !held.is_null() {
+        // SAFETY: the pointer came from `Box::into_raw` in the `prepare` handler
+        // and is taken exactly once — the swap leaves null behind, so the parent
+        // and the child each free their own copy.
+        drop(unsafe { Box::from_raw(held) });
+    }
+}
+
+/// Registered from the store's initializer rather than from [`install`], since a
+/// test forks without ever installing the handler and needs the same protection.
+fn guard_the_store_across_forks() {
+    // SAFETY: the three handlers are `extern "C" fn()` with no arguments, and
+    // none of them can re-enter this function: `reaper()` is mid-initialization
+    // here, and the handlers only run on a later `fork`.
+    unsafe {
+        libc::pthread_atfork(
+            Some(take_store_for_fork),
+            Some(release_store_after_fork),
+            Some(release_store_after_fork),
+        );
+    }
 }
 
 /// The thread whose `waitpid` a `SIGCHLD` should cut short, as a `pthread_t`.
@@ -413,4 +464,78 @@ pub(crate) fn is_owned(pid: libc::pid_t) -> bool {
         .lock()
         .map(|reaper| reaper.owned.contains(&pid))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// A child forked while another thread holds the store must still be able to
+    /// reach it.
+    ///
+    /// The test harness runs tests on parallel threads, so a test that forks
+    /// does it from a process where another thread may be inside `reaper()`.
+    /// `fork` carries over the lock but not the thread holding it, so the
+    /// child's copy is held by nobody and `forget_all` — the first thing a
+    /// forked child calls — waits on it forever. The parent's blocking `waitpid`
+    /// then never returns, which is the whole-suite hang in `TODO.md`.
+    #[test]
+    fn a_child_forked_while_the_store_is_held_can_still_reach_it() {
+        let (locked, held) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let guard = reaper().lock().expect("hold the store");
+            locked.send(()).expect("announce the lock");
+            // Long enough for the fork below to be underway while the store is
+            // still held — the window being tested. The holder releases on its
+            // own timeline, the way real code does; waiting for the fork instead
+            // would deadlock against a `prepare` handler that waits for the
+            // store, which is a cycle no caller of `fork` actually forms.
+            thread::sleep(Duration::from_millis(500));
+            drop(guard);
+        });
+        held.recv().expect("the store is held");
+
+        // SAFETY: `fork` takes no arguments. The child only calls `forget_all`
+        // and leaves through `_exit`, so it never unwinds into the harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            forget_all();
+            // SAFETY: leaving without running the parent's destructors is the
+            // point; this child owns none of them.
+            unsafe { libc::_exit(0) };
+        }
+        holder.join().expect("the holder thread");
+
+        // Without the `prepare` handler the fork goes through while the store is
+        // held, and the child's own copy stays held by nobody: it never comes
+        // back from `forget_all`. The deadline is what tells that hang from a
+        // slow start — it is not a retry papering one over.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut status = 0;
+        let mut reaped = 0;
+        while Instant::now() < deadline {
+            // SAFETY: scalar arguments and a stack slot for the status.
+            reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if reaped != 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if reaped == 0 {
+            // SAFETY: scalar arguments; the pid is this process's own child.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                let mut discard = 0;
+                libc::waitpid(pid, &mut discard, 0);
+            }
+            panic!("the child never came back from a store it inherited locked");
+        }
+        assert_eq!(reaped, pid);
+        assert!(libc::WIFEXITED(status), "the child died rather than exited");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
 }

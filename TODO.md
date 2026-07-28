@@ -556,26 +556,38 @@ file as tasks land.
       exactly as long as there is something to report. The last is closest to
       free at the prompt and the most machinery, and needs the editor's history
       and session state to survive a rebuild.
-- [ ] **A `mesh-core` unit test occasionally hangs the whole suite.** Seen three
+- [x] **A `mesh-core` unit test occasionally hangs the whole suite.** Seen three
       times in roughly a dozen `cargo test --workspace` runs, always after the
       CLI tests have passed, and in a *different* test each time —
       `exec::tests::spawn_failure_reclaims_the_terminal` once,
       `repl::tests::named_prompt_hooks_replace_in_place_and_run_before_the_prompt`
       another — each reported as "has been running for over 60 seconds" and never
-      finishing. Not cargo and not a leaked pipe: the CLI test binary itself
-      exits promptly (~26s over five direct runs), and no `Blocking waiting for
-      file lock` appears in any log.
+      finishing.
 
-      The suspected mechanism is the classic one for these tests: they `fork()`
-      from the multi-threaded test harness, and a child that touches a lock some
-      other thread held at fork time (the allocator's, or the reaper's) blocks
-      forever — after which the parent's blocking `waitpid` never returns, which
-      is exactly the shape observed. Unproven: it has not been caught in the act,
-      and three attempts to reproduce it deliberately (including under load) came
-      back clean. Worth attaching a debugger to the child on the next occurrence
-      rather than guessing again. Note one of the two sightings predates
-      `JobTable::drop` learning to poll, so that change is not the cause even
-      though it added a lock to a path a forked child can reach.
+      It was the reaper's lock, and the suspected mechanism was the right one.
+      The tests `fork()` from the multi-threaded harness; `fork` copies the lock
+      but not the thread holding it, so a child that inherits a held store waits
+      on a thread that does not exist in it. The first thing a forked child calls
+      is `reaper::forget_all`, which locks — after which the parent's blocking
+      `waitpid` never returns.
+
+      Reproducing it by running the suite was still hopeless: 25 more clean
+      rounds, on top of the three earlier attempts. Holding the store from
+      another thread and forking makes it deterministic instead, which is what
+      `a_child_forked_while_the_store_is_held_can_still_reach_it` does — it hung
+      every time before the fix.
+
+      Fixed with `pthread_atfork`: the store is taken in the `prepare` handler
+      and released in both the parent and the child, so the copy a child gets is
+      never held. A `fork` now waits for whoever holds the store, which costs
+      nothing — every critical section in `reaper.rs` is short, and `drain`
+      releases before its `waitpid` loop.
+
+      Note the allocator was the other suspect and is not implicated: user
+      `prepare` handlers run before `fork` locks the malloc arenas. If a hang is
+      ever seen again, the remaining process-global that a forked child reaches
+      is the `OnceLock` in `reaper()` itself, whose initialization is not covered
+      by the handler it registers.
 - [ ] **A stopped job killed from outside can still be reported stopped.**
       `wait` reports a stopped job's cached stop rather than blocking, since a
       stopped job does not finish on its own. Our own `kill -KILL` clears that
