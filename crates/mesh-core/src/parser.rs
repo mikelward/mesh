@@ -4919,9 +4919,9 @@ fn leading_operand(expression: &Expr) -> &Expr {
 /// Two words escape. An **integer literal** is never a command name, which is what lets
 /// a block yield one (`func answer() { 42 }` is 42, not "command not found: 42"; `./42`
 /// still runs a file called that) and what makes `1 < 2` a comparison wherever it is
-/// read. A **quoted** word is how a program whose path needs quoting is written, so it
-/// stays a command — but the *evaluator* is what runs it, from a scalar the parser
-/// hands over, which is why it counts as a value here. See `repl::runs_as_command`.
+/// read. A **quoted** word is a string literal rather than a command, so it takes the
+/// value reading here and the evaluator does not run it either; a path needing quotes
+/// goes through `command -- "…"` (`DESIGN.md` §"Bare words and quoted values").
 fn outranks_a_command(expression: &Expr) -> bool {
     match leading_operand(expression) {
         Expr::Scalar(word) => word.value.bare_integer().is_some() || word_is_quoted(&word.value),
