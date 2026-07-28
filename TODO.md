@@ -2299,6 +2299,19 @@ of each PR had landed by another route, but these pieces had not.
         for. Check whether there is a job to wait for before reaching for a
         primitive.
 
+- [ ] **A bare `return` reached through a variable loses the result so far.**
+      `func f() { r = return; false; $r }` reports **0**, where the written
+      `func f() { false; return }` reports 1. Both build the same
+      `Step::Return(shell.result.clone())`, so the operand is not the problem —
+      expanding word zero is. `$r` is evaluated before the word is known to name
+      `return`, and evaluating it overwrites `shell.result`, so "the result so
+      far" is the expansion's own rather than the `false` before it. Pre-existing
+      and narrow (the operand forms agree since the typed-`return` fix; only the
+      *bare* one diverges), but it is the same word meaning two things depending
+      on how it is spelled. The fix is to snapshot the result before expanding a
+      stage's words rather than to special-case `return`, since any command word
+      that carries a value has the same effect on what follows it.
+
 ## Redirection: one source-ordered pass ✅ (done)
 
 Three sides of one change, done together. What each closed is written up in the
