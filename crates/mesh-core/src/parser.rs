@@ -648,6 +648,10 @@ pub enum BindingPattern {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlKind {
     Return,
+    /// `fail [STATUS]` — leave the function with a nonzero status and no result.
+    /// The status channel's counterpart to `return`, spelled apart from `exit`
+    /// because `exit` tears down the whole shell.
+    Fail,
     Break,
     Continue,
 }
@@ -2147,7 +2151,7 @@ impl Parser {
         if self.word("fork") && self.block_follows(1) {
             return self.fork_expr();
         }
-        if self.word("return") || self.word("break") || self.word("continue") {
+        if self.word("return") || self.word("fail") || self.word("break") || self.word("continue") {
             return self.control();
         }
         // `global` and `unset` lead a statement, but only where one can follow —
@@ -3317,6 +3321,8 @@ impl Parser {
     fn control(&mut self) -> Result<Executable, ParseError> {
         let kind = if self.take_word("return") {
             ControlKind::Return
+        } else if self.take_word("fail") {
+            ControlKind::Fail
         } else if self.take_word("break") {
             ControlKind::Break
         } else {

@@ -48,6 +48,12 @@ struct Shell {
     funcs: Funcs,
     jobs: exec::JobTable,
     control: Option<parser::ControlKind>,
+    /// The exit status the innermost **value call** unwound with, when it left
+    /// through `return`/`fail`. A value call reads the value channel, so the
+    /// status would otherwise be lost — and `f(…):capture` exists precisely to
+    /// report every channel, `fail 7`'s `7` included. `None` when the body fell
+    /// off its end, where the status is the ordinary "last command" one.
+    value_call_status: Option<u8>,
     /// True in a forked pipeline stage or background job: this process runs the
     /// shell's code but owns none of its children, so job control is not its to
     /// perform.
@@ -206,6 +212,7 @@ impl Shell {
             funcs: Funcs::new(),
             jobs: exec::JobTable::new(),
             control: None,
+            value_call_status: None,
             forked: false,
             loop_depth: 0,
             prompt: PromptConfig::default(),
@@ -297,13 +304,13 @@ fn run_batch(text: &str, options: &StartupOptions) -> ExitCode {
     let last = match run_startup_files(options, false, 0, &mut shell) {
         Step::Continue(code) => code,
         Step::Exit(code) => return ExitCode::from(run_logout(options, code, &mut shell)),
-        Step::Return(value) => {
-            return ExitCode::from(run_logout(options, status_of(&value), &mut shell));
+        Step::Return(_, code) => {
+            return ExitCode::from(run_logout(options, code, &mut shell));
         }
     };
     let code = match run_line(text, last, false, &mut shell) {
         Step::Continue(code) | Step::Exit(code) => code,
-        Step::Return(_) => unreachable!("top-level return handled in run_line"),
+        Step::Return(..) => unreachable!("top-level return handled in run_line"),
     };
     ExitCode::from(run_logout(options, code, &mut shell))
 }
@@ -757,7 +764,7 @@ fn run_sourced_text(text: &str, path: &Path, last: u8, shell: &mut Shell) -> Ste
         // `return` from a sourced file's top level ends *that file* and nothing
         // further: the value it carries becomes this `source`'s status, so a nested
         // source returns to its own caller rather than unwinding the whole stack.
-        Step::Return(value) => Step::Continue(status_of(&value)),
+        Step::Return(_, code) => Step::Continue(code),
         step => step,
     };
     // `source` is a **status-producing command**, so whatever the file's last
@@ -853,32 +860,35 @@ enum Step {
     Continue(u8),
     /// `exit` was invoked; leave the shell with this status.
     Exit(u8),
-    /// `return` was invoked; unwind the current function carrying its result
-    /// value. Exit status is a *view* of that value ([`status_of`]). At top level
-    /// (no function) `run_line` reports it as a recoverable error instead.
-    Return(Value),
+    /// `return` (or `fail`) was invoked; unwind the current function carrying its
+    /// result value **and**, separately, the exit status to leave behind. At top
+    /// level (no function) `run_line` reports it as a recoverable error instead.
+    ///
+    /// The two travel together rather than one being derived from the other
+    /// because they are independent channels: `return 5` yields the *integer* five
+    /// with a status of `0`, and `fail 5` yields no value with a status of `5`.
+    Return(Value, u8),
 }
 
 impl Step {
     /// The exit status this step contributes as the new "last status".
     fn status(&self) -> u8 {
         match self {
-            Step::Continue(code) | Step::Exit(code) => *code,
-            Step::Return(value) => status_of(value),
+            Step::Continue(code) | Step::Exit(code) | Step::Return(_, code) => *code,
         }
     }
 }
 
-/// A mesh value's exit status — the "status is a view of the result" rule from
-/// `DESIGN.md` §"Functions": an integer is its own status, a boolean inverts
-/// (`true` → 0, `false` → 1, the Unix convention), and every other value type is
-/// `0` (producing a value is success).
+/// The exit status a **returned value** leaves behind.
+///
+/// Only `false` fails. `false` is mesh's "no result" — what `gets()` yields at
+/// EOF and what a failing predicate returns — so it is the one value whose
+/// absence of a result is worth reporting as a nonzero status. Every other value
+/// is a result, and producing a result is success, so `return 5` carries the
+/// integer five with status `0` rather than claiming exit code 5. Naming a
+/// specific code is [`fail`](make_fail)'s job.
 fn status_of(value: &Value) -> u8 {
-    match value {
-        Value::Integer(code) => code.rem_euclid(256) as u8,
-        Value::Boolean(ok) => u8::from(!ok),
-        _ => 0,
-    }
+    u8::from(matches!(value, Value::Boolean(false)))
 }
 
 /// Parse and run one input unit against the session. `in_function` is true while
@@ -1164,7 +1174,9 @@ fn run_executable(
             body,
             wrapper,
         } => {
-            if name == "func" || name == "return" || name == "not" || builtins::is_builtin(name) {
+            if matches!(name.as_str(), "func" | "return" | "fail" | "not")
+                || builtins::is_builtin(name)
+            {
                 note!("mesh: func: `{name}` is a reserved name and cannot be a function name");
                 return Step::Continue(2);
             }
@@ -1212,18 +1224,34 @@ fn run_executable(
                         note!("mesh: return: not inside a function or sourced file");
                         return Step::Continue(1);
                     }
-                    // `return val` unwinds carrying any value (its status is a view
-                    // of the value); a bare `return` carries the last status, so it
-                    // reads the same as `exit` with no argument (`DESIGN.md`).
+                    // `return val` unwinds carrying the value, and succeeds unless
+                    // the value is `false`; a bare `return` carries the result so
+                    // far with the **last status**, so it reads as "stop here, as
+                    // if the body ended at this line" (`DESIGN.md`).
                     match value
                         .as_ref()
                         .map(|v| eval_expr(v, last, in_function, shell))
                         .transpose()
                     {
-                        Ok(Some(value)) => Step::Return(value),
-                        // A bare `return` carries the result so far, not a
-                        // freshly minted status (`DESIGN.md`).
-                        Ok(None) => Step::Return(shell.result.clone()),
+                        Ok(Some(value)) => {
+                            let code = status_of(&value);
+                            Step::Return(value, code)
+                        }
+                        Ok(None) => Step::Return(shell.result.clone(), last),
+                        Err(step) => step,
+                    }
+                }
+                parser::ControlKind::Fail => {
+                    if !in_function && !shell.vars.in_sourced_file() {
+                        note!("mesh: fail: not inside a function or sourced file");
+                        return Step::Continue(1);
+                    }
+                    match value
+                        .as_ref()
+                        .map(|v| eval_expr(v, last, in_function, shell))
+                        .transpose()
+                    {
+                        Ok(operand) => make_fail(operand.into_iter().map(|v| (v, true)).collect()),
                         Err(step) => step,
                     }
                 }
@@ -1316,6 +1344,7 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
         Fork { .. } => "a `fork` block",
         Control { kind, .. } => match kind {
             parser::ControlKind::Return => "`return`",
+            parser::ControlKind::Fail => "`fail`",
             parser::ControlKind::Break => "`break`",
             parser::ControlKind::Continue => "`continue`",
         },
@@ -1697,7 +1726,7 @@ fn run_ast_for(
         match shell.control.take() {
             Some(parser::ControlKind::Break) => break,
             Some(parser::ControlKind::Continue) => continue,
-            Some(parser::ControlKind::Return) => unreachable!(),
+            Some(parser::ControlKind::Return | parser::ControlKind::Fail) => unreachable!(),
             None => results.push(pass),
         }
     }
@@ -1738,7 +1767,7 @@ fn run_forked_block(body: &parser::Source, in_function: bool, shell: &mut Shell)
             Step::Continue(code) | Step::Exit(code) => code,
             // A `return` that reached the top of a subshell body has no caller
             // left inside it; its value's status is what the child exits with.
-            Step::Return(value) => status_of(&value),
+            Step::Return(_, code) => code,
         }
     });
     match status {
@@ -1806,7 +1835,9 @@ fn run_ast_while(
         match shell.control.take() {
             Some(parser::ControlKind::Break) => break,
             Some(parser::ControlKind::Continue) => continue,
-            Some(parser::ControlKind::Return) => unreachable!("`return` unwinds as a Step"),
+            Some(parser::ControlKind::Return | parser::ControlKind::Fail) => {
+                unreachable!("`return` and `fail` unwind as a Step")
+            }
             None => {}
         }
     }
@@ -4301,9 +4332,13 @@ fn capture_call(
         return capture_command(&name, arguments, last, in_function, shell);
     }
 
+    shell.value_call_status = None;
     let (outcome, out_text, err_text) = capture::with_channels_captured(shell, |shell| {
         eval_call(callee, arguments, last, in_function, shell)
     })?;
+    // A `return`/`fail` carries its own status out; a body that fell off its end
+    // reports the value's, which is the same rule an expression statement follows.
+    let unwound = shell.value_call_status.take();
     // A runtime error in the call fails the enclosing statement, as it does for a
     // plain value call — `:capture` observes a call's channels, it does not turn a
     // failure into data. Its diagnostic went to the captured stderr, so it is
@@ -4317,11 +4352,12 @@ fn capture_call(
             return Err(step);
         }
     };
+    let status = unwound.unwrap_or_else(|| status_of(&value));
     Ok(channel_record(
         Some(value.clone()),
         out_text,
         err_text,
-        status_of(&value),
+        status,
     ))
 }
 
@@ -4678,7 +4714,7 @@ fn eval_for_expr(
         match shell.control.take() {
             Some(parser::ControlKind::Break) => break,
             Some(parser::ControlKind::Continue) => continue,
-            Some(parser::ControlKind::Return) => unreachable!(),
+            Some(parser::ControlKind::Return | parser::ControlKind::Fail) => unreachable!(),
             None => results.push(result),
         }
     }
@@ -5024,6 +5060,10 @@ fn run_single(
             note!("mesh: return: cannot be redirected or backgrounded");
             return Step::Continue(2);
         }
+        Ok(Expanded::Fail(_)) => {
+            note!("mesh: fail: cannot be redirected or backgrounded");
+            return Step::Continue(2);
+        }
         Ok(Expanded::Argv(argv)) => argv,
         Err(step) => return step,
     };
@@ -5136,6 +5176,10 @@ fn run_multi(
             // pipeline stage, so reject it rather than launch an external `return`.
             Ok(Expanded::Return(_)) => {
                 note!("mesh: return: cannot be used in a pipeline");
+                return Step::Continue(2);
+            }
+            Ok(Expanded::Fail(_)) => {
+                note!("mesh: fail: cannot be used in a pipeline");
                 return Step::Continue(2);
             }
             Err(step) => return step,
@@ -5333,7 +5377,7 @@ fn run_stage_in_shell(
             Ok(Expanded::Function { name, args }) => dispatch_function_call(&name, args, shell),
             // `return` unwinds the enclosing function; it is not something a stage
             // can run, and the eager paths refuse it in the same terms.
-            Ok(Expanded::Return(_)) => {
+            Ok(Expanded::Return(_) | Expanded::Fail(_)) => {
                 note!("mesh: {}", context.returning());
                 Step::Continue(2)
             }
@@ -5352,8 +5396,7 @@ fn run_stage_in_shell(
         },
     };
     match step {
-        Step::Continue(code) | Step::Exit(code) => code,
-        Step::Return(value) => status_of(&value),
+        Step::Continue(code) | Step::Exit(code) | Step::Return(_, code) => code,
     }
 }
 
@@ -5500,6 +5543,8 @@ enum Expanded {
     /// or map on the way past, and a function's result is exactly where those have
     /// to survive (`DESIGN.md` §"Result and `return`").
     Return(Vec<(Value, bool)>),
+    /// `fail`, whose operand is typed the same way `return`'s is.
+    Fail(Vec<(Value, bool)>),
     /// argv for a builtin or an external program.
     Argv(Vec<String>),
 }
@@ -5550,7 +5595,7 @@ fn expand_stage(
     // become *values*, and argv is the boundary that would flatten a list or map on
     // the way. A function can never be named `return` — definition rejects the word
     // — so the two cannot both claim one stage.
-    let returning = name.as_deref() == Some("return");
+    let returning = matches!(name.as_deref(), Some("return" | "fail"));
     let calling = name
         .as_ref()
         .is_some_and(|name| shell.funcs.get(name).is_some());
@@ -5566,10 +5611,10 @@ fn expand_stage(
             );
         }
         let name = name.expect("a named stage, since one of the two branches claimed it");
-        return Ok(if returning {
-            Expanded::Return(args)
-        } else {
-            Expanded::Function { name, args }
+        return Ok(match name.as_str() {
+            "return" => Expanded::Return(args),
+            "fail" => Expanded::Fail(args),
+            _ => Expanded::Function { name, args },
         });
     }
     for word in rest {
@@ -5641,7 +5686,8 @@ fn run_command(tokens: &[parser::Word], last: u8, in_function: bool, shell: &mut
     // reorder the builtins → functions → external chain.
     match expand_stage(tokens, stdout_decoration(), last, in_function, shell) {
         Ok(Expanded::Function { name, args }) => dispatch_function_call(&name, args, shell),
-        Ok(Expanded::Return(args)) => make_return(args, shell),
+        Ok(Expanded::Return(args)) => make_return(args, last, shell),
+        Ok(Expanded::Fail(args)) => make_fail(args),
         Ok(Expanded::Argv(words)) => run_expanded(words, last, shell),
         Err(step) => step,
     }
@@ -5856,12 +5902,16 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     }
     // `return` ends the enclosing function (a recoverable error at top
     // level; `run_line` decides which by `in_function`).
-    if words[0] == "return" {
+    if words[0] == "return" || words[0] == "fail" {
         let args = words[1..]
             .iter()
             .map(|word| (expand::typed_scalar(word), true))
             .collect();
-        return make_return(args, shell);
+        return if words[0] == "fail" {
+            make_fail(args)
+        } else {
+            make_return(args, last, shell)
+        };
     }
     // `command` is read before any of the resolution below, because everything
     // below is what it exists to skip — and because its arguments are another
@@ -6742,16 +6792,55 @@ fn run_prompt_hooks(event: PromptEvent, args: Vec<Value>, shell: &mut Shell) {
 /// agree about what they carry, or `return` is a narrower channel than falling off
 /// the end. Quoting still separates `return 42` from `return "42"`, as everywhere
 /// else a value is typed from a word.
-fn make_return(args: Vec<(Value, bool)>, shell: &Shell) -> Step {
+fn make_return(args: Vec<(Value, bool)>, last: u8, shell: &Shell) -> Step {
     match <[_; 1]>::try_from(args) {
-        Ok([(value, _)]) => Step::Return(value),
-        // Bare: the result so far (`DESIGN.md` §"Result and `return`").
-        Err(args) if args.is_empty() => Step::Return(shell.result.clone()),
+        Ok([(value, _)]) => {
+            let code = status_of(&value);
+            Step::Return(value, code)
+        }
+        // Bare: the result so far, carrying the last status (`DESIGN.md`
+        // §"Result and `return`").
+        Err(args) if args.is_empty() => Step::Return(shell.result.clone(), last),
         Err(_) => {
             note!("mesh: return: too many arguments");
             Step::Continue(1)
         }
     }
+}
+
+/// Build the [`Step::Return`] for `fail` — the status channel's counterpart to
+/// `return`.
+///
+/// `fail` leaves the function with a **nonzero** status and no result. Bare it is
+/// `1`, the shell's ordinary "something went wrong"; `fail 3` names a specific
+/// code. The value it carries is `false`, which is mesh's "no result", so a caller
+/// reading the value sees the same absence whether the callee said `fail` or
+/// `return false`; the two are told apart by the status.
+///
+/// `fail 0` is refused rather than silently succeeding: a `fail` that succeeds is
+/// always a mistake, and the spelling for "leave with success" is `return true`.
+fn make_fail(args: Vec<(Value, bool)>) -> Step {
+    let code = match <[_; 1]>::try_from(args) {
+        Ok([(value, _)]) => match &value {
+            Value::Integer(code) if (1..=255).contains(code) => {
+                u8::try_from(*code).expect("checked against the u8 range above")
+            }
+            Value::Integer(_) => {
+                note!("mesh: fail: status must be between 1 and 255");
+                return Step::Continue(2);
+            }
+            _ => {
+                note!("mesh: fail: status must be an integer");
+                return Step::Continue(2);
+            }
+        },
+        Err(args) if args.is_empty() => 1,
+        Err(_) => {
+            note!("mesh: fail: too many arguments");
+            return Step::Continue(2);
+        }
+    };
+    Step::Return(Value::Boolean(false), code)
 }
 
 /// Call the function `name` with already-expanded typed `args`. Binds the
@@ -6799,7 +6888,7 @@ fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &
         // A default's `return N` ends the call with that status, like the body's;
         // an `exit`/runtime step unwinds unchanged.
         return match step {
-            Step::Return(value) => Step::Continue(status_of(&value)),
+            Step::Return(_, code) => Step::Continue(code),
             other => other,
         };
     }
@@ -6819,7 +6908,7 @@ fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &
         shell.control = None;
     }
     let result = match executed {
-        Step::Return(value) => Step::Continue(status_of(&value)),
+        Step::Return(_, code) => Step::Continue(code),
         other => other,
     };
     shell.vars.pop_scope();
@@ -6984,6 +7073,10 @@ fn run_call_body_for_value(
     shell.loop_depth = caller_loop_depth;
     shell.result = caller_result;
     shell.produced = caller_produced;
+    shell.value_call_status = match &outcome {
+        Err(Step::Return(_, code)) => Some(*code),
+        _ => None,
+    };
     match outcome {
         // `exit` unwinds regardless: it leaves the shell, not just this call.
         Err(step @ Step::Exit(_)) => Err(step),
@@ -6991,7 +7084,7 @@ fn run_call_body_for_value(
         _ if escaped => Err(Step::Continue(1)),
         Ok(value) => Ok(value),
         // An explicit `return val` yields its value; a runtime step unwinds.
-        Err(Step::Return(value)) => Ok(value),
+        Err(Step::Return(value, _)) => Ok(value),
         Err(other) => Err(other),
     }
 }
@@ -7536,7 +7629,7 @@ fn evaluate_default(
 ) -> Result<Value, Step> {
     eval_expr(default, 0, true, shell).map_err(|step| match step {
         exit @ Step::Exit(_) => exit,
-        ret @ Step::Return(_) => ret,
+        ret @ Step::Return(..) => ret,
         _ => {
             note!("mesh: {name}: could not evaluate default for `{param}`");
             Step::Continue(2)
@@ -8706,8 +8799,8 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         Step::Exit(code) => {
             return ExitCode::from(run_logout(options, code, &mut shell));
         }
-        Step::Return(value) => {
-            return ExitCode::from(run_logout(options, status_of(&value), &mut shell));
+        Step::Return(_, code) => {
+            return ExitCode::from(run_logout(options, code, &mut shell));
         }
     };
     // Now, and deliberately: the environment the session's sequences are chosen
@@ -8845,7 +8938,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                     Some(Step::Continue(code)) => last = code,
                     // Top-level `run_line` reports a stray `return` itself, so one
                     // never reaches here.
-                    Some(Step::Return(_)) => unreachable!("top-level return handled in run_line"),
+                    Some(Step::Return(..)) => unreachable!("top-level return handled in run_line"),
                 }
                 pending_history_rows = 0;
                 if let Some(command) = completed_command {
@@ -9648,8 +9741,8 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
         Step::Exit(code) => {
             return ExitCode::from(run_logout(options, code, &mut shell));
         }
-        Step::Return(value) => {
-            return ExitCode::from(run_logout(options, status_of(&value), &mut shell));
+        Step::Return(_, code) => {
+            return ExitCode::from(run_logout(options, code, &mut shell));
         }
     };
     // Now, and deliberately: the environment the session's sequences are chosen
@@ -9707,7 +9800,7 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
                 return ExitCode::from(run_logout(options, code, &mut shell));
             }
             Step::Continue(code) => last = code,
-            Step::Return(_) => unreachable!("top-level return handled in run_line"),
+            Step::Return(..) => unreachable!("top-level return handled in run_line"),
         }
     }
     // Report an incomplete unit at EOF; a poisoned one was already diagnosed.
@@ -9717,7 +9810,7 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
                 return ExitCode::from(run_logout(options, code, &mut shell));
             }
             Step::Continue(code) => last = code,
-            Step::Return(_) => unreachable!("top-level return handled in run_line"),
+            Step::Return(..) => unreachable!("top-level return handled in run_line"),
         }
     }
     ExitCode::from(run_logout(options, last, &mut shell))

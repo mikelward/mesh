@@ -2425,31 +2425,50 @@ Rules:
   ran — results in the **empty string with status `0`**, the same "nothing
   produced, nothing failed" answer a no-`else` `if` gives; there is no null to
   invent.
-- **Exit status is a view of the result** — not a separate channel — and it is
-  defined for *every* result type, so a function used in command position
-  (`if f { … }`) always has one:
+- **Value and status are separate channels** *(decided; shipped)*. A function has
+  three outputs, not two: the **bytes** it writes to stdout, the **value** it
+  returns, and its **exit status**. `return` fills the value channel; `fail`
+  fills the status channel. Neither is derived from the other:
 
-  | Result type | Exit status |
-  | --- | --- |
-  | command | its own exit status |
-  | int | the integer itself — `0` success (the shell `return N`) |
-  | bool | `true` → `0`, `false` → `1` (the Unix inversion) |
-  | string / list / map / styled value / Instant / Duration / regex / stream handle (incl. empty or zero) | `0` — producing a value *is* success |
+  | Form | Value | Status |
+  | --- | --- | --- |
+  | body ends in a command | none | the command's own |
+  | `return $v` | `$v` | `0` — or `1` when `$v` is `false` |
+  | `return true` / `return false` | the bool | `0` / `1` |
+  | bare `return` | the result so far | the **last** status |
+  | `fail` / `fail 123` | `false` | `1` / `123` |
 
-  So a session predicate like `connected-remotely` ends in a test whose bool
-  becomes the status and `if connected-remotely { … }` reads correctly — the
-  name-resolution half is the [`:kind` modifier](#modifiers) instead, and yields
-  a value rather than a status; `return $cond` exits `0`/`1`;
-  `return 2` exits `2`; and a function that returns a string or a list is a
-  success (`0`) when its status is observed. Failure is only ever signaled by a
-  command's own status, a `false`, or an explicit nonzero `int` — never by the
-  mere *shape* of a returned value.
+  **Only `false` fails.** `false` is mesh's "no result" — what `gets()` yields at
+  EOF, what a failing predicate returns, what `if x = f() { … }` tests for — so it
+  is the one value whose status is worth reporting as nonzero. Every other value
+  *is* a result, and producing a result is success, which is why `return 5` carries
+  the integer five with status `0` rather than claiming exit code 5. A returned
+  string, list, map or zero is likewise a success.
 
-  A status is the OS's **8-bit** process status, so an out-of-range int is
-  **masked to `0`–`255`** (`return 256` → `0`, `return -1` → `255`, matching
-  `exit`) — an in-process call and a process-backed one then report the *same*
-  status. The full integer survives as the function's **value** (`n = f()`);
-  only the *status view* is 8-bit.
+  That keeps a session predicate like `connected-remotely` usable in command
+  position — `if connected-remotely { … }` reads correctly whether the body ends
+  in a test, a `return $cond`, or a `fail`.
+
+  **`fail` is the status channel's verb**, spelled apart from `exit` because
+  `exit` tears down the whole shell from wherever it is called, while `fail`
+  leaves only the current function — the same unit `return` leaves. It takes a
+  nonzero code only: bare `fail` is `1`, `fail 123` names a code, and `fail 0` is
+  refused, because a `fail` that succeeds is always a mistake and the spelling for
+  "leave with success" is `return true`. It is a reserved name, as `return` is.
+
+  Bare `return` is *not* a synonym for `return true`: it means "stop here, as if
+  the body ended at this line", so it propagates a **failure** as readily as a
+  success — the one place the word `return` does not imply success.
+
+  A status is the OS's **8-bit** process status. The value channel is not: the
+  full integer survives as the function's value (`n = f()`), because it was never
+  a status to begin with.
+
+  *(Why not one channel. Deriving the status from the value — `return 5` meaning
+  both "the number five" and "exit code 5" — conflates two unrelated things and
+  makes every integer-returning function a landmine. The nullable `false | T`
+  encoding is a real and useful duality and is kept; an integer's coincidental
+  resemblance to a status is not.)*
 - **Output is stdout.** Independently of its result, whatever a `func` writes to
   stdout *is* its output stream, exactly like an external command, so functions
   compose in byte-stream pipes with everything else.
