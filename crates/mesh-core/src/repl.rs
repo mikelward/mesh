@@ -5861,7 +5861,7 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
         "gets" => return gets(&words[1..], shell),
         // `whence` reads this shell's functions and bindings, which `builtins::dispatch`
         // is handed none of.
-        "whence" => return Step::Continue(whence::whence(&words[1..], &shell.funcs, &shell.vars)),
+        "type" => return Step::Continue(whence::type_of(&words[1..], &shell.funcs, &shell.vars)),
         _ => {}
     }
     // Job control belongs to the shell that owns the jobs. A forked stage is not
@@ -9055,7 +9055,7 @@ fn argument_completions(
     // came first**, which is exactly what that terminator is for: past it,
     // `whence` reads every word as a name, so a program really called `--tool`
     // has to be completable the same way it is lookupable.
-    if words.first().is_some_and(|first| first == "whence")
+    if words.first().is_some_and(|first| first == "type")
         && !word.contains('/')
         && (!word.starts_with('-') || terminated(&words[..words.len().saturating_sub(1)]))
     {
@@ -10937,7 +10937,7 @@ mod tests {
             ..CompletionState::default()
         };
         let whence = |word: &str| {
-            argument_completions(&state, &["whence".into(), word.into()], word, Lookup::Shell)
+            argument_completions(&state, &["type".into(), word.into()], word, Lookup::Shell)
         };
         // Ranking is by subsequence, so assert the best match rather than the set:
         // what matters is that each namespace is reachable at all.
@@ -10967,7 +10967,7 @@ mod tests {
             argument_completions(&state, &owned, word, Lookup::Shell)
         };
         assert_eq!(
-            complete(&["whence", "--", "--to"], "--to")
+            complete(&["type", "--", "--to"], "--to")
                 .first()
                 .map(String::as_str),
             Some("--tool")
@@ -10975,7 +10975,7 @@ mod tests {
         // Without the terminator a `-` prefix is still an option, so the name is
         // not offered — `whence --to` is a misspelled flag, not a lookup.
         assert!(
-            !complete(&["whence", "--to"], "--to")
+            !complete(&["type", "--to"], "--to")
                 .iter()
                 .any(|value| value == "--tool")
         );
@@ -10996,17 +10996,17 @@ mod tests {
             )
         };
         let state = CompletionState {
-            help: [spec("whence"), spec("prompt")].into(),
+            help: [spec("type"), spec("prompt")].into(),
             ..CompletionState::default()
         };
         let flags = |command: &str, word: &str| {
             argument_completions(&state, &[command.into(), word.into()], word, Lookup::Shell)
         };
-        assert_eq!(flags("whence", "--a"), ["--all"]);
-        assert_eq!(flags("whence", "--q"), ["--quiet"]);
+        assert_eq!(flags("type", "-P"), ["-P"]);
+        assert_eq!(flags("type", "--q"), ["--quiet"]);
         assert_eq!(flags("prompt", "--r"), ["--reset"]);
         // `--help` is still there, and still last.
-        assert!(flags("whence", "--").contains(&"--help".to_owned()));
+        assert!(flags("type", "--").contains(&"--help".to_owned()));
     }
 
     #[test]

@@ -1,17 +1,20 @@
-//! `whence` — say what a name is.
+//! `type` — say what a name is.
 //!
 //! The lookup every shell has under a different spelling: bash's `type`, ksh's
 //! `whence`, the external `which`. It answers the interactive question "what
 //! happens when I type this word" — and, because mesh keeps bindings in their own
 //! namespace, "what is bound to this name" alongside it.
 //!
-//! **The ksh spelling, not `type`.** This *is* ksh's `whence`, down to `-a` and
-//! `-q` arriving here as `--all` and `--quiet`, so it takes that name. `type`
-//! would have been the wider reflex but is the one word mesh cannot spend on a
-//! name lookup: mesh has real value types and `$p:type` already asks a path's, so
-//! `type $x` would read as a question about the *value* forever. The reflexes
-//! still land here — `type`, `which`, `where` and `what` are all in
-//! `builtins::RENAMED`, so typing any of them says where to go.
+//! **Bash's name, flags and words.** `-t` and `-P` are bash's, and are the shapes
+//! a script *compares* rather than reads, so they match it byte for byte; the
+//! prose is mesh's own, since a sentence is read. `whence` is ksh's spelling and
+//! `where` zsh's; both, and `what`, are in `builtins::RENAMED` and point here.
+//! **`which` is deliberately absent** — in bash it is an external program that
+//! cannot see builtins or functions, and mesh keeps that rather than shadowing a
+//! binary.
+//!
+//! The file is still `whence.rs` because `type` is a Rust keyword and `r#type.rs`
+//! reads worse than the history it would tidy.
 //!
 //! **Names, not values.** The value-side question — what a value *is*, written
 //! back as the source you would have typed — is the `:repr` modifier, which
@@ -158,8 +161,14 @@ impl Found {
 /// operand that could not be run, a syntax row that reserves no name — still
 /// prints its line and still fails, so the report says why the status is what it
 /// is rather than contradicting it.
-pub(crate) fn whence(args: &[String], funcs: &Funcs, vars: &Vars) -> u8 {
-    let Options { all, quiet, names } = match parse(args) {
+pub(crate) fn type_of(args: &[String], funcs: &Funcs, vars: &Vars) -> u8 {
+    let Options {
+        all,
+        quiet,
+        kind,
+        path,
+        names,
+    } = match parse(args) {
         Ok(parsed) => parsed,
         Err(status) => return status,
     };
@@ -167,6 +176,25 @@ pub(crate) fn whence(args: &[String], funcs: &Funcs, vars: &Vars) -> u8 {
     let mut out = Vec::new();
     for name in names {
         let found = look_up(name, funcs, vars);
+        // `-t` and `-P` answer about the **winner**, and each has its own notion of
+        // failure: `-P` fails on a name that resolves perfectly well as a function,
+        // so neither can lean on `resolved`.
+        if kind || path {
+            let answer = if path {
+                found.commands.iter().find_map(external_path)
+            } else {
+                found.commands.first().or(found.separate.first()).map(word)
+            };
+            match answer {
+                Some(answer) if !quiet => {
+                    out.extend_from_slice(answer);
+                    out.push(b'\n');
+                }
+                Some(_) => {}
+                None => status = 1,
+            }
+            continue;
+        }
         if !found.resolved() {
             status = 1;
         }
@@ -174,17 +202,40 @@ pub(crate) fn whence(args: &[String], funcs: &Funcs, vars: &Vars) -> u8 {
             continue;
         }
         if found.is_empty() {
-            // The same note `command not found` carries, so a `type` / `whence` /
-            // `which` reflex lands on mesh's spelling from either direction.
+            // The same note `command not found` carries, so a `whence` / `where` /
+            // `what` reflex lands on mesh's spelling from either direction.
             match builtins::rename_note(name) {
-                Some(note) => note!("mesh: whence: {name}: not found ({note})"),
-                None => note!("mesh: whence: {name}: not found"),
+                Some(note) => note!("mesh: type: {name}: not found ({note})"),
+                None => note!("mesh: type: {name}: not found"),
             }
             continue;
         }
         report(name, &found, all, &mut out);
     }
-    status | builtins::write_stdout("whence", &out)
+    status | builtins::write_stdout("type", &out)
+}
+
+/// The one word `-t` prints. Bash's tokens, because this output is *compared*
+/// rather than read — `case "$(type -t "$1")" in function)` is what a port
+/// carries over. `variable` is the one addition, since bash's `type` cannot see
+/// bindings.
+fn word(finding: &Finding) -> &'static [u8] {
+    match finding {
+        Finding::Syntax { .. } => b"keyword",
+        Finding::Builtin(_) => b"builtin",
+        Finding::Function(_) => b"function",
+        Finding::External(_) | Finding::File(_) => b"file",
+        Finding::Variable { .. } | Finding::Environment { .. } => b"variable",
+    }
+}
+
+/// The path `-P` prints, for a finding that has one. A function or a builtin has
+/// none, which is the whole point of the flag.
+fn external_path(finding: &Finding) -> Option<&[u8]> {
+    match finding {
+        Finding::External(path) => Some(path.as_os_str().as_bytes()),
+        _ => None,
+    }
 }
 
 /// The parsed command line: which listing was asked for, and the names to
@@ -192,6 +243,10 @@ pub(crate) fn whence(args: &[String], funcs: &Funcs, vars: &Vars) -> u8 {
 struct Options<'a> {
     all: bool,
     quiet: bool,
+    /// `-t` — one word per name, the shape a guard compares against.
+    kind: bool,
+    /// `-P` — a `PATH` hit only, ignoring functions and builtins.
+    path: bool,
     names: Vec<&'a String>,
 }
 
@@ -200,17 +255,27 @@ struct Options<'a> {
 fn parse(args: &[String]) -> Result<Options<'_>, u8> {
     let mut all = false;
     let mut quiet = false;
+    let mut kind = false;
+    let mut path = false;
     let mut names = Vec::new();
     let mut options = true;
     for arg in args {
         if options {
             match arg.as_str() {
-                "--all" => {
+                "-a" => {
                     all = true;
                     continue;
                 }
                 "--quiet" => {
                     quiet = true;
+                    continue;
+                }
+                "-t" => {
+                    kind = true;
+                    continue;
+                }
+                "-P" => {
+                    path = true;
                     continue;
                 }
                 "--" => {
@@ -220,7 +285,7 @@ fn parse(args: &[String]) -> Result<Options<'_>, u8> {
                 // A lone `-` is a name, not a malformed option: it is a real
                 // enough word to ask about, and nothing reads it as a flag.
                 _ if arg.starts_with('-') && arg.len() > 1 => {
-                    note!("mesh: whence: {arg}: unknown option (`--all` or `--quiet`)");
+                    note!("mesh: type: {arg}: unknown option (`-t`, `-P`, `-a` or `--quiet`)");
                     return Err(2);
                 }
                 _ => {}
@@ -229,13 +294,19 @@ fn parse(args: &[String]) -> Result<Options<'_>, u8> {
         names.push(arg);
     }
     if names.is_empty() {
-        note!("mesh: whence: expected a name; `whence NAME …` says what each one is");
+        note!("mesh: type: expected a name; `type NAME …` says what each one is");
         return Err(2);
     }
     // Not an error together: `--quiet` asks for no output at all, which is a
     // superset of what `--all` would have printed rather than a contradiction of
     // it. The status is the same either way.
-    Ok(Options { all, quiet, names })
+    Ok(Options {
+        all,
+        quiet,
+        kind,
+        path,
+        names,
+    })
 }
 
 /// Everything `name` is, gathered in the order the shell itself resolves a
@@ -482,28 +553,25 @@ fn report(name: &str, found: &Found, all: bool, out: &mut Vec<u8>) {
     } else {
         &found.commands[..1]
     };
-    for (index, finding) in shown.iter().enumerate() {
-        let shadowed = (!all && index == 0)
-            .then(|| &found.commands[1..])
-            .filter(|rest| !rest.is_empty());
-        line(name, finding, shadowed, out);
+    for finding in shown {
+        line(name, finding, out);
     }
     for finding in &found.separate {
-        line(name, finding, None, out);
+        line(name, finding, out);
     }
 }
 
-/// One `NAME is …` headline, its shadow note, and the indented detail under it.
+/// One `NAME is …` headline and the indented detail under it.
 ///
 /// Built as bytes rather than a `String` because a `PATH` entry need not be valid
 /// UTF-8, and the path mesh would run has to be printed as the bytes it is —
 /// the same care `pwd` takes.
-fn line(name: &str, finding: &Finding, shadowed: Option<&[Finding]>, out: &mut Vec<u8>) {
+fn line(name: &str, finding: &Finding, out: &mut Vec<u8>) {
     out.extend_from_slice(name.as_bytes());
     out.extend_from_slice(b" is ");
     match finding {
-        Finding::Syntax { .. } => out.extend_from_slice(b"syntax"),
-        Finding::Builtin(_) => out.extend_from_slice(b"a builtin"),
+        Finding::Syntax { .. } => out.extend_from_slice(b"a shell keyword"),
+        Finding::Builtin(_) => out.extend_from_slice(b"a shell builtin"),
         Finding::Function(_) => out.extend_from_slice(b"a function"),
         Finding::External(path) => out.extend_from_slice(path.as_os_str().as_bytes()),
         Finding::File(FileKind::Executable) => out.extend_from_slice(b"an executable file"),
@@ -513,14 +581,6 @@ fn line(name: &str, finding: &Finding, shadowed: Option<&[Finding]>, out: &mut V
         Finding::Variable { local: true, .. } => out.extend_from_slice(b"a local variable"),
         Finding::Variable { local: false, .. } => out.extend_from_slice(b"a variable"),
         Finding::Environment { .. } => out.extend_from_slice(b"an environment entry"),
-    }
-    if let Some(rest) = shadowed {
-        out.extend_from_slice(b" (shadowing ");
-        short(&rest[0], out);
-        if rest.len() > 1 {
-            out.extend_from_slice(format!(", and {} more", rest.len() - 1).as_bytes());
-        }
-        out.push(b')');
     }
     out.push(b'\n');
     let detail = match finding {
@@ -534,24 +594,6 @@ fn line(name: &str, finding: &Finding, shadowed: Option<&[Finding]>, out: &mut V
         out.extend_from_slice(b"    ");
         out.extend_from_slice(detail.as_bytes());
         out.push(b'\n');
-    }
-}
-
-/// How a shadowed finding is named inside the note — the path for an external,
-/// since that is the whole of what it is, and the kind for everything else.
-fn short(finding: &Finding, out: &mut Vec<u8>) {
-    match finding {
-        Finding::External(path) => out.extend_from_slice(path.as_os_str().as_bytes()),
-        Finding::Syntax { .. } => out.extend_from_slice(b"the syntax"),
-        Finding::Builtin(_) => out.extend_from_slice(b"the builtin"),
-        Finding::Function(_) => out.extend_from_slice(b"the function"),
-        Finding::File(_) => out.extend_from_slice(b"the file"),
-        // Not reachable: a binding is never in the shadowing list, which is the
-        // command half only. Named rather than `unreachable!`, since a wrong word
-        // is a better failure than a panicking `whence`.
-        Finding::Variable { .. } | Finding::Environment { .. } => {
-            out.extend_from_slice(b"the binding")
-        }
     }
 }
 
@@ -596,14 +638,17 @@ mod tests {
         let found = look_up(ONLY_A_BUILTIN, &Funcs::new(), &Vars::new());
         assert_eq!(
             rendered(ONLY_A_BUILTIN, &found, false),
-            "prompt-hook is a builtin\n    prompt-hook [--remove] [EVENT] NAME [FUNCTION]\n"
+            "prompt-hook is a shell builtin\n    prompt-hook [--remove] [EVENT] NAME [FUNCTION]\n"
         );
     }
 
     #[test]
     fn names_a_keyword_by_its_form() {
         let found = look_up("unless", &Funcs::new(), &Vars::new());
-        assert!(rendered("unless", &found, false).starts_with("unless is syntax\n    cmd if COND"));
+        assert!(
+            rendered("unless", &found, false)
+                .starts_with("unless is a shell keyword\n    cmd if COND")
+        );
     }
 
     #[test]
@@ -643,7 +688,7 @@ mod tests {
         let found = look_up(ONLY_A_BUILTIN, &Funcs::new(), &vars);
         assert_eq!(
             rendered(ONLY_A_BUILTIN, &found, false),
-            "prompt-hook is a builtin\n    prompt-hook [--remove] [EVENT] NAME [FUNCTION]\n\
+            "prompt-hook is a shell builtin\n    prompt-hook [--remove] [EVENT] NAME [FUNCTION]\n\
              prompt-hook is a variable\n    an integer: 5\n"
         );
     }
@@ -698,20 +743,21 @@ mod tests {
             .push(Finding::External(PathBuf::from("/usr/bin/cd")));
         assert_eq!(
             rendered("cd", &found, false),
-            "cd is a builtin (shadowing /usr/bin/cd)\n    cd [DIR]\n"
+            "cd is a shell builtin\n    cd [DIR]\n"
         );
         assert_eq!(
             rendered("cd", &found, true),
-            "cd is a builtin\n    cd [DIR]\ncd is /usr/bin/cd\n"
+            "cd is a shell builtin\n    cd [DIR]\ncd is /usr/bin/cd\n"
         );
     }
 
+    /// `-a` lists **every** match in resolution order. The bare form names only the
+    /// winner — what a name could have matched but did not is not worth a line, and
+    /// this is where that information lives instead.
     #[test]
-    fn counts_the_rest_when_more_than_one_is_shadowed() {
+    fn all_lists_every_match_in_resolution_order() {
         let mut found = Found::default();
-        found
-            .commands
-            .push(Finding::Function("func ls()".to_owned()));
+        found.commands.push(Finding::Function("func ls()".into()));
         found
             .commands
             .push(Finding::External(PathBuf::from("/usr/local/bin/ls")));
@@ -720,7 +766,11 @@ mod tests {
             .push(Finding::External(PathBuf::from("/usr/bin/ls")));
         assert_eq!(
             rendered("ls", &found, false),
-            "ls is a function (shadowing /usr/local/bin/ls, and 1 more)\n    func ls()\n"
+            "ls is a function\n    func ls()\n"
+        );
+        assert_eq!(
+            rendered("ls", &found, true),
+            "ls is a function\n    func ls()\nls is /usr/local/bin/ls\nls is /usr/bin/ls\n"
         );
     }
 
@@ -794,7 +844,7 @@ mod tests {
         // the same position, so neither shadows the other.
         assert_eq!(
             rendered("/", &found, false),
-            "/ is syntax\n    n = (1 + 2)\n/ is a directory\n"
+            "/ is a shell keyword\n    n = (1 + 2)\n/ is a directory\n"
         );
         // Described twice over and usable as neither: `/ 1 2` is a `127` and
         // running the directory a `126`.
@@ -845,7 +895,7 @@ mod tests {
         // race; the keyword is described from the side and shadows nothing.
         assert_eq!(
             rendered("fork", &found, false),
-            "fork is a function\n    func fork()\nfork is syntax\n    fork { … }\n"
+            "fork is a function\n    func fork()\nfork is a shell keyword\n    fork { … }\n"
         );
         assert!(found.resolved());
     }
@@ -913,7 +963,7 @@ mod tests {
 
     #[test]
     fn reads_both_listing_options() {
-        let args = ["--all".to_owned(), "--quiet".to_owned(), "ls".to_owned()];
+        let args = ["-a".to_owned(), "--quiet".to_owned(), "ls".to_owned()];
         let options = parse(&args).expect("parses");
         assert!(options.all && options.quiet);
         assert_eq!(options.names, [&"ls".to_owned()]);
@@ -921,10 +971,10 @@ mod tests {
 
     #[test]
     fn a_terminator_makes_a_flag_looking_word_a_name() {
-        let args = ["--".to_owned(), "--all".to_owned()];
+        let args = ["--".to_owned(), "-a".to_owned()];
         let options = parse(&args).expect("parses");
         assert!(!options.all);
-        assert_eq!(options.names, [&"--all".to_owned()]);
+        assert_eq!(options.names, [&"-a".to_owned()]);
     }
 
     #[test]

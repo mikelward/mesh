@@ -358,7 +358,7 @@ file as tasks land.
       leaves only the status (`0` found, `1` not), which is `command -v`.
       `type` is deliberately not taken: mesh has value types and `:type` already
       asks a path's, so it stays free for the value question — which is `:repr`.
-- [ ] **Rename `whence` to `type`, with `-t` / `-P` / `-a`** *(decided)*. Bash's
+- [x] **Rename `whence` to `type`, with `-t` / `-P` / `-a`** *(landed)*. Bash's
       name, bash's flags, bash's words. `whence` stays reachable as a rename
       pointer, as do `what` and `where`; none is reserved, so a user function may
       take any of them (`func what()` works today and must keep working). **Do not
@@ -368,22 +368,22 @@ file as tasks land.
       binary on disk, so claiming it would mean shadowing a program rather than
       improving a not-found message.
 
-  - [ ] **`-t` prints one word**: `function`, `builtin`, `file`, `keyword`,
+  - [x] **`-t` prints one word**: `function`, `builtin`, `file`, `keyword`,
         `variable`. Bash's tokens, because this output is *compared*, not read —
         `case "$(type -t "$1")" in function)` is the shape a port carries over.
         `variable` is the one addition; bash's `type` does not see bindings.
         Nothing printed and status `1` when the name is not found.
-  - [ ] **`-P` prints only a `PATH` hit**, ignoring functions and builtins, and
+  - [x] **`-P` prints only a `PATH` hit**, ignoring functions and builtins, and
         nothing with status `1` otherwise. This retires the hand-rolled
         `for d in $PATH` loop an `shrc` carries because `type -P` is not portable.
-  - [ ] **`-a` as the short form of the existing `--all`.** `--quiet` stays a mesh
+  - [x] **`-a` as the short form of the existing `--all`.** `--quiet` stays a mesh
         convenience over `>/dev/null`.
-  - [ ] **One vocabulary in every form** — the prose says `if is a shell keyword`,
+  - [x] **One vocabulary in every form** — the prose says `if is a shell keyword`,
         never "is syntax", so the sentence and `-t` cannot disagree. Follow bash's
         wording wherever there is no reason to differ (`cd is a shell builtin`,
         `ls is /usr/bin/ls`); keep what mesh has a reason for — the detail line,
         the variable row, and naming what a winner shadows.
-  - [ ] `func type()` stops being definable once `type` is a builtin, the way
+  - [x] `func type()` stops being definable once `type` is a builtin, the way
         `func whence()` is refused today. Worth a test pinning that, and one
         pinning that `func what()` / `func where()` still work.
   - [ ] **This likely closes the `:kind` / `:where` question** in the predicate
