@@ -9630,6 +9630,37 @@ fn return_carries_a_typed_value_whose_status_is_a_view_of_it() {
 }
 
 #[test]
+fn a_return_reached_through_a_variable_is_typed_like_a_written_one() {
+    // A written `return` is a control node whose operand is evaluated as a value,
+    // so it carries any type. Reached through a variable (`r = return`) the word is
+    // resolved after expansion instead, and that path used to build the result from
+    // *argv* — which flattens. A list was refused outright ("list value needs
+    // `...`") and a quoted `"42"` came back as the integer 42, so the same `return`
+    // meant two things depending on how it was spelled.
+    let list = run_with_input("func f() { xs = [a b c]\n r = return\n $r $xs }\nputs f():repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout),
+        "['a', 'b', 'c']\n",
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.stderr.is_empty(), "{:?}", list.stderr);
+
+    // Quoting separates the string from the integer here as it does everywhere
+    // else a value is typed from a word.
+    let quoted = run_with_input("func f() { r = return\n $r \"42\" }\nputs f():repr\n");
+    assert_eq!(String::from_utf8_lossy(&quoted.stdout), "'42'\n");
+
+    // A surplus operand keeps its answer.
+    let surplus = run_with_input("func f() { r = return\n $r a b }\nf\n");
+    assert!(
+        String::from_utf8_lossy(&surplus.stderr).contains("return: too many arguments"),
+        "{}",
+        String::from_utf8_lossy(&surplus.stderr)
+    );
+}
+
+#[test]
 fn a_bare_return_uses_the_last_status() {
     // A `return` with no argument carries the last status, like `exit` with none.
     let out = run_with_input("func f() { false\n return }\nf || puts nonzero\n");

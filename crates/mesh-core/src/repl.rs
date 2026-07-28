@@ -5016,19 +5016,19 @@ fn run_single(
                 }
             };
         }
+        // `return` is control flow handled on the no-redirection path; with a
+        // redirection or in the background it never reaches that handler, so reject
+        // it rather than launch an external `return` while the body keeps running.
+        Ok(Expanded::Return(_)) => {
+            note!("mesh: return: cannot be redirected or backgrounded");
+            return Step::Continue(2);
+        }
         Ok(Expanded::Argv(argv)) => argv,
         Err(step) => return step,
     };
     if argv.is_empty() {
         note!("mesh: redirection with no command is not supported yet");
         return Step::Continue(1);
-    }
-    // `return` is control flow handled on the no-redirection path; with a
-    // redirection or in the background it never reaches that handler, so reject
-    // it rather than launch an external `return` while the body keeps running.
-    if argv[0] == "return" {
-        note!("mesh: return: cannot be redirected or backgrounded");
-        return Step::Continue(2);
     }
     // A redirected builtin runs in the shell like a redirected function: the
     // targets apply to the shell's own descriptors around the call, so there is
@@ -5131,18 +5131,17 @@ fn run_multi(
             // stringification for a list or map, so only the name goes into the
             // words a job listing echoes back.
             Ok(Expanded::Function { name, args }) => (vec![name], StageBody::Function(args)),
+            // `return` unwinds the enclosing function; it has no meaning as a
+            // pipeline stage, so reject it rather than launch an external `return`.
+            Ok(Expanded::Return(_)) => {
+                note!("mesh: return: cannot be used in a pipeline");
+                return Step::Continue(2);
+            }
             Err(step) => return step,
             Ok(Expanded::Argv(argv)) => {
                 if argv.is_empty() {
                     note!("mesh: empty command in a pipeline");
                     return Step::Continue(1);
-                }
-                // `return` unwinds the enclosing function; it has no meaning as a
-                // pipeline stage, so reject it rather than launch an external
-                // `return`.
-                if argv[0] == "return" {
-                    note!("mesh: return: cannot be used in a pipeline");
-                    return Step::Continue(2);
                 }
                 // `command NAME …` is the program `NAME`, so the stage is that
                 // program rather than a forked shell that runs it.
@@ -5331,15 +5330,16 @@ fn run_stage_in_shell(
             context,
         } => match expand_stage(words, *decoration, last, in_function, shell) {
             Ok(Expanded::Function { name, args }) => dispatch_function_call(&name, args, shell),
+            // `return` unwinds the enclosing function; it is not something a stage
+            // can run, and the eager paths refuse it in the same terms.
+            Ok(Expanded::Return(_)) => {
+                note!("mesh: {}", context.returning());
+                Step::Continue(2)
+            }
             Ok(Expanded::Argv(argv)) => {
                 if argv.is_empty() {
                     note!("mesh: {}", context.empty());
                     Step::Continue(1)
-                } else if argv[0] == "return" {
-                    // `return` unwinds the enclosing function; it is not something a
-                    // stage can run, and the eager paths refuse it in the same terms.
-                    note!("mesh: {}", context.returning());
-                    Step::Continue(2)
                 } else if let Some(program) = external_stage(&argv) {
                     // Replaces this process, so nothing below runs on success.
                     return exec::exec_stage(&program);
@@ -5494,6 +5494,11 @@ enum Expanded {
         name: String,
         args: Vec<(Value, bool)>,
     },
+    /// `return`, with its operand typed the way a function call's arguments are.
+    /// Resolved here for the same reason a function is: argv would flatten a list
+    /// or map on the way past, and a function's result is exactly where those have
+    /// to survive (`DESIGN.md` §"Result and `return`").
+    Return(Vec<(Value, bool)>),
     /// argv for a builtin or an external program.
     Argv(Vec<String>),
 }
@@ -5540,7 +5545,15 @@ fn expand_stage(
     // A word that expanded to several (a glob) or to none names no command; those
     // fall through to the plain argv rule, which reports what is wrong with them.
     let name = (argv.len() == 1).then(|| argv[0].clone());
-    if let Some(name) = name.clone().filter(|name| shell.funcs.get(name).is_some()) {
+    // A function's arguments and `return`'s operand take the same typed path: both
+    // become *values*, and argv is the boundary that would flatten a list or map on
+    // the way. A function can never be named `return` — definition rejects the word
+    // — so the two cannot both claim one stage.
+    let returning = name.as_deref() == Some("return");
+    let calling = name
+        .as_ref()
+        .is_some_and(|name| shell.funcs.get(name).is_some());
+    if returning || calling {
         let mut args = Vec::new();
         for word in rest {
             let word = expansion_word(word, last, in_function, shell)?;
@@ -5551,7 +5564,12 @@ fn expand_stage(
                 })?,
             );
         }
-        return Ok(Expanded::Function { name, args });
+        let name = name.expect("a named stage, since one of the two branches claimed it");
+        return Ok(if returning {
+            Expanded::Return(args)
+        } else {
+            Expanded::Function { name, args }
+        });
     }
     for word in rest {
         let word = expansion_word(word, last, in_function, shell)?;
@@ -5616,6 +5634,7 @@ fn run_command(tokens: &[parser::Word], last: u8, in_function: bool, shell: &mut
     // reorder the builtins → functions → external chain.
     match expand_stage(tokens, stdout_decoration(), last, in_function, shell) {
         Ok(Expanded::Function { name, args }) => dispatch_function_call(&name, args, shell),
+        Ok(Expanded::Return(args)) => make_return(args, shell),
         Ok(Expanded::Argv(words)) => run_expanded(words, last, shell),
         Err(step) => step,
     }
@@ -5817,6 +5836,11 @@ fn unknown_command_option(flag: &str) -> Step {
 /// help, the prompt and job-control builtins, then the builtin → external chain. A
 /// function has already been resolved by the caller, which still has its unexpanded
 /// words and so can keep its arguments typed.
+///
+/// `return` reaches here only from the one caller that has nothing but strings —
+/// `cmd(args):capture`, which expands into argv before it knows the name. Command
+/// position resolves it as [`Expanded::Return`] instead and keeps the operand
+/// typed, so a `return $xs` there carries the list rather than its text.
 fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     if words.is_empty() {
         // A command whose words all expanded away (e.g. a glob with no
@@ -5826,7 +5850,11 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     // `return` ends the enclosing function (a recoverable error at top
     // level; `run_line` decides which by `in_function`).
     if words[0] == "return" {
-        return make_return(&words[1..], shell);
+        let args = words[1..]
+            .iter()
+            .map(|word| (expand::typed_scalar(word), true))
+            .collect();
+        return make_return(args, shell);
     }
     // `command` is read before any of the resolution below, because everything
     // below is what it exists to skip — and because its arguments are another
@@ -6696,16 +6724,23 @@ fn run_prompt_hooks(event: PromptEvent, args: Vec<Value>, shell: &mut Shell) {
 }
 
 /// Build the [`Step::Return`] for a `return` command word: no argument uses the
-/// last status; a single argument is typed like any bare scalar (`7` → the
-/// integer `7`, `true`/`false` → booleans, else a string) and carried as the
-/// result, its status a view of that value. A surplus operand is reported and
-/// does not unwind (the function keeps running).
-fn make_return(args: &[String], shell: &Shell) -> Step {
-    match args {
+/// last status; a single argument is carried as the result, its status a view of
+/// that value. A surplus operand is reported and does not unwind (the function
+/// keeps running).
+///
+/// The operand arrives typed the way a function call's arguments do, so a bare
+/// `7` is the integer, `true`/`false` are booleans, and a list or map keeps its
+/// shape — `return $xs` carries the list. That is the same typing as the implicit
+/// last expression, which is the point: the two ways to leave a function must
+/// agree about what they carry, or `return` is a narrower channel than falling off
+/// the end. Quoting still separates `return 42` from `return "42"`, as everywhere
+/// else a value is typed from a word.
+fn make_return(args: Vec<(Value, bool)>, shell: &Shell) -> Step {
+    match <[_; 1]>::try_from(args) {
+        Ok([(value, _)]) => Step::Return(value),
         // Bare: the result so far (`DESIGN.md` §"Result and `return`").
-        [] => Step::Return(shell.result.clone()),
-        [value] => Step::Return(expand::typed_scalar(value)),
-        _ => {
+        Err(args) if args.is_empty() => Step::Return(shell.result.clone()),
+        Err(_) => {
             note!("mesh: return: too many arguments");
             Step::Continue(1)
         }
