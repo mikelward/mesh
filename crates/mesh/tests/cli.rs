@@ -18036,6 +18036,51 @@ fn an_argument_free_modifier_applies_to_a_literal_in_command_position() {
     );
 }
 
+/// An attached `:modifier` outranks keyword parsing. A keyword is claimed only as a
+/// *bare* word, so `if:upper` is a chain on the text `if`. The keyword arms return
+/// before the postfix loop, so without the guard `if` / `match` / `for` were syntax
+/// errors and `not:upper` was silently `false` — `not` took the negation and left
+/// `:upper` to fold away, which is the worst of the four because nothing reports it.
+#[test]
+fn an_attached_modifier_outranks_keyword_parsing() {
+    let out = run_with_input(
+        "a = if:upper\n\
+         b = not:upper\n\
+         c = for:upper\n\
+         d = match:upper\n\
+         puts $a $b $c $d\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "IF NOT FOR MATCH\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Command position too, where `if` / `unless` also lead a trailing guard: the
+    // chain wins, so `puts if:upper` is an argument rather than a guarded `puts`.
+    let out = run_with_input("puts if:upper\nputs unless:upper\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "IF\nUNLESS\n");
+    // The keywords and the guards are untouched — spacing is the signal, as it is
+    // wherever else a chain is recognized.
+    let out = run_with_input(
+        "if true { puts yes }\n\
+         x = if true { 1 } else { 2 }\n\
+         puts $x\n\
+         puts guarded if true\n\
+         puts skipped if false\n\
+         if :exists(\"Cargo.toml\") { puts found }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "yes\n1\nguarded\nfound\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A bare `:name` after a value is still literal text when it names no modifier,
 /// so recognizing an argument list cannot have changed `$host:$port`.
 #[test]
