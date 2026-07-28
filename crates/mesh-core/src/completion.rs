@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher};
 
-const CACHE_VERSION: &str = "mesh-completion-v5";
+const CACHE_VERSION: &str = "mesh-completion-v6";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ValueHint {
@@ -65,7 +65,8 @@ impl CompletionSpec {
             {
                 positional = Some(hint);
             }
-            let options = option_names(&tokens);
+            let declared: Vec<_> = declaration(trimmed).split_whitespace().collect();
+            let options = option_names(&declared);
             if let Some(pending) = &mut pending_values {
                 match pending {
                     PendingValues::Described { .. } if trimmed.is_empty() => continue,
@@ -131,7 +132,7 @@ impl CompletionSpec {
                         values: enum_values,
                     });
                 }
-            } else if let Some(hint) = value_hint(&tokens) {
+            } else if let Some(hint) = value_hint(&declared) {
                 for option in &options {
                     values.insert(option.clone(), hint.clone());
                 }
@@ -368,6 +369,51 @@ fn command_names(entry: &str) -> Vec<String> {
             return names;
         }
     }
+}
+
+/// The part of a line that *declares* options, with any description dropped.
+///
+/// An option entry names its flags first and describes them after a two-space or
+/// tab gap — the same boundary `command_names` reads a table entry by. Scanning
+/// the description too offers whatever the prose happens to mention: `ls --help`
+/// writes "with `-l`, print the author of each file" under `--author` and "with
+/// `-lt`: sort by, and show, ctime" under `-c`, so `-lt` became a flag you could
+/// complete even though `ls` declares no such option.
+///
+/// A gap only ends the declaration when a description follows it. Help that
+/// aligns its short and long forms in columns puts one *between* them —
+/// `-h<TAB><TAB><TAB>--help` — so cutting at the first gap would keep `-h` and
+/// throw the alias away. Every gap-separated column that declares an option
+/// stays; the first one that does not is where the description begins.
+///
+/// A line that does not lead with an option is left whole. A usage line spreads
+/// its flags across the full width (`usage: git [-v | --version] [-C <path>]`)
+/// and separates them by single spaces, so it has no description to cut.
+fn declaration(trimmed: &str) -> &str {
+    if !declares_option(trimmed) {
+        return trimmed;
+    }
+    let mut kept = 0;
+    let mut rest = trimmed;
+    loop {
+        let Some(gap) = rest.find('\t').into_iter().chain(rest.find("  ")).min() else {
+            return trimmed;
+        };
+        let next = rest[gap..].trim_start();
+        if !declares_option(next) {
+            return &trimmed[..kept + gap];
+        }
+        kept += rest.len() - next.len();
+        rest = next;
+    }
+}
+
+/// Whether text begins by naming an option, looking past the bracket a usage
+/// line wraps an optional flag in.
+fn declares_option(text: &str) -> bool {
+    text.split_whitespace()
+        .next()
+        .is_some_and(|token| token.trim_start_matches(['[', '(']).starts_with('-'))
 }
 
 fn option_names(tokens: &[&str]) -> Vec<String> {
@@ -1073,6 +1119,50 @@ mod tests {
         assert_eq!(spec.value_hint("--quiet"), None);
     }
 
+    #[test]
+    fn columns_of_aligned_options_all_belong_to_the_declaration() {
+        // Help that lines its long forms up in a column separates them from the
+        // short form by the same gap that ends a declaration. Cutting at the
+        // first one would offer `-h` and lose `--help` with it.
+        let spec = CompletionSpec::from_help(concat!(
+            "Options:\n",
+            "\t-h\t\t\t--help\n",
+            "\t-V\t\t\t--version\n",
+            "\t-f progfile\t\t--file=progfile\tread the program from there\n",
+        ));
+
+        assert_eq!(
+            spec.matching("-"),
+            ["--file", "--help", "--version", "-V", "-f", "-h"]
+        );
+        // The description still ends the declaration once a column stops
+        // declaring options — `read the program from there` types nothing.
+        assert_eq!(spec.value_hint("--file"), None);
+    }
+
+    #[test]
+    fn an_entrys_description_declares_nothing() {
+        let spec = CompletionSpec::from_help(concat!(
+            "usage: prog [-p | --paginate] <command>\n",
+            "\n",
+            "Options:\n",
+            "  -v, --verbose      louder, unlike -q\n",
+            "      --out=<FILE>    write there; see --help for -1 style output\n",
+            "  -c                  sort by ctime, and show <FILE> mtime\n",
+        ));
+
+        // The declaration on each entry, and the usage line's flags — a usage
+        // line spreads its options across the whole width, so it is read whole.
+        assert_eq!(
+            spec.matching("-"),
+            ["--out", "--paginate", "--verbose", "-c", "-p", "-v"]
+        );
+        // A value type comes from the declaration too: `--out` keeps the one it
+        // declares, and `-c` gains nothing from the metavar in its prose.
+        assert_eq!(spec.value_hint("--out"), Some(&ValueHint::File));
+        assert_eq!(spec.value_hint("-c"), None);
+    }
+
     /// Specs parsed from **real** `--help` output, captured verbatim under
     /// `tests/help/` — see the README there for the commands and versions, and
     /// for how to re-capture. Hand-written help exercises one parsing rule at a
@@ -1209,6 +1299,26 @@ mod tests {
             // nothing but options is on offer.
             assert!(spec.matching("a").is_empty());
             assert!(spec.matching("").iter().all(|value| value.starts_with('-')));
+        }
+
+        #[test]
+        fn ls_offers_no_options_its_descriptions_merely_mention() {
+            let spec = CompletionSpec::from_help(LS);
+            let options = spec.matching("-");
+
+            // `ls` describes `-c` as "with -lt: sort by, and show, ctime" and
+            // `--author` as "with -l, print the author of each file". Reading the
+            // description as more declarations offered `-lt`, which `ls` has no
+            // such option for.
+            assert!(
+                !options.contains(&"-lt".to_owned()),
+                "-lt is prose, not a declared option"
+            );
+            // The flags those sentences point at are still on offer, because
+            // `ls` declares them on their own entries.
+            for declared in ["-c", "-l", "--author"] {
+                assert!(options.contains(&declared.to_owned()), "missing {declared}");
+            }
         }
     }
 
