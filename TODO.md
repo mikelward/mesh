@@ -264,7 +264,23 @@ file as tasks land.
       under `crates/mesh-core/tests/help/`.
 - [x] Complete a `PAGE` operand from the installed manual — `man l<Tab>` offers
       pages, not the current directory's files.
-- [ ] Load curated completion specs, then add man-page-derived specs.
+- [x] Load curated completion specs — `$XDG_DATA_HOME/mesh/completions/`, named
+      the way the manual names the same thing (`git`, `git-commit`), so a
+      subcommand's spec sits beside its command's. Read before anything is
+      resolved or run, so one holds for a command that is not on `PATH` at all,
+      and read afresh each time rather than cached, so editing one takes effect
+      at the next Tab. Its own line-based format rather than the `--help` parser:
+      a curated spec exists for when the heuristic guess was wrong, so it says
+      its value types instead of having them inferred from a metavar. A file that
+      says nothing falls through to the generated spec rather than answering with
+      an empty one. A command word is a file name, never a path — one with a
+      separator in it is refused rather than joined.
+- [ ] Add man-page-derived specs, the layer between curated and the `--help`
+      probe: parse the page for the *resolved* executable when it can be
+      associated with it, keyed by the selected page's path and mtime plus the
+      `MANPATH` / locale that selected it. Needs no execution, so `DESIGN.md`
+      prefers it to the probe; a system page is not trusted for a
+      `PATH`-shadowing local binary, which falls through to the probe instead.
 - [ ] Expose static and dynamic completion overrides through `$sh.complete`.
 
 ## Beyond M3 — The environment

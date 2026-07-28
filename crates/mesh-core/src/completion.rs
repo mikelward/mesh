@@ -171,6 +171,57 @@ impl CompletionSpec {
         }
     }
 
+    /// A spec the user wrote by hand.
+    ///
+    /// The generated sources read whatever a program happens to print, so they
+    /// are heuristic by nature. A curated spec exists for when that guess was
+    /// wrong, which means it has to *say* things rather than have them inferred:
+    /// one candidate per line, and a value type spelled out rather than deduced
+    /// from a metavar's name.
+    ///
+    /// ```text
+    /// # mesh completions for demo
+    /// --verbose
+    /// --output file
+    /// --color auto|always|never
+    /// build
+    /// positional dir
+    /// ```
+    ///
+    /// A line naming no candidate is skipped rather than failing the file: a
+    /// spec that mostly works beats one the shell refuses to load at a prompt,
+    /// where there is nowhere good to report it.
+    fn parse_curated(text: &str) -> Option<Self> {
+        let mut spec = Self::default();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (name, rest) = match line.split_once(char::is_whitespace) {
+                Some((name, rest)) => (name, rest.trim()),
+                None => (line, ""),
+            };
+            let hint = (!rest.is_empty()).then(|| curated_hint(rest));
+            if name == "positional" {
+                spec.positional = hint;
+                continue;
+            }
+            spec.candidates.push(name.to_owned());
+            if let Some(hint) = hint {
+                spec.values.insert(name.to_owned(), hint);
+            }
+        }
+        // An empty file says nothing, and answering with an empty spec would
+        // suppress the generated one rather than override it.
+        if spec.candidates.is_empty() && spec.positional.is_none() {
+            return None;
+        }
+        spec.candidates.sort();
+        spec.candidates.dedup();
+        Some(spec)
+    }
+
     pub(crate) fn matching(&self, prefix: &str) -> Vec<String> {
         let candidates = self
             .candidates
@@ -634,19 +685,39 @@ impl From<&str> for CompletionSpec {
 #[derive(Debug)]
 pub(crate) struct CompletionCache {
     directory: Option<PathBuf>,
+    curated: Option<PathBuf>,
     memory: Mutex<HashMap<String, CompletionSpec>>,
 }
 
 impl Default for CompletionCache {
     fn default() -> Self {
-        Self::new(cache_directory())
+        Self {
+            directory: cache_directory(),
+            curated: curated_directory(),
+            memory: Mutex::new(HashMap::new()),
+        }
     }
 }
 
 impl CompletionCache {
+    /// A cache with no curated directory behind it, which is what a test of the
+    /// generated path wants: the user's own `~/.local/share` must not decide
+    /// what it sees. Outside a test the only constructor is `Default`, which
+    /// reads both directories from the environment.
+    #[cfg(test)]
     pub(crate) fn new(directory: Option<PathBuf>) -> Self {
         Self {
             directory,
+            curated: None,
+            memory: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_curated(curated: Option<PathBuf>, directory: Option<PathBuf>) -> Self {
+        Self {
+            directory,
+            curated,
             memory: Mutex::new(HashMap::new()),
         }
     }
@@ -655,6 +726,13 @@ impl CompletionCache {
         let Some((command, args)) = words.split_first() else {
             return CompletionSpec::default();
         };
+        // A curated spec is the user's own answer, so it is read before anything
+        // is resolved or run — it holds for a command that is not on `PATH` at
+        // all, and it is read afresh every time rather than cached, so editing
+        // one takes effect at the next Tab.
+        if let Some(spec) = self.curated_spec(words) {
+            return spec;
+        }
         let Some(executable) = resolve_command(command) else {
             return CompletionSpec::default();
         };
@@ -696,6 +774,25 @@ impl CompletionCache {
         spec
     }
 
+    /// The curated spec for these words, if the user wrote one.
+    ///
+    /// Named the way the manual names the same thing — `git`, `git-commit` — so
+    /// a spec for a subcommand sits beside the one for its command instead of
+    /// needing a directory per command. A name with a separator in it is refused
+    /// rather than joined, so a command word can never reach outside the
+    /// directory.
+    fn curated_spec(&self, words: &[String]) -> Option<CompletionSpec> {
+        let directory = self.curated.as_ref()?;
+        if words
+            .iter()
+            .any(|word| word.is_empty() || word.contains('/') || word == "." || word == "..")
+        {
+            return None;
+        }
+        let path = directory.join(words.join("-"));
+        CompletionSpec::parse_curated(&fs::read_to_string(path).ok()?)
+    }
+
     fn remember(&self, fingerprint: String, spec: CompletionSpec) {
         self.memory
             .lock()
@@ -722,6 +819,37 @@ impl CompletionCache {
         }
         let _ = fs::remove_file(temporary);
     }
+}
+
+/// The value type a curated line spells out.
+///
+/// The four names are the value types a spec can hold; anything else is read as
+/// a list of literal values, so `auto|always|never` and a single fixed word both
+/// mean what they look like.
+fn curated_hint(text: &str) -> ValueHint {
+    match text {
+        "file" => ValueHint::File,
+        "dir" | "directory" => ValueHint::Directory,
+        "page" | "manpage" => ValueHint::ManPage,
+        _ => ValueHint::Enum(
+            text.split('|')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        ),
+    }
+}
+
+/// Where a hand-written spec goes: data rather than cache, since nothing
+/// regenerates it and losing it loses the user's work.
+fn curated_directory() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("XDG_DATA_HOME").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path).join("mesh/completions"));
+    }
+    env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(path).join(".local/share/mesh/completions"))
 }
 
 fn cache_directory() -> Option<PathBuf> {
@@ -1122,6 +1250,112 @@ mod tests {
 
         assert_eq!(spec.positional_hint(), Some(&ValueHint::File));
         assert_eq!(spec.value_hint("--quiet"), None);
+    }
+
+    #[test]
+    fn a_curated_spec_says_its_candidates_and_their_types() {
+        let spec = CompletionSpec::parse_curated(concat!(
+            "# mesh completions for demo\n",
+            "\n",
+            "--verbose\n",
+            "--output file          # where to write\n",
+            "--into dir\n",
+            "--color auto|always|never\n",
+            "--page page\n",
+            "build\n",
+            "positional dir\n",
+        ))
+        .expect("a spec");
+
+        assert_eq!(
+            spec.matching("-"),
+            ["--color", "--into", "--output", "--page", "--verbose"]
+        );
+        assert_eq!(spec.matching("b"), ["build"]);
+        assert_eq!(spec.value_hint("--output"), Some(&ValueHint::File));
+        assert_eq!(spec.value_hint("--into"), Some(&ValueHint::Directory));
+        assert_eq!(spec.value_hint("--page"), Some(&ValueHint::ManPage));
+        assert_eq!(
+            spec.value_hint("--color"),
+            Some(&ValueHint::Enum(vec![
+                "auto".into(),
+                "always".into(),
+                "never".into()
+            ]))
+        );
+        assert_eq!(spec.value_hint("--verbose"), None);
+        assert_eq!(spec.positional_hint(), Some(&ValueHint::Directory));
+    }
+
+    #[test]
+    fn a_curated_file_that_says_nothing_does_not_override() {
+        // Empty or comments-only must fall through to the generated spec rather
+        // than answer with nothing, which would look like "this command has no
+        // completions" instead of "no one curated it".
+        assert!(CompletionSpec::parse_curated("").is_none());
+        assert!(CompletionSpec::parse_curated("# just a note\n\n").is_none());
+        // A positional alone is a real answer, even with no candidates.
+        assert!(CompletionSpec::parse_curated("positional file\n").is_some());
+    }
+
+    #[test]
+    fn a_curated_spec_outranks_the_probe_and_needs_no_executable() {
+        let root = fresh_temp_dir("mesh-curated");
+        let curated = root.join("curated");
+        fs::create_dir_all(&curated).unwrap();
+        let command = root.join("helper");
+        helper(&command, "echo '  --probed  from the probe'");
+
+        // Named for the command as typed, so the curated spec answers even
+        // though the words name a path the probe would otherwise run.
+        fs::write(curated.join("nothing-on-path"), "--curated\n").unwrap();
+        let cache = CompletionCache::with_curated(Some(curated), Some(root.join("cache")));
+
+        let spec = cache.spec_for(&["nothing-on-path".to_owned()]);
+        assert_eq!(spec.matching("-"), ["--curated"]);
+
+        // A command with no curated file still reaches the probe.
+        let probed = cache.spec_for(&[command.to_string_lossy().into_owned()]);
+        assert_eq!(probed.matching("-"), ["--probed"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_curated_subcommand_spec_sits_beside_its_command() {
+        let root = fresh_temp_dir("mesh-curated-sub");
+        let curated = root.join("curated");
+        fs::create_dir_all(&curated).unwrap();
+        fs::write(curated.join("demo"), "build\n").unwrap();
+        fs::write(curated.join("demo-build"), "--release\n").unwrap();
+        let cache = CompletionCache::with_curated(Some(curated), None);
+
+        assert_eq!(cache.spec_for(&["demo".to_owned()]).matching(""), ["build"]);
+        assert_eq!(
+            cache
+                .spec_for(&["demo".to_owned(), "build".to_owned()])
+                .matching("-"),
+            ["--release"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_curated_lookup_cannot_leave_its_directory() {
+        let root = fresh_temp_dir("mesh-curated-escape");
+        let curated = root.join("curated");
+        fs::create_dir_all(&curated).unwrap();
+        fs::write(root.join("outside"), "--reached\n").unwrap();
+        let cache = CompletionCache::with_curated(Some(curated), None);
+
+        // A command word is a file name here, never a path: joining one with a
+        // separator in it would read a spec from wherever it pointed.
+        for word in ["../outside", "..", ".", "/etc/passwd"] {
+            assert!(
+                cache.spec_for(&[word.to_owned()]).matching("").is_empty(),
+                "{word} reached a spec"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
