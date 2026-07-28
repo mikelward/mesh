@@ -11493,6 +11493,167 @@ fn an_unknown_flag_is_a_loud_error() {
 }
 
 #[test]
+fn a_wrapper_func_forwards_an_undeclared_flag_instead_of_rejecting_it() {
+    // The whole point of the marker: a wrapper does not know the callee's
+    // grammar, so it cannot validate what it forwards. Validity is *relocated*
+    // to the wrapped call, not dropped (`DESIGN.md` §"Functions").
+    let out = run_with_input("wrapper func g(...xs) { puts $xs:repr }\ng --color=never -a x\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "['--color=never', '-a', 'x']\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_wrapper_func_forwards_help_rather_than_answering_it() {
+    // `g --help` has to reach whatever `g` wraps; answering with mesh's
+    // generated help would hide the callee's own.
+    let out = run_with_input("wrapper func g(...xs) { puts $xs:repr }\ng --help\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "['--help']\n");
+    // A plain `func` still gets the canned help, so the marker is what changed.
+    let plain = run_with_input("func g(...xs) { puts $xs:repr }\ng --help\n");
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains("Usage:"),
+        "{:?}",
+        String::from_utf8_lossy(&plain.stdout)
+    );
+}
+
+#[test]
+fn a_wrapper_func_forwards_the_terminator_too() {
+    // `--` is data to a wrapper: the callee may need it (`grep -- -x`), and a
+    // wrapper that ate it would change the command it forwards.
+    let out = run_with_input("wrapper func g(...xs) { puts $xs:repr }\ng -- --x\ng a -- b\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "['--', '--x']\n['a', '--', 'b']\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_wrapper_func_still_binds_its_positionals() {
+    // Disabling flag parsing is not disabling the signature: arity still holds,
+    // and a leading positional still binds before the rest collects.
+    let out = run_with_input(
+        "wrapper func g(first, ...rest) { puts $first\nputs $rest:repr }\ng --a --b c\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "--a\n['--b', 'c']\n");
+    let short = run_with_input("wrapper func g(a, b) { puts ok }\ng only\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&short.stderr).contains("expected 2 argument(s), got 1"),
+        "{:?}",
+        String::from_utf8_lossy(&short.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&short.stdout), "after\n");
+}
+
+#[test]
+fn wrapper_is_contextual_not_reserved() {
+    // Like `fork`, `wrapper` leads a definition only where `func` follows it, so
+    // the word is still free as a variable, a function name, and a command.
+    let out =
+        run_with_input("wrapper = 1\nputs $wrapper\nfunc wrapper() { puts called }\nwrapper\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\ncalled\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn type_reports_a_wrapper_as_it_was_written() {
+    // How a function treats a `--flag` is the part of its contract a caller most
+    // needs to know, so `type` shows the marker rather than hiding it.
+    let out = run_with_input("wrapper func g(...xs) { puts hi }\ntype g\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "g is a function\n    wrapper func g(...xs)\n"
+    );
+}
+
+#[test]
+fn a_wrapper_func_forwards_flags_in_a_value_call_too() {
+    // The two call spellings are the same call, so the marker has to hold in both:
+    // a value-mode `g(--color=never)` used to scan the token as an option and fail
+    // on a flag the wrapper never declared.
+    let out = run_with_input(
+        "wrapper func g(...xs) { return $xs }\nputs g(--color=never, --, --help):repr\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "['--color=never', '--', '--help']\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_plain_func_still_scans_flags_in_a_value_call() {
+    // The gate is the marker, not the call form: without `wrapper`, an undeclared
+    // flag is still the caller's mistake.
+    let out = run_with_input("func g(...xs) { return $xs }\nputs g(--color=never):repr\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown flag `--color`"),
+        "{:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_malformed_wrapper_header_quarantines_its_body() {
+    // The reader judges a function header by scanning braces, and it has to see
+    // the marked form as a header too: otherwise a typo dispatched the header on
+    // the spot and the body's commands ran at top level.
+    let out = run_with_input("wrapper func f(') {\nputs LEAKED\n}\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("LEAKED"), "{stdout}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unclosed"),
+        "{:?}",
+        out.stderr
+    );
+    // The plain spelling is the behavior being matched.
+    let plain = run_with_input("func f(') {\nputs LEAKED\n}\n");
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout),
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn a_multiline_wrapper_body_still_reads_to_its_close() {
+    // The counterpart: a well-formed wrapper written across lines must keep
+    // buffering rather than dispatching at the first newline.
+    let out = run_with_input("wrapper func g(...xs) {\nputs ok ...$xs\n}\ng --a b\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok --a b\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_wrapper_cannot_declare_a_flag_of_its_own() {
+    // The marker says the function parses no flags, so declaring one is a
+    // contradiction: help would list it and completion offer it while every
+    // command-position `--force` went to `...rest`.
+    let out = run_with_input("wrapper func g(--force, ...xs) { puts hi }\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot declare `--force`"), "{stderr}");
+    // A plain `func` is unaffected.
+    let ok = run_with_input("func p(--force, ...xs) { puts $force:repr }\np --force\n");
+    assert_eq!(String::from_utf8_lossy(&ok.stdout), "true\n");
+}
+
+#[test]
+fn help_explains_the_wrapper_marker() {
+    // A word the parser takes and `help` does not know is a reader being told,
+    // falsely, that the word they just used is not syntax.
+    let out = run_with_input("help wrapper\n");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("wrapper func NAME(…ARGS) { … }"),
+        "{:?}",
+        out.stdout
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
 fn a_valued_flag_without_a_value_is_an_error() {
     let out = run_with_input("func f(--tag = d) { puts $tag }\nf --tag\nputs after\n");
     let stderr = String::from_utf8_lossy(&out.stderr);

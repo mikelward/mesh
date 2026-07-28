@@ -388,7 +388,10 @@ fn signature(name: &str, def: &FuncDef) -> String {
             ParamKind::Rest => format!("...{}", param.name),
         })
         .collect();
-    format!("func {name}({})", params.join(", "))
+    // A wrapper is reported as it was written: how it treats a `--flag` is the
+    // part of its contract a caller most needs to know.
+    let lead = if def.wrapper { "wrapper func" } else { "func" };
+    format!("{lead} {name}({})", params.join(", "))
 }
 
 /// Every executable `name` names on `PATH`, in `PATH` order, so the first is the
@@ -672,6 +675,7 @@ mod tests {
                     },
                 ],
                 body: body(),
+                wrapper: false,
             },
         );
         let found = look_up("deploy", &funcs, &Vars::new());
@@ -888,6 +892,7 @@ mod tests {
             FuncDef {
                 params: Vec::new(),
                 body: body(),
+                wrapper: false,
             },
         );
         let found = look_up("fork", &funcs, &Vars::new());

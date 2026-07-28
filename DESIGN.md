@@ -2421,22 +2421,36 @@ syntax above.
 *(TODO: **wrappers, forwarding, and dynamic definition.** [No aliases](#built-ins)
 is *decided* — a `func` replaces `alias ll`. But real configs still need things a
 plain `func` doesn't yet give cleanly; these are open:*
-  - *A **terse forwarding wrapper.** Even `func co(...args) { vcs checkout ...$args }`
-    is not a fully transparent baseline: under the settled function rules an
+  - *A **terse forwarding wrapper.** ~~Open.~~ **Settled, and built:
+    [`wrapper func`](#functions).** Even `func co(...args) { vcs checkout ...$args }`
+    was not a fully transparent baseline: under the settled function rules an
     **undeclared long flag** (`co --amend`) is rejected before `...args` can collect
-    it, so the caller would need an explicit `--` — the same trap nushell hits, where
+    it, so the caller needed an explicit `--` — the same trap nushell hits, where
     a plain `def` wrapper rejects `co -m msg` as an "unknown flag" unless it uses
-    `def --wrapped`. So the open work is a shorthand — `wrap co = vcs checkout`, or a
-    loop-friendly definer over `$(vcs --list-commands)` — that **disables the
-    wrapper's own flag parsing and forwards every argument verbatim**, which a plain
-    `...args` `func` does not do today. *Decided (porting the ssh/vcs wrappers): a
+    `def --wrapped`. *Decided (porting the ssh/vcs wrappers): a
     wrapper **cannot** validate the flags it forwards — it does not know the callee's
     grammar — so a passthrough wrapper forwards unknown flags **verbatim** and
     validity is enforced at the **wrapped call**: the wrapped in-shell `func`'s own
     signature rejects a bad flag (a loud error* there*), or the external program
     rejects it itself. Disabling the wrapper's flag parsing therefore does not drop
-    the check, it **relocates** it to where the grammar is known. Still open: only the
-    surface — `wrap`, a `--wrapped` marker, or a passthrough-tagged `...rest`.*
+    the check, it **relocates** it to where the grammar is known.*
+
+    *The surface is a **prefix marker**, `wrapper func name(…) { … }`, for the same
+    reason `fork func` is spelled that way: a word before `func` is already how a
+    definition's properties are marked here, so nushell's `--wrapped` would have been
+    importing a spelling that follows from `def` being a command rather than a
+    keyword. `wrapped` was rejected on its own terms too — it is an adjective
+    describing the **callee**, and the callee is not what the marker sits on.*
+
+    *Still to come: the **shorthand**. `wrapper func co(...args) { vcs checkout
+    ...$args }` is transparent but not terse, and the everyday case is a name plus a
+    command prefix. That gets its own spelling — **`alias co = vcs checkout`**,
+    sugar over the marker rather than a competing mechanism — which also carries the
+    loop-friendly definer over `$(vcs --list-commands)` that the dynamic-definition
+    note below wants. Reusing the word `alias` needs the "No aliases" text under
+    [Built-ins](#built-ins) reworded: what is being dropped is the alias
+    **mechanism** — parse-time textual expansion, its own resolution stage — not the
+    familiar name for "give this command a shorter one."*
   - ***Running a wrapper under `sudo` / `xargs` / `watch`.** Because mesh commands
     are functions, not aliases or `PATH` binaries, `sudo ll` can't see `ll` — bash
     papers over this with the invisible `alias sudo='sudo '` trailing-space trick.

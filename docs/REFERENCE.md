@@ -2310,6 +2310,39 @@ greet world          # -> hi, world
     even if it begins with `--`.
   - **Defaults** are evaluated at call time, in the call's fresh scope, only when
     the parameter is omitted.
+- **`wrapper func`** — a function that parses **no flags of its own**. Every
+  argument reaches its positionals and `...rest` verbatim: an undeclared
+  `--flag`, a bare `--`, and `--help` alike.
+
+  ```mesh
+  wrapper func g(...args) { command grep --line-number ...$args }
+  g --color=never pattern file    # both flags reach grep
+  g --help                        # grep's help, not mesh's
+  ```
+
+  This is what a forwarding wrapper needs and a plain `func` cannot give: an
+  undeclared long flag is otherwise rejected before `...args` can collect it, so
+  every wrapper would need an explicit `--`. A wrapper **cannot validate what it
+  forwards** — it does not know the callee's grammar — so the check is
+  *relocated* rather than dropped: the wrapped in-shell function's own signature
+  rejects a bad flag, or the external program does.
+
+  Everything else about the signature still holds — arity is checked, and
+  positionals bind before `...rest` collects the remainder. Only the reading of
+  `--`-leading words changes, and it changes in **both call forms**: a value call
+  `g(--color=never)` forwards the token exactly as command position does. A
+  `key: value` argument is unaffected — that is the caller naming a parameter,
+  not a flag being passed through.
+
+  A wrapper **cannot declare a `--flag`** — `wrapper func g(--force, …)` is a
+  syntax error. The two statements contradict each other, and the visible
+  consequence would be help and completion advertising a flag that every call
+  forwards to `...rest`. For the same reason a wrapper advertises no options at
+  all: `g --<Tab>` offers nothing, and there is no generated `--help`.
+
+  `wrapper` is **contextual, not reserved**: it leads a definition only where
+  `func` follows it, so the word is still free as a variable, a function name,
+  and a command. It does not combine with `fork func`.
 - **Body.** May span multiple lines; the shell keeps reading until the `{ … }`
   braces balance. Interactively, the continuation prompt is `...`.
 - **Scope.** Each call gets a fresh **function-local** scope: `x = 5` in a body

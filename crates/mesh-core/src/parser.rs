@@ -246,6 +246,11 @@ pub enum ParseErrorKind {
     Expected(&'static str),
     ReservedParameter(String),
     ReservedFunctionName(String),
+    /// A `wrapper func` that declares a `--flag`. The marker's whole content is
+    /// "parses no flags of its own", so the two cannot both be true: the flag
+    /// would be listed in help and offered by completion while every
+    /// command-position `--flag` went straight to `...rest` instead.
+    WrapperDeclaresFlag(String),
     /// A value argument with text glued to it — `pre$(x)post`, `f()x`. Its own
     /// variant because the fix a reader needs is a *spelling*, not a rethink: the
     /// message names both, and it keeps this the loud error it was before value
@@ -359,6 +364,11 @@ impl std::fmt::Display for ParseError {
                     "syntax error: `{name}` is a built-in value call and cannot be a function name"
                 )
             }
+            ParseErrorKind::WrapperDeclaresFlag(name) => write!(
+                f,
+                "syntax error: a `wrapper func` parses no flags, so it cannot declare \
+                 `--{name}`; drop the marker, or take the flag through `...rest`"
+            ),
             ParseErrorKind::DuplicateParameter(name) => {
                 write!(f, "syntax error: duplicate parameter `{name}`")
             }
@@ -479,6 +489,12 @@ pub enum Executable {
         name: String,
         parameters: Vec<Param>,
         body: Source,
+        /// `wrapper func name(…) { … }` — the function parses no flags of its
+        /// own, so every argument reaches its positionals and `...rest`
+        /// verbatim. A wrapper cannot validate what it forwards, because it does
+        /// not know the callee's grammar; the check is *relocated* to the
+        /// wrapped call rather than dropped (`DESIGN.md` §"Functions").
+        wrapper: bool,
     },
     If(IfExpr),
     Match(MatchExpr),
@@ -561,6 +577,12 @@ impl ParamKind {
             ParamKind::Rest => OrderClass::Rest,
             ParamKind::Switch | ParamKind::Flag(_) => OrderClass::Independent,
         }
+    }
+
+    /// Is this a declared `--flag` — a switch or a valued flag — rather than a
+    /// positional or `...rest`?
+    pub fn is_option(&self) -> bool {
+        matches!(self, ParamKind::Switch | ParamKind::Flag(_))
     }
 }
 
@@ -2040,13 +2062,20 @@ impl Parser {
     }
 
     fn executable(&mut self) -> Result<Executable, ParseError> {
+        // Contextual, like `fork`: `wrapper` leads a definition only where `func`
+        // follows it, so a command or variable of that name is still reachable as
+        // `wrapper`, `wrapper --flag`, or `wrapper = 1`.
+        if self.word("wrapper") && self.word_at(1, "func") {
+            self.take_word("wrapper");
+            return self.function(true);
+        }
         if self.word("func")
             && !self
                 .tokens
                 .get(self.position + 1)
                 .is_some_and(|token| matches!(token.value, TokenKind::LParen))
         {
-            return self.function();
+            return self.function(false);
         }
         if self.word("if") {
             return Ok(Executable::If(self.if_expr()?));
@@ -2524,7 +2553,7 @@ impl Parser {
         }))
     }
 
-    fn function(&mut self) -> Result<Executable, ParseError> {
+    fn function(&mut self, wrapper: bool) -> Result<Executable, ParseError> {
         self.take_word("func");
         let name = self.name()?;
         // `re(...)`, `style(...)` and the `glob` family answer with a built-in value.
@@ -2536,12 +2565,19 @@ impl Parser {
             return Err(self.error(ParseErrorKind::ReservedFunctionName(name)));
         }
         let parameters = self.parameters()?;
+        // "Parses no flags of its own" is the whole content of the marker, so a
+        // declared flag contradicts it: help would list the flag and completion
+        // offer it while every command-position `--flag` went to `...rest`.
+        if wrapper && let Some(flag) = parameters.iter().find(|p| p.kind.is_option()) {
+            return Err(self.error(ParseErrorKind::WrapperDeclaresFlag(flag.name.clone())));
+        }
         self.newlines();
         let body = self.block()?;
         Ok(Executable::Function {
             name,
             parameters,
             body,
+            wrapper,
         })
     }
 
@@ -4540,6 +4576,15 @@ impl Parser {
     fn word(&self, expected: &str) -> bool {
         matches!(self.peek().map(|t| &t.value), Some(TokenKind::Word(word)) if word.is_bare_text(expected))
     }
+    /// Is the token `offset` ahead the bare word `expected`? The lookahead a
+    /// two-word lead-in needs (`wrapper func`), where [`word`](Self::word) only
+    /// sees the cursor.
+    fn word_at(&self, offset: usize, expected: &str) -> bool {
+        matches!(
+            self.tokens.get(self.position + offset).map(|t| &t.value),
+            Some(TokenKind::Word(word)) if word.is_bare_text(expected)
+        )
+    }
     /// Is the cursor on a bare identifier with an **attached** `:` — a map key?
     ///
     /// Narrow on purpose: only a bare word qualifies, so a quoted, expanded or
@@ -4968,6 +5013,32 @@ mod tests {
         };
         assert_eq!(pipeline.stages.len(), 2);
         assert_eq!(pipeline.pipe_stderr, vec![true]);
+    }
+
+    #[test]
+    fn parses_the_wrapper_marker_only_before_func() {
+        // Contextual, like `fork`: the word leads a definition only where `func`
+        // follows it, so an ordinary command or assignment of that name is
+        // untouched.
+        let tree = complete("wrapper func g(...xs) { puts hi }");
+        let Executable::Function { wrapper, name, .. } = &tree.statements[0].and_or.first else {
+            panic!("expected a function definition")
+        };
+        assert!(wrapper);
+        assert_eq!(name, "g");
+
+        let plain = complete("func g(...xs) { puts hi }");
+        let Executable::Function { wrapper, .. } = &plain.statements[0].and_or.first else {
+            panic!("expected a function definition")
+        };
+        assert!(!wrapper);
+
+        // A bare `wrapper` is still a command word, not a malformed definition.
+        let command = complete("wrapper --flag x");
+        assert!(matches!(
+            command.statements[0].and_or.first,
+            Executable::Pipeline(_)
+        ));
     }
 
     #[test]

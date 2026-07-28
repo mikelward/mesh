@@ -416,6 +416,11 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
         "Define a function; call it by name",
     ),
     (
+        &["wrapper"],
+        "wrapper func NAME(…ARGS) { … }",
+        "Define a function that parses no flags of its own",
+    ),
+    (
         &["return"],
         "return [VALUE]",
         "Leave a function, or a sourced file",
@@ -450,8 +455,8 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
 /// word is unavailable: `fork`, `unless`, `and` are all legal function names.
 /// For "does a bare one do something", see [`COMMAND_KEYWORDS`].
 pub(crate) const SYNTAX_WORDS: &[&str] = &[
-    "func", "return", "if", "else", "unless", "match", "for", "in", "while", "loop", "break",
-    "continue", "fork", "global", "unset", "export", "not", "and", "or",
+    "func", "wrapper", "return", "if", "else", "unless", "match", "for", "in", "while", "loop",
+    "break", "continue", "fork", "global", "unset", "export", "not", "and", "or",
     // The built-in *value* names, reserved as function names by the same parser
     // check but reached as value calls rather than in command position.
     "re", "style", "link", "glob", "files", "dirs",
@@ -1586,7 +1591,7 @@ mod tests {
         // follows it, so a bare one is an ordinary command word — legal as a
         // function name, and `command not found` when nothing defines it. Treating
         // these as keywords made `whence fork` outrank a real `func fork()`.
-        for contextual in ["fork", "unless", "else", "and", "or", "in"] {
+        for contextual in ["fork", "wrapper", "unless", "else", "and", "or", "in"] {
             assert!(SYNTAX_WORDS.contains(&contextual), "{contextual}");
             assert!(!is_command_keyword(contextual), "{contextual}");
         }
