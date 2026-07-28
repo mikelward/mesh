@@ -158,6 +158,25 @@ impl Word {
         }
     }
 
+    /// The `bool` this word spells, under exactly [`bare_integer`]'s rule: a single
+    /// bare run of text, so `"true"` and `tr\ue` stay strings and reach a program of
+    /// that name.
+    fn bare_boolean(&self) -> Option<bool> {
+        match self.pieces.as_slice() {
+            [
+                WordPiece::Text {
+                    text,
+                    quote: QuoteMode::Bare,
+                },
+            ] => match text.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The text of a word that is a single **unquoted** piece, as `bare_integer`
     /// requires for the same reason: `:'stem'` and `:\stem` compose to the same
     /// text as `:stem`, and a quoted word must not keep the operator meaning the
@@ -4922,9 +4941,20 @@ fn leading_operand(expression: &Expr) -> &Expr {
 /// read. A **quoted** word is a string literal rather than a command, so it takes the
 /// value reading here and the evaluator does not run it either; a path needing quotes
 /// goes through `command -- "…"` (`DESIGN.md` §"Bare words and quoted values").
+///
+/// **`true` / `false`** escape for the integer's reason: read as a value they are the
+/// boolean, so `if true` is a literal rather than a fork+exec of `/usr/bin/true`, and
+/// `func no() { false }` is the boolean instead of that program's status. They differ
+/// from a numeral in that a program of each name really does exist, so the bare word
+/// stops reaching it — `./true` and `command -- true` still do, exactly as `./42` does
+/// (`DESIGN.md` §"Bare words and quoted values").
 fn outranks_a_command(expression: &Expr) -> bool {
     match leading_operand(expression) {
-        Expr::Scalar(word) => word.value.bare_integer().is_some() || word_is_quoted(&word.value),
+        Expr::Scalar(word) => {
+            word.value.bare_integer().is_some()
+                || word.value.bare_boolean().is_some()
+                || word_is_quoted(&word.value)
+        }
         _ => true,
     }
 }

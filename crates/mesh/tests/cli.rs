@@ -9829,10 +9829,24 @@ fn only_a_lone_numeral_becomes_a_value() {
     let bare = run_with_input("func f() { 42 }\nv = f()\nn = $v + 1\nputs $n\n");
     assert_eq!(String::from_utf8_lossy(&bare.stdout), "43\n");
 
-    // A bare word that happens to name a command is untouched: `true` is the
-    // command, and its status is the block's value.
-    let word = run_with_input("func t() { true }\nv = t()\nputs $v\n");
-    assert_eq!(String::from_utf8_lossy(&word.stdout), "0\n");
+    // `true` / `false` are literals for the numeral's reason, even though a program
+    // of each name exists: read as a value they are the boolean, so no `/usr/bin/true`
+    // is forked to learn what everyone already knows.
+    let word = run_with_input("func t() { true }\nfunc f() { false }\nputs t():repr f():repr\n");
+    assert_eq!(String::from_utf8_lossy(&word.stdout), "true false\n");
+
+    // The program is still reachable the way `./42` is — by a spelling that is not a
+    // lone bare word.
+    let program = run_with_input("func t() { command -- true\n $sh.status }\nputs t():repr\n");
+    assert_eq!(String::from_utf8_lossy(&program.stdout), "0\n");
+
+    // And a bare word that names a command and is *not* a literal still runs: its
+    // output streams and a function body's result is its status, which is exactly
+    // what `true` did before it became a literal.
+    let ran = run_with_input("func p() { pwd }\nv = p()\nputs \"v=$v:repr\"\n");
+    let ran = String::from_utf8_lossy(&ran.stdout);
+    assert!(ran.ends_with("v=0\n"), "{ran:?}");
+    assert!(ran.starts_with('/'), "pwd should have streamed: {ran:?}");
 
     // mesh has no float literals, so `3.5` is still just a word — and still a
     // command. Closing that would mean adding a type, not a parse rule.
@@ -10301,10 +10315,12 @@ fn a_bare_return_carries_the_result_so_far() {
 
     // The `return` can be *inside* an `&&` / `||` list, where the result so far
     // is the executable that just ran in the same list, not the statement before.
+    // A bare `false` is the boolean literal, so that is what the `return` carries;
+    // its status view is 1, which is what makes the `||` fire in the first place.
     let chained = run_with_input(
         "func f() { false || return }\nf && puts bad\nf || puts ok\nv = f()\nputs \"v=[$v]\"\n",
     );
-    assert_eq!(String::from_utf8_lossy(&chained.stdout), "ok\nv=[1]\n");
+    assert_eq!(String::from_utf8_lossy(&chained.stdout), "ok\nv=[false]\n");
     assert!(chained.stderr.is_empty(), "{:?}", chained.stderr);
 
     // What produced the result is *observed*: a branch's value survives the `if`
