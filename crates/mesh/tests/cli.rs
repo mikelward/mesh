@@ -18036,6 +18036,41 @@ fn an_argument_free_modifier_applies_to_a_literal_in_command_position() {
     );
 }
 
+/// A map literal's `key: value` is not a modifier chain on the key. Both halves of an
+/// attached chain have to abut, and without that check any map whose *value* word
+/// happened to name a modifier was silently read as a chain: `[host: upper]` was the
+/// string `HOST`, `[host: len]` was `4`, `[host: keys]` an error. Nothing reported it,
+/// and the set of words that triggered it was the whole modifier vocabulary.
+#[test]
+fn a_map_literal_value_is_not_read_as_a_modifier_on_the_key() {
+    // Assigned first: in command-argument position `[` opens a glob character class,
+    // so a map literal only reaches the parser as a value.
+    let out = run_with_input(
+        "a = [host: upper]\n\
+         b = [host: len]\n\
+         c = [host: keys]\n\
+         d = [host: build1, port: 22]\n\
+         puts $a\nputs $b\nputs $c\nputs $d\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "host: upper\nhost: len\nhost: keys\nhost: build1\nport: 22\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Abutting on both sides is still the chain, so nothing about `$x:upper` moved.
+    let out = run_with_input("x = abc\nputs $x:upper\nputs $x:split(\"b\"):len\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ABC\n2\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// An attached `:modifier` outranks keyword parsing. A keyword is claimed only as a
 /// *bare* word, so `if:upper` is a chain on the text `if`. The keyword arms return
 /// before the postfix loop, so without the guard `if` / `match` / `for` were syntax
