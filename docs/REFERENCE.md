@@ -738,7 +738,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `exit [n]` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). Leaves the **whole shell**; to leave only the current function with a status, use `fail`. |
 | `fail [n]` | Leave the current function (or sourced file) with a nonzero status — `1` by default, `n` when given — and `false` as its value. The status channel's counterpart to `return`. `fail 0` is refused; `return true` is how a function leaves with success. |
 | `prompt [text]` | Set the interactive prompt to `text`. With no arguments, print the current prompt; `--reset` restores the status-sensitive default, and `prompt -- --reset` sets that literal text. |
-| `prompt-hook [event] name function` | Register a named function for a prompt lifecycle event. The default event is `preprompt`. Reusing `name` within an event replaces that hook without changing its order. |
+| `on event name function` | Register a named function for a prompt lifecycle event. Reusing `name` within an event replaces that hook without changing its order. |
 | `jobs` | List the jobs, one `[id] State command` per line. |
 | `fg [job]` | Resume a job in the foreground and wait for it. No argument takes the most recent job. |
 | `bg [job]` | Resume a stopped job in the background. No argument takes the most recent job. |
@@ -777,7 +777,7 @@ kill -- -9 %1                 # looks for a job named `-9`, not signal 9
 
 Which command consumes it depends on which has options to end. `puts`, `print`, `gets`,
 `clip`, `notify`, `cd`, `source` and `help` have none of their own, so the terminator
-is simply removed. `kill`, `disown`, `prompt`, `prompt-hook`, `command` and `type`
+is simply removed. `kill`, `disown`, `prompt`, `on`, `command` and `type`
 do, so each ends its own options at `--` — only they know where those stop.
 
 `command` is also where the `--help` rule stops applying, because the arguments
@@ -1092,7 +1092,7 @@ prompt. This example includes the current directory:
 func refresh-prompt() {
   prompt "$(pwd)> "
 }
-prompt-hook cwd refresh-prompt
+on preprompt cwd refresh-prompt
 ```
 
 To print a context line containing the short (unqualified) hostname, working
@@ -1111,7 +1111,7 @@ func prompt-context() {
   }
 }
 
-prompt-hook context prompt-context
+on preprompt context prompt-context
 prompt "> "
 ```
 
@@ -1125,17 +1125,17 @@ An external renderer works the same way:
 
 ```mesh
 func refresh-prompt() { prompt "$(starship prompt)" }
-prompt-hook renderer refresh-prompt
+on preprompt renderer refresh-prompt
 ```
 
 Hooks are session-local and run in registration order. Re-registering the same
 event/name pair replaces it in place, making configuration safe to reload.
-Remove one with `prompt-hook --remove [event] name`. `preprompt` hooks run only
+Remove one with `on --remove event name`. `preprompt` hooks run only
 for primary prompts, not multiline continuation prompts.
 
 | Event | Function parameters | When it runs |
 | --- | --- | --- |
-| `preprompt` | none | Before each primary prompt is rendered. This is the default event when omitted. |
+| `preprompt` | none | Before each primary prompt is rendered. |
 | `preexec` | `command` | Immediately before an interactive command runs. |
 | `postexec` | `command, status, elapsed` | After an interactive command; `elapsed` is integer milliseconds. |
 | `precd` | `target` | Before the working directory changes, still in the old one. `target` is where it is about to go. |
@@ -1148,8 +1148,8 @@ func command-started(cmd) { puts "running $cmd" }
 func command-finished(cmd, status, elapsed) {
   puts "$cmd exited $status after ${elapsed}ms"
 }
-prompt-hook preexec log command-started
-prompt-hook postexec log command-finished
+on preexec log command-started
+on postexec log command-finished
 ```
 
 `jobdone` runs where the `[N] Done` notice is printed — at the prompt after the
@@ -1170,7 +1170,7 @@ func job-finished(id, cmd, status) {
     puts "job $id failed ($status): $cmd"
   }
 }
-prompt-hook jobdone report job-finished
+on jobdone report job-finished
 ```
 
 The **directory hooks fire around each actual move**, a `cd` inside a function
@@ -1181,7 +1181,7 @@ about net movement compares `$env.PWD` itself.
 ```mesh
 global last-visit = ""
 func remember(previous) { global last-visit = $previous }
-prompt-hook postcd history remember
+on postcd history remember
 ```
 
 Three rules make them predictable:

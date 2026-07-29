@@ -130,7 +130,7 @@ session whose behavior is written down in the user's own config.
 
 ```mesh
 func refresh-prompt() { prompt "$(starship prompt)" }
-prompt-hook renderer refresh-prompt
+on preprompt renderer refresh-prompt
 ```
 
 The interesting version passes starship the context it wants, all of which mesh
@@ -139,12 +139,12 @@ already exposes as values:
 ```mesh
 global cmd-elapsed = 0
 func record-time(cmd, status, elapsed) { global cmd-elapsed = $elapsed }
-prompt-hook postexec timing record-time
+on postexec timing record-time
 
 func refresh-prompt() {
   prompt "$(starship prompt --status=${sh.status} --jobs=${sh.jobs:len} --cmd-duration=${cmd-elapsed})"
 }
-prompt-hook renderer refresh-prompt
+on preprompt renderer refresh-prompt
 ```
 
 `$sh.status`, `$sh.jobs` (a live, indexable map — `:len` is the job count
@@ -205,8 +205,8 @@ func atuin-end(cmd, status, elapsed) {
   }
 }
 
-prompt-hook preexec atuin atuin-start
-prompt-hook postexec atuin atuin-end
+on preexec atuin atuin-start
+on postexec atuin atuin-end
 ```
 
 (atuin times the command itself if `--duration` is omitted; the flag takes
@@ -335,7 +335,7 @@ run — the right behavior, with zoxide's own message as the report.
 
 ```mesh
 func track-dir(previous) { zoxide add $env.PWD }
-prompt-hook postcd zoxide track-dir
+on postcd zoxide track-dir
 ```
 
 That is the whole integration. The hook fires around **each actual move**, a

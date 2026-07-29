@@ -1269,12 +1269,12 @@ fn a_builtin_with_options_keeps_the_terminator_for_its_own_parser() {
     let reset = run_with_input("prompt 'x> '\nprompt --reset\nprompt\n");
     assert_eq!(String::from_utf8_lossy(&reset.stdout), "mesh$ \n");
 
-    // `prompt-hook` reads `--remove`, so after `--` every word is an operand — which
+    // `on` reads `--remove`, so after `--` every word is an operand — which
     // is what lets a hook be *named* `--remove`, the case the terminator exists for.
     for (source, label) in [
-        ("prompt-hook -- p1 h\n", "plain"),
-        ("prompt-hook -- --remove h\n", "a hook named --remove"),
-        ("prompt-hook -- preexec p1 h\n", "with an event"),
+        ("on -- preprompt p1 h\n", "plain"),
+        ("on -- preprompt --remove h\n", "a hook named --remove"),
+        ("on -- preexec p1 h\n", "with an event"),
     ] {
         let out = run_with_input(&format!(
             "func h(c) {{ puts hook }}\n{source}puts status=$sh.status\n"
@@ -1289,9 +1289,23 @@ fn a_builtin_with_options_keeps_the_terminator_for_its_own_parser() {
 
     // And `--remove` without the terminator still removes.
     let removed = run_with_input(
-        "func h(c) { puts hook }\nprompt-hook p1 h\nprompt-hook --remove p1\nputs status=$sh.status\n",
+        "func h(c) { puts hook }\non preprompt p1 h\non --remove preprompt p1\nputs status=$sh.status\n",
     );
     assert_eq!(String::from_utf8_lossy(&removed.stdout), "status=0\n");
+
+    let missing_event = run_with_input(
+        "func h() { puts hook }\non p1 h\nputs register=$sh.status\non --remove p1\nputs remove=$sh.status\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&missing_event.stdout),
+        "register=2\nremove=2\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&missing_event.stderr)
+            .matches("mesh: on: expected EVENT NAME FUNCTION or --remove EVENT NAME")
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -1482,8 +1496,8 @@ fn cd_hooks_run_on_each_side_of_the_move() {
     let out = run_with_input(&format!(
         "func leaving(to) {{ puts \"leaving $(pwd) for $to\" }}\n\
          func arrived(from) {{ puts \"arrived $(pwd) from $from\" }}\n\
-         prompt-hook precd trace leaving\n\
-         prompt-hook postcd trace arrived\n\
+         on precd trace leaving\n\
+         on postcd trace arrived\n\
          cd {}\n\
          cd sub\n",
         root.display()
@@ -1515,7 +1529,7 @@ fn cd_hooks_fire_per_move_inside_a_function() {
     let (root, sub) = cd_hook_dirs("cd_hooks_function");
     let out = run_with_input(&format!(
         "func note(to) {{ puts \"-> $to\" }}\n\
-         prompt-hook precd n note\n\
+         on precd n note\n\
          func visit() {{ cd {}\n cd sub }}\n\
          visit\n\
          pwd\n",
@@ -1543,7 +1557,7 @@ fn a_cd_inside_a_hook_does_not_dispatch_the_hooks_again() {
     let out = run_with_input(&format!(
         "cd {root}\n\
          func arrived(from) {{ puts \"hook $from\"\n cd {other} }}\n\
-         prompt-hook postcd a arrived\n\
+         on postcd a arrived\n\
          cd sub\n\
          pwd\n",
         root = root.display(),
@@ -1563,8 +1577,8 @@ fn a_failed_cd_runs_neither_hook() {
     let out = run_with_input(
         "func p(to) { puts \"precd $to\" }\n\
          func q(from) { puts \"postcd $from\" }\n\
-         prompt-hook precd p p\n\
-         prompt-hook postcd q q\n\
+         on precd p p\n\
+         on postcd q q\n\
          cd /nonexistent-mesh-test-directory\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "");
@@ -1584,7 +1598,7 @@ fn a_precd_hook_that_wanders_cannot_redirect_the_move() {
     let out = run_with_input(&format!(
         "cd {}\n\
          func wander(to) {{ cd sub }}\n\
-         prompt-hook precd w wander\n\
+         on precd w wander\n\
          cd sub\n\
          pwd\n\
          puts $env.OLDPWD\n",
@@ -2713,8 +2727,8 @@ fn semantic_mark_harness(exec: &MeshExec) -> i32 {
     for line in [
         "func pre(c) { puts PREHOOK }\n",
         "func post(c, s, e) { puts POSTHOOK }\n",
-        "prompt-hook preexec p1 pre\n",
-        "prompt-hook postexec p2 post\n",
+        "on preexec p1 pre\n",
+        "on postexec p2 post\n",
     ] {
         if unsafe { libc::write(master, line.as_ptr().cast(), line.len()) } != line.len() as isize
             || pty_read_until_command_done(master).is_none()
@@ -3011,10 +3025,7 @@ fn blank_line_harness(exec: &MeshExec) -> i32 {
         return 70;
     };
     let mut seen = shell.startup.clone();
-    for line in [
-        "func pre(c) { puts PREHOOK }\n",
-        "prompt-hook preexec p1 pre\n",
-    ] {
+    for line in ["func pre(c) { puts PREHOOK }\n", "on preexec p1 pre\n"] {
         if !pty_write(shell.master, line.as_bytes()) {
             return 71;
         }
@@ -3114,7 +3125,7 @@ fn jobdone_hook_harness(exec: &MeshExec) -> i32 {
     let mut seen = shell.startup.clone();
     for line in [
         "func done(id, cmd, status) { puts JOBDONE=$id/$status }\n",
-        "prompt-hook jobdone j1 done\n",
+        "on jobdone j1 done\n",
     ] {
         if !pty_write(shell.master, line.as_bytes()) {
             return 111;
@@ -3233,7 +3244,7 @@ fn jobdone_hook_harness(exec: &MeshExec) -> i32 {
         return 139;
     };
     seen.extend_from_slice(&window);
-    if !pty_write(shell.master, b"prompt-hook preprompt p pp\n") {
+    if !pty_write(shell.master, b"on preprompt p pp\n") {
         return 140;
     }
     let Some((window, _)) = pty_read_until_command_done(shell.master) else {
@@ -3286,7 +3297,7 @@ fn jobdone_hook_harness(exec: &MeshExec) -> i32 {
     // The `preprompt` handler registered above is removed first; it sleeps, and
     // leaving it would run before this prompt and reap the job itself, which is
     // the previous case rather than this one.
-    if !pty_write(shell.master, b"prompt-hook --remove preprompt p\n") {
+    if !pty_write(shell.master, b"on --remove preprompt p\n") {
         return 149;
     }
     let Some((window, _)) = pty_read_until_command_done(shell.master) else {
@@ -3296,10 +3307,7 @@ fn jobdone_hook_harness(exec: &MeshExec) -> i32 {
     // An `exit` handler, to pin the *order*. It stands for the teardown one is
     // for — `DESIGN.md`'s example is closing a job-publish file — so a `jobdone`
     // that arrived after it would be writing to something already closed.
-    for line in [
-        "func bye(s) { puts EXITHOOK }\n",
-        "prompt-hook exit e bye\n",
-    ] {
+    for line in ["func bye(s) { puts EXITHOOK }\n", "on exit e bye\n"] {
         if !pty_write(shell.master, line.as_bytes()) {
             return 157;
         }
@@ -3315,7 +3323,7 @@ fn jobdone_hook_harness(exec: &MeshExec) -> i32 {
     // the first one's handler is sleeping.
     for line in [
         "func chain(id, cmd, status) { puts JOBDONE=$id/$status; sleep 0.5; jobs }\n",
-        "prompt-hook jobdone j1 chain\n",
+        "on jobdone j1 chain\n",
         "sh -c 'sleep 0.2; exit 3' &\n",
         "sh -c 'sleep 0.7; exit 4' &\n",
     ] {
@@ -8872,7 +8880,7 @@ fn help_lists_every_builtin_with_its_usage() {
         "disown [-h] [-a | -r] [JOB …]",
         "kill [-SIGNAL] JOB|PID ...",
         "prompt [--reset | TEXT]",
-        "prompt-hook [--remove] [EVENT] NAME [FUNCTION]",
+        "on [--remove] EVENT NAME [FUNCTION]",
         "source FILE",
         "help [NAME ...]",
     ] {
@@ -9041,12 +9049,12 @@ fn type_shows_a_functions_flags_and_optionals_in_its_signature() {
 
 #[test]
 fn type_names_a_builtin_and_a_keyword() {
-    // `prompt-hook` rather than `pwd`, which is also an external on most systems
+    // `on` rather than `pwd`, which is also an external on most systems
     // and so answers with a shadow note that has nothing to do with this.
-    let out = run_with_input("type prompt-hook\ntype unless\n");
+    let out = run_with_input("type on\ntype unless\n");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.starts_with("prompt-hook is a shell builtin\n    prompt-hook [--remove]"),
+        stdout.starts_with("on is a shell builtin\n    on [--remove]"),
         "{stdout}"
     );
     assert!(

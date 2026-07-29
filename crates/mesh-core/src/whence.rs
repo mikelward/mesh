@@ -634,14 +634,14 @@ mod tests {
     /// A builtin that is **not** also an external on any usual system, so the
     /// table lookups can be asserted whole without a real `PATH` hit joining the
     /// report. `pwd` and `kill` would both find `/usr/bin/…` here.
-    const ONLY_A_BUILTIN: &str = "prompt-hook";
+    const ONLY_A_BUILTIN: &str = "on";
 
     #[test]
     fn names_a_builtin_by_its_usage() {
         let found = look_up(ONLY_A_BUILTIN, &Funcs::new(), &Vars::new());
         assert_eq!(
             rendered(ONLY_A_BUILTIN, &found, false),
-            "prompt-hook is a shell builtin\n    prompt-hook [--remove] [EVENT] NAME [FUNCTION]\n"
+            "on is a shell builtin\n    on [--remove] EVENT NAME [FUNCTION]\n"
         );
     }
 
@@ -692,8 +692,8 @@ mod tests {
         let found = look_up(ONLY_A_BUILTIN, &Funcs::new(), &vars);
         assert_eq!(
             rendered(ONLY_A_BUILTIN, &found, false),
-            "prompt-hook is a shell builtin\n    prompt-hook [--remove] [EVENT] NAME [FUNCTION]\n\
-             prompt-hook is a variable\n    an integer: 5\n"
+            "on is a shell builtin\n    on [--remove] EVENT NAME [FUNCTION]\n\
+             on is a variable\n    an integer: 5\n"
         );
     }
 
