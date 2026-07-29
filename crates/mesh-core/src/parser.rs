@@ -1539,7 +1539,7 @@ pub(crate) fn variable_end(source: &str, start: usize) -> Result<usize, ParseErr
     let Some((offset, head)) = chars.next() else {
         return Ok(end);
     };
-    if !head.is_alphabetic() {
+    if head != '_' && !head.is_alphabetic() {
         return Ok(end);
     }
     end = start + 1 + offset + head.len_utf8();
@@ -5004,7 +5004,7 @@ fn defers_to_a_command_list(expression: &Expr, one_word: bool) -> bool {
 /// Is the whole of `name` a name?
 ///
 /// The rule the tokenizer's own `$name` scan applies
-/// ([`variable_end`](variable_end)) — an alphabetic head, then alphanumerics, `_`,
+/// ([`variable_end`](variable_end)) — an alphabetic or `_` head, then alphanumerics, `_`,
 /// and *interior* `-` — asked of a complete string instead of a prefix of one. Every
 /// caller that validates a name it did not scan itself (an `$env.KEY` target,
 /// `export NAME`, a `${…}` place's root) goes through here, so a name a read accepts
@@ -5016,7 +5016,7 @@ pub(crate) fn valid_name(name: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    if !first.is_alphabetic() {
+    if first != '_' && !first.is_alphabetic() {
         return false;
     }
     let mut previous_hyphen = false;
@@ -5828,17 +5828,17 @@ mod tests {
     /// that `export CAFÉ = x` then refused as an invalid name.
     #[test]
     fn a_name_a_read_accepts_is_a_name_a_write_accepts() {
-        for name in ["x", "MY-VAR", "PATH", "a_b", "a1-b2", "café", "CAFÉ"] {
+        for name in [
+            "x", "MY-VAR", "PATH", "a_b", "a1-b2", "_", "_private", "café", "CAFÉ",
+        ] {
             assert!(valid_name(name), "{name} should be a name");
         }
-        // Interior-only hyphens, an alphabetic head, and nothing else.
-        for name in [
-            "", "-x", "1x", "x-", "a--b", "_x", "a.b", "PATH[0]", "x:dedup",
-        ] {
+        // Interior-only hyphens, an alphabetic or underscore head, and nothing else.
+        for name in ["", "-x", "1x", "x-", "a--b", "a.b", "PATH[0]", "x:dedup"] {
             assert!(!valid_name(name), "{name} should not be a name");
         }
         // And the read side agrees: each of these is one whole variable token.
-        for name in ["x", "MY-VAR", "a1-b2", "café"] {
+        for name in ["x", "MY-VAR", "a1-b2", "_", "_private", "café"] {
             let source = format!("${name}");
             assert_eq!(
                 variable_end(&source, 0).unwrap(),

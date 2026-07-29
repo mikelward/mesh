@@ -2435,13 +2435,15 @@ fn unterminated_braced_interpolation_is_a_syntax_error() {
 }
 
 #[test]
-fn leading_underscore_is_not_a_variable_name() {
-    // A name starts with a letter; `_` is reserved as the discard pattern, so
-    // `_`/`_x` are not bindable (the line is a command, which isn't found) and
-    // `$_` is a literal. An interior underscore (`a_b`) is still a valid name.
-    let out = run_with_input("_ = secret\na_b = ok\nputs $a_b\nputs after\n");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("command not found: _"));
+fn leading_underscore_is_a_variable_name() {
+    // `_` remains the discard pattern in a binding, while longer names beginning
+    // with an underscore can be bound and read like names with an alphabetic head.
+    let out = run_with_input("_ = secret\n_private = ok\nputs $_private\nputs after\n");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\nafter\n");
 }
 
@@ -18012,27 +18014,25 @@ fn a_name_that_reads_can_also_be_exported() {
     let out = run_with_input(
         "café = 5\n\
          puts $café\n\
+         _private = 6\n\
+         puts $_private\n\
          export CAFÉ = x\n\
          puts $env.CAFÉ\n\
+         export _PRIVATE = z\n\
+         puts $env._PRIVATE\n\
          $env.naïve = y\n\
          puts $env.naïve\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "5\nx\ny\n",
+        "5\n6\nx\nz\ny\n",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Widening the alphabet does not widen the *shape*: an alphabetic head and
-    // interior-only hyphens still decide, so these stay refusals rather than
-    // becoming exports.
-    for source in [
-        "export 1x = v\n",
-        "export a--b = v\n",
-        "export x- = v\n",
-        "export _x = v\n",
-    ] {
+    // Widening the head does not widen the rest of the shape: interior-only
+    // hyphens still decide, so these stay refusals rather than becoming exports.
+    for source in ["export 1x = v\n", "export a--b = v\n", "export x- = v\n"] {
         let out = run_with_input(source);
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("syntax error"),
