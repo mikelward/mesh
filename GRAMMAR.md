@@ -135,7 +135,7 @@ var     = "$" name access modifier*             # $x, $name.member, $xs[-1]:stem
         | "$" "{" name access modifier* "}"           # ${xs[-1]:stem}
 access  = ("." name)? ("[" signed-integer "]")?
 modifier = ":" modifier-name
-name    = alpha (alnum | "_" | interior "-")*   # kebab identifier
+name    = (alpha | "_") (alnum | "_" | interior "-")*   # kebab identifier
 ```
 
 - **Assignment** binds a session-global variable. `name=value` (unspaced) is the

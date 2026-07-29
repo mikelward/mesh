@@ -1435,7 +1435,7 @@ name = value          # spaced form
 name=value            # unspaced form
 ```
 
-A name starts with a letter, then letters, digits, `_`, and interior `-` (a
+A name starts with a letter or `_`, then letters, digits, `_`, and interior `-` (a
 hyphen must sit between two name characters). A bare `_` is not a name. At top
 level, bindings are session-global.
 
