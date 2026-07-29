@@ -770,7 +770,7 @@ than the string the argv boundary would have produced.
       literal as a number, and `puts 007` has to print `007`.
 - [x] **One flag rule for builtins and functions.** Settled: builtins parse flags —
       several must, since `kill -9`, `disown -a`, `prompt --reset` and
-      `prompt-hook --remove` are their spellings — and `DESIGN.md`'s "`puts` takes no
+      `on --remove` are their spellings — and `DESIGN.md`'s "`puts` takes no
       flags" means none *of its own*, never that its `--help` is data. The two
       sentences were not in tension. A word that **is** `--help` asks for help
       wherever it came from, which is what functions already did (`x = --help; f $x`
@@ -1231,7 +1231,7 @@ produced. Several entries overlap with items elsewhere in this file
 here because the integration case is what makes them urgent rather than merely
 designed, and the cross-references say where the fuller note lives.
 
-- [x] **`precd` / `postcd` hooks** — *landed*. `prompt-hook precd NAME FUNC`
+- [x] **`precd` / `postcd` hooks** — *landed*. `on precd NAME FUNC`
       runs before the move, still in the old directory, given the target;
       `postcd` runs after, in the new one, given the previous directory. They
       were the highest-value missing hook of the set — zoxide's directory
@@ -2386,7 +2386,7 @@ of each PR had landed by another route, but these pieces had not.
         wrote to the pipe.
   - [ ] `notify_reaches_the_terminal_and_a_quick_command_does_not` — **still open,
         and not reproduced.** Failed once in CI with harness code 150,
-        `pty_read_until_command_done` timing out after `prompt-hook --remove`.
+        `pty_read_until_command_done` timing out after `on --remove`.
         75 local runs found nothing: 30 interleaved pairs against an unmodified
         tree, 25 with the machine loaded to a load average of 4.7 on 4 cores, and
         20 pinned to a single contended core. Deliberately left alone rather than

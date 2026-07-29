@@ -967,12 +967,12 @@ hooks fire around each command and each finished job:
 
 ```mesh
 func refresh-prompt() { prompt "$(pwd)> " }
-prompt-hook cwd refresh-prompt          # `cwd` names the hook, so it can be replaced
+on preprompt cwd refresh-prompt  # `cwd` names the hook, so it can be replaced
 
 func command-finished(cmd, status, elapsed) {
   puts "$cmd exited $status after ${elapsed}ms"
 }
-prompt-hook postexec log command-finished
+on postexec log command-finished
 ```
 
 Interactive decorations — bold input, the window title, the working-directory

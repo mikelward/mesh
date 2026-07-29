@@ -3931,7 +3931,7 @@ spoken for the name.
 
 **One flag rule, for built-ins and functions alike** *(decided)*. Built-ins parse
 flags — several must, since `kill -9`, `disown -a`, `prompt --reset` and
-`prompt-hook --remove` are their spellings — and `puts` "takes no flags" means it has
+`on --remove` are their spellings — and `puts` "takes no flags" means it has
 none *of its own*, not that its `--help` is data. Two consequences, and they are the
 same for both kinds of command:
 

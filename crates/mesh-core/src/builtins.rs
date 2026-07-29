@@ -40,7 +40,7 @@ const TABLE: &[(&str, &str)] = &[
         "Set or print the interactive prompt",
     ),
     (
-        "prompt-hook [--remove] [EVENT] NAME [FUNCTION]",
+        "on [--remove] EVENT NAME [FUNCTION]",
         "Register a function for a prompt event",
     ),
     (
@@ -510,7 +510,7 @@ fn syntax_help(name: &str) -> Option<String> {
     Some(format!("{summary}\n\nSyntax: {form}\n"))
 }
 
-/// The widest form the summary column makes room for. `prompt-hook`'s full
+/// The widest form the summary column makes room for. `on`'s full
 /// signature is half again as wide as any other, and indenting every summary
 /// past it would push the shortest lines — `jobs`, `pwd` — into empty space.
 const USAGE_COLUMN: usize = 32;
@@ -1471,7 +1471,7 @@ mod tests {
         let continuation = rows
             .iter()
             .find(|row| row.starts_with("     "))
-            .expect("prompt-hook's summary wraps onto its own line")
+            .expect("on's summary wraps onto its own line")
             .clone();
         for row in &rows {
             assert!(

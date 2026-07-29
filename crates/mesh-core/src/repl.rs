@@ -169,11 +169,11 @@ enum Produced {
 #[derive(Default)]
 struct PromptConfig {
     text: Option<String>,
-    hooks: Vec<PromptHook>,
+    hooks: Vec<Hook>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PromptEvent {
+enum HookEvent {
     PrePrompt,
     PreExec,
     PostExec,
@@ -183,7 +183,7 @@ enum PromptEvent {
     Exit,
 }
 
-impl PromptEvent {
+impl HookEvent {
     fn parse(name: &str) -> Option<Self> {
         match name {
             "preprompt" => Some(Self::PrePrompt),
@@ -199,8 +199,8 @@ impl PromptEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PromptHook {
-    event: PromptEvent,
+struct Hook {
+    event: HookEvent,
     name: String,
     function: String,
 }
@@ -5999,7 +5999,7 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     }
     match words[0].as_str() {
         "prompt" => return configure_prompt(&words[1..], shell),
-        "prompt-hook" => return configure_prompt_hook(&words[1..], shell),
+        "on" => return configure_hook(&words[1..], shell),
         // `cd` fires the `precd` / `postcd` hooks, which are this shell's, so it
         // cannot go through `builtins::dispatch` either.
         "cd" => return change_directory(&words[1..], shell),
@@ -6069,14 +6069,14 @@ fn change_directory(args: &[String], shell: &mut Shell) -> Step {
     let previous = env::current_dir().ok();
     let hooks = !shell.in_cd_hooks;
     if hooks {
-        run_cd_hooks(PromptEvent::PreCd, target.path(), shell);
+        run_cd_hooks(HookEvent::PreCd, target.path(), shell);
     }
     let status = match builtins::cd_change(&target, previous.as_deref()) {
         Ok(status) => status,
         Err(code) => return Step::Continue(code),
     };
     if hooks && let Some(previous) = previous {
-        run_cd_hooks(PromptEvent::PostCd, &previous, shell);
+        run_cd_hooks(HookEvent::PostCd, &previous, shell);
     }
     Step::Continue(status)
 }
@@ -6089,13 +6089,13 @@ fn change_directory(args: &[String], shell: &mut Shell) -> Step {
 /// with replacement characters rather than not at all — the alternative,
 /// skipping the event, would hide the move entirely from something like a
 /// directory tracker.
-fn run_cd_hooks(event: PromptEvent, path: &Path, shell: &mut Shell) {
+fn run_cd_hooks(event: HookEvent, path: &Path, shell: &mut Shell) {
     if !shell.prompt.hooks.iter().any(|hook| hook.event == event) {
         return;
     }
     let argument = Value::String(path.to_string_lossy().into_owned());
     shell.in_cd_hooks = true;
-    run_prompt_hooks(event, vec![argument], shell);
+    run_hooks(event, vec![argument], shell);
     shell.in_cd_hooks = false;
 }
 
@@ -6154,8 +6154,8 @@ fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
     }
 }
 
-fn configure_prompt_hook(args: &[String], shell: &mut Shell) -> Step {
-    // `prompt-hook` reads an option, so it owns its terminator: after `--` every word
+fn configure_hook(args: &[String], shell: &mut Shell) -> Step {
+    // `on` reads an option, so it owns its terminator: after `--` every word
     // is an operand. That is what lets a hook be *named* `--remove`, which is the
     // whole case the terminator exists for.
     if let [terminator, rest @ ..] = args
@@ -6164,16 +6164,9 @@ fn configure_prompt_hook(args: &[String], shell: &mut Shell) -> Step {
         return register_hook_operands(rest, shell);
     }
     match args {
-        [flag, name] if flag == "--remove" => {
-            shell
-                .prompt
-                .hooks
-                .retain(|hook| hook.event != PromptEvent::PrePrompt || hook.name != *name);
-            Step::Continue(0)
-        }
         [flag, event, name] if flag == "--remove" => {
-            let Some(event) = PromptEvent::parse(event) else {
-                return invalid_prompt_hook();
+            let Some(event) = HookEvent::parse(event) else {
+                return invalid_hook();
             };
             shell
                 .prompt
@@ -6185,31 +6178,30 @@ fn configure_prompt_hook(args: &[String], shell: &mut Shell) -> Step {
     }
 }
 
-/// The `[EVENT] NAME FUNCTION` form, with no option reading left to do.
+/// The `EVENT NAME FUNCTION` form, with no option reading left to do.
 ///
 /// Shared by the plain path and the one past `--`, so the two cannot drift into
 /// disagreeing about what an operand list looks like.
 fn register_hook_operands(args: &[String], shell: &mut Shell) -> Step {
     match args {
-        [name, function] => register_prompt_hook(PromptEvent::PrePrompt, name, function, shell),
         [event, name, function] => {
-            let Some(event) = PromptEvent::parse(event) else {
-                return invalid_prompt_hook();
+            let Some(event) = HookEvent::parse(event) else {
+                return invalid_hook();
             };
-            register_prompt_hook(event, name, function, shell)
+            register_hook(event, name, function, shell)
         }
-        _ => invalid_prompt_hook(),
+        _ => invalid_hook(),
     }
 }
 
-fn invalid_prompt_hook() -> Step {
-    note!("mesh: prompt-hook: expected [EVENT] NAME FUNCTION or --remove [EVENT] NAME");
+fn invalid_hook() -> Step {
+    note!("mesh: on: expected EVENT NAME FUNCTION or --remove EVENT NAME");
     Step::Continue(2)
 }
 
-fn register_prompt_hook(event: PromptEvent, name: &str, function: &str, shell: &mut Shell) -> Step {
+fn register_hook(event: HookEvent, name: &str, function: &str, shell: &mut Shell) -> Step {
     if shell.funcs.get(function).is_none() {
-        note!("mesh: prompt-hook: `{function}` is not a function");
+        note!("mesh: on: `{function}` is not a function");
         return Step::Continue(1);
     }
     if let Some(hook) = shell
@@ -6220,7 +6212,7 @@ fn register_prompt_hook(event: PromptEvent, name: &str, function: &str, shell: &
     {
         hook.function = function.to_string();
     } else {
-        shell.prompt.hooks.push(PromptHook {
+        shell.prompt.hooks.push(Hook {
             event,
             name: name.to_string(),
             function: function.to_string(),
@@ -6790,8 +6782,8 @@ fn run_jobdone_hooks(shell: &mut Shell) {
             return;
         }
         for job in finished {
-            run_prompt_hooks(
-                PromptEvent::JobDone,
+            run_hooks(
+                HookEvent::JobDone,
                 vec![
                     Value::Integer(i64::try_from(job.id).unwrap_or(i64::MAX)),
                     Value::String(job.command),
@@ -6803,7 +6795,7 @@ fn run_jobdone_hooks(shell: &mut Shell) {
     }
 }
 
-fn run_prompt_hooks(event: PromptEvent, args: Vec<Value>, shell: &mut Shell) {
+fn run_hooks(event: HookEvent, args: Vec<Value>, shell: &mut Shell) {
     let hooks: Vec<String> = shell
         .prompt
         .hooks
@@ -7254,7 +7246,7 @@ fn apply_modifier_ref(name: &str, argument: Value) -> Result<Value, Step> {
 ///
 /// `flags_enabled` gates the `--`/`--flag` interpretation: a command-position
 /// call parses flags, but synthesized calls whose arguments are computed values
-/// rather than user syntax (prompt hooks) disable it so every value binds
+/// rather than user syntax (hooks) disable it so every value binds
 /// positionally — a command line of `--`/`--word` is then data, not flag syntax.
 fn bind_arguments(
     name: &str,
@@ -8885,7 +8877,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         shell.jobs.reap();
         run_jobdone_hooks(&mut shell);
         if pending.is_empty() {
-            run_prompt_hooks(PromptEvent::PrePrompt, Vec::new(), &mut shell);
+            run_hooks(HookEvent::PrePrompt, Vec::new(), &mut shell);
             // Again, because a `preprompt` handler can report a job itself — it
             // need only run `jobs`, which reaps before it lists. Without this the
             // notice would be printed above this prompt while its hook waited
@@ -8987,8 +8979,8 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                         // by nobody, and `exit` forks nothing that would notice.
                         shell.jobs.reap();
                         run_jobdone_hooks(&mut shell);
-                        run_prompt_hooks(
-                            PromptEvent::Exit,
+                        run_hooks(
+                            HookEvent::Exit,
                             vec![Value::Integer(i64::from(code))],
                             &mut shell,
                         );
@@ -9722,8 +9714,8 @@ fn handle_signal(
             // the command line the user typed; a `postexec` hook that writes
             // after `D` lands outside the output a terminal will offer to fold.
             semantic_mark(marks, SemanticMark::OutputStart);
-            run_prompt_hooks(
-                PromptEvent::PreExec,
+            run_hooks(
+                HookEvent::PreExec,
                 vec![Value::String(command.clone())],
                 shell,
             );
@@ -9744,8 +9736,8 @@ fn handle_signal(
                 took,
             );
             let elapsed = i64::try_from(took.as_millis()).unwrap_or(i64::MAX);
-            run_prompt_hooks(
-                PromptEvent::PostExec,
+            run_hooks(
+                HookEvent::PostExec,
                 vec![
                     Value::String(command),
                     Value::Integer(i64::from(status)),
@@ -10061,8 +10053,8 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgumentRecall, CommandLine, CompletionState, HeredocGate, Integration, Invocation, Lookup,
-        MeshPrompt, NOTIFY_LIMIT, PromptEvent, PromptHook, PromptMarkers, SemanticMark, Shell,
+        ArgumentRecall, CommandLine, CompletionState, HeredocGate, Hook, HookEvent, Integration,
+        Invocation, Lookup, MeshPrompt, NOTIFY_LIMIT, PromptMarkers, SemanticMark, Shell,
         StartupOptions, Step, TITLE_LIMIT, TimestampedHistory, argument_completions,
         body_awaits_close, command_line, command_notification, command_position,
         command_segment_words, command_words, completed_command, cwd_url, deferred_words,
@@ -10071,7 +10063,7 @@ mod tests {
         history_designators, history_path_from, input_highlighter, interactive_keybindings,
         interruptible_task, last_argument, mark_sequence, needs_more_input, open_history,
         path_completions_sync, persist_logical_history, prepare_history_path, prompt_title,
-        run_line, run_prompt_hooks, run_source, running_title, segment_completions, title_sequence,
+        run_hooks, run_line, run_source, running_title, segment_completions, title_sequence,
         title_text, variable_completions, vscode_escaped,
     };
     use crate::builtins::{Multiplexer, through_multiplexer};
@@ -12214,24 +12206,24 @@ mod tests {
     }
 
     #[test]
-    fn named_prompt_hooks_replace_in_place_and_run_before_the_prompt() {
-        let marker = std::env::temp_dir().join(format!("mesh-prompt-hook-{}", std::process::id()));
+    fn named_hooks_replace_in_place_and_run_before_the_prompt() {
+        let marker = std::env::temp_dir().join(format!("mesh-on-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let mut shell = Shell::new();
         let script = format!(
-            "func first() {{ false }}\nfunc second() {{ touch '{}' }}\nprompt-hook refresh first\nprompt-hook refresh second\n",
+            "func first() {{ false }}\nfunc second() {{ touch '{}' }}\non preprompt refresh first\non preprompt refresh second\n",
             marker.display()
         );
         assert_eq!(run_line(&script, 0, false, &mut shell), Step::Continue(0));
         assert_eq!(
             shell.prompt.hooks,
-            vec![PromptHook {
-                event: PromptEvent::PrePrompt,
+            vec![Hook {
+                event: HookEvent::PrePrompt,
                 name: "refresh".into(),
                 function: "second".into(),
             }]
         );
-        run_prompt_hooks(PromptEvent::PrePrompt, Vec::new(), &mut shell);
+        run_hooks(HookEvent::PrePrompt, Vec::new(), &mut shell);
         assert!(marker.exists());
         std::fs::remove_file(marker).unwrap();
     }
@@ -12248,12 +12240,12 @@ mod tests {
             Step::Continue(0)
         );
         assert_eq!(
-            run_line("prompt-hook preprompt p h\n", 0, false, &mut shell),
+            run_line("on preprompt p h\n", 0, false, &mut shell),
             Step::Continue(0)
         );
         assert_eq!(run_line("false\n", 0, false, &mut shell), Step::Continue(1));
         assert_eq!(shell.vars.status(), 1);
-        run_prompt_hooks(PromptEvent::PrePrompt, Vec::new(), &mut shell);
+        run_hooks(HookEvent::PrePrompt, Vec::new(), &mut shell);
         assert_eq!(shell.vars.status(), 1, "a hook replaced the user's status");
     }
 
@@ -12276,7 +12268,7 @@ mod tests {
         let mut shell = Shell::new();
         assert_eq!(
             run_line(
-                "func before(cmd) { puts $cmd }\nfunc after(cmd, status, elapsed) { puts $cmd $status $elapsed }\nprompt-hook preexec log before\nprompt-hook postexec log after",
+                "func before(cmd) { puts $cmd }\nfunc after(cmd, status, elapsed) { puts $cmd $status $elapsed }\non preexec log before\non postexec log after",
                 0,
                 false,
                 &mut shell,
