@@ -2184,6 +2184,21 @@ changing any bindings:
 if [head ...tail] = $items { puts $head ...$tail }
 ```
 
+A **command** condition is a command that ran, so the body it selects reads its
+status — the code, not just the fact that it failed:
+
+```mesh
+if diff old new {
+  puts identical
+} else {
+  puts "differed ($sh.status)"     # 1 for a difference, 2 for trouble
+}
+```
+
+A **value** condition has no status to report, so it leaves the previous
+command's standing — the same rule a guard that skipped its statement follows.
+The `if` itself still reports its *body's* status, not its condition's.
+
 ## List patterns
 
 List patterns are shared by assignment, conditional binding, loops, and list

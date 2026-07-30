@@ -2078,7 +2078,7 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Three have since been fixed; two are tracked
+matched back to the discussion. Six have since been fixed; two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
 
@@ -2157,13 +2157,21 @@ was re-checked against `main` rather than taken from the PR text.
       own `$UID` for free. Mesh now exposes the effective user id directly, captured
       with the shell's process identity and kept stable in a forked stage, so a
       prompt does not need to fork `id -u` or keep its own cache.
-- [ ] **15. `$sh.status` is cleared while an `if` condition is evaluated**, so it
-      reads `0` in *both* arms and a command used as a condition cannot have its
-      status inspected afterwards — `if sh -c "exit 3" { … } else { … }` reports
-      `status=0` in the else branch. The cost is not the branch but the detail: a
-      `130` from Ctrl-C flattens to a generic failure, so `trydiff`, `applydiff`
-      and `isort` each run their command as a plain statement and capture
+- [x] **15. `$sh.status` was cleared while an `if` condition was evaluated**, so it
+      read `0` in *both* arms and a command used as a condition could not have its
+      status inspected afterwards — `if sh -c "exit 3" { … } else { … }` reported
+      `status=0` in the else branch. The cost was not the branch but the detail: a
+      `130` from Ctrl-C flattened to a generic failure, so `trydiff`, `applydiff`
+      and `isort` each ran their command as a plain statement and captured
       `$sh.status` before branching.
+
+      **Fixed:** a command condition publishes its status like any other command,
+      so the branch it picks reads the real code. The publishing happens in
+      `condition_status`, which had been bypassing the `run_recorded` funnel that
+      normally does it — a condition is not the statement's result, so it never
+      passed through. A *value* condition is exempt: a bool is not a command and
+      has no status to report, so it leaves the previous command's standing, as a
+      skipped guard does. A pipeline condition keeps its per-stage breakdown.
 - [ ] **16. No path-resolving modifier.** `:type` reports `link` but nothing
       resolves one, so `realdir` shells out to `readlink -f` — a fork for
       something the shell already has the syscall for. A `:real` / `:resolve`
