@@ -2327,6 +2327,48 @@ of each PR had landed by another route, but these pieces had not.
       be interruptible as a unit" is a question worth answering deliberately
       rather than as a side effect. Raised by review on that PR.
 
+- [ ] **Two pty tests fail under load.**
+      `settings_turn_the_interactive_decorations_off_and_back_on` and
+      `an_abandoned_line_is_closed_without_a_status` (`crates/mesh/tests/cli.rs`)
+      each failed once during full-suite runs that took 58s against the usual
+      32s, on branches touching neither. Run alone they pass — 5/5 and 3/3.
+
+      **It has since failed in CI**, on a `TODO.md`-only push, with
+      `PTY harness failed with status 0x7b00`. That decodes to **phase 123** of
+      `decoration_settings_harness`: after writing
+      `$sh.options.shell-integration = true ; touch <restored>` to the pty, the
+      harness waited for `<restored>` to appear and gave up. So it is not a
+      developer-machine artifact, and it is not a read racing ahead of the shell —
+      the wait it lost is a `wait_for_path`, which polls for **30 seconds**.
+
+      That reframes the question. A line taking over 30s to reach its `touch` is
+      not the harness being impatient; something stopped making progress. Worth
+      ruling out first: whether the shell received the line at all (`pty_write`
+      succeeding says the bytes were written, not that they were read), and
+      whether an earlier phase left the session mid-line so this write landed as a
+      continuation of it.
+
+      Reading a failure: each harness returns a distinct code per phase —
+      `abandoned_line_harness` 90–96, `decoration_settings_harness` 110–128. The
+      panic does not print that number directly, though. All 24 of these
+      assertions share the message `PTY harness failed with status {status:#x}`
+      and `status` is the **raw wait status** from `waitpid`, so phase 123 shows
+      as `0x7b00` — the code is the high byte, `status >> 8`. Printing
+      `WEXITSTATUS(status)` instead would be a kindness to whoever debugs this,
+      and the assertions already compute it for the condition; worth doing next
+      time these are touched.
+
+      To reproduce locally, run the suite under contention: `cargo test
+      --workspace` (see `DEVELOPMENT.md`) alongside a parallel build, or on an
+      already-loaded machine. Both local sightings were in runs that took 58s
+      against the usual 32s.
+
+      A test that passes most of the time is broken, so whatever this turns out to
+      be wants the ordering made explicit rather than a longer timeout — the
+      standing rule, and the reason `await_job` exists in the same file, a fixed
+      sleep having "still lost under load". A 30-second poll is already generous
+      enough that raising it would only hide the problem.
+
 - [ ] **If the syntactic capture-status rule proves too narrow, carry the status
       as evaluation metadata instead.** An assignment takes its right-hand side's
       capture status only when that side syntactically *is* a capture
