@@ -3598,21 +3598,67 @@ fn await_pty_harness(harness: libc::pid_t) {
     assert!(phase == 0, "PTY harness failed at phase {phase}");
 }
 
-/// Wait for a path to appear, up to a deadline.
+/// Read until the line editor has submitted the current line and started reading
+/// the next one, returning everything the shell wrote in between.
 ///
-/// How a harness synchronizes with a command it cannot hear: with
-/// `shell-integration` off there is no `D` to wait for, and reading the echo back
-/// instead would re-answer the cursor-position queries in the accumulated buffer,
-/// which reedline takes as input. A file the command creates is neither.
-fn wait_for_path(path: &Path) -> bool {
+/// How a harness waits for a command it cannot hear. With `shell-integration`
+/// off there is no `D` to stop on, and the file such a command creates to
+/// announce itself is not a substitute: `touch` creates it and *then* exits, so
+/// the moment the path appears the shell is still finishing the command — the
+/// terminal back in cooked mode, reedline not yet re-entered. A line typed into
+/// that window is echoed by the line discipline and picked up by reedline as it
+/// starts, and the losing side of that race is a garbled command that never
+/// runs. The file still proves the command *ran*; it just cannot say when the
+/// shell is ready to be typed at again.
+///
+/// Bracketed paste can. Reedline turns it off as it leaves a read and on as it
+/// enters the next, whatever the marks under test are set to, so `?2004l`
+/// followed by `?2004h` is exactly "the line I typed was submitted, and the
+/// editor is waiting for another." Requiring the `l` first is what keeps a
+/// leftover `h` from the previous prompt out of the answer.
+///
+/// Reading while it waits is the other half. Left unread the pty backs up, and
+/// the cursor-position query reedline writes at each prompt goes unanswered
+/// until it gives up — after which the reply the *next* reader sends arrives
+/// with nothing waiting for it and is taken as typed input. The bytes read here
+/// are handed back rather than dropped: they are the window the caller's
+/// assertions are about.
+fn pty_read_until_the_prompt_returns(master: RawFd) -> Option<Vec<u8>> {
+    const PASTE_OFF: &[u8] = b"\x1b[?2004l";
+    const PASTE_ON: &[u8] = b"\x1b[?2004h";
+    let mut ready = libc::pollfd {
+        fd: master,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready_again = |bytes: &[u8]| {
+        let submitted = bytes
+            .windows(PASTE_OFF.len())
+            .position(|part| part == PASTE_OFF)?;
+        bytes[submitted..]
+            .windows(PASTE_ON.len())
+            .any(|part| part == PASTE_ON)
+            .then_some(())
+    };
+    let mut seen = Vec::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
-        if path.exists() {
-            return true;
+        if ready_again(&seen).is_some() {
+            return Some(seen);
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        if unsafe { libc::poll(&mut ready, 1, QUIET) } <= 0 {
+            return None;
+        }
+        let mut chunk = [0_u8; 256];
+        let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if count <= 0 {
+            return None;
+        }
+        let fresh = seen.len().saturating_sub(3);
+        seen.extend_from_slice(&chunk[..count as usize]);
+        answer_cursor_queries(master, &seen[fresh..]);
     }
-    false
+    ready_again(&seen).map(|()| seen)
 }
 
 /// The case a setting is actually *for*: an rc file turning a decoration off, so
@@ -4518,16 +4564,25 @@ fn decoration_settings_harness(exec: &MeshExec, directory: &Path) -> i32 {
     if occurrences(&seen, b"\x1b]133;D;") != 1 {
         return 121;
     }
-    // Two commands with the marks off. Neither can be waited for on the wire, so
-    // each announces itself with a file instead; the pty is left unread until the
-    // end, which is what puts both commands' bytes in the buffer examined below.
+    // Two commands with the marks off. Neither can be waited for by its marks, so
+    // each is followed to the prompt that comes back after it, and announces that
+    // it ran by creating a file. What those two wrote is kept and joined to the
+    // next command's window below, since the count is over all three.
     let quiet = directory.join("quiet");
     let restored = directory.join("restored");
+    let mut window = Vec::new();
     let mut line = Vec::from(b"touch ");
     line.extend_from_slice(quiet.as_os_str().as_bytes());
     line.push(b'\n');
-    if !pty_write(shell.master, &line) || !wait_for_path(&quiet) {
+    if !pty_write(shell.master, &line) {
         return 122;
+    }
+    let Some(quiet_window) = pty_read_until_the_prompt_returns(shell.master) else {
+        return 123;
+    };
+    window.extend_from_slice(&quiet_window);
+    if !quiet.exists() {
+        return 124;
     }
     // Re-enabling and a command in one line, so the harness can hear that the
     // *assignment* landed. It runs with the marks still off, like the `touch`
@@ -4535,26 +4590,34 @@ fn decoration_settings_harness(exec: &MeshExec, directory: &Path) -> i32 {
     let mut line = Vec::from(b"$sh.options.shell-integration = true ; touch ");
     line.extend_from_slice(restored.as_os_str().as_bytes());
     line.push(b'\n');
-    if !pty_write(shell.master, &line) || !wait_for_path(&restored) {
-        return 123;
-    }
-    // Now read everything those two commands wrote, plus one marked command after
-    // them. Exactly one `C` and one `D` in the lot: the pair belongs to `puts
-    // back`, so the two that ran with the setting off contributed none.
-    if !pty_write(shell.master, b"puts back\n") {
-        return 124;
-    }
-    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+    if !pty_write(shell.master, &line) {
         return 125;
-    };
-    if status != 0 || occurrences(&seen, b"back\r\n") == 0 {
-        return 126;
     }
-    if occurrences(&seen, b"\x1b]133;C\x1b\\") != 1 || occurrences(&seen, b"\x1b]133;D;") != 1 {
+    let Some(restored_window) = pty_read_until_the_prompt_returns(shell.master) else {
+        return 126;
+    };
+    window.extend_from_slice(&restored_window);
+    if !restored.exists() {
         return 127;
     }
-    if !stop_pty_shell(shell) {
+    // One marked command after those two. Exactly one `C` and one `D` across all
+    // three: the pair belongs to `puts back`, so the two that ran with the
+    // setting off contributed none.
+    if !pty_write(shell.master, b"puts back\n") {
         return 128;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 129;
+    };
+    if status != 0 || occurrences(&seen, b"back\r\n") == 0 {
+        return 130;
+    }
+    window.extend_from_slice(&seen);
+    if occurrences(&window, b"\x1b]133;C\x1b\\") != 1 || occurrences(&window, b"\x1b]133;D;") != 1 {
+        return 131;
+    }
+    if !stop_pty_shell(shell) {
+        return 132;
     }
     0
 }
@@ -5178,6 +5241,21 @@ const COMMAND_DONE: &[u8] = b"\x1b]133;D;";
 /// waiting for the shell to start taking input.
 fn pty_wait_for_prompt(master: std::os::fd::RawFd) -> bool {
     pty_read_until_one_of(master, &[INPUT_READY]).is_some()
+}
+
+/// Answer every `ESC[6n` in `fresh` — and *only* in `fresh`.
+///
+/// One reply per query is the whole contract, which is why callers pass the
+/// bytes that just arrived rather than everything they have read. Scanning the
+/// accumulated buffer re-answers every earlier query on every read: reedline has
+/// long since stopped waiting for those, so the extra replies arrive as ordinary
+/// input, the line stops being empty, and a harness waiting on the shell waits
+/// forever. Callers overlap their slices by three bytes so a query split across
+/// two reads is still answered once.
+fn answer_cursor_queries(master: RawFd, fresh: &[u8]) {
+    for _ in fresh.windows(4).filter(|part| *part == b"\x1b[6n") {
+        unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
+    }
 }
 
 /// Read until the shell says the command is over, answering `ESC[6n` on the way,
