@@ -2275,9 +2275,41 @@ exact_number = item42 ~ /^item\d+$/
 not_source = notes.txt !~ *.rs
 ```
 
-A slash-delimited regex is recognized only in the right operand of `~` or `!~`.
-Its body is raw except that `\/` includes a literal slash. Flags are postfix
-modifiers on the pattern, each with a short and a long spelling:
+A slash-delimited regex is recognized in three slots: the right operand of `~` or
+`!~`, a `match` arm, and the pattern a replace takes. Its body is raw except that
+`\/` includes a literal slash, and it reaches the end of its own closing `/`
+rather than the end of a word — so the characters a pattern is made of (`[`, `(`,
+`{`, `|`, `,`, `:`, and a space) sit inside one:
+
+```mesh
+letters = abc ~ /[A-Za-z]+/
+grouped = abc ~ /a(b)c/
+either = abc ~ /abc|xyz/
+```
+
+The closing `/` has to end the word, which is what keeps a path a path: `/usr/bin`
+is the glob it looks like, since the slash before `bin` has a word character after
+it and so closes nothing. A pattern that needs an interior slash writes it `\/`.
+
+Some things are read before the literal is, so they cannot appear inside one, and
+`re(…)` takes every one of them as ordinary text:
+
+| In a literal | Read first as | Reported |
+| --- | --- | --- |
+| `#` with whitespace before it | a comment (an attached `a#b` is not) | yes |
+| an unmatched `'` or `"` | an unclosed quote — so `/['"]/` needs `re("[\"']")` | yes |
+| `<<` | a heredoc | yes |
+| an unbalanced `}` or `)` in a `${…}` or `$(…)` body | that body's closing delimiter | no |
+
+A *balanced* pair is fine in a body, which covers the shapes patterns actually
+use: `/a{1,2}/` and `/a(b)c/` both work there and at top level.
+
+A trailing `\` continues the line as it does anywhere else, and the two lines are
+joined before the pattern is read — so `/a\`⏎`b/` is `ab`, not a pattern holding a
+newline.
+
+Flags are postfix modifiers on the pattern, each with a short and a long
+spelling:
 
 | Flag | Long form | Effect |
 | --- | --- | --- |
@@ -2293,13 +2325,17 @@ contains_slash = a/b ~ /a\/b/
 ```
 
 They chain like any other modifier (`/error/:i:m`), and they apply to a compiled
-`re(…)` value as readily as to a literal. A `/…/` literal is one **word**, so it
-cannot contain a space — which is why `:x`, whose whole point is a spaced-out
-pattern, pairs with `re(…)`:
+`re(…)` value as readily as to a literal — so `:x`, whose whole point is a
+spaced-out pattern, works with either:
 
 ```mesh
-spaced = re("\\d{3} - \\d{4}"):x
+spaced = "555-1234" ~ /\d{3} - \d{4}/:x     # true — `:x` ignores the spacing
+compiled = re("\\d{3} - \\d{4}"):x
 ```
+
+Only a **flag** chain keeps a literal a pattern. `/a/:upper` is the string `/A/`,
+which is what it means everywhere else, and reading it as a regex would both
+change that and fail — `:upper` is not a flag.
 
 Use `re(STRING)` to compile a regex for reuse or to build one from a value, and
 `re(STRING, literal: true)` to quote regex metacharacters and match the supplied

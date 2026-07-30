@@ -293,6 +293,14 @@ pub enum ParseErrorKind {
     /// would be listed in help and offered by completion while every
     /// command-position `--flag` went straight to `...rest` instead.
     WrapperDeclaresFlag(String),
+    /// A `/…/` literal the tokenizer had already taken apart — the only way that
+    /// happens is a construct the lexer consumes *without emitting a token*, so
+    /// in practice a ` #` comment inside the pattern. Its own variant because the
+    /// alternative is the silence this literal exists to remove: the scan
+    /// declines, the leading `/a` reads as a glob, and the test quietly answers
+    /// false. Carries nothing — the span points at the literal, which is the
+    /// whole answer.
+    RegexLiteralInterrupted,
     /// A value argument with text glued to it — `pre$(x)post`, `f()x`. Its own
     /// variant because the fix a reader needs is a *spelling*, not a rethink: the
     /// message names both, and it keeps this the loud error it was before value
@@ -406,6 +414,11 @@ impl std::fmt::Display for ParseError {
             ParseErrorKind::DuplicateGlobQualifier(dimension) => write!(
                 f,
                 "syntax error: the glob qualifier `{dimension}` is given twice"
+            ),
+            ParseErrorKind::RegexLiteralInterrupted => write!(
+                f,
+                "syntax error: a `/…/` literal cannot contain a comment; attach the \
+                 `#` to the pattern, or build it with `re(r\"…\")`"
             ),
             ParseErrorKind::GluedValueArgument => write!(
                 f,
@@ -928,8 +941,10 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
     let mut parser = Parser {
         tokens,
         position: 0,
+        source,
         source_len: source.len(),
         depth: 0,
+        regex_slot: false,
     };
     match parser.source(None) {
         Ok(tree) => Ok(ParseOutcome::Complete(tree)),
@@ -1054,8 +1069,10 @@ pub(crate) fn params_prefix_status(list: &str) -> PrefixStatus {
     Parser {
         tokens,
         position: 0,
+        source: list,
         source_len: list.len(),
         depth: 0,
+        regex_slot: false,
     }
     .parameters_prefix()
 }
@@ -1668,8 +1685,10 @@ fn capture_in_string(
     let mut parser = Parser {
         tokens,
         position: 0,
+        source,
         source_len: end,
         depth,
+        regex_slot: false,
     };
     Ok((Expr::Capture(parser.source(Some(TokenKind::RParen))?), end))
 }
@@ -1711,8 +1730,10 @@ fn braced_expression_in_string(
     let mut parser = Parser {
         tokens,
         position: 0,
+        source,
         source_len: end,
         depth,
+        regex_slot: false,
     };
     // A newline inside the braces is layout, not a terminator — the body is one
     // expression, so it wraps the way a `( … )` group does. Without this the
@@ -2167,6 +2188,17 @@ fn bare_delimiters(pieces: &[WordPiece]) -> bool {
     bare_edge(pieces.first(), true) && bare_edge(pieces.last(), false)
 }
 
+/// Does this character end a bare word, so that a `/` before it is the word's
+/// last character? Whitespace, the closers and separators, and the `:` a regex
+/// flag chain hangs off.
+fn ends_a_word(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            ')' | ']' | '}' | ',' | ';' | '&' | '|' | '<' | '>' | '=' | ':'
+        )
+}
+
 fn match_pattern_operand(expression: Expr) -> Expr {
     let original = expression.clone();
     match match_operand(expression) {
@@ -2241,10 +2273,21 @@ pub fn value_builtin(name: &str) -> bool {
     RESERVED_FUNCTION_NAMES.contains(&name)
 }
 
-struct Parser {
+struct Parser<'a> {
     tokens: Vec<Token>,
     position: usize,
+    /// The text the tokens were lexed from. Spans index into it, so a construct
+    /// that has to be read as it was *written* rather than as it tokenized —
+    /// see [`Parser::regex_literal`] — can take itself back out of the source.
+    source: &'a str,
     source_len: usize,
+    /// Is the operand about to be parsed a **regex slot** — the right-hand side
+    /// of `~` / `!~`, a `match` arm, or the pattern a replace takes?
+    ///
+    /// Consulted once and cleared, by the first [`Parser::primary`] to run under
+    /// it, so it describes where an operand *starts* and never leaks into a
+    /// sub-expression further in.
+    regex_slot: bool,
     /// How many nested constructs deep [`Parser::primary`] currently is, so that
     /// input can be *refused* before the recursive descent runs out of stack.
     depth: usize,
@@ -2266,7 +2309,7 @@ struct Parser {
 /// limit is the fix for the common stack and the handler is the net for the rest.
 const MAX_DEPTH: usize = 100;
 
-impl Parser {
+impl Parser<'_> {
     fn source(&mut self, closer: Option<TokenKind>) -> Result<Source, ParseError> {
         let start = self.peek().map_or(self.source_len, |t| t.span.start);
         self.newlines();
@@ -3361,9 +3404,10 @@ impl Parser {
             self.position += 1;
             Ok(MatchPattern::Value(Expr::Glob("*".into())))
         } else {
-            Ok(MatchPattern::Value(match_pattern_operand(
-                self.expression()?,
-            )))
+            self.regex_slot = true;
+            let pattern = self.expression();
+            self.regex_slot = false;
+            Ok(MatchPattern::Value(match_pattern_operand(pattern?)))
         }
     }
 
@@ -3726,7 +3770,9 @@ impl Parser {
             }
             self.position += 1;
             self.newlines();
+            self.regex_slot = matches!(op, BinaryOp::Match | BinaryOp::NotMatch);
             let mut right = self.binary(precedence + 1)?;
+            self.regex_slot = false;
             if matches!(op, BinaryOp::Match | BinaryOp::NotMatch) {
                 right = match_operand(right);
             }
@@ -3883,18 +3929,22 @@ impl Parser {
                         .is_some_and(|token| token.span.start == self.previous_end())
                 {
                     self.position += 1;
-                    let mut arguments = self.deeper(Self::arguments)?;
                     // The first argument of the replace family is a **regex match
                     // slot** (`DESIGN.md` §"String"), so a bare `/…/` there reads as
                     // a pattern rather than an absolute path — the same conversion
                     // the `~` right-hand side and a `match` arm get. Only the first:
                     // the replacement is an ordinary value slot, where `/…/` is the
-                    // literal string it looks like.
-                    if matches!(
+                    // literal string it looks like. Setting the slot here is enough
+                    // to say "only the first", since the first operand to be parsed
+                    // takes the flag with it.
+                    let regex_slot = matches!(
                         name.as_str(),
                         "replaceall" | "replacestart" | "replaceend" | "match" | "matches"
-                    ) && !arguments.is_empty()
-                    {
+                    );
+                    self.regex_slot = regex_slot;
+                    let mut arguments = self.deeper(Self::arguments)?;
+                    self.regex_slot = false;
+                    if regex_slot && !arguments.is_empty() {
                         if let Argument::Positional(first) = arguments.remove(0) {
                             arguments.insert(0, Argument::Positional(regex_slot_operand(first)));
                         } else {
@@ -4153,7 +4203,144 @@ impl Parser {
         self.deeper(Self::primary_inner)
     }
 
+    /// A `/…/` literal in a **regex slot**, read from the source rather than
+    /// reassembled from tokens.
+    ///
+    /// A regex literal is not a token: it is an ordinary word that
+    /// [`match_operand`] recognizes afterwards by its shape, so it ends wherever
+    /// a word ends. Every character a regex is *made of* ends one — `[`, `(`,
+    /// `{`, `|`, `,`, `:` — so `/[A-Za-z]/` was never one word to recognize, and
+    /// the tokens it did produce parsed as an index and a division: "expected a
+    /// value expression", pointing at neither. In an `if` condition it did not
+    /// even report, since a condition that fails to parse as a value is re-read
+    /// as a command, and `if $x ~ /[A-Za-z]/` quietly ran `$x`.
+    ///
+    /// The slots are the reason this can be decided at all. A leading `/` is far
+    /// more often a path than a pattern, so the lexer cannot know — but the
+    /// right-hand side of `~`, a `match` arm, and a replace's pattern are three
+    /// places where the shape is a pattern or nothing, so the parser can ask.
+    /// Command position never reaches here, and `ls /usr/bin` stays a path.
+    ///
+    /// **The closing `/` must end the word.** That is what keeps `$x ~ /usr/bin`
+    /// the glob it is today: the scan finds a closing `/` before `bin`, sees a
+    /// word character after it, and declines — leaving the existing reading,
+    /// which refuses any literal holding an interior slash, to answer as before.
+    /// A regex that needs one spells it `\/`, as it always has.
+    fn regex_literal(&mut self) -> Result<Option<Expr>, ParseError> {
+        let Some(start) = self.peek().map(|token| token.span.start) else {
+            return Ok(None);
+        };
+        // Bounded by `source_len`, not by the end of the string. A nested parse —
+        // a `${…}` body, a capture — is handed the *whole* source with its own
+        // end recorded separately, so an unbounded scan would run past the body
+        // and take a slash from the text around it as the closer.
+        let Some(rest) = self.source.get(start..self.source_len) else {
+            return Ok(None);
+        };
+        let mut characters = rest.char_indices();
+        if characters.next().is_none_or(|(_, first)| first != '/') {
+            return Ok(None);
+        }
+        let mut pattern = String::new();
+        let mut close = None;
+        while let Some((offset, character)) = characters.next() {
+            match character {
+                // A literal is one line. Scanning past a newline would swallow
+                // whole statements looking for a slash that was never a closer.
+                '\n' => return Ok(None),
+                '\\' => {
+                    let Some((_, escaped)) = characters.next() else {
+                        return Ok(None);
+                    };
+                    match escaped {
+                        // A **line continuation**, which the lexer has already
+                        // resolved by joining the lines — so keeping the pair
+                        // would put a backslash and a newline in the pattern
+                        // that the reader never wrote, and `/a\⏎b/` would match
+                        // a newline instead of `ab`.
+                        '\n' => {}
+                        // `\/` is how a literal spells a slash, and the regex
+                        // engine has no such escape — it is this grammar's, so
+                        // it is spent here.
+                        '/' => pattern.push('/'),
+                        // Every other escape is the engine's and travels whole.
+                        other => {
+                            pattern.push('\\');
+                            pattern.push(other);
+                        }
+                    }
+                }
+                '/' => {
+                    close = Some(start + offset);
+                    break;
+                }
+                _ => pattern.push(character),
+            }
+        }
+        let Some(close) = close else {
+            return Ok(None);
+        };
+        // The closer has to end the word, or this is a path with slashes in it
+        // rather than a literal with one at each end.
+        if self.source[close + 1..self.source_len]
+            .chars()
+            .next()
+            .is_some_and(|after| !ends_a_word(after))
+        {
+            return Ok(None);
+        }
+        // Give back every token the literal covers. A token that straddles its
+        // end is not one this can consume — nothing spells that today, and
+        // guessing at half a token is worse than declining.
+        let saved = self.position;
+        while self.peek().is_some_and(|token| token.span.start <= close) {
+            self.position += 1;
+        }
+        if self.previous_end() != close + 1 {
+            self.position = saved;
+            // The literal is well formed in the source and the tokens do not
+            // cover it, which means the lexer consumed part of it without
+            // emitting anything — a comment. Reported rather than declined: a
+            // decline leaves the leading `/a` to read as a glob and the test to
+            // answer false, which is the silence this whole reading exists to
+            // remove.
+            return Err(ParseError {
+                kind: ParseErrorKind::RegexLiteralInterrupted,
+                span: start..close + 1,
+            });
+        }
+        // A chain hanging off the closer keeps this a literal only if every link
+        // is a regex **flag**. `/a/:upper` is the ordinary string `/A/`
+        // everywhere else, and reading it as a regex here would both change what
+        // it means and fail, since `:upper` is not a flag — the rule
+        // [`became_regex`] already applies to a literal that tokenized as one
+        // word, asked here of one that did not.
+        let mut ahead = 0;
+        while matches!(
+            self.tokens.get(self.position + ahead).map(|t| &t.value),
+            Some(TokenKind::Colon)
+        ) {
+            match self.word_text_at(ahead + 1) {
+                Some(name) if regex_flag(name) => ahead += 2,
+                _ => {
+                    self.position = saved;
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(Expr::Regex(pattern)))
+    }
+
     fn primary_inner(&mut self) -> Result<Expr, ParseError> {
+        // Before anything else, and only where a slot asked for it: a `/…/`
+        // literal is read whole here or not at all, since every reading below
+        // would take it apart. Cleared as it is read, so it describes the start
+        // of this operand and not of a sub-expression inside it.
+        if std::mem::take(&mut self.regex_slot)
+            && let Some(regex) = self.regex_literal()?
+        {
+            return Ok(regex);
+        }
         if self.eat(&TokenKind::CaptureStart).is_some() {
             self.newlines();
             return Ok(Expr::Capture(self.source(Some(TokenKind::RParen))?));
@@ -5282,7 +5469,7 @@ pub(crate) fn valid_name(name: &str) -> bool {
     !previous_hyphen
 }
 
-impl Parser {
+impl Parser<'_> {
     /// The name of a `:name` modifier reference starting at the current `:`, when
     /// the next token really is a modifier name written tight against it.
     ///
@@ -5455,10 +5642,12 @@ mod tests {
         ] {
             let tokens = tokenize(source).unwrap();
             let parser = Parser {
+                source,
                 source_len: source.len(),
                 position: 0,
                 tokens,
                 depth: 0,
+                regex_slot: false,
             };
             // The whole source, which is what the value parse would consume here.
             let end = parser.tokens.len();

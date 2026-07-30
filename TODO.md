@@ -1463,24 +1463,52 @@ designed, and the cross-references say where the fuller note lives.
       too — `f (1)` currently calls `f` and would stop — which is a language
       decision rather than a bug fix.
 
-- [ ] **A bare `/…/` literal cannot hold a space or an unbalanced paren.** A regex
-      literal is not lexed as a unit — it is an ordinary word that
-      `match_operand` recognizes *after* tokenization, by its shape — so it ends
-      where any word ends. `/foo #bar/:x` is two words and `/foo(/` opens a group,
-      both "unexpected end of input", exactly as `puts a b` and `puts a(b` are.
-      Pre-existing on `main`, and it applies to every match slot alike: the `~`
-      right-hand side, a `match` arm, and the replace family.
+- [x] **A bare `/…/` literal cannot hold a space or an unbalanced paren.** Fixed
+      by having the three **slots** read the literal themselves, which is what
+      makes the ambiguity decidable: a leading `/` is far more often a path than a
+      pattern and the lexer cannot know, but the right-hand side of `~`, a `match`
+      arm, and a replace's pattern are three places where the shape is a pattern
+      or nothing. `Parser::regex_literal` scans from the opening `/` to its closer
+      and takes the text from the source, so `[`, `(`, `{`, `|`, `,`, `:` and a
+      space all sit inside one. Command position never reaches it, so
+      `ls /usr/bin` is untouched, and so is `cat a(b`.
 
-      It bites `:x` hardest, since extended mode exists to let a pattern be spaced
-      out and commented, and the spelling that most wants a space is the one that
-      cannot have one. `#` itself is fine — `/foo#bar/:x` works, so a comment with
-      no space before it is writable — and `re(r"…")` takes anything.
+      `/usr/bin` stays a glob because **the closer has to end the word**: the
+      slash before `bin` has a word character after it, so it closes nothing and
+      the existing reading answers as before. A pattern that wants an interior
+      slash still writes `\/`.
 
-      The fix would be lexing `/…/` as a unit, which is exactly what the
-      after-the-fact recognition avoids: a leading `/` is far more often a path
-      than a pattern, so the lexer cannot know. Any change here has to keep
-      `ls /usr/bin` a path and `cat a(b` whatever it is today. Worth a design
-      entry rather than a patch.
+      Three cases are left. A slash inside a character class (`/a[/]b/`) closes
+      the literal, since the scan is not bracket-aware — `/a[\/]b/` works and is
+      a valid class either way.
+
+      The other four are the **lexer's**, and together they are why the scan
+      being a parser-side reading is a trade rather than a free win: it runs on
+      the source *after* tokenization, so anything the lexer resolves first is
+      inside the literal in the source and already decided in the tokens.
+
+      - A ` #` comment. Reported now as `a /…/ literal cannot contain a
+        comment`, where it used to decline and leave the leading `/a` to read as
+        a glob and answer false.
+      - An unmatched `'` or `"`, rejected as an unclosed quote — so the class
+        `/['"]/`, which is not an exotic thing to want, has to be written
+        `re("[\"']")`.
+      - `<<`, rejected as an unterminated heredoc before the parser sees
+        anything, so the message names a delimiter nobody wrote.
+      - An **unbalanced** `}` or `)` inside a `${…}` or `$(…)` body, whose
+        closing delimiter the lexer finds first: `"${ "a}b" ~ /a}b/ }"` ends the
+        body at the pattern's `}` and renders `falseb/ }`, while the same test
+        at top level is `true`. Silent, and the inconsistency is new — the top
+        level only started accepting `}` with this change. A *balanced* pair is
+        fine in both places, which covers what patterns actually use
+        (`/a{1,2}/`, `/a(b)c/`).
+
+      Closing all four means teaching the **lexer** the slots — it knows the
+      token before the one it is about to scan, so `~` and `!~` are reachable
+      there, but a `match` arm and a replace's argument are not without more
+      context. Doing it for one slot and not the others would be worse than the
+      limit. Four instances now argue for doing it properly; all four were
+      raised by review on mikelward/mesh#318.
 
 - [ ] **How `puts` should render a nested structure.** *(mikelward)* A collection
       inside a collection has no rendering today, so `puts $m` on
@@ -2138,13 +2166,19 @@ was re-checked against `main` rather than taken from the PR text.
       `$sh.status` be read into a name, and the `if` test that. Predicates written
       as value functions (`if not have-command(x)`) are fine; it is the external
       command that has nowhere to go.
-- [ ] **4. A `/…/` regex literal ends at the first `[`, `(`, `{`, `|`, `:`, `,`,
-      `;`, `<`, `>` or `&`.** Already tracked under "Loose ends" as *A bare `/…/`
-      literal cannot hold a space or an unbalanced paren*. The port adds the
-      character class, which is the shape a config reaches for first, and the
-      observation that the failure is **silent**: `if $x ~ /[A-Za-z]/ { … }` runs
-      `$x` as a command and takes the `else` branch rather than reporting
-      anything. `re("[A-Za-z]")` is the workaround, used throughout.
+- [x] **4. A `/…/` regex literal ends at the first `[`, `(`, `{`, `|`, `:`, `,`,
+      `;`, `<`, `>` or `&`.** Fixed with the "Loose ends" entry it shares — see
+      *A bare `/…/` literal cannot hold a space or an unbalanced paren* — so
+      `/[A-Za-z]/` is now the pattern it looks like and `re("[A-Za-z]")` is a
+      choice rather than the workaround.
+
+      The **silence** this entry added is worth keeping in view, because the fix
+      removed the symptom without touching the cause. `if $x ~ /[A-Za-z]/` did not
+      report because an `if` condition that fails to parse as a value is re-read
+      as a *command*, so the shell ran `$x` and took the `else` branch. That
+      fallback is deliberate — a partial command has to stay buffered rather than
+      erroring — but it swallows the diagnostic for any condition that was clearly
+      meant as a value. Nothing else in the file makes a wrong answer this quiet.
 - [ ] **5. `$env[$name] = value` — no dynamically-named environment write.**
       `$env:get(NAME, default)` reads by computed name and has no writing twin, so
       a generic "parse this tool's `shellenv` output and apply it" helper cannot be
