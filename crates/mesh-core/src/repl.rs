@@ -1731,9 +1731,34 @@ fn condition_status(
         let truth = condition_bool(&value).map_err(runtime_message)?;
         return Ok(Some(u8::from(!truth)));
     }
+    // A command condition **is** a command that ran, so it publishes its status
+    // like any other one, and the branch it picks can read it: `if cmd { … } else
+    // { … }` sees the real code in the `else`, where bash's `$?` has it too. The
+    // publishing normally happens in `run_recorded`, which a condition does not
+    // pass through — the condition is not the statement's result, the branch is.
+    //
+    // Two conditions are exempt, for the same reason: nothing ran. A bool is not a
+    // command and has no status to report, so `if $x == 1 { … }` leaves the
+    // previous command's standing; and a condition its own trailing guard skipped
+    // — `if cmd if false { … }` — never ran the command at all. Both are the rule
+    // `docs/REFERENCE.md` §Guards already states, and `Produced::Nothing` is what
+    // says which happened.
+    let records = shell.status_records;
+    shell.produced = Produced::Status;
     match run_executable(condition, false, last, in_function, shell) {
         Step::Continue(_) if shell.control.is_some() => Ok(None),
-        Step::Continue(code) => Ok(Some(code)),
+        Step::Continue(code) => {
+            // Beyond "did it run", the same test `run_recorded` applies: a pipeline
+            // already recorded its own per-stage breakdown, so leave it rather than
+            // flattening it to one entry — `if a | b { puts ...$sh.pipestatus }`
+            // still sees both stages.
+            if shell.produced != Produced::Nothing
+                && (shell.status_records == records || shell.vars.status() != code)
+            {
+                shell.record_status(code, vec![code]);
+            }
+            Ok(Some(code))
+        }
         step => Err(step),
     }
 }
@@ -1881,6 +1906,21 @@ fn run_ast_while(
     // produced nothing; each pass's `run_source` overwrites it otherwise.
     shell.produced = Produced::Nothing;
     let mut errored = false;
+    // Everything the last completed pass left behind. A `while` is the one
+    // construct whose condition runs *after* its final pass, so the failing test
+    // is the newest thing to have run — and the loop reports the *pass*, not the
+    // test. Two ways that showed:
+    //
+    // - `run_recorded` cannot tell the test's status record from the body's when
+    //   the codes coincide, so a body ending in `true | sh -c 'exit 1'` under a
+    //   now-false condition reported `1 | 1` where the pass was `1 | 0 1`.
+    // - the test produces a *status*, which displaces the pass's value, so
+    //   `func f() { n = 0; while test $n -lt 1 { n = 1; 7 + 0 } }` answered `0`
+    //   where the same loop under a value condition answers `7`.
+    //
+    // Both are the same mistake, so both are undone the same way: snapshot after
+    // each pass, put it back on the way out.
+    let mut pass_record = None;
     shell.loop_depth += 1;
     loop {
         if let Some(condition) = condition {
@@ -1921,6 +1961,11 @@ fn run_ast_while(
                 return flow;
             }
         }
+        pass_record = Some((
+            shell.vars.status_snapshot(),
+            shell.result.clone(),
+            shell.produced,
+        ));
         match shell.control.take() {
             Some(parser::ControlKind::Break) => break,
             Some(parser::ControlKind::Continue) => continue,
@@ -1931,6 +1976,14 @@ fn run_ast_while(
         }
     }
     shell.loop_depth -= 1;
+    // Only when a pass actually ran: a loop whose condition was false from the
+    // start reports its own 0 and produced nothing, which `run_recorded` and
+    // `compound_result` answer for between them.
+    if let Some((record, result, produced)) = pass_record {
+        shell.vars.restore_status(record);
+        shell.result = result;
+        shell.produced = produced;
+    }
     compound_result(sequenced(status, errored), shell)
 }
 

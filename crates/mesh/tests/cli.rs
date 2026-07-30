@@ -17675,6 +17675,109 @@ fn sh_pipestatus_breaks_a_pipeline_down_by_stage() {
 }
 
 #[test]
+fn a_command_condition_publishes_its_status_to_the_branch_it_picks() {
+    // A condition is a command that ran, so the branch it chose can read what it
+    // exited with — the detail bash's `$?` has in the same place. Without it a
+    // `130` from Ctrl-C flattened to a generic failure, and every caller that
+    // wanted the code had to run the command as a plain statement and read
+    // `$sh.status` before branching.
+    let failed = run_with_input(
+        "if sh -c 'exit 3' { puts \"then=$sh.status\" } else { puts \"else=$sh.status\" }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&failed.stdout), "else=3\n");
+
+    // The success arm reads the 0 that picked it, not whatever ran before it.
+    let passed = run_with_input("sh -c 'exit 3'\nif sh -c 'exit 0' { puts \"then=$sh.status\" }\n");
+    assert_eq!(
+        String::from_utf8_lossy(&passed.stdout),
+        "then=0\n",
+        "{}",
+        String::from_utf8_lossy(&passed.stderr)
+    );
+
+    // A `while` header is the same construct, so its body sees it too.
+    let looped = run_with_input(
+        "n = 0\nwhile $n < 2 { n = $n + 1\n  if sh -c 'exit 4' { puts no } else { puts $sh.status } }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&looped.stdout), "4\n4\n");
+
+    // A **value** condition is not a command and has no status to report, so the
+    // previous command's still stands — the rule a skipped guard already follows.
+    let boolean = run_with_input("sh -c 'exit 3'\nif 1 == 1 { puts \"then=$sh.status\" }\n");
+    assert_eq!(String::from_utf8_lossy(&boolean.stdout), "then=3\n");
+
+    // The `if` itself still reports its *body's* status, not its condition's.
+    assert_eq!(
+        status_line("if sh -c 'exit 3' { puts x } else { true }"),
+        "0 | 0"
+    );
+
+    // A condition its own trailing guard skipped never ran the command, so it
+    // publishes nothing and the previous run stands — breakdown included, since
+    // the two always describe the same run. Raised in review: this reported
+    // `1 | 1` for what was `1 | 1 0`.
+    let skipped = run_with_input(
+        "false | true\nif puts no if false { puts T } else { puts \"$sh.status |\" ...$sh.pipestatus }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&skipped.stdout), "1 | 1 0\n");
+}
+
+#[test]
+fn a_while_reports_its_last_passs_breakdown_not_its_final_tests() {
+    // `while` is the one construct whose condition runs *after* its final pass,
+    // so the failing test leaves the newest record — and when its code happens to
+    // match the body's, nothing downstream can tell the two apart. The loop
+    // reports its body's status, so the body's breakdown has to go with it.
+    // Raised in review: this read `1 | 1` where the pass was `1 | 0 1`.
+    let out = run_with_input(
+        "n = 0\nwhile test $n -lt 1 { n = 1\n  true | sh -c 'exit 1' }\nputs \"$sh.status |\" ...$sh.pipestatus\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1 | 0 1\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The same mistake in the value channel: the failing test produces a *status*,
+    // which displaced the pass's value, so a `while` in tail position answered the
+    // loop's code instead of what its last pass evaluated. Raised in review.
+    let valued = run_with_input(
+        "func f() { n = 0\n  while test $n -lt 1 { n = 1\n    7 + 0 } }\nputs f()\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&valued.stdout),
+        "7\n",
+        "{}",
+        String::from_utf8_lossy(&valued.stderr)
+    );
+    // The reference: a value condition, which never had the problem, agrees.
+    let reference =
+        run_with_input("func f() { n = 0\n  while $n < 1 { n = 1\n    7 + 0 } }\nputs f()\n");
+    assert_eq!(String::from_utf8_lossy(&reference.stdout), "7\n");
+
+    // A loop whose condition was false from the start ran no pass, so it produced
+    // nothing and reports its own 0 rather than restoring what it never made.
+    let never = run_with_input("func g() { while false { 7 } }\nputs \"[$(g())]\"\n");
+    assert_eq!(String::from_utf8_lossy(&never.stdout), "[]\n");
+    assert_eq!(
+        status_line("while false { sh -c 'exit 4' | true }"),
+        "0 | 0"
+    );
+}
+
+#[test]
+fn a_pipeline_condition_keeps_its_breakdown_in_the_branch() {
+    // The condition publishes one entry only when nothing nested already
+    // recorded, so a pipeline used as a condition arrives with both stages
+    // intact rather than flattened to its pipefail status.
+    let out = run_with_input(
+        "if sh -c 'exit 3' | sh -c 'exit 0' { puts no } else { puts \"$sh.status |\" ...$sh.pipestatus }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3 | 3 0\n");
+}
+
+#[test]
 fn sh_pipestatus_shows_a_sigpipe_that_pipefail_forgives() {
     // The pipefail rule ignores an upstream SIGPIPE, so `$sh.status` is 0 — but
     // the stage really did die of signal 13, and saying so is the whole point of
@@ -17697,6 +17800,10 @@ fn sh_status_and_pipestatus_always_describe_the_same_run() {
         "func g() { if true { sh -c 'exit 4' | true } }\ng",
         "match 1 { 1 => { sh -c 'exit 4' | true } }",
         "true && sh -c 'exit 4' | true",
+        // A `while` with a *command* condition: the test that ends the loop runs
+        // after the last pass, so its record is the newest one when the loop
+        // reports the body's status.
+        "n = 0\nwhile test $n -lt 1 { n = 1\n  sh -c 'exit 4' | true }",
     ] {
         assert_eq!(status_line(source), "4 | 4 0", "for: {source}");
     }
