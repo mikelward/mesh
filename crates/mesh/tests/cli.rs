@@ -20101,6 +20101,251 @@ fn exiting_over_a_finished_job_reports_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `with NAME=value … { … }` runs its body with those environment entries in
+/// place and puts the environment back afterwards — the block form of the
+/// one-command prefix other shells spell `LC_ALL=C sort file`. Rough edge 2 from
+/// the config port, whose workaround was `fork { $env.VAR = …; cmd }`: three
+/// lines and a process for what is one word elsewhere.
+#[test]
+fn with_sets_the_environment_for_its_body_and_restores_it() {
+    // A child sees it, and stops seeing it after — the whole point, since a shell
+    // binding would never have reached the child at all.
+    let out = run_with_input(
+        "with MESH_WITH_A=one {\n\
+         sh -c 'echo in=[$MESH_WITH_A]' }\n\
+         sh -c 'echo out=[$MESH_WITH_A]'\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "in=[one]\nout=[]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Several bindings, as a prefix takes; values interpolate like any word.
+    let out = run_with_input(
+        "x = zed\n\
+         with LC_ALL=C TZ=UTC NAME=$x QUOTED=\"a b\" {\n\
+         puts $env.LC_ALL $env.TZ $env.NAME $env.QUOTED }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "C UTC zed a b\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Restoring means the *previous* state, so a name that was unset goes back to
+    // unset rather than to an empty string — a child can tell those apart.
+    let out = run_with_input(
+        "with MESH_WITH_B=x { puts $env.MESH_WITH_B }\n\
+         sh -c 'echo [${MESH_WITH_B-UNSET}]'\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "x\n[UNSET]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Nested headers stack and unwind one layer at a time.
+    let out = run_with_input(
+        "$env.MESH_WITH_C = outer\n\
+         with MESH_WITH_C=inner { with MESH_WITH_C=deep { puts $env.MESH_WITH_C }\n\
+         puts $env.MESH_WITH_C }\n\
+         puts $env.MESH_WITH_C\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "deep\ninner\nouter\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A repeated name: the last wins, and the restore is to what the *header*
+    // found rather than to what the first binding left.
+    let out = run_with_input(
+        "$env.MESH_WITH_D = orig\n\
+         with MESH_WITH_D=one MESH_WITH_D=two { puts $env.MESH_WITH_D }\n\
+         puts $env.MESH_WITH_D\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "two\norig\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `+=` is the append the `$env.KEY` write already has, so a header can extend
+    // a path for one block without rebuilding it.
+    // Read back through a child rather than `$env.PATH`, which mesh presents as a
+    // list — the bytes a child inherits are what the append is about.
+    let out = run_with_input(
+        "$env.PATH = /usr/bin\n\
+         with PATH+=/opt/bin { sh -c 'echo $PATH' }\n\
+         sh -c 'echo $PATH'\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "/usr/bin:/opt/bin\n/usr/bin\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // An empty value is a value, as it is in every other shell: the name is set
+    // and holds nothing, which is not the same as being unset.
+    let out = run_with_input("with MESH_WITH_E= { sh -c 'echo [${MESH_WITH_E-UNSET}]' }\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The restore is the whole contract, so it holds however the body leaves — which
+/// is why it cannot be written as an early return.
+#[test]
+fn with_restores_the_environment_on_every_way_out() {
+    for (source, expected) in [
+        // A failing command.
+        (
+            "with MESH_WITH_X=temp { nosuchcommand-mesh-test }\n",
+            "orig\n",
+        ),
+        // `return` out of the enclosing function.
+        (
+            "func f() { with MESH_WITH_X=temp { return } }\nf\n",
+            "orig\n",
+        ),
+        // `break` out of the enclosing loop.
+        (
+            "for i in [1] { with MESH_WITH_X=temp { break } }\n",
+            "orig\n",
+        ),
+        // A binding whose own value fails: the header stops there, and the writes
+        // it had already made are undone with the rest.
+        (
+            "with MESH_WITH_X=temp MESH_WITH_Y=$nosuchvar { puts body }\n",
+            "orig\n",
+        ),
+    ] {
+        let out = run_with_input(&format!(
+            "$env.MESH_WITH_X = orig\n{source}puts $env.MESH_WITH_X\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            expected,
+            "for {source:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A value expression can write the environment itself, so every name in the
+    // header is snapshotted before *any* right-hand side runs. Snapshotting each as
+    // its binding was reached recorded what an earlier value's write had left, and
+    // restored to that — leaking the side effect past the block. Raised in review as
+    // a P2. It holds whether the header finishes or fails partway.
+    for header in [
+        "with A=alter() MESH_WITH_Z=inside { puts $env.MESH_WITH_Z }\n",
+        "with A=alter() MESH_WITH_Z=$nosuchvar { puts body }\n",
+    ] {
+        let out = run_with_input(&format!(
+            "func alter() {{ $env.MESH_WITH_Z = leaked\n             return one }}\n             $env.MESH_WITH_Z = orig\n             {header}puts after=$env.MESH_WITH_Z\n"
+        ));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("after=orig"),
+            "for {header:?}: {} / {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The body never ran in the failing-binding case, so nothing it would have
+    // printed is here — and the failing binding is reported rather than skipped.
+    let out = run_with_input("with A=ok B=$nosuchvar { puts body }\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nosuchvar: unbound variable"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+/// A header that is shaped like a binding but does not hold a usable name is a
+/// syntax error, not a crash. `env_binding_follows` asks only about the shape — a
+/// word with an attached `=` — because that is what tells the statement from a
+/// command; whether the word is a name is a separate question, and both answers
+/// arrive from ordinary input. Treating the shape check as a guarantee panicked the
+/// shell with status 101. Raised in review as a P1.
+#[test]
+fn a_with_header_reports_a_name_it_cannot_use() {
+    for source in ["with \"A\"=x { puts hi }\n", "with 1=x { puts hi }\n"] {
+        let out = run_with_input(source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("a valid NAME before `=` in a `with` header"),
+            "for {source:?}: {stderr}"
+        );
+        assert_eq!(out.status.code(), Some(2), "for {source:?}: {stderr}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "", "for {source:?}");
+    }
+}
+
+/// An empty body is a success, not the previous command's status. The body is
+/// seeded at 0 and passed through `compound_result` as every other compound body
+/// is; seeding it with the incoming status let an empty `with` — or one whose
+/// statements were all guard-skipped — inherit an unrelated failure. Raised in
+/// review as a P2.
+#[test]
+fn an_empty_with_block_succeeds_on_its_own() {
+    let out = run_with_input(
+        "false\n         with A=x { } || puts inherited\n         false\n         with A=x { puts hi if false } || puts skipped\n         with A=x { false } || puts body-failed\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "body-failed\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A new construct has to be reachable through the shell's own help, or it exists
+/// only for whoever read the commit. `help fork` worked and `help with` said it was
+/// "not a builtin or a keyword" — raised in review as a P2.
+#[test]
+fn with_is_in_the_syntax_help() {
+    let out = run_with_input("help with\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("with NAME=value") && stdout.contains("restoring them after"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `with` is **contextual**, not reserved: it leads a statement only where a
+/// `NAME=` binding follows, so a command of that name is still reachable.
+#[test]
+fn with_is_contextual_not_reserved() {
+    let out = run_with_input("with = 5\nputs $with\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "5\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A command of that name still reaches the command path — this one is not on
+    // `PATH`, and the report says so rather than being a syntax error.
+    let out = run_with_input("with somewhere\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("command not found: with"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `fork { … }` is a subshell: the body runs in a forked child, so the process
 /// state it changes is its own. `DESIGN.md` makes isolation explicit in three
 /// grades and this is the strongest — the one that costs a process.

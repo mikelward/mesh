@@ -436,6 +436,11 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
         "Leave a function, or a sourced file",
     ),
     (&["fork"], "fork { … }", "Run a body in a forked child"),
+    (
+        &["with"],
+        "with NAME=value … { … }",
+        "Run a body with environment entries set, restoring them after",
+    ),
     // The value constructors have no operator to be documented at, unlike `re`,
     // which the `~` row covers. They still have to answer: the parser reserves all
     // three names, so a reader who is told `style` is "not a builtin or a keyword"
@@ -466,7 +471,7 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
 /// For "does a bare one do something", see [`COMMAND_KEYWORDS`].
 pub(crate) const SYNTAX_WORDS: &[&str] = &[
     "func", "wrapper", "alias", "return", "if", "else", "unless", "match", "for", "in", "while",
-    "loop", "break", "continue", "fork", "global", "unset", "export", "not", "and", "or",
+    "loop", "break", "continue", "fork", "with", "global", "unset", "export", "not", "and", "or",
     // The built-in *value* names, reserved as function names by the same parser
     // check but reached as value calls rather than in command position.
     "re", "style", "link", "glob", "files", "dirs",
@@ -1602,7 +1607,7 @@ mod tests {
         // function name, and `command not found` when nothing defines it. Treating
         // these as keywords made `whence fork` outrank a real `func fork()`.
         for contextual in [
-            "fork", "wrapper", "alias", "unless", "else", "and", "or", "in",
+            "fork", "with", "wrapper", "alias", "unless", "else", "and", "or", "in",
         ] {
             assert!(SYNTAX_WORDS.contains(&contextual), "{contextual}");
             assert!(!is_command_keyword(contextual), "{contextual}");

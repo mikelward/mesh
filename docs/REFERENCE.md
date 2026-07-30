@@ -1727,6 +1727,7 @@ export EDITOR = vim           # identical to the first line
 
 An environment write is **global on purpose**, even inside a function: changing
 what children inherit is the point, so it persists after the function returns.
+To scope one to a block instead, see [`with`](#with--the-environment-for-one-block).
 
 Bare `export NAME` — bash's "mark this existing variable exported" — does **not**
 work, because mesh keeps shell bindings and the environment in separate
@@ -2454,6 +2455,53 @@ whole function. A loop reports the status of its last completed pass.
 Note that `<` and `>` also spell redirections. In a **condition** a spaced
 comparison wins — `while $i < 3` compares — while an attached or command-position
 form still redirects (`grep -q x < file`, `$cmd > log`).
+
+## `with` — the environment for one block
+
+`with NAME=value … { body }` runs the body with those environment entries in
+place and puts the environment back afterwards — the block form of what other
+shells write as a one-command prefix:
+
+```mesh
+with LC_ALL=C {
+  sort names.txt }              # LC_ALL is back to what it was after the `}`
+
+with TZ=UTC LANG=C.UTF-8 {      # as many bindings as you like
+  date }
+```
+
+It is the **environment**, not shell bindings, because the point is what a child
+inherits — a `x = 1` before a command has never reached one.
+
+Each binding is written **unspaced**, `NAME=value` or `NAME+=value`, the way the
+prefix form is. That is what lets a header hold several without the reader
+guessing where one value ends: in `with FOO=a b { … }` the `b` cannot be part of
+`FOO`, so it is reported. Values are ordinary words, so they interpolate and
+quote as anywhere else, and `+=` appends exactly as the `$env.KEY` write does.
+An empty value (`with FOO= { … }`) sets the name to nothing, which is not the
+same as leaving it unset.
+
+**The restore is to the previous state**, not to empty: a name that was unset
+before goes back to unset, since a child can tell those apart. It happens however
+the body leaves — normally, through a failing command, or through `return`,
+`break` or `continue`:
+
+```mesh
+func build() {
+  with CC=clang {
+    return }                    # CC is restored on the way out
+}
+```
+
+Bindings apply left to right, so a later one wins on a repeated name and each is
+evaluated against what the ones before it left — `with PATH=/opt PATH+=/usr/bin`
+reads as it looks. The restore is still to what the whole header found.
+
+`with` is **contextual**, not reserved: it leads a statement only where a `NAME=`
+binding follows it, so `with = 5` still binds a variable and `with somewhere` is
+still a command.
+
+Unlike `fork`, this costs no process — only the body's own commands do.
 
 ## `fork` — a subshell
 
