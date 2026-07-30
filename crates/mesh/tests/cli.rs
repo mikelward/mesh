@@ -14954,6 +14954,244 @@ fn tilde_matches_regexes_and_globs() {
     );
 }
 
+/// A literal holds the characters a regex is **made of**, which are the same
+/// ones that used to end the word it was recognized from.
+///
+/// `[`, `(`, `{`, `|`, `,`, `;`, `&`, `<` and `:` each closed the word early, so
+/// `/[A-Za-z]/` was never one word to recognize: its tokens parsed as an index
+/// and a division instead. A space did the same, which the extended mode `:x`
+/// exists to allow.
+#[test]
+fn a_regex_literal_holds_the_characters_a_regex_is_made_of() {
+    let out = run_with_input(
+        "class = abc ~ /[A-Za-z]+/\n\
+         group = abc ~ /a(b)c/\n\
+         alternative = abc ~ /abc|xyz/\n\
+         repeat = abc ~ /a{1,2}bc/\n\
+         comma = 'a,b' ~ /a,b/\n\
+         semi = 'a;b' ~ /a;b/\n\
+         amp = 'a&b' ~ /a&b/\n\
+         less = 'a<b' ~ /a<b/\n\
+         colon = 'a:b' ~ /a:b/\n\
+         spaced = abc ~ /a b c/:x\n\
+         puts $class $group $alternative $repeat $comma $semi $amp $less $colon $spaced\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true true true true true true true true true true\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The three slots that read one, and the one that does not.
+///
+/// A `match` arm and a replace's *pattern* get the same reading the `~`
+/// right-hand side gets. The replacement does not: it is an ordinary value slot,
+/// where `/…/` is the string it looks like.
+#[test]
+fn every_regex_slot_reads_a_literal_the_same_way() {
+    let out = run_with_input(
+        "arm = match abc {\n\
+         \x20 /[a-c]+/ => matched\n\
+         \x20 _ => missed\n\
+         }\n\
+         replaced = 'a1b':replaceall(/[0-9]/, '/x/')\n\
+         puts $arm $replaced\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "matched a/x/b\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The closing `/` has to end the word, which is what keeps a path a path.
+///
+/// `/usr/bin` names a directory and matches one as a glob; reading it as the
+/// regex `usr` plus a stray `bin` would take that away. `/usr/bin/` is the same
+/// question with a slash at each end — still a glob, since the one in the middle
+/// is not written as `\/`.
+#[test]
+fn a_path_in_a_match_slot_is_still_a_glob() {
+    let out = run_with_input(
+        "directory = /usr/bin ~ /usr/bin\n\
+         trailing = /usr/bin/ ~ /usr/bin/\n\
+         escaped = a/b ~ /a\\/b/\n\
+         under = /usr/local/bin ~ /usr/*/bin\n\
+         puts $directory $trailing $escaped $under\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true true true true\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The scan reads the source, and by then the lexer has already had its say —
+/// so a construct it consumes *without emitting a token* is inside the literal
+/// in the source and gone from the tokens.
+///
+/// A ` #` comment is the one that reaches here, and it used to be the silence
+/// this reading exists to remove: the scan declined, the leading `/a` read as a
+/// glob, and the test answered false. It is reported now. An **attached** `#`
+/// was never a comment and still is not, which is the spelling to reach for.
+#[test]
+fn a_comment_inside_a_regex_literal_is_reported_rather_than_dropped() {
+    let out = run_with_input(
+        "x = abc ~ /a # comment/:x\n\
+         attached = 'a#b' ~ /a#b/\n\
+         puts $attached\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("a `/…/` literal cannot contain a comment"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\n");
+}
+
+/// A nested parse — a `${…}` body, a capture — is handed the **whole** source
+/// with its own end recorded separately, so the scan has to stop at that end.
+///
+/// Unbounded, it ran past the body and took a slash from the text around it as
+/// the closer: `"${ $x ~ /tmp }/ rest"` claimed the one after the `}`, and the
+/// literal it built spanned a brace. The body's own end counts as a word end,
+/// which is what lets a literal finish flush against it.
+#[test]
+fn a_regex_literal_inside_a_braced_body_stops_at_the_body() {
+    let out = run_with_input(
+        "x = /tmp\n\
+         path = \"${ $x ~ /tmp }/ rest\"\n\
+         pattern = \"${ abc ~ /[a-c]+/ }/ rest\"\n\
+         puts $path\n\
+         puts $pattern\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true/ rest\ntrue/ rest\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A trailing backslash continues a line, and the lexer has already joined the
+/// two by the time the scan runs — so the pair is not in the pattern.
+///
+/// Keeping it put a backslash and a newline the reader never wrote into the
+/// regex: `/a\⏎b/` matched a subject holding a newline and not `ab`, silently
+/// and in both directions.
+///
+/// A script rather than piped input, since a continuation needs both lines at
+/// once and the piped reader takes them one at a time.
+#[test]
+fn a_regex_literal_joins_a_continued_line() {
+    let path = script(
+        "regex_continuation",
+        "joined = ab ~ /a\\\nb/\nnewline = \"a\nb\" ~ /a\\\nb/\nputs $joined $newline\n",
+    );
+    let out = run_with_args(&[path.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true false\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success());
+}
+
+/// A **quote** is read before the literal is, too, so an unmatched one inside a
+/// pattern is an unclosed shell quote — `/'/` and the class `/['"]/` both.
+///
+/// Loud, and pinned as it stands with the spelling that does work. Same cause as
+/// the two below; `TODO.md` carries them together.
+#[test]
+fn an_unmatched_quote_in_a_regex_literal_is_still_the_lexers() {
+    let out = run_with_input("puts (\"'\" ~ /'/)\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unclosed `'`"), "{stderr}");
+
+    // `re(…)` takes a quote as the ordinary character it is.
+    let works = run_with_input(
+        "single = \"'\" ~ re(\"[\\\"']\")\n\
+         double = '\"' ~ re(\"[\\\"']\")\n\
+         neither = a ~ re(\"[\\\"']\")\n\
+         puts $single $double $neither\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&works.stdout),
+        "true true false\n",
+        "{}",
+        String::from_utf8_lossy(&works.stderr)
+    );
+}
+
+/// The third thing read before the literal is: a `${…}` or `$(…)` body's own
+/// closing delimiter, which the lexer finds first.
+///
+/// So an **unbalanced** `}` in a pattern ends the body there, and the same test
+/// that answers `true` at top level renders text. Pinned as it stands and
+/// recorded; a *balanced* pair is fine in both places, which is what patterns
+/// actually use, and that half is what this asserts is not broken.
+#[test]
+fn a_regex_literal_in_a_braced_body_shares_its_closing_delimiter() {
+    let out = run_with_input(
+        "balanced = \"${ abc ~ /a{1,2}bc/ }\"\n\
+         grouped = \"${ abc ~ /a(b)c/ }\"\n\
+         top = 'a}b' ~ /a}b/\n\
+         nested = \"${ 'a}b' ~ /a}b/ }\"\n\
+         puts $balanced $grouped $top\n\
+         puts $nested\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true true true\nfalseb/ }\n"
+    );
+}
+
+/// The limit the same lateness leaves open: `<<` is a **heredoc** to the lexer,
+/// so a literal holding one is rejected before the parser sees any of it.
+///
+/// Pinned as it stands rather than fixed here. The message is the lexer's and
+/// names a delimiter nobody wrote, which is poor — but it is loud, and moving it
+/// means teaching the lexer the slots, which is a larger change than this one.
+/// `TODO.md` carries it.
+#[test]
+fn a_shift_operator_in_a_regex_literal_is_still_the_lexers() {
+    let out = run_with_input("puts ('a<<b' ~ /a<<b/)\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("heredoc missing its"), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+/// An `if` condition that fails to parse as a value is re-read as a **command**,
+/// so a literal the parser could not assemble did not report — it ran the
+/// subject and took the `else` branch.
+///
+/// The wrong answer with no diagnostic is what made this worth fixing ahead of
+/// the shapes that at least said something.
+#[test]
+fn a_condition_holding_a_regex_literal_is_not_read_as_a_command() {
+    let out = run_with_input(
+        "x = abc\n\
+         if $x ~ /[A-Za-z]/ { puts yes } else { puts no }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "yes\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    assert!(out.status.success());
+}
+
 #[test]
 fn re_constructs_reusable_and_literal_patterns() {
     let out = run_with_input(
