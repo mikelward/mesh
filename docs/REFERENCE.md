@@ -13,6 +13,7 @@ mesh                       # interactive when stdin and stdout are terminals
 mesh script.mesh a b c     # run a script; a b c become $sh.args
 mesh -c "puts hi" a b      # run a command string; a b become $sh.args
 mesh -s a b                # read commands from stdin, even on a terminal
+mesh -i                    # interactive session whatever stdin is
 mesh -l / --login          # login shell (also sources login.mesh)
 mesh --rcfile FILE         # use FILE instead of rc.mesh
 mesh --norc                # skip rc.mesh
@@ -22,6 +23,13 @@ mesh --help / --version
 With no script and no `-c`, mesh is interactive when both stdin and stdout are
 terminals, and otherwise reads commands from stdin — so `echo 'ls' | mesh` works
 without `-s`.
+
+`-i` decides the session's **character**, not its input: `$sh.interactive` is
+true and `rc.mesh` is sourced, while the commands still come from wherever the
+invocation says. It does not conjure a terminal — without one there is nothing to
+run a line editor on, so `mesh -i` off a terminal reads stdin the way it always
+did, just as an interactive session. That is what makes the half of a config
+behind `return unless $sh.interactive` testable without a pty.
 
 **Option parsing stops at the first operand**, as in POSIX shells, so a script's
 own flags reach the script rather than mesh: `mesh deploy.mesh --login` passes
@@ -77,11 +85,15 @@ Two read-only entries say **what is being evaluated**:
 | `$sh.origin` | `script`, `sourced`, `command` (`-c`), `stdin` (`-s`), or `interactive` |
 | `$sh.source` | the file's path for `script` / `sourced`, empty otherwise |
 
-They are deliberately **not** the same question as `$sh.interactive`. The two come
-apart today with `-s`: `mesh -s` on a terminal reads typed commands, yet its origin
-is `stdin` and `$sh.interactive` is `false`, because only the interactive loop sets
-that. (The reverse pairing — a script that is also interactive — waits on `-i`,
-which is not implemented yet.)
+They are deliberately **not** the same question as `$sh.interactive`, and come
+apart in both directions. `mesh -s` on a terminal reads typed commands, yet its
+origin is `stdin` and `$sh.interactive` is `false`. And `mesh -i script.mesh` is a
+script — origin `script` — that is nonetheless an interactive session, so it sources
+`rc.mesh` and reports `$sh.interactive` as `true`.
+
+The `interactive` **origin** is the narrower claim that the commands were *typed
+at a prompt*, which only the interactive loop can make. `printf 'ls' | mesh -i` is
+an interactive session whose commands came from a pipe, so its origin is `stdin`.
 
 `$sh.source` reports the **innermost** file, so it changes across a `source` and
 changes back afterwards, and a startup file reports itself as `sourced` — which is
@@ -121,9 +133,9 @@ The rest of the read-only runtime surface:
 | `$sh.stdin` / `$sh.stdout` / `$sh.stderr` | Handles for the shell's own streams |
 | `$sh.jobs` | The live background jobs, as a map of records |
 
-`$sh.interactive` answers **which loop is running**, not what fd 0 happens to
-be — `mesh -s` on a terminal reads commands without being an interactive session,
-and reports `false`.
+`$sh.interactive` answers **what kind of session this is**, not what fd 0 happens
+to be: `mesh -s` on a terminal reads commands without being an interactive session
+and reports `false`, while `-i` makes one out of any input and reports `true`.
 
 For "is *this stream* a terminal", the stream handles take **`:tty`** — the
 `test -t N` replacement:
