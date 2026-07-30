@@ -17,6 +17,36 @@ fn run_with_input(input: &str) -> Output {
     run_with_bytes(input.as_bytes())
 }
 
+/// Run a script file with `bytes` on its stdin — a different stream from the
+/// source, which is the distinction several location tests turn on.
+fn run_script_with_stdin(script: &Path, config_home: &Path, bytes: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .arg(script)
+        .env("XDG_CONFIG_HOME", config_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(bytes)
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for mesh")
+}
+
+/// A parse diagnostic with its `mesh: file:line:column: ` prefix removed, leaving
+/// the message. For comparing against a path that reports the same message
+/// without a location — a heredoc body, scanned by its own pass.
+fn message_after_location(diagnostic: &str) -> String {
+    diagnostic.split_once("syntax error: ").map_or_else(
+        || diagnostic.to_owned(),
+        |(_, rest)| format!("syntax error: {rest}"),
+    )
+}
+
 /// A fresh, empty temp directory unique to this test process and `tag`.
 fn fresh_dir(tag: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
@@ -12544,12 +12574,254 @@ fn an_unopenable_redirect_target_for_a_function_is_reported() {
 }
 
 #[test]
-fn an_unterminated_definition_at_eof_is_reported() {
-    let out = run_with_input("func f() {\n  puts hi\n");
+fn a_syntax_error_is_located_in_the_whole_input_not_the_unit() {
+    // The piped reader dispatches one complete unit at a time, so each `run_line`
+    // sees text starting at its own line 1. Without the running offset a fault on
+    // line 3 reported line 1 — worse than no location, since it names a line that
+    // is fine. Raised in review.
+    let piped = run_with_input("puts ok\nputs ok\nx = )\n");
+    assert_eq!(
+        String::from_utf8_lossy(&piped.stderr),
+        "mesh: stdin:3:5: syntax error: expected a value expression\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&piped.stdout), "ok\nok\n");
+
+    // A multi-line unit counts for its whole length, not one line.
+    let spanning = run_with_input("func f() {\n  puts hi\n}\nx = )\n");
+    assert_eq!(
+        String::from_utf8_lossy(&spanning.stderr),
+        "mesh: stdin:4:5: syntax error: expected a value expression\n"
+    );
+
+    // The same text as a script is handed over whole, so it agrees.
+    let dir = fresh_dir("error_location");
+    let script = dir.join("s.mesh");
+    std::fs::write(&script, "puts ok\nputs ok\nx = )\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .arg(&script)
+        .env("XDG_CONFIG_HOME", &dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run mesh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "mesh: {}:3:5: syntax error: expected a value expression\n",
+            script.display()
+        )
+    );
+}
+
+#[test]
+fn a_sourced_files_lines_are_counted_from_its_own_start() {
+    // The line offset belongs to the *input*, not the shell: a sourced file is a
+    // fresh input, so stdin's count must not carry into it. Raised in review —
+    // line 1 of the sourced file was reported as line 2.
+    let dir = fresh_dir("sourced_location");
+    let bad = dir.join("bad.mesh");
+    std::fs::write(&bad, "x = )\n").unwrap();
+
+    let out = run_with_input(&format!("puts ok\nsource {}\n", bad.display()));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "mesh: {}:1:5: syntax error: expected a value expression\n",
+            bad.display()
+        )
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+#[test]
+fn an_invalid_utf8_line_still_counts_toward_later_locations() {
+    // A bad line that is a whole unit is dropped where it is read, before the
+    // dispatch that normally advances the count. It was still read, so a fault on
+    // the next physical line is on line 2. Raised in review.
+    let out = run_with_bytes(b"puts \xff\nx = )\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid UTF-8 in input"), "{stderr}");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("unexpected end of input"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr.contains("stdin:2:5: syntax error: expected a value expression"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_lexer_delimiter_error_points_at_the_delimiter() {
+    // The lexer reports an unterminated delimiter against the **word** it was
+    // reading, so a column taken straight off the span named a character to the
+    // left of the quote. The message names the delimiter, so the position has to
+    // agree with it. Raised in review.
+    let attached = run_with_input("puts abc'unclosed\n");
+    assert_eq!(
+        String::from_utf8_lossy(&attached.stderr),
+        "mesh: stdin:1:9: syntax error: unclosed `'`\n"
+    );
+
+    // A capture inside a double-quoted word: the `"` that never closes is the
+    // inner one the capture opened, at column 11, not the word's own at 6.
+    let nested = run_with_input("puts \"a$(b\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&nested.stderr),
+        "mesh: stdin:1:11: syntax error: unclosed `\"`\n"
+    );
+
+    // An **escaped** copy of the same character before the real opener. The
+    // position is recorded where the quote is lexed rather than recovered by
+    // searching the word for the character, which would have stopped at the
+    // `\'` on column 10. Raised in review.
+    let escaped = run_with_input("puts abc\\'def'unclosed\n");
+    assert_eq!(
+        String::from_utf8_lossy(&escaped.stderr),
+        "mesh: stdin:1:14: syntax error: unclosed `'`\n"
+    );
+
+    // A braced reference names the `}` it is missing, which appears nowhere in
+    // the text — so there is nothing to search for, and the position has to come
+    // from the `{` that opened it. Raised in review.
+    let braced = run_with_input("puts ${bad\n");
+    assert_eq!(
+        String::from_utf8_lossy(&braced.stderr),
+        "mesh: stdin:1:7: syntax error: unclosed `}`\n"
+    );
+}
+
+#[test]
+fn a_line_gets_consumes_counts_toward_later_locations() {
+    // `gets` reads straight off descriptor 0, which in a piped session is the
+    // same stream the commands come from — so its data is a line of that input
+    // even though the reader never sees it. Raised in review.
+    let piped = run_with_input("gets x\nDATA\nx = )\n");
+    assert_eq!(
+        String::from_utf8_lossy(&piped.stderr),
+        "mesh: stdin:3:5: syntax error: expected a value expression\n"
+    );
+
+    // And the trap on the other side: under a script the data `gets` reads has
+    // nothing to do with the script's own lines, so counting it there would push
+    // every later diagnostic down the file by the size of the data.
+    let dir = fresh_dir("gets_location");
+    let script = dir.join("g.mesh");
+    std::fs::write(&script, "gets x\nx = )\n").unwrap();
+    let out = run_script_with_stdin(&script, &dir, b"DATA\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "mesh: {}:2:5: syntax error: expected a value expression\n",
+            script.display()
+        )
+    );
+
+    // And when a redirection has fd 0 pointed elsewhere, the read is not of the
+    // session at all. A heredoc is the sharp case: the reader already counted its
+    // body as part of the buffered unit, so counting it again here put the error a
+    // line *past* where it is. Raised in review.
+    let heredoc = run_with_input("gets x << END\nDATA\nEND\nx = )\n");
+    assert_eq!(
+        String::from_utf8_lossy(&heredoc.stderr),
+        "mesh: stdin:4:5: syntax error: expected a value expression\n"
+    );
+
+    // A file redirection reads no session lines at all.
+    let data = dir.join("data.txt");
+    std::fs::write(&data, "DATA\n").unwrap();
+    let redirected = run_with_input(&format!("gets x < {}\nx = )\n", data.display()));
+    assert_eq!(
+        String::from_utf8_lossy(&redirected.stderr),
+        "mesh: stdin:2:5: syntax error: expected a value expression\n"
+    );
+}
+
+#[test]
+fn an_earlier_parse_error_survives_a_later_open_brace() {
+    // An unmatched `{` anywhere in the input routes through the same arm that
+    // re-aims an incomplete parse at its opener, so the substitution has to be
+    // limited to actually running out of input. Otherwise the brace on line 2
+    // replaces the real fault on line 1 — the one the reader needs. Raised in
+    // review.
+    // Through `-c`, where the whole string is one unit. Piped input dispatches
+    // per unit, so there the two faults are two separate units and both report —
+    // which is right, and a different question from this one.
+    let commanded = |source: &str| {
+        let out = mesh_command()
+            .args(["-c", source])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run mesh");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    assert_eq!(
+        commanded("x = )\nfunc f() {\n"),
+        "mesh: command:1:5: syntax error: expected a value expression\n"
+    );
+
+    // The plain case still re-aims: nothing is wrong but the missing `}`.
+    assert_eq!(
+        commanded("puts one\nfunc f() {\nputs two\n"),
+        "mesh: command:2:10: syntax error: unclosed `{`\n"
+    );
+}
+
+#[test]
+fn a_quoted_capture_names_the_innermost_opener_too() {
+    // The quoted path hard-coded the capture's own `(`, so it blamed the outer
+    // delimiter where the unquoted spelling of the same text correctly named the
+    // inner one. Innermost-first is the rule everywhere else. Raised in review.
+    let commanded = |source: &str| {
+        let out = mesh_command()
+            .args(["-c", source])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run mesh");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    // Column 13 quoted and 12 unquoted, the difference being the `\"` itself —
+    // both name the `[`, which is what has to agree.
+    assert_eq!(
+        commanded("puts \"$(x = [1"),
+        "mesh: command:1:13: syntax error: unclosed `[`\n"
+    );
+    assert_eq!(
+        commanded("puts $(x = [1"),
+        "mesh: command:1:12: syntax error: unclosed `[`\n"
+    );
+
+    // With nothing open inside it, the capture's own `(` is still the answer.
+    assert_eq!(
+        commanded("puts \"$(pwd"),
+        "mesh: command:1:8: syntax error: unclosed `(`\n"
+    );
+
+    // A closer only cancels an opener it **matches**. Popping whatever was
+    // innermost let a stray `]` throw away the capture's `(`, leaving nothing
+    // open and falling back to end of input — the answer this whole change
+    // exists to stop giving. Raised in review.
+    assert_eq!(
+        commanded("puts $(echo ]"),
+        "mesh: command:1:7: syntax error: unclosed `(`\n"
+    );
+}
+
+#[test]
+fn an_unclosed_capture_is_reported_at_its_paren() {
+    // `$(` is one token, so its span starts at the `$`; the delimiter left open is
+    // the paren, and the report names the paren. Raised in review.
+    let out = run_with_input("puts $(pwd\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "mesh: stdin:1:7: syntax error: unclosed `(`\n"
+    );
+}
+
+#[test]
+fn an_unterminated_definition_at_eof_is_reported() {
+    // Named and *located*: the input ending is the symptom, the unclosed `{` on
+    // line 1 is the cause, and only the second is actionable in a long file.
+    let out = run_with_input("func f() {\n  puts hi\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "mesh: stdin:1:10: syntax error: unclosed `{`\n"
     );
 }
 
@@ -17382,9 +17654,13 @@ fn a_malformed_reference_in_a_heredoc_is_an_error() {
     // heredoc — the promise is that the two grammars agree, not merely that both
     // fail somehow.
     let string_form = run_with_input("puts \"${bad\"\nputs after\n");
+    // Compared after the location. A parse error carries a `file:line:column`,
+    // but a heredoc body is scanned by its own pass with no span to report, so
+    // only the message is common ground — which is what this promises anyway:
+    // that the two *grammars* agree, not that both diagnostics are built alike.
     assert_eq!(
-        String::from_utf8_lossy(&out.stderr),
-        String::from_utf8_lossy(&string_form.stderr).replace("mesh: ", "mesh: heredoc: "),
+        String::from_utf8_lossy(&out.stderr).replace("mesh: heredoc: ", ""),
+        message_after_location(&String::from_utf8_lossy(&string_form.stderr)),
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 
@@ -17401,8 +17677,8 @@ fn a_malformed_unicode_escape_in_a_heredoc_is_an_error() {
     let out = run_with_input("cat << END\nbad \\u{zz}\nEND\nputs after\n");
     let string_form = run_with_input("puts \"bad \\u{zz}\"\nputs after\n");
     assert_eq!(
-        String::from_utf8_lossy(&out.stderr),
-        String::from_utf8_lossy(&string_form.stderr).replace("mesh: ", "mesh: heredoc: "),
+        String::from_utf8_lossy(&out.stderr).replace("mesh: heredoc: ", ""),
+        message_after_location(&String::from_utf8_lossy(&string_form.stderr)),
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 

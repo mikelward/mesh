@@ -2077,7 +2077,7 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Eight have since been fixed; two are tracked
+matched back to the discussion. Nine have since been fixed; two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
 
@@ -2112,12 +2112,38 @@ was re-checked against `main` rather than taken from the PR text.
       a generic "parse this tool's `shellenv` output and apply it" helper cannot be
       written at all; every tool's variables have to be named literally, which is
       why `setup-fnm` and `setup-brew` are each hand-written.
-- [ ] **6. A syntax error carries no line or column, and there is no parse-only
-      flag.** A broken file reports `syntax error: unexpected end of input` and
-      nothing else, so locating one in an 1800-line config means bisecting it. The
-      second half bites harder than the first: a config that *generates* mesh
-      source (see 26) has no way to check the generated file before sourcing it,
-      so its only test is whether sourcing it breaks the shell.
+- [ ] **6. There is no parse-only flag.** *(The line-and-column half of this
+      entry is fixed; see below.)* A config that *generates* mesh source (see 26)
+      has no way to check the generated file before sourcing it, so its only test
+      is whether sourcing it breaks the shell.
+
+      **Fixed, the first half:** a syntax error used to report
+      `syntax error: unexpected end of input` and nothing else, so locating one in
+      an 1800-line config meant bisecting it. Diagnostics now carry
+      `file:line:column`, and an unclosed delimiter is reported **at the
+      delimiter** rather than at the end of the file — the innermost one, which is
+      what has to be closed first. The spans were already on `ParseError`; what
+      was missing was that `ParseOutcome::Incomplete` discarded the error rather
+      than carrying it, so the one case a config hits most had nothing left to
+      report.
+
+      **Still unlocated: heredocs.** An unterminated heredoc takes the
+      `IncompleteHeredoc` arm, and a malformed interpolation inside a body is
+      found by a hand-written scan in `repl.rs` rather than by the parser. Neither
+      carries a span, so both report the message alone. The scan would need to
+      know the body's offset within the file to say more. Raised in review on the
+      PR that located the rest.
+
+      **One residual gap in the piped line count**, from the same review. A piped
+      session counts the lines `gets` takes off descriptor 0, since they are lines
+      of the same stream the commands come from. In a *forked pipeline stage* —
+      `gets x | cat` — the count happens in the child's copy of `Vars` and dies
+      with the stage, so the parent's later diagnostics are short by the lines
+      that stage consumed. Getting it back means the child reporting to the
+      parent, which is a lot of machinery for a line number in a shape that is
+      already rare (`gets` in a pipeline, in a piped script, before a syntax
+      error). Left as is deliberately; if it is ever worth closing, the count
+      would ride back on whatever channel a forked stage gets for reporting.
 - [x] **7. No terminal width.** `$sh` had no `width`, so the prompt's rule cost
       one `tput cols` **fork per prompt** — measured at 2.6ms against 2.0ms for
       the whole prompt composition path, so the decoration cost more than what it

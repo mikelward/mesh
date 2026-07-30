@@ -2568,6 +2568,16 @@ static SHELL_STDIN: AtomicI32 = AtomicI32::new(-1);
 /// non-interactive there would skip process-group setup and signal restoration,
 /// leaving a child with mesh's ignored terminal signals (so Ctrl-C could not
 /// reach it).
+/// Is descriptor 0 still the shell's own stdin, rather than a redirection's file?
+///
+/// `SHELL_STDIN` holds the saved descriptor exactly while an in-process
+/// redirection has fd 0 pointed elsewhere, so this is the question "would a read
+/// of fd 0 right now consume the session's input" — which is what deciding
+/// whether such a read counts as a line of that input turns on.
+pub(crate) fn stdin_is_the_shells() -> bool {
+    SHELL_STDIN.load(Ordering::Relaxed) < 0
+}
+
 /// The descriptor that refers to the shell's controlling terminal.
 ///
 /// Job control — reading/restoring terminal modes and handing the terminal to a
