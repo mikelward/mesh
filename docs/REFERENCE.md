@@ -476,9 +476,34 @@ puts "$(id -un)@$(hostname)"     # glue it to text by quoting the whole word
   so a diagnostic still reaches the terminal instead of ending up in the value.
 - **The result is one literal value** — never re-split on spaces, never re-globbed
   — like every other value: `puts $(puts '*')` prints `*`.
-- **A failing capture stops the statement.** The assignment or command it was part
-  of does not run, and the shell recovers and reads the next one; the failing
-  command's own diagnostic is the report.
+- **A failing capture still yields its output**, and the status travels alongside
+  it. A nonzero exit is routinely a *result* rather than an error — `diff` exits 1
+  for "they differ" and puts the diff on stdout, `grep` exits 1 for "no match",
+  `timeout` exits 124 over whatever was printed before the deadline — so throwing
+  the bytes away would discard the thing that was asked for. An **assignment takes
+  its right-hand side's capture status**, which is what makes the bash idiom read
+  the same here:
+
+  ```mesh
+  if out = $(diff old new) {
+    puts "no change"
+  } else {
+    puts $out                    # the diff, on the branch that has it
+  }
+  ```
+
+  With several captures in one right-hand side the last one decides, as in bash
+  (`x = "$(false)$(true)"` leaves `0`).
+
+  **Only an assignment keeps it.** Interpolate a capture into a *command* and the
+  command's own status is what remains — `puts "[$(false)]"` finishes with `puts`'s
+  `0`, and the capture's failure is no longer recoverable, exactly as in bash. So
+  when a capture's failure matters, **bind it first** and branch on that, rather
+  than passing it straight to another command and checking afterward:
+
+  ```mesh
+  if out = $(cmd) { use $out } else { warn "cmd failed" }
+  ```
 - The body is ordinary mesh, so it may hold several statements
   (`$(puts a; puts b)`), a pipeline, or another capture.
 
@@ -1424,10 +1449,12 @@ func host-info() { style("$(hostname)", fg: red) }
 ```
 
 What the capture produced crosses **whole** — quoted, so it is never re-split and
-never re-globbed, however many spaces or `*`s it contains. A capture that fails is an
-error there as everywhere, so the statement stops rather than substituting nothing,
-and a syntax error inside it is reported when the line is parsed. `'…'` and `r"…"` are
-literal, and `\$(` keeps the text in a double-quoted string.
+never re-globbed, however many spaces or `*`s it contains. A capture that fails
+substitutes what it printed, the same as anywhere else — and interpolating it into a
+command **loses its status**, since the command reports its own, so bind it with
+`if out = $(…)` first when the failure matters. A syntax error inside it is reported
+when the line is parsed. `'…'` and `r"…"` are literal, and `\$(` keeps the text in a
+double-quoted string.
 
 ## Variables
 

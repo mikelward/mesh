@@ -302,14 +302,14 @@ fn run_batch(text: &str, options: &StartupOptions) -> ExitCode {
     let (origin, source) = options.origin(false);
     shell.vars.set_origin(origin, source);
     let last = match run_startup_files(options, false, 0, &mut shell) {
-        Step::Continue(code) => code,
+        Step::Continue(code) | Step::Error(code) => code,
         Step::Exit(code) => return ExitCode::from(run_logout(options, code, &mut shell)),
         Step::Return(_, code) => {
             return ExitCode::from(run_logout(options, code, &mut shell));
         }
     };
     let code = match run_line(text, last, false, &mut shell) {
-        Step::Continue(code) | Step::Exit(code) => code,
+        Step::Continue(code) | Step::Error(code) | Step::Exit(code) => code,
         Step::Return(..) => unreachable!("top-level return handled in run_line"),
     };
     ExitCode::from(run_logout(options, code, &mut shell))
@@ -609,7 +609,7 @@ fn run_config_file(path: &Path, last: u8, shell: &mut Shell) -> Step {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Step::Continue(last),
         Err(error) => {
             note!("mesh: {}: {error}", path.display());
-            return Step::Continue(1);
+            return Step::Error(1);
         }
     };
     // A startup file *is* a sourced file, so it reports itself the same way — which
@@ -645,7 +645,7 @@ fn gets(args: &[String], shell: &mut Shell) -> Step {
         [name] => Some(name.as_str()),
         _ => {
             note!("mesh: gets: takes at most one variable name");
-            return Step::Continue(2);
+            return Step::Error(2);
         }
     };
     // Checked before a byte is read, so a rejected operand does not also consume
@@ -656,11 +656,11 @@ fn gets(args: &[String], shell: &mut Shell) -> Step {
     if let Some(name) = name {
         if !parser::valid_name(name) {
             note!("mesh: gets: `{name}` is not a variable name");
-            return Step::Continue(2);
+            return Step::Error(2);
         }
         if vars::is_reserved_namespace(name) {
             note!("mesh: gets: `{name}` is a reserved namespace");
-            return Step::Continue(2);
+            return Step::Error(2);
         }
     }
     let mut line = Vec::new();
@@ -691,7 +691,7 @@ fn gets(args: &[String], shell: &mut Shell) -> Step {
     // `while gets line` as though the input had simply run out.
     if let Err(err) = read {
         note!("mesh: gets: {err}");
-        return Step::Continue(2);
+        return Step::Error(2);
     }
     // Only a zero-byte read is the end. A file's last line without a trailing
     // newline is still a line, and an empty line is a successful read of `""` —
@@ -711,7 +711,7 @@ fn gets(args: &[String], shell: &mut Shell) -> Step {
         Ok(text) => text,
         Err(_) => {
             note!("mesh: gets: line is not valid UTF-8");
-            return Step::Continue(2);
+            return Step::Error(2);
         }
     };
     if let Some(name) = name {
@@ -729,7 +729,7 @@ fn source_file(args: &[String], last: u8, shell: &mut Shell) -> Step {
              supported yet"
         };
         note!("mesh: {message}");
-        return Step::Continue(2);
+        return Step::Error(2);
     };
     let path = Path::new(path);
     let text = match std::fs::read_to_string(path) {
@@ -773,7 +773,7 @@ fn run_sourced_text(text: &str, path: &Path, last: u8, shell: &mut Shell) -> Ste
     // `lib.mesh` happened to end with — an integer, a list — where every other
     // command yields its status. Set on both paths, since a startup file is run
     // outside `run_recorded` and would otherwise leave the value behind.
-    if let Step::Continue(code) = step {
+    if let Step::Continue(code) | Step::Error(code) = step {
         shell.result = Value::Integer(i64::from(code));
         shell.produced = Produced::Status;
         // Published here rather than left to `run_recorded`, which a startup file
@@ -794,7 +794,11 @@ fn run_startup_files(
 ) -> Step {
     for path in startup_files(options, interactive) {
         match run_config_file(&path, last, shell) {
-            Step::Continue(code) => last = code,
+            // A startup file that ends on an evaluation error has already reported
+            // it, and it is no more a reason to skip the remaining files than a
+            // failing command in it is: `rc.mesh` still runs after a typo in
+            // `env.mesh`. Only `exit` stops the sequence.
+            Step::Continue(code) | Step::Error(code) => last = code,
             flow => return flow,
         }
     }
@@ -858,6 +862,18 @@ fn run_logout(options: &StartupOptions, last: u8, shell: &mut Shell) -> u8 {
 enum Step {
     /// A line ran; carry this status as the new "last status".
     Continue(u8),
+    /// An **evaluation error** — the program was invalid (an unbound name, a
+    /// modifier applied to the wrong type, a bad argument), already reported.
+    ///
+    /// Distinct from `Continue` with a nonzero status, which is a command that ran
+    /// and *answered*: `diff` saying 1 for "they differ" is a result the statement
+    /// carries on with, while an invalid program is not. Both leave the same status
+    /// behind and both let the *next* statement run, so almost everywhere the two
+    /// behave alike — but a `$(…)` has to tell them apart, since it yields the
+    /// captured bytes for a status and must not for an error. The distinction lives
+    /// in the type rather than in a flag beside it so that a site which has to
+    /// choose cannot be written without choosing.
+    Error(u8),
     /// `exit` was invoked; leave the shell with this status.
     Exit(u8),
     /// `return` (or `fail`) was invoked; unwind the current function carrying its
@@ -874,7 +890,9 @@ impl Step {
     /// The exit status this step contributes as the new "last status".
     fn status(&self) -> u8 {
         match self {
-            Step::Continue(code) | Step::Exit(code) | Step::Return(_, code) => *code,
+            Step::Continue(code) | Step::Error(code) | Step::Exit(code) | Step::Return(_, code) => {
+                *code
+            }
         }
     }
 }
@@ -900,7 +918,7 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
     // next command while `$sh.status` still reports whatever ran before.
     let reject = |shell: &mut Shell| {
         shell.record_status(2, vec![2]);
-        Step::Continue(2)
+        Step::Error(2)
     };
     let step = match parser::parse(text) {
         Ok(parser::ParseOutcome::Complete(source)) => run_source(&source, last, in_function, shell),
@@ -937,12 +955,33 @@ fn run_source(
     // was skipped by a guard, produced nothing — so it does not pass the
     // surrounding code's result off as its own. Same rule as `eval_body`.
     let mut produced = Produced::Nothing;
+    // Whether the statement that just ran was an evaluation error. An error does
+    // **not** stop the body — mesh reports it and runs the next statement, which is
+    // what `puts "a[$nope]b"` followed by `puts after` has always done — so this
+    // only records how the body *ended*, which is what a `$(…)` around it needs in
+    // order to tell an invalid program from a command's status.
+    let mut errored = false;
     for statement in &source.statements {
-        match run_statement(statement, status, in_function, shell) {
-            Step::Continue(code) => status = code,
+        let step = run_statement(statement, status, in_function, shell);
+        // A statement a guard skipped **ran nothing**, so it neither carries a
+        // status of its own nor says anything about the one before it. Clearing
+        // `errored` on one would let `$(puts $nope; puts skipped if false)` lose
+        // the error and hand back the empty output as an answer.
+        let executed = shell.produced != Produced::Nothing;
+        match step {
+            Step::Continue(code) => {
+                status = code;
+                if executed {
+                    errored = false;
+                }
+            }
+            Step::Error(code) => {
+                status = code;
+                errored = true;
+            }
             flow => return flow,
         }
-        if shell.produced != Produced::Nothing {
+        if executed {
             produced = shell.produced;
         }
         if shell.control.is_some() {
@@ -950,7 +989,7 @@ fn run_source(
         }
     }
     shell.produced = produced;
-    Step::Continue(status)
+    sequenced(status, errored)
 }
 
 fn run_statement(
@@ -983,11 +1022,14 @@ fn run_and_or(
         // `return` after it would carry that instead of the failure.
         shell.result = Value::Integer(2);
         shell.produced = Produced::Status;
-        return Step::Continue(2);
+        return Step::Error(2);
     }
     let mut step = run_recorded(&node.first, background, last, in_function, shell);
     for (op, executable) in &node.rest {
-        let Step::Continue(status) = step else {
+        // An evaluation error chains like any other failure: it left a status, so
+        // `h() || fallback` runs the fallback rather than abandoning the list. Only
+        // `exit` and `return` are control flow that skips the rest.
+        let (Step::Continue(status) | Step::Error(status)) = step else {
             return step;
         };
         let run = match op {
@@ -1023,7 +1065,7 @@ fn run_recorded(
     shell.produced = Produced::Status;
     let records = shell.status_records;
     let step = run_executable(executable, background, last, in_function, shell);
-    if let Step::Continue(code) = step
+    if let Step::Continue(code) | Step::Error(code) = step
         && shell.produced == Produced::Status
     {
         shell.result = Value::Integer(i64::from(code));
@@ -1037,7 +1079,7 @@ fn run_recorded(
     //
     // Stated as an invariant: after this, `$sh.status` is always the code just
     // returned, and `$sh.pipestatus` always breaks down the run that produced it.
-    if let Step::Continue(code) = step
+    if let Step::Continue(code) | Step::Error(code) = step
         && (shell.status_records == records || shell.vars.status() != code)
     {
         shell.record_status(code, vec![code]);
@@ -1055,7 +1097,7 @@ fn run_executable(
     use parser::Executable::*;
     if background && let Some(what) = not_backgroundable(node) {
         note!("mesh: &: backgrounding {what} is not supported yet");
-        return Step::Continue(2);
+        return Step::Error(2);
     }
     match node {
         Pipeline(pipeline) => run_ast_pipeline(pipeline, background, last, in_function, shell),
@@ -1064,34 +1106,35 @@ fn run_executable(
             append,
             value,
             global,
-        } => match eval_operand_of(value, last, in_function, shell) {
-            // A right-hand side that raised `break`/`continue` produced no value to
-            // bind — the loop is unwinding, so leave the target as it was rather
-            // than overwriting it with the placeholder.
-            Ok(_) if shell.control.is_some() => Step::Continue(last),
-            Ok(value) => {
-                let result = if *append {
-                    let parser::BindingPattern::Name(name) = pattern else {
-                        unreachable!("the parser restricts += to names")
-                    };
-                    if *global {
-                        shell.vars.append_global(name, value)
+        } => {
+            let evaluated = eval_operand_of(value, last, in_function, shell);
+            match evaluated {
+                // A right-hand side that raised `break`/`continue` produced no value to
+                // bind — the loop is unwinding, so leave the target as it was rather
+                // than overwriting it with the placeholder.
+                Ok(_) if shell.control.is_some() => Step::Continue(last),
+                Ok(bound) => {
+                    let result = if *append {
+                        let parser::BindingPattern::Name(name) = pattern else {
+                            unreachable!("the parser restricts += to names")
+                        };
+                        if *global {
+                            shell.vars.append_global(name, bound)
+                        } else {
+                            shell.vars.append(name, bound)
+                        }
                     } else {
-                        shell.vars.append(name, value)
-                    }
-                } else {
-                    bind_pattern(pattern, &value, &mut shell.vars, *global)
-                };
-                result.map_or_else(
-                    |error| {
-                        note!("mesh: {error}");
-                        Step::Continue(1)
-                    },
-                    |_| Step::Continue(0),
-                )
+                        bind_pattern(pattern, &bound, &mut shell.vars, *global)
+                    };
+                    // A right-hand side that *is* a capture lends the statement its
+                    // status, so `if out = $(diff a b)` branches on the diff rather
+                    // than on the binding having worked — which is always true here.
+                    let captured = capture_status_of(value, shell);
+                    result.map_or_else(runtime_message, |_| Step::Continue(captured))
+                }
+                Err(step) => step,
             }
-            Err(step) => step,
-        },
+        }
         Unset { targets, global } => {
             let mut status = 0;
             for target in targets {
@@ -1132,18 +1175,17 @@ fn run_executable(
         // inherit, so a function-local scope would defeat the point
         // (`DESIGN.md` §"Variables and assignment").
         EnvAssignment { key, append, value } => {
-            match eval_operand_of(value, last, in_function, shell) {
+            let evaluated = eval_operand_of(value, last, in_function, shell);
+            match evaluated {
                 // As for an ordinary assignment: a right-hand side that raised
                 // `break`/`continue` produced no value, so leave the variable
                 // alone.
                 Ok(_) if shell.control.is_some() => Step::Continue(last),
-                Ok(value) => environ::write(key, value, *append).map_or_else(
-                    |error| {
-                        note!("mesh: {error}");
-                        Step::Continue(1)
-                    },
-                    |_| Step::Continue(0),
-                ),
+                Ok(evaluated_value) => {
+                    let captured = capture_status_of(value, shell);
+                    environ::write(key, evaluated_value, *append)
+                        .map_or_else(runtime_message, |_| Step::Continue(captured))
+                }
                 Err(step) => step,
             }
         }
@@ -1153,18 +1195,16 @@ fn run_executable(
             value,
             global,
         } => {
-            match eval_operand_of(value, last, in_function, shell) {
+            let evaluated = eval_operand_of(value, last, in_function, shell);
+            match evaluated {
                 // As for an ordinary assignment: a right-hand side that raised
                 // `break`/`continue` produced no value, so leave the place alone.
                 Ok(_) if shell.control.is_some() => Step::Continue(last),
-                Ok(value) => assign_into_member(target, value, *append, *global, shell)
-                    .map_or_else(
-                        |error| {
-                            note!("mesh: {error}");
-                            Step::Continue(1)
-                        },
-                        |()| Step::Continue(0),
-                    ),
+                Ok(evaluated_value) => {
+                    let captured = capture_status_of(value, shell);
+                    assign_into_member(target, evaluated_value, *append, *global, shell)
+                        .map_or_else(runtime_message, |()| Step::Continue(captured))
+                }
                 Err(step) => step,
             }
         }
@@ -1178,7 +1218,7 @@ fn run_executable(
                 || builtins::is_builtin(name)
             {
                 note!("mesh: func: `{name}` is a reserved name and cannot be a function name");
-                return Step::Continue(2);
+                return Step::Error(2);
             }
             // Parameter names are already validated (distinct, not `env`) by the
             // parser's `parameters()`.
@@ -1222,7 +1262,7 @@ fn run_executable(
                     // error, the same distinction bash draws.
                     if !in_function && !shell.vars.in_sourced_file() {
                         note!("mesh: return: not inside a function or sourced file");
-                        return Step::Continue(1);
+                        return Step::Error(1);
                     }
                     // `return val` unwinds carrying the value, and succeeds unless
                     // the value is `false`; a bare `return` carries the result so
@@ -1244,7 +1284,7 @@ fn run_executable(
                 parser::ControlKind::Fail => {
                     if !in_function && !shell.vars.in_sourced_file() {
                         note!("mesh: fail: not inside a function or sourced file");
-                        return Step::Continue(1);
+                        return Step::Error(1);
                     }
                     match value
                         .as_ref()
@@ -1266,7 +1306,7 @@ fn run_executable(
                             }
                         );
                         shell.control = Some(*kind);
-                        Step::Continue(1)
+                        Step::Error(1)
                     } else {
                         shell.control = Some(*kind);
                         Step::Continue(0)
@@ -1510,8 +1550,22 @@ fn guard_allows(
 /// construct did run, so it is no longer the result so far) and not its own
 /// status: that is what the same construct yields in value position, where
 /// `x = if false { … }` is `""`.
+/// How a body that ran to its end reports itself.
+///
+/// Every boundary that *sequences* statements — a source, a loop, a function body
+/// — keeps going after an evaluation error and answers for how the last statement
+/// that executed ended. The two channels only ever separate at `$(…)`, so this is
+/// the one place either arm is chosen.
+fn sequenced(status: u8, errored: bool) -> Step {
+    if errored {
+        Step::Error(status)
+    } else {
+        Step::Continue(status)
+    }
+}
+
 fn compound_result(step: Step, shell: &mut Shell) -> Step {
-    if matches!(step, Step::Continue(_)) && shell.produced == Produced::Nothing {
+    if matches!(step, Step::Continue(_) | Step::Error(_)) && shell.produced == Produced::Nothing {
         shell.result = Value::String(String::new());
         shell.produced = Produced::Value;
     }
@@ -1650,6 +1704,8 @@ fn condition_status(
     } = condition
         && matches!(pattern, parser::BindingPattern::List(_))
     {
+        // What this condition asks is whether the value has the requested shape
+        // (`docs/REFERENCE.md` §Conditionals); a capture's status is no part of it.
         let value = eval_operand_of(value, last, in_function, shell)?;
         if shell.control.is_some() {
             return Ok(None);
@@ -1692,7 +1748,7 @@ fn run_ast_for(
 ) -> Step {
     if let Err(message) = validate_patterns(bindings) {
         note!("mesh: for: {message}");
-        return Step::Continue(2);
+        return Step::Error(2);
     }
     let value = match eval_operand_of(iterable, last, in_function, shell) {
         Ok(v) => v,
@@ -1718,6 +1774,7 @@ fn run_ast_for(
     // leave its final iteration's value behind as the result so far, and a bare
     // `return` after it would carry that scalar instead of the list.
     let mut results = Vec::new();
+    let mut errored = false;
     shell.loop_depth += 1;
     for values in values {
         if let Err(message) = bind_iteration(bindings, values, shell) {
@@ -1725,7 +1782,18 @@ fn run_ast_for(
             return runtime_message(message);
         }
         match run_source(body, 0, in_function, shell) {
-            Step::Continue(code) => status = code,
+            // An evaluation error says how *this pass* ended, not that the loop is
+            // unwinding: the next pass runs exactly as it does after a failing
+            // command. Only the classification is carried out, so a `$(for …)`
+            // around the loop can still tell an invalid body from a bad status.
+            Step::Continue(code) => {
+                status = code;
+                errored = false;
+            }
+            Step::Error(code) => {
+                status = code;
+                errored = true;
+            }
             flow => {
                 shell.loop_depth -= 1;
                 return flow;
@@ -1746,7 +1814,7 @@ fn run_ast_for(
     shell.loop_depth -= 1;
     shell.result = Value::List(results);
     shell.produced = Produced::Value;
-    Step::Continue(status)
+    sequenced(status, errored)
 }
 
 /// Run `while COND { … }`, or `loop { … }` when there is no condition.
@@ -1777,7 +1845,7 @@ fn run_forked_block(body: &parser::Source, in_function: bool, shell: &mut Shell)
         // boundary: `false; fork { }` reporting 1 would carry a failure from
         // outside it across the very edge the construct exists to draw.
         match run_source(body, 0, in_function, shell) {
-            Step::Continue(code) | Step::Exit(code) => code,
+            Step::Continue(code) | Step::Error(code) | Step::Exit(code) => code,
             // A `return` that reached the top of a subshell body has no caller
             // left inside it; its value's status is what the child exits with.
             Step::Return(_, code) => code,
@@ -1791,7 +1859,7 @@ fn run_forked_block(body: &parser::Source, in_function: bool, shell: &mut Shell)
         }
         Err(error) => {
             note!("mesh: fork: {error}");
-            Step::Continue(1)
+            Step::Error(1)
         }
     }
 }
@@ -1812,6 +1880,7 @@ fn run_ast_while(
     // A body that never runs leaves this in place, so the loop reports having
     // produced nothing; each pass's `run_source` overwrites it otherwise.
     shell.produced = Produced::Nothing;
+    let mut errored = false;
     shell.loop_depth += 1;
     loop {
         if let Some(condition) = condition {
@@ -1836,9 +1905,16 @@ fn run_ast_while(
             }
         }
         match run_source(body, 0, in_function, shell) {
+            // As in `for`: an evaluation error ends the pass, not the loop.
             Step::Continue(code) => {
                 status = code;
                 previous = code;
+                errored = false;
+            }
+            Step::Error(code) => {
+                status = code;
+                previous = code;
+                errored = true;
             }
             flow => {
                 shell.loop_depth -= 1;
@@ -1855,7 +1931,7 @@ fn run_ast_while(
         }
     }
     shell.loop_depth -= 1;
-    compound_result(Step::Continue(status), shell)
+    compound_result(sequenced(status, errored), shell)
 }
 
 fn iteration_values(value: Value, binding_count: usize) -> Result<Vec<Vec<Value>>, String> {
@@ -2069,7 +2145,7 @@ fn run_ast_pipeline(
                 "mesh: a value cannot be backgrounded with a redirection yet; \
                  bind it first — `m = $(…)` then `cmd $m > out &`"
             );
-            return Step::Continue(2);
+            return Step::Error(2);
         }
         let mut words = Vec::new();
         let mut redirs = Vec::new();
@@ -2117,7 +2193,7 @@ fn run_ast_pipeline(
                         parser::RedirectKind::Heredoc => {
                             let Some(body) = body else {
                                 note!("mesh: heredoc: missing body");
-                                return Step::Continue(1);
+                                return Step::Error(1);
                             };
                             redirs.push(Redir {
                                 kind: exec::RedirKind::In,
@@ -2756,7 +2832,7 @@ fn eval_expr(
             expand::expand_values(vec![word], &shell.vars)
                 .map_err(|e| {
                     note!("mesh: {e}");
-                    Step::Continue(1)
+                    Step::Error(1)
                 })
                 .map(|mut v| {
                     if v.len() == 1 {
@@ -2774,10 +2850,7 @@ fn eval_expr(
         E::Glob(pattern) => Ok(Value::Glob(pattern.clone())),
         E::Variable(name) => {
             let reference = expansion_variable(&name.value, parser::QuoteMode::Bare);
-            expand::resolve_value(&reference, &shell.vars).map_err(|error| {
-                note!("mesh: {error}");
-                Step::Continue(1)
-            })
+            expand::resolve_value(&reference, &shell.vars).map_err(runtime_message)
         }
         E::List(items) => {
             let mut out = Vec::new();
@@ -2856,7 +2929,7 @@ fn eval_expr(
                 .map(Value::Integer)
                 .map_err(|m| {
                     note!("mesh: {m}");
-                    Step::Continue(1)
+                    Step::Error(1)
                 })
         }
         E::Unary {
@@ -2884,7 +2957,7 @@ fn eval_expr(
             }
             eval_binary(l, *op, r).map_err(|m| {
                 note!("mesh: {m}");
-                Step::Continue(1)
+                Step::Error(1)
             })
         }
         E::Member { value, name } => {
@@ -2895,7 +2968,7 @@ fn eval_expr(
                     .map(|value| Value::String(value.to_string_lossy().into_owned()))
                     .ok_or_else(|| {
                         note!("mesh: $env.{name}: not set");
-                        Step::Continue(1)
+                        Step::Error(1)
                     });
             }
             let Some(value) = eval_operand(value, last, in_function, shell)? else {
@@ -2968,7 +3041,7 @@ fn eval_expr(
                         .cloned()
                         .ok_or_else(|| {
                             note!("mesh: list index {index} out of range");
-                            Step::Continue(1)
+                            Step::Error(1)
                         })
                 }
                 Value::String(_)
@@ -3984,7 +4057,7 @@ fn single_string_argument(
 
 fn runtime_message(message: impl std::fmt::Display) -> Step {
     note!("mesh: {message}");
-    Step::Continue(1)
+    Step::Error(1)
 }
 
 fn runtime_error<T>(message: impl std::fmt::Display) -> Result<T, Step> {
@@ -4527,6 +4600,107 @@ fn argv_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
     }
 }
 
+/// The status an assignment takes from its right-hand side: the last recorded
+/// status when that side **is** a capture, and `0` otherwise.
+///
+/// Reading the shell's ordinary status is safe precisely because [`capture_tail`]
+/// is syntactic — the only way to reach this is to have just evaluated an
+/// expression whose value came from a capture, and running that capture is what
+/// recorded the status.
+fn capture_status_of(expr: &parser::Expr, shell: &Shell) -> u8 {
+    if capture_tail(expr) {
+        shell.vars.status()
+    } else {
+        0
+    }
+}
+
+/// Can this expression be evaluated without running anything that records a
+/// status? Conservative by construction — anything not listed executes as far as
+/// this is concerned, so a new expression kind defaults to "assume it runs".
+fn runs_nothing(expr: &parser::Expr) -> bool {
+    match expr {
+        parser::Expr::Variable(_) | parser::Expr::Regex(_) | parser::Expr::Glob(_) => true,
+        // A word runs something only if a spliced value does.
+        parser::Expr::Scalar(word) => word.value.pieces.iter().all(|piece| match piece {
+            parser::WordPiece::Text { .. } | parser::WordPiece::Variable { .. } => true,
+            parser::WordPiece::Value(inner) => runs_nothing(&inner.value),
+        }),
+        parser::Expr::Group(inner) => runs_nothing(inner),
+        // Reaching into a value runs nothing of its own, so `($m).sep` is as inert
+        // as `$sep` — how a separator is *accessed* must not change whether the
+        // capture beside it keeps its status. Both halves are checked, since either
+        // can hold something that executes (`$m[$(cmd)]`).
+        parser::Expr::Member { value, .. } => runs_nothing(value),
+        parser::Expr::Index { value, index } => runs_nothing(value) && runs_nothing(index),
+        _ => false,
+    }
+}
+
+/// Does this expression's value come from a `$(…)` at its **tail**?
+///
+/// This is what decides whether an assignment reports its right-hand side's
+/// capture status or its own `0`, and it is answered from the **syntax** rather
+/// than from anything the evaluation left behind — `DESIGN.md`'s standing
+/// preference, "readable from the line, never data-dependent". That is what
+/// makes the rule leak-proof: an expression that merely *ran* a capture along the
+/// way (a call whose body used one, a compound whose body did, a `:capture`
+/// record over a command taking one as an argument) is not a capture, so there is
+/// no state for it to smuggle out.
+///
+/// An interpolation reports its **last executing** piece, as bash does:
+/// `"$(false)$(true)"` leaves `0`, and `"$(false)suffix"` leaves `1` — trailing
+/// text runs nothing, so it cannot displace the capture's status. Only a piece
+/// that runs something can, which is why the scan skips text and variables and
+/// then answers on whatever it reaches first: a capture hands over its status, and
+/// anything else that executes (a call, say) is the thing whose status was
+/// recorded last, so the capture's is gone.
+fn capture_tail(expr: &parser::Expr) -> bool {
+    match expr {
+        parser::Expr::Capture(_) => true,
+        parser::Expr::Group(inner) => capture_tail(inner),
+        // Indexing runs nothing, so a capture reached through one keeps its status
+        // — `$(cmd):split(":")[0]` still answers for `cmd`. The index expression
+        // itself has to be inert, since `$(cmd):split(":")[$(other)]` would put
+        // `other` last.
+        parser::Expr::Index { value, index } => runs_nothing(index) && capture_tail(value),
+        // A modifier that runs nothing leaves the capture as the last thing that
+        // recorded a status, so `$(cmd):upper` still answers for `cmd`. The ones
+        // that *do* run something — a higher-order modifier invoking a callable,
+        // `:capture` invoking outright — are not transparent, and neither is a
+        // modifier whose arguments could execute, since those run after the
+        // subject and would be what recorded last.
+        parser::Expr::Modifier {
+            value,
+            name,
+            arguments,
+        } => {
+            let invokes = matches!(name.as_str(), "map" | "filter" | "each" | "capture");
+            let inert_arguments = arguments.as_ref().is_none_or(|arguments| {
+                arguments.iter().all(|argument| match argument {
+                    parser::Argument::Positional(expr) | parser::Argument::Named(_, expr) => {
+                        runs_nothing(expr)
+                    }
+                    parser::Argument::Spread(expr) => runs_nothing(expr),
+                })
+            });
+            !invokes && inert_arguments && capture_tail(value)
+        }
+        parser::Expr::Scalar(word) => word
+            .value
+            .pieces
+            .iter()
+            .rev()
+            .find_map(|piece| match piece {
+                parser::WordPiece::Value(inner) => Some(capture_tail(&inner.value)),
+                // Runs nothing, so it records no status and the scan continues.
+                parser::WordPiece::Text { .. } | parser::WordPiece::Variable { .. } => None,
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn capture_source(
     source: &parser::Source,
     last: u8,
@@ -4535,9 +4709,46 @@ fn capture_source(
 ) -> Result<Value, Step> {
     let (step, output) =
         capture::with_stdout_captured(shell, |shell| run_source(source, last, in_function, shell))?;
+    // A capture that **ran nothing** — `$()`, or a body whose every statement a
+    // guard skipped — has no status of its own to hand back. Without this it would
+    // borrow whatever ran before it, so `false; x = $()` would report `1`.
+    //
+    // `produced` is the signal rather than the status-record count, because a
+    // skipped statement still passes through `run_recorded` and bumps that count
+    // while executing nothing. `run_source` leaves `produced` at `Nothing` exactly
+    // when no statement in the body ran, which is the question being asked.
+    if shell.produced == Produced::Nothing {
+        shell.record_status(0, vec![0]);
+    }
     match step {
-        Step::Continue(0) => Ok(Value::String(output.trim_end_matches('\n').to_string())),
-        Step::Continue(code) => Err(Step::Continue(code)),
+        // The bytes are the answer whatever the command exited with. A nonzero
+        // status is routinely a *result* rather than an error — `diff` says 1 for
+        // "they differ" and the diff itself is on stdout, `grep` says 1 for "no
+        // match", `timeout` says 124 over whatever was printed first — so
+        // discarding the output would throw away the thing that was asked for.
+        // Every POSIX shell binds it and reports the status separately. Nothing is
+        // stashed for the caller here: running the body recorded the status the
+        // ordinary way, and an assignment whose right-hand side is a capture reads
+        // it back through `capture_status_of`.
+        Step::Continue(_) => Ok(Value::String(output.trim_end_matches('\n').to_string())),
+        // An evaluation error is not a status to carry — the program was invalid,
+        // and mesh aborts the statement for one wherever it happens (`x = $nope`
+        // leaves `x` unbound; `puts "a[$nope]b"` prints nothing). Yielding here
+        // would turn `x = $(puts $nope)` into an empty string and let the statement
+        // continue, which is the "invalid source" and "the command failed" channels
+        // being confused — the one distinction `AGENTS.md` asks to keep.
+        //
+        // The classification is **within one process**, which is the boundary
+        // `DESIGN.md` §"Isolation and subshells" draws: a subshell forks, and "only
+        // bytes cross back out". An error inside a forked part of the body — a
+        // pipeline stage, an explicit `fork { … }` — therefore arrives as a status,
+        // and `x = $(fork { puts $nope })` binds the empty string. That is the
+        // subshell contract doing its job rather than a gap in this one: reducing
+        // an inner world to bytes and a status is what the isolation is *for*, and
+        // a side channel carrying the classification out would undo it.
+        Step::Error(code) => Err(Step::Error(code)),
+        // `break` / `continue` / `return` / `exit` are not statuses — they are the
+        // body unwinding, with no value to yield — so they still propagate.
         step => Err(step),
     }
 }
@@ -4751,6 +4962,10 @@ fn eval_body(
     // statement was skipped — yields the empty string rather than inheriting
     // whatever the surrounding code last recorded.
     let mut recorded = false;
+    // How the last statement that executed ended, as in `run_source`: a body whose
+    // value comes from an invalid program is not an answer, and the caller — a
+    // `$(f())` above all — has to be able to tell.
+    let mut errored = false;
     for (index, statement) in body.statements.iter().enumerate() {
         let final_statement = index + 1 == body.statements.len();
         if final_statement && !statement.background && statement.and_or.rest.is_empty() {
@@ -4762,7 +4977,12 @@ fn eval_body(
                     // an earlier statement's result still stands: the same answer
                     // a bare `return` in its place would carry.
                     return match guard_allows(guard.as_ref(), last, in_function, shell) {
+                        // A tail that runs answers for the body, clearing an earlier
+                        // statement's error the way the next statement does in
+                        // `run_source`. One a guard skipped answers for nothing, so
+                        // the earlier error still stands.
                         Ok(true) => eval_expr(expression, last, in_function, shell),
+                        Ok(false) if errored => Err(Step::Error(last)),
                         Ok(false) if recorded => Ok(shell.result.clone()),
                         Ok(false) => Ok(Value::String(String::new())),
                         Err(step) => Err(step),
@@ -4784,14 +5004,33 @@ fn eval_body(
                 _ => {}
             }
         }
-        match run_statement(statement, last, in_function, shell) {
-            Step::Continue(code) => last = code,
+        let step = run_statement(statement, last, in_function, shell);
+        let executed = shell.produced != Produced::Nothing;
+        match step {
+            // An evaluation error abandons its own statement, not the body around
+            // it, exactly as in `run_source` — `func f() { 1 / 0; return }` still
+            // reaches the `return`, carrying the status the failed statement left.
+            // Only the classification outlives the statement, so that a body which
+            // *ends* invalid says so instead of handing back a plausible value.
+            Step::Continue(code) => {
+                last = code;
+                if executed {
+                    errored = false;
+                }
+            }
+            Step::Error(code) => {
+                last = code;
+                errored = true;
+            }
             flow => return Err(flow),
         }
-        recorded |= shell.produced != Produced::Nothing;
+        recorded |= executed;
         if shell.control.is_some() {
             return Ok(Value::String(String::new()));
         }
+    }
+    if errored {
+        return Err(Step::Error(last));
     }
     // The last statement was not a tail expression — an `&&`/`||` list, a
     // command, a background job. Its recorded result is still the body's, the
@@ -5097,7 +5336,7 @@ fn run_single(
                 Ok(step) => step,
                 Err((path, err)) => {
                     note!("mesh: {path}: {err}");
-                    Step::Continue(1)
+                    Step::Error(1)
                 }
             };
         }
@@ -5106,18 +5345,18 @@ fn run_single(
         // it rather than launch an external `return` while the body keeps running.
         Ok(Expanded::Return(_)) => {
             note!("mesh: return: cannot be redirected or backgrounded");
-            return Step::Continue(2);
+            return Step::Error(2);
         }
         Ok(Expanded::Fail(_)) => {
             note!("mesh: fail: cannot be redirected or backgrounded");
-            return Step::Continue(2);
+            return Step::Error(2);
         }
         Ok(Expanded::Argv(argv)) => argv,
         Err(step) => return step,
     };
     if argv.is_empty() {
         note!("mesh: redirection with no command is not supported yet");
-        return Step::Continue(1);
+        return Step::Error(1);
     }
     // A redirected builtin runs in the shell like a redirected function: the
     // targets apply to the shell's own descriptors around the call, so there is
@@ -5138,7 +5377,7 @@ fn run_single(
             Ok(step) => step,
             Err((path, err)) => {
                 note!("mesh: {path}: {err}");
-                Step::Continue(1)
+                Step::Error(1)
             }
         };
     }
@@ -5224,17 +5463,17 @@ fn run_multi(
             // pipeline stage, so reject it rather than launch an external `return`.
             Ok(Expanded::Return(_)) => {
                 note!("mesh: return: cannot be used in a pipeline");
-                return Step::Continue(2);
+                return Step::Error(2);
             }
             Ok(Expanded::Fail(_)) => {
                 note!("mesh: fail: cannot be used in a pipeline");
-                return Step::Continue(2);
+                return Step::Error(2);
             }
             Err(step) => return step,
             Ok(Expanded::Argv(argv)) => {
                 if argv.is_empty() {
                     note!("mesh: empty command in a pipeline");
-                    return Step::Continue(1);
+                    return Step::Error(1);
                 }
                 // `command NAME …` is the program `NAME`, so the stage is that
                 // program rather than a forked shell that runs it.
@@ -5427,12 +5666,12 @@ fn run_stage_in_shell(
             // can run, and the eager paths refuse it in the same terms.
             Ok(Expanded::Return(_) | Expanded::Fail(_)) => {
                 note!("mesh: {}", context.returning());
-                Step::Continue(2)
+                Step::Error(2)
             }
             Ok(Expanded::Argv(argv)) => {
                 if argv.is_empty() {
                     note!("mesh: {}", context.empty());
-                    Step::Continue(1)
+                    Step::Error(1)
                 } else if let Some(program) = external_stage(&argv) {
                     // Replaces this process, so nothing below runs on success.
                     return exec::exec_stage(&program);
@@ -5444,7 +5683,7 @@ fn run_stage_in_shell(
         },
     };
     match step {
-        Step::Continue(code) | Step::Exit(code) | Step::Return(_, code) => code,
+        Step::Continue(code) | Step::Error(code) | Step::Exit(code) | Step::Return(_, code) => code,
     }
 }
 
@@ -5486,10 +5725,7 @@ fn expand_redirs(
 ) -> Result<Vec<exec::Redirection>, Step> {
     // Every "what is wrong with this target" answer is a message the caller used to
     // report; reported here instead, so the caller has one thing to propagate.
-    let bad = |message: String| {
-        note!("mesh: {message}");
-        Step::Continue(1)
-    };
+    let bad = |message: String| runtime_message(message);
     let mut out = Vec::with_capacity(redirs.len());
     for redir in redirs {
         if let Means::Document(body) = redir.means {
@@ -5632,10 +5868,7 @@ fn expand_stage(
         return Ok(Expanded::Argv(Vec::new()));
     };
     let head = expansion_word(first, last, in_function, shell)?;
-    let mut argv = expand::expand(vec![head], &shell.vars).map_err(|err| {
-        note!("mesh: {err}");
-        Step::Continue(1)
-    })?;
+    let mut argv = expand::expand(vec![head], &shell.vars).map_err(runtime_message)?;
     // A word that expanded to several (a glob) or to none names no command; those
     // fall through to the plain argv rule, which reports what is wrong with them.
     let name = (argv.len() == 1).then(|| argv[0].clone());
@@ -5652,10 +5885,7 @@ fn expand_stage(
         for word in rest {
             let word = expansion_word(word, last, in_function, shell)?;
             args.extend(
-                expand::expand_call_values(vec![word], &shell.vars).map_err(|err| {
-                    note!("mesh: {err}");
-                    Step::Continue(1)
-                })?,
+                expand::expand_call_values(vec![word], &shell.vars).map_err(runtime_message)?,
             );
         }
         let name = name.expect("a named stage, since one of the two branches claimed it");
@@ -5698,10 +5928,7 @@ fn stage_argument(
         }
         _ => {}
     }
-    expand::expand(vec![word.clone()], &shell.vars).map_err(|err| {
-        note!("mesh: {err}");
-        Step::Continue(1)
-    })
+    expand::expand(vec![word.clone()], &shell.vars).map_err(runtime_message)
 }
 
 /// Run an in-shell function call whose arguments are already expanded: generated
@@ -5768,17 +5995,14 @@ fn output_words(
             .map(|value| {
                 builtins::rendered_for_output(value, decoration).map_err(|message| {
                     note!("mesh: {name}: {message}");
-                    Step::Continue(1)
+                    Step::Error(1)
                 })
             })
             .collect(),
         // Either every value was a scalar, or the value pass failed; ordinary
         // expansion renders the first and reports the second in the terms the
         // rest of the shell uses.
-        _ => expand::expand(vec![word.clone()], vars).map_err(|err| {
-            note!("mesh: {err}");
-            Step::Continue(1)
-        }),
+        _ => expand::expand(vec![word.clone()], vars).map_err(runtime_message),
     }
 }
 
@@ -5930,7 +6154,7 @@ fn unknown_command_option(flag: &str) -> Step {
              `command -- {flag}` runs a program of that name"
         );
     }
-    Step::Continue(2)
+    Step::Error(2)
 }
 
 /// Run a command whose words are already expanded: `return`, `command`, generated
@@ -5972,7 +6196,7 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
             CommandLine::Unknown(flag) => unknown_command_option(&flag),
             CommandLine::Nothing => {
                 note!("mesh: command: expected a program to run");
-                Step::Continue(2)
+                Step::Error(2)
             }
         };
     }
@@ -6127,7 +6351,7 @@ fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
             }
             _ => {
                 note!("mesh: prompt: expected one prompt string after `--`");
-                Step::Continue(2)
+                Step::Error(2)
             }
         };
     }
@@ -6149,7 +6373,7 @@ fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {
         }
         _ => {
             note!("mesh: prompt: expected one prompt string or --reset");
-            Step::Continue(2)
+            Step::Error(2)
         }
     }
 }
@@ -6196,13 +6420,13 @@ fn register_hook_operands(args: &[String], shell: &mut Shell) -> Step {
 
 fn invalid_hook() -> Step {
     note!("mesh: on: expected EVENT NAME FUNCTION or --remove EVENT NAME");
-    Step::Continue(2)
+    Step::Error(2)
 }
 
 fn register_hook(event: HookEvent, name: &str, function: &str, shell: &mut Shell) -> Step {
     if shell.funcs.get(function).is_none() {
         note!("mesh: on: `{function}` is not a function");
-        return Step::Continue(1);
+        return Step::Error(1);
     }
     if let Some(hook) = shell
         .prompt
@@ -6843,7 +7067,7 @@ fn make_return(args: Vec<(Value, bool)>, last: u8, shell: &Shell) -> Step {
         Err(args) if args.is_empty() => Step::Return(shell.result.clone(), last),
         Err(_) => {
             note!("mesh: return: too many arguments");
-            Step::Continue(1)
+            Step::Error(1)
         }
     }
 }
@@ -6867,17 +7091,17 @@ fn make_fail(args: Vec<(Value, bool)>) -> Step {
             }
             Value::Integer(_) => {
                 note!("mesh: fail: status must be between 1 and 255");
-                return Step::Continue(2);
+                return Step::Error(2);
             }
             _ => {
                 note!("mesh: fail: status must be an integer");
-                return Step::Continue(2);
+                return Step::Error(2);
             }
         },
         Err(args) if args.is_empty() => 1,
         Err(_) => {
             note!("mesh: fail: too many arguments");
-            return Step::Continue(2);
+            return Step::Error(2);
         }
     };
     Step::Return(Value::Boolean(false), code)
@@ -7041,7 +7265,7 @@ fn call_signature_for_value(
         // fail the statement, or the rest of the script would never run.
         if shell.loop_depth == 0 {
             shell.control = None;
-            return Err(Step::Continue(1));
+            return Err(Step::Error(1));
         }
         return Ok(Value::String(String::new()));
     }
@@ -7121,7 +7345,7 @@ fn run_call_body_for_value(
         // `exit` unwinds regardless: it leaves the shell, not just this call.
         Err(step @ Step::Exit(_)) => Err(step),
         // The diagnostic is already on stderr, so fail quietly with its status.
-        _ if escaped => Err(Step::Continue(1)),
+        _ if escaped => Err(Step::Error(1)),
         Ok(value) => Ok(value),
         // An explicit `return val` yields its value; a runtime step unwinds.
         Err(Step::Return(value, _)) => Ok(value),
@@ -7193,7 +7417,7 @@ fn call_modifier_ref(
         shell.produced = caller_produced;
         if shell.loop_depth == 0 {
             shell.control = None;
-            return Err(Step::Continue(1));
+            return Err(Step::Error(1));
         }
         return Ok(Value::String(String::new()));
     }
@@ -7329,7 +7553,7 @@ fn bind_scanned<'p>(
         } else {
             note!("mesh: {name}: expected {required} argument(s), got {supplied}");
         }
-        return Err(Step::Continue(2));
+        return Err(Step::Error(2));
     }
     if !has_rest && supplied > maximum {
         if maximum > required {
@@ -7337,7 +7561,7 @@ fn bind_scanned<'p>(
         } else {
             note!("mesh: {name}: expected {maximum} argument(s), got {supplied}");
         }
-        return Err(Step::Continue(2));
+        return Err(Step::Error(2));
     }
 
     // Bind every parameter in declaration order, consuming supplied positionals in
@@ -7499,7 +7723,7 @@ fn evaluate_value_arguments<'p>(
 fn reject_option_after_terminator(name: &str, key: &str, flags_ended: bool) -> Result<(), Step> {
     if flags_ended {
         note!("mesh: {name}: option `{key}:` cannot follow `--`");
-        return Err(Step::Continue(2));
+        return Err(Step::Error(2));
     }
     Ok(())
 }
@@ -7582,20 +7806,20 @@ fn bind_dashed_option<'p>(
     });
     let Some(declared) = declared else {
         note!("mesh: {name}: unknown flag `--{flag}`");
-        return Err(Step::Continue(2));
+        return Err(Step::Error(2));
     };
     match &declared.kind {
         ParamKind::Switch => {
             if inline.is_some() {
                 note!("mesh: {name}: flag `--{flag}` is a switch and takes no value");
-                return Err(Step::Continue(2));
+                return Err(Step::Error(2));
             }
             switches_on.insert(declared.name.as_str());
         }
         ParamKind::Flag(_) => {
             let Some(value) = inline else {
                 note!("mesh: {name}: flag `--{flag}` requires a value (write `--{flag}=VALUE`)");
-                return Err(Step::Continue(2));
+                return Err(Step::Error(2));
             };
             // Last occurrence wins for a valued flag. A bare literal value is typed
             // like the same token passed positionally, so `--n=2` binds the integer
@@ -7628,7 +7852,7 @@ fn bind_named_option<'p>(
     use parser::ParamKind;
     let Some(param) = params.iter().find(|param| param.name == key) else {
         note!("mesh: {name}: unknown option `{key}:`");
-        return Err(Step::Continue(2));
+        return Err(Step::Error(2));
     };
     match &param.kind {
         ParamKind::Switch => {
@@ -7636,7 +7860,7 @@ fn bind_named_option<'p>(
                 note!(
                     "mesh: {name}: switch `{key}:` takes a boolean (`{key}: true` or `{key}: false`)"
                 );
-                return Err(Step::Continue(2));
+                return Err(Step::Error(2));
             };
             if on {
                 switches_on.insert(param.name.as_str());
@@ -7651,7 +7875,7 @@ fn bind_named_option<'p>(
             note!(
                 "mesh: {name}: `{key}` is a positional parameter, passed by position not `{key}:`"
             );
-            return Err(Step::Continue(2));
+            return Err(Step::Error(2));
         }
     }
     Ok(())
@@ -7676,14 +7900,14 @@ fn evaluate_default(
     if shell.control.is_some() {
         shell.control = None;
         note!("mesh: {name}: could not evaluate default for `{param}`");
-        return Err(Step::Continue(2));
+        return Err(Step::Error(2));
     }
     evaluated.map_err(|step| match step {
         exit @ Step::Exit(_) => exit,
         ret @ Step::Return(..) => ret,
         _ => {
             note!("mesh: {name}: could not evaluate default for `{param}`");
-            Step::Continue(2)
+            Step::Error(2)
         }
     })
 }
@@ -8846,7 +9070,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     let (origin, source) = options.origin(true);
     shell.vars.set_origin(origin, source);
     let mut last = match run_startup_files(options, true, 0, &mut shell) {
-        Step::Continue(code) => code,
+        Step::Continue(code) | Step::Error(code) => code,
         Step::Exit(code) => {
             return ExitCode::from(run_logout(options, code, &mut shell));
         }
@@ -8986,7 +9210,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                         );
                         return ExitCode::from(run_logout(options, code, &mut shell));
                     }
-                    Some(Step::Continue(code)) => last = code,
+                    Some(Step::Continue(code) | Step::Error(code)) => last = code,
                     // Top-level `run_line` reports a stray `return` itself, so one
                     // never reaches here.
                     Some(Step::Return(..)) => unreachable!("top-level return handled in run_line"),
@@ -9788,7 +10012,7 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
     let (origin, source) = options.origin(false);
     shell.vars.set_origin(origin, source);
     let mut last = match run_startup_files(options, false, 0, &mut shell) {
-        Step::Continue(code) => code,
+        Step::Continue(code) | Step::Error(code) => code,
         Step::Exit(code) => {
             return ExitCode::from(run_logout(options, code, &mut shell));
         }
@@ -9850,7 +10074,7 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
             Step::Exit(code) => {
                 return ExitCode::from(run_logout(options, code, &mut shell));
             }
-            Step::Continue(code) => last = code,
+            Step::Continue(code) | Step::Error(code) => last = code,
             Step::Return(..) => unreachable!("top-level return handled in run_line"),
         }
     }
@@ -9860,7 +10084,7 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
             Step::Exit(code) => {
                 return ExitCode::from(run_logout(options, code, &mut shell));
             }
-            Step::Continue(code) => last = code,
+            Step::Continue(code) | Step::Error(code) => last = code,
             Step::Return(..) => unreachable!("top-level return handled in run_line"),
         }
     }
@@ -12256,10 +12480,9 @@ mod tests {
         // still reported whatever ran before.
         let mut shell = Shell::new();
         assert_eq!(run_line("true\n", 0, false, &mut shell), Step::Continue(0));
-        assert_eq!(
-            run_line("nope (\n", 0, false, &mut shell),
-            Step::Continue(2)
-        );
+        // `Step::Error`: a parse failure is an invalid program, so a `$(…)` around
+        // one must not take its empty output as an answer. Status unchanged.
+        assert_eq!(run_line("nope (\n", 0, false, &mut shell), Step::Error(2));
         assert_eq!(shell.vars.status(), 2);
     }
 
@@ -12319,7 +12542,10 @@ mod tests {
                 true,
                 &mut shell,
             ),
-            Step::Continue(2),
+            // An unknown flag is an invalid call, so it reports `Step::Error` — the
+            // status and the recovery are the same, but a `$(…)` around one must
+            // not take its empty output as an answer.
+            Step::Error(2),
         );
     }
 
@@ -12638,7 +12864,8 @@ mod tests {
             &mut pending,
             &mut gate,
         );
-        assert_eq!(step, Some(Step::Continue(2)));
+        // Invalid source, so `Step::Error` rather than a command's status.
+        assert_eq!(step, Some(Step::Error(2)));
         assert!(pending.is_empty());
         // `f` was never defined.
         assert!(shell.funcs.get("f").is_none());
@@ -12648,8 +12875,11 @@ mod tests {
     fn a_bare_return_at_top_level_is_reported() {
         // Outside a function, `return` is a recoverable error (status 1), not an
         // unwind — `run_line` reports it and continues rather than propagating it.
+        // `Step::Error` rather than `Continue`: a `return` with nothing to return
+        // from is an invalid program, so a `$(…)` around one must not take the
+        // empty output as an answer. The status and the recovery are unchanged.
         let mut shell = Shell::new();
-        assert_eq!(run_line("return", 0, false, &mut shell), Step::Continue(1));
+        assert_eq!(run_line("return", 0, false, &mut shell), Step::Error(1));
     }
 
     #[test]
