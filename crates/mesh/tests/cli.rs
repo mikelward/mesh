@@ -4855,7 +4855,15 @@ fn spawn_failure_harness(exec: &MeshExec) -> i32 {
     if !output.windows(11).any(|part| part == b"recovered\r\n") {
         return 36;
     }
-    if unsafe { libc::write(master, b"exit\n".as_ptr().cast(), 5) } != 5 {
+    // `exit 0`, not a bare `exit`, because the check below is that the session
+    // *left cleanly* — and a bare `exit` leaves with the last command's status,
+    // so it also asserts that whatever ran last succeeded. That is not this
+    // harness's subject, and it is answerable by anything the terminal put on
+    // the input: a cursor-position reply arriving between the last command and
+    // this line runs as a command of its own and takes the status with it.
+    // `stop_pty_shell` has spelled it `exit 0` for this reason since it was
+    // written; these two harnesses predate it.
+    if unsafe { libc::write(master, b"exit 0\n".as_ptr().cast(), 7) } != 7 {
         return 37;
     }
     let mut status = 0;
@@ -4922,7 +4930,15 @@ fn sigcont_harness(exec: &MeshExec) -> i32 {
     if output.windows(13).any(|part| part == b"unsolicited\r\n") {
         return 25;
     }
-    if unsafe { libc::write(master, b"exit\n".as_ptr().cast(), 5) } != 5 {
+    // `exit 0`, not a bare `exit`, because the check below is that the session
+    // *left cleanly* — and a bare `exit` leaves with the last command's status,
+    // so it also asserts that whatever ran last succeeded. That is not this
+    // harness's subject, and it is answerable by anything the terminal put on
+    // the input: a cursor-position reply arriving between the last command and
+    // this line runs as a command of its own and takes the status with it.
+    // `stop_pty_shell` has spelled it `exit 0` for this reason since it was
+    // written; these two harnesses predate it.
+    if unsafe { libc::write(master, b"exit 0\n".as_ptr().cast(), 7) } != 7 {
         return 26;
     }
     let mut status = 0;
