@@ -4867,15 +4867,7 @@ fn wait_interrupt_harness(exec: &MeshExec) -> i32 {
             }
             let fresh = seen.len().saturating_sub(3);
             seen.extend_from_slice(&chunk[..count as usize]);
-            // Answer only queries in the bytes that just arrived. Scanning the
-            // whole buffer re-answers every earlier query on every read, and
-            // reedline takes the replies as *input* — the line stops being empty,
-            // so Ctrl-D no longer exits and a harness waiting on the shell waits
-            // forever. The three-byte overlap is for a query split across two
-            // reads.
-            if seen[fresh..].windows(4).any(|part| part == b"\x1b[6n") {
-                unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
-            }
+            answer_cursor_queries(master, &seen[fresh..]);
         }
         seen.clear();
 
@@ -4894,10 +4886,9 @@ fn wait_interrupt_harness(exec: &MeshExec) -> i32 {
                 if count <= 0 {
                     return 47;
                 }
+                let fresh = seen.len().saturating_sub(3);
                 seen.extend_from_slice(&chunk[..count as usize]);
-                if seen.windows(4).any(|part| part == b"\x1b[6n") {
-                    unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
-                }
+                answer_cursor_queries(master, &seen[fresh..]);
             }
             if seen.windows(5).any(|part| part == b"mesh!") {
                 abandoned = true;
@@ -5315,14 +5306,7 @@ fn pty_read_until_command_done_within(
         }
         let fresh = seen.len().saturating_sub(3);
         seen.extend_from_slice(&chunk[..count as usize]);
-        // Answer only queries in the bytes that just arrived. Scanning the whole
-        // buffer re-answers every earlier query on every read, and reedline takes
-        // the replies as *input* — the line stops being empty, so Ctrl-D no
-        // longer exits and a harness waiting on the shell waits forever. The
-        // three-byte overlap is for a query split across two reads.
-        if seen[fresh..].windows(4).any(|part| part == b"\x1b[6n") {
-            unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
-        }
+        answer_cursor_queries(master, &seen[fresh..]);
     }
     complete(&seen).map(|status| (seen, status))
 }
@@ -5398,11 +5382,7 @@ fn pty_wait_for_markers(master: std::os::fd::RawFd, markers: &[&str]) -> bool {
         }
         let fresh = seen.len().saturating_sub(3);
         seen.extend_from_slice(&chunk[..count as usize]);
-        // Answer only queries in the bytes that just arrived, for the reason
-        // given on `pty_wait_for_marker`.
-        if seen[fresh..].windows(4).any(|part| part == b"\x1b[6n") {
-            unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
-        }
+        answer_cursor_queries(master, &seen[fresh..]);
     }
     all_present(&seen)
 }
@@ -5432,14 +5412,7 @@ fn pty_wait_for_marker(master: std::os::fd::RawFd, marker: &[u8]) -> bool {
         }
         let fresh = seen.len().saturating_sub(3);
         seen.extend_from_slice(&chunk[..count as usize]);
-        // Answer only queries in the bytes that just arrived. Scanning the whole
-        // buffer re-answers every earlier query on every read, and reedline takes
-        // the replies as *input* — the line stops being empty, so Ctrl-D no
-        // longer exits and a harness waiting on the shell waits forever. The
-        // three-byte overlap is for a query split across two reads.
-        if seen[fresh..].windows(4).any(|part| part == b"\x1b[6n") {
-            unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
-        }
+        answer_cursor_queries(master, &seen[fresh..]);
     }
     seen.windows(marker.len()).any(|part| part == marker)
 }
@@ -5495,10 +5468,9 @@ fn pty_read_until_one_of(master: std::os::fd::RawFd, accept: &[&[u8]]) -> Option
         if count <= 0 {
             return None;
         }
+        let fresh = prompt.len().saturating_sub(3);
         prompt.extend_from_slice(&chunk[..count as usize]);
-        if prompt.windows(4).any(|part| part == b"\x1b[6n") {
-            unsafe { libc::write(master, b"\x1b[1;1R".as_ptr().cast(), 6) };
-        }
+        answer_cursor_queries(master, &prompt[fresh..]);
     }
     seen(&prompt).then_some(prompt)
 }
