@@ -2345,19 +2345,30 @@ of each PR had landed by another route, but these pieces had not.
       32s, on branches touching neither. Run alone they pass — 5/5 and 3/3.
 
       **It has since failed in CI**, on a `TODO.md`-only push, with
-      `PTY harness failed with status 0x7b00`. That decodes to **phase 123** of
-      `decoration_settings_harness`: after writing
-      `$sh.options.shell-integration = true ; touch <restored>` to the pty, the
-      harness waited for `<restored>` to appear and gave up. So it is not a
-      developer-machine artifact, and it is not a read racing ahead of the shell —
-      the wait it lost is a `wait_for_path`, which polls for **30 seconds**.
+      `PTY harness failed with status 0x7b00` — **phase 123** of
+      `decoration_settings_harness`. So it is not a developer-machine artifact,
+      which is the one thing that failure settles.
 
-      That reframes the question. A line taking over 30s to reach its `touch` is
-      not the harness being impatient; something stopped making progress. Worth
-      ruling out first: whether the shell received the line at all (`pty_write`
-      succeeding says the bytes were written, not that they were read), and
-      whether an earlier phase left the session mid-line so this write landed as a
-      continuation of it.
+      Phase 123 covers **two** steps, and the code does not say which gave way:
+
+      ```rust
+      if !pty_write(shell.master, &line) || !wait_for_path(&restored) {
+          return 123;
+      }
+      ```
+
+      The line is `$sh.options.shell-integration = true ; touch <restored>`. If
+      `pty_write` failed the wait never ran; if the write succeeded then a
+      `wait_for_path` polling for **30 seconds** gave up, which is a much
+      stranger thing and would mean something stopped making progress rather
+      than the harness being impatient. Those want different investigations, so
+      **splitting 123 into a code per step is the first move** — cheap, and it
+      makes the next occurrence self-explaining.
+
+      After that, worth ruling out: whether the shell received the line at all
+      (`pty_write` succeeding says the bytes were written, not that they were
+      read), and whether an earlier phase left the session mid-line so this write
+      landed as a continuation of it.
 
       Reading a failure: each harness returns a distinct code per phase —
       `abandoned_line_harness` 90–96, `decoration_settings_harness` 110–128. The
