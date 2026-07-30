@@ -716,6 +716,18 @@ fn gets(args: &[String], shell: &mut Shell) -> Step {
     if line.is_empty() {
         return Step::Continue(1);
     }
+    // The line came off the same descriptor a piped session reads its commands
+    // from, so it is a line of that input even though the reader never saw it.
+    // Without this, `gets x` followed by its data leaves every later diagnostic
+    // naming a line too far up the stream.
+    //
+    // Unless a redirection has fd 0 pointed somewhere else — `gets x < file`, or
+    // `gets x << END`, whose body the reader already counted as part of this
+    // unit. Reading a file is not reading the session, and counting the heredoc
+    // twice is worse than not counting it at all.
+    if exec::stdin_is_the_shells() {
+        shell.vars.count_stdin_line();
+    }
     if line.last() == Some(&b'\n') {
         line.pop();
     }
@@ -926,6 +938,25 @@ fn status_of(value: &Value) -> u8 {
     u8::from(matches!(value, Value::Boolean(false)))
 }
 
+/// Where a syntax error is, as the `file:line:column: ` prefix a diagnostic wears.
+///
+/// The name is `$sh.source` where there is a file — a script or a sourced file,
+/// which is the case that matters, since locating a syntax error in a long config
+/// otherwise means bisecting it. For the file-less origins it is the origin word
+/// (`stdin`, `command`, `interactive`), so the line number still has something to
+/// hang off and the reader can tell which input is meant.
+fn located(text: &str, offset: usize, shell: &Shell) -> String {
+    let (line, column) = parser::line_and_column(text, offset);
+    let line = line + shell.vars.input_line_offset();
+    let source = shell.vars.input_source();
+    let name = if source.is_empty() {
+        shell.vars.input_origin().to_owned()
+    } else {
+        source
+    };
+    format!("{name}:{line}:{column}: ")
+}
+
 /// Parse and run one input unit against the session. `in_function` is true while
 /// running a function body: there a `return` unwinds; at top level it is a
 /// recoverable error.
@@ -939,8 +970,12 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
     };
     let step = match parser::parse(text) {
         Ok(parser::ParseOutcome::Complete(source)) => run_source(&source, last, in_function, shell),
-        Ok(parser::ParseOutcome::Incomplete) => {
-            note!("mesh: syntax error: unexpected end of input");
+        // Nothing more is coming — this text *is* the unit — so what a line reader
+        // would buffer is a syntax error here, reported where the parser gave up
+        // rather than as a bare "unexpected end of input" the reader has to bisect
+        // a file to locate.
+        Ok(parser::ParseOutcome::Incomplete(error)) => {
+            note!("mesh: {}{error}", located(text, error.span.start, shell));
             reject(shell)
         }
         Ok(parser::ParseOutcome::IncompleteHeredoc(delimiter)) => {
@@ -948,7 +983,7 @@ fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step 
             reject(shell)
         }
         Err(error) => {
-            note!("mesh: {error}");
+            note!("mesh: {}{error}", located(text, error.span.start, shell));
             reject(shell)
         }
     };
@@ -8026,8 +8061,8 @@ fn pending_input(text: &str) -> Pending {
     };
     match parser::parse(text) {
         Ok(parser::ParseOutcome::IncompleteHeredoc(delimiter)) => Pending::Heredoc(delimiter),
-        Ok(parser::ParseOutcome::Incomplete) if func_header => by_braces(),
-        Ok(parser::ParseOutcome::Incomplete) => Pending::Other,
+        Ok(parser::ParseOutcome::Incomplete(_)) if func_header => by_braces(),
+        Ok(parser::ParseOutcome::Incomplete(_)) => Pending::Other,
         Err(_) if func_header => by_braces(),
         Ok(parser::ParseOutcome::Complete(_)) | Err(_) => Pending::Complete,
     }
@@ -10141,6 +10176,10 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
                 last = 1;
                 lossy = String::from_utf8_lossy(&line).into_owned();
                 if pending.is_empty() && !needs_more_input(&lossy) {
+                    // A whole unit on its own, dropped here rather than buffered.
+                    // It was still read, so the count has to advance or every
+                    // later diagnostic names a line one too high up the file.
+                    shell.vars.advance_input_lines(lossy.matches('\n').count());
                     continue;
                 }
                 poisoned = true;
@@ -10152,9 +10191,14 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
             continue;
         }
         let full = std::mem::take(&mut pending);
+        // Counted before the discard below, since a unit that is thrown away has
+        // still been read: skipping it here would number every later diagnostic
+        // short by its length.
+        let lines = full.matches('\n').count();
         if std::mem::take(&mut poisoned) {
             // Discard the definition that contained invalid UTF-8 (error already
             // reported when the bad line was read); do not define or run it.
+            shell.vars.advance_input_lines(lines);
             continue;
         }
         match run_line(&full, last, false, &mut shell) {
@@ -10164,6 +10208,9 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
             Step::Continue(code) | Step::Error(code) => last = code,
             Step::Return(..) => unreachable!("top-level return handled in run_line"),
         }
+        // After the unit runs, so its own diagnostics are numbered from where it
+        // started rather than from where the next one will.
+        shell.vars.advance_input_lines(lines);
     }
     // Report an incomplete unit at EOF; a poisoned one was already diagnosed.
     if !poisoned && !pending.trim().is_empty() {

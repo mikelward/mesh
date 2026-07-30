@@ -435,7 +435,13 @@ impl std::error::Error for ParseError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseOutcome {
     Complete(Source),
-    Incomplete,
+    /// More input would finish this: an open delimiter, a trailing operator. The
+    /// error that says so rides along rather than being discarded, because
+    /// "incomplete" is only an *answer* for a reader that can go on reading. A
+    /// whole script or `-c` string has no more input coming, so for those this is
+    /// a syntax error — and one that has to be able to say **where**, which is
+    /// what the payload is for.
+    Incomplete(Box<ParseError>),
     /// Incomplete because a heredoc body is still open, awaiting a line equal to
     /// this delimiter. Distinguished from [`ParseOutcome::Incomplete`] so a
     /// line-at-a-time reader can wait for that one line directly: re-parsing the
@@ -897,6 +903,7 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
             _ => depth,
         })
         > 0;
+    let unclosed = unclosed_opener(&tokens);
     let mut parser = Parser {
         tokens,
         position: 0,
@@ -912,10 +919,86 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
                     ParseErrorKind::UnexpectedEnd | ParseErrorKind::Unterminated(_)
                 ) =>
         {
-            Ok(ParseOutcome::Incomplete)
+            // Point at the delimiter that is still open rather than at the end of
+            // the input. "Unexpected end of input" on line 1800 of a config says
+            // only that the file ended, which is what made locating one a bisect;
+            // the `(` on line 42 is the answer the reader wanted.
+            //
+            // Only when running out of input is what actually went wrong, though.
+            // `open_block` also sends a *real* error here — `x = )` followed by an
+            // unmatched `{` — and substituting there would replace the fault on
+            // line 1 with a brace on line 2, hiding the thing the reader needs.
+            let ran_out = matches!(
+                error.kind,
+                ParseErrorKind::UnexpectedEnd | ParseErrorKind::Unterminated(_)
+            );
+            Ok(ParseOutcome::Incomplete(Box::new(
+                unclosed
+                    .filter(|_| ran_out)
+                    .map_or(error, |(delimiter, span)| ParseError {
+                        kind: ParseErrorKind::Unterminated(delimiter),
+                        span,
+                    }),
+            )))
         }
         Err(error) => Err(error),
     }
+}
+
+/// The innermost delimiter still open at the end of the token stream, and where
+/// it was written.
+///
+/// Innermost because that is the one a reader has to close first, and the one an
+/// editor's own matching would have led them to.
+///
+/// A closer only pops an opener it **matches**. Popping whatever was innermost
+/// let a mismatched one throw away a delimiter that is genuinely still open —
+/// `$(echo ]` lost the capture's `(` to a stray `]` and fell back to end of
+/// input, which is the answer this exists to stop giving. Leaving the stack
+/// alone also reads better for `([)`: the `[` really does have to close before
+/// the `)` can match, so naming it is the honest answer rather than a guess.
+fn unclosed_opener(tokens: &[Token]) -> Option<(char, Span)> {
+    let mut open: Vec<(char, Span)> = Vec::new();
+    for token in tokens {
+        match token.value {
+            TokenKind::LParen => open.push(('(', token.span.clone())),
+            // `$(` is one token, so its span starts at the `$`. The delimiter
+            // left open is the paren, and the report names the paren, so point at
+            // it rather than one column to its left.
+            TokenKind::CaptureStart => {
+                open.push(('(', token.span.start + 1..token.span.end));
+            }
+            TokenKind::LBracket => open.push(('[', token.span.clone())),
+            TokenKind::LBrace => open.push(('{', token.span.clone())),
+            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                let closes = match token.value {
+                    TokenKind::RParen => '(',
+                    TokenKind::RBracket => '[',
+                    _ => '{',
+                };
+                if open.last().is_some_and(|(opener, _)| *opener == closes) {
+                    open.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    open.pop()
+}
+
+/// Where a byte offset falls in the source, as a 1-based line and column.
+///
+/// Columns count **characters**, not bytes: the number is for a person locating
+/// a spot in their own file, and a byte column would name the wrong place on any
+/// line holding a non-ASCII character.
+#[must_use]
+pub fn line_and_column(source: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(source.len());
+    let start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
+    (
+        source[..offset].matches('\n').count() + 1,
+        source[start..offset].chars().count() + 1,
+    )
 }
 
 /// How a still-open `func` parameter list (the text after `(`, before any `)`)
@@ -1116,6 +1199,10 @@ impl<'a> Lexer<'a> {
                     } else {
                         here
                     };
+                    // Where the quote itself is, kept for the unterminated case:
+                    // the word may have started columns earlier, and an escaped
+                    // copy of the same character may sit between the two.
+                    let quote_at = self.position;
                     self.position += 1;
                     let mode = if raw {
                         QuoteMode::Raw
@@ -1221,7 +1308,7 @@ impl<'a> Lexer<'a> {
                     if !closed {
                         return Err(ParseError {
                             kind: ParseErrorKind::Unterminated(quote),
-                            span: start..self.source.len(),
+                            span: quote_at..self.source.len(),
                         });
                     }
                     if pieces.len() == piece_count {
@@ -1264,9 +1351,19 @@ impl<'a> Lexer<'a> {
         // `(` so it reads like the open delimiter it is, rather than as whatever the
         // string's own quote would have been blamed for.
         if until_close {
+            // Innermost first, as everywhere else: the capture's own `(` is the
+            // outermost thing still open, so a delimiter opened *inside* it has to
+            // be closed before the capture can be. Without asking the body's
+            // tokens, `"$(x = [1"` blamed the `(` while the unquoted spelling of
+            // the same text correctly named the `[`.
+            let (delimiter, span) = unclosed_opener(&tokens).unwrap_or((
+                '(',
+                // The body starts after `$(`, and the delimiter named is the paren.
+                body_start.saturating_sub(1)..self.source.len(),
+            ));
             return Err(ParseError {
-                kind: ParseErrorKind::Unterminated('('),
-                span: body_start..self.source.len(),
+                kind: ParseErrorKind::Unterminated(delimiter),
+                span,
             });
         }
         Ok((tokens, self.position))
@@ -1523,7 +1620,8 @@ pub(crate) fn variable_end(source: &str, start: usize) -> Result<usize, ParseErr
         let Some(close) = braced.find('}') else {
             return Err(ParseError {
                 kind: ParseErrorKind::Unterminated('}'),
-                span: start..source.len(),
+                // The `{` this is missing the mate for, not the `$` before it.
+                span: start + 1..source.len(),
             });
         };
         if !valid_variable_access(&braced[..close]) {
@@ -5164,7 +5262,7 @@ mod tests {
     fn complete(source: &str) -> Source {
         match parse(source).unwrap() {
             ParseOutcome::Complete(tree) => tree,
-            ParseOutcome::Incomplete | ParseOutcome::IncompleteHeredoc(_) => {
+            ParseOutcome::Incomplete(_) | ParseOutcome::IncompleteHeredoc(_) => {
                 panic!("unexpected incomplete input")
             }
         }
@@ -5378,13 +5476,57 @@ mod tests {
 
     #[test]
     fn reports_incomplete_delimiters_and_connectors() {
-        assert_eq!(parse("x = (1").unwrap(), ParseOutcome::Incomplete);
-        assert_eq!(parse("a &&").unwrap(), ParseOutcome::Incomplete);
-        assert_eq!(
-            parse("func f(x {\nputs )").unwrap(),
-            ParseOutcome::Incomplete
-        );
+        // The payload is what a reader with no more input reports, so each case
+        // is checked for *where* it says the trouble is, not only that it is
+        // incomplete. An open delimiter names the delimiter and points at it.
+        let incomplete = |source: &str| match parse(source).unwrap() {
+            ParseOutcome::Incomplete(error) => *error,
+            other => panic!("expected incomplete input, got {other:?}"),
+        };
+
+        let open_paren = incomplete("x = (1");
+        assert_eq!(open_paren.kind, ParseErrorKind::Unterminated('('));
+        assert_eq!(open_paren.span.start, 4);
+
+        // A trailing connector has no delimiter to point at, so it keeps the
+        // parser's own "ran out of input" rather than inventing a location.
+        assert_eq!(incomplete("a &&").kind, ParseErrorKind::UnexpectedEnd);
+
+        // A real fault reached before the input ran out keeps the parser's own
+        // error: the parameter list wanted `,` or `)` and met `{`, which is more
+        // use than "unclosed `(`" and is where the reader has to look. Only an
+        // input that genuinely ends mid-construct gets re-aimed at its opener,
+        // which is what stops a stray `{` later in a file from displacing the
+        // fault above it.
+        let nested = incomplete("func f(x {\nputs )");
+        assert_eq!(nested.kind, ParseErrorKind::Expected("`,` or `)`"));
+
+        // And the innermost opener is still what an end-of-input case names: `{`
+        // has to be closed before the `(` around it.
+        let both_open = incomplete("func f() {\n  x = (1");
+        assert_eq!(both_open.kind, ParseErrorKind::Unterminated('('));
+        assert_eq!(both_open.span.start, 17);
+
         assert!(parse("func f(x {\nputs )\n}").is_err());
+    }
+
+    #[test]
+    fn line_and_column_are_one_based_and_counted_in_characters() {
+        let source = "puts one\nputs two\nx = )\n";
+        assert_eq!(line_and_column(source, 0), (1, 1));
+        assert_eq!(line_and_column(source, 9), (2, 1));
+        // The `)` on the third line.
+        assert_eq!(line_and_column(source, 22), (3, 5));
+
+        // Columns count characters: a byte column would name the wrong place on
+        // any line holding a multi-byte one.
+        let wide = "puts \"日本\"\nx = )\n";
+        assert_eq!(line_and_column(wide, wide.find(')').unwrap()), (2, 5));
+
+        // An offset at or past the end is the end, not a panic — `UnexpectedEnd`
+        // carries exactly that.
+        assert_eq!(line_and_column("abc", 3), (1, 4));
+        assert_eq!(line_and_column("abc", 99), (1, 4));
     }
 
     #[test]

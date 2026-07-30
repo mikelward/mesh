@@ -37,10 +37,33 @@ own flags reach the script rather than mesh: `mesh deploy.mesh --login` passes
 name itself looks like an option.
 
 A script is read and parsed as a single unit, so a syntax error anywhere in the
-file rejects the whole thing and nothing runs. A script that cannot be found
-exits `127`; one that exists but cannot be read exits `126` — the same codes an
-unrunnable command yields. Otherwise the exit status is the last command's, or
-whatever `exit` was given.
+file rejects the whole thing and nothing runs. A **parse** error says where:
+
+```
+mesh: deploy.mesh:42:5: syntax error: unclosed `(`
+```
+
+The name is the file for a script or a sourced file, and the origin word
+(`stdin`, `command`, `interactive`) for the inputs that have none. The line and
+column are 1-based, and the column counts characters rather than bytes.
+
+An **unclosed delimiter** is reported at the delimiter, not at the end of the
+file: "the input ended" is the symptom, and the `(` on line 42 is the cause. When
+several are open, the innermost is named — that is the one to close first, and
+where an editor's own matching would land.
+
+Reading from a pipe, the line number counts the stream as the shell read it. A
+command that consumes stdin itself — `head -1`, `dd`, anything interactive —
+takes lines the shell never sees, and diagnostics after it are short by that
+many. A script or a `-c` string is handed over whole and is always exact.
+
+A **heredoc** is the exception, and reports without a location: an unterminated
+one and a malformed interpolation inside a body are both found by their own scan
+rather than by the parser, and neither carries a span to report yet.
+
+A script that cannot be found exits `127`; one that exists but cannot be read
+exits `126` — the same codes an unrunnable command yields. Otherwise the exit
+status is the last command's, or whatever `exit` was given.
 
 Scripts can carry a shebang, since `#` starts a comment:
 

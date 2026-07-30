@@ -753,6 +753,12 @@ struct Input {
     origin: Origin,
     /// The file's path, empty for the origins that are not files.
     source: String,
+    /// How many lines of *this* input came before the unit being run, so a
+    /// diagnostic can name the line in the whole input rather than in the
+    /// fragment. Per-frame rather than per-shell because a sourced file is its
+    /// own input: without that, `puts ok` followed by `source bad.mesh` reported
+    /// the sourced file's line 1 as line 2, having carried stdin's count into it.
+    line_offset: usize,
 }
 
 /// Where the source being evaluated came from — `DESIGN.md`'s input **origin**,
@@ -804,6 +810,7 @@ impl Default for Vars {
             // A shell with nothing said about it reads commands from stdin, which
             // is what `Invocation::Default` falls back to.
             inputs: vec![Input {
+                line_offset: 0,
                 origin: Origin::Stdin,
                 source: String::new(),
             }],
@@ -901,13 +908,21 @@ impl Vars {
 
     /// Replace the outermost input — the one the invocation itself established.
     pub fn set_origin(&mut self, origin: Origin, source: String) {
-        self.inputs = vec![Input { origin, source }];
+        self.inputs = vec![Input {
+            origin,
+            source,
+            line_offset: 0,
+        }];
     }
 
     /// Enter a nested input for the duration of a `source`, so `$sh.origin` reads
     /// `sourced` and `$sh.source` names *that* file while it runs.
     pub(crate) fn push_input(&mut self, origin: Origin, source: String) {
-        self.inputs.push(Input { origin, source });
+        self.inputs.push(Input {
+            origin,
+            source,
+            line_offset: 0,
+        });
     }
 
     /// Leave it again. The outermost frame is never popped: something is always
@@ -948,6 +963,47 @@ impl Vars {
     pub(crate) fn restore_status(&mut self, (status, stages): (u8, Vec<u8>)) {
         self.status = status;
         self.stages = stages;
+    }
+
+    /// The innermost input's file path, empty for the origins that have none —
+    /// what `$sh.source` reports, read directly for a diagnostic that has to name
+    /// where it is.
+    pub(crate) fn input_source(&self) -> String {
+        self.input().source.clone()
+    }
+
+    /// How many lines of the innermost input came before the unit being run.
+    pub(crate) fn input_line_offset(&self) -> usize {
+        self.input().line_offset
+    }
+
+    /// Advance the innermost input's line count by a unit just consumed. Only the
+    /// piped reader calls it: every other caller hands its input over whole.
+    pub(crate) fn advance_input_lines(&mut self, lines: usize) {
+        if let Some(input) = self.inputs.last_mut() {
+            input.line_offset += lines;
+        }
+    }
+
+    /// Count a line that `gets` took straight off descriptor 0.
+    ///
+    /// It belongs to the **outermost** input, which is the one being read from
+    /// that descriptor — a `gets` inside a sourced file still consumes from the
+    /// stream the outer session is reading. And only when that input *is* stdin:
+    /// under `mesh script.mesh` the data `gets` reads has nothing to do with the
+    /// script's own lines, so counting it would push every later diagnostic down
+    /// the file by the size of the data.
+    pub(crate) fn count_stdin_line(&mut self) {
+        if let Some(outermost) = self.inputs.first_mut()
+            && outermost.origin == Origin::Stdin
+        {
+            outermost.line_offset += 1;
+        }
+    }
+
+    /// The innermost input's origin word, as `$sh.origin` reports it.
+    pub(crate) fn input_origin(&self) -> &'static str {
+        self.input().origin.word()
     }
 
     /// Is the innermost input a **sourced file**? That is the one top level a
