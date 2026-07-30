@@ -1647,16 +1647,34 @@ designed, and the cross-references say where the fuller note lives.
       whole-argument rule `DESIGN.md` states for captures — `pre$(x)post` and
       `f()x` are syntax errors, not three arguments — and honoring that needs a
       decision rather than an accident.
-- [ ] **A modifier's arguments flip the reading of a braced body.** `${xs:len}` is
-      the *reference* (sigil-less, resolved as the binding), but `${xs:join(" ")}`
-      is not a valid access, so it falls to the expression path where a bare `xs`
-      is the **word** `xs` — and `:join` then reports "requires a list" rather than
-      joining the list. `${$xs:join(" ")}` is the working spelling and is what
-      `docs/REFERENCE.md` now documents, but the seam is a trap: adding an argument
-      to a modifier silently changes what the body means. The fix is to teach
-      `valid_variable_access` argument-taking modifiers so the reference reading
-      extends to them, which needs paren matching beside the existing
-      `subscript_end`.
+- [x] **A modifier's arguments flip the reading of a braced body** — *fixed*.
+      `${xs:len}` was the *reference* (sigil-less, resolved as the binding) while
+      `${xs:join(" ")}` was not a valid access, so it fell to the expression path
+      where a bare `xs` is the **word** `xs`. `:join` then reported "requires a
+      list" — and `${xs[0]:join(" ")}` was worse, producing nothing at all rather
+      than saying so. Adding an argument silently changed what the body meant.
+
+      The question is asked of the **parsed body**, not of its text.
+      `has_modifier_arguments` walks the expression the body already parsed to, and
+      `head_as_variable` then reads its sigil-less head as the binding it names.
+      That last step is what makes `${xs:join(" ")}` and `${$xs:join(" ")}` agree.
+
+      The first attempt scanned the source for the closing `)` and `}` instead, and
+      that is the part worth remembering: a scan has to re-derive the lexer's idea
+      of what counts as *text*, and review found four separate places the two
+      disagreed — bare escapes (`:join(a\)b)`), raw strings whose content ends in a
+      backslash, a `#` that is only a comment at a word's head (`"a"#b` is text),
+      and nested interpolations inside a quoted argument. Each fix exposed the
+      next. The parse has already applied every one of those rules, so asking it
+      costs nothing and cannot drift.
+
+      The *path* still splits, because `expand`'s `Modifier` is a bare enum with
+      nowhere to put an argument: an argument-free chain keeps the cheap
+      `&Vars`-only route, and one with arguments goes through the expression parser.
+
+      Left as it was: `expand` still cannot carry modifier arguments itself. Giving
+      `Modifier` an argument list would let the cheap path take the whole shape and
+      retire the split, and is the change to make if the two paths start to drift.
 
 ## Beyond M3 — The predicate vocabulary
 

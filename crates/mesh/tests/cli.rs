@@ -2519,6 +2519,114 @@ fn a_braced_interpolation_takes_an_expression_across_lines() {
 }
 
 #[test]
+fn a_braced_reference_takes_a_modifiers_arguments() {
+    // `${xs:len}` is the sigil-less *reference*, and adding an argument must not
+    // change what the body means. It used to: `:join(" ")` was not a valid access,
+    // so the body fell to the expression path where a bare `xs` is the word `xs`,
+    // and `:join` reported "requires a list" — or, with an index, quietly produced
+    // nothing. Each spelling below is paired with its `$`-sigil equivalent, which
+    // is what it has to agree with.
+    let out = run_with_input(
+        "xs = [a b]\n\
+         m = [k: [c d]]\n\
+         nested = [[e f] [g h]]\n\
+         puts \"${xs:join(\"-\")} ${$xs:join(\"-\")}\"\n\
+         puts \"${m.k:join(\"-\")} ${$m.k:join(\"-\")}\"\n\
+         puts \"${nested[0]:join(\"-\")} ${$nested[0]:join(\"-\")}\"\n\
+         puts \"${xs:join(\"-\"):upper}\"\n\
+         puts \"${xs:len}\"\n",
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a-b a-b\nc-d c-d\ne-f e-f\nA-B\n2\n"
+    );
+
+    // A `}` inside the argument is the argument's, not the body's terminator.
+    let out = run_with_input("xs = [a b]\nputs \"${xs:join(\"}\")}\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a}b\n");
+
+    // Escaped bare delimiters are text, the way the word lexer reads them — and
+    // `\)` is only spellable bare, since inside quotes it is an invalid escape. Each
+    // is paired with its sigil form, which is what it has to agree with.
+    let out = run_with_input(
+        "xs = [a b]\n\
+         puts \"${xs:join(a\\)b)} ${$xs:join(a\\)b)}\"\n\
+         puts \"${xs:join(a\\}b)} ${$xs:join(a\\}b)}\"\n",
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "aa)bb aa)bb\naa}bb aa}bb\n"
+    );
+
+    // A raw string keeps its contents literal, so its trailing `\` does not escape
+    // the closing quote — the scan has to read it the way the lexer does or the
+    // body appears unterminated. `r` and `#` only start something at a word's head.
+    let out = run_with_input(
+        "xs = [a b]\n\
+         puts \"${xs:join(r\"\\\")} ${$xs:join(r\"\\\")}\"\n\
+         puts \"${xs:join(var\"x\")} ${xs:join(a#b)}\"\n\
+         puts \"${xs:join(\"a\"#b)} ${xs:join(a/#b)}\"\n",
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a\\b a\\b\navarxb aa#bb\naa#bb aa/#bb\n"
+    );
+
+    // A nested interpolation whose own value is a delimiter: knowing where the
+    // arguments end needs the lexer's full reading, which is why the shape is taken
+    // from the parse rather than from a scan over the source.
+    let out = run_with_input(
+        "xs = [a b]\n\
+         func f() { \")\" }\n\
+         puts \"${xs:join(\"${f()}\")} ${$xs:join(\"${f()}\")}\"\n",
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a)b a)b\n");
+
+    // The same point with a comment inside a lambda body, where the commented `)`
+    // must not be counted. Needs a script, since piped input is read a line at a
+    // time and no braced body spans two lines there.
+    let dir = fresh_dir("braced_modifier_arguments");
+    let script = dir.join("comment.mesh");
+    std::fs::write(
+        &script,
+        "xs = [a b]\nputs \"${xs:map(func(x) {# ) here\n$x:upper}):join(\"-\")}\"\n",
+    )
+    .expect("write script");
+    let out = run_script_with_stdin(&script, isolated_config_home(), b"");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "A-B\n");
+
+    // A quoted head spells a string, so it keeps that reading rather than becoming
+    // the name it looks like — `upper` applies to the text `lit`.
+    let out = run_with_input("lit = other\nputs \"${\"lit\":upper}\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "LIT\n");
+}
+
+#[test]
 fn a_plain_access_still_takes_the_variable_path() {
     // The cheap path — a name, member, index, or modifier chain — is resolved by
     // `expand` with no shell, and must not be diverted through the expression

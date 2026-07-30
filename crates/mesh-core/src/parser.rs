@@ -1347,13 +1347,23 @@ impl<'a> Lexer<'a> {
                             // `"… ${ expr } …"` — a braced body that is not a plain
                             // access is an expression, and needs the shell for the
                             // same reason a capture does, so it rides in the same
-                            // value piece rather than through `expand`.
+                            // value piece rather than through `expand`. A body whose
+                            // modifier takes arguments comes here too, still meaning
+                            // the binding its head names.
                             if braced_is_access(self.source, self.position) == Some(false) {
                                 let (expression, end) = braced_expression_in_string(
                                     self.source,
                                     self.position,
                                     self.capture_depth + 1,
                                 )?;
+                                // An access whose modifier took arguments is still
+                                // the *reference* reading, so its sigil-less head
+                                // names the binding rather than the word.
+                                let expression = if has_modifier_arguments(&expression) {
+                                    head_as_variable(expression)
+                                } else {
+                                    expression
+                                };
                                 pieces.push(WordPiece::Value {
                                     expression: Box::new(Spanned {
                                         value: expression,
@@ -1700,6 +1710,94 @@ fn braced_is_access(source: &str, start: usize) -> Option<bool> {
     let braced = source[start..].strip_prefix("${")?;
     let close = braced.find('}')?;
     Some(valid_variable_access(&braced[..close]))
+}
+
+/// Does this chain end in a modifier that was **given arguments**?
+///
+/// The question is asked of the parsed body rather than of its text. A scan for
+/// the closing `)` has to re-derive the lexer's idea of what counts as text —
+/// escapes, raw strings, comments, token heads, nested interpolations — and every
+/// place the two disagreed produced a body read one way by the scan and another by
+/// the lexer. The parse already applied all of those rules, so it is the thing to
+/// ask.
+fn has_modifier_arguments(expression: &Expr) -> bool {
+    match expression {
+        Expr::Modifier {
+            value, arguments, ..
+        } => arguments.is_some() || has_modifier_arguments(value),
+        Expr::Member { value, .. } | Expr::Index { value, .. } => has_modifier_arguments(value),
+        _ => false,
+    }
+}
+
+/// Read the head of an access-shaped body as the **binding** it names.
+///
+/// `${xs:join(" ")}` is the reference form, so its sigil-less `xs` is the variable
+/// — but the expression parser that carries the arguments reads a bare word as the
+/// *word* `xs`, which is how `:join` came to report "requires a list" the moment a
+/// modifier grew an argument. The chain is walked to its root because the
+/// modifiers, members, and indices wrap it.
+fn head_as_variable(expression: Expr) -> Expr {
+    match expression {
+        // A single bare run of text, by [`Word::bare_integer`]'s rule: a quoted or
+        // escaped head spells a string, not a name, and must stay one.
+        //
+        // It becomes the same **variable piece** the sigil spelling produces, rather
+        // than an `Expr::Variable`, so a head that carries its own members and
+        // indices (`m.k`, `xs[0]`) resolves exactly as `${$m.k:…}` does — `expand`
+        // reads the whole path out of the one name.
+        Expr::Scalar(word) => {
+            // Every piece bare text, joined: the lexer splits `m.k` into `m`, `.`,
+            // `k`, so one piece is not the test — but a quoted or escaped piece
+            // anywhere means the head spells a *string*, and those keep their
+            // reading.
+            let bare = word
+                .value
+                .pieces
+                .iter()
+                .try_fold(String::new(), |mut text, piece| match piece {
+                    WordPiece::Text {
+                        text: part,
+                        quote: QuoteMode::Bare,
+                    } => {
+                        text.push_str(part);
+                        Some(text)
+                    }
+                    _ => None,
+                });
+            match bare {
+                Some(name) if valid_variable_access(&name) => Expr::Scalar(Spanned {
+                    value: Word {
+                        pieces: vec![WordPiece::Variable {
+                            name,
+                            quote: QuoteMode::Bare,
+                        }],
+                        qualifiers: word.value.qualifiers.clone(),
+                    },
+                    span: word.span,
+                }),
+                _ => Expr::Scalar(word),
+            }
+        }
+        Expr::Modifier {
+            value,
+            name,
+            arguments,
+        } => Expr::Modifier {
+            value: Box::new(head_as_variable(*value)),
+            name,
+            arguments,
+        },
+        Expr::Member { value, name } => Expr::Member {
+            value: Box::new(head_as_variable(*value)),
+            name,
+        },
+        Expr::Index { value, index } => Expr::Index {
+            value: Box::new(head_as_variable(*value)),
+            index,
+        },
+        other => other,
+    }
 }
 
 /// Parse the `${ … }` starting at `dollar` as an **expression**, for a body that
@@ -6209,6 +6307,30 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn an_access_with_modifier_arguments_is_recognised_from_the_parse() {
+        // Asked of the parsed body, not its text: the parse has already applied the
+        // lexer's rules about escapes, raw strings, comments, and nested
+        // interpolations, which a scan over the source would have to re-derive.
+        let arguments = |source: &str| {
+            let tokens = tokenize(source).expect("lexes");
+            tokens.iter().any(|token| match &token.value {
+                TokenKind::Word(word) => word.pieces.iter().any(|piece| match piece {
+                    WordPiece::Value { expression, .. } => {
+                        has_modifier_arguments(&expression.value)
+                    }
+                    _ => false,
+                }),
+                _ => false,
+            })
+        };
+        assert!(arguments("\"${xs:join(\" \")}\""));
+        assert!(arguments("\"${m.k:join(\" \"):upper}\""));
+        // An argument-free chain is the cheap path and never reaches this.
+        assert!(!arguments("\"${$xs:len}\""));
+        assert!(!arguments("\"${$n + 1}\""));
     }
 
     #[test]
