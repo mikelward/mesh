@@ -1539,7 +1539,12 @@ pub(crate) fn variable_end(source: &str, start: usize) -> Result<usize, ParseErr
     let Some((offset, head)) = chars.next() else {
         return Ok(end);
     };
-    if head != '_' && !head.is_alphabetic() {
+    if !head.is_alphabetic()
+        && (head != '_'
+            || !chars
+                .peek()
+                .is_some_and(|(_, next)| *next == '_' || next.is_alphanumeric()))
+    {
         return Ok(end);
     }
     end = start + 1 + offset + head.len_utf8();
@@ -5016,7 +5021,13 @@ pub(crate) fn valid_name(name: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    if first != '_' && !first.is_alphabetic() {
+    if !first.is_alphabetic()
+        && (first != '_'
+            || !chars
+                .clone()
+                .next()
+                .is_some_and(|c| c == '_' || c.is_alphanumeric()))
+    {
         return false;
     }
     let mut previous_hyphen = false;
@@ -5671,7 +5682,7 @@ mod tests {
 
     #[test]
     fn invalid_unbraced_variable_heads_remain_literal() {
-        for source in ["$5", "$_name"] {
+        for source in ["$5", "$_"] {
             let tokens = tokenize(source).unwrap();
             let TokenKind::Word(word) = &tokens[0].value else {
                 panic!()
@@ -5829,16 +5840,18 @@ mod tests {
     #[test]
     fn a_name_a_read_accepts_is_a_name_a_write_accepts() {
         for name in [
-            "x", "MY-VAR", "PATH", "a_b", "a1-b2", "_", "_private", "café", "CAFÉ",
+            "x", "MY-VAR", "PATH", "a_b", "a1-b2", "_private", "café", "CAFÉ",
         ] {
             assert!(valid_name(name), "{name} should be a name");
         }
         // Interior-only hyphens, an alphabetic or underscore head, and nothing else.
-        for name in ["", "-x", "1x", "x-", "a--b", "a.b", "PATH[0]", "x:dedup"] {
+        for name in [
+            "", "_", "_-x", "-x", "1x", "x-", "a--b", "a.b", "PATH[0]", "x:dedup",
+        ] {
             assert!(!valid_name(name), "{name} should not be a name");
         }
         // And the read side agrees: each of these is one whole variable token.
-        for name in ["x", "MY-VAR", "a1-b2", "_", "_private", "café"] {
+        for name in ["x", "MY-VAR", "a1-b2", "_private", "café"] {
             let source = format!("${name}");
             assert_eq!(
                 variable_end(&source, 0).unwrap(),

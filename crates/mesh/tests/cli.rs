@@ -2436,15 +2436,15 @@ fn unterminated_braced_interpolation_is_a_syntax_error() {
 
 #[test]
 fn leading_underscore_is_a_variable_name() {
-    // `_` remains the discard pattern in a binding, while longer names beginning
-    // with an underscore can be bound and read like names with an alphabetic head.
-    let out = run_with_input("_ = secret\n_private = ok\nputs $_private\nputs after\n");
+    // Bare `_` remains reserved, while longer names beginning with an underscore
+    // can be bound and read like names with an alphabetic head.
+    let out = run_with_input("_private = ok\nputs $_private\nputs \"$_\"\nputs after\n");
     assert!(
         out.stderr.is_empty(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\nafter\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n$_\nafter\n");
 }
 
 #[test]
