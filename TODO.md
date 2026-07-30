@@ -2118,11 +2118,22 @@ was re-checked against `main` rather than taken from the PR text.
       second half bites harder than the first: a config that *generates* mesh
       source (see 26) has no way to check the generated file before sourcing it,
       so its only test is whether sourcing it breaks the shell.
-- [ ] **7. No terminal width.** `$sh` has no `width`, so the prompt's rule costs
+- [x] **7. No terminal width.** `$sh` had no `width`, so the prompt's rule cost
       one `tput cols` **fork per prompt** — measured at 2.6ms against 2.0ms for
-      the whole prompt composition path, so the decoration costs more than what it
-      decorates. Needs a `TIOCGWINSZ` read and a `SIGWINCH` refresh, not just a
-      field.
+      the whole prompt composition path, so the decoration cost more than what it
+      decorated.
+
+      **Fixed** by `$sh.width`, a `TIOCGWINSZ` read. No `SIGWINCH` refresh was
+      needed after all: the entry is read at each access rather than cached, and
+      the ioctl is current the instant the window changes — the signal is only the
+      notification that it did, so a cache would need it to stay honest where a
+      live read cannot be stale. One `ioctl` against a fork, or up to three when the
+      fallback below walks past a redirected stdout. It asks stdout's
+      terminal, then stderr's, then stdin's — the width that matters is the one
+      being looked at, and a redirected stdout answers `ENOTTY` rather than the
+      terminal behind it, so `mesh script.mesh | less` reaches the real width
+      through stderr. With no terminal anywhere it answers `0`, which is not a
+      width, rather than a made-up 80.
 - [ ] **8. No way to set the window title.** OSC 0 landed as an automatic
       `user@host: dir` (§"Beyond M3 — Terminal integration") with
       `$sh.options.osc-title` to turn it off, but there is no way for a config to

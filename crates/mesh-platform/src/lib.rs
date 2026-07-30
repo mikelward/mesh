@@ -24,3 +24,20 @@ pub const TIOCSCTTY: libc::c_ulong = libc::TIOCSCTTY as libc::c_ulong;
 pub const TIOCSCTTY: libc::c_ulong = libc::TIOCSCTTY;
 #[cfg(target_env = "musl")]
 pub const TIOCSCTTY: libc::c_int = libc::TIOCSCTTY;
+
+/// The `TIOCGWINSZ` ioctl request, typed the same way and for the same reason.
+#[cfg(all(not(target_env = "musl"), target_os = "macos"))]
+pub const TIOCGWINSZ: libc::c_ulong = libc::TIOCGWINSZ as libc::c_ulong;
+#[cfg(all(not(target_env = "musl"), not(target_os = "macos")))]
+pub const TIOCGWINSZ: libc::c_ulong = libc::TIOCGWINSZ;
+#[cfg(target_env = "musl")]
+pub const TIOCGWINSZ: libc::c_int = libc::TIOCGWINSZ;
+
+/// The `TIOCSWINSZ` ioctl request — the write half of the pair above. Used by
+/// the tests, which give a pty a known size to read back.
+#[cfg(all(not(target_env = "musl"), target_os = "macos"))]
+pub const TIOCSWINSZ: libc::c_ulong = libc::TIOCSWINSZ as libc::c_ulong;
+#[cfg(all(not(target_env = "musl"), not(target_os = "macos")))]
+pub const TIOCSWINSZ: libc::c_ulong = libc::TIOCSWINSZ;
+#[cfg(target_env = "musl")]
+pub const TIOCSWINSZ: libc::c_int = libc::TIOCSWINSZ;

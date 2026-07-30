@@ -130,12 +130,33 @@ The rest of the read-only runtime surface:
 | `$sh.uid` | This shell's effective user id |
 | `$sh.version` | The shell's version |
 | `$sh.interactive` | Whether this is an interactive session |
+| `$sh.width` | The terminal's column count, or `0` when there is no terminal |
 | `$sh.stdin` / `$sh.stdout` / `$sh.stderr` | Handles for the shell's own streams |
 | `$sh.jobs` | The live background jobs, as a map of records |
 
 `$sh.interactive` answers **what kind of session this is**, not what fd 0 happens
 to be: `mesh -s` on a terminal reads commands without being an interactive session
 and reports `false`, while `-i` makes one out of any input and reports `true`.
+
+`$sh.width` is read from the terminal at each access rather than cached, so it
+cannot go stale: `TIOCGWINSZ` is what the kernel answers from and it is current
+the instant the window changes, `SIGWINCH` being only the notification that it
+did. It costs one `ioctl` when stdout is a terminal, and up to three when it is
+not and the fallback below walks on — against the `tput cols` fork it replaces.
+
+The terminal it asks is stdout's, then stderr's, then stdin's: the width that
+matters is the one being *looked at*, and a redirected stdout answers `ENOTTY`
+rather than the terminal behind it. `mesh script.mesh | less` is what the
+fallback is for — stdout is a pipe, and a script sizing a progress line or a
+table it writes to stderr still wants the real width.
+
+With no terminal anywhere it is **`0`**, which is not a width — so `$sh.width`
+says "there is no terminal" without a caller having to know which number was
+invented. A prompt that wants a default can pick its own:
+
+```mesh
+columns = if $sh.width == 0 { 80 } else { $sh.width }
+```
 
 For "is *this stream* a terminal", the stream handles take **`:tty`** — the
 `test -t N` replacement:

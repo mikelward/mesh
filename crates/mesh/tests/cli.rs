@@ -17874,8 +17874,8 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     let out = run_with_input("puts ...$sh:keys\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "status pipestatus pid ppid uid version interactive stdin stdout stderr jobs \
-         origin source options name args\n"
+        "status pipestatus pid ppid uid version interactive width stdin stdout stderr \
+         jobs origin source options name args\n"
     );
 
     // A mistyped key is still a loud error, and `status` is not a reserved
@@ -17888,6 +17888,96 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     );
     let out = run_with_input("status = mine\nputs $status\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "mine\n");
+}
+
+/// Give a pty a known size, hand it to mesh as the named descriptors, and read
+/// back what `$sh.width` said. Returns `None` when the pty could not be opened.
+///
+/// Non-interactive on purpose: `-c` is enough to ask the question, and it avoids
+/// the whole line-editor handshake a prompt-driven harness needs.
+fn width_seen_on_pty(columns: u16, redirect: &[i32]) -> Option<String> {
+    let (mut master, mut slave) = (-1, -1);
+    if open_pty_pair(&mut master, &mut slave) != 0 {
+        return None;
+    }
+    let size = libc::winsize {
+        ws_row: 24,
+        ws_col: columns,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: a `winsize` is passed for the request that reads one, on a
+    // descriptor `openpty` just returned.
+    unsafe { libc::ioctl(slave, mesh_platform::TIOCSWINSZ, &raw const size) };
+
+    // The answer comes back on a pipe rather than the pty, so a case that leaves
+    // stdout redirected can still be read — the point of several of these.
+    let mut child = mesh_command();
+    child
+        .args(["-c", "puts $sh.width"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for fd in redirect {
+        // SAFETY: `dup` of a live descriptor; `Stdio` owns and closes the copy.
+        let copy = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
+        match *fd {
+            0 => child.stdin(copy),
+            1 => child.stdout(copy),
+            _ => child.stderr(copy),
+        };
+    }
+    // With stdout on the pty there is no pipe to read, so the pty is where the
+    // answer lands; both cases are covered by reading whichever one mesh wrote to.
+    let out = child.output().expect("run mesh on a pty");
+    // SAFETY: descriptors this function opened and still owns.
+    unsafe {
+        libc::close(slave);
+    }
+    let piped = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !piped.is_empty() {
+        unsafe { libc::close(master) };
+        return Some(piped);
+    }
+    let mut buffer = [0_u8; 64];
+    // SAFETY: a buffer this function owns, on a descriptor it opened.
+    let count = unsafe { libc::read(master, buffer.as_mut_ptr().cast(), buffer.len()) };
+    unsafe { libc::close(master) };
+    let read = usize::try_from(count).unwrap_or(0);
+    Some(String::from_utf8_lossy(&buffer[..read]).trim().to_string())
+}
+
+/// `$sh.width` is the terminal's column count, which a prompt needs to draw a
+/// rule or right-align a segment. Rough edge 7 from the config port: without it
+/// the config forked `tput cols` **per prompt**, measured at 2.6ms against 2.0ms
+/// for the whole prompt composition path — the decoration costing more than what
+/// it decorated.
+#[test]
+fn sh_width_reports_the_terminals_columns() {
+    // No terminal anywhere, so no width: `0` rather than a made-up 80, which is
+    // what lets `if $sh.width == 0` be the test for it.
+    let out = run_with_input("puts $sh.width\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+
+    let Some(width) = width_seen_on_pty(100, &[1]) else {
+        eprintln!("SKIP: sh_width_reports_the_terminals_columns (no pty available)");
+        return;
+    };
+    assert_eq!(width, "100");
+
+    // Asked of stdout first, then stderr, then stdin. A redirected stdout answers
+    // `ENOTTY` rather than the terminal behind it, so `mesh script.mesh | less`
+    // reaches the real width through stderr.
+    assert_eq!(
+        width_seen_on_pty(55, &[2]).expect("pty"),
+        "55",
+        "stderr should answer when stdout is redirected"
+    );
+    assert_eq!(
+        width_seen_on_pty(37, &[0]).expect("pty"),
+        "37",
+        "stdin should answer when neither of the others is a terminal"
+    );
 }
 
 /// `$sh.options` is a map of booleans, every one of them on out of the box.

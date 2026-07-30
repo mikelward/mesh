@@ -812,6 +812,33 @@ impl Default for Vars {
     }
 }
 
+/// The terminal's column count, or `0` when there is no terminal to ask.
+///
+/// Asked of stdout first, then stderr, then stdin: the width that matters is the
+/// terminal the user is *looking at*, and a redirected stdout answers `ENOTTY`
+/// rather than the terminal behind it. `mesh script.mesh | less` is the case the
+/// fallback exists for — stdout is a pipe, and a script sizing a progress line or
+/// a table it writes to stderr still needs the real width.
+///
+/// `0` rather than a conventional 80: a width of zero is not a width, so it says
+/// "there is no terminal" without a caller having to know which number was made
+/// up. `if $sh.width == 0` is the test, and a prompt that wants a default can say
+/// so itself.
+fn terminal_width() -> u16 {
+    for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO, libc::STDIN_FILENO] {
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: `TIOCGWINSZ` writes a `winsize` through the pointer, which is
+        // what is passed; a bad descriptor or a non-terminal is a return of -1
+        // rather than a write.
+        if unsafe { libc::ioctl(fd, mesh_platform::TIOCGWINSZ, &raw mut size) } == 0
+            && size.ws_col > 0
+        {
+            return size.ws_col;
+        }
+    }
+    0
+}
+
 /// The `$sh` entries that describe how mesh was invoked. Only these exist today;
 /// the rest of the `$sh.*` surface in `DESIGN.md` is deferred.
 fn invocation_entries(name: String, args: Vec<String>) -> Vec<(String, Value)> {
@@ -964,6 +991,16 @@ impl Vars {
                 Value::String(env!("CARGO_PKG_VERSION").to_owned()),
             ),
             ("interactive".to_owned(), Value::Boolean(self.interactive)),
+            // Read here, on each access, rather than cached and refreshed on
+            // `SIGWINCH`. `TIOCGWINSZ` is what the kernel answers from, and it is
+            // current the instant the window changes — `SIGWINCH` is only the
+            // notification that it did. A cache would need the signal to stay
+            // honest; a live read cannot be stale, and costs one syscall against
+            // the fork per prompt that `tput cols` was.
+            (
+                "width".to_owned(),
+                Value::Integer(i64::from(terminal_width())),
+            ),
             // Handles rather than integers: `DESIGN.md` puts a stream handle in
             // the same row as a regex — no byte form — so `puts $sh.stdin` is a
             // loud error and `:tty` is the way to ask about one.
