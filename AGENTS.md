@@ -85,9 +85,12 @@ apply throughout.
   no `wip` / `fix typo` / `address review` churn shipping to `main`.
 - After rewriting history, push with `git push --force-with-lease`, never a bare
   `--force`.
-- **These rules assume an `origin` remote.** Without one you can't fetch,
-  branch from `origin/main`, push, or open a PR — say so and stop rather than
-  improvising a local substitute.
+- **These rules assume an `origin` remote.** In sandboxes without remote Git
+  support, such as Codex cloud, continue on the current branch without fetching
+  or rebasing onto `origin/main`, and commit the changes locally. Report that
+  pushing and opening a pull request are unavailable. In other environments,
+  if `origin` is missing, say so and stop rather than improvising a local
+  substitute.
 - **Branch naming.** Feature branches are prefixed with the agent's own short
   name: `<agent>/<short-topic>` (`claude/...` for Claude Code, `codex/...` for
   Codex, and so on). One topic per branch; never commit to `main`. The
