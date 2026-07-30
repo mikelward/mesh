@@ -48,6 +48,10 @@ pub enum Modifier {
     TrimStart,
     TrimEnd,
     Int,
+    /// `:words` — split a string on runs of ASCII whitespace, the classic IFS
+    /// word-split. A **split** modifier, so it consumes one string and yields a
+    /// list; the argument-taking member of the family is `:split(SEP)`.
+    Words,
     /// This value written as the mesh source you would have typed for it, as a
     /// string. The inverse of reading a literal, so `$x:repr` on a value that
     /// has no literal form is an error rather than an approximation — see
@@ -95,6 +99,7 @@ impl Modifier {
             "trimstart" => Self::TrimStart,
             "trimend" => Self::TrimEnd,
             "int" => Self::Int,
+            "words" => Self::Words,
             "repr" => Self::Repr,
             "exists" => Self::Exists,
             "type" => Self::Type,
@@ -1161,6 +1166,10 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 message: "requires a path or a list of paths".into(),
             }),
         },
+        // A **split** modifier, so it consumes exactly one string rather than
+        // mapping element-wise: `$line:words` and `$line:split(" ")` have to agree
+        // about what a list subject means, and `split_value` refuses one.
+        Modifier::Words => words_value(value),
         _ => match value {
             Value::String(value) => Ok(Value::String(modify_string(value, modifier))),
             Value::List(values) => values
@@ -1218,6 +1227,43 @@ pub(crate) fn split_value(value: Value, separator: &str) -> Result<Value, Expand
         fields.pop();
     }
     Ok(Value::List(fields))
+}
+
+/// `:words` — turn a string into a list by splitting on runs of whitespace, the
+/// classic IFS word-split (`DESIGN.md` §"Modifiers"). Unlike `:split(SEP)` it
+/// yields no empty elements at all: leading, trailing and interior runs are each
+/// one boundary, so a column-padded line — what `getent`, `ip -o` and `df` all
+/// produce — comes apart into its columns without a caller dropping empties by
+/// hand. A string that is empty or all whitespace yields the empty list.
+///
+/// **ASCII** whitespace, not Unicode: a non-breaking space is *data* — it turns
+/// up inside filenames and in program output — and splitting a field on one would
+/// corrupt it with no way for the caller to opt out. The set is written out rather
+/// than taken from `split_ascii_whitespace`, which omits the vertical tab; the
+/// three that matter (` `, `\t`, `\n`) are what IFS and awk mean by whitespace,
+/// and the rest are here so the set has no arbitrary hole.
+///
+/// Consumes exactly one string, as `split_value` does: these two are the same
+/// family and a list subject cannot mean one thing to one and something else to
+/// the other.
+pub(crate) fn words_value(value: Value) -> Result<Value, ExpandError> {
+    let Value::String(text) = value else {
+        return Err(ExpandError::Modifier {
+            name: "words".into(),
+            message: "requires a string".into(),
+        });
+    };
+    Ok(Value::List(
+        text.split(is_field_separator)
+            .filter(|word| !word.is_empty())
+            .map(|word| Value::String(word.into()))
+            .collect(),
+    ))
+}
+
+/// The whitespace `:words` splits on — every ASCII whitespace character.
+fn is_field_separator(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
 }
 
 /// `:join(SEP)` — fold a list back into a single string, placing `separator`
@@ -1416,6 +1462,7 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::TrimStart => "trimstart",
         Modifier::TrimEnd => "trimend",
         Modifier::Int => "int",
+        Modifier::Words => "words",
         Modifier::Repr => "repr",
         Modifier::Exists => "exists",
         Modifier::Type => "type",
@@ -1537,6 +1584,7 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         Modifier::TrimStart => value.trim_start().to_string(),
         Modifier::TrimEnd => value.trim_end().to_string(),
         Modifier::Int
+        | Modifier::Words
         | Modifier::Len
         | Modifier::First
         | Modifier::Last
@@ -1636,7 +1684,7 @@ mod tests {
     use super::{
         Access, ExpandError, Modifier, VarRef, accessible_c, apply_modifier, apply_tilde,
         entries_pattern, get_value, has_glob_meta, join_value, map_strings, resolve_value,
-        split_value,
+        split_value, words_value,
     };
     use crate::vars::{Value, Vars};
 
@@ -1696,6 +1744,80 @@ mod tests {
             split_value(list(&["a", "b"]), ":"),
             Err(ExpandError::Modifier { name, .. }) if name == "split"
         ));
+    }
+
+    #[test]
+    fn words_splits_on_runs_and_never_yields_an_empty_element() {
+        assert_eq!(
+            words_value(Value::String("a b c".into())),
+            Ok(list(&["a", "b", "c"]))
+        );
+        // The difference from `:split(" ")`, and the whole reason it exists: a run
+        // is one boundary, so a column-padded line comes apart into its columns.
+        assert_eq!(
+            words_value(Value::String("a   b  c".into())),
+            Ok(list(&["a", "b", "c"]))
+        );
+        // Leading and trailing whitespace contribute nothing at either end, unlike
+        // `:split`, which drops only the trailing run.
+        assert_eq!(
+            words_value(Value::String("   a b   ".into())),
+            Ok(list(&["a", "b"]))
+        );
+    }
+
+    #[test]
+    fn words_takes_the_whole_ascii_whitespace_set() {
+        assert_eq!(
+            words_value(Value::String("a\tb\nc\r\x0bd\x0ce".into())),
+            Ok(list(&["a", "b", "c", "d", "e"]))
+        );
+    }
+
+    #[test]
+    fn words_leaves_a_non_breaking_space_in_the_field() {
+        // U+00A0 is data, not a separator — `char::is_whitespace` would split here
+        // and corrupt a filename that contains one.
+        assert_eq!(
+            words_value(Value::String("a\u{a0}b c".into())),
+            Ok(list(&["a\u{a0}b", "c"]))
+        );
+    }
+
+    #[test]
+    fn words_of_empty_or_all_whitespace_is_the_empty_list() {
+        assert_eq!(
+            words_value(Value::String(String::new())),
+            Ok(Value::List(vec![]))
+        );
+        assert_eq!(
+            words_value(Value::String("  \t\n ".into())),
+            Ok(Value::List(vec![]))
+        );
+    }
+
+    #[test]
+    fn words_rejects_a_non_string_the_way_split_does() {
+        // Both are split modifiers, so a list subject has to mean the same thing to
+        // each of them — element-wise mapping for one and not the other would be a
+        // trap.
+        assert!(matches!(
+            words_value(list(&["a b", "c d"])),
+            Err(ExpandError::Modifier { name, .. }) if name == "words"
+        ));
+        assert!(matches!(
+            words_value(Value::Integer(42)),
+            Err(ExpandError::Modifier { name, .. }) if name == "words"
+        ));
+    }
+
+    #[test]
+    fn words_reaches_the_modifier_table_by_name() {
+        assert_eq!(Modifier::from_name("words"), Some(Modifier::Words));
+        assert_eq!(
+            apply_modifier(Value::String("a  b".into()), Modifier::Words),
+            Ok(list(&["a", "b"]))
+        );
     }
 
     #[test]
