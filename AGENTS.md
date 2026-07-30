@@ -169,6 +169,11 @@ apply throughout.
   `git@example.com:org/repo.git`) in examples and fixtures. If a bug report
   contains any of it, paraphrase in the commit / PR — don't quote verbatim.
   When in doubt, ask before pushing.
+- **Compiler output is not one of those artifacts.** A diagnostic prints on the
+  user's own terminal, and naming the source path and span is the point of the
+  message. Redact only secrets: tokens, keys, and passwords. Quoting that
+  output into a commit, PR, issue, or fixture republishes it, and the bullet
+  above governs again — paraphrase or use a placeholder path there.
 
 ## Cost and reliability
 
