@@ -471,6 +471,16 @@ pub enum ParseOutcome {
     IncompleteHeredoc(String),
 }
 
+/// One `NAME=value` (or `NAME+=value`) in a `with` header. The same three parts
+/// an [`Executable::EnvAssignment`] carries, so both go through `environ::write`
+/// and inherit its boundary rules unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvBinding {
+    pub key: String,
+    pub append: bool,
+    pub value: Expr,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     pub statements: Vec<Statement>,
@@ -577,6 +587,19 @@ pub enum Executable {
     /// `loop { … }` — repeats until a `break`. Clearer than `while true`, and
     /// the one loop whose header cannot end it.
     Loop {
+        body: Source,
+    },
+    /// `with NAME=value … { … }` — run the body with those environment entries
+    /// overridden, restoring what was there on the way out, however the body
+    /// leaves: normally, through an error, or through `return` / `break` /
+    /// `continue`. The block form of what other shells write as a one-command
+    /// prefix (`LC_ALL=C sort file`); the prefix itself is still undecided
+    /// (`TODO.md`), and the header spells a binding the same way it would, so
+    /// the two cannot drift.
+    ///
+    /// **Environment**, not shell variables: the point is what a child inherits.
+    With {
+        bindings: Vec<EnvBinding>,
         body: Source,
     },
     /// `fork { … }` — a subshell. The body runs in a forked child, so the
@@ -2386,6 +2409,12 @@ impl Parser {
         if self.word("fork") && self.block_follows(1) {
             return self.fork_expr();
         }
+        // Contextual for the same reason `fork` is: `with` leads a statement only
+        // where a `NAME=` binding follows it, so `with`, `with --help` and
+        // `with somewhere` are still reachable as commands.
+        if self.word("with") && self.env_binding_follows(1) {
+            return self.with_expr();
+        }
         if self.word("return") || self.word("fail") || self.word("break") || self.word("continue") {
             return self.control();
         }
@@ -3298,6 +3327,94 @@ impl Parser {
         self.newlines();
         let body = self.block()?;
         Ok(Executable::Fork { body })
+    }
+
+    /// `with NAME=value NAME2=value2 … { … }`.
+    ///
+    /// Each binding is written **unspaced**, as the one-command prefix form in
+    /// other shells is and as mesh's own would be. That is what lets a header
+    /// hold several of them without the reader having to guess where one value
+    /// ends: in `with FOO=a b { … }` the `b` cannot be part of `FOO`, so it is
+    /// reported rather than absorbed.
+    fn with_expr(&mut self) -> Result<Executable, ParseError> {
+        self.take_word("with");
+        let mut bindings = Vec::new();
+        while let Some(binding) = self.env_binding()? {
+            bindings.push(binding);
+        }
+        if bindings.is_empty() {
+            return Err(self.error(ParseErrorKind::Expected("a `NAME=value` after `with`")));
+        }
+        self.newlines();
+        let body = self.block()?;
+        Ok(Executable::With { bindings, body })
+    }
+
+    /// One unspaced `NAME=value` / `NAME+=value`, or `None` where the header ends.
+    fn env_binding(&mut self) -> Result<Option<EnvBinding>, ParseError> {
+        if !self.env_binding_follows(0) {
+            return Ok(None);
+        }
+        // `env_binding_follows` asks only about the *shape* — a word with an
+        // attached `=` — because that is what tells the statement from a command of
+        // the same name. Whether the word is a usable name is this function's
+        // question, and both answers are reachable from ordinary input: `with "A"=x`
+        // is quoted, so it is not the text it looks like, and `with 1=x` is not a
+        // name at all. Both are reported; treating the shape check as a guarantee
+        // here crashed the shell on them.
+        let key = self
+            .word_text_at(0)
+            .map(str::to_owned)
+            .filter(|key| valid_name(key));
+        let Some(key) = key else {
+            return Err(self.error(ParseErrorKind::Expected(
+                "a valid NAME before `=` in a `with` header",
+            )));
+        };
+        self.position += 1;
+        let append = self.eat(&TokenKind::PlusEqual).is_some();
+        if !append {
+            self.expect(&TokenKind::Equal, "`=`")?;
+        }
+        // `FOO= cmd` is the empty value, as it is in every other shell: the
+        // operator is there, so the name is being set, and what follows is the
+        // next binding or the block rather than this one's value. Told apart by
+        // spacing, like every other attachment rule here.
+        let value = if self.peek().is_some_and(|token| {
+            token.span.start == self.previous_end() && !matches!(token.value, TokenKind::LBrace)
+        }) {
+            self.expression()?
+        } else {
+            Expr::Scalar(Spanned {
+                value: Word {
+                    pieces: vec![WordPiece::Text {
+                        text: String::new(),
+                        quote: QuoteMode::Double,
+                    }],
+                    qualifiers: None,
+                },
+                span: self.previous_end()..self.previous_end(),
+            })
+        };
+        Ok(Some(EnvBinding { key, append, value }))
+    }
+
+    /// Is the run at `offset` an **unspaced** `NAME=` / `NAME+=`? The signal a
+    /// `with` header is made of, and what tells the statement from a command of
+    /// the same name — `with --help` and `with somewhere` stay commands.
+    fn env_binding_follows(&self, offset: usize) -> bool {
+        let Some(name) = self.tokens.get(self.position + offset) else {
+            return false;
+        };
+        if !matches!(name.value, TokenKind::Word(_)) {
+            return false;
+        }
+        self.tokens
+            .get(self.position + offset + 1)
+            .is_some_and(|operator| {
+                matches!(operator.value, TokenKind::Equal | TokenKind::PlusEqual)
+                    && operator.span.start == name.span.end
+            })
     }
 
     fn match_expr(&mut self) -> Result<MatchExpr, ParseError> {

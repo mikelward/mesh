@@ -1408,6 +1408,7 @@ fn run_executable(
         While { condition, body } => run_ast_while(Some(condition), body, last, in_function, shell),
         Loop { body } => run_ast_while(None, body, last, in_function, shell),
         Fork { body } => run_forked_block(body, in_function, shell),
+        With { bindings, body } => run_with_block(bindings, body, last, in_function, shell),
         Control { kind, value, guard } => {
             match guard_allows(guard.as_ref(), last, in_function, shell) {
                 Ok(true) => {}
@@ -1548,6 +1549,7 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
         // entry of its own to be resumable; until it has one, refusing says so
         // rather than silently running it in the foreground.
         Fork { .. } => "a `fork` block",
+        With { .. } => "a `with` block",
         Control { kind, .. } => match kind {
             parser::ControlKind::Return => "`return`",
             parser::ControlKind::Fail => "`fail`",
@@ -2020,6 +2022,81 @@ fn run_ast_for(
 /// child, so its status arrives here as an ordinary result instead of ending the
 /// shell. Only bytes cross back, as `DESIGN.md` says of a subshell — the child's
 /// stdout is the shell's, so what it prints appears, but no value returns.
+/// Run `body` with `bindings` applied to the environment, then put the environment
+/// back the way it was.
+///
+/// The restore is the whole point, so it runs on **every** way out — a normal
+/// finish, a runtime error, `exit`, and `return` / `break` / `continue` — which is
+/// why the body's `Step` is held rather than propagated with `?`. Restoring means
+/// the *previous* state, so a name that was unset before goes back to unset rather
+/// than to an empty string: a child can tell those apart, and this construct exists
+/// for what a child sees.
+///
+/// Bindings are applied left to right, so a later one wins on a repeated name, and
+/// each is evaluated against the environment the ones before it left — which is what
+/// makes `with PATH=/opt PATH+=/usr/bin { … }` mean what it reads like. The snapshot
+/// is taken before any of them run, so the restore is still to the state the whole
+/// header found.
+fn run_with_block(
+    bindings: &[parser::EnvBinding],
+    body: &parser::Source,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
+    // Every name in the header is snapshotted **before any right-hand side runs**,
+    // not as each binding is reached. A value expression can write the environment
+    // itself — `with A=alter() B=inside { … }` where `alter` sets `$env.B` — and a
+    // per-binding snapshot would then record what that write left rather than what
+    // the header found, so the restore would leak it. Deduplicated, so a name bound
+    // twice still goes back to the one state that predates the header.
+    let mut saved: Vec<(&str, Option<std::ffi::OsString>)> = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        if !saved.iter().any(|(key, _)| *key == binding.key) {
+            saved.push((&binding.key, std::env::var_os(&binding.key)));
+        }
+    }
+    let mut failure = None;
+    for binding in bindings {
+        match eval_operand_of(&binding.value, last, in_function, shell) {
+            // A right-hand side that raised `break`/`continue` produced no value, so
+            // there is nothing to bind — and the control flow is the answer, as it is
+            // for an ordinary assignment.
+            Ok(_) if shell.control.is_some() => {
+                failure = Some(Step::Continue(last));
+                break;
+            }
+            Ok(value) => {
+                if let Err(message) = environ::write(&binding.key, value, binding.append) {
+                    failure = Some(runtime_message(message));
+                    break;
+                }
+            }
+            Err(step) => {
+                failure = Some(step);
+                break;
+            }
+        }
+    }
+    // Whatever happened, the header's writes are undone before this returns —
+    // including the ones a later binding's failure left standing.
+    // Seeded at 0 and passed through `compound_result`, as every other compound
+    // body is. Seeding with `last` let an empty body — or one whose statements were
+    // all guard-skipped — inherit the previous command's status, so
+    // `false; with A=x { } || puts fallback` took the fallback over a header that
+    // applied and restored cleanly. Raised in review as a P2.
+    let step =
+        failure.unwrap_or_else(|| compound_result(run_source(body, 0, in_function, shell), shell));
+    for (key, previous) in saved {
+        match previous {
+            // SAFETY: single-threaded execution loop, as `environ::write` relies on.
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+    step
+}
+
 fn run_forked_block(body: &parser::Source, in_function: bool, shell: &mut Shell) -> Step {
     // A subshell is a status, never a value: nothing typed survives the process
     // boundary, so whatever the surrounding code had produced is not passed off

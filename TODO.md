@@ -2115,7 +2115,8 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Eleven have since been fixed; two are tracked
+matched back to the discussion. Eleven have since been fixed, one half fixed
+(marked `~`); two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
 
@@ -2127,10 +2128,33 @@ was re-checked against `main` rather than taken from the PR text.
       *that* function owns. Fixed by `wrapper func` (mikelward/mesh#286) and the
       terser `alias NAME = COMMAND` (mikelward/mesh#289); the config is 130
       aliases and 53 wrappers on the far side of it.
-- [ ] **2. `VAR=value cmd` is a syntax error.** No one-command environment
+- [~] **2. `VAR=value cmd` is a syntax error.** No one-command environment
       prefix, so every occurrence becomes `fork { $env.VAR = …; cmd }` — three
       lines and a process for what is one word in every other shell. The config's
       `ssh-to` (`LC_CLIENT_HOST`) and `xr` (`DISPLAY`) both pay it.
+
+      **Half fixed:** `with NAME=value … { … }` runs a block with those
+      environment entries in place and restores them on the way out, however the
+      body leaves. It takes as many bindings as a prefix would, spells each of
+      them the same way (unspaced `NAME=value` / `NAME+=value`), and costs no
+      process — so the `fork` is gone and the three lines are one header. See
+      §`with` in `docs/REFERENCE.md`.
+
+      **Still to decide: the prefix form itself**, `VAR=value cmd`. It is
+      available — mesh requires a separator between statements, so a `NAME=value`
+      followed by another word on the same line has exactly one possible reading,
+      and the parser can take it syntactically. What it costs is that `x=1` and
+      `x=1 cmd` stop being the same construct, and `x=1 y=2` — today a clean
+      `expected a statement separator` — becomes a command-not-found for `y=2`.
+
+      Open questions if it lands: does a prefix on a **function** or a builtin
+      scope the same way (they run in-shell, so it is `with`'s push/pop rather
+      than the child's environment); per-stage in a pipeline
+      (`FOO=1 a | FOO=2 b`); and per-job when backgrounded. Whatever is decided,
+      the mechanism is `with`'s — the prefix would be a second surface on it, not
+      a second implementation. One bash behavior to **not** copy: its special-
+      builtin rule, where `FOO=bar export …` leaks `FOO` into the shell
+      permanently.
 - [ ] **3. Negating a *command's* status has no spelling.** `if not cmd` is
       ``syntax error: expected `{` `` — `not` starts a **value**, deliberately, so
       it never claims `not foo`. Together with 15 below that leaves no direct way
@@ -2539,6 +2563,15 @@ of each PR had landed by another route, but these pieces had not.
       `start_pty_shell` giving up after 10 seconds of silence. On one CPU shared
       by eight test threads that is arguably the machine rather than the test,
       so they are recorded but not counted above.
+
+      **Two more, seen in CI rather than under `taskset`:**
+      `notify_reaches_the_terminal_and_a_quick_command_does_not` (phase 163) and
+      `spawn_failure_returns_terminal_to_interactive_shell` (phase 38). The
+      notify one failed on two unrelated branches — a modifier diagnostic and
+      this `with` block — neither of which can reach the notify path, and both
+      pass locally in repeated single and full-suite runs. Recorded here rather
+      than chased on whichever branch happens to catch them, since they are not
+      that branch's failure.
 
 - [ ] **If the syntactic capture-status rule proves too narrow, carry the status
       as evaluation metadata instead.** An assignment takes its right-hand side's

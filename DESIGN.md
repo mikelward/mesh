@@ -1391,10 +1391,15 @@ hyphen between — the third payoff of that one spacing rule.
   `export`). A plain **local shadow does not touch the environment**: inside a
   function, `PATH = …` binds an in-shell local that only that function sees;
   children still inherit the *exported* `env[PATH]` until you `export` (or
-  `global`-assign an already-exported name). For a **temporary** env change
-  around a single command, `env NAME=val cmd` stays the idiom; a whole function
-  scoping-and-restoring the environment is the deferred *isolation* question
-  (see [Open questions](#open-questions)).
+  `global`-assign an already-exported name). For a **temporary** env change,
+  `with NAME=value … { … }` runs a block with those entries in place and restores
+  what was there on the way out, however the block leaves — so scoping and
+  restoring the environment is **settled** for a block rather than deferred.
+  Whether the same reaches a *one-command prefix* (`NAME=value cmd`) is still
+  open, and it is a question of surface rather than of mechanism: the prefix would
+  ride on `with`'s. A whole **function** scoping its environment implicitly stays
+  the deferred *isolation* question (see [Open questions](#open-questions)) —
+  `with` is explicit, which is the property that made it decidable first.
 - **Types are inferred, not declared.** `x = foo` is a string, `x = [a b c]` a
   list, `x = [a: 1]` a map. There is no type sigil (`@`, `%`) on the *name* —
   a variable just holds whatever value it was given, and `$x` reads it back.
