@@ -451,7 +451,6 @@ file as tasks land.
       value-call position, which today only `style` / `link` / `re` do.
 - [x] First slice of the read-only `$sh` namespace: `$sh.args` (a real list, not
       `$1` / `$@` / `$#`) and `$sh.name`. `sh` joins `env` as a reserved name.
-- [ ] `-i` to force an interactive session when stdin is not a terminal.
 - [ ] Mutating positional arguments (`shift` / `set --`), deferred in `DESIGN.md`
       along with system-wide `/etc/mesh/*` startup files.
 - [x] A `source` builtin, and the input **origin** (`script` / `sourced` /
@@ -2078,7 +2077,7 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Seven have since been fixed; two are tracked
+matched back to the discussion. Eight have since been fixed; two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
 
@@ -2286,13 +2285,20 @@ was re-checked against `main` rather than taken from the PR text.
       because by the time control returns every later statement has overwritten
       the evidence. Both local-override files in the config carry a report at the
       point of failure for that reason.
-- [ ] **30. No force-interactive flag**, tracked as `-i` under "Beyond M3 —
-      Invocation" (`mesh -i -s` is `unknown option -i` today). The port adds what
-      it costs a config: nothing past `return unless $sh.interactive` can be
-      exercised without a pty, so everything with behavior worth asserting has to
-      be a named function defined *above* that line, with the interactive section
-      reduced to calling them. That is a defensible arrangement, but it is
-      currently the only testable one.
+- [x] **30. No force-interactive flag.** `mesh -i -s` was `unknown option -i`.
+      The port added what it cost a config: nothing past
+      `return unless $sh.interactive` could be exercised without a pty, so
+      everything with behavior worth asserting had to be a named function defined
+      *above* that line, with the interactive section reduced to calling them.
+
+      **Fixed:** `-i` makes the session interactive whatever its input is —
+      `$sh.interactive` is true and `rc.mesh` joins the startup set — while the
+      invocation still decides where the commands come from, which is the
+      orthogonality `DESIGN.md` §Invocation asks for (`mesh -i script.mesh` is a
+      script *and* interactive). It does not conjure a terminal: without one there
+      is nothing to run a line editor on, so `mesh -i` off a terminal reads stdin
+      as it always did, just as an interactive session. Nothing a prompt would
+      decorate with leaks into a piped run, so output stays byte-exact.
 
 ## Loose ends
 

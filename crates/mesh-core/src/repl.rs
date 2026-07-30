@@ -299,9 +299,14 @@ fn run_batch(text: &str, options: &StartupOptions) -> ExitCode {
     shell
         .vars
         .set_invocation(options.name.clone(), options.args.clone());
+    // `-i` makes this an interactive session without changing where the commands
+    // come from, so `$sh.interactive` and the `rc.mesh` in the startup set follow
+    // the flag while the origin stays `script` / `command` — nothing here is typed
+    // at a prompt.
+    shell.vars.set_interactive(options.interactive);
     let (origin, source) = options.origin(false);
     shell.vars.set_origin(origin, source);
-    let last = match run_startup_files(options, false, 0, &mut shell) {
+    let last = match run_startup_files(options, options.interactive, 0, &mut shell) {
         Step::Continue(code) | Step::Error(code) => code,
         Step::Exit(code) => return ExitCode::from(run_logout(options, code, &mut shell)),
         Step::Return(_, code) => {
@@ -335,6 +340,12 @@ enum Invocation {
 #[derive(Debug, PartialEq, Eq)]
 struct StartupOptions {
     login: bool,
+    /// `-i` — this is an interactive session whatever stdin is, so `rc.mesh` is
+    /// sourced and `$sh.interactive` is true. Orthogonal to where the commands
+    /// come from (`DESIGN.md` §Invocation): `mesh -i script.mesh` is a script
+    /// *and* interactive, which is what makes a config's interactive half
+    /// testable without a pty.
+    interactive: bool,
     no_rc: bool,
     rc_file: Option<PathBuf>,
     save_history: bool,
@@ -350,15 +361,18 @@ impl StartupOptions {
     /// path for the origins that are files.
     ///
     /// Kept separate from interactivity on purpose — `mesh -i script.mesh` is both
-    /// interactive and a script — so `interactive` only decides between the two
-    /// readings of a bare invocation, which is the one place they overlap.
-    fn origin(&self, interactive: bool) -> (vars::Origin, String) {
+    /// interactive and a script. `typed` is the narrower question of whether a bare
+    /// invocation's commands are being **typed at a prompt** or read from a pipe,
+    /// which is the one place the invocation alone cannot say. Only the interactive
+    /// loop answers it yes; `-i` does not, because a piped `mesh -i` is an
+    /// interactive session whose commands still came from stdin.
+    fn origin(&self, typed: bool) -> (vars::Origin, String) {
         match &self.invocation {
             Invocation::Script(path) => (vars::Origin::Script, path.to_string_lossy().into_owned()),
             Invocation::Command(_) => (vars::Origin::Command, String::new()),
             Invocation::Stdin => (vars::Origin::Stdin, String::new()),
             Invocation::Default | Invocation::Print(_) => (
-                if interactive {
+                if typed {
                     vars::Origin::Interactive
                 } else {
                     vars::Origin::Stdin
@@ -373,6 +387,7 @@ impl Default for StartupOptions {
     fn default() -> Self {
         Self {
             login: false,
+            interactive: false,
             no_rc: false,
             rc_file: None,
             save_history: true,
@@ -390,6 +405,7 @@ Usage: mesh [OPTIONS] [SCRIPT [ARG ...]]
 Options:
   -c COMMAND           Run COMMAND, then exit
   -s                   Read commands from stdin, even on a terminal
+  -i                   Interactive session whatever stdin is (sources rc.mesh)
   -l, --login          Run as a login shell (also sources login.mesh)
       --rcfile FILE    Use FILE instead of rc.mesh
       --norc           Skip rc.mesh
@@ -411,6 +427,7 @@ impl StartupOptions {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-l" | "--login" => options.login = true,
+                "-i" => options.interactive = true,
                 "--norc" => options.no_rc = true,
                 "--no-save-history" | "--no-history" => options.save_history = false,
                 "-h" | "--help" => {
@@ -829,7 +846,7 @@ fn run_logout(options: &StartupOptions, last: u8, shell: &mut Shell) -> u8 {
     // Reaping here regardless put `[1] Done (0) …` on the stderr of any script
     // that left a job running, which two tests caught and which is not this
     // change's business.
-    if shell.vars.interactive() {
+    if shell.vars.owns_terminal() {
         shell.jobs.reap();
     }
     run_jobdone_hooks(shell);
@@ -1859,7 +1876,11 @@ fn run_forked_block(body: &parser::Source, in_function: bool, shell: &mut Shell)
     // boundary, so whatever the surrounding code had produced is not passed off
     // as this block's own.
     shell.produced = Produced::Status;
-    let status = exec::fork_and_wait(shell.vars.interactive(), || {
+    // `owns_terminal`, not `interactive`: putting the child in its own process
+    // group is only safe for a shell that took the terminal. A `mesh -i` batch
+    // session never did, and a group of its own would be excluded from the
+    // `SIGINT` sent to the invocation's — killing the shell and orphaning this.
+    let status = exec::fork_and_wait(shell.vars.owns_terminal(), || {
         // Runs after the fork, so this marks the *child's* copy of the shell:
         // it is not the parent of the pids in the job table it inherited, so
         // `jobs` must not `waitpid` on them — that fails with `ECHILD` and
@@ -6307,8 +6328,11 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
         "fg" => Some(shell.jobs.foreground(&words[1..])),
         "bg" => Some(shell.jobs.background(&words[1..])),
         "wait" => {
-            let interactive = shell.vars.interactive();
-            Some(shell.jobs.wait(&words[1..], interactive))
+            // Whether Ctrl-C abandons the wait or resumes it presupposes a
+            // keyboard attached to a terminal this shell took, so it asks the
+            // stricter question rather than what kind of session this is.
+            let interrupts = shell.vars.owns_terminal();
+            Some(shell.jobs.wait(&words[1..], interrupts))
         }
         "kill" => Some(shell.jobs.kill(&words[1..])),
         "disown" => Some(shell.jobs.disown(&words[1..])),
@@ -6609,7 +6633,7 @@ fn vscode_escaped(command: &str) -> String {
 /// commands without being a session — stays quiet whatever `$sh.options` says,
 /// and so does every piped run the test suite asserts byte-exact output from.
 fn decoration(vars: &vars::Vars, option: Opt) -> bool {
-    vars.interactive() && vars.options().get(option)
+    vars.owns_terminal() && vars.options().get(option)
 }
 
 /// Write an OSC 133 mark, so a terminal can tell prompt from input from output:
@@ -9113,10 +9137,16 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
     shell
         .vars
         .set_invocation(options.name.clone(), options.args.clone());
-    // The only loop that is an interactive session. `mesh -s` on a terminal
-    // reads commands but is not one, so this is recorded by the loop rather than
-    // derived from `isatty`.
+    // The only loop that is an interactive session by itself; `-i` makes one out
+    // of the others. `mesh -s` on a terminal reads commands without being one,
+    // which is why this is recorded rather than derived from `isatty`.
     shell.vars.set_interactive(true);
+    // And the only place that may claim the terminal: `wait_until_foreground` and
+    // `ignore_interactive_signals` have both succeeded above, so this process
+    // really does hold the foreground group and the signal dispositions that go
+    // with it. Everything presupposing a keyboard asks this rather than the flag
+    // above — see `Vars::owns_terminal`.
+    shell.vars.set_owns_terminal();
     // Only this loop drains what `reap` reports, and only here can a `jobdone`
     // hook run, so only here is it worth remembering.
     shell.jobs.collect_finished();
@@ -10062,9 +10092,13 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
     shell
         .vars
         .set_invocation(options.name.clone(), options.args.clone());
+    // As in `run_batch`: `-i` decides the session's character, not its input. This
+    // loop reads stdin whether or not the flag is set, so `printf … | mesh -i` is
+    // an interactive session whose origin is still `stdin`.
+    shell.vars.set_interactive(options.interactive);
     let (origin, source) = options.origin(false);
     shell.vars.set_origin(origin, source);
-    let mut last = match run_startup_files(options, false, 0, &mut shell) {
+    let mut last = match run_startup_files(options, options.interactive, 0, &mut shell) {
         Step::Continue(code) | Step::Error(code) => code,
         Step::Exit(code) => {
             return ExitCode::from(run_logout(options, code, &mut shell));
@@ -10667,6 +10701,40 @@ mod tests {
             StartupOptions::parse(["-c"].into_iter().map(str::to_owned)),
             Err("-c requires a command string".to_owned())
         );
+    }
+
+    #[test]
+    fn dash_i_is_orthogonal_to_where_the_commands_come_from() {
+        // `-i` says what kind of session this is; the invocation still says where
+        // its commands come from. Every pairing is legal, which is the point.
+        let options =
+            StartupOptions::parse(["-i", "deploy.mesh", "x"].into_iter().map(str::to_owned))
+                .unwrap();
+        assert!(options.interactive);
+        assert_eq!(
+            options.invocation,
+            Invocation::Script(PathBuf::from("deploy.mesh"))
+        );
+        assert_eq!(options.args, ["x"]);
+
+        let options =
+            StartupOptions::parse(["-i", "-c", "puts hi"].into_iter().map(str::to_owned)).unwrap();
+        assert!(options.interactive);
+        assert_eq!(
+            options.invocation,
+            Invocation::Command("puts hi".to_owned())
+        );
+
+        let options = StartupOptions::parse(["-i", "-s"].into_iter().map(str::to_owned)).unwrap();
+        assert!(options.interactive);
+        assert_eq!(options.invocation, Invocation::Stdin);
+
+        // Option parsing still stops at the first operand, so a script's own
+        // `-i` reaches the script rather than the shell.
+        let options =
+            StartupOptions::parse(["deploy.mesh", "-i"].into_iter().map(str::to_owned)).unwrap();
+        assert!(!options.interactive);
+        assert_eq!(options.args, ["-i"]);
     }
 
     #[test]

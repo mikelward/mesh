@@ -18130,6 +18130,134 @@ fn a_startup_file_reports_itself_as_sourced() {
 /// a startup file never passes through `run_recorded` — the funnel that normally
 /// does it. Otherwise the next file in the chain reads `$sh.status` as whatever ran
 /// before, while receiving the returned code as its `last`: two answers for one run.
+/// `-i` makes a session interactive whatever its input is: `rc.mesh` is sourced
+/// and `$sh.interactive` is true, so the half of a config behind
+/// `return unless $sh.interactive` can be exercised without a pty. Rough edge 30
+/// from the config port.
+#[test]
+fn dash_i_makes_a_session_interactive_whatever_its_input_is() {
+    let home = fresh_dir("force_interactive");
+    let config = home.join("mesh");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("env.mesh"), "puts env=$sh.interactive\n").unwrap();
+    std::fs::write(config.join("rc.mesh"), "puts rc-ran\n").unwrap();
+    let script = home.join("main.mesh");
+    std::fs::write(&script, "puts \"$sh.origin $sh.interactive\"\n").unwrap();
+
+    let mesh = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_mesh"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", &home)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run mesh")
+    };
+
+    // Without it a script is not interactive, and `rc.mesh` is not in the set.
+    let plain = mesh(&[script.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout),
+        "env=false\nscript false\n",
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+
+    // With it the same script sources `rc.mesh` and reports true — while its
+    // origin stays `script`, since where the commands come from is a separate
+    // question from what kind of session this is.
+    let forced = mesh(&["-i", script.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&forced.stdout),
+        "env=true\nrc-ran\nscript true\n"
+    );
+
+    // `-c` too, and `--norc` still wins over the rc file it would have added.
+    let commanded = mesh(&["-i", "-c", "puts $sh.interactive"]);
+    assert_eq!(
+        String::from_utf8_lossy(&commanded.stdout),
+        "env=true\nrc-ran\ntrue\n"
+    );
+    let no_rc = mesh(&["-i", "--norc", "-c", "puts $sh.interactive"]);
+    assert_eq!(String::from_utf8_lossy(&no_rc.stdout), "env=true\ntrue\n");
+
+    // Piped stdin: an interactive session whose commands still came from a pipe,
+    // so the origin stays `stdin`. `-i` says what kind of session this is; it does
+    // not claim the commands were typed at a prompt, which is what `interactive`
+    // as an origin means. Raised in review.
+    let piped = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .arg("-i")
+        .env("XDG_CONFIG_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(b"puts \"$sh.origin $sh.interactive\"\n")?;
+            child.wait_with_output()
+        })
+        .expect("run mesh with piped stdin");
+    assert_eq!(
+        String::from_utf8_lossy(&piped.stdout),
+        "env=true\nrc-ran\nstdin true\n"
+    );
+
+    // It does not conjure a terminal, so nothing a prompt would decorate with
+    // leaks into a piped run's output — that stays byte-exact.
+    let decorated = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .args(["-i", "-c", "puts hi"])
+        .env("XDG_CONFIG_HOME", &home)
+        .env("TERM", "xterm-256color")
+        .env("TERM_PROGRAM", "vscode")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run mesh");
+    assert_eq!(
+        String::from_utf8_lossy(&decorated.stdout),
+        "env=true\nrc-ran\nhi\n"
+    );
+}
+
+/// `-i` says what kind of session this is; it does not claim the terminal. A
+/// `fork` in a `-i` batch session must therefore stay in the invocation's process
+/// group, because a group of its own is excluded from a `SIGINT` sent to that one
+/// — which would kill the shell and leave the child running. Raised in review as
+/// a P1.
+#[test]
+fn dash_i_does_not_claim_terminal_job_control() {
+    let home = fresh_dir("force_interactive_pgid");
+    std::fs::create_dir_all(home.join("mesh")).unwrap();
+
+    // mesh is spawned without a session of its own, so it shares this process's
+    // group; a `fork` child that is not given job control stays in it. Under an
+    // interactive shell that took the terminal the child would `setpgid(0, 0)`
+    // and become its own leader instead — which is the state that gets it missed
+    // by a signal sent to the invocation's group.
+    // SAFETY: `getpgrp` takes no arguments and cannot fail.
+    let ours = unsafe { libc::getpgrp() };
+
+    let out = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .args(["-i", "-c", "fork { sh -c 'ps -o pgid= -p $$' }"])
+        .env("XDG_CONFIG_HOME", &home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run mesh");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let child_pgid: i32 = stdout.trim().parse().expect("a process group id");
+    assert_eq!(
+        child_pgid, ours,
+        "a `-i` batch session must leave a fork child in the invocation's group"
+    );
+}
+
 #[test]
 fn a_startup_file_that_returns_publishes_its_status() {
     let home = fresh_dir("source_startup_status");

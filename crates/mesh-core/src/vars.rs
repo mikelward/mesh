@@ -706,6 +706,17 @@ pub struct Vars {
     status: u8,
     stages: Vec<u8>,
     interactive: bool,
+    /// Whether this process is the interactive REPL driving a terminal it has
+    /// **taken** — foreground group acquired, terminal signals configured.
+    ///
+    /// A stricter question than `interactive`, and a separate one since `-i`:
+    /// that flag says what *kind* of session this is, while everything that
+    /// presupposes a keyboard and a controlling terminal has to ask this instead.
+    /// `mesh -i script.mesh` is an interactive session that never took a
+    /// terminal, so it must not put a `fork` child in its own process group —
+    /// that group is excluded from a `SIGINT` sent to the invocation's, which
+    /// kills the shell and orphans the child.
+    owns_terminal: bool,
     /// Captured once rather than read per access, so they stay the *shell's* —
     /// bash's `$$` / `$PPID`, which do not change inside a subshell. A forked
     /// pipeline stage inherits this copy, so `$sh.pid` there still names the
@@ -783,6 +794,7 @@ impl Default for Vars {
             status: 0,
             stages: vec![0],
             interactive: false,
+            owns_terminal: false,
             pid: std::process::id(),
             // SAFETY: `getppid` takes no arguments and cannot fail.
             ppid: unsafe { libc::getppid() },
@@ -840,9 +852,17 @@ impl Vars {
         self.interactive = interactive;
     }
 
-    /// Whether this session is interactive, as recorded above.
-    pub fn interactive(&self) -> bool {
-        self.interactive
+    /// Record that this process has taken the terminal: the interactive loop
+    /// calls it once, after `wait_until_foreground` and `ignore_interactive_signals`
+    /// have both succeeded. Nothing else may — the flag is a claim about what this
+    /// process actually did, not about what kind of session it is.
+    pub fn set_owns_terminal(&mut self) {
+        self.owns_terminal = true;
+    }
+
+    /// Whether this process owns terminal job control, as recorded above.
+    pub(crate) fn owns_terminal(&self) -> bool {
+        self.owns_terminal
     }
 
     /// The live `$sh.options` settings. Handed out as the shared `Arc` rather
