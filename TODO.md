@@ -2364,58 +2364,83 @@ of each PR had landed by another route, but these pieces had not.
       be interruptible as a unit" is a question worth answering deliberately
       rather than as a side effect. Raised by review on that PR.
 
-- [ ] **Two pty tests fail under load.**
-      `settings_turn_the_interactive_decorations_off_and_back_on` and
-      `an_abandoned_line_is_closed_without_a_status` (`crates/mesh/tests/cli.rs`)
-      each failed once during full-suite runs that took 58s against the usual
-      32s, on branches touching neither. Run alone they pass — 5/5 and 3/3.
+- [x] **Two pty tests fail under load.** The one the harness caused is fixed: it
+      typed the next line while the shell was still finishing the previous
+      command.
 
-      **It has since failed in CI**, on a `TODO.md`-only push, with
-      `PTY harness failed with status 0x7b00` — **phase 123** of
-      `decoration_settings_harness`. So it is not a developer-machine artifact,
-      which is the one thing that failure settles.
+      `decoration_settings_harness` synchronized on a file its command created,
+      because with `shell-integration` off there is no `D` mark to wait for. But
+      `touch` creates the file and *then* exits, so when the path appeared the
+      shell was still mid-command — the terminal back in cooked mode, reedline
+      not yet re-entered. The line the harness wrote next was echoed by the line
+      discipline and read back by reedline as it started, which the session
+      transcript shows plainly: the typed text arrives between the `?2004l` that
+      ends one read and the `?2004h` that begins the next, rather than in a
+      repaint. Whether that survives is timing, and phase 123 —
+      `wait_for_path(&restored)` giving up after 30 seconds — is the losing side.
 
-      Phase 123 covers **two** steps, and the code does not say which gave way:
+      Two mechanisms, both removed:
 
-      ```rust
-      if !pty_write(shell.master, &line) || !wait_for_path(&restored) {
-          return 123;
-      }
-      ```
+      - **Type only when the editor is reading.** Reedline turns bracketed paste
+        off as it leaves a read and on as it enters the next, whatever the marks
+        under test are set to, so `?2004l` then `?2004h` is the prompt-ready
+        signal a session with its marks off still has.
+        `pty_read_until_the_prompt_returns` waits for that pair and hands back
+        what it read; the file stays as proof the command *ran*.
+      - **Never leave the pty unread.** The harness had deliberately left two
+        commands' output unread so both would be in the buffer it examined at the
+        end. Meanwhile the cursor-position query reedline writes at each prompt
+        went unanswered until it timed out — after which the reply the next
+        reader sent arrived with nothing waiting for it and was taken as typed
+        input. Reading throughout and joining the windows gets the same bytes
+        without the stall.
 
-      The line is `$sh.options.shell-integration = true ; touch <restored>`. If
-      `pty_write` failed the wait never ran; if the write succeeded then a
-      `wait_for_path` polling for **30 seconds** gave up, which is a much
-      stranger thing and would mean something stopped making progress rather
-      than the harness being impatient. Those want different investigations, so
-      **splitting 123 into a code per step is the first move** — cheap, and it
-      makes the next occurrence self-explaining.
-
-      After that, worth ruling out: whether the shell received the line at all
-      (`pty_write` succeeding says the bytes were written, not that they were
-      read), and whether an earlier phase left the session mid-line so this write
-      landed as a continuation of it.
+      `pty_read_until_one_of` also answered *every* `ESC[6n` in its accumulated
+      buffer on every read — three replies to one query in an idle run, 26 when
+      reads are small — the mistake its sibling's comment already warned about.
+      One reply per query now, from `answer_cursor_queries`.
 
       Reading a failure: each harness returns a distinct code per phase —
-      `abandoned_line_harness` 90–96, `decoration_settings_harness` 110–128. The
-      panic does not print that number directly, though. All 24 of these
-      assertions share the message `PTY harness failed with status {status:#x}`
-      and `status` is the **raw wait status** from `waitpid`, so phase 123 shows
-      as `0x7b00` — the code is the high byte, `status >> 8`. Printing
-      `WEXITSTATUS(status)` instead would be a kindness to whoever debugs this,
-      and the assertions already compute it for the condition; worth doing next
-      time these are touched.
+      `abandoned_line_harness` 90–96, `decoration_settings_harness` 110–132
+      (renumbered; 123 is now "the prompt did not come back after `touch`").
+      `await_pty_harness` prints that code directly, so a failure reads
+      `PTY harness failed at phase 123` rather than the encoded wait status
+      `0x7b00` that reached this file.
 
-      To reproduce locally, run the suite under contention: `cargo test
-      --workspace` (see `DEVELOPMENT.md`) alongside a parallel build, or on an
-      already-loaded machine. Both local sightings were in runs that took 58s
-      against the usual 32s.
+      Reproducing it needed no load in the end. With only the cursor-query fix
+      applied, phase 123 failed on the *first* full run of `cli` on an idle
+      machine, in 55s against the usual 30s — the same slow-run signature as
+      both sightings above. The spurious replies had been masking the unread
+      window: they left one sitting in the input queue for reedline's next query
+      to consume, so cutting them to one per query is what let the shell stall
+      where it had only been slow. Both fixes, in that order, is why the two
+      land together.
 
-      A test that passes most of the time is broken, so whatever this turns out to
-      be wants the ordering made explicit rather than a longer timeout — the
-      standing rule, and the reason `await_job` exists in the same file, a fixed
-      sleep having "still lost under load". A 30-second poll is already generous
-      enough that raising it would only hide the problem.
+      `an_abandoned_line_is_closed_without_a_status` is a weaker claim. It went
+      through the same `pty_read_until_one_of`, via `start_pty_shell`, so the
+      over-answering reached it too — but its failure was never reproduced, so
+      what fixed it is inference rather than a measurement. Worth watching in
+      CI.
+
+      To reproduce under contention, `taskset -c 0 cargo test --workspace` is
+      the sharpest form, and is what surfaced the three below.
+
+- [ ] **Three more pty tests fail on a single CPU**, found while fixing the
+      entry above and untouched by it: `a_jobdone_hook_fires_where_the_done_notice_prints`
+      (phase 155, 4 failures in 9 runs), `the_title_setting_turns_the_title_off_and_back_on`
+      (140), and `vs_code_gets_its_own_dialect_and_the_command_line` (170).
+      Reproduce with `taskset -c 0 cargo test --workspace`.
+
+      The job-done one is the frequent one and its cause is in the test: it
+      sleeps 400ms expecting a `sleep 0.2` job to have ended and a `sleep 0.7`
+      job not to have, which on a starved CPU is not a safe bet. That is the
+      "no sleeps" rule owed a real fix, not a longer sleep.
+
+      Two others in the same runs — phase 110 of the decorations harness and
+      phase 22 of `new_foreground_job_does_not_receive_sigcont` — are both
+      `start_pty_shell` giving up after 10 seconds of silence. On one CPU shared
+      by eight test threads that is arguably the machine rather than the test,
+      so they are recorded but not counted above.
 
 - [ ] **If the syntactic capture-status rule proves too narrow, carry the status
       as evaluation metadata instead.** An assignment takes its right-hand side's
