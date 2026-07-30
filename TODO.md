@@ -2077,7 +2077,7 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Nine have since been fixed; two are tracked
+matched back to the discussion. Ten have since been fixed; two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
 
@@ -2112,10 +2112,16 @@ was re-checked against `main` rather than taken from the PR text.
       a generic "parse this tool's `shellenv` output and apply it" helper cannot be
       written at all; every tool's variables have to be named literally, which is
       why `setup-fnm` and `setup-brew` are each hand-written.
-- [ ] **6. There is no parse-only flag.** *(The line-and-column half of this
-      entry is fixed; see below.)* A config that *generates* mesh source (see 26)
-      has no way to check the generated file before sourcing it, so its only test
-      is whether sourcing it breaks the shell.
+- [x] **6. A syntax error carried no line or column, and there was no way to
+      check a file without running it.** A config that *generates* mesh source (see 26) had no way to check
+      the generated file before sourcing it, so its only test was whether sourcing
+      it broke the shell.
+
+      **Fixed, the second half:** `-n` / `--no-execute` parses the input and runs
+      nothing — silent on success, `2` and a located diagnostic on a syntax error,
+      so `mesh -n generated.mesh && source generated.mesh` is the check that was
+      missing. It skips the startup files: `env.mesh` is ordinary mesh code, and
+      sourcing it to check an unrelated file would run arbitrary commands.
 
       **Fixed, the first half:** a syntax error used to report
       `syntax error: unexpected end of input` and nothing else, so locating one in

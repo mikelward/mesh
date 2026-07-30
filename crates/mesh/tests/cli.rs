@@ -18500,6 +18500,187 @@ fn a_startup_file_reports_itself_as_sourced() {
 /// and `$sh.interactive` is true, so the half of a config behind
 /// `return unless $sh.interactive` can be exercised without a pty. Rough edge 30
 /// from the config port.
+/// `-n` parses the input and runs nothing — the syntax check a config that
+/// generates mesh source needs before sourcing it. Rough edge 6 from the port.
+#[test]
+fn dash_n_checks_syntax_without_running_anything() {
+    let home = fresh_dir("no_execute");
+    let config = home.join("mesh");
+    std::fs::create_dir_all(&config).unwrap();
+    // Startup files must not run: sourcing `env.mesh` to check an unrelated file
+    // would run arbitrary commands, which is what the flag promises not to do.
+    std::fs::write(config.join("env.mesh"), "puts ENV-RAN\n").unwrap();
+
+    let ok = home.join("ok.mesh");
+    std::fs::write(&ok, "puts one\nputs two\n").unwrap();
+    let bad = home.join("bad.mesh");
+    std::fs::write(&bad, "puts one\nx = )\n").unwrap();
+
+    let check = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_mesh"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", &home)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run mesh")
+    };
+
+    // Valid input: silent, successful, and nothing ran — not the script's own
+    // `puts`, and not the startup file's.
+    let valid = check(&["-n", ok.to_str().unwrap()]);
+    assert_eq!(String::from_utf8_lossy(&valid.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&valid.stderr), "");
+    assert_eq!(valid.status.code(), Some(0));
+
+    // Without the flag, both do run — which is what makes the silence above mean
+    // something rather than being a script that prints nothing.
+    let ran = check(&[ok.to_str().unwrap()]);
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "ENV-RAN\none\ntwo\n");
+
+    // A syntax error is reported where it is, and exits 2.
+    let invalid = check(&["-n", bad.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&invalid.stderr),
+        format!(
+            "mesh: {}:2:5: syntax error: expected a value expression\n",
+            bad.display()
+        )
+    );
+    assert_eq!(invalid.status.code(), Some(2));
+
+    // An input that merely ends mid-construct is a syntax error here: nothing
+    // more is coming, so there is no reader left to buffer for.
+    let open = home.join("open.mesh");
+    std::fs::write(&open, "puts one\nfunc f() {\n").unwrap();
+    let unclosed = check(&["-n", open.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&unclosed.stderr),
+        format!(
+            "mesh: {}:2:10: syntax error: unclosed `{{`\n",
+            open.display()
+        )
+    );
+    assert_eq!(unclosed.status.code(), Some(2));
+
+    // `-c` and the long spelling reach the same check.
+    let commanded = check(&["-n", "-c", "x = )"]);
+    assert_eq!(
+        String::from_utf8_lossy(&commanded.stderr),
+        "mesh: command:1:5: syntax error: expected a value expression\n"
+    );
+    assert_eq!(commanded.status.code(), Some(2));
+    assert_eq!(
+        check(&["--no-execute", ok.to_str().unwrap()]).status.code(),
+        Some(0)
+    );
+
+    // A file that is not there still reports as it does without the flag.
+    assert_eq!(
+        check(&["-n", home.join("nope.mesh").to_str().unwrap()])
+            .status
+            .code(),
+        Some(127)
+    );
+
+    // A heredoc body is opaque to the parser — data delimited by a line — so a
+    // parse that says `Complete` has not looked inside it. Without checking them,
+    // `-n` passed a file whose `${bad` rejects it on the way in, *after* every
+    // statement before it had run, which is exactly what this flag exists to
+    // prevent. Raised in review as a P1.
+    let heredoc = home.join("heredoc.mesh");
+    std::fs::write(&heredoc, "puts BEFORE\ncat << END\n${bad\nEND\n").unwrap();
+    let malformed = check(&["-n", heredoc.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&malformed.stderr),
+        format!(
+            "mesh: {}:3:1: heredoc: syntax error: unclosed `}}`\n",
+            heredoc.display()
+        )
+    );
+    assert_eq!(malformed.status.code(), Some(2));
+    // And nothing ran — `BEFORE` is what running it would have printed first.
+    assert_eq!(String::from_utf8_lossy(&malformed.stdout), "");
+
+    // A well-formed body passes, including one with references in it.
+    let fine = home.join("heredoc-ok.mesh");
+    std::fs::write(&fine, "cat << END\nhello $name and ${other}\nEND\n").unwrap();
+    assert_eq!(
+        check(&["-n", fine.to_str().unwrap()]).status.code(),
+        Some(0)
+    );
+
+    // An **unbound** variable is a runtime failure, not a syntax error, so the
+    // check must not resolve anything — only confirm it could.
+    let unbound = home.join("heredoc-unbound.mesh");
+    std::fs::write(&unbound, "cat << END\n$definitely_missing\nEND\n").unwrap();
+    assert_eq!(
+        check(&["-n", unbound.to_str().unwrap()]).status.code(),
+        Some(0)
+    );
+
+    // A quoted delimiter takes no interpolation at all, so its body is data and
+    // there is nothing in it to be wrong.
+    let quoted = home.join("heredoc-raw.mesh");
+    std::fs::write(&quoted, "cat << 'END'\n${bad\nEND\n").unwrap();
+    assert_eq!(
+        check(&["-n", quoted.to_str().unwrap()]).status.code(),
+        Some(0)
+    );
+
+    let feed = |args: &[&str], input: &[u8]| {
+        let input = input.to_vec();
+        Command::new(env!("CARGO_BIN_EXE_mesh"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", &home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().expect("stdin").write_all(&input)?;
+                child.wait_with_output()
+            })
+            .expect("run mesh with piped stdin")
+    };
+
+    // Piped input is taken whole rather than a unit at a time, so a fault on
+    // line 2 is on line 2.
+    let piped = feed(&["-n"], b"puts one\nx = )\n");
+    assert_eq!(
+        String::from_utf8_lossy(&piped.stderr),
+        "mesh: stdin:2:5: syntax error: expected a value expression\n"
+    );
+    assert_eq!(piped.status.code(), Some(2));
+
+    // `-s` names where the input comes from, so it must not swallow the flags
+    // after it: either ordering checks stdin and runs none of it. Raised in
+    // review as a P1 — `mesh -s -n` used to take `-n` as an argument and run.
+    for order in [["-s", "-n"], ["-n", "-s"]] {
+        let checked = feed(&order, b"puts SHOULD_NOT_RUN\n");
+        assert_eq!(
+            String::from_utf8_lossy(&checked.stdout),
+            "",
+            "for {order:?}"
+        );
+        assert_eq!(checked.status.code(), Some(0), "for {order:?}");
+
+        let faulty = feed(&order, b"puts one\nx = )\n");
+        assert_eq!(
+            String::from_utf8_lossy(&faulty.stderr),
+            "mesh: stdin:2:5: syntax error: expected a value expression\n",
+            "for {order:?}"
+        );
+        assert_eq!(faulty.status.code(), Some(2), "for {order:?}");
+    }
+
+    // Its operands are still this session's arguments rather than a script.
+    let with_args = feed(&["-s", "a", "b"], b"puts ...$sh.args\nputs $sh.name\n");
+    assert_eq!(
+        String::from_utf8_lossy(&with_args.stdout),
+        "ENV-RAN\na b\nmesh\n"
+    );
+}
+
 #[test]
 fn dash_i_makes_a_session_interactive_whatever_its_input_is() {
     let home = fresh_dir("force_interactive");
