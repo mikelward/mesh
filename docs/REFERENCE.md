@@ -1853,8 +1853,8 @@ expression) is a syntax error. A `$` not followed by a name (`$5`) is a literal
 
 Postfix modifiers apply from left to right after a variable, member, list access,
 or a **literal** — `abc:upper` is `ABC`, the same as `$x:upper`. They work in bare
-and double-quoted interpolation; braced form puts the modifier inside the braces
-(`${file:stem}`).
+and double-quoted interpolation (see the known gap below for where a `"…"` chain
+is read); braced form puts the modifier inside the braces (`${file:stem}`).
 
 **`:` followed by an identifier is reserved by the grammar**, so a name that is not
 a modifier is a syntax error rather than literal text:
@@ -1877,6 +1877,32 @@ reading as text. A `[…]` literal's `key:` is a map key, not a chain on the key
 
 The chain also outranks keyword parsing, so `if:upper` is `IF` rather than the
 start of a conditional; `if :upper` — with the space — is still the keyword.
+
+Inside a `"…"` string a `$…` reference is scanned by its **characters**, which
+stop at a `(`, so a modifier that takes arguments has nowhere to put them there.
+That is a syntax error naming the spelling that does work — `${…}`, whose body is
+an expression:
+
+```
+puts "$env:get(HOME, none)"
+mesh: syntax error: `:get` takes arguments, which a `$…` interpolation cannot
+pass; brace it as an expression (`"${$x:get(…)}"`)
+
+puts "${$env:get(HOME, none)}"    # /home/user
+```
+
+Note the `$` **inside** the braces: `${…}` holds an expression, where a bare
+`env` is the string `env` rather than the variable. Only an *abutting* `(` after
+a name that **takes** arguments is this shape; after an argument-free modifier a
+`(` is ordinary text, so `"$x:upper(foo)"` is `AB(foo)`, and `"$x:upper (1)"` and
+`"$x:nosuch(1)"` keep their readings too.
+
+> **Known gap.** A bare `$name:mod` chain inside a `"…"` string is read in
+> **command position** only, so `puts "$x:upper"` is `AB` while `y = "$x:upper"`
+> binds the literal `ab:upper` — and the error above is reported only where the
+> chain is read, which is the same set plus interpolated heredoc bodies. The
+> braced form (`"${$x:upper}"`) is consistent in both positions and is the
+> spelling to reach for. Tracked as rough edge 11 in `TODO.md`.
 
 A name mesh **reserves** for a modifier it has not built yet — `:sort`, `:lines`,
 `:replace`, and the rest of the `DESIGN.md` set — parses, then reports a

@@ -305,6 +305,13 @@ pub enum ParseErrorKind {
     /// says *unknown* rather than *unimplemented*: a name the vocabulary reserves but
     /// the engine cannot apply yet (`:sort`) parses fine and reports at run time.
     UnknownModifier(String),
+    /// A modifier given an **argument list** inside a `$…` interpolation —
+    /// `"$env:get(HOME, none)"`. Its own variant because the reader wrote
+    /// something that has a working spelling rather than something mesh cannot
+    /// do: a `$…` reference is scanned by its characters and stops at the `(`,
+    /// so the arguments became literal text and the modifier ran with none. The
+    /// braced expression form `${$env:get(HOME, none)}` takes them.
+    InterpolatedModifierArguments(String),
     /// Input nested past [`MAX_DEPTH`]. Its own variant because the failure is a
     /// *resource* limit rather than a shape the grammar rejects: the source may be
     /// perfectly well formed, and the honest report is that mesh will not go that
@@ -376,6 +383,11 @@ impl std::fmt::Display for ParseError {
                 "syntax error: `:{name}` is not a modifier; quote the whole word to \
                  keep it as text (`\"x:{name}\"`), or brace the name when it comes \
                  from a variable (`\"${{x}}:{name}\"`)"
+            ),
+            ParseErrorKind::InterpolatedModifierArguments(name) => write!(
+                f,
+                "syntax error: `:{name}` takes arguments, which a `$…` interpolation \
+                 cannot pass; brace it as an expression (`\"${{$x:{name}(…)}}\"`)"
             ),
             ParseErrorKind::UnknownGlobQualifier(text) => write!(
                 f,
@@ -1909,7 +1921,7 @@ fn word_is_quoted(word: &Word) -> bool {
     })
 }
 
-fn merge_command_variable_access(pieces: Vec<WordPiece>) -> Vec<WordPiece> {
+fn merge_command_variable_access(pieces: Vec<WordPiece>) -> Result<Vec<WordPiece>, ParseErrorKind> {
     let mut coalesced = Vec::with_capacity(pieces.len());
     for piece in pieces {
         match piece {
@@ -1927,7 +1939,7 @@ fn merge_command_variable_access(pieces: Vec<WordPiece>) -> Vec<WordPiece> {
             && *variable_quote == *quote
             && !name.ends_with('}')
         {
-            let length = variable_access_prefix(text);
+            let length = variable_access_prefix(text)?;
             if length > 0 {
                 name.push_str(&text[..length]);
                 if length < text.len() {
@@ -1941,10 +1953,10 @@ fn merge_command_variable_access(pieces: Vec<WordPiece>) -> Vec<WordPiece> {
         }
         output.push(piece);
     }
-    output
+    Ok(output)
 }
 
-pub(crate) fn variable_access_prefix(text: &str) -> usize {
+pub(crate) fn variable_access_prefix(text: &str) -> Result<usize, ParseErrorKind> {
     let mut consumed = 0;
     loop {
         let rest = &text[consumed..];
@@ -1982,12 +1994,29 @@ pub(crate) fn variable_access_prefix(text: &str) -> usize {
             if length == 0 || !modifier_name(&value[..length]) {
                 break;
             }
+            // An abutting `(` after a modifier that **can take one** is an argument
+            // list, and this scan has nowhere to put it: it stops at the character,
+            // so the arguments stayed behind as literal text while the modifier ran
+            // with none. That is silent and wrong in the same breath —
+            // `"$env:get(HOME, none)"` answered the whole environment and then failed
+            // on being a list. Reported rather than supported here because the
+            // expression form already takes them, so what the reader needs is the
+            // other spelling.
+            //
+            // Gated on arity, because after an argument-free modifier a `(` is
+            // ordinary text and always was: `"$x:upper(foo)"` is `AB(foo)`, and the
+            // braced form the message points at would reject it.
+            if modifier_accepts_arguments(&value[..length]) && value[length..].starts_with('(') {
+                return Err(ParseErrorKind::InterpolatedModifierArguments(
+                    value[..length].to_string(),
+                ));
+            }
             consumed += length + 1;
         } else {
             break;
         }
     }
-    consumed
+    Ok(consumed)
 }
 
 fn match_operand(expression: Expr) -> Expr {
@@ -2789,9 +2818,15 @@ impl Parser {
             self.position += 1;
             pieces.extend(next_pieces);
         }
+        let pieces = merge_command_variable_access(pieces).map_err(|kind| ParseError {
+            kind,
+            // The merge works on piece text, which carries no offsets of its own, so
+            // the word is the narrowest span honestly available.
+            span: start..end,
+        })?;
         Ok(Spanned {
             value: Word {
-                pieces: merge_command_variable_access(pieces),
+                pieces,
                 qualifiers: None,
             },
             span: start..end,
@@ -5270,6 +5305,36 @@ impl Parser {
 
 fn modifier_name(name: &str) -> bool {
     MODIFIER_NAMES.contains(&name)
+}
+
+/// Is `name` a modifier that **requires** a parenthesized argument list? Used to
+/// give a clearer error when such a modifier is written bare (`:split` with no
+/// arguments) rather than the generic "not implemented yet".
+///
+/// `:trimstart` / `:trimend` are deliberately absent: their argument (a char set)
+/// is optional, so the bare spelling is the whitespace form rather than a mistake.
+pub(crate) fn modifier_requires_arguments(name: &str) -> bool {
+    matches!(
+        name,
+        "join"
+            | "split"
+            | "map"
+            | "filter"
+            | "each"
+            | "get"
+            | "stripstart"
+            | "stripend"
+            | "replaceall"
+            | "replacestart"
+            | "replaceend"
+    )
+}
+
+/// Can `name` take an argument list at all? The superset that adds the two whose
+/// argument is *optional*, since an abutting `(` after either is still the argument
+/// form — `"$x:trimstart(abc)"` asks for the char set, not for literal parentheses.
+fn modifier_accepts_arguments(name: &str) -> bool {
+    modifier_requires_arguments(name) || matches!(name, "trimstart" | "trimend")
 }
 
 const MODIFIER_NAMES: &[&str] = &[

@@ -2551,7 +2551,9 @@ fn interpolate_heredoc(text: &str, vars: Option<&Vars>) -> Result<String, String
                 } else {
                     let tail = &text[end..];
                     let word = tail.find(char::is_whitespace).unwrap_or(tail.len());
-                    end + parser::variable_access_prefix(&tail[..word])
+                    end + parser::variable_access_prefix(&tail[..word]).map_err(|kind| {
+                        format!("heredoc: {}", parser::ParseError { kind, span: 0..0 })
+                    })?
                 };
                 // Checking stops at "the reference is well-formed"; only an
                 // expansion resolves it.
@@ -2995,6 +2997,13 @@ fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
             rest = &rest[close..];
         } else if let Some(value) = rest.strip_prefix(':') {
             let end = value.find(':').unwrap_or(value.len());
+            // A `from_name` miss is dropped rather than reported: the miss does not
+            // mean the name is unimplemented, only that `expand` is not where it
+            // lives — the regex flags and `:capture` are implemented in
+            // `apply_argument_free_modifier`, on the other side of a layer this path
+            // cannot reach. Reporting it here mislabeled them. Left as it was, and
+            // recorded in TODO.md: the fix is to unify the two paths, not to guess
+            // from the name.
             if let Some(modifier) = expand::Modifier::from_name(&value[..end]) {
                 modifiers.push(modifier);
             }
@@ -3890,28 +3899,6 @@ fn glob_path_argument(
     Ok(path)
 }
 
-/// Is `name` a modifier that requires a parenthesized argument list? Used only to
-/// give a clearer error when such a modifier is written bare (`:split` without
-/// arguments) rather than the generic "not implemented yet".
-/// `:trimstart` / `:trimend` are deliberately absent: their argument (a char set)
-/// is optional, so the bare spelling is the whitespace form rather than a mistake.
-fn modifier_takes_arguments(name: &str) -> bool {
-    matches!(
-        name,
-        "join"
-            | "split"
-            | "map"
-            | "filter"
-            | "each"
-            | "get"
-            | "stripstart"
-            | "stripend"
-            | "replaceall"
-            | "replacestart"
-            | "replaceend"
-    )
-}
-
 /// Apply an argument-free modifier to a value.
 ///
 /// Which modifier `:name` *is* depends on the value: on a regex the flag names are
@@ -3932,7 +3919,7 @@ fn apply_argument_free_modifier(name: &str, mut value: Value) -> Result<Value, S
         return Ok(value);
     }
     let Some(modifier) = expand::Modifier::from_name(name) else {
-        if modifier_takes_arguments(name) {
+        if parser::modifier_requires_arguments(name) {
             return runtime_error(format!("modifier :{name} requires an argument"));
         }
         return runtime_error(format!("modifier :{name} is not implemented yet"));
@@ -7733,7 +7720,7 @@ fn apply_modifier_ref(name: &str, argument: Value) -> Result<Value, Step> {
     // Checked here rather than left to the shared path: a reference to `:join` is
     // wrong whatever it would be applied to, so say that instead of complaining
     // about the value it met.
-    if modifier_takes_arguments(name) {
+    if parser::modifier_requires_arguments(name) {
         return runtime_error(format!(
             "`:{name}` takes arguments, so it is not a one-argument function"
         ));

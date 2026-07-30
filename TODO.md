@@ -2115,7 +2115,7 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Ten have since been fixed; two are tracked
+matched back to the discussion. Eleven have since been fixed; two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
 
@@ -2217,10 +2217,64 @@ was re-checked against `main` rather than taken from the PR text.
       — at **runtime**, so a rarely-taken branch carries it silently until it is
       taken. `"${file}.bak"` is the fix, and the brace is easy to forget precisely
       because every other shell makes it optional here.
-- [ ] **11. An argument-taking modifier cannot be interpolated.**
-      `"$env:get(HOME, none)"` does not call the modifier; the name has to be
-      bound first. Walked into four separate times in one port, which is the usual
-      sign that the diagnostic should name the rule.
+- [x] **11. An argument-taking modifier cannot be interpolated.**
+      `"$env:get(HOME, none)"` does not call the modifier. Walked into four
+      separate times in one port, which is the usual sign that the diagnostic
+      should name the rule.
+
+      **Fixed, and the premise was wrong in mesh's favor:** the value does *not*
+      have to be bound first. `"${$env:get(HOME, none)}"` works today — a braced
+      body is an expression, and an expression takes arguments. What failed was
+      the bare `$…` form, which is scanned by its characters: the scan stops at
+      the `(`, so the arguments stayed behind as literal text and the modifier ran
+      with **none**. `"$env:get(HOME, none)"` therefore answered the whole
+      environment and failed with ``$env: list value needs `...` ``, naming
+      neither the mistake nor the fix.
+
+      Now a syntax error that names both, reported where the scan is
+      (`variable_access_prefix`) so a `"…"` string and a heredoc body agree. Note
+      the working spelling needs the `$` **inside** the braces: `${…}` holds an
+      expression, where a bare `env` is the string `env`.
+
+      **Found alongside, not fixed:** the bare chain is read in *command* position
+      only. `puts "$x:upper"` is `AB`, while `y = "$x:upper"` binds the literal
+      `ab:upper` — the merge step that attaches a chain to a preceding reference
+      runs in `command_word` and nowhere else. So the same string means two things
+      depending on where it sits, and the value-position reading is silent. The
+      braced form is consistent in both. The diagnostic above inherits the same
+      boundary — it is reported where the chain is read — which is why
+      `docs/REFERENCE.md` now carries the gap rather than a rule that holds in
+      one position; raised in review as a P2.
+
+      Note this makes the divergence a bug against the **documented** behavior,
+      not a design choice: §Modifiers says they work in double-quoted
+      interpolation without qualifying by position. Fixing it means running the
+      merge on every word, which changes what an existing value string means
+      whenever it happens to hold `$name:word` — worth taking on its own rather
+      than as a side effect of a diagnostic.
+
+      **Also found alongside, also not fixed: an interpolation drops a modifier
+      `expand::Modifier::from_name` does not know.** `expansion_variable`
+      (`repl.rs`) pushes the modifier only `if let Some(…)`, so `"$x:sort"`
+      renders its subject unchanged with no error where the bare `$x:sort` says
+      `modifier :sort is not implemented yet`, and `"$x:match(/a/)"` renders
+      `abc(/a/)`. Raised in review as a P2.
+
+      The tempting one-line fix — map the miss to "unimplemented" — is **wrong**,
+      and two review rounds proved it: a miss does not mean unimplemented, only
+      that `expand` is not where the name lives. The regex flags (`:i`, `:m`,
+      `:s`, `:x` and their long spellings) and `:capture` are implemented in
+      `repl::apply_argument_free_modifier`, on the other side of a layer the
+      expansion path cannot reach, so the fallback reported `:i: is not
+      implemented yet` for a flag that works and replaced `:capture`'s actionable
+      ``applies to a call — write `f(…):capture` `` with a false one.
+
+      The real fix is to stop having **two** modifier vocabularies: expansion
+      knows `expand::Modifier`, while the expression path knows that plus the
+      regex flags, `:capture`, and the argument-taking set. Unify them — one
+      entry point that takes a name and a value and answers the same way
+      wherever the chain was written — and the silent drop, the wrong messages,
+      and the position-dependence above all close together.
 - [x] **12. No whitespace-run tokenizer.** `:split(SEP)` takes a literal separator
       and keeps interior empties (`"a   b":split(" "):len` is 4), so every
       column-padded output — `getent`, `ip -o`, `df`, `stat` — needed a
