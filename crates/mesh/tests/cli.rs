@@ -2906,16 +2906,19 @@ fn start_pty_shell_ready(exec: &MeshExec, cwd: Option<&Path>, ready: &[u8]) -> O
     });
     let mut master = -1;
     let mut slave = -1;
-    if open_pty_pair(&mut master, &mut slave) != 0
-        || unsafe { libc::setsid() } < 0
-        || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
-    {
-        return None;
+    if open_pty_pair(&mut master, &mut slave) != 0 {
+        return pty_start_failed("could not open a pty pair");
+    }
+    if unsafe { libc::setsid() } < 0 {
+        return pty_start_failed("could not start a session");
+    }
+    if unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0 {
+        return pty_start_failed("could not take the pty as a controlling terminal");
     }
     unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
     let mesh = unsafe { libc::fork() };
     if mesh < 0 {
-        return None;
+        return pty_start_failed("could not fork the shell");
     }
     if mesh == 0 {
         unsafe {
@@ -2935,13 +2938,15 @@ fn start_pty_shell_ready(exec: &MeshExec, cwd: Option<&Path>, ready: &[u8]) -> O
     }
     // Set the group from both sides of fork so tcsetpgrp cannot race the child.
     if unsafe { libc::setpgid(mesh, mesh) } < 0 && unsafe { libc::getpgid(mesh) } != mesh {
-        return None;
+        return pty_start_failed("could not put the shell in its own process group");
     }
     unsafe { libc::close(slave) };
     if unsafe { libc::tcsetpgrp(master, mesh) } < 0 {
-        return None;
+        return pty_start_failed("could not hand the terminal to the shell");
     }
-    let startup = pty_read_until_one_of(master, &[ready])?;
+    let Some(startup) = pty_read_until_one_of(master, &[ready]) else {
+        return pty_start_failed(&format!("no prompt arrived; {}", shell_fate(mesh)));
+    };
     Some(PtyShell {
         master,
         mesh,
@@ -2949,16 +2954,96 @@ fn start_pty_shell_ready(exec: &MeshExec, cwd: Option<&Path>, ready: &[u8]) -> O
     })
 }
 
+/// Say on the way out **why** a session could not be started.
+///
+/// Six steps reach the caller as one `None`, and the caller turns that into a
+/// single phase code — 110 for `decoration_settings_harness`, which is how a CI
+/// failure said the session did not start without saying which step gave way.
+/// They want different investigations: a pty that would not open is a machine
+/// out of descriptors, and a prompt that never arrived is a shell that either
+/// died or went quiet, which [`shell_fate`] then tells apart.
+///
+/// Printed rather than returned because every caller's contract is an `Option`
+/// and threading a reason through all of them would be a larger change than the
+/// diagnosis is worth. The harness runs forked, with the test binary's own
+/// stderr, so the line lands beside the panic that follows it.
+fn pty_start_failed<T>(why: &str) -> Option<T> {
+    eprintln!("start_pty_shell: {why}");
+    None
+}
+
+/// Is the shell still there, and if not, what happened to it?
+///
+/// The question a silent session turns on. A shell that is still running and
+/// saying nothing is a shell that is stuck — and one that is gone never got far
+/// enough to say anything, so its status is the diagnosis rather than a detail.
+///
+/// A stuck one is also killed here. Nothing waits for a session that failed to
+/// start, so it outlived the run holding a pty open, which the CI runner then
+/// reported as an orphan to terminate.
+fn shell_fate(mesh: libc::pid_t) -> String {
+    let mut status = 0;
+    match unsafe { libc::waitpid(mesh, &mut status, libc::WNOHANG) } {
+        0 => {
+            unsafe { libc::kill(mesh, libc::SIGKILL) };
+            unsafe { libc::waitpid(mesh, &mut status, 0) };
+            "the shell is still running".to_owned()
+        }
+        reaped if reaped == mesh && libc::WIFEXITED(status) => {
+            format!("the shell exited with {}", libc::WEXITSTATUS(status))
+        }
+        reaped if reaped == mesh && libc::WIFSIGNALED(status) => {
+            format!("the shell was killed by signal {}", libc::WTERMSIG(status))
+        }
+        _ => format!("the shell could not be waited for (status {status:#x})"),
+    }
+}
+
 /// Send `exit 0` and require the shell to leave cleanly, so a harness that ends
 /// happily also proves the session survived what it did to it.
 fn stop_pty_shell(shell: PtyShell) -> bool {
+    // Four different endings answer `false` here, and the caller turns that into
+    // one phase code, so each says which on the way out — the same reason
+    // `pty_start_failed` exists for the six ways a session fails to start.
     if !pty_write(shell.master, b"exit 0\n") {
-        return false;
+        // The write itself failing means the session was **already gone**: a pty
+        // master whose slave has no owner answers `EIO`. So this is not a shell
+        // that refused to leave, it is one that left before it was asked.
+        return pty_stop_failed(&format!(
+            "could not ask the shell to exit; {}",
+            shell_fate(shell.mesh)
+        ))
+        .is_some();
     }
     let mut status = 0;
     let reaped = unsafe { libc::waitpid(shell.mesh, &mut status, 0) } == shell.mesh;
     unsafe { libc::close(shell.master) };
-    reaped && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    if !reaped {
+        return pty_stop_failed("the shell could not be waited for").is_some();
+    }
+    if !libc::WIFEXITED(status) {
+        return pty_stop_failed(&format!(
+            "the shell was killed by signal {}",
+            libc::WTERMSIG(status)
+        ))
+        .is_some();
+    }
+    // `exit 0` names its own status, so a nonzero one here means the line never
+    // ran as written — the input reached the shell as something else.
+    if libc::WEXITSTATUS(status) != 0 {
+        return pty_stop_failed(&format!(
+            "`exit 0` left with {} instead",
+            libc::WEXITSTATUS(status)
+        ))
+        .is_some();
+    }
+    true
+}
+
+/// As [`pty_start_failed`], for the other end of a session.
+fn pty_stop_failed(why: &str) -> Option<()> {
+    eprintln!("stop_pty_shell: {why}");
+    None
 }
 
 fn pty_write(master: RawFd, bytes: &[u8]) -> bool {
