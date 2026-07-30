@@ -1835,11 +1835,21 @@ first. Two things follow from the quotes:
   A [styled value](#styled-values) contributes its text and leaves its attributes
   behind, exactly as `"$styled"` does — quote it and you have asked for the text.
 
+**The sigil-less reference form covers the whole access** — a name, its members, its
+indices, and its modifiers, whether or not those modifiers take arguments. Adding an
+argument does not change what the body means:
+
+```mesh
+xs = [a b]
+puts "${xs:len}"            # 2
+puts "${xs:join("-")}"      # a-b   — still the binding
+puts "${$xs:join("-")}"     # a-b   — the same thing, spelled as an expression
+```
+
 **The expression form is ordinary mesh, so a variable keeps its `$`.** That is the
-one seam worth knowing, because the sigil-less *reference* form covers a name, its
-members, its indices, and its **argument-free** modifiers — so `${xs:len}` is the
-variable, while `${xs:join(" ")}` is read as an expression, where a bare `xs` is
-the *word* `xs` rather than the binding. Write `${$xs:join(" ")}` for the value.
+seam worth knowing: the two spellings above agree, but the moment a body stops being
+an access — a call, arithmetic — it is an expression, where a bare word is the *word*
+and a binding needs its `$` (`${$n + 1}`, not `${n + 1}`).
 
 **An expression body may wrap**, the way a `( … )` group or a `$( … )` body does —
 a newline inside the braces is layout, not a terminator. It still holds exactly one
