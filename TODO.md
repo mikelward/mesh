@@ -2071,6 +2071,209 @@ designed, and the cross-references say where the fuller note lives.
       `func`s over `$sh.interactive`, `$sh.stdin:tty` and `$env:get(NAME, "")`,
       all of which exist. Worth an `rc.mesh` example rather than builtins.
 
+## Rough edges found porting a real config
+
+Thirty findings from porting a ~1800-line bash/zsh config to mesh
+(`mikelward/conf#226`), the first thing of that size written against the
+language. Each is worked around in that config, so none of them blocks a port —
+what an entry records is what the workaround *costs*, which is what decides
+whether the edge is worth closing. The numbering is the PR's, so a finding can be
+matched back to the discussion. Three have since been fixed; two are tracked
+elsewhere in this file and are cross-referenced rather than restated. Every entry
+was re-checked against `main` rather than taken from the PR text.
+
+- [x] **1. A `...rest` function refused an unknown long flag.** A plain `func`
+      scanned every `--`-leading argument against its signature, which broke both
+      kinds of rest parameter — one holding a delegated command's options
+      (`setx curl --location URL`), one holding data that merely looks like an
+      option (`bak --weird-name`, `error "--x is unset"`). Neither is a flag
+      *that* function owns. Fixed by `wrapper func` (mikelward/mesh#286) and the
+      terser `alias NAME = COMMAND` (mikelward/mesh#289); the config is 130
+      aliases and 53 wrappers on the far side of it.
+- [ ] **2. `VAR=value cmd` is a syntax error.** No one-command environment
+      prefix, so every occurrence becomes `fork { $env.VAR = …; cmd }` — three
+      lines and a process for what is one word in every other shell. The config's
+      `ssh-to` (`LC_CLIENT_HOST`) and `xr` (`DISPLAY`) both pay it.
+- [ ] **3. Negating a *command's* status has no spelling.** `if not cmd` is
+      ``syntax error: expected `{` `` — `not` starts a **value**, deliberately, so
+      it never claims `not foo`. Together with 15 below that leaves no direct way
+      to branch on "this command failed": the command has to run as a statement,
+      `$sh.status` be read into a name, and the `if` test that. Predicates written
+      as value functions (`if not have-command(x)`) are fine; it is the external
+      command that has nowhere to go.
+- [ ] **4. A `/…/` regex literal ends at the first `[`, `(`, `{`, `|`, `:`, `,`,
+      `;`, `<`, `>` or `&`.** Already tracked under "Loose ends" as *A bare `/…/`
+      literal cannot hold a space or an unbalanced paren*. The port adds the
+      character class, which is the shape a config reaches for first, and the
+      observation that the failure is **silent**: `if $x ~ /[A-Za-z]/ { … }` runs
+      `$x` as a command and takes the `else` branch rather than reporting
+      anything. `re("[A-Za-z]")` is the workaround, used throughout.
+- [ ] **5. `$env[$name] = value` — no dynamically-named environment write.**
+      `$env:get(NAME, default)` reads by computed name and has no writing twin, so
+      a generic "parse this tool's `shellenv` output and apply it" helper cannot be
+      written at all; every tool's variables have to be named literally, which is
+      why `setup-fnm` and `setup-brew` are each hand-written.
+- [ ] **6. A syntax error carries no line or column, and there is no parse-only
+      flag.** A broken file reports `syntax error: unexpected end of input` and
+      nothing else, so locating one in an 1800-line config means bisecting it. The
+      second half bites harder than the first: a config that *generates* mesh
+      source (see 26) has no way to check the generated file before sourcing it,
+      so its only test is whether sourcing it breaks the shell.
+- [ ] **7. No terminal width.** `$sh` has no `width`, so the prompt's rule costs
+      one `tput cols` **fork per prompt** — measured at 2.6ms against 2.0ms for
+      the whole prompt composition path, so the decoration costs more than what it
+      decorates. Needs a `TIOCGWINSZ` read and a `SIGWINCH` refresh, not just a
+      field.
+- [ ] **8. No way to set the window title.** OSC 0 landed as an automatic
+      `user@host: dir` (§"Beyond M3 — Terminal integration") with
+      `$sh.options.osc-title` to turn it off, but there is no way for a config to
+      *supply* the text — so the choice is mesh's title or no title.
+- [ ] **9. A newline inside an unclosed `(…)` ends the expression** unless it
+      follows an operator, so a two-line `x = (1` / `+ 2)` is
+      ``syntax error: expected `)` `` where `docs/REFERENCE.md` reads as
+      continuing. Either the parser or the reference is wrong; decide which.
+- [ ] **10. `"$var.suffix"` in a string is member access, not text.**
+      `"$file.bak"` looks up `bak` in `$file` and fails with `value is not a map`
+      — at **runtime**, so a rarely-taken branch carries it silently until it is
+      taken. `"${file}.bak"` is the fix, and the brace is easy to forget precisely
+      because every other shell makes it optional here.
+- [ ] **11. An argument-taking modifier cannot be interpolated.**
+      `"$env:get(HOME, none)"` does not call the modifier; the name has to be
+      bound first. Walked into four separate times in one port, which is the usual
+      sign that the diagnostic should name the rule.
+- [ ] **12. No whitespace-run tokenizer.** `:split(SEP)` takes a literal separator
+      and keeps interior empties (`"a   b":split(" "):len` is 4), so every
+      column-padded output — `getent`, `ip -o`, `df`, `stat` — needs a
+      hand-written `fields()` helper that splits and drops empties. bash's
+      `read a b c` and fish's `string split -n` both do this for free; it is the
+      most-copied helper in the port.
+- [x] **13. A function whose last statement was a `match` swallowed its own
+      earlier stdout when called for a value.** `confirm("ok")` returned the right
+      answer with no prompt printed. Fixed in 77dca06, "Stop `if` and `match`
+      capturing a value block's stdout".
+- [ ] **14. No `$sh.uid`.** The root check that picks the prompt's `#` / `$`
+      glyph runs on every render, and bash, zsh and fish each answer it from their
+      own `$UID` for free. The config forks `id -u` once at startup and exports
+      the answer rather than paying a fork per prompt — a cache it should not have
+      to keep.
+- [ ] **15. `$sh.status` is cleared while an `if` condition is evaluated**, so it
+      reads `0` in *both* arms and a command used as a condition cannot have its
+      status inspected afterwards — `if sh -c "exit 3" { … } else { … }` reports
+      `status=0` in the else branch. The cost is not the branch but the detail: a
+      `130` from Ctrl-C flattens to a generic failure, so `trydiff`, `applydiff`
+      and `isort` each run their command as a plain statement and capture
+      `$sh.status` before branching.
+- [ ] **16. No path-resolving modifier.** `:type` reports `link` but nothing
+      resolves one, so `realdir` shells out to `readlink -f` — a fork for
+      something the shell already has the syscall for. A `:real` / `:resolve`
+      alongside the existing path modifiers is the obvious shape.
+- [ ] **17. A value call scans an argument by its *runtime* value.** `f($word)`
+      reports ``unknown flag `--sleep` `` when `$word` happens to hold
+      `--sleep=0`, so data that merely looks like a flag cannot be passed to a
+      plain `func` at all. This is 1 again, one level down: `wrapper func` fixed
+      the *command* position, and a value call still has no equivalent.
+- [ ] **18. A bare `...$list` in command position runs nothing.** `xs = [echo hi]`
+      followed by `...$xs` produces no output and no error — the head has to be
+      bound out and used as the command word. The condition half of this —
+      `if ...$rest` taking the branch without invoking anything — was fixed in
+      03c22a9, "Make a condition a bool or a command, with no truthy values", and
+      is now a loud `a list is not a condition`; command position is what remains.
+- [ ] **19. "Parse my own leading option, forward everything after" has no
+      spelling.** A `wrapper func` may declare no flags at all —
+      ``a `wrapper func` parses no flags, so it cannot declare `--times` `` — and a
+      plain `func` scans a declared flag against the **whole** argument list, so
+      `retry --times=2 curl --fail URL` is rejected for curl's `--fail`. `retry`,
+      `body` and `recent` each read their own option off the front by hand, in all
+      three spellings (`-N`, `--opt N`, `--opt=N`) — the shape bash gets from a
+      `case $1 in` and a `shift`.
+- [ ] **20. A bare `-2` argument arrives as the integer `-2`**, not the string
+      that was typed, so string modifiers refuse it — `:len` answers
+      `requires a string or collection` — and `~` errors outright, saying its
+      left operand must be a string. `body`, `recent` and `shift-options` each
+      classify a text copy and then forward the original argument.
+- [ ] **21. `files` is a reserved value-call name, so the shortcut cannot be
+      written.** `alias files = package files` is a *syntax error* — `files` is a
+      built-in value call and cannot be a function name — rather than a
+      shadowing, and `re`, `style`, `link`, `glob` and `dirs` are the same.
+      The other three shells in that config all define this shortcut; mesh has no
+      spelling for it, which makes it the one name the port had to drop rather
+      than translate.
+- [ ] **22. An alias cannot be tab-completed.** `co --` offers nothing:
+      completion builds a spec from a function's generated help, which a wrapper
+      leaves empty by design, and it cannot fall back to probing because the name
+      is a function rather than a program on `PATH`. Since `alias` exists to make
+      forwarding terse, every alias in a config is a name the shell can run and
+      cannot complete. Related to the open `$sh.complete` item under "Beyond M3 —
+      Interactive completion", though the likelier fix is that a wrapper's spec
+      should be the spec of whatever it forwards to.
+- [ ] **23. `'…'` is not literal, which surprises on paste.** mesh processes
+      escapes inside single quotes as well as double, so a pasted sed/awk/grep
+      program is a *syntax error* (`invalid escape \(`) rather than a working
+      command. `r'…'` is the right answer and works — the edge is that the failure
+      arrives on paste, which is exactly when the reader is least likely to know
+      the raw form exists, and that the diagnostic does not mention it. A mesh
+      string is also single-line, so a multi-line sed script still has to be split
+      across `-e` expressions.
+- [ ] **24. No NUL-delimited read.** `gets` takes no delimiter and `"\0"` is
+      `invalid escape`, so `find -print0 | while read -d ''` has no translation.
+      `each0` delegates to `xargs -0` instead, which means it can only run
+      **programs** where its sibling `each` can call a mesh function — the one
+      capability gap between the pair.
+- [ ] **25. A value function's exit status cannot be reached, and `$(f)` around
+      one captures nothing.** `y = $(v)` on a value function binds the empty
+      string, so bash's `find_up x && …` has no mesh spelling; a falsy return
+      value stands in, which is why `find-up` answers `""` on a miss rather than a
+      status. `"$(f(x))"` inside a string silently yields nothing too. Related to
+      the open *`$( … )` around a value-producing statement* item under "Loose
+      ends".
+- [ ] **26. No `eval` and no dynamically-named `func`**, so "define one function
+      per name in this list" — what a VCS-subcommand loop and an ssh-host alias
+      loop both do — has to write a file and source it. That turns a private
+      in-memory definition into **shared mutable state on disk**: the port had to
+      handle a concurrent second shell, a partial write, a stale generation, an
+      unreadable input, a directory sitting at the target path, and a 0600 file
+      mode for definitions derived from an ssh config — none of which `eval` has.
+      A `func` bound to a computed name, or a way to define into the function
+      table from a value, would retire all of it.
+- [ ] **27. Three separate rules decide what can be a function name, and only one
+      of them is a runtime error.** A leading underscore is a syntax error
+      (`expected a name`, so `_exit` became `safe-exit`), a dot is a syntax error
+      (recorded in `DESIGN.md`, mikelward/mesh#293), a built-in value call is a
+      third (``syntax error: `files` is a built-in value call``), and a reserved
+      word is the milder runtime one (``func: `puts` is a reserved name``).
+      Because the first three are *parse* errors, one bad name in a generated file
+      (26) costs **every** definition in it — which is why the ssh-host generator
+      filters names through `type -t` before emitting rather than emitting and
+      hoping. The underscore rule is the icebox item *Reserve only bare `_` as
+      discard, allow `_name`* reached from a second direction.
+- [ ] **28. A failing capture does not bind the name, and execution continues.**
+      The single most costly edge in the port. `x = $(sh -c "echo x; exit 3")`
+      leaves `x` **unbound** and discards the output, so the next `$x` fails with
+      `unbound variable` — and then carries on, so the symptom is a confusing
+      second error rather than a stop. In a `for`
+      head it silently iterates nothing, with no error at all. `$sh.status` is set
+      correctly in both, but the guard has to come *before* the value is read, and
+      `and` does not short-circuit past an unbound read. Every "look it up, fall
+      back if there is nothing" shape needs one; the config named the guard
+      `capture-or-empty` and uses it wherever a miss is routine (`getent` exiting
+      2, `dig` exiting 9, `pgrep` exiting 1). Worth deciding whether a failing
+      capture should bind the output it *did* produce, as bash does, or stop.
+- [ ] **29. `source` reports failure only through the status, and a file's status
+      is its last statement's.** So a sequence of sources has to be gated by hand
+      — an `env.mesh` that stopped parsing followed by an `rc.mesh` that still
+      does would report success over a shell holding the old `PATH` — *and* a
+      failure nested inside a sourced file has to be reported where it happens,
+      because by the time control returns every later statement has overwritten
+      the evidence. Both local-override files in the config carry a report at the
+      point of failure for that reason.
+- [ ] **30. No force-interactive flag**, tracked as `-i` under "Beyond M3 —
+      Invocation" (`mesh -i -s` is `unknown option -i` today). The port adds what
+      it costs a config: nothing past `return unless $sh.interactive` can be
+      exercised without a pty, so everything with behavior worth asserting has to
+      be a named function defined *above* that line, with the interactive section
+      reduced to calling them. That is a defensible arrangement, but it is
+      currently the only testable one.
+
 ## Loose ends
 
 Small items rescued from pull requests that were closed as superseded — the bulk
