@@ -2305,6 +2305,28 @@ was re-checked against `main` rather than taken from the PR text.
 Small items rescued from pull requests that were closed as superseded — the bulk
 of each PR had landed by another route, but these pieces had not.
 
+- [ ] **Decide whether a non-interactive shell should start process groups for
+      its pipelines.** `run_pipeline` takes its job-control decision from
+      `shell_stdin_is_terminal()` (`exec.rs`) — an `isatty` on the shell's saved
+      stdin — rather than from anything about the session. So `mesh -c 'sleep 30'`
+      launched from a terminal puts the child in a **group of its own**, though
+      that shell never acquired the terminal: it did not take the foreground group
+      and did not configure the terminal signals.
+
+      The consequence is that a `SIGINT` sent to the invocation's process group
+      reaches mesh but *misses* the child, killing the shell and orphaning what it
+      launched. Measured under a pty, printing the child's group: the shell's own
+      is `26730`, and both `mesh -c` and `mesh -i -c` answer a fresh group
+      (`26737`, `26742`).
+
+      The narrower case — a `fork` block — was fixed by asking
+      `Vars::owns_terminal` instead of `Vars::interactive` (mikelward/mesh#307),
+      which is the shape the answer here probably takes too. It is separate work
+      because it changes behavior for **every** batch invocation on a terminal,
+      not just a forced-interactive one, and because "should a script's children
+      be interruptible as a unit" is a question worth answering deliberately
+      rather than as a side effect. Raised by review on that PR.
+
 - [ ] **If the syntactic capture-status rule proves too narrow, carry the status
       as evaluation metadata instead.** An assignment takes its right-hand side's
       capture status only when that side syntactically *is* a capture
