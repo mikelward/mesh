@@ -57,6 +57,11 @@ pub enum Modifier {
     /// has no literal form is an error rather than an approximation — see
     /// [`Value::to_literal`](crate::vars::Value::to_literal).
     Repr,
+    /// `:real` — the path with every symlink, `.` and `..` resolved, absolute.
+    /// Grouped with the path components in `DESIGN.md` and maps over a list like
+    /// them, but it is the one that **asks the filesystem** rather than slicing
+    /// the string, so it can fail where they cannot.
+    Real,
     // File tests: `-e`, `find -type`, `-r`, `-w`. Scalar questions about one path,
     // mapping element-wise over a list like the transforms above.
     Exists,
@@ -85,6 +90,7 @@ impl Modifier {
             "exts" => Self::Exts,
             "stem" => Self::Stem,
             "bare" => Self::Bare,
+            "real" => Self::Real,
             "len" => Self::Len,
             "tty" => Self::Tty,
             "first" => Self::First,
@@ -1104,6 +1110,38 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 message: "requires a string".into(),
             }),
         },
+        // Resolving is a syscall, not string surgery: every component on the way
+        // has to exist for the kernel to follow it, so a path that is not there has
+        // no real path to report and this errors rather than inventing one. `:type`
+        // is the other file modifier that errors, for the same reason — the
+        // remaining ones answer a yes/no question, which a missing file can still
+        // answer with `false`. The error carries the OS's own words, so a resolvable
+        // path refused for permissions does not read as a missing one.
+        Modifier::Real => match value {
+            Value::String(path) => std::fs::canonicalize(&path)
+                .map(|resolved| Value::String(resolved.to_string_lossy().into_owned()))
+                .map_err(|error| ExpandError::Modifier {
+                    name: name.into(),
+                    message: format!("`{path}`: {error}"),
+                }),
+            Value::List(values) => values
+                .into_iter()
+                .map(|value| apply_modifier(value, modifier))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::List),
+            Value::Map(_)
+            | Value::Styled(_)
+            | Value::Integer(_)
+            | Value::Boolean(_)
+            | Value::Regex(_)
+            | Value::Glob(_)
+            | Value::Stream(_)
+            | Value::Job(_)
+            | Value::Function(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a path".into(),
+            }),
+        },
         // A file test asks one question of one path, so on a list it maps
         // element-wise like any other value modifier.
         Modifier::Exists | Modifier::Type | Modifier::Read | Modifier::Write => match value {
@@ -1449,6 +1487,7 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::Exts => "exts",
         Modifier::Stem => "stem",
         Modifier::Bare => "bare",
+        Modifier::Real => "real",
         Modifier::Len => "len",
         Modifier::First => "first",
         Modifier::Last => "last",
@@ -1583,7 +1622,10 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         Modifier::Lower => value.to_lowercase(),
         Modifier::TrimStart => value.trim_start().to_string(),
         Modifier::TrimEnd => value.trim_end().to_string(),
-        Modifier::Int
+        // A path component in `DESIGN.md`'s table, but it reads the filesystem and
+        // can fail, so it is handled where a `Result` is available rather than here.
+        Modifier::Real
+        | Modifier::Int
         | Modifier::Words
         | Modifier::Len
         | Modifier::First
