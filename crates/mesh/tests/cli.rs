@@ -12760,6 +12760,52 @@ puts $dot:exts $dot:bare
 }
 
 #[test]
+fn real_resolves_symlinks_and_dot_segments_to_an_absolute_path() {
+    // The `readlink -f` a config otherwise forks for, on a syscall the shell
+    // already has. Rough edge 16 from the config port.
+    let dir = fresh_dir("real_modifier");
+    let target = dir.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::os::unix::fs::symlink(&target, dir.join("link")).unwrap();
+    // The temp root may itself sit under a symlink, so compare against the
+    // resolved answer rather than the path we built.
+    let resolved = std::fs::canonicalize(&target).unwrap();
+    let resolved = resolved.display();
+
+    // Quoted: a bare `..` is the range operator, so a dot-segment path is written
+    // as the string it is.
+    let out = run_with_input(&format!(
+        "p = \"{}/./target/../link\"\nputs $p:real\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{resolved}\n"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A path modifier, so it maps element-wise over a list.
+    let listed = run_with_input(&format!(
+        "ps = [{0}/link {0}/target]\nputs ...$ps:real\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        format!("{resolved} {resolved}\n")
+    );
+
+    // Resolving is a syscall, so a path that is not there has no answer to give
+    // and this errors rather than inventing one — as `:type` does, and unlike the
+    // yes/no file tests, which a missing file can still answer with `false`.
+    let missing = run_with_input(&format!("puts {}/nope:real\n", dir.display()));
+    assert!(!missing.status.success());
+    let err = String::from_utf8_lossy(&missing.stderr);
+    assert!(err.contains(":real:"), "{err}");
+    assert!(err.contains("nope"), "{err}");
+}
+
+#[test]
 fn value_modifiers_recurse_through_nested_lists() {
     let out = run_with_input("xs = [[a b] c]\nys = $xs:upper\nputs ...$ys[0]\nputs $ys[1]\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "A B\nC\n");

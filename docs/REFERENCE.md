@@ -1775,6 +1775,7 @@ a different failure from an unknown name, which never parses.
 | `:exts` | string or list | All extensions, without the first dot. |
 | `:stem` | string or list | Basename without the last extension. |
 | `:bare` | string or list | Basename without any extensions. |
+| `:real` | path or list | The path with every symlink, `.` and `..` resolved, absolute. Errors on a path it cannot resolve. |
 | `:upper` / `:lower` | string or list | Change case; maps over list elements. |
 | `:int` | string | Parse an integer, failing loudly on invalid input. |
 | `:len` | string, list, or map | Character, element, or entry count as an integer. |
@@ -1819,6 +1820,9 @@ Every file modifier **dereferences symlinks**, as `test` does, so a live link is
 are the two that exist to ask about the link itself: `:links`, and `:type`, which
 reports `link`. `:type` is the only file modifier that **errors** on a path that
 is not there — the others answer `false`, but a missing file has no type word.
+`:real` errors for the same reason: resolving is a syscall, and every component
+on the way has to exist for the kernel to follow it, so an unresolvable path has
+no real path to report rather than a `false` to give.
 Note that a searchable directory carries the execute bit, so `:exec` alone keeps
 directories; `:f:x` is the executable-files idiom. List results retain their type: use `...$xs:rest` in command position,
 or bind them directly with `ys = $xs:rest`.

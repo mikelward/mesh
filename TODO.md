@@ -2078,7 +2078,7 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Six have since been fixed; two are tracked
+matched back to the discussion. Seven have since been fixed; two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
 
@@ -2172,10 +2172,17 @@ was re-checked against `main` rather than taken from the PR text.
       passed through. A *value* condition is exempt: a bool is not a command and
       has no status to report, so it leaves the previous command's standing, as a
       skipped guard does. A pipeline condition keeps its per-stage breakdown.
-- [ ] **16. No path-resolving modifier.** `:type` reports `link` but nothing
-      resolves one, so `realdir` shells out to `readlink -f` — a fork for
-      something the shell already has the syscall for. A `:real` / `:resolve`
-      alongside the existing path modifiers is the obvious shape.
+- [x] **16. No path-resolving modifier.** `:type` reported `link` but nothing
+      resolved one, so `realdir` shelled out to `readlink -f` — a fork for
+      something the shell already has the syscall for.
+
+      **Fixed** by `:real`, the name `DESIGN.md` had specified for it all along
+      (§"Path components"). It resolves every symlink, `.` and `..` and answers
+      an absolute path, and maps over a list like the other path modifiers. It
+      **errors** on a path it cannot resolve rather than inventing one: the kernel
+      has to be able to follow every component, so there is no partial answer to
+      give — the same reason `:type` errors where the yes/no file tests answer
+      `false`.
 - [ ] **17. A value call scans an argument by its *runtime* value.** `f($word)`
       reports ``unknown flag `--sleep` `` when `$word` happens to hold
       `--sleep=0`, so data that merely looks like a flag cannot be passed to a
