@@ -418,7 +418,9 @@ mesh$ <strong>puts $count</strong>
 A capture works in an argument too (`puts $(pwd)`), and inside `"…"`, which is
 how you glue it to text: `puts "$(id -un)@$(hostname)"`. What comes back is one
 literal value — never re-split, never re-globbed — and a capture whose command
-fails stops the statement rather than substituting nothing.
+fails still hands back what it printed, since a nonzero exit is often the answer
+rather than an error (`diff` says 1 when files differ). Bind it with
+`if out = $(cmd) { … } else { … }` when you care which it was.
 
 ## Writing the environment
 

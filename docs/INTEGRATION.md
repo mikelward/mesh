@@ -254,14 +254,22 @@ parts that are a keybinding do not.
 **Works today.** Anything where fzf's output is a command's *argument*:
 
 ```mesh
-func fcd() { cd $(fd --type d | fzf) }         # Alt-C, as a command
-func fv()  { vim $(fzf) }                      # Ctrl-T, as a command
+func fcd() {                                   # Alt-C, as a command
+  if dir = $(fd --type d | fzf) { cd $dir }
+}
+func fv() {                                    # Ctrl-T, as a command
+  if file = $(fzf) { vim $file }
+}
 ```
 
 Full-screen handoff works, so fzf draws and restores correctly. A canceled fzf
-exits nonzero, and mesh's rule that
-[a failing capture stops the statement](REFERENCE.md#command-substitution--)
-does exactly the right thing: `cd` never runs on an empty selection.
+exits nonzero (130) having printed nothing, so the selection is **guarded on the
+status**: [a capture hands back its output whatever the command
+exited with](REFERENCE.md#command-substitution--), so an unguarded
+`cd $(fd --type d | fzf)` would run `cd ""` on a cancel and report a path error
+for a path the user never asked for. `if dir = $(…)` binds the selection and
+branches on fzf's status in one line, which is the same shape bash's
+`if dir=$(…); then` has.
 
 `FZF_DEFAULT_OPTS` and friends are ordinary environment writes.
 

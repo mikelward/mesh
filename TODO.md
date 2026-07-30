@@ -2247,18 +2247,22 @@ was re-checked against `main` rather than taken from the PR text.
       filters names through `type -t` before emitting rather than emitting and
       hoping. The underscore rule is the icebox item *Reserve only bare `_` as
       discard, allow `_name`* reached from a second direction.
-- [ ] **28. A failing capture does not bind the name, and execution continues.**
+- [x] **28. A failing capture did not bind the name, and execution continued.**
       The single most costly edge in the port. `x = $(sh -c "echo x; exit 3")`
-      leaves `x` **unbound** and discards the output, so the next `$x` fails with
-      `unbound variable` — and then carries on, so the symptom is a confusing
-      second error rather than a stop. In a `for`
-      head it silently iterates nothing, with no error at all. `$sh.status` is set
-      correctly in both, but the guard has to come *before* the value is read, and
-      `and` does not short-circuit past an unbound read. Every "look it up, fall
-      back if there is nothing" shape needs one; the config named the guard
-      `capture-or-empty` and uses it wherever a miss is routine (`getent` exiting
-      2, `dig` exiting 9, `pgrep` exiting 1). Worth deciding whether a failing
-      capture should bind the output it *did* produce, as bash does, or stop.
+      left `x` **unbound** and discarded the output, so the next `$x` failed with
+      `unbound variable` — and then carried on, so the symptom was a confusing
+      second error rather than a stop. In a `for` head it silently iterated
+      nothing, with no error at all.
+
+      **Fixed:** a capture now yields its bytes whatever the command exited with,
+      and an assignment takes its right-hand side's capture status, so
+      `if out = $(diff old new) { … } else { puts $out }` reads as it does in
+      bash — the status picks the branch and the output is there on the one that
+      needs it. Discarding was never right: a nonzero exit is routinely a
+      *result*, not an error (`diff` exits 1 with the diff on stdout, `timeout`
+      124 over what it printed first), so the bytes thrown away were the answer.
+      With several captures in one right-hand side the last decides, as in bash.
+      `capture-or-empty` is no longer needed for this.
 - [ ] **29. `source` reports failure only through the status, and a file's status
       is its last statement's.** So a sequence of sources has to be gated by hand
       — an `env.mesh` that stopped parsing followed by an `rc.mesh` that still
@@ -2279,6 +2283,28 @@ was re-checked against `main` rather than taken from the PR text.
 
 Small items rescued from pull requests that were closed as superseded — the bulk
 of each PR had landed by another route, but these pieces had not.
+
+- [ ] **If the syntactic capture-status rule proves too narrow, carry the status
+      as evaluation metadata instead.** An assignment takes its right-hand side's
+      capture status only when that side syntactically *is* a capture
+      (`capture_tail` in `repl.rs`), which is what makes the rule leak-proof: there
+      is no shared state, so nothing can smuggle a status out of an expression that
+      merely ran a capture along the way.
+
+      The first attempt did use shared state — an `Option<u8>` on `Shell`, cleared
+      and consumed by whoever needed it — and review found **five** separate escape
+      routes for it in a row: a callee's body, `$env.K =` / `$m.k =`, a capture
+      interpolated into a command, a list-pattern condition, and an argument to a
+      command-form `:capture`. Each fix was another clear site, and the next probe
+      found the next one. That is the record worth keeping: the mechanism was the
+      bug, not the sites.
+
+      The alternative, if the syntactic rule ever needs to answer for an expression
+      it currently reports `0` for, is to thread the status through `eval_expr` as
+      part of the evaluation result (`{ value, capture }`) so it follows the value
+      rather than the shell. That is the general answer and it costs ~46 call sites;
+      the syntactic rule is one function and covers every case anyone has wanted so
+      far. Do not go back to a slot on `Shell` — that is the shape that failed.
 
 - [x] **A value expression can be a command argument.** `puts (1 + 2)`, `puts $(pwd)`,
       `ls $(pwd)`, `puts style(x, fg: red)`, `puts f()` and `puts pwd():capture` all
