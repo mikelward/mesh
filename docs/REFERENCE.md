@@ -1734,8 +1734,8 @@ reading as text. A `[…]` literal's `key:` is a map key, not a chain on the key
 The chain also outranks keyword parsing, so `if:upper` is `IF` rather than the
 start of a conditional; `if :upper` — with the space — is still the keyword.
 
-A name mesh **reserves** for a modifier it has not built yet — `:sort`, `:words`,
-`:lines`, `:replace`, and the rest of the `DESIGN.md` set — parses, then reports a
+A name mesh **reserves** for a modifier it has not built yet — `:sort`, `:lines`,
+`:replace`, and the rest of the `DESIGN.md` set — parses, then reports a
 loud `not implemented yet` in a value context rather than a silent no-op. That is
 a different failure from an unknown name, which never parses.
 
@@ -1764,6 +1764,7 @@ a different failure from an unknown name, which never parses.
 | `:values` | map | Values as an insertion-ordered list. |
 | `:repr` | any value with a literal form | The value written as the mesh source you would have typed for it, as a string. |
 | `:tty` | stream handle | Is that stream a terminal? The `test -t N` replacement — see [`$sh.args` and `$sh.name`](#shargs-and-shname). |
+| `:words` | string | Split on runs of whitespace into a list — the IFS word-split. Never yields an empty element. |
 | `:split(SEP)` | string | Split on the literal separator into a list. |
 | `:join(SEP)` | list | Fold the list into a string, `SEP` between elements. |
 | `:get(KEY, DEFAULT)` | map or list | **Total** access — `DEFAULT` when the key or index is absent. |
@@ -1836,6 +1837,30 @@ empty or all-separator string is the empty list. The two are not exact inverses:
 because `:split` trims a trailing empty field, `:join` then `:split` round-trips
 losslessly only when the list has no empty final element (`[a ""]:join(":")` is
 `"a:"`, which splits back to `[a]`).
+
+`:words` is the other member of that family built so far, and takes no argument:
+it splits on **runs** of whitespace and yields no empty element anywhere — leading,
+trailing and interior runs are each one boundary, so `"  a   b ":words` is
+`[a b]`. That is the difference from `:split(" ")`, which would answer
+`["" "" a "" "" b]` on the same string, and it is what makes `:words` the way to
+read column-padded output: `getent`, `ip -o`, `df` and `ps` all align their
+columns, so every index after the first is wrong under a literal split. It is
+bash's `read a b c` and awk's default `FS`, and it composes with list-pattern
+binding the same way:
+
+```mesh
+[user _ uid] = $line:words       # take a padded line apart positionally
+count = $line:words:len          # how many columns
+```
+
+The whitespace is the **ASCII** set (` `, `\t`, `\n`, `\r`, and the vertical and
+form feeds). A non-breaking space is *data* — it appears inside filenames — so it
+stays in the field rather than splitting it.
+
+Both are **split** modifiers, which consume exactly one string: neither maps
+element-wise over a list, and a list subject is a loud `requires a string`. To
+take a list of lines apart, hand `:words` over as a callable — `$lines:map(:words)`
+— which works because it takes no argument.
 
 `:get(KEY, DEFAULT)` is the **total** accessor, where `$m.key` and `$xs[i]` fail
 loud: it answers `DEFAULT` when the key or index is absent, which is what makes

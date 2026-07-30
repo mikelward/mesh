@@ -2141,12 +2141,13 @@ was re-checked against `main` rather than taken from the PR text.
       `"$env:get(HOME, none)"` does not call the modifier; the name has to be
       bound first. Walked into four separate times in one port, which is the usual
       sign that the diagnostic should name the rule.
-- [ ] **12. No whitespace-run tokenizer.** `:split(SEP)` takes a literal separator
+- [x] **12. No whitespace-run tokenizer.** `:split(SEP)` takes a literal separator
       and keeps interior empties (`"a   b":split(" "):len` is 4), so every
-      column-padded output — `getent`, `ip -o`, `df`, `stat` — needs a
-      hand-written `fields()` helper that splits and drops empties. bash's
-      `read a b c` and fish's `string split -n` both do this for free; it is the
-      most-copied helper in the port.
+      column-padded output — `getent`, `ip -o`, `df`, `stat` — needed a
+      hand-written `fields()` helper that split and dropped empties. It was the
+      most-copied helper in the port. **Fixed** by `:words`, the name `DESIGN.md`
+      had specified for it all along; the config's helper is gone and its six
+      call sites are a modifier chain.
 - [x] **13. A function whose last statement was a `match` swallowed its own
       earlier stdout when called for a value.** `confirm("ok")` returned the right
       answer with no prompt printed. Fixed in 77dca06, "Stop `if` and `match`

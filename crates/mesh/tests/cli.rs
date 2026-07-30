@@ -13551,6 +13551,75 @@ fn split_operates_on_the_trimmed_capture_value() {
 }
 
 #[test]
+fn words_splits_a_column_padded_line_into_its_columns() {
+    // The case `:words` exists for: `getent`, `ip -o` and `df` all pad their
+    // columns, so `:split(" ")` on one of their lines yields empty fields between
+    // the real ones and every index after the first is wrong.
+    let out = run_with_input(
+        "line = \"root   x  0  0\"\nputs $line:split(\" \"):len\nputs $line:words:len\nputs $line:words:get(2, \"-\")\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "8\n4\n0\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn words_ignores_leading_and_trailing_whitespace() {
+    // Unlike `:split`, which drops only the *trailing* empty run, `:words` yields
+    // no empty element at either end.
+    let out = run_with_input("a = \"  x y  \"\nputs $a:words:len\nputs $a:words:first\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\nx\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn words_binds_through_a_list_pattern() {
+    // The shape that replaces bash's `read a b c`, which is what a config reaches
+    // for when it takes a line apart.
+    let out = run_with_input("[user _ uid] = \"root  x   0\":words\nputs \"$user/$uid\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "root/0\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn words_is_a_split_modifier_so_it_refuses_a_list() {
+    // Same rule as `:split`, deliberately: the two are one family, and mapping
+    // element-wise for one and not the other would be a trap. `:map(:words)` is
+    // how a list of lines is taken apart.
+    let out = run_with_input("xs = [\"a b\" \"c d\"]\nys = $xs:words\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("requires a string"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success());
+}
+
+#[test]
+fn words_works_as_a_callable_reference() {
+    // Argument-free, so it is usable as a bare `:mod` reference — which is what
+    // makes the list-of-lines case a one-liner rather than a loop.
+    let out = run_with_input("xs = [\"a  b\" \"c   d\"]\nputs $xs:map(:words):len\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn join_of_a_nested_list_fails_loud() {
     let out = run_with_input("xs = [a b]\nys = [$xs c]\nz = $ys:join(\",\")\n");
     assert!(
