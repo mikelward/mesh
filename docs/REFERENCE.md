@@ -14,6 +14,7 @@ mesh script.mesh a b c     # run a script; a b c become $sh.args
 mesh -c "puts hi" a b      # run a command string; a b become $sh.args
 mesh -s a b                # read commands from stdin, even on a terminal
 mesh -i                    # interactive session whatever stdin is
+mesh -n script.mesh        # check for syntax errors, run nothing
 mesh -l / --login          # login shell (also sources login.mesh)
 mesh --rcfile FILE         # use FILE instead of rc.mesh
 mesh --norc                # skip rc.mesh
@@ -31,10 +32,32 @@ run a line editor on, so `mesh -i` off a terminal reads stdin the way it always
 did, just as an interactive session. That is what makes the half of a config
 behind `return unless $sh.interactive` testable without a pty.
 
+**`-n`** (`--no-execute`) parses the input, reports the first thing wrong with
+it, and runs nothing — the `sh -n` of other shells. Silent on success, `2` on a
+syntax error, so it composes:
+
+```mesh
+mesh -n generated.mesh && source generated.mesh
+```
+
+It checks interpolated **heredoc bodies** too. The parser treats a body as data
+delimited by a line, so a file whose heredoc holds a malformed `${bad` parses
+clean and is rejected on the way in — after everything before it has run. The
+check looks inside; it does not resolve anything, so an unbound variable in a
+body is a runtime failure rather than a syntax error.
+
+It **skips the startup files**. `env.mesh` is ordinary mesh code, so sourcing it
+to check an unrelated file would run arbitrary commands, which is the one thing
+the flag promises not to do — and the check then answers for the named input
+alone rather than for the reader's environment.
+
 **Option parsing stops at the first operand**, as in POSIX shells, so a script's
 own flags reach the script rather than mesh: `mesh deploy.mesh --login` passes
 `--login` along in `$sh.args`. Use `--` to end option parsing when a script's
-name itself looks like an option.
+name itself looks like an option. `-s` is not an operand — it says where the
+commands come from and parsing continues, so `mesh -s -n` checks stdin. Its
+operands are `$sh.args`, since the input is already settled and there is no
+script to name.
 
 A script is read and parsed as a single unit, so a syntax error anywhere in the
 file rejects the whole thing and nothing runs. A **parse** error says where:

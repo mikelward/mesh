@@ -255,9 +255,15 @@ pub fn run() -> ExitCode {
         Invocation::Print(text) => {
             ExitCode::from(builtins::write_stdout("stdout", text.as_bytes()))
         }
+        Invocation::Command(text) if options.no_execute => check_syntax(text, &options),
         Invocation::Command(text) => run_batch(&text.clone(), &options),
         Invocation::Script(path) => match read_script(path) {
+            Ok(text) if options.no_execute => check_syntax(&text, &options),
             Ok(text) => run_batch(&text, &options),
+            Err(code) => ExitCode::from(code),
+        },
+        Invocation::Stdin | Invocation::Default if options.no_execute => match read_all_stdin() {
+            Ok(text) => check_syntax(&text, &options),
             Err(code) => ExitCode::from(code),
         },
         Invocation::Stdin => run_piped(&options),
@@ -267,6 +273,93 @@ pub fn run() -> ExitCode {
             } else {
                 run_piped(&options)
             }
+        }
+    }
+}
+
+/// `-n` — parse the input, report the first thing wrong with it, and run nothing.
+///
+/// Startup files are **skipped**, deliberately. `env.mesh` is ordinary mesh code,
+/// so sourcing it to check an unrelated file would run arbitrary commands — which
+/// is the one thing this flag promises not to do. It also means the check answers
+/// for the named input alone rather than for the reader's environment.
+///
+/// Silent on success, so it composes: `mesh -n generated.mesh && source …`.
+fn check_syntax(text: &str, options: &StartupOptions) -> ExitCode {
+    let mut shell = Shell::new();
+    // For the diagnostic's name only — nothing here runs, so the rest of the
+    // session state is never consulted.
+    let (origin, source) = options.origin(false);
+    shell.vars.set_origin(origin, source);
+    match parser::parse(text) {
+        // A heredoc body is opaque to the parser — it is data, delimited by a
+        // line — so `Complete` does not mean its interpolation is well-formed.
+        // Without this, `-n` passed a file whose `${bad` rejects it on the way in,
+        // *after* every statement before it has run, which is the one thing
+        // `mesh -n f && source f` exists to prevent.
+        Ok(parser::ParseOutcome::Complete(_)) => match check_heredoc_bodies(text, &shell) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(report) => {
+                note!("mesh: {report}");
+                ExitCode::from(2)
+            }
+        },
+        // A whole input that is still open *is* a syntax error, the same reading
+        // `run_line` takes: nothing more is coming.
+        Ok(parser::ParseOutcome::Incomplete(error)) => {
+            note!("mesh: {}{error}", located(text, error.span.start, &shell));
+            ExitCode::from(2)
+        }
+        Ok(parser::ParseOutcome::IncompleteHeredoc(delimiter)) => {
+            note!("mesh: syntax error: heredoc missing its `{delimiter}` delimiter");
+            ExitCode::from(2)
+        }
+        Err(error) => {
+            note!("mesh: {}{error}", located(text, error.span.start, &shell));
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Check every interpolated heredoc body in the input, which the parser passed
+/// over. Bodies are tokens, so this needs the token stream rather than a walk of
+/// the tree, and each one carries the span that locates it.
+fn check_heredoc_bodies(text: &str, shell: &Shell) -> Result<(), String> {
+    // Already parsed once by the caller, so this cannot fail; the second pass
+    // buys the spans without threading tokens back out of `parse`.
+    let Ok(tokens) = parser::tokenize(text) else {
+        return Ok(());
+    };
+    for token in tokens {
+        let parser::TokenKind::HeredocBody(body) = &token.value else {
+            continue;
+        };
+        // A quoted delimiter takes no interpolation at all, so its body is data
+        // and there is nothing to be wrong with.
+        if body.raw {
+            continue;
+        }
+        if let Err(message) = interpolate_heredoc(&body.text, None) {
+            // Located at the body's first line. The scan reports offsets within
+            // the body, which would need threading out to point at the exact
+            // character; naming the heredoc is enough to find it.
+            return Err(format!(
+                "{}{message}",
+                located(text, token.span.start, shell)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read all of stdin, for the checks that take their input whole.
+fn read_all_stdin() -> Result<String, u8> {
+    let mut text = String::new();
+    match io::Read::read_to_string(&mut io::stdin(), &mut text) {
+        Ok(_) => Ok(text),
+        Err(error) => {
+            note!("mesh: stdin: {error}");
+            Err(1)
         }
     }
 }
@@ -346,6 +439,10 @@ struct StartupOptions {
     /// *and* interactive, which is what makes a config's interactive half
     /// testable without a pty.
     interactive: bool,
+    /// `-n` — parse the input and report what is wrong with it, running nothing.
+    /// A syntax check, for a config that *generates* mesh source and today can
+    /// only find out whether it is valid by sourcing it into a live shell.
+    no_execute: bool,
     no_rc: bool,
     rc_file: Option<PathBuf>,
     save_history: bool,
@@ -388,6 +485,7 @@ impl Default for StartupOptions {
         Self {
             login: false,
             interactive: false,
+            no_execute: false,
             no_rc: false,
             rc_file: None,
             save_history: true,
@@ -406,6 +504,7 @@ Options:
   -c COMMAND           Run COMMAND, then exit
   -s                   Read commands from stdin, even on a terminal
   -i                   Interactive session whatever stdin is (sources rc.mesh)
+  -n, --no-execute     Check the input for syntax errors, run nothing
   -l, --login          Run as a login shell (also sources login.mesh)
       --rcfile FILE    Use FILE instead of rc.mesh
       --norc           Skip rc.mesh
@@ -428,6 +527,7 @@ impl StartupOptions {
             match arg.as_str() {
                 "-l" | "--login" => options.login = true,
                 "-i" => options.interactive = true,
+                "-n" | "--no-execute" => options.no_execute = true,
                 "--norc" => options.no_rc = true,
                 "--no-save-history" | "--no-history" => options.save_history = false,
                 "-h" | "--help" => {
@@ -453,15 +553,18 @@ impl StartupOptions {
                     options.args = args.collect();
                     return Ok(options);
                 }
-                "-s" => {
-                    options.invocation = Invocation::Stdin;
-                    options.args = args.collect();
-                    return Ok(options);
-                }
+                // `-s` says where the commands come from; it does not end option
+                // parsing. Collecting the rest here made `mesh -s -n` swallow the
+                // `-n` as an argument and run the input — against this parser's own
+                // rule, which stops at the first *operand*, and against bash, which
+                // honors both orderings. What follows the first operand is this
+                // session's arguments rather than a script name; the operand arm
+                // below knows that from the invocation.
+                "-s" => options.invocation = Invocation::Stdin,
                 // `--` ends option parsing without itself being an operand, so
                 // a script whose name looks like an option can still be run.
                 "--" => {
-                    options.take_operands(args);
+                    options.take_first_operand_onward(args);
                     return Ok(options);
                 }
                 _ if arg.starts_with('-') && arg != "-" => {
@@ -470,12 +573,23 @@ impl StartupOptions {
                 // The first operand is the script; everything after it is an
                 // argument to that script, options included.
                 _ => {
-                    options.take_operands(std::iter::once(arg).chain(args));
+                    options.take_first_operand_onward(std::iter::once(arg).chain(args));
                     return Ok(options);
                 }
             }
         }
         Ok(options)
+    }
+
+    /// Take the operands, which mean different things depending on where the
+    /// commands come from. Under `-s` the input is already settled, so every one
+    /// of them is an argument to this session; otherwise the first names a script.
+    fn take_first_operand_onward(&mut self, operands: impl Iterator<Item = String>) {
+        if self.invocation == Invocation::Stdin {
+            self.args = operands.collect();
+        } else {
+            self.take_operands(operands);
+        }
     }
 
     /// Consume the operand list: the first names the script, the rest are its
@@ -2366,7 +2480,15 @@ fn run_ast_pipeline(
 /// expanded, globbed, or word-split. Only the variable and escape rules a `"…"`
 /// string uses carry over, which is what an unquoted `<< END` promises in
 /// `DESIGN.md`.
-fn interpolate_heredoc(text: &str, vars: &Vars) -> Result<String, String> {
+/// Expand a heredoc body, or — with no `vars` — merely check that it *could* be
+/// expanded.
+///
+/// The checking half is what `-n` needs: the body's escapes and references have
+/// to be well-formed for the file to be valid, but resolving them would need a
+/// session, and an unbound variable is a runtime failure rather than a syntax
+/// error. One walk rather than two, so the check cannot drift from the thing it
+/// is checking.
+fn interpolate_heredoc(text: &str, vars: Option<&Vars>) -> Result<String, String> {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
@@ -2431,8 +2553,12 @@ fn interpolate_heredoc(text: &str, vars: &Vars) -> Result<String, String> {
                     let word = tail.find(char::is_whitespace).unwrap_or(tail.len());
                     end + parser::variable_access_prefix(&tail[..word])
                 };
-                let reference = expansion_variable(&text[i..end], parser::QuoteMode::Double);
-                out.push_str(&expand::resolve(&reference, vars).map_err(|e| e.to_string())?);
+                // Checking stops at "the reference is well-formed"; only an
+                // expansion resolves it.
+                if let Some(vars) = vars {
+                    let reference = expansion_variable(&text[i..end], parser::QuoteMode::Double);
+                    out.push_str(&expand::resolve(&reference, vars).map_err(|e| e.to_string())?);
+                }
                 i = end;
                 continue;
             }
@@ -5887,7 +6013,7 @@ fn expand_redirs(
             let text = if body.raw {
                 body.text
             } else {
-                interpolate_heredoc(&body.text, &shell.vars).map_err(bad)?
+                interpolate_heredoc(&body.text, Some(&shell.vars)).map_err(bad)?
             };
             out.push(exec::Redirection {
                 fd: libc::STDIN_FILENO,
@@ -10789,6 +10915,64 @@ mod tests {
             StartupOptions::parse(["-c"].into_iter().map(str::to_owned)),
             Err("-c requires a command string".to_owned())
         );
+    }
+
+    #[test]
+    fn dash_s_settles_the_input_without_ending_option_parsing() {
+        // Unlike `-c`, `-s` takes no argument of its own, so the options after it
+        // are still mesh's. Collecting them as arguments made `mesh -s -n` run the
+        // input the flag says not to run.
+        for order in [["-s", "-n"], ["-n", "-s"]] {
+            let options = StartupOptions::parse(order.into_iter().map(str::to_owned)).unwrap();
+            assert!(options.no_execute, "for {order:?}");
+            assert_eq!(options.invocation, Invocation::Stdin, "for {order:?}");
+            assert!(options.args.is_empty(), "for {order:?}");
+        }
+
+        // Operands still end it, and under `-s` they are this session's arguments
+        // rather than a script to run — before and after a `--`.
+        for form in [
+            vec!["-s", "a", "-n"],
+            vec!["-s", "--", "a", "-n"],
+            vec!["-s", "--", "--odd-name", "-n"],
+        ] {
+            let options = StartupOptions::parse(form.iter().copied().map(str::to_owned)).unwrap();
+            assert!(!options.no_execute, "for {form:?}");
+            assert_eq!(options.invocation, Invocation::Stdin, "for {form:?}");
+            assert_eq!(options.name, "mesh", "for {form:?}");
+            assert_eq!(options.args, form[form.len() - 2..], "for {form:?}");
+        }
+    }
+
+    #[test]
+    fn dash_n_parses_in_both_spellings_and_pairs_with_any_input() {
+        for spelling in ["-n", "--no-execute"] {
+            let options =
+                StartupOptions::parse([spelling, "check.mesh"].into_iter().map(str::to_owned))
+                    .unwrap();
+            assert!(options.no_execute, "for {spelling}");
+            assert_eq!(
+                options.invocation,
+                Invocation::Script(PathBuf::from("check.mesh"))
+            );
+        }
+
+        // Like `-i`, it says what to *do* with the input rather than where the
+        // input comes from, so it pairs with any of them.
+        let options =
+            StartupOptions::parse(["-n", "-c", "puts hi"].into_iter().map(str::to_owned)).unwrap();
+        assert!(options.no_execute);
+        assert_eq!(
+            options.invocation,
+            Invocation::Command("puts hi".to_owned())
+        );
+
+        // And option parsing still stops at the first operand, so a script's own
+        // `-n` reaches the script.
+        let options =
+            StartupOptions::parse(["check.mesh", "-n"].into_iter().map(str::to_owned)).unwrap();
+        assert!(!options.no_execute);
+        assert_eq!(options.args, ["-n"]);
     }
 
     #[test]
