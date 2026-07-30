@@ -2609,12 +2609,7 @@ fn background_interactive_startup_stops_until_foregrounded() {
         unsafe { libc::_exit(background_startup_harness(&exec)) };
     }
 
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 #[test]
@@ -2625,12 +2620,7 @@ fn new_foreground_job_does_not_receive_sigcont() {
     if harness == 0 {
         unsafe { libc::_exit(sigcont_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 #[test]
@@ -2641,12 +2631,7 @@ fn spawn_failure_returns_terminal_to_interactive_shell() {
     if harness == 0 {
         unsafe { libc::_exit(spawn_failure_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 #[test]
@@ -2707,12 +2692,7 @@ fn an_interactive_shell_marks_where_the_command_ended() {
     if harness == 0 {
         unsafe { libc::_exit(semantic_mark_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// `C` before the command's output and `D` after it, carrying its status.
@@ -2974,12 +2954,7 @@ fn an_interactive_shell_turns_on_bracketed_paste() {
     if harness == 0 {
         unsafe { libc::_exit(bracketed_paste_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// Pasted text is *inserted*, not executed line by line.
@@ -3034,12 +3009,7 @@ fn a_blank_line_is_not_a_command() {
     if harness == 0 {
         unsafe { libc::_exit(blank_line_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// A bare Enter submits nothing, so it gets no marks and fires no hooks.
@@ -3114,12 +3084,7 @@ fn a_jobdone_hook_fires_where_the_done_notice_prints() {
     if harness == 0 {
         unsafe { libc::_exit(jobdone_hook_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// Submit no-op commands until `marker` has been read, or give up.
@@ -3424,12 +3389,7 @@ fn an_abandoned_line_is_closed_without_a_status() {
     if harness == 0 {
         unsafe { libc::_exit(abandoned_line_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// Ctrl-C on a half-typed line ends the input region reedline opened at `B`.
@@ -3481,12 +3441,7 @@ fn ctrl_c_cancels_an_interactive_gets() {
     if harness == 0 {
         unsafe { libc::_exit(gets_interrupt_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 fn gets_interrupt_harness(exec: &MeshExec) -> i32 {
@@ -3551,12 +3506,7 @@ fn an_interactive_shell_reports_where_it_is() {
     if harness == 0 {
         unsafe { libc::_exit(cwd_report_harness(&exec, &directory)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// `OSC 7` at the first prompt and again after the shell moves.
@@ -3628,12 +3578,24 @@ fn an_interactive_shell_titles_the_window() {
     if harness == 0 {
         unsafe { libc::_exit(title_harness(&exec, &directory)) };
     }
+    await_pty_harness(harness);
+}
+
+/// Reap a forked pty harness and name the phase it stopped at.
+///
+/// Each harness returns a distinct code per phase, so that code is the whole
+/// diagnosis — but `waitpid` reports it inside an encoded wait status, where it
+/// is the high byte. Printing the encoded form is how phase 123 reached
+/// `TODO.md` as `0x7b00`, a number nothing in the file explains.
+fn await_pty_harness(harness: libc::pid_t) {
     let mut status = 0;
     assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
     assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
+        libc::WIFEXITED(status),
+        "PTY harness did not exit (wait status {status:#x})"
     );
+    let phase = libc::WEXITSTATUS(status);
+    assert!(phase == 0, "PTY harness failed at phase {phase}");
 }
 
 /// Wait for a path to appear, up to a deadline.
@@ -3670,12 +3632,7 @@ fn a_startup_file_can_turn_a_decoration_off_before_the_first_prompt() {
     if harness == 0 {
         unsafe { libc::_exit(rc_disabled_decoration_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// Where the shell is at the prompt, what it is running while it runs, and back
@@ -3753,12 +3710,7 @@ fn the_title_setting_turns_the_title_off_and_back_on() {
     if harness == 0 {
         unsafe { libc::_exit(title_setting_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// `$sh.options.osc-title` off means *no* title sequence, and on again means the
@@ -3848,12 +3800,7 @@ fn a_session_that_never_titles_writes_no_title_at_all() {
     if harness == 0 {
         unsafe { libc::_exit(no_title_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// Off from the rc file, so the shell never titles anything — **including on the
@@ -3906,12 +3853,7 @@ fn changing_term_does_not_orphan_the_title() {
     if harness == 0 {
         unsafe { libc::_exit(term_change_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// `$env.TERM` is read once, so a session cannot end holding a title it can no
@@ -3962,12 +3904,7 @@ fn clip_copies_through_the_terminal() {
     if harness == 0 {
         unsafe { libc::_exit(clip_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// `clip` reaches the terminal, from an argument and from a pipe.
@@ -4025,12 +3962,7 @@ fn vs_code_gets_its_own_dialect_and_the_command_line() {
     if harness == 0 {
         unsafe { libc::_exit(vscode_dialect_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// Under `TERM_PROGRAM=vscode` the marks are `OSC 633`, they carry the command
@@ -4092,12 +4024,7 @@ fn a_startup_file_can_choose_the_dialect() {
     if harness == 0 {
         unsafe { libc::_exit(startup_dialect_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// The very first prompt already speaks the dialect the startup file asked for.
@@ -4136,12 +4063,7 @@ fn notify_reaches_the_terminal_and_a_quick_command_does_not() {
     if harness == 0 {
         unsafe { libc::_exit(notify_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// `notify` reaches the terminal, and a command that finishes quickly raises
@@ -4217,12 +4139,7 @@ fn a_styled_value_colors_only_what_reaches_the_terminal() {
     if harness == 0 {
         unsafe { libc::_exit(style_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// A styled value emits its attributes only where they can be seen.
@@ -4357,12 +4274,7 @@ fn a_link_reaches_a_terminal_that_parses_osc() {
     if harness == 0 {
         unsafe { libc::_exit(link_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// `OSC 8` on a pty, and the three ways it drops — which are *not* the three ways
@@ -4545,12 +4457,7 @@ fn settings_turn_the_interactive_decorations_off_and_back_on() {
     if harness == 0 {
         unsafe { libc::_exit(decoration_settings_harness(&exec, &directory)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// `$sh.options.cwd-report` and `$sh.options.shell-integration` govern sequences
@@ -4802,12 +4709,7 @@ fn an_interrupt_abandons_a_wait_and_leaves_the_jobs_alone() {
     if harness == 0 {
         unsafe { libc::_exit(wait_interrupt_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 /// A wait blocks on a job that does *not* hold the terminal, so the SIGINT a
@@ -5159,12 +5061,7 @@ fn a_backgrounded_function_leaves_the_terminal_with_the_shell() {
     if harness == 0 {
         unsafe { libc::_exit(background_function_terminal_harness(&exec)) };
     }
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(harness, &mut status, 0) }, harness);
-    assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-        "PTY harness failed with status {status:#x}"
-    );
+    await_pty_harness(harness);
 }
 
 fn background_function_terminal_harness(exec: &MeshExec) -> i32 {
