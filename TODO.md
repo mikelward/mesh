@@ -2503,22 +2503,46 @@ of each PR had landed by another route, but these pieces had not.
       To reproduce under contention, `taskset -c 0 cargo test --workspace` is
       the sharpest form, and is what surfaced the three below.
 
-- [ ] **Three more pty tests fail on a single CPU**, found while fixing the
-      entry above and untouched by it: `a_jobdone_hook_fires_where_the_done_notice_prints`
-      (phase 155, 4 failures in 9 runs), `the_title_setting_turns_the_title_off_and_back_on`
-      (140), and `vs_code_gets_its_own_dialect_and_the_command_line` (170).
-      Reproduce with `taskset -c 0 cargo test --workspace`.
+- [ ] **The pty suite is flaky in CI, in more than one place.** Six distinct
+      failures now, and the pattern that matters is that they are *different
+      tests each time* — so this is one property of the harness rather than six
+      bugs, and it will keep blocking merges until it is taken as its own piece
+      of work.
 
-      The job-done one is the frequent one and its cause is in the test: it
-      sleeps 400ms expecting a `sleep 0.2` job to have ended and a `sleep 0.7`
-      job not to have, which on a starved CPU is not a safe bet. That is the
-      "no sleeps" rule owed a real fix, not a longer sleep.
+      Seen on a single CPU (`taskset -c 0 cargo test --workspace`, which is the
+      sharpest reproduction):
 
-      Two others in the same runs — phase 110 of the decorations harness and
-      phase 22 of `new_foreground_job_does_not_receive_sigcont` — are both
-      `start_pty_shell` giving up after 10 seconds of silence. On one CPU shared
-      by eight test threads that is arguably the machine rather than the test,
-      so they are recorded but not counted above.
+      - `a_jobdone_hook_fires_where_the_done_notice_prints`, phase 155 — 4
+        failures in 9 runs, the most frequent of the lot.
+      - `the_title_setting_turns_the_title_off_and_back_on`, phase 140.
+      - `vs_code_gets_its_own_dialect_and_the_command_line`, phase 170.
+
+      Seen in **CI**, on a two-core runner at ordinary speed, each once and each
+      a different test — mikelward/mesh#318, across three pushes:
+
+      - `settings_turn_the_interactive_decorations_off_and_back_on`, phase 110 —
+        `start_pty_shell` giving up. The same phase the pinned runs produced, so
+        it is not only a starved machine.
+      - `new_foreground_job_does_not_receive_sigcont`, phase 27 — `exit` written,
+        and the shell did not leave cleanly.
+      - `notify_reaches_the_terminal_and_a_quick_command_does_not`.
+
+      The job-done one is the only one with a cause already named, and it is in
+      the test: it sleeps 400ms expecting a `sleep 0.2` job to have ended and a
+      `sleep 0.7` job not to have, which on a loaded machine is not a safe bet.
+      That is the "no sleeps" rule owed a real fix, not a longer sleep.
+
+      For the rest, the thing to establish first is whether they share a cause.
+      Every one of them is a harness that stops reading the pty at some point,
+      which is what the fix to the entry above turned out to be about — the
+      cursor-position query reedline writes at each prompt goes unanswered while
+      no reader is running, and it is answered late or not at all. That is a
+      hypothesis, not a diagnosis: `main` has been green across its last fifteen
+      runs, so whatever this is, it is a minority of runs.
+
+      The phase codes now name themselves (`await_pty_harness`, and
+      `pty_start_failed` for the six ways a session fails to start), so the next
+      occurrences should be cheaper to read than these were.
 
 - [ ] **If the syntactic capture-status rule proves too narrow, carry the status
       as evaluation metadata instead.** An assignment takes its right-hand side's
