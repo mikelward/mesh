@@ -115,6 +115,7 @@ The rest of the read-only runtime surface:
 | `$sh.status` | The last command's exit status — see [Exit status](#exit-status) |
 | `$sh.pipestatus` | That run's per-stage statuses, as a list |
 | `$sh.pid` / `$sh.ppid` | This shell's process id, and its parent's |
+| `$sh.uid` | This shell's effective user id |
 | `$sh.version` | The shell's version |
 | `$sh.interactive` | Whether this is an interactive session |
 | `$sh.stdin` / `$sh.stdout` / `$sh.stderr` | Handles for the shell's own streams |

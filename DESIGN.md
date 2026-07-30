@@ -1438,7 +1438,7 @@ top-level is **yours**; the built-ins hang off two reserved roots:
   **`$sh.status`** (last exit, int `0`–`255`, the readable replacement for `$?`),
   **`$sh.pipestatus`** (a **list** of the last pipeline's stage statuses, where
   real lists beat bash's `PIPESTATUS`), `$sh.pid` / `$sh.ppid` (own and parent PID,
-  bash's `$$` / `$PPID`), `$sh.version`, `$sh.options`,
+  bash's `$$` / `$PPID`), `$sh.uid` (effective user id), `$sh.version`, `$sh.options`,
   `$sh.interactive`, the **stream handles** `$sh.stdin` / `$sh.stdout` / `$sh.stderr`
   (each with a `:tty` test — the `test -t N` replacement), **`$sh.jobs`** (the live
   [job-control](#job-control) map),
@@ -1456,7 +1456,7 @@ clashes. Access is strict [map access](#maps-associative-arrays), so `$sh:keys`
 lists the whole surface and a mistyped key fails loud.
 
 **Read-only vs. writable within `$sh`.** The **runtime** entries (`$sh.status`,
-`$sh.pipestatus`, `$sh.pid`, `$sh.ppid`, `$sh.version`, `$sh.interactive`, the
+`$sh.pipestatus`, `$sh.pid`, `$sh.ppid`, `$sh.uid`, `$sh.version`, `$sh.interactive`, the
 `$sh.stdin` / `$sh.stdout` / `$sh.stderr` handles, `$sh.jobs` with
 its records, and `$sh.args` / `$sh.name`) are the shell's authoritative state —
 **read-only**: assigning or `unset`ting one is an error, so config can't corrupt

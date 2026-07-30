@@ -2152,11 +2152,11 @@ was re-checked against `main` rather than taken from the PR text.
       earlier stdout when called for a value.** `confirm("ok")` returned the right
       answer with no prompt printed. Fixed in 77dca06, "Stop `if` and `match`
       capturing a value block's stdout".
-- [ ] **14. No `$sh.uid`.** The root check that picks the prompt's `#` / `$`
+- [x] **14. `$sh.uid`.** The root check that picks the prompt's `#` / `$`
       glyph runs on every render, and bash, zsh and fish each answer it from their
-      own `$UID` for free. The config forks `id -u` once at startup and exports
-      the answer rather than paying a fork per prompt — a cache it should not have
-      to keep.
+      own `$UID` for free. Mesh now exposes the effective user id directly, captured
+      with the shell's process identity and kept stable in a forked stage, so a
+      prompt does not need to fork `id -u` or keep its own cache.
 - [ ] **15. `$sh.status` is cleared while an `if` condition is evaluated**, so it
       reads `0` in *both* arms and a command used as a condition cannot have its
       status inspected afterwards — `if sh -c "exit 3" { … } else { … }` reports

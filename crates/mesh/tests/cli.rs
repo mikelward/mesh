@@ -17352,7 +17352,7 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     let out = run_with_input("puts ...$sh:keys\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "status pipestatus pid ppid version interactive stdin stdout stderr jobs \
+        "status pipestatus pid ppid uid version interactive stdin stdout stderr jobs \
          origin source options name args\n"
     );
 
@@ -18146,6 +18146,25 @@ fn sh_reports_the_shells_own_process_ids() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 2, "{text}");
     assert_eq!(lines[0], lines[1], "$sh.ppid changed inside a forked stage");
+}
+
+#[test]
+fn sh_reports_the_effective_user_id() {
+    // Compare with the platform tool rather than assuming the test user. The
+    // effective id is the one that decides the shell's process privileges.
+    let out = run_with_input("puts $sh.uid\nid -u\n");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(lines[0], lines[1], "$sh.uid is not the effective user id");
+
+    // Like `$sh.pid`, this is session state and remains stable in a forked
+    // in-shell pipeline stage.
+    let out = run_with_input("puts $sh.uid\nfunc f() { puts $sh.uid }\nf | cat\n");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(lines[0], lines[1], "$sh.uid changed inside a forked stage");
 }
 
 #[test]

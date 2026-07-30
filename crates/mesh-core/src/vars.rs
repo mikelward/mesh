@@ -712,6 +712,10 @@ pub struct Vars {
     /// session rather than the short-lived stage.
     pid: u32,
     ppid: i32,
+    /// The effective user owns the shell's filesystem and process privileges.
+    /// Capture it with the process ids so a forked stage reports the session's
+    /// identity rather than consulting its own process state.
+    uid: libc::uid_t,
     /// The live job table as `$sh.jobs` reports it. A snapshot rather than a
     /// live borrow, because expansion is handed only the variable store — the
     /// shell refreshes it from the real table on the same funnel that publishes
@@ -782,6 +786,8 @@ impl Default for Vars {
             pid: std::process::id(),
             // SAFETY: `getppid` takes no arguments and cannot fail.
             ppid: unsafe { libc::getppid() },
+            // SAFETY: `geteuid` takes no arguments and cannot fail.
+            uid: unsafe { libc::geteuid() },
             jobs: Vec::new(),
             // A shell with nothing said about it reads commands from stdin, which
             // is what `Invocation::Default` falls back to.
@@ -932,6 +938,7 @@ impl Vars {
             ),
             ("pid".to_owned(), Value::Integer(i64::from(self.pid))),
             ("ppid".to_owned(), Value::Integer(i64::from(self.ppid))),
+            ("uid".to_owned(), Value::Integer(i64::from(self.uid))),
             (
                 "version".to_owned(),
                 Value::String(env!("CARGO_PKG_VERSION").to_owned()),
