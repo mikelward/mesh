@@ -20688,6 +20688,77 @@ fn a_modifier_chain_survives_punctuation_after_it() {
     );
 }
 
+/// An argument-taking modifier inside a `$…` interpolation is reported, and the
+/// message names the spelling that works. The scan stops at the `(`, so the
+/// arguments stayed behind as literal text while the modifier ran with none —
+/// `"$env:get(HOME, none)"` answered the whole environment and then failed on being
+/// a list, which names neither the mistake nor the fix. Rough edge 11 from the
+/// config port, walked into four separate times there.
+#[test]
+fn an_interpolated_modifier_cannot_take_arguments() {
+    for (source, modifier) in [
+        ("puts \"$env:get(HOME, none)\"\n", "get"),
+        ("xs = [a b]\nputs \"$xs:join(-)\"\n", "join"),
+        ("x = a.b\nputs \"[$x:split(.)]\"\n", "split"),
+        // A heredoc body reads references through the same scan, which is where a
+        // generated config meets this.
+        ("cat << END\n$env:get(HOME, none)\nEND\n", "get"),
+    ] {
+        let out = run_with_input(source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("`:{modifier}` takes arguments"))
+                && stderr.contains("brace it as an expression"),
+            "for {source:?}: {stderr}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "", "for {source:?}");
+    }
+
+    // The braced expression form takes them, which is what the message points at.
+    let out = run_with_input("xs = [a b]\nputs \"${$xs:join(\"-\")}\"\nputs \"${$xs:len}\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a-b\n2\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A modifier whose argument is **optional** still means the argument form when a
+    // `(` abuts it, so it reports too — while its bare spelling keeps the whitespace
+    // reading it always had.
+    let out = run_with_input("x = xxaxx\nputs \"$x:trimstart(x)\"\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("`:trimstart` takes arguments"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Only an **abutting** `(` after a name the vocabulary holds *and takes
+    // arguments* is the shape. After an argument-free modifier a `(` is ordinary
+    // text and always was, which the first line here would have broken: the braced
+    // form the message points at rejects `${$x:upper(foo)}` outright. Raised in
+    // review as a P2. A gap is a separate argument, a name that is not a modifier is
+    // text, and a `(` with no `$` in front of the word never was a chain.
+    let out = run_with_input(
+        "x = ab\n\
+         puts \"$x:upper(foo)\"\n\
+         puts \"$x:upper (1)\"\n\
+         puts \"$x:nosuch(1)\"\n\
+         puts \"a:get(b)\"\n\
+         puts \"($x:upper)\"\n\
+         puts \"[  a  ]:trimstart\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "AB(foo)\nAB (1)\nab:nosuch(1)\na:get(b)\n(AB)\n[  a  ]:trimstart\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A **compact** map literal is a map, whatever its value word names. The key is
 /// otherwise parsed by `expression`, whose postfix loop claims the colon first, so
 /// `[host:upper]` built the string `HOST` and `[host:upper, port:22]` was a hard
