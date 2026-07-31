@@ -1698,6 +1698,34 @@ designed, and the cross-references say where the fuller note lives.
       do. Unifying them — one dispatcher both reach — is what stops the sets
       diverging again.
 
+- [x] **One dispatcher for both spellings of a modifier chain** — *done*. `${x:m}`
+      and `$x:m` are the same chain written two ways, and each carried its own
+      implementation. They drifted apart four times, every one found singly and in
+      review: which names are flags, which table wins on a pattern (`:x` is
+      `extended` there and `Modifier::Exec` everywhere else), whether a flag change
+      is validated at all, and what a value that cannot take a modifier is told.
+
+      Now `repl::modifier_step` builds a step — folding in the two things only that
+      layer knows, which names take arguments and which are implemented past a
+      boundary `expand` cannot cross — and `expand::apply_modifier_step` applies it.
+      One builder, one applier; `apply_argument_free_modifier` is a call to both.
+      The last divergence went with it: every `expand`-known modifier on a pattern
+      (`:upper`, `:len`, `:dir`, `:base`, `:stem`, `:keys`) reported a type-generic
+      message through the reference path and `not valid for a regex` through the
+      other.
+
+      Guarded by the *property* rather than by instances:
+      `both_spellings_of_a_modifier_chain_agree` runs 25 modifiers across a pattern,
+      a string, a list, a map and a path, and asserts the two spellings produce
+      identical output — 125 pairs. It fails on the parent commit.
+
+      Not covered, and a real limit: this unifies the **argument-free** chain.
+      `:join(…)`, `:map(…)` and the rest are still applied only on the expression
+      side, because `expand` resolves with `&Vars` and no shell while the
+      higher-order ones call lambdas. A sigil-less `${xs:join(" ")}` gets there by
+      being *routed* to the expression path (see the entry above), not by this
+      dispatcher growing arguments.
+
 ## Beyond M3 — The predicate vocabulary
 
 - [ ] **`:kind` and `:where`** — the name-resolution half of the predicate

@@ -2611,6 +2611,69 @@ fn a_braced_interpolation_takes_an_expression_across_lines() {
 }
 
 #[test]
+fn both_spellings_of_a_modifier_chain_agree() {
+    // The property, rather than the instances. `${x:m}` and `$x:m` are the same
+    // chain written two ways, and while each spelling carried its own dispatcher
+    // they drifted apart four separate times — over which names are flags, which
+    // table wins on a pattern, whether a flag change is validated, and what a value
+    // that cannot take a modifier is told. Each was found one instance at a time,
+    // which is why this asserts the rule instead.
+    //
+    // Both spellings are unquoted, so what differs is the dispatch and nothing else:
+    // a quoted body would also be answering "make this text", which is a separate
+    // question with its own answers.
+    const MODIFIERS: &[&str] = &[
+        "upper",
+        "lower",
+        "len",
+        "dir",
+        "base",
+        "stem",
+        "ext",
+        "sort",
+        "keys",
+        "values",
+        "lines",
+        "num",
+        "iso",
+        "capture",
+        "join",
+        "split",
+        "i",
+        "x",
+        "m",
+        "s",
+        "ignorecase",
+        "extended",
+        "first",
+        "last",
+        "dedup",
+    ];
+    for (binding, name) in [
+        ("r = re(a)", "r"),
+        ("s = \"a b\"", "s"),
+        ("xs = [a b]", "xs"),
+        ("mp = [k: v]", "mp"),
+        ("p = /bin/sh", "p"),
+    ] {
+        for modifier in MODIFIERS {
+            let reference = run_with_input(&format!("{binding}\nputs ${{{name}:{modifier}}}\n"));
+            let expression = run_with_input(&format!("{binding}\nputs ${name}:{modifier}\n"));
+            assert_eq!(
+                String::from_utf8_lossy(&reference.stdout),
+                String::from_utf8_lossy(&expression.stdout),
+                "stdout differs for `{name}:{modifier}` with `{binding}`"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&reference.stderr),
+                String::from_utf8_lossy(&expression.stderr),
+                "stderr differs for `{name}:{modifier}` with `{binding}`"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_modifier_the_reference_path_cannot_apply_is_reported() {
     // `expand` implements 35 of the 83 modifiers the parser accepts, and used to
     // drop the rest rather than report them — so a chain quietly lost a step.
