@@ -21282,6 +21282,354 @@ fn exiting_over_a_finished_job_reports_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `NAME=value cmd` puts those entries in the command's environment and takes
+/// them back after — the one-command prefix every other shell has. The other half
+/// of rough edge 2, whose workaround was `fork { $env.VAR = …; cmd }`.
+#[test]
+fn an_environment_prefix_applies_to_one_command() {
+    // The child sees it; the shell does not keep it.
+    let out = run_with_input(
+        "MESH_PFX_A=one sh -c 'echo in=[$MESH_PFX_A]'\n\
+         sh -c 'echo out=[$MESH_PFX_A]'\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "in=[one]\nout=[]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // As many as you like, left to right, and `+=` appends.
+    let out = run_with_input(
+        "$env.MESH_PFX_P = /usr\n\
+         A=1 B=2 MESH_PFX_P+=/opt sh -c 'echo [$A$B$MESH_PFX_P]'\n\
+         sh -c 'echo [$MESH_PFX_P]'\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[12/usr/opt]\n[/usr]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A name that was unset goes back to unset, not to empty — a child can tell.
+    let out = run_with_input(
+        "MESH_PFX_B=x sh -c 'echo in=[$MESH_PFX_B]'\n\
+         sh -c 'echo out=[${MESH_PFX_B-UNSET}]'\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "in=[x]\nout=[UNSET]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A function sees it and it is restored after — what bash does, and what a
+    // prefix on an in-shell command has to do since there is no child to inherit.
+    let out = run_with_input(
+        "func f() { puts \"in=$env.MESH_PFX_C\" }\n\
+         $env.MESH_PFX_C = orig\n\
+         MESH_PFX_C=qux f\n\
+         puts \"after=$env.MESH_PFX_C\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "in=qux\nafter=orig\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A condition is a command position too. The condition parser reached for an
+    // assignment first, claimed `MESH_PFX_I=x`, and left the command where the `{`
+    // belonged — a syntax error on a line that parsed fine one statement up.
+    // Raised in review as a P1.
+    let out = run_with_input(
+        "if MESH_PFX_I=yes sh -c 'test \"$MESH_PFX_I\" = yes' { puts sees } else { puts blind }\n\
+         if MESH_PFX_I=x sh -c 'exit 1' { puts taken } else { puts skipped }\n\
+         if not MESH_PFX_I=x sh -c 'exit 1' { puts negated }\n\
+         i = 0\n\
+         while MESH_PFX_I=x test $i -lt 2 { puts tick\n\
+         i = ($i + 1) }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "sees\nskipped\nnegated\ntick\ntick\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And a condition that really is an assignment is untouched.
+    let out = run_with_input("if x = 5 { puts \"bound $x\" }\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bound 5\n");
+}
+
+/// The prefix binds to a **stage**, not to the statement — so each side of a pipe
+/// gets its own and an `&&` right-hand side gets none. Both are what every other
+/// shell does, and both follow from reading the run in `command` rather than at
+/// statement level.
+#[test]
+fn an_environment_prefix_binds_to_one_stage() {
+    let out = run_with_input(
+        "MESH_PFX_D=1 sh -c 'echo a=$MESH_PFX_D' | MESH_PFX_D=2 sh -c 'cat; echo b=$MESH_PFX_D'\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a=1\nb=2\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_with_input(
+        "MESH_PFX_E=1 sh -c 'echo one=$MESH_PFX_E' && sh -c 'echo two=[$MESH_PFX_E]'\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "one=1\ntwo=[]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A stage carrying a **value** expands in its own fork, and still needs its
+    // prefix there — the deferred branch dropped it, so a capture anywhere in the
+    // stage silently took the environment away from the command. Raised in review
+    // as a P1.
+    let out = run_with_input("MESH_PFX_F=bar sh -c 'printenv MESH_PFX_F' $(printf '') | cat\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "bar\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A run means the same thing piped as unpiped: each binding is evaluated
+    // against what the ones beside it left, so `+=` appends to its neighbor and a
+    // later one can read an earlier. Raised in review as a P2 — the piped form
+    // gave `[right]` where the unpiped one gave `[leftright]`.
+    for tail in ["", " | cat"] {
+        let out = run_with_input(&format!(
+            "A=left A+=right B=$env.A sh -c 'echo [$A][$B]'{tail}\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "[leftright][leftright]\n",
+            "for {tail:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The stage's own words and redirect targets read `$env` **under** the prefix.
+    // Putting the parent's environment back before expanding gave the new value
+    // unpiped and the old one piped, from the same line. Raised in review as a P1.
+    for tail in ["", " | cat"] {
+        let out = run_with_input(&format!(
+            "$env.MESH_PFX_G = \"old\"\nMESH_PFX_G=new puts $env.MESH_PFX_G{tail}\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "new\n",
+            "for {tail:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A redirect target is expanded in that same window, so a piped stage writes
+    // the file its prefix names rather than the one the parent still has.
+    let dir = fresh_dir("prefix_stage_expansion");
+    let out = run_with_input(&format!(
+        "$env.MESH_PFX_H = \"{0}/old\"\nMESH_PFX_H={0}/new puts hi > $env.MESH_PFX_H | cat\n",
+        dir.display()
+    ));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(dir.join("new")).unwrap(), "hi\n");
+    assert!(!dir.join("old").exists(), "wrote the parent's target");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // And none of that reaches the parent, piped or not.
+    let out = run_with_input("A=x sh -c 'true' | cat\nsh -c 'echo after=[$A]'\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after=[]\n");
+    let out = run_with_input(
+        "$env.MESH_PFX_G = \"old\"\nMESH_PFX_G=new puts $env.MESH_PFX_G | cat\nputs $env.MESH_PFX_G\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "new\nold\n");
+}
+
+/// A prefix whose value **runs code** — a capture, a call — is evaluated in the
+/// stage's own fork, exactly as a value in one of its words already was. Doing it
+/// in the parent ran the work in the wrong process, and it showed in both ways the
+/// deferral exists to prevent. Raised in review as a P1.
+#[test]
+fn a_value_bearing_prefix_is_evaluated_in_the_stage() {
+    // A call's writes stay in the fork. Eagerly evaluated, `change()` reached the
+    // shell's own binding and `g` came back `leaked`.
+    let out = run_with_input(
+        "g = before\n\
+         func change() { global g = leaked\n\
+         return x }\n\
+         A=change() puts ok | cat\n\
+         puts \"g=$g\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ok\ng=before\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The value still reaches the command — deferring moves the work, it does not
+    // drop it — piped and backgrounded alike.
+    let out = run_with_input("A=$(printf deferred) sh -c 'echo [$A]' | cat\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[deferred]\n");
+    let out = run_with_input("A=$(printf deferred) sh -c 'echo [$A]' &\nwait\n");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("[deferred]"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// `break` or `continue` from a prefix's right-hand side stops the stage from
+/// launching, piped as well as unpiped. The piped form used to hand back an empty
+/// environment and run the command anyway. Raised in review as a P2.
+#[test]
+fn loop_control_in_a_prefix_stops_the_stage() {
+    for tail in ["", " | cat"] {
+        let out = run_with_input(&format!(
+            "for i in [1] {{ A=(if true {{ break }}) puts BAD{tail} }}\nputs done\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "done\n",
+            "for {tail:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Where it *stops* differs, and that is a property of deferring rather than of
+    // prefixes: a piped stage runs in a fork, and control raised there cannot reach
+    // the parent, so the loop keeps going. A value-bearing **word** has always done
+    // exactly this, and the point of asserting them side by side is that the prefix
+    // matches it — a prefix that propagated control while `puts (…)` did not would
+    // be the inconsistency. Raised in review; declined with this as the evidence,
+    // and recorded in `TODO.md` as a limitation of deferred stages generally.
+    let prefix = run_with_input(
+        "for i in [1 2] { A=(if true { break }) puts BAD | cat\nputs AFTER }\nputs done\n",
+    );
+    let word = run_with_input(
+        "for i in [1 2] { puts (if true { break }) | cat\nputs AFTER }\nputs done\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&prefix.stdout),
+        String::from_utf8_lossy(&word.stdout),
+        "a prefix and a word should defer alike"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&prefix.stdout),
+        "AFTER\nAFTER\ndone\n"
+    );
+}
+
+/// A value that runs code cannot be **backgrounded with a redirection**: the shell
+/// resolves every stage's targets before forking, so such a stage cannot defer, and
+/// evaluating it in the parent is what the deferral exists to avoid. That was
+/// already refused for a value in the command's words; a prefix reaches the same
+/// parent-side evaluation by the same route and is now refused with it. Raised in
+/// review as a P1 — `A=change() puts ok > out &` had left the call's write in the
+/// shell, and `A=$(sleep 2) puts ok > out &` had held the prompt.
+#[test]
+fn a_value_bearing_prefix_cannot_be_backgrounded_with_a_redirection() {
+    let dir = fresh_dir("prefix_redirect_bg");
+    let out = run_with_input(&format!(
+        "g = before\n\
+         func change() {{ global g = leaked\n\
+         return x }}\n\
+         A=change() puts ok > {}/out &\n\
+         wait\n\
+         puts \"g=$g\"\n",
+        dir.display()
+    ));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot be backgrounded with a redirection"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("g=before"),
+        "the call must not have reached the shell: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // A prefix of plain words runs no code, so it is unaffected — the refusal is
+    // about evaluating in the wrong process, not about prefixes.
+    let out = run_with_input(&format!(
+        "A=plain sh -c 'echo $A' > {}/plain &\nwait\n",
+        dir.display()
+    ));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("plain")).unwrap_or_default(),
+        "plain\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A binding run is only a prefix when a command follows it. Alone it is the
+/// assignment it has always been — and the two write **different namespaces**,
+/// which is deliberate and recorded as an open question in `TODO.md`.
+#[test]
+fn a_binding_run_is_an_assignment_when_nothing_follows_it() {
+    let out = run_with_input("x=1\nputs $x\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+
+    // The two write different namespaces, and this is the sharp end of it: the
+    // prefix reaches the child and leaves **no shell binding at all**, so `$y`
+    // afterwards is unbound rather than `2`. The assignment is the mirror image —
+    // it binds `$x` and the child sees nothing.
+    let out = run_with_input("y=2 sh -c 'echo child=[$y]'\nputs \"shell=[$y]\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "child=[2]\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("y: unbound variable"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_with_input("x = 5\nsh -c 'echo child=[$x]'\nputs \"shell=[$x]\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "child=[]\nshell=[5]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `export` takes a binding run too, so a name list is written the same way
+/// wherever it appears — `with`, a command prefix, and here.
+#[test]
+fn export_takes_several_bindings() {
+    let out = run_with_input(
+        "export A=1 B=2 C=$env.A\n\
+         puts \"$env.A$env.B$env.C\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "121\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The spaced single-binding spelling is untouched, and stays single: with
+    // spaces there is no seeing where one value ends and the next name begins.
+    let out = run_with_input("export A = 9\nputs $env.A\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "9\n");
+}
+
 /// `with NAME=value … { … }` runs its body with those environment entries in
 /// place and puts the environment back afterwards — the block form of the
 /// one-command prefix other shells spell `LC_ALL=C sort file`. Rough edge 2 from

@@ -1423,6 +1423,25 @@ fn run_executable(
         Loop { body } => run_ast_while(None, body, last, in_function, shell),
         Fork { body } => run_forked_block(body, in_function, shell),
         With { bindings, body } => run_with_block(bindings, body, last, in_function, shell),
+        // Permanent, unlike `with` and the command prefix: nothing is snapshotted
+        // and nothing is put back. `export` is the spelling for changing what
+        // children inherit from here on.
+        EnvAssignments { bindings } => {
+            let mut status = 0;
+            for binding in bindings {
+                match eval_operand_of(&binding.value, last, in_function, shell) {
+                    Ok(_) if shell.control.is_some() => return Step::Continue(last),
+                    Ok(value) => {
+                        if let Err(message) = environ::write(&binding.key, value, binding.append) {
+                            return runtime_message(message);
+                        }
+                        status = capture_status_of(&binding.value, shell);
+                    }
+                    Err(step) => return step,
+                }
+            }
+            Step::Continue(status)
+        }
         Control { kind, value, guard } => {
             match guard_allows(guard.as_ref(), last, in_function, shell) {
                 Ok(true) => {}
@@ -1570,6 +1589,7 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
         // rather than silently running it in the foreground.
         Fork { .. } => "a `fork` block",
         With { .. } => "a `with` block",
+        EnvAssignments { .. } => "an `export`",
         Control { kind, .. } => match kind {
             parser::ControlKind::Return => "`return`",
             parser::ControlKind::Fail => "`fail`",
@@ -1593,8 +1613,8 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
 /// word order, before its targets. It gives up the isolation the deferral buys,
 /// which is why backgrounding one stays refused rather than silently running in the
 /// wrong process.
-fn can_defer(words: &[parser::Word], redirs: &[Redir]) -> bool {
-    redirs.is_empty() && words.iter().any(word_carries_a_value)
+fn can_defer(words: &[parser::Word], redirs: &[Redir], env: &[parser::EnvBinding]) -> bool {
+    redirs.is_empty() && (words.iter().any(word_carries_a_value) || env_carries_a_value(env))
 }
 
 /// Does this word carry a value — `puts $(pwd)`, `puts "$(pwd)"`, `cmd f()`?
@@ -1669,16 +1689,21 @@ fn deferred_words(words: &[parser::Word]) -> Vec<String> {
 ///
 /// A heredoc body is not checked because it does not interpolate a capture at all
 /// (`TODO.md`).
-fn carries_a_value(items: &[parser::CommandItem]) -> bool {
+fn carries_a_value(items: &[parser::CommandItem], env: &[parser::EnvBinding]) -> bool {
     let redirects = items
         .iter()
         .any(|item| matches!(item, parser::CommandItem::Redirect { .. }));
+    // The redirect gate belongs to both halves: without one the stage defers and
+    // the value is evaluated in its own fork, which is ordinary. A `NAME=value`
+    // prefix is checked here rather than beside the call so it cannot lose that
+    // gate — asked separately at first, it refused `A=$(…) cmd &`, which defers
+    // perfectly well.
     redirects
-        && items.iter().any(|item| match item {
+        && (items.iter().any(|item| match item {
             parser::CommandItem::Value(_) => true,
             parser::CommandItem::Word(word) => word_carries_a_value(&word.value),
             parser::CommandItem::Redirect { target, .. } => word_carries_a_value(&target.value),
-        })
+        }) || env_carries_a_value(env))
 }
 
 /// Does this one-word body name a **command**?
@@ -2095,6 +2120,164 @@ fn run_ast_for(
 /// makes `with PATH=/opt PATH+=/usr/bin { … }` mean what it reads like. The snapshot
 /// is taken before any of them run, so the restore is still to the state the whole
 /// header found.
+/// Write `bindings` to the environment, answering what has to be put back.
+///
+/// Shared by `with` and the `NAME=value cmd` prefix so the two cannot drift: both
+/// snapshot **before any right-hand side runs**, not as each binding is reached. A
+/// value expression can write the environment itself — `A=alter() B=inside` where
+/// `alter` sets `$env.B` — and a per-binding snapshot would record what that write
+/// left rather than what the run found, so the restore would leak it. Deduplicated,
+/// so a name bound twice goes back to the one state that predates the run.
+///
+/// Applied left to right, so a later binding wins on a repeated name and each is
+/// evaluated against what the ones before it left — `PATH=/opt PATH+=/usr/bin`
+/// reads as it looks. A failure stops there; the caller still restores.
+fn apply_env_bindings<'a>(
+    bindings: &'a [parser::EnvBinding],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> (Vec<(&'a str, Option<std::ffi::OsString>)>, Option<Step>) {
+    let mut saved: Vec<(&str, Option<std::ffi::OsString>)> = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        if !saved.iter().any(|(key, _)| *key == binding.key) {
+            saved.push((&binding.key, std::env::var_os(&binding.key)));
+        }
+    }
+    for binding in bindings {
+        match eval_operand_of(&binding.value, last, in_function, shell) {
+            // A right-hand side that raised `break`/`continue` produced no value, so
+            // there is nothing to bind — and the control flow is the answer, as it is
+            // for an ordinary assignment.
+            Ok(_) if shell.control.is_some() => return (saved, Some(Step::Continue(last))),
+            Ok(value) => {
+                if let Err(message) = environ::write(&binding.key, value, binding.append) {
+                    return (saved, Some(runtime_message(message)));
+                }
+            }
+            Err(step) => return (saved, Some(step)),
+        }
+    }
+    (saved, None)
+}
+
+/// Put back what [`apply_env_bindings`] saved. A name that was unset goes back to
+/// unset rather than to an empty string — a child can tell those apart, and these
+/// constructs exist for what a child sees.
+fn restore_env_bindings(saved: Vec<(&str, Option<std::ffi::OsString>)>) {
+    for (key, previous) in saved {
+        match previous {
+            // SAFETY: single-threaded execution loop, as `environ::write` relies on.
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+}
+
+/// Apply a stage's `NAME=value` prefix and read back the bytes a child inherits.
+///
+/// Separate from [`apply_env_bindings`] because a pipeline stage does not *keep*
+/// the parent's environment: the values ride down to that stage's fork, so no
+/// other stage can see them. The boundary rules are still `environ`'s — only
+/// strings cross, path-type names join with `:`, an embedded NUL is refused —
+/// since the same `serialize` decides both.
+///
+/// Returns the guard **still applied**, and the caller restores it once the stage
+/// has finished expanding. The window has to span expansion because the stage's
+/// own words and redirect targets may read what the prefix wrote: putting it back
+/// here made `MESH_A=new puts $env.MESH_A` print the new value alone and the old
+/// one piped, and sent `MESH_A=new puts hi > $env.MESH_A | cat` to the old path.
+/// Raised in review as a P1.
+fn applied_stage_env<'a>(
+    bindings: &'a [parser::EnvBinding],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<StageEnv<'a>, Step> {
+    if bindings.is_empty() {
+        return Ok(StageEnv::default());
+    }
+    // Applied for real and then read back, rather than each binding evaluated
+    // against the parent's untouched environment. Evaluating them in place is what
+    // makes a run mean the same thing piped as unpiped: `A=left A+=right` has to
+    // append to what the binding beside it left, and `B=$env.A` has to see it.
+    // Doing it the other way gave `[right]` where the unpiped `[leftright]` sat
+    // right beside it for comparison. Raised in review as a P2.
+    //
+    // Nothing escapes: the caller puts the parent back once the stage is expanded,
+    // so the values reach this stage's fork and no other stage.
+    let (saved, failure) = apply_env_bindings(bindings, last, in_function, shell);
+    let mut pairs: Vec<(String, std::ffi::OsString)> = Vec::with_capacity(bindings.len());
+    if failure.is_none() {
+        for binding in bindings {
+            if pairs.iter().any(|(key, _)| *key == binding.key) {
+                continue;
+            }
+            // Absent only if the write failed, which `failure` has already caught.
+            if let Some(value) = std::env::var_os(&binding.key) {
+                pairs.push((binding.key.clone(), value));
+            }
+        }
+    }
+    match failure {
+        // Every failure stops the caller, **including** `break`/`continue`. Handing
+        // back an empty environment for those let the pipeline launch anyway, so
+        // `for i in [1] { A=(if true { break }) puts BAD | cat }` printed `BAD`
+        // where the unpiped form correctly ran nothing. The control flag is already
+        // set; the `Step` is what keeps a stage from starting before the enclosing
+        // loop sees it. Raised in review as a P2.
+        //
+        // Nothing is expanded under a prefix that failed, so the guard is spent
+        // here rather than handed to a caller that has nothing left to do.
+        Some(step) => {
+            restore_env_bindings(saved);
+            Err(step)
+        }
+        None => Ok(StageEnv { pairs, saved }),
+    }
+}
+
+/// A stage's prefix, applied to the parent and waiting to be put back.
+///
+/// Held rather than restored immediately so the stage expands under it; see
+/// [`applied_stage_env`]. `pairs` is what the fork inherits, read back after the
+/// bindings were applied left to right.
+#[derive(Default)]
+struct StageEnv<'a> {
+    pairs: Vec<(String, std::ffi::OsString)>,
+    saved: Vec<(&'a str, Option<std::ffi::OsString>)>,
+}
+
+impl StageEnv<'_> {
+    /// Put the parent's environment back and hand over what the fork inherits.
+    ///
+    /// Called once the stage has finished expanding, never before.
+    fn take(self) -> Vec<(String, std::ffi::OsString)> {
+        restore_env_bindings(self.saved);
+        self.pairs
+    }
+}
+
+/// Does this prefix have to be evaluated in the stage's **own** fork?
+///
+/// The same question [`word_carries_a_value`] asks of a word, for the same reason:
+/// a capture or a call runs code, and running it in the parent runs it in the wrong
+/// process. A prefix was evaluated eagerly at first, and it showed in both ways the
+/// deferral exists to prevent — `A=change() cmd | cat` leaked the call's global
+/// write into the shell, and `A=$(sleep 2) cmd &` held the prompt for two seconds
+/// where the same capture as an *argument* returned at once. Raised in review as a
+/// P1.
+///
+/// Conservative on purpose: anything that is not a plain word defers. Deferring a
+/// pure expression costs nothing but doing it in the child, while evaluating an
+/// impure one early is exactly the bug.
+fn env_carries_a_value(bindings: &[parser::EnvBinding]) -> bool {
+    bindings.iter().any(|binding| match &binding.value {
+        parser::Expr::Scalar(word) => word_carries_a_value(&word.value),
+        _ => true,
+    })
+}
+
 fn run_with_block(
     bindings: &[parser::EnvBinding],
     body: &parser::Source,
@@ -2108,34 +2291,7 @@ fn run_with_block(
     // per-binding snapshot would then record what that write left rather than what
     // the header found, so the restore would leak it. Deduplicated, so a name bound
     // twice still goes back to the one state that predates the header.
-    let mut saved: Vec<(&str, Option<std::ffi::OsString>)> = Vec::with_capacity(bindings.len());
-    for binding in bindings {
-        if !saved.iter().any(|(key, _)| *key == binding.key) {
-            saved.push((&binding.key, std::env::var_os(&binding.key)));
-        }
-    }
-    let mut failure = None;
-    for binding in bindings {
-        match eval_operand_of(&binding.value, last, in_function, shell) {
-            // A right-hand side that raised `break`/`continue` produced no value, so
-            // there is nothing to bind — and the control flow is the answer, as it is
-            // for an ordinary assignment.
-            Ok(_) if shell.control.is_some() => {
-                failure = Some(Step::Continue(last));
-                break;
-            }
-            Ok(value) => {
-                if let Err(message) = environ::write(&binding.key, value, binding.append) {
-                    failure = Some(runtime_message(message));
-                    break;
-                }
-            }
-            Err(step) => {
-                failure = Some(step);
-                break;
-            }
-        }
-    }
+    let (saved, failure) = apply_env_bindings(bindings, last, in_function, shell);
     // Whatever happened, the header's writes are undone before this returns —
     // including the ones a later binding's failure left standing.
     // Seeded at 0 and passed through `compound_result`, as every other compound
@@ -2145,13 +2301,7 @@ fn run_with_block(
     // applied and restored cleanly. Raised in review as a P2.
     let step =
         failure.unwrap_or_else(|| compound_result(run_source(body, 0, in_function, shell), shell));
-    for (key, previous) in saved {
-        match previous {
-            // SAFETY: single-threaded execution loop, as `environ::write` relies on.
-            Some(value) => unsafe { std::env::set_var(key, value) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-    }
+    restore_env_bindings(saved);
     step
 }
 
@@ -2436,12 +2586,15 @@ fn commit_bindings(bindings: Vec<(String, Value)>, vars: &mut Vars) {
     }
 }
 
-struct Stage {
+struct Stage<'a> {
     /// The stage's words, still **parsed**: a value in one is evaluated by the
     /// code that expands that word, in word order — see [`expand_stage`].
     words: Vec<parser::Word>,
     redirs: Vec<Redir>,
     pipe_stderr: bool,
+    /// The `NAME=value …` prefix in front of this stage, applied around it and
+    /// restored after. Per stage, so `FOO=1 a | FOO=2 b` gives each its own.
+    env: &'a [parser::EnvBinding],
 }
 
 struct Redir {
@@ -2498,7 +2651,13 @@ fn run_ast_pipeline(
         // in the parent, where `puts $(slow) > out &` hangs the prompt and a mutating
         // call reaches the parent's bindings that `docs/REFERENCE.md` promises the
         // fork keeps. Refused rather than silently done in the wrong process.
-        if background && carries_a_value(&command.items) {
+        //
+        // A `NAME=value` prefix is one of the places a value can be, and it reaches
+        // the same parent-side evaluation by the same route: `A=change() cmd > out &`
+        // left the call's write in the shell, and `A=$(sleep 2) cmd > out &` held the
+        // prompt, while the identical unredirected forms were refused or deferred.
+        // Raised in review as a P1.
+        if background && carries_a_value(&command.items, &command.env) {
             note!(
                 "mesh: a value cannot be backgrounded with a redirection yet; \
                  bind it first — `m = $(…)` then `cmd $m > out &`"
@@ -2600,6 +2759,7 @@ fn run_ast_pipeline(
             words,
             redirs,
             pipe_stderr: node.pipe_stderr.get(index).copied().unwrap_or(false),
+            env: &command.env,
         });
     }
     run_pipeline(stages, background, last, in_function, shell)
@@ -5300,7 +5460,14 @@ fn eval_value_body(
         && statement.and_or.rest.is_empty()
         && let parser::Executable::Pipeline(parser::Pipeline { stages, .. }) =
             &statement.and_or.first
-        && let [parser::Command { items, guard: None }] = stages.as_slice()
+        && let [
+            parser::Command {
+                items,
+                guard: None,
+                env,
+            },
+        ] = stages.as_slice()
+        && env.is_empty()
         && let [parser::CommandItem::Word(word)] = items.as_slice()
         && !bare_word_names_a_command(&word.value)
     {
@@ -5673,7 +5840,37 @@ fn run_single(
         words,
         redirs,
         pipe_stderr: _,
+        env,
     } = stage;
+    // A one-stage command may run in the shell itself — a builtin, a function, an
+    // assignment — so its prefix is applied here and put back after, rather than
+    // riding on a fork that might not happen. Same helpers `with` uses, so the two
+    // spellings cannot drift.
+    //
+    // Except when this stage is about to defer. A backgrounded stage forks, and a
+    // prefix carrying a capture or a call belongs in that fork like everything else
+    // that runs code: applying it here held the prompt for the length of
+    // `A=$(sleep 2) cmd &`, where the same capture in an *argument* returned at
+    // once. The deferring branch below carries the bindings down unevaluated.
+    if !env.is_empty() && !(background && can_defer(&words, &redirs, env)) {
+        let (saved, failure) = apply_env_bindings(env, last, in_function, shell);
+        let step = failure.unwrap_or_else(|| {
+            run_single(
+                Stage {
+                    words,
+                    redirs,
+                    pipe_stderr: false,
+                    env: &[],
+                },
+                background,
+                last,
+                in_function,
+                shell,
+            )
+        });
+        restore_env_bindings(saved);
+        return step;
+    }
     if redirs.is_empty() && !background {
         return run_command(&words, last, in_function, shell);
     }
@@ -5692,7 +5889,7 @@ fn run_single(
     // than at the prompt. A foreground redirected command has no fork to defer to:
     // a builtin or function runs in the shell with the targets around the call, so
     // its arguments were always this process's to evaluate.
-    if background && can_defer(&words, &redirs) {
+    if background && can_defer(&words, &redirs, env) {
         let opened = match expand_redirs(redirs, last, in_function, shell) {
             Ok(redirs) => redirs,
             Err(step) => return step,
@@ -5703,8 +5900,13 @@ fn run_single(
                 redirs: opened,
                 pipe_stderr: false,
                 in_shell: true,
+                // Left empty on purpose: the body below applies the prefix in the
+                // fork, so evaluating it here would be the work this branch exists
+                // to move.
+                env: Vec::new(),
             }],
             vec![StageBody::Deferred {
+                env: env.to_vec(),
                 words,
                 decoration,
                 context: Deferred::Backgrounded,
@@ -5735,6 +5937,7 @@ fn run_single(
                         redirs: opened,
                         pipe_stderr: false,
                         in_shell: true,
+                        env: Vec::new(),
                     }],
                     vec![StageBody::Function(args)],
                     background,
@@ -5803,6 +6006,7 @@ fn run_single(
             redirs: opened,
             pipe_stderr: false,
             in_shell: builtin,
+            env: Vec::new(),
         }],
         vec![if builtin {
             StageBody::Builtin
@@ -5834,7 +6038,28 @@ fn run_multi(
             words,
             redirs,
             pipe_stderr,
+            env,
         } = stage;
+        // A stage carrying a value expands in its **own** fork, not here: a call in
+        // one of its arguments belongs to the stage, and this process is not it.
+        // Every stage of a pipeline forks, so every one of them can defer.
+        //
+        // Asked **before** the prefix is evaluated, because the prefix is one of
+        // the things that can carry a value: deciding after would already have run
+        // it here, which is the thing being avoided.
+        let deferring = can_defer(&words, &redirs, env);
+        // Evaluated here only when this stage is not deferring — a prefix of plain
+        // words runs no code, so where it happens cannot be observed — and carried
+        // to the stage's fork so only that child inherits it. `FOO=1 a | FOO=2 b`
+        // gives each side its own either way.
+        let stage_env = if deferring {
+            StageEnv::default()
+        } else {
+            match applied_stage_env(env, last, in_function, shell) {
+                Ok(applied) => applied,
+                Err(step) => return step,
+            }
+        };
         // Only the last stage can be writing to the terminal; every earlier one has
         // stdout on a pipe, so a styled value there renders as plain text.
         let decoration = if index + 1 == count && !redirects_stdout(&redirs) {
@@ -5842,10 +6067,7 @@ fn run_multi(
         } else {
             Decoration::plain()
         };
-        // A stage carrying a value expands in its **own** fork, not here: a call in
-        // one of its arguments belongs to the stage, and this process is not it.
-        // Every stage of a pipeline forks, so every one of them can defer.
-        if can_defer(&words, &redirs) {
+        if deferring {
             let opened = match expand_redirs(redirs, last, in_function, shell) {
                 Ok(redirs) => redirs,
                 Err(step) => return step,
@@ -5855,49 +6077,30 @@ fn run_multi(
                 redirs: opened,
                 pipe_stderr,
                 in_shell: true,
+                // A deferred stage still ends in an `exec` inside its own fork, so
+                // it needs the prefix exactly as an eager one does. Dropping it
+                // here meant a value-bearing word anywhere in the stage silently
+                // took the environment away from the command:
+                // `A=bar sh -c 'printenv A' $(printf x) | cat` found nothing.
+                // Raised in review as a P1.
+                env: stage_env.take(),
             });
             bodies.push(StageBody::Deferred {
+                env: env.to_vec(),
                 words,
                 decoration,
                 context: Deferred::Piped,
             });
             continue;
         }
-        // Command words expand before the redirect targets, the order `run_single`
-        // uses, so a stage reports the same first failure the unpiped command
-        // does — and `f * > summary` cannot glob the file the redirection is
-        // about to create.
-        let (stage_words, body) = match expand_stage(&words, decoration, last, in_function, shell) {
-            // The arguments are typed values, and mesh has no implicit
-            // stringification for a list or map, so only the name goes into the
-            // words a job listing echoes back.
-            Ok(Expanded::Function { name, args }) => (vec![name], StageBody::Function(args)),
-            // `return` unwinds the enclosing function; it has no meaning as a
-            // pipeline stage, so reject it rather than launch an external `return`.
-            Ok(Expanded::Return(_)) => {
-                note!("mesh: return: cannot be used in a pipeline");
-                return Step::Error(2);
-            }
-            Ok(Expanded::Fail(_)) => {
-                note!("mesh: fail: cannot be used in a pipeline");
-                return Step::Error(2);
-            }
-            Err(step) => return step,
-            Ok(Expanded::Argv(argv)) => {
-                if argv.is_empty() {
-                    note!("mesh: empty command in a pipeline");
-                    return Step::Error(1);
-                }
-                // `command NAME …` is the program `NAME`, so the stage is that
-                // program rather than a forked shell that runs it.
-                match external_stage(&argv) {
-                    Some(program) => (program, StageBody::External),
-                    None => (argv, StageBody::Builtin),
-                }
-            }
-        };
-        let opened = match expand_redirs(redirs, last, in_function, shell) {
-            Ok(redirs) => redirs,
+        let expanded = expand_eager_stage(&words, redirs, decoration, last, in_function, shell);
+        // Put the prefix back only now. Both expansions above run under it because
+        // the stage's own words and redirect targets read what it wrote, and one
+        // failing does not change that — restoring on the way past a `?` is what
+        // this shape exists to prevent.
+        let stage_env = stage_env.take();
+        let (stage_words, body, opened) = match expanded {
+            Ok(stage) => stage,
             Err(step) => return step,
         };
         cmds.push(exec::Cmd {
@@ -5905,6 +6108,7 @@ fn run_multi(
             redirs: opened,
             pipe_stderr,
             in_shell: !matches!(body, StageBody::External),
+            env: stage_env,
         });
         bodies.push(body);
     }
@@ -5938,6 +6142,11 @@ enum StageBody {
     /// decides, that late, whether it is a builtin, a function, or an external to
     /// `exec::exec_stage` into.
     Deferred {
+        /// The stage's `NAME=value` prefix, still **unevaluated** — applied in this
+        /// stage's own fork for the same reason its words are expanded there. A
+        /// right-hand side can be a capture or a call, so evaluating it in the
+        /// parent runs the work in the wrong process.
+        env: Vec<parser::EnvBinding>,
         words: Vec<parser::Word>,
         decoration: Decoration,
         /// Which of the two the stage is, since the words it will come to are
@@ -6070,30 +6279,50 @@ fn run_stage_in_shell(
         // effects belong. What they come to decides how the stage ends — as a
         // function call, a builtin, or this process replaced by a program.
         StageBody::Deferred {
+            env,
             words,
             decoration,
             context,
-        } => match expand_stage(words, *decoration, last, in_function, shell) {
-            Ok(Expanded::Function { name, args }) => dispatch_function_call(&name, args, shell),
-            // `return` unwinds the enclosing function; it is not something a stage
-            // can run, and the eager paths refuse it in the same terms.
-            Ok(Expanded::Return(_) | Expanded::Fail(_)) => {
-                note!("mesh: {}", context.returning());
-                Step::Error(2)
-            }
-            Ok(Expanded::Argv(argv)) => {
-                if argv.is_empty() {
-                    note!("mesh: {}", context.empty());
-                    Step::Error(1)
-                } else if let Some(program) = external_stage(&argv) {
-                    // Replaces this process, so nothing below runs on success.
-                    return exec::exec_stage(&program);
-                } else {
-                    run_expanded(argv, last, shell)
+        } => {
+            // The prefix is applied **here** too, for the same reason and before the
+            // words: a right-hand side can be a capture or a call, so evaluating it
+            // in the parent would run the work in the wrong process — leaking a
+            // call's writes back into the shell, and holding the prompt for the
+            // length of a capture that was supposed to be backgrounded. Nothing is
+            // restored: this process is the stage, and it is about to end.
+            let prefix_failed = if env.is_empty() {
+                None
+            } else {
+                apply_env_bindings(env, last, in_function, shell).1
+            };
+            if let Some(step) = prefix_failed {
+                step
+            } else {
+                match expand_stage(words, *decoration, last, in_function, shell) {
+                    Ok(Expanded::Function { name, args }) => {
+                        dispatch_function_call(&name, args, shell)
+                    }
+                    // `return` unwinds the enclosing function; it is not something a
+                    // stage can run, and the eager paths refuse it in the same terms.
+                    Ok(Expanded::Return(_) | Expanded::Fail(_)) => {
+                        note!("mesh: {}", context.returning());
+                        Step::Error(2)
+                    }
+                    Ok(Expanded::Argv(argv)) => {
+                        if argv.is_empty() {
+                            note!("mesh: {}", context.empty());
+                            Step::Error(1)
+                        } else if let Some(program) = external_stage(&argv) {
+                            // Replaces this process, so nothing below runs on success.
+                            return exec::exec_stage(&program);
+                        } else {
+                            run_expanded(argv, last, shell)
+                        }
+                    }
+                    Err(step) => step,
                 }
             }
-            Err(step) => step,
-        },
+        }
     };
     match step {
         Step::Continue(code) | Step::Error(code) | Step::Exit(code) | Step::Return(_, code) => code,
@@ -6123,6 +6352,54 @@ fn redirects_stdout(redirs: &[Redir]) -> bool {
         });
         fd == 1
     })
+}
+
+/// Expand one eagerly-run pipeline stage: its command words, then its redirects.
+///
+/// Both halves together, so a caller holding the stage's `NAME=value` prefix has a
+/// single place to put the parent's environment back — after the expansions that
+/// read it, on the failing path as much as the succeeding one.
+fn expand_eager_stage(
+    words: &[parser::Word],
+    redirs: Vec<Redir>,
+    decoration: Decoration,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<(Vec<String>, StageBody, Vec<exec::Redirection>), Step> {
+    // Command words expand before the redirect targets, the order `run_single`
+    // uses, so a stage reports the same first failure the unpiped command does —
+    // and `f * > summary` cannot glob the file the redirection is about to create.
+    let (stage_words, body) = match expand_stage(words, decoration, last, in_function, shell)? {
+        // The arguments are typed values, and mesh has no implicit
+        // stringification for a list or map, so only the name goes into the words
+        // a job listing echoes back.
+        Expanded::Function { name, args } => (vec![name], StageBody::Function(args)),
+        // `return` unwinds the enclosing function; it has no meaning as a pipeline
+        // stage, so reject it rather than launch an external `return`.
+        Expanded::Return(_) => {
+            note!("mesh: return: cannot be used in a pipeline");
+            return Err(Step::Error(2));
+        }
+        Expanded::Fail(_) => {
+            note!("mesh: fail: cannot be used in a pipeline");
+            return Err(Step::Error(2));
+        }
+        Expanded::Argv(argv) => {
+            if argv.is_empty() {
+                note!("mesh: empty command in a pipeline");
+                return Err(Step::Error(1));
+            }
+            // `command NAME …` is the program `NAME`, so the stage is that program
+            // rather than a forked shell that runs it.
+            match external_stage(&argv) {
+                Some(program) => (program, StageBody::External),
+                None => (argv, StageBody::Builtin),
+            }
+        }
+    };
+    let opened = expand_redirs(redirs, last, in_function, shell)?;
+    Ok((stage_words, body, opened))
 }
 
 /// Expand each redirection target, evaluating any value in one on the way.
@@ -10085,32 +10362,133 @@ fn completion_for(state: &CompletionState, words: &[String], lookup: Lookup) -> 
         .unwrap_or_else(|| state.cache.spec_for(words))
 }
 
-fn command_segment_words(line: &str) -> Option<Vec<String>> {
-    let mut segment_start = 0;
-    let mut quote = None;
-    let mut escaped = false;
-    for (at, character) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
+/// Quoting and `(` / `[` nesting, tracked across a scan of a line.
+///
+/// Shared by the two scanners below so both agree on what counts as *inside*
+/// something: the `|` in `FOO=$(a | b) cmd` does not start a new segment and the
+/// space in it does not end a word, both of which the parser already knows.
+///
+/// `{` is deliberately **not** nested. It opens a block rather than a group, and
+/// `if x { cargo …` has to keep starting a fresh segment at it.
+#[derive(Default)]
+struct Nesting {
+    quote: Option<char>,
+    escaped: bool,
+    depth: usize,
+}
+
+impl Nesting {
+    /// Take one character, answering whether it sits in the open — a separator or
+    /// a space there is structural, anywhere else it is content.
+    fn step(&mut self, character: char) -> bool {
+        if self.escaped {
+            self.escaped = false;
+            return false;
         }
-        if character == '\\' && quote != Some('\'') {
-            escaped = true;
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            if quote == Some(character) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(character);
+        match character {
+            '\\' if self.quote != Some('\'') => {
+                self.escaped = true;
+                false
             }
-            continue;
-        }
-        if quote.is_none() && matches!(character, ';' | '|' | '&' | '{' | '}') {
-            segment_start = at + character.len_utf8();
+            '\'' | '"' if self.quote == Some(character) => {
+                self.quote = None;
+                false
+            }
+            '\'' | '"' if self.quote.is_none() => {
+                self.quote = Some(character);
+                false
+            }
+            _ if self.quote.is_some() => false,
+            '(' | '[' => {
+                self.depth += 1;
+                false
+            }
+            // Saturating, so a stray `)` in an argument cannot push the rest of
+            // the line into a group that was never opened.
+            ')' | ']' => {
+                self.depth = self.depth.saturating_sub(1);
+                false
+            }
+            _ => self.depth == 0,
         }
     }
-    let words: Vec<String> = line[segment_start..]
+
+    /// Did the scan end inside a quote or a group — that is, mid-word?
+    fn unfinished(&self) -> bool {
+        self.quote.is_some() || self.depth > 0
+    }
+}
+
+/// Where the last command of `line` starts — after the final separator that is
+/// not inside quoting or a group.
+fn segment_start(line: &str) -> usize {
+    let mut nesting = Nesting::default();
+    let mut start = 0;
+    for (at, character) in line.char_indices() {
+        if nesting.step(character) && matches!(character, ';' | '|' | '&' | '{' | '}') {
+            start = at + character.len_utf8();
+        }
+    }
+    start
+}
+
+/// Is this word an unspaced `NAME=value` / `NAME+=value` binding?
+///
+/// The completion side of the parser's `env_binding_follows`, matched on text
+/// because completion has a line rather than tokens. A name is whatever runs up
+/// to the operator without whitespace or quoting, which is what the lexer would
+/// have made one `Word` of.
+fn env_binding_word(word: &str) -> bool {
+    let Some(at) = word.find('=') else {
+        return false;
+    };
+    let name = word[..at].strip_suffix('+').unwrap_or(&word[..at]);
+    !name.is_empty() && !name.contains(['\'', '"', '$', '\\', '/'])
+}
+
+/// Where the word starting at `from` ends — and whether it ran off the end still
+/// inside something.
+///
+/// `FOO="a b"`, `FOO=$(printf a b)` and `FOO=f(a, b)` are each **one** word, as
+/// the lexer reads them; splitting on whitespace made every spaced value look
+/// like a binding followed by junk, and the junk was then taken for the command.
+/// Raised in review as a P2, twice — first for quotes, then for groups.
+///
+/// An unclosed quote or group means the cursor is still *inside* the value, which
+/// is neither a finished binding nor a command position.
+fn word_end(segment: &str, from: usize) -> (usize, bool) {
+    let mut nesting = Nesting::default();
+    for (at, character) in segment[from..].char_indices() {
+        if nesting.step(character) && character.is_whitespace() {
+            return (from + at, false);
+        }
+    }
+    (segment.len(), nesting.unfinished())
+}
+
+/// How much of `segment` is a leading run of `NAME=value` bindings.
+///
+/// An environment prefix stands in front of the command it applies to, so the
+/// command is what follows the run — argument completion was looking up a program
+/// named `FOO=x`. Raised in review as a P2.
+fn env_prefix_end(segment: &str) -> usize {
+    let mut end = 0;
+    loop {
+        let start = end + segment[end..].len() - segment[end..].trim_start().len();
+        if start == segment.len() {
+            return end;
+        }
+        let (word, open) = word_end(segment, start);
+        if open || !env_binding_word(&segment[start..word]) {
+            return end;
+        }
+        end = word;
+    }
+}
+
+fn command_segment_words(line: &str) -> Option<Vec<String>> {
+    let segment = &line[segment_start(line)..];
+    let words: Vec<String> = segment[env_prefix_end(segment)..]
         .split_whitespace()
         .map(str::to_owned)
         .collect();
@@ -10124,7 +10502,14 @@ fn help_completions(help: &str, prefix: &str) -> Vec<String> {
 
 fn command_position(before: &str) -> bool {
     let before = before.trim_end();
-    before.is_empty() || before.ends_with([';', '|', '&', '{'])
+    if before.is_empty() || before.ends_with([';', '|', '&', '{']) {
+        return true;
+    }
+    // `FOO=x ` leaves the cursor at a command, since a prefix binds to the command
+    // in front of which it is written. Only a whole segment of them counts:
+    // `puts FOO=x ` is an argument that happens to look like one.
+    let segment = &before[segment_start(before)..];
+    !segment.is_empty() && env_prefix_end(segment) == segment.len()
 }
 
 fn variable_completions(word: &str, variables: &[(String, Value)]) -> Vec<String> {
@@ -11639,6 +12024,67 @@ mod tests {
         assert!(command_position("puts x | "));
         assert!(command_position("false && "));
         assert!(!command_position("puts "));
+    }
+
+    /// An environment prefix keeps the cursor at a command: `FOO=x <Tab>` has to
+    /// offer commands, and `FOO=x cargo <Tab>` has to complete `cargo`'s arguments
+    /// rather than look up a program named `FOO=x`. Raised in review as a P2.
+    #[test]
+    fn completion_looks_past_an_environment_prefix() {
+        assert!(command_position("FOO=x "));
+        assert!(command_position("FOO=x BAR+=y "));
+        assert!(command_position("puts a | FOO=x "));
+        // An argument that merely looks like one is still an argument.
+        assert!(!command_position("puts FOO=x "));
+        assert!(!command_position("FOO=x cargo "));
+
+        assert_eq!(
+            command_segment_words("FOO=x cargo bu"),
+            Some(vec!["cargo".to_owned(), "bu".to_owned()])
+        );
+        assert_eq!(
+            command_segment_words("echo a | FOO=x BAR+=y cargo --v"),
+            Some(vec!["cargo".to_owned(), "--v".to_owned()])
+        );
+        // Bindings alone are not a command, so there is nothing to look up.
+        assert_eq!(command_segment_words("FOO=x"), None);
+
+        // A quoted value holding a space is **one** word, as the parser reads it.
+        // Split on whitespace alone it looked like `FOO="a` plus junk, so the skip
+        // stopped early and `b"` stood in for the command. Raised in review as a P2.
+        assert!(command_position("FOO=\"a b\" "));
+        assert!(command_position("FOO='a b' BAR=\"c d\" "));
+        assert_eq!(
+            command_segment_words("FOO=\"a b\" cargo bu"),
+            Some(vec!["cargo".to_owned(), "bu".to_owned()])
+        );
+        assert_eq!(command_segment_words("FOO=\"a b\""), None);
+        // The quoting still has to close: an open quote is not a finished binding.
+        assert!(!command_position("FOO=\"a b "));
+
+        // A **group** holds a word together for the same reason quoting does — the
+        // parser takes `FOO=$(printf a b)`, `FOO=(1 + 2)` and `FOO=f(a, b)` as one
+        // binding each, so a space inside one is not where the command starts.
+        // Raised in review as a P2, after the quoted case.
+        assert!(command_position("FOO=$(printf a b) "));
+        assert!(command_position("FOO=f(a, b) BAR=(1 + 2) "));
+        assert_eq!(
+            command_segment_words("FOO=$(printf a b) cargo bu"),
+            Some(vec!["cargo".to_owned(), "bu".to_owned()])
+        );
+        // A separator inside a group is not a separator, so the segment does not
+        // restart at it.
+        assert_eq!(
+            command_segment_words("FOO=$(a | b) cargo bu"),
+            Some(vec!["cargo".to_owned(), "bu".to_owned()])
+        );
+        // An unclosed group leaves the cursor inside the value, like an open quote.
+        assert!(!command_position("FOO=$(printf a "));
+        // `{` opens a block rather than a group, so it still starts a segment.
+        assert_eq!(
+            command_segment_words("if $x { cargo bu"),
+            Some(vec!["cargo".to_owned(), "bu".to_owned()])
+        );
     }
 
     #[test]

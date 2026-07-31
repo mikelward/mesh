@@ -2211,8 +2211,7 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Twelve have since been fixed, one half fixed
-(marked `~`); two are tracked
+matched back to the discussion. Thirteen have since been fixed; two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
 
@@ -2224,7 +2223,7 @@ was re-checked against `main` rather than taken from the PR text.
       *that* function owns. Fixed by `wrapper func` (mikelward/mesh#286) and the
       terser `alias NAME = COMMAND` (mikelward/mesh#289); the config is 130
       aliases and 53 wrappers on the far side of it.
-- [~] **2. `VAR=value cmd` is a syntax error.** No one-command environment
+- [x] **2. `VAR=value cmd` is a syntax error.** No one-command environment
       prefix, so every occurrence becomes `fork { $env.VAR = …; cmd }` — three
       lines and a process for what is one word in every other shell. The config's
       `ssh-to` (`LC_CLIENT_HOST`) and `xr` (`DISPLAY`) both pay it.
@@ -2236,7 +2235,32 @@ was re-checked against `main` rather than taken from the PR text.
       process — so the `fork` is gone and the three lines are one header. See
       §`with` in `docs/REFERENCE.md`.
 
-      **Still to decide: the prefix form itself**, `VAR=value cmd`. It is
+      **Fixed, the other half:** `VAR=value cmd` is the prefix form, binding to
+      one **stage** — `FOO=1 a | FOO=2 b` gives each side its own, `FOO=1 a && b`
+      leaves `b` alone, a function or builtin gets it applied and restored around
+      the call, and a name that was unset goes back to unset. It shares `with`'s
+      apply/restore, so the two spellings cannot drift.
+
+      The collision it creates was accepted knowingly and is written down rather
+      than hidden: `FOO=bar cmd` writes the **environment**, while `FOO=bar` alone
+      binds a shell variable no child sees. A prefix that wrote a shell binding
+      would do nothing for the child, so it has to mean the environment. Whether a
+      bare `FOO=bar` should mean it too is its own entry under Loose ends.
+
+      The historical note, kept because it was wrong for a while: this entry once
+      argued the prefix would cost `x=1` and `x=1 cmd` being one construct, and
+      that `x=1 y=2` — a clean `expected a statement separator` today — would
+      become a command-not-found. Neither happened. A binding run is parsed and
+      **given back** unless a command follows it, so `x=1` and `x=1 y=2` read
+      exactly as they did.
+
+      **The one bash behavior not copied**, and it is POSIX's rule rather than
+      bash's own: under `--posix` (and in dash), a prefix on a *special builtin*
+      leaks into the shell — `FOO=qux :` leaves `FOO` as `qux`. Default bash does
+      not do this. Verified both ways rather than taken from folklore.
+
+      **Superseded, kept for the record:** the prefix form as an open question. It
+      is
       available — mesh requires a separator between statements, so a `NAME=value`
       followed by another word on the same line has exactly one possible reading,
       and the parser can take it syntactically. What it costs is that `x=1` and
@@ -2713,6 +2737,57 @@ was re-checked against `main` rather than taken from the PR text.
 
 Small items rescued from pull requests that were closed as superseded — the bulk
 of each PR had landed by another route, but these pieces had not.
+
+- [ ] **Control flow raised inside a deferred stage never reaches the parent.**
+      A stage carrying a value expands in its **own fork** — that is what keeps a
+      call's writes out of the shell and stops `cmd $(sleep 2) &` holding the
+      prompt — but a `break`, `continue` or `return` raised while expanding there
+      dies with the fork:
+
+      ```mesh
+      for i in [1 2] { puts (if true { break }) | cat
+        puts AFTER }        # AFTER twice; unpiped, the loop exits
+      ```
+
+      Not new, and not about the `NAME=value` prefix, though that is where it was
+      noticed: a prefix now defers exactly as a word does, so the two behave
+      alike, and `loop_control_in_a_prefix_stops_the_stage` asserts them side by
+      side so they cannot drift apart. The stage does not *launch* either way —
+      what is lost is only the effect on the enclosing loop or function.
+
+      Fixing it means a forked stage reporting its control outcome back, which is
+      the same missing channel the piped `gets` line count needs (rough edge 6).
+      Worth doing once, for both.
+
+- [ ] **Consider making a bare `FOO=bar` an environment assignment, and `$FOO`
+      an environment reference.** Raised when the `NAME=value cmd` prefix landed,
+      because the prefix creates a deliberate collision: `FOO=bar cmd` writes the
+      **environment**, since what a child inherits is the entire point, while
+      `FOO=bar` alone binds a **shell** variable that no child ever sees. Same
+      spelling, two namespaces, told apart only by whether a command follows.
+
+      That was accepted knowingly — bash has one namespace and the prefix has to
+      mean the environment to be worth having — but it is worth asking whether
+      the collision should be removed from the other side instead: let a bare
+      `FOO=bar` mean `$env.FOO = bar` and `$FOO` mean `$env.FOO`, so the two
+      spellings agree.
+
+      Against it, and why it is a question rather than a plan:
+
+      - It would give mesh two ways to say the same thing (`FOO=bar` and
+        `$env.FOO = bar`) where `DESIGN.md` keeps shell bindings and the
+        environment deliberately separate.
+      - Every child would inherit anything a script assigns in passing, which is
+        the leak the separation exists to prevent.
+      - `$FOO` reading the environment collides with local bindings — a function's
+        `PATH = …` local shadow would stop being local.
+      - Types: `x = 1` binds an integer, and only strings cross into the
+        environment, so the two spellings would not accept the same values.
+
+      Worth deciding together with `export`, which is already the ingrained
+      spelling for exactly this, and with `x=1 y=2` — two bindings on one line,
+      which bash reads as two assignments and mesh reports as a missing
+      separator.
 
 - [ ] **A numeric-looking argument loses its spelling through a mesh binding.**
       Found while re-checking rough edge 20, which is about something else. A
