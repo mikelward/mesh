@@ -3073,11 +3073,110 @@ fn start_pty_shell_ready(exec: &MeshExec, cwd: Option<&Path>, ready: &[u8]) -> O
 ///
 /// Printed rather than returned because every caller's contract is an `Option`
 /// and threading a reason through all of them would be a larger change than the
-/// diagnosis is worth. The harness runs forked, with the test binary's own
-/// stderr, so the line lands beside the panic that follows it.
+/// diagnosis is worth.
 fn pty_start_failed<T>(why: &str) -> Option<T> {
-    eprintln!("start_pty_shell: {why}");
+    say_from_the_harness("start_pty_shell", why);
     None
+}
+
+/// The diagnostic has to survive the **fork**, which is the whole reason it is
+/// written to a descriptor rather than printed.
+///
+/// The child redirects its own descriptor 2 onto a pipe and says something; the
+/// parent reads it back. An `eprintln!` here would not arrive: the test runner
+/// captures stderr through a thread-local sink installed in the parent, the
+/// child inherits it, and its `_exit` takes the buffer away — which is exactly
+/// the regression this pins, since that is how a CI failure came to read
+/// `PTY harness failed at phase 163` and nothing else.
+#[test]
+fn a_harness_diagnostic_survives_the_fork() {
+    let mut ends = [0; 2];
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+    let (read_end, write_end) = (ends[0], ends[1]);
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0);
+    if child == 0 {
+        unsafe {
+            libc::dup2(write_end, libc::STDERR_FILENO);
+            libc::close(read_end);
+            libc::close(write_end);
+        }
+        say_from_the_harness("start_pty_shell", "a reason worth reading");
+        unsafe { libc::_exit(0) };
+    }
+    unsafe { libc::close(write_end) };
+    let mut said = Vec::new();
+    let mut chunk = [0_u8; 256];
+    loop {
+        let count = unsafe { libc::read(read_end, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if count <= 0 {
+            break;
+        }
+        said.extend_from_slice(&chunk[..count as usize]);
+    }
+    unsafe { libc::close(read_end) };
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert_eq!(
+        String::from_utf8_lossy(&said),
+        "start_pty_shell: a reason worth reading\n"
+    );
+}
+
+/// What a failed teardown quotes back: the last stretch, on one line, with the
+/// control bytes spelled out rather than sent to the reader's own terminal.
+#[test]
+fn a_transcript_tail_is_escaped_and_bounded() {
+    assert_eq!(
+        visible_tail(b"exit 0\r\n\x1b[?2004h\x1b[6n\x07"),
+        "exit 0\\r\\n\\e[?2004h\\e[6n\\a"
+    );
+    assert_eq!(visible_tail(&[0x00, 0x80]), "\\x00\\x80");
+
+    // Longer than the tail it keeps, so it is cut and says so.
+    let long = vec![b'x'; 400];
+    let tail = visible_tail(&long);
+    assert!(tail.starts_with('…'), "{tail}");
+    assert_eq!(tail.chars().count(), 241);
+}
+
+/// Write a harness diagnostic straight to descriptor 2.
+///
+/// **Not `eprintln!`**, and that is the whole point. These run in the *forked*
+/// harness, and the test runner captures stderr per test through a thread-local
+/// sink installed in the parent. A child inherits the sink and writes into its
+/// own copy of it, which goes away with the `_exit` — so every one of these
+/// lines was discarded, and a CI failure arrived with a phase number and no
+/// explanation. Measured: a forked `eprintln!` never appears in the output, a
+/// forked `write(2, …)` always does.
+fn say_from_the_harness(who: &str, why: &str) {
+    let line = format!("{who}: {why}\n");
+    let bytes = line.as_bytes();
+    let mut written = 0;
+    while written < bytes.len() {
+        let count = unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                bytes[written..].as_ptr().cast(),
+                bytes.len() - written,
+            )
+        };
+        if count > 0 {
+            written += count as usize;
+            continue;
+        }
+        // A signal interrupted it, which is not a failure — the rest of the line
+        // is still owed.
+        if count < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        // Anything else is unrecoverable, and there is nowhere left to say so:
+        // this *is* the reporting channel. The harness's phase code still names
+        // the step, which is what the caller had before any of this existed, so
+        // the failure degrades to that rather than hanging or panicking inside a
+        // forked child.
+        return;
+    }
 }
 
 /// Is the shell still there, and if not, what happened to it?
@@ -3125,32 +3224,66 @@ fn stop_pty_shell(shell: PtyShell) -> bool {
     }
     let mut status = 0;
     let reaped = unsafe { libc::waitpid(shell.mesh, &mut status, 0) } == shell.mesh;
+    // Read only when something went wrong, so the ordinary path is byte for byte
+    // what it was. The shell has been reaped by now, so this drains what it left
+    // buffered and then meets end of file.
+    let parting = |master| visible_tail(&pty_read_to_end(master));
+    let why = if !reaped {
+        Some("the shell could not be waited for".to_owned())
+    } else if !libc::WIFEXITED(status) {
+        Some(format!(
+            "the shell was killed by signal {}; last words: {}",
+            libc::WTERMSIG(status),
+            parting(shell.master)
+        ))
+    } else if libc::WEXITSTATUS(status) != 0 {
+        // `exit 0` names its own status, so a nonzero one here means the line
+        // never ran as written — the input reached the shell as something else,
+        // and what it echoed back is the evidence for what.
+        Some(format!(
+            "`exit 0` left with {} instead; last words: {}",
+            libc::WEXITSTATUS(status),
+            parting(shell.master)
+        ))
+    } else {
+        None
+    };
     unsafe { libc::close(shell.master) };
-    if !reaped {
-        return pty_stop_failed("the shell could not be waited for").is_some();
+    match why {
+        Some(why) => pty_stop_failed(&why).is_some(),
+        None => true,
     }
-    if !libc::WIFEXITED(status) {
-        return pty_stop_failed(&format!(
-            "the shell was killed by signal {}",
-            libc::WTERMSIG(status)
-        ))
-        .is_some();
+}
+
+/// The tail of what a session wrote, escaped onto one line.
+///
+/// A pty transcript is mostly cursor moves and color resets, and the whole of it
+/// is far more than a failure needs — so this is the last stretch, with the
+/// control bytes spelled out. Enough to see whether the shell was mid-prompt,
+/// reporting an error, or echoing something nobody typed.
+fn visible_tail(bytes: &[u8]) -> String {
+    const TAIL: usize = 240;
+    let from = bytes.len().saturating_sub(TAIL);
+    let mut out = String::new();
+    if from > 0 {
+        out.push('…');
     }
-    // `exit 0` names its own status, so a nonzero one here means the line never
-    // ran as written — the input reached the shell as something else.
-    if libc::WEXITSTATUS(status) != 0 {
-        return pty_stop_failed(&format!(
-            "`exit 0` left with {} instead",
-            libc::WEXITSTATUS(status)
-        ))
-        .is_some();
+    for &byte in &bytes[from..] {
+        match byte {
+            0x1b => out.push_str("\\e"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            0x07 => out.push_str("\\a"),
+            0x20..=0x7e => out.push(char::from(byte)),
+            other => out.push_str(&format!("\\x{other:02x}")),
+        }
     }
-    true
+    out
 }
 
 /// As [`pty_start_failed`], for the other end of a session.
 fn pty_stop_failed(why: &str) -> Option<()> {
-    eprintln!("stop_pty_shell: {why}");
+    say_from_the_harness("stop_pty_shell", why);
     None
 }
 
