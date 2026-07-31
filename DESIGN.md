@@ -646,7 +646,7 @@ read past: those answers hold *because nothing named `if` is defined*. Expansion
 consults `shell.funcs` (`repl.rs:5529`), so a defined function is found:
 
 ```
-func if(x) { puts OK }; n = "if"; $n arg     # OK
+func if(_x) { puts OK }; n = "if"; $n arg   # OK
 ```
 
 So a keyword is not runnable **bare**, which is all `:kind` needs to be
@@ -658,7 +658,7 @@ part that is not yet settled.
 `global`, `unset` and `export` look contextual and are not, for this purpose:
 each claims the word wherever an assignment does not follow, so no *literal*
 `global x` reaches a function. (Via an expanded name it does —
-`func global(x) { … }; n = "global"; $n y` runs the function. The qualifier
+`func global(_x) { … }; n = "global"; $n y` runs the function. The qualifier
 matters and is not decoration.) They are keywords. `fork` is the one word
 that genuinely straddles it — `fork { … }` is syntax, `fork arg` calls a function
 — and it lands on the reachable side, because that is where a wrong answer costs
@@ -671,7 +671,7 @@ answering `keyword` for something callable hides it. Three of the four spellings
 make that rule apply to *every* command-position word, not just `fork`:
 
 ```
-func if(x) { … }; "if" arg     # a real function, hidden by `keyword`
+func if(_x) { … }; "if" arg    # a real function, hidden by `keyword`
 "if" arg                        # a real program,  hidden by `keyword`
 ```
 
@@ -722,7 +722,7 @@ the third reaches every one of them:
 
 ```
 func while() { return OK }; x = while()        # value call — OK
-func if(x) { puts OK }; n = "if"; $n arg       # expanded name — OK
+func if(_x) { puts OK }; n = "if"; $n arg     # expanded name — OK
 ```
 
 `repl.rs:5529` looks the expanded head up in `shell.funcs` before anything else,
@@ -1004,7 +1004,7 @@ $line:replaceall(re($pat), $new) # pattern arrives as a string → re()
   `${1}` / `${name}` currently stand in for syntax that splices
   the numbered / named group of *this match* (a replacement-local scope, not an
   outer variable — bare `$1` stays reserved, mesh having no positional `$1`). For a
-  **computed** replacement, `NEW` may be a **lambda** taking the match — `:replaceall(/(\d+)/, func(m) { $m:int + 1 })` — the callback form, consistent with `:map` / `:filter` / `:each`.
+  **computed** replacement, `NEW` may be a **lambda** taking the match — `:replaceall(/(\d+)/, func(_m) { $_m:int + 1 })` — the callback form, consistent with `:map` / `:filter` / `:each`.
 
 *(Open sub-questions: the exact backref spelling (`${1}` vs `$1` inside the
 replacement string), and whether a first-only variant is ever needed — it would be a
@@ -1499,6 +1499,161 @@ Because `$env` / `$sh` are already maps, indirect *environment* access falls out
 for free (`$env[$name]`). Open question: is a map always enough, or is a narrow
 by-name facility (read, perhaps write) warranted for genuine metaprogramming?
 Leaning: maps only — revisit only if a real need survives the reframe.)*
+
+**Bare environment references, and one scope ladder** *(decided for now — the
+strong form, adopted to be tried in real use and reversible if it does not hold
+up)*. `$env.NAME` is the only spelling for the environment today,
+and in practice nobody wants to write `$env.ANYTHING` for the handful of names
+they touch daily. `$PATH` is an unbound-variable error (`expand.rs:279`) and bare
+`PATH` is the word `PATH`. The shape that makes both work, taken as a set because
+the pieces only hold together as one:
+
+- ***Three rungs, one existing rule.*** Scopes nest **local ⊂ session ⊂
+  environment**, and the rule is the one the store already implements: reads fall
+  outward (`vars.rs:1198`, innermost local then global), writes stay put
+  (`vars.rs:1145`, the active scope), and an outward write names its scope —
+  `global x = v` for the session (`vars.rs:1158`), `export X = v` for the
+  environment. The environment is a third rung, not a new concept. `export` is
+  then required uniformly at *every* scope, which is less special-casing than
+  today, not more.
+- ***Reads fall out to the environment.*** An unbound `$NAME` resolves
+  `$env.NAME`. The trigger is **presence in the environment**, not a
+  SCREAMING_CASE convention — `http_proxy` and `no_proxy` are real, common,
+  lowercase environment variables, and a case rule cannot see them.
+- ***Writes must not reach through, and that is what makes the fallback safe.***
+  A shell binding named `PATH` is **inert**: command lookup reads the process
+  environment directly (`whence.rs:415`, `env::var_os("PATH")`), never a binding.
+  So a read fallback paired with a local-binding write would let
+  `PATH = /opt/bin:$PATH` bind a local, let `$PATH` read that local straight back
+  and *confirm* the value, and change nothing whatsoever about what runs. The
+  fallback manufactures that trap; the next bullet removes it.
+- ***No shadowing, at any rung.*** A binding may not be created where the name is
+  already visible further out — not local over session, not session over
+  environment. `PATH = /x` is refused, naming `export`, in the same teaching-error
+  style as the bare-`export` refusal (`parser.rs:5530`). The payoff is that
+  `$NAME` has no precedence question at all: a collision cannot exist, so the
+  fallthrough in `vars.rs:1198` can never actually choose. Worth noting Python
+  faces this exact situation and binds the local silently, then fails on read —
+  `UnboundLocalError` is one of its most-hit footguns. Erroring at the assignment
+  is strictly better.
+- ***`_`-prefixed locals, enforced rather than styled.*** No-shadow on its own is
+  non-modular: `func f { count = 0 }` works until a caller creates a session
+  `count`, so a callee breaks on its caller's namespace, detectable only at
+  runtime. Requiring a function-local binding to be `_`-prefixed — and making a
+  `_` name *always* current-scope, never global or exported — makes collision
+  impossible by construction. The namespaces are disjoint, so the check is static
+  and no caller can break a callee. Inside a function every assignment is then
+  `_local`, `global`, or `export`; there is no fourth case. (`_name` already
+  parses: `valid_name` (`parser.rs:5804`) accepts `_private` and rejects bare
+  `_`, which stays the discard.)
+- ***Parameters carry the underscore too — no exemption.*** A parameter is a
+  function-local binding like any other, so it is spelled `_name` in the signature
+  and read as `$_name` in the body. This is the stricter of the two options on the
+  table, taken deliberately: it makes the rule **exceptionless** — every binding
+  visible inside a function body is `_`-prefixed, with no "…unless it is in the
+  signature" clause for a reader to carry — and it costs nothing structural,
+  because parameters are known when the body is parsed either way.
+
+  Two things fall out that are worth naming, because both *remove* rules rather
+  than adding them. **The declaration-site exemption disappears**: there is no
+  longer a class of plain-named inner bindings, so a plain name inside a body
+  always means an outer one, mechanically, with no signature to consult. And
+  **the path-var blacklist becomes unnecessary** — `func f(_PATH)` cannot shadow
+  the environment's `PATH`, because `$_PATH` and `$PATH` are simply different
+  names, so the one genuinely misleading parameter shadow stops being reachable.
+- ***It reaches every binding form — but only inside a function.*** Once
+  parameters carry the prefix on the grounds that they are locals, so must every
+  other construct that introduces a local name: **lambda parameters**,
+  **destructuring**, and **match-arm bindings**. Nothing distinguishes those from
+  a parameter — each binds a name visible in a body, each could otherwise shadow
+  an outer one — so an exemption for any of them would reopen exactly the hole
+  the exceptionless reading closes.
+
+  The scope qualifier is what bounds this, and it bounds it sharply. `_` marks a
+  **function**-local, and at top level the session *is* the current scope, so a
+  top-level binding is plain-named and unaffected. The same destructure is
+  therefore spelled two ways, and the difference is the only thing the reader has
+  to track:
+
+  ```
+  [user pass uid] = $line:split(":")        # top level — session scope, plain
+
+  func parse(_line) {
+    [_user _pass _uid] = $_line:split(":")  # inside a function — local, prefixed
+  }
+  ```
+
+  So the tax lands on **function bodies that destructure or match**, not on
+  interactive or top-level code — which is the bulk of what a shell user types,
+  and the reason the [Destructuring](#destructuring) and
+  [Matching](#matching-match) examples below stand correct as written rather than
+  needing a sweep. It is still the piece to judge first in use: a helper that
+  pulls apart its arguments is exactly the code that gains the most underscores,
+  and it is also the code mesh most wants people writing instead of `$1`-style
+  plumbing.
+- ***The call syntax, and the question it turns on.*** The underscore is a
+  **scope** marker, and a flag parameter's name is also **public interface** —
+  `func deploy(--_region = us-west)` has to decide what a caller types. This
+  narrows to *flags* only: a positional is passed by position, so `deploy prod`
+  never names `_env` at all, and a rest parameter likewise. Hyphens are already
+  legal in names (`valid_name`, `parser.rs:5804`, accepts `MY-VAR`), so
+  `--dry-run` can bind `$_dry-run` with no name mangling — the leading underscore
+  is the whole question.
+
+  The question underneath is **whether `_` is part of the identifier or a marker
+  on it**, and the two readings are not interchangeable:
+
+  - ***Part of the identifier.*** `_region` and `region` are unrelated names. This
+    is what makes no-shadow **free** — a local can never collide with an outer
+    binding because the namespaces are disjoint, so the check is static and no
+    caller can break a callee. It is the reading the bullets above assume.
+  - ***A marker on the identifier*** (punctuation, like a sigil). Then `_region`
+    *is* `region`, marked local, and the call site strips it for the same reason
+    a sigil is not part of a name. Clean at the call site — but it **gives back
+    the disjointness**, because `_count = 0` in a function is now the name
+    `count`, which a session `count` collides with. No-shadow becomes a runtime
+    check again, and a caller can break a callee again.
+
+  **Taken: `_` is part of the identifier** — the strong form, chosen because it is
+  the reading that makes the ban free rather than checked.
+
+  That makes "strip the prefix at the call site" circular *if* justified the
+  natural way, since the marker reading is exactly what would undo the property
+  just bought. So stripping is defined instead as a **derivation rule, not an
+  identity claim**: `_region` remains its own identifier, and the flag it
+  *exposes* is mechanically its name minus the leading `_`. The derivation is
+  total and injective — only a parameter named `_region` can expose `--region` —
+  so disjointness survives untouched and callers type `deploy --region=eu-west`.
+  The honest cost is two spellings for one parameter, related by a rule the reader
+  has to know.
+
+  The property that makes this worth the rule: **call sites do not change at all.**
+  `deploy prod --force web1 web2` is byte-identical before and after; only
+  signatures and bodies gain underscores. A reversal is therefore confined to
+  declarations, which is what keeps the whole block cheap to undo.
+
+  Rejected, and why: **keep it** (`deploy --_region=eu-west`) is one spelling with
+  no rule, but leaks a scope marker into every call site of a public interface, and
+  would churn every call site in the language. **Name the external form
+  explicitly** is honest but adds ceremony to the common case where the two match.
+  **Exempt parameters** is the smallest change and the one most languages make —
+  it costs only the exceptionless "every binding in a body is `_`-prefixed"
+  reading, and it is the fallback if the strong form does not survive use.
+
+*Costs and loose ends, in the order they are likely to bite: `_i` / `_line` /
+`_out` throughout every function body is a visible tax and a hard break from
+every other shell — this is the piece most likely to be reversed once it has been
+lived with, and the reason the whole block is provisional. A read that falls out
+to the environment turns what is today an unbound-variable error into an
+inherited ambient value — it can only fire where the name is bound nowhere, so it
+cannot change a working program's meaning, but it is a real dent in fail-loud.
+`$env.PATH` is a **list**, so even with all of the above `echo $PATH` errors
+("list value needs `...`") unless a path-type value `:`-joins when a byte context
+demands one, which is arguably just the export serialization above applied one
+step earlier. Removing an environment entry still has no spelling, so
+`unset PATH` would drop a binding rather than the entry. And whether the
+one-command prefix `NAME=value cmd` rides on this or on
+[`with`](#variables-and-assignment)'s remains open either way.*
 
 ### Quoting and escaping
 
@@ -2113,6 +2268,12 @@ the left**. So splitting a string into variables — bash's `read a b c` — is 
   `a`/`b`/`c` left at their prior values (or unbound), never half-updated. The
   assignment is atomic: all names take their new values or none do.
 
+*(The examples here bind at **top level**, where the session is the current scope,
+so the names are plain. Inside a `func` the same patterns bind function-locals and
+carry the `_` prefix the [scope ladder](#variables-and-assignment) requires —
+`[_user _pass _uid] = $_line:split(":")`. The grammar is identical either way; only
+the names differ.)*
+
 **The pattern grammar is shared with [`match`](#matching-match).** A bare
 destructuring assignment is the *unconditional* use ("I know the shape — bind it");
 a **`match` arm** is the *conditional* use — branch on shape or length and bind in
@@ -2300,8 +2461,8 @@ natural extension of the same idea; and nested patterns (`[a [b c]] = …`).)*
 ### Functions
 
 ```
-func greet(name) {
-  echo "hi, $name"
+func greet(_name) {
+  echo "hi, $_name"
 }
 
 greet world               # -> hi, world
@@ -2310,40 +2471,48 @@ greet world               # -> hi, world
 Paren-delimited, `func name(params) { … }` — C/Go/JS muscle memory, and unlike
 Elvish's `{|a b| … }` or Nushell's `def f [a b] { … }` it puts the signature
 where a reader already looks for it. Parameters are **named**: inside the body
-you reference `$name`, never `$1`. This is the fish `--argument-names` idea
+you reference `$_name`, never `$1`. This is the fish `--argument-names` idea
 promoted to the declaration itself.
+
+Parameters carry the `_` prefix because they *are* function-locals, and the
+[scope ladder](#variables-and-assignment) spells every function-local that way —
+there is no exemption, so every binding visible inside a body reads as local
+without consulting the signature. A **flag** parameter exposes its name minus the
+leading `_`, so `--_region` is passed as `--region`; call sites are therefore
+unchanged by the prefix, and positionals and rest parameters never name themselves
+at a call site at all.
 
 The signature borrows Nushell's/Elvish's proven vocabulary — *positional*,
 *optional-with-default*, *flag*, and *rest*:
 
 ```
-func deploy(env, --region = us-west, --force, --tag = latest, ...hosts) {
-  # $env     required positional
-  # $region  valued flag,   defaults to us-west
-  # $force   boolean switch: true iff --force was passed
-  # $tag     valued flag,   defaults to latest
-  # $hosts   list of any remaining positionals   (rest / "flattening")
+func deploy(_env, --_region = us-west, --_force, --_tag = latest, ..._hosts) {
+  # $_env     required positional
+  # $_region  valued flag,   defaults to us-west   (passed as --region)
+  # $_force   boolean switch: true iff --force was passed
+  # $_tag     valued flag,   defaults to latest    (passed as --tag)
+  # $_hosts   list of any remaining positionals    (rest / "flattening")
 }
 
 deploy prod --force web1 web2
-#   env=prod  region=us-west  force=true  tag=latest  hosts=[web1 web2]
+#   _env=prod  _region=us-west  _force=true  _tag=latest  _hosts=[web1 web2]
 
 deploy prod --region=eu-west --tag=v9 ...$fleet
-#   env=prod  region=eu-west  tag=v9  hosts = the spread-in elements of $fleet
+#   _env=prod  _region=eu-west  _tag=v9  _hosts = the spread-in elements of $fleet
 ```
 
-`region` is a **flag**, not an optional positional, on purpose — with a
-`...hosts` rest parameter present, an optional *positional* `region` could not
+`_region` is a **flag**, not an optional positional, on purpose — with a
+`..._hosts` rest parameter present, an optional *positional* `_region` could not
 be skipped (the first host would silently bind to it). That is the general
 rule below. An optional positional is fine when it is the last non-rest
 parameter and can just be omitted from the right:
 
 ```
-func tag(image, version = latest) {          # optional positional, no rest
-  docker tag $image $image:$version
+func tag(_image, _version = latest) {        # optional positional, no rest
+  docker tag $_image $_image:$_version
 }
-tag app          # version defaults to latest
-tag app v9       # version = v9
+tag app          # _version defaults to latest
+tag app v9       # _version = v9
 ```
 
 Rules:
@@ -2356,8 +2525,10 @@ Rules:
   optional positional. It follows that an optional positional and a `...rest`
   do **not** usefully coexist (the rest would swallow anything meant for the
   optional), so a signature with `...rest` keeps its positionals required.
-- **Flags** are declared with a leading `--`. `--force` (no `=`) is a boolean
-  **switch**, false unless passed; `--tag = default` is a **valued flag**. At the call
+- **Flags** are declared with a leading `--` on the parameter name, so `--_force`
+  (no `=`) is a boolean **switch**, false unless passed, and `--_tag = default` is
+  a **valued flag**. Each exposes its name minus the leading `_`, which is what
+  callers write. At the call
   site each has the two equivalent spellings from
   [Calling for a value](#calling-for-a-value-and-lambdas): the dashed sugar
   (`--force`, `--tag=v2`) and the value-mode `key: value` pair (`force: true`,
@@ -2505,7 +2676,7 @@ mechanism](#built-ins) is *decided* — what `alias ll` defines is a `func`. But
 real configs still need things a plain `func` doesn't yet give cleanly; these are
 open:*
   - *A **terse forwarding wrapper.** ~~Open.~~ **Settled, and built:
-    [`wrapper func`](#functions).** Even `func co(...args) { vcs checkout ...$args }`
+    [`wrapper func`](#functions).** Even `func co(..._args) { vcs checkout ...$_args }`
     was not a fully transparent baseline: under the settled function rules an
     **undeclared long flag** (`co --amend`) is rejected before `...args` can collect
     it, so the caller needed an explicit `--` — the same trap nushell hits, where
@@ -2570,7 +2741,7 @@ process* and its `cd` (or `export`) **persists after return** — exactly like
 bash, and exactly what navigation helpers want:
 
 ```
-func proj(name) { cd ~/work/$name }     # moving your shell is the point
+func proj(_name) { cd ~/work/$_name }   # moving your shell is the point
 ```
 
 The decisive reason to keep persist as the default (over auto-restoring cwd the
@@ -2712,8 +2883,8 @@ Rules:
   first position, and a `--help` **option** is told apart by its leading `--` — the
   same way a shell already separates flags from arguments.
 - **A signature declares options with the `--name` spelling**
-  (`func deploy(env, --force, --region = us-west, --out = -) { … }`) and positionals as
-  bare names (`env`); either call spelling (`--region=us-west` or `region: us-west`)
+  (`func deploy(_env, --_force, --_region = us-west, --_out = -) { … }`) and
+  positionals as bare names (`_env`); either call spelling (`--region=us-west` or `region: us-west`)
   binds the same parameter. `...spread` works in both modes — a list of positionals or
   a map of options.
 - **The channels are independent.** During `x = f(…)`, whatever `f` writes to
@@ -4654,6 +4825,22 @@ to avoid" rather than promising the latter as done.
   a value call (independent channels); externals have no return value (runtime
   error → `$(…)`). Lambdas are `func(params) { … }` (anonymous, one param
   grammar), passed to `:map` / `:filter` / `:each`.
+- **Bare environment references (`$PATH`) — decided for now, and reversible**
+  ([Variables and assignment](#variables-and-assignment)). The environment becomes
+  a third scope rung below local and session; reads fall outward to it on
+  presence; no binding may shadow one further out; and `_`-prefixed
+  function-locals — **parameters included, no exemption** — keep that ban static
+  and modular. Adopted to be lived with rather than settled on paper: the
+  underscore tax on every function body is the piece most likely to be reversed.
+  `_` is **part of the identifier**, which is what keeps the ban free and static;
+  a flag parameter therefore *derives* its call-site name by dropping the leading
+  `_` (`--_region` is passed as `--region`) rather than being identified with it,
+  so call sites are unchanged and only declarations gain the prefix. The prefix
+  reaches every binding form — lambda parameters, destructuring, match arms — but
+  only **inside a function**: at top level the session is the current scope, so
+  interactive and top-level code stays plain-named. The cost therefore lands on
+  function bodies that destructure or match, which is the first thing to judge in
+  use.
 - **Remaining function questions** — whether a **`func` defined inside a `func`**
   is visible only there; a **TODO — dynamic scope**: the "extract a chunk
   into a subfunction" goal that fixed cwd as *persist* would be served further by
