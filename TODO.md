@@ -2836,6 +2836,17 @@ of each PR had landed by another route, but these pieces had not.
         its prompt, and the second waits for one the handler opens before it
         sleeps. Six full-suite runs pinned to one CPU, all green, against four
         failures in six before.
+
+        Both waits end on the job being **reapable**, not on it having begun to
+        leave. End of file is the second of those, not the first: the kernel
+        closes a process's descriptors in `exit_files` and publishes its wait
+        status later in `exit_notify`, and between the two the shell cannot yet
+        reap it. Probed over 5000 runs that gap was open about 1% of the time,
+        and *flat* whether the reader did nothing afterwards or five thousand
+        syscalls' worth — a child preempted mid-teardown is waiting for a
+        scheduling slot, not for work to finish, so waiting longer does not
+        help. `/proc/<pid>/stat` reporting state `Z` is the answer, and where
+        there is no `/proc` the fifo answers alone.
       - `the_title_setting_turns_the_title_off_and_back_on`, phase 140.
       - `vs_code_gets_its_own_dialect_and_the_command_line`, phase 170.
 

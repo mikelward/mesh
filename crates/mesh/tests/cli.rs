@@ -3863,6 +3863,83 @@ fn pty_settle_until(master: RawFd, seen: &mut Vec<u8>, marker: &[u8]) -> bool {
 /// A pty, because this is a prompt-lifecycle hook: the notice and the hook both
 /// belong to the interactive loop, and a piped script never reaches it. The
 /// job's own status is what the hook is for, so it is one no default produces.
+#[test]
+fn a_backgrounded_jobs_pid_is_read_off_the_announcement() {
+    assert_eq!(announced_pid(b"[1] 31445\r\n"), Some(31445));
+    // As it actually arrives, wrapped in what the line editor drew around it.
+    assert_eq!(
+        announced_pid(b"\x1b[0m\x1b[?25l[2] 907\r\n\x1b[?2004h"),
+        Some(907)
+    );
+    assert_eq!(announced_pid(b"no job here"), None);
+}
+
+/// The state is read from after the last `)` rather than by counting columns,
+/// because the command name sits in those parentheses and may hold anything.
+#[test]
+fn a_process_state_survives_a_command_name_with_spaces() {
+    assert_eq!(process_state("31445 (sh) Z 31440 31445 0"), Some('Z'));
+    assert_eq!(process_state("907 (a b) c) R 900 907 0"), Some('R'));
+    assert_eq!(process_state("truncated"), None);
+}
+
+/// The state letter in a `/proc/<pid>/stat` line.
+///
+/// Taken from after the **last** `)`, not by counting fields. The field before
+/// it is the command name, which is parenthesized precisely because it may hold
+/// anything — spaces and parentheses included — so splitting on whitespace
+/// finds the wrong column for a process named `(a b)`.
+fn process_state(stat: &str) -> Option<char> {
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.chars().next())
+}
+
+/// Wait until a process is **reapable** — terminated, and its status published.
+///
+/// The step after end of file. `/proc/<pid>/stat` reports it as state `Z`, and
+/// the state is the first field after the last `)`, which is where it has to be
+/// read from: the field before it is the command name, and that is in
+/// parentheses precisely because it may contain anything.
+///
+/// A missing entry answers yes. Two things produce one and both mean this is
+/// over: the shell has already reaped the job, or there is no `/proc` at all —
+/// which is every platform but Linux, and there the fifo answers alone as it
+/// did before. Linux is where the suite's tests run in CI, and where the flake
+/// this closes was seen.
+fn wait_until_reapable(pid: u32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return true;
+        };
+        match process_state(&stat) {
+            Some('Z') | None => return true,
+            _ => std::thread::sleep(std::time::Duration::from_millis(1)),
+        }
+    }
+    false
+}
+
+/// The same wait, for the handler to run — mesh has no `/proc` reader, so it
+/// asks a shell.
+///
+/// `$2` is the pid. An unreadable entry ends the loop, so this is the no-op it
+/// should be wherever there is no `/proc`, and the `sed` takes the state from
+/// after the last `)` for the reason [`wait_until_reapable`] gives.
+const REAPABLE: &str = "while [ -r /proc/$2/stat ] && [ \"$(sed -e \"s/.*) //\" -e \"s/ .*//\" /proc/$2/stat)\" != Z ]; do sleep 0.01; done";
+
+/// The pid mesh announces when it backgrounds a job — `[1] 31445`.
+fn announced_pid(window: &[u8]) -> Option<u32> {
+    let text = String::from_utf8_lossy(window);
+    let start = text.rfind("] ")? + 2;
+    text[start..]
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .filter(|digits| !digits.is_empty())?
+        .parse()
+        .ok()
+}
+
 /// Make a fifo, the harness's one exact signal that a process has **ended**.
 fn make_fifo(path: &Path) -> bool {
     let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
@@ -4157,15 +4234,24 @@ fn jobdone_hook_harness(exec: &MeshExec, gates: &Path) -> i32 {
     let (Some(one_word), Some(two_word)) = (quoted(&one), quoted(&two)) else {
         return 163;
     };
+    //
+    // End of file is not the last word, though, and this is the part that took a
+    // review to see. It says the job has *begun* to leave: the kernel closes a
+    // process's descriptors in `exit_files` and publishes its wait status later,
+    // in `exit_notify`, so between the two the shell cannot yet reap it. Probed
+    // here over 5000 runs, that gap was open about 1% of the time — and flat
+    // whether the reader did nothing afterwards or five thousand syscalls'
+    // worth, because a child preempted mid-teardown is waiting for a scheduling
+    // slot rather than for work to finish. So each wait ends on the job being
+    // **reapable**, which `/proc/<pid>/stat` reports as state `Z`. Where there
+    // is no `/proc` the check is skipped and the fifo answers alone, which is
+    // where this stood before.
+    //
+    // The jobs are launched before the handler is written, since it needs the
+    // second one's pid. Nothing can fire in between: both are blocked opening
+    // their fifos, and no reader arrives until the handler is registered.
+    let mut pids = Vec::new();
     for line in [
-        // Only for the *first* job. The handler runs for both, and by the
-        // second there is no writer left on that fifo — a `cat` there would
-        // wait for one that has already been and gone.
-        format!(
-            "func chain(id, cmd, status) {{ puts JOBDONE=$id/$status; if $status == 3 {{ sh -c 'cat \"$1\" > /dev/null' _ {} }}; jobs }}\n",
-            two_word
-        ),
-        "on jobdone j1 chain\n".to_owned(),
         // A byte before the exit, so end of file means "a writer opened and then
         // left" rather than "no writer ever came".
         format!("sh -c 'printf x; exit 3' > {one_word} &\n"),
@@ -4177,11 +4263,36 @@ fn jobdone_hook_harness(exec: &MeshExec, gates: &Path) -> i32 {
         let Some((window, _)) = pty_read_until_command_done(shell.master) else {
             return 152;
         };
+        let Some(pid) = announced_pid(&window) else {
+            return 164;
+        };
+        pids.push(pid);
+        seen.extend_from_slice(&window);
+    }
+    let [one_pid, two_pid] = pids[..] else {
+        return 164;
+    };
+    for line in [
+        // Only for the *first* job. The handler runs for both, and by the
+        // second there is no writer left on that fifo — a `cat` there would
+        // wait for one that has already been and gone.
+        format!(
+            "func chain(id, cmd, status) {{ puts JOBDONE=$id/$status; if $status == 3 {{ sh -c 'cat \"$1\" > /dev/null; {}' _ {} {two_pid} }}; jobs }}\n",
+            REAPABLE, two_word
+        ),
+        "on jobdone j1 chain\n".to_owned(),
+    ] {
+        if !pty_write(shell.master, line.as_bytes()) {
+            return 151;
+        }
+        let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+            return 152;
+        };
         seen.extend_from_slice(&window);
     }
     // Reading here releases job one and waits for it to be over. The shell is
     // idle at its prompt throughout, so nothing has noticed it.
-    if !read_fifo_to_end(&one) {
+    if !read_fifo_to_end(&one) || !wait_until_reapable(one_pid) {
         return 162;
     }
     // A bare `exit`, with no `jobs` to do the noticing. `exit` is a builtin and
