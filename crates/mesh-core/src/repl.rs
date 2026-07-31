@@ -13027,7 +13027,11 @@ mod tests {
         assert!(!needs_more_input("cd /"));
         assert!(!needs_more_input("puts *"));
         assert!(needs_more_input("puts value |"));
-        assert!(!needs_more_input("puts 'unterminated"));
+        // An unclosed quote is the same "ran out of input" signal an unclosed
+        // brace is, so it waits for the line that closes it rather than failing
+        // on sight — which is what a script has always done with the same text.
+        assert!(needs_more_input("puts 'unterminated"));
+        assert!(!needs_more_input("puts 'closed'"));
     }
 
     #[test]

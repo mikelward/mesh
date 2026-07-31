@@ -457,7 +457,10 @@ impl std::fmt::Display for ParseError {
                 f,
                 "syntax error: an optional positional cannot combine with a `...rest` parameter"
             ),
-            ParseErrorKind::UnknownEscape(c) => write!(f, "syntax error: invalid escape \\{c}"),
+            ParseErrorKind::UnknownEscape(c) => write!(
+                f,
+                "syntax error: invalid escape \\{c}; for text holding its own backslashes (a sed or awk program, a Windows path) use a raw string, `r'…'`"
+            ),
             ParseErrorKind::BadUnicodeEscape => {
                 write!(f, "syntax error: invalid \\u{{…}} escape")
             }
@@ -942,14 +945,42 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
     // which is every interactive and piped use of a heredoc.
     let tokens = match tokenize(source) {
         Ok(tokens) => tokens,
-        // Only the heredoc case. An unterminated quote or `${` is a genuine
-        // syntax error even at end of input — those cannot be continued on the
-        // next line, and buffering them would swallow the diagnostic.
         Err(ParseError {
             kind: ParseErrorKind::UnterminatedHeredoc(delimiter),
             ..
         }) => {
             return Ok(ParseOutcome::IncompleteHeredoc(delimiter));
+        }
+        // An unclosed **quote** is the tokenizer running out of input, not a shape
+        // it rejects — the next line can close it, and a script proves it: a
+        // `r'…'` holding a two-line sed program parses and runs from a file
+        // today. Reported rather than buffered, the same text was a syntax error
+        // the moment it arrived a line at a time, so the two readers disagreed
+        // about the same source.
+        //
+        // Buffering does not swallow the diagnostic, which was the reason for
+        // returning early here: at true end of input every caller converts an
+        // incomplete parse back into the error it carries, because nothing more
+        // is coming. Only a reader with more input to offer waits, and it shows
+        // the continuation prompt while it does — exactly what an open `{`
+        // already gets from the arm below.
+        //
+        // The quote characters and nothing else. A **bare** `${x` also ends the
+        // input, but no later line can complete it: it is scanned by
+        // `variable_end`, whose `valid_variable_access` rejects the newline, so
+        // buffering it would consume a following `}` into a reference that still
+        // cannot parse — and with no `}` at all, swallow every command after it
+        // through EOF. Raised in review as a P2. An unclosed `$(` or `${` *inside*
+        // a string keeps its old hard error for the same reason: continuing it is
+        // a separate question from continuing the string around it.
+        Err(ParseError {
+            kind: ParseErrorKind::Unterminated(quote @ ('"' | '\'')),
+            span,
+        }) => {
+            return Ok(ParseOutcome::Incomplete(Box::new(ParseError {
+                kind: ParseErrorKind::Unterminated(quote),
+                span,
+            })));
         }
         Err(error) => return Err(error),
     };

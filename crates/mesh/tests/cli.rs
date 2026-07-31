@@ -2212,12 +2212,69 @@ fn quoting_suppresses_tilde_expansion() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The paste that motivated this: a multi-line sed program in a raw string. It
+/// parsed from a *file* already, so the line-at-a-time reader was the only thing
+/// that disagreed — and paste is exactly where that reader is used. Rough edge 23
+/// from the config port.
 #[test]
-fn unterminated_quote_is_a_syntax_error_that_recovers() {
-    // The bad line reports a syntax error; the shell keeps going.
+fn a_multi_line_raw_string_survives_being_pasted() {
+    let out = run_with_input("sed r's/x/y/\ns/a/b/' /dev/null\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And the escape error a pasted *unraw* program hits now names the raw form,
+    // which is the other half of that edge: `r'…'` existed, the diagnostic that
+    // fires when you needed it did not mention it.
+    let out = run_with_input("sed 's/\\(a\\)/[\\1]/' /dev/null\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid escape \\(") && stderr.contains("r'…'"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn an_unterminated_quote_continues_onto_the_next_line() {
+    // A quote that never closes is the reader running out of input, not a shape
+    // it rejects — so it buffers, exactly as an open `{` does, and the next line
+    // is string content rather than a command. A script has always read it this
+    // way; the line-at-a-time reader used to disagree with it about the same text.
+    let out = run_with_input("puts 'a\nb'\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\nafter\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // **Only** the quote characters continue. A bare `${x` also ends the input,
+    // but no later line can complete it — it is scanned by `variable_end`, whose
+    // `valid_variable_access` rejects the newline — so buffering it consumed a
+    // following `}` into a reference that still could not parse, and with no `}`
+    // at all swallowed every command after it through EOF. Raised in review as a
+    // P2; it reports on its own line, and what follows still runs.
+    let out = run_with_input("puts ${x\nputs after\nputs more\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unclosed `}`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\nmore\n");
+
+    // The cost of that, stated plainly: a quote that is never closed swallows
+    // what follows, and the error arrives at end of input rather than per line.
     let out = run_with_input("puts 'oops\nputs ok\n");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("syntax error"));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unclosed `'`"), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "`puts ok` is string content now, not a command"
+    );
 }
 
 #[test]
@@ -2459,8 +2516,13 @@ fn unterminated_braced_interpolation_is_a_syntax_error() {
     // `${` signals interpolation intent, so a missing `}` (or a malformed name
     // inside) is a loud syntax error, not silent literal text — a literal `$`
     // in a string is `\$`. An unbraced `$5` stays a literal `$5`.
-    let out = run_with_input("x = abc\nputs \"${x\"\nputs \"$5\"\n");
+    let out = run_with_input("x = abc\nputs \"${x\"\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("syntax error"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+
+    // An unbraced `$5` is a literal `$5` — asked separately, since the line above
+    // now buffers rather than failing on sight and would swallow this one.
+    let out = run_with_input("puts \"$5\"\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "$5\n");
 }
 
@@ -18048,11 +18110,13 @@ fn a_heredoc_is_buffered_until_its_delimiter_arrives() {
     let out = run_with_input("cat << END\nbody\nEND\nputs after\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "body\nafter\n");
 
-    // An unterminated *quote* is still a hard error at end of input, since it
-    // cannot be continued on the next line.
+    // An unterminated *quote* buffers the same way — it is the same "ran out of
+    // input" signal — so it reports at end of input rather than on sight, and
+    // what follows is string content. See
+    // `an_unterminated_quote_continues_onto_the_next_line`.
     let out = run_with_input("puts 'unterminated\nputs after\n");
     assert!(String::from_utf8_lossy(&out.stderr).contains("syntax error"));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
 }
 
 #[test]
