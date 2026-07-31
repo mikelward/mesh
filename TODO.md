@@ -2691,14 +2691,57 @@ of each PR had landed by another route, but these pieces had not.
       `pty_start_failed` for the six ways a session fails to start), so the next
       occurrences should be cheaper to read than these were.
 
-      **Two more, seen in CI rather than under `taskset`:**
-      `notify_reaches_the_terminal_and_a_quick_command_does_not` (phase 163) and
-      `spawn_failure_returns_terminal_to_interactive_shell` (phase 38). The
-      notify one failed on two unrelated branches — a modifier diagnostic and
-      this `with` block — neither of which can reach the notify path, and both
-      pass locally in repeated single and full-suite runs. Recorded here rather
-      than chased on whichever branch happens to catch them, since they are not
-      that branch's failure.
+      **Two more were seen in CI rather than under `taskset`. Both are fixed**,
+      and they are kept here because of how they turned out rather than because
+      anything is outstanding — one bug, found late, wearing two phase numbers.
+
+      Note what this does *not* close: the same notify test has a separate
+      still-open entry below at harness code **150**, a
+      `pty_read_until_command_done` timeout after `on --remove`. That is a
+      different failure of the same test, and nothing here touches it.
+
+      `notify_reaches_the_terminal_and_a_quick_command_does_not` (phase 163) —
+      **fixed** in 036a7f5, and it was not load at all. `stop_pty_shell` wrote
+      `exit 0` and then blocked in `waitpid` with nobody reading the pty, so the
+      farewell prompt's cursor-position query went unanswered, reedline gave up
+      with `line editor error: The cursor position could not be read within a
+      normal duration`, and mesh left with **1** — an `exit 0` that named its own
+      status not having it. The harness reads to end of file before it waits now.
+
+      Two things that hid it, both worth remembering. It read as flaky because it
+      failed on unrelated branches — a modifier diagnostic, a `with` block —
+      neither of which can reach the notify path, which is exactly the shape that
+      argues "not this branch's fault, therefore load". And the harness's own
+      explanation was being thrown away: `pty_start_failed` / `pty_stop_failed`
+      run in the **forked** child, where the test runner's thread-local stderr
+      sink is a copy that `_exit` discards, so `PTY harness failed at phase 163`
+      arrived with nothing beside it. 296b98a writes to descriptor 2 directly.
+      A phase number with no line under it is what made a diagnosable failure
+      look like weather.
+
+      `spawn_failure_returns_terminal_to_interactive_shell` (phase 38) **shared
+      the same cause and is fixed with it**, and the next sighting is what said so — it arrived on the
+      docs-only branch that first wrote this paragraph, as phase 27 of
+      `new_foreground_job_does_not_receive_sigcont`. Both phases are the
+      `WEXITSTATUS(status) != 0` check in `spawn_failure_harness` and
+      `sigcont_harness`, the only two harnesses left writing `exit 0` and then
+      waiting with nobody reading the pty. Their own comment named them —
+      "these two harnesses predate it" — while explaining the `exit 0` spelling
+      they had copied without the drain that makes it work. Both drain now.
+
+      Worth stating because it changes what the word covers: **four of the five
+      teardown failures recorded here were one bug wearing different phase
+      numbers**, across
+      different tests, on unrelated branches. What made them look like weather
+      was that each sighting was a phase code with no line under it, on a diff
+      that plainly could not have caused it. Neither observation was wrong;
+      together they suggested load, and load was never it.
+
+      Not reproduced locally — not under `taskset -c 0` per test, and not with a
+      full single-CPU suite run. The argument is structural: the same pattern was
+      proven to cause exactly this in `stop_pty_shell` (036a7f5), only these two
+      still had it, and the two phase numbers CI reported are precisely their
+      status checks. CI is the test.
 
 - [ ] **If the syntactic capture-status rule proves too narrow, carry the status
       as evaluation metadata instead.** An assignment takes its right-hand side's

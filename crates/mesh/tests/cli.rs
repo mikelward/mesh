@@ -5180,6 +5180,13 @@ fn spawn_failure_harness(exec: &MeshExec) -> i32 {
     if unsafe { libc::write(master, b"exit 0\n".as_ptr().cast(), 7) } != 7 {
         return 37;
     }
+    // Read — and keep answering — until the session closes the pty, rather than
+    // waiting in `waitpid` with nobody at the other end. A shell on its way out
+    // paints one more prompt and asks the terminal where the cursor is; left
+    // unanswered the line editor gives up and mesh leaves with 1, so the `exit 0`
+    // above ends up not having named its status. `stop_pty_shell` learned this in
+    // 036a7f5 — these two harnesses predate it and kept the raw pattern.
+    let _parting = pty_read_to_end(master);
     let mut status = 0;
     if unsafe { libc::waitpid(mesh, &mut status, 0) } != mesh
         || !libc::WIFEXITED(status)
@@ -5255,6 +5262,13 @@ fn sigcont_harness(exec: &MeshExec) -> i32 {
     if unsafe { libc::write(master, b"exit 0\n".as_ptr().cast(), 7) } != 7 {
         return 26;
     }
+    // Read — and keep answering — until the session closes the pty, rather than
+    // waiting in `waitpid` with nobody at the other end. A shell on its way out
+    // paints one more prompt and asks the terminal where the cursor is; left
+    // unanswered the line editor gives up and mesh leaves with 1, so the `exit 0`
+    // above ends up not having named its status. `stop_pty_shell` learned this in
+    // 036a7f5 — these two harnesses predate it and kept the raw pattern.
+    let _parting = pty_read_to_end(master);
     let mut status = 0;
     if unsafe { libc::waitpid(mesh, &mut status, 0) } != mesh
         || !libc::WIFEXITED(status)
