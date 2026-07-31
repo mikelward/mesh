@@ -154,6 +154,52 @@ impl ModifierStep {
             ModifierStep::Apply { name, .. } | ModifierStep::Unavailable { name, .. } => name,
         }
     }
+
+    /// What a **pattern** is told when this step is not one of its flags.
+    ///
+    /// A pattern takes the four flags and nothing else, so the reason is normally
+    /// the value's type. The caller can say otherwise, which is how `:capture`
+    /// keeps "needs an invocation" whatever value it meets.
+    fn regex_message(&self) -> String {
+        match self {
+            ModifierStep::Unavailable { regex_message, .. } => regex_message.clone(),
+            ModifierStep::Apply { name, .. } => {
+                format!("modifier :{name} is not valid for a regex")
+            }
+        }
+    }
+}
+
+/// Apply one step of a modifier chain — **the** implementation, for every spelling.
+///
+/// `${x:m}` reaches it through [`resolve_value`] and `$x:m` through the caller's
+/// dispatcher. While those were two implementations they disagreed three times over
+/// — about which names are flags, about which table wins on a pattern, and about
+/// whether a flag change is validated — each time silently, and each time in the
+/// direction of the spelling that was written second. So the rule is that neither
+/// side re-derives anything decided here.
+pub(crate) fn apply_modifier_step(
+    mut value: Value,
+    step: &ModifierStep,
+) -> Result<Value, ExpandError> {
+    // A pattern answers first, and on its own terms: `:x` is the `extended` flag
+    // here and `Modifier::Exec` everywhere else, so a name table consulted before
+    // the value is known answers the wrong one.
+    if let Value::Regex(regex) = &mut value {
+        if !set_regex_flag(regex, step.name()) {
+            return Err(ExpandError::ModifierUnavailable(step.regex_message()));
+        }
+        // A flag can invalidate a pattern that parsed without it, so the change is
+        // validated here rather than left to whatever matches with it later.
+        compile_regex(regex).map_err(ExpandError::ModifierUnavailable)?;
+        return Ok(value);
+    }
+    match step {
+        ModifierStep::Apply { modifier, .. } => apply_modifier(value, *modifier),
+        ModifierStep::Unavailable { message, .. } => {
+            Err(ExpandError::ModifierUnavailable(message.clone()))
+        }
+    }
 }
 
 /// Build `value` into a usable pattern, or say why it cannot be one.
@@ -943,39 +989,7 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
         };
     }
     for step in &vref.modifiers {
-        // A pattern takes the regex flags, and takes them *first*: `:x` names the
-        // `extended` flag here and `Modifier::Exec` everywhere else, so consulting
-        // the shared name table before the value is known answers the wrong one.
-        // This is the one value the path can finish for itself either way.
-        if let Value::Regex(regex) = &mut value
-            && set_regex_flag(regex, step.name())
-        {
-            // A flag can invalidate a pattern that parsed without it, so the change
-            // is validated here rather than left to whatever matches with it later
-            // — otherwise the broken value travels on, and `f ${r:x}` succeeds where
-            // `f $r:x` reports the parse error.
-            compile_regex(regex).map_err(ExpandError::ModifierUnavailable)?;
-            continue;
-        }
-        value = match step {
-            ModifierStep::Apply { modifier, .. } => apply_modifier(value, *modifier)?,
-            // Not a flag, so the report is whichever the value is owed — the
-            // type-shaped one for a pattern, except where the reason is not the
-            // type at all (`:capture` needs an invocation, whatever it meets).
-            ModifierStep::Unavailable {
-                message,
-                regex_message,
-                ..
-            } => {
-                return Err(ExpandError::ModifierUnavailable(
-                    if matches!(value, Value::Regex(_)) {
-                        regex_message.clone()
-                    } else {
-                        message.clone()
-                    },
-                ));
-            }
-        };
+        value = apply_modifier_step(value, step)?;
     }
     Ok(value)
 }

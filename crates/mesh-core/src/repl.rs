@@ -3143,32 +3143,7 @@ fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
             // there. Carried rather than raised here so the steps before it report
             // first — `${s:keys:lines}` is a `:keys` problem, and an unbound root is
             // an unbound root.
-            modifiers.push(match expand::Modifier::from_name(name) {
-                Some(modifier) => expand::ModifierStep::Apply {
-                    modifier,
-                    name: name.to_string(),
-                },
-                None if name == "capture" => expand::ModifierStep::Unavailable {
-                    name: name.to_string(),
-                    // Implemented, but for a call rather than a value — calling it
-                    // unimplemented would be the mislabel the silence was there to
-                    // avoid. The reason is the invocation, not the value, so a
-                    // pattern hears the same thing everything else does.
-                    message: CAPTURE_NEEDS_A_CALL.to_string(),
-                    regex_message: CAPTURE_NEEDS_A_CALL.to_string(),
-                },
-                None => expand::ModifierStep::Unavailable {
-                    name: name.to_string(),
-                    message: if parser::modifier_requires_arguments(name) {
-                        format!("modifier :{name} requires an argument")
-                    } else {
-                        format!("modifier :{name} is not implemented yet")
-                    },
-                    // What `apply_argument_free_modifier` tells a pattern: the four
-                    // flags are the whole of what one takes.
-                    regex_message: format!("modifier :{name} is not valid for a regex"),
-                },
-            });
+            modifiers.push(modifier_step(name));
             rest = &value[end..];
         } else {
             unreachable!("parser validated variable access")
@@ -4063,21 +4038,41 @@ fn glob_path_argument(
 /// flag there and the executable-file filter everywhere else. Shared by the postfix
 /// path and [`apply_modifier_ref`] so a reference cannot answer differently from the
 /// `$r:i` it is defined to mean.
-fn apply_argument_free_modifier(name: &str, mut value: Value) -> Result<Value, Step> {
-    if let Value::Regex(regex) = &mut value {
-        if !expand::set_regex_flag(regex, name) {
-            return runtime_error(format!("modifier :{name} is not valid for a regex"));
-        }
-        compile_regex(regex).map_err(runtime_message)?;
-        return Ok(value);
+fn apply_argument_free_modifier(name: &str, value: Value) -> Result<Value, Step> {
+    expand::apply_modifier_step(value, &modifier_step(name))
+        .map_err(|error| runtime_message(error.to_string()))
+}
+
+/// The step `name` spells, with everything only this layer knows folded in: which
+/// names take arguments, and which are implemented past a boundary `expand` cannot
+/// cross.
+///
+/// Built in one place, and applied in one place ([`expand::apply_modifier_step`]),
+/// so the two spellings of a chain cannot come to disagree about what a name means
+/// — which they did, repeatedly, while each carried its own copy.
+fn modifier_step(name: &str) -> expand::ModifierStep {
+    match expand::Modifier::from_name(name) {
+        Some(modifier) => expand::ModifierStep::Apply {
+            modifier,
+            name: name.to_string(),
+        },
+        // Implemented, but for a call rather than a value, so the reason is never
+        // the value's type — a pattern hears the same thing everything else does.
+        None if name == "capture" => expand::ModifierStep::Unavailable {
+            name: name.to_string(),
+            message: CAPTURE_NEEDS_A_CALL.to_string(),
+            regex_message: CAPTURE_NEEDS_A_CALL.to_string(),
+        },
+        None => expand::ModifierStep::Unavailable {
+            name: name.to_string(),
+            message: if parser::modifier_requires_arguments(name) {
+                format!("modifier :{name} requires an argument")
+            } else {
+                format!("modifier :{name} is not implemented yet")
+            },
+            regex_message: format!("modifier :{name} is not valid for a regex"),
+        },
     }
-    let Some(modifier) = expand::Modifier::from_name(name) else {
-        if parser::modifier_requires_arguments(name) {
-            return runtime_error(format!("modifier :{name} requires an argument"));
-        }
-        return runtime_error(format!("modifier :{name} is not implemented yet"));
-    };
-    expand::apply_modifier(value, modifier).map_err(|error| runtime_message(error.to_string()))
 }
 
 /// Evaluate a modifier that carries a parenthesized argument list (`:split(SEP)`,
