@@ -617,6 +617,14 @@ pub enum Executable {
     Loop {
         body: Source,
     },
+    /// `export A=1 B=2 …` — several environment writes in one statement, each
+    /// the [`EnvAssignment`](Executable::EnvAssignment) it would have been alone.
+    /// Its own variant rather than a loop at the call site because a statement is
+    /// one `Executable`, and applying them left to right is what lets a later one
+    /// read what an earlier one wrote.
+    EnvAssignments {
+        bindings: Vec<EnvBinding>,
+    },
     /// `with NAME=value … { … }` — run the body with those environment entries
     /// overridden, restoring what was there on the way out, however the body
     /// leaves: normally, through an error, or through `return` / `break` /
@@ -750,6 +758,11 @@ pub struct Pipeline {
 pub struct Command {
     pub items: Vec<CommandItem>,
     pub guard: Option<Guard>,
+    /// `NAME=value …` written in front of the command — environment entries in
+    /// place for this command alone, restored after it. Per **stage** rather than
+    /// per statement, as in every other shell: `FOO=1 a | FOO=2 b` gives each
+    /// side its own, and `FOO=1 a && b` leaves `b` alone.
+    pub env: Vec<EnvBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2629,6 +2642,18 @@ impl Parser<'_> {
                 executable
             }
         };
+        // `NAME=value cmd` is an environment prefix, not an assignment, and only
+        // what follows the bindings tells them apart. Asked before the assignment
+        // paths below, since the first one would otherwise claim `FOO=bar` and
+        // leave `cmd` looking like a second statement. `command` re-reads the run
+        // when it gets there, which is what binds it to a **stage** rather than to
+        // the whole pipeline.
+        //
+        // After the negation, so `not FOO=bar cmd` negates the prefixed command
+        // rather than leaving the `not` behind for the expression parser.
+        if self.env_prefix_follows()? {
+            return Ok(negate(Executable::Pipeline(self.pipeline()?)));
+        }
         let assignment_start = self.position;
         if let Some(key) = self.env_target() {
             if matches!(
@@ -2729,6 +2754,16 @@ impl Parser<'_> {
     }
 
     fn command(&mut self) -> Result<Command, ParseError> {
+        // `NAME=value …` in front of a command is an environment prefix, as in
+        // every other shell. Read here rather than at statement level so it binds
+        // to a **stage**: `FOO=1 a | FOO=2 b` gives each side its own, and
+        // `FOO=1 a && b` leaves `b` alone.
+        //
+        // A binding only counts as a prefix when a command follows it. Without
+        // that, `x=1` on its own is the assignment it has always been, and the
+        // two are told apart by looking rather than by guessing — the bindings
+        // are parsed and then given back if nothing follows them.
+        let env = self.env_prefix()?;
         let mut items = Vec::new();
         while !self.at_command_end() {
             // An attached `:modifier` outranks the guard keyword too, so
@@ -2929,7 +2964,7 @@ impl Parser<'_> {
             return Err(self.error(ParseErrorKind::Expected("an empty command in a pipeline")));
         }
         let guard = self.guard()?;
-        Ok(Command { items, guard })
+        Ok(Command { items, guard, env })
     }
 
     /// Does a **value** start here, in an argument position?
@@ -3602,6 +3637,62 @@ impl Parser<'_> {
         Ok(Some(EnvBinding { key, append, value }))
     }
 
+    /// The `NAME=value …` run in front of a command, or empty if there is none.
+    ///
+    /// Speculative: the bindings are parsed and then **given back** unless a
+    /// command follows them, because `x=1` alone is an assignment and `x=1 cmd`
+    /// is a prefix, and only what comes after tells them apart. Rewinding is what
+    /// keeps that decision from being a guess about where a value ends — the
+    /// value has actually been parsed by the time the question is asked.
+    ///
+    /// Note which namespace this writes. A prefix sets the **environment**, since
+    /// its whole purpose is what the child inherits, while `x=1` alone binds a
+    /// shell variable a child never sees. The same spelling, two namespaces —
+    /// deliberate, and the reason `TODO.md` carries the question of whether a
+    /// bare `FOO=bar` should mean the environment too.
+    /// Is a `NAME=value …` run here followed by a command?
+    ///
+    /// Non-consuming: the bindings are parsed to find where they end — the only
+    /// honest way to know, since a value can be a call or a capture — and the
+    /// position is always given back. `command` parses them again for real.
+    fn env_prefix_follows(&mut self) -> Result<bool, ParseError> {
+        if !self.env_binding_follows(0) {
+            return Ok(false);
+        }
+        let start = self.position;
+        let mut sound = true;
+        while self.env_binding_follows(0) {
+            // A malformed binding is not this question's business — say "not a
+            // prefix" and let the assignment path produce the diagnostic it
+            // always did, rather than reporting from inside a lookahead.
+            if self.env_binding().is_err() {
+                sound = false;
+                break;
+            }
+        }
+        let prefix = sound && !self.at_command_end();
+        self.position = start;
+        Ok(prefix)
+    }
+
+    fn env_prefix(&mut self) -> Result<Vec<EnvBinding>, ParseError> {
+        if !self.env_binding_follows(0) {
+            return Ok(Vec::new());
+        }
+        let start = self.position;
+        let mut bindings = Vec::new();
+        while let Some(binding) = self.env_binding()? {
+            bindings.push(binding);
+        }
+        // A command has to follow, on this line. At the end of a statement the
+        // run was an assignment after all, so hand the tokens back untouched.
+        if self.at_command_end() {
+            self.position = start;
+            return Ok(Vec::new());
+        }
+        Ok(bindings)
+    }
+
     /// Is the run at `offset` an **unspaced** `NAME=` / `NAME+=`? The signal a
     /// `with` header is made of, and what tells the statement from a command of
     /// the same name — `with --help` and `with somewhere` stay commands.
@@ -4064,6 +4155,14 @@ impl Parser<'_> {
     /// The condition proper: an assignment, a value, or a command.
     fn bare_condition(&mut self) -> Result<Executable, ParseError> {
         let start = self.position;
+        // A condition is a command position too, so `if FOO=x cmd { … }` is the
+        // prefixed command it reads as. Asked before the assignment path below for
+        // the same reason `executable` does: that path claims `FOO=x` and leaves
+        // `cmd` where the `{` belongs, which reported a syntax error on a form that
+        // parsed fine one line up. Raised in review as a P1.
+        if self.env_prefix_follows()? {
+            return self.pipeline().map(Executable::Pipeline);
+        }
         // `not` never opens a binding, since it is reserved — see `value_start`. Left
         // out, `if not = 5` would bind a variable whose name can never be spoken in
         // command position again, the way `func = 5` and `return = 6` already refuse to.
@@ -5514,6 +5613,18 @@ impl Parser<'_> {
     /// because it means anything else.
     fn export(&mut self) -> Result<Executable, ParseError> {
         self.take_word("export");
+        // `export A=1 B=2` — the unspaced run `with` and the command prefix take,
+        // so a name list is written the same way everywhere it appears. The spaced
+        // `export NAME = value` below stays the single-binding spelling: with
+        // spaces there is no way to see where one value ends and the next name
+        // begins, which is the same reason a prefix requires them unspaced.
+        if self.env_binding_follows(0) {
+            let mut bindings = Vec::new();
+            while let Some(binding) = self.env_binding()? {
+                bindings.push(binding);
+            }
+            return Ok(Executable::EnvAssignments { bindings });
+        }
         let Some(key) = self.word_text_at(0).map(str::to_owned) else {
             return Err(self.error(ParseErrorKind::Expected("a NAME after `export`")));
         };

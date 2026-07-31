@@ -1750,6 +1750,7 @@ already has:
 $env.EDITOR = vim
 $env.EDITOR += " -u NONE"     # += concatenates
 export EDITOR = vim           # identical to the first line
+export A=1 B=2 C=3            # a whole run at once, unspaced
 ```
 
 An environment write is **global on purpose**, even inside a function: changing
@@ -2540,6 +2541,49 @@ whole function. A loop reports the status of its last completed pass.
 Note that `<` and `>` also spell redirections. In a **condition** a spaced
 comparison wins — `while $i < 3` compares — while an attached or command-position
 form still redirects (`grep -q x < file`, `$cmd > log`).
+
+## `NAME=value cmd` — the environment for one command
+
+A `NAME=value` run in front of a command puts those entries in its environment
+and takes them back afterwards, as in every other shell:
+
+```mesh
+LC_ALL=C sort names.txt
+TZ=UTC LANG=C.UTF-8 date          # as many as you like
+PATH+=/opt/bin mytool             # `+=` appends, as it does for `$env.PATH`
+```
+
+It binds to **one stage**, so each side of a pipe gets its own and an `&&`
+right-hand side gets none:
+
+```mesh
+FOO=1 a | FOO=2 b                 # a sees 1, b sees 2
+FOO=1 a && b                      # b sees nothing
+```
+
+A function or builtin gets the same treatment — the entries are in place for the
+call and restored after — since there is no child to inherit them. A name that
+was unset goes back to unset rather than to empty, which a child can tell apart.
+
+**Note which namespace this writes.** A prefix sets the **environment**, because
+what the child inherits is the whole point. A bare `FOO=bar` with no command
+after it is an ordinary [assignment](#variables) and binds a *shell* variable,
+which no child ever sees:
+
+```mesh
+y=2 sh -c 'echo [$y]'   # [2]    — the environment, for that command
+x = 5
+sh -c 'echo [$x]'       # []     — a shell binding never crosses
+```
+
+The same spelling meaning two namespaces is deliberate — a prefix that wrote a
+shell binding would do nothing for the child — but it is a real trap, and
+whether a bare `FOO=bar` should mean the environment too is an open question in
+`TODO.md`.
+
+The bindings are written **unspaced**, `NAME=value` or `NAME+=value`. With
+spaces there is no seeing where one value ends and the next name begins, which is
+why `with` and `export` want the same form for a list.
 
 ## `with` — the environment for one block
 

@@ -1395,9 +1395,15 @@ hyphen between — the third payoff of that one spacing rule.
   `with NAME=value … { … }` runs a block with those entries in place and restores
   what was there on the way out, however the block leaves — so scoping and
   restoring the environment is **settled** for a block rather than deferred.
-  Whether the same reaches a *one-command prefix* (`NAME=value cmd`) is still
-  open, and it is a question of surface rather than of mechanism: the prefix would
-  ride on `with`'s. A whole **function** scoping its environment implicitly stays
+  The **one-command prefix** (`NAME=value cmd`) is settled too, and rides on
+  `with`'s mechanism as expected: it binds to a *stage* rather than a statement,
+  so `FOO=1 a | FOO=2 b` gives each side its own and `FOO=1 a && b` leaves `b`
+  alone. A run of them is one prefix (`TZ=UTC LANG=C date`), `+=` appends, and a
+  run with no command after it is the assignment it always was — `x=1` is
+  unchanged. Like `export`, the prefix writes the **environment**, so it collides
+  with the shell binding `FOO=bar` writes; that collision is deliberate, since a
+  prefix that wrote a shell binding would give the child nothing.
+  A whole **function** scoping its environment implicitly stays
   the deferred *isolation* question (see [Open questions](#open-questions)) —
   `with` is explicit, which is the property that made it decidable first.
 - **Types are inferred, not declared.** `x = foo` is a string, `x = [a b c]` a

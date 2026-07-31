@@ -5,6 +5,7 @@
 //! run in a process group that owns the terminal while it is in the foreground;
 //! non-interactive commands remain in mesh's group so signals still reach them.
 
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::io::IsTerminal;
@@ -85,6 +86,11 @@ pub struct Cmd {
     /// It still gets its own forked process, so the stages of a pipeline run
     /// concurrently — see [`fork_in_shell`].
     pub in_shell: bool,
+    /// This stage's `NAME=value` prefix, already evaluated to bytes. Applied in
+    /// the parent immediately before the stage is forked and put back straight
+    /// after, so the child inherits it and no other stage does — which is what
+    /// makes `FOO=1 a | FOO=2 b` give each side its own.
+    pub env: Vec<(String, OsString)>,
 }
 
 /// Running background jobs and foreground jobs suspended with Ctrl-Z.
@@ -980,6 +986,7 @@ pub fn run(words: &[String], jobs: &mut JobTable) -> u8 {
             redirs: Vec::new(),
             pipe_stderr: false,
             in_shell: false,
+            env: Vec::new(),
         }],
         jobs,
         false,
@@ -1080,6 +1087,19 @@ impl Program {
 ///
 /// # Panics
 /// Never: an empty `words` is reported as the failure it is.
+/// Put back what a stage's `NAME=value` prefix displaced, straight after its
+/// fork. A name that was unset goes back to unset rather than to an empty string
+/// — a child can tell those apart.
+fn restore_stage_env(saved: Vec<(&str, Option<OsString>)>) {
+    for (key, previous) in saved {
+        // SAFETY: as above — the stage loop is single-threaded.
+        match previous {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+}
+
 pub fn exec_stage(words: &[String]) -> u8 {
     let program = match Program::new(words) {
         Ok(program) => program,
@@ -1526,7 +1546,21 @@ pub fn run_pipeline(
                 }
             }
         };
-        match fork_stage(
+        // In place only across this stage's fork, so the child inherits it and no
+        // other stage does. Restored immediately after — a name that was unset
+        // goes back to unset, since a child can tell that from an empty one.
+        let restore: Vec<(&str, Option<OsString>)> = cmd
+            .env
+            .iter()
+            .map(|(key, value)| {
+                let previous = std::env::var_os(key);
+                // SAFETY: the shell forks its stages from a single-threaded loop,
+                // the same reasoning `environ::write` relies on.
+                unsafe { std::env::set_var(key, value) };
+                (key.as_str(), previous)
+            })
+            .collect();
+        let spawned = fork_stage(
             &cmd,
             is_last,
             incoming,
@@ -1541,7 +1575,9 @@ pub fn run_pipeline(
             background,
             process_group,
             body,
-        ) {
+        );
+        restore_stage_env(restore);
+        match spawned {
             Ok((pid, piped_out, read_end)) => {
                 if (interactive || background) && !forked {
                     let pgid = process_group.unwrap_or(pid);
