@@ -2299,18 +2299,25 @@ was re-checked against `main` rather than taken from the PR text.
       should name the rule.
 
       **Fixed, and the premise was wrong in mesh's favor:** the value does *not*
-      have to be bound first. `"${$env:get(HOME, none)}"` works today — a braced
-      body is an expression, and an expression takes arguments. What failed was
-      the bare `$…` form, which is scanned by its characters: the scan stops at
-      the `(`, so the arguments stayed behind as literal text and the modifier ran
-      with **none**. `"$env:get(HOME, none)"` therefore answered the whole
-      environment and failed with ``$env: list value needs `...` ``, naming
-      neither the mistake nor the fix.
+      have to be bound first. `"${env:get(HOME, none)}"` works — a braced body
+      takes arguments. What failed was the bare `$…` form, which is scanned by its
+      characters: the scan stops at the `(`, so the arguments stayed behind as
+      literal text and the modifier ran with **none**.
+      `"$env:get(HOME, none)"` therefore answered the whole environment and failed
+      with ``$env: list value needs `...` ``, naming neither the mistake nor the
+      fix.
 
       Now a syntax error that names both, reported where the scan is
-      (`variable_access_prefix`) so a `"…"` string and a heredoc body agree. Note
-      the working spelling needs the `$` **inside** the braces: `${…}` holds an
-      expression, where a bare `env` is the string `env`.
+      (`variable_access_prefix`) so a `"…"` string and a heredoc body agree.
+
+      The braced form takes its head **sigil-less**, as the argument-free
+      `${file:stem}` does, so adding an argument does not change how the head
+      reads. That was not true when this landed — the message and the reference
+      both said the `$` inside the braces was required, which
+      "Take a modifier's arguments in a sigil-less `${…}`" (a17ab27) made false
+      two commits later. Corrected since; `$` there is now optional rather than
+      necessary, and the test asserts both spellings so the advice cannot drift
+      from what works again.
 
       **Found alongside, not fixed:** the bare chain is read in *command* position
       only. `puts "$x:upper"` is `AB`, while `y = "$x:upper"` binds the literal

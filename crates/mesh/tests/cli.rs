@@ -21400,15 +21400,20 @@ fn an_interpolated_modifier_cannot_take_arguments() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains(&format!("`:{modifier}` takes arguments"))
-                && stderr.contains("brace it as an expression"),
+                && stderr.contains("brace it instead"),
             "for {source:?}: {stderr}"
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout), "", "for {source:?}");
     }
 
-    // The braced expression form takes them, which is what the message points at.
-    let out = run_with_input("xs = [a b]\nputs \"${$xs:join(\"-\")}\"\nputs \"${$xs:len}\"\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "a-b\n2\n");
+    // The braced form takes them, which is what the message points at — and it is
+    // the **sigil-less** spelling the message now names, since a braced body reads
+    // its head as the binding whether or not an argument follows. Both are asserted
+    // so the advice cannot drift from what works.
+    let out = run_with_input(
+        "xs = [a b]\n         puts \"${xs:join(\"-\")}\"\n         puts \"${xs:len}\"\n         puts \"${$xs:join(\"-\")}\"\n         puts \"${$xs:len}\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a-b\n2\na-b\n2\n");
     assert!(
         out.status.success(),
         "{}",
