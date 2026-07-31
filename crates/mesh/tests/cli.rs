@@ -3381,8 +3381,16 @@ fn start_pty_shell_ready(exec: &MeshExec, cwd: Option<&Path>, ready: &[u8]) -> O
     if unsafe { libc::tcsetpgrp(master, mesh) } < 0 {
         return pty_start_failed("could not hand the terminal to the shell");
     }
-    let Some(startup) = pty_read_until_one_of(master, &[ready]) else {
-        return pty_start_failed(&format!("no prompt arrived; {}", shell_fate(mesh)));
+    let startup = match pty_read_until_one_of_seen(master, &[ready]) {
+        Ok(startup) => startup,
+        Err(seen) => {
+            return pty_start_failed(&format!(
+                "no prompt arrived; {}; got {} bytes, ending {}",
+                shell_fate(mesh),
+                seen.len(),
+                visible_tail(&seen)
+            ));
+        }
     };
     Some(PtyShell {
         master,
@@ -6452,6 +6460,19 @@ fn pty_wait_for_marker(master: std::os::fd::RawFd, marker: &[u8]) -> bool {
 /// The per-poll timeouts still fail fast, so a shell that has genuinely gone
 /// quiet is caught as quickly as before.
 fn pty_read_until_one_of(master: std::os::fd::RawFd, accept: &[&[u8]]) -> Option<Vec<u8>> {
+    pty_read_until_one_of_seen(master, accept).ok()
+}
+
+/// [`pty_read_until_one_of`], handing back what it read when the marker never
+/// came.
+///
+/// "No prompt arrived" is not much to work back from; how far the shell got
+/// before it went quiet is, and it is the difference between a session that
+/// wrote nothing at all and one that stopped mid-paint.
+fn pty_read_until_one_of_seen(
+    master: std::os::fd::RawFd,
+    accept: &[&[u8]],
+) -> Result<Vec<u8>, Vec<u8>> {
     let mut ready = libc::pollfd {
         fd: master,
         events: libc::POLLIN,
@@ -6468,18 +6489,22 @@ fn pty_read_until_one_of(master: std::os::fd::RawFd, accept: &[&[u8]]) -> Option
         let found = seen(&prompt);
         let timeout = if found { 50 } else { QUIET };
         if unsafe { libc::poll(&mut ready, 1, timeout) } <= 0 {
-            return found.then_some(prompt);
+            return if found { Ok(prompt) } else { Err(prompt) };
         }
         let mut chunk = [0_u8; 256];
         let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
         if count <= 0 {
-            return None;
+            return Err(prompt);
         }
         let fresh = prompt.len().saturating_sub(3);
         prompt.extend_from_slice(&chunk[..count as usize]);
         answer_cursor_queries(master, &prompt[fresh..]);
     }
-    seen(&prompt).then_some(prompt)
+    if seen(&prompt) {
+        Ok(prompt)
+    } else {
+        Err(prompt)
+    }
 }
 
 #[test]
