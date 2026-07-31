@@ -2608,6 +2608,144 @@ fn a_braced_interpolation_takes_an_expression_across_lines() {
         "stderr was {}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // The operator may open the continuing line rather than close the wrapped
+    // one. Only this spelling was refused, which made "the body wraps" true of
+    // three newline positions out of four.
+    let leading = dir.join("leading.mesh");
+    std::fs::write(&leading, "puts \"${1\n+ 2}\"\n").expect("write script");
+    let out = run_script_with_stdin(&leading, isolated_config_home(), b"");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `( … )` group holds **one expression**, so a newline in it separates nothing
+/// and is layout — the rule `docs/REFERENCE.md` already stated and the group
+/// already followed everywhere except mid-expression. Rough edge 9.
+#[test]
+fn a_group_takes_an_expression_across_lines() {
+    let dir = fresh_dir("group_multiline");
+    let script = |name: &str, text: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, text).expect("write script");
+        run_script_with_stdin(&path, isolated_config_home(), b"")
+    };
+
+    // Each of the four newline positions in a group, the last of which was
+    // ``syntax error: expected `)` ``. Wrapping was never a new rule — three of
+    // these already worked, which is what made the fourth a wart rather than a
+    // feature request.
+    for (name, text) in [
+        ("after_open", "x = (\n1 + 2)\nputs $x\n"),
+        ("after_operator", "x = (1 +\n2)\nputs $x\n"),
+        ("before_close", "x = (1 + 2\n)\nputs $x\n"),
+        ("before_operator", "x = (1\n+ 2)\nputs $x\n"),
+    ] {
+        let out = script(name, text);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "3\n",
+            "for {name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Every operator kind reached through the wrap, not just arithmetic: the
+    // word operators go through their own loops, and a range is read before the
+    // operator table rather than out of it.
+    let out = script(
+        "kinds",
+        "puts (1\n< 2)\nputs (true\nand false)\nputs (1\n..3)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true\nfalse\n1\n2\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A block or a capture written inside a group is back to **statements**, so a
+    // newline separates again. Getting this wrong is how "layout" would quietly
+    // eat a statement boundary.
+    let out = script(
+        "nested",
+        "x = (if true {\nputs one\n2 })\nputs $x\ny = ($(printf a\nprintf b))\nputs $y\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "one\n2\nab\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The skip is speculative, so an unclosed group still reports where it runs
+    // out rather than swallowing the lines after it. Consuming the newline first
+    // and asking afterwards is what would move this error to end of input.
+    let out = script("unclosed", "x = (1\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("2:1"), "stderr was {stderr}");
+    assert!(stderr.contains("expected `)`"), "stderr was {stderr}");
+
+    // A list is element-separated, so a newline in one is **not** layout — the
+    // two brackets differ here because they hold different things. Two elements,
+    // one per line, rather than one wrapped expression. Asserted **bare and
+    // inside a group**, because wrapping one in the other is exactly how the rule
+    // leaked: `([1` / `+ 2])` was the one-element `[3]` while the identical bare
+    // list was a syntax error. Raised in review as a P2.
+    for (name, text) in [
+        ("list", "xs = [1\n2]\nputs $xs\n"),
+        ("list_in_group", "xs = ([1\n2])\nputs $xs\n"),
+    ] {
+        let out = script(name, text);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "1\n2\n",
+            "for {name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    for (name, text) in [
+        ("leading_op", "xs = [1\n+ 2]\n"),
+        ("leading_op_in_group", "xs = ([1\n+ 2])\n"),
+    ] {
+        let out = script(name, text);
+        assert!(
+            !out.status.success(),
+            "for {name}: a list element does not wrap, so this must not parse"
+        );
+    }
+
+    // Call arguments separate too, and had the same leak. A group written *inside*
+    // an element turns wrapping back on, which is the part that has to keep
+    // working once the rule stops leaking.
+    let out = script(
+        "arguments",
+        "func f(a) { return $a }\nputs (f(2\n))\nxs = [1, (2\n+ 3)]\nputs $xs\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "2\n1\n5\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = script(
+        "argument_wrap",
+        "func f(a) { return $a }\nputs (f(1\n+ 2))\n",
+    );
+    assert!(
+        !out.status.success(),
+        "an argument does not wrap inside a group either"
+    );
+
+    // And a group still holds exactly one expression: wrapping is what became
+    // legal, not a second expression on the next line.
+    let out = script("two", "x = (1\n2)\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("expected `)`"),
+        "stderr was {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `:name` is reserved by the **shape** of what follows the colon, not by whether
