@@ -2842,13 +2842,21 @@ of each PR had landed by another route, but these pieces had not.
       expecting a `sleep 0.2` job to have ended and a `sleep 0.7` job not to
       have, which on a loaded machine is not a safe bet — and it is fixed.
 
-      For the rest, the thing to establish first is whether they share a cause.
-      Every one of them is a harness that stops reading the pty at some point,
-      which is what the fix to the entry above turned out to be about — the
-      cursor-position query reedline writes at each prompt goes unanswered while
-      no reader is running, and it is answered late or not at all. That is a
-      hypothesis, not a diagnosis: `main` has been green across its last fifteen
-      runs, so whatever this is, it is a minority of runs.
+      **`start_pty_shell` giving up is the one thing left**, and it now reports
+      what it saw. The answer is `got 0 bytes` with the shell still running:
+      nothing written at all, so it is a session that has not been scheduled far
+      enough to speak rather than one that stopped mid-paint. It survives a full
+      30-second budget, and at the oversubscription that reproduces it — 24 test
+      threads pinned to one CPU — unrelated non-pty cases
+      (`a_line_gets_consumes_counts_toward_later_locations`) fail in half the
+      runs too, which is the signal that the machine is what is being measured.
+      At eight threads on one CPU, the level that surfaced every other flake
+      here, it is green.
+
+      So what is unexplained is narrow: the same failure was seen **once in real
+      CI**, on a two-core runner at ordinary speed, and starvation is a poor fit
+      for that. Left open for the next occurrence, which will say which of the
+      two it was.
 
       The phase codes now name themselves (`await_pty_harness`, and
       `pty_start_failed` for the six ways a session fails to start), so the next
