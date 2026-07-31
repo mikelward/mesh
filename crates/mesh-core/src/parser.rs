@@ -2170,14 +2170,25 @@ pub(crate) fn variable_access_prefix(text: &str) -> Result<usize, ParseErrorKind
             // `upper]`, matched no modifier, and reverted to the literal text
             // `[ab:upper]` with no error — while `"$x:upper."` worked, because `.`
             // happened to be listed.
-            let length = value
-                .char_indices()
-                .take_while(|(_, ch)| ch.is_alphanumeric())
-                .map(|(offset, ch)| offset + ch.len_utf8())
-                .last()
-                .unwrap_or(0);
-            if length == 0 || !modifier_name(&value[..length]) {
+            let length = name_prefix(value);
+            // **Shape, not membership.** What follows the colon is claimed when it is
+            // an identifier; whether that identifier names a modifier decides only
+            // whether it *works*, never whether it was claimed. Asking the name list
+            // instead made the reading depend on the list's contents, so a string
+            // holding `$h:nope` was the text `host:nope` until the day `:nope` was
+            // implemented and it silently became a chain — introducing a modifier
+            // would break scripts that never mentioned it. Every other spelling
+            // already reserves the shape (`$h:nope` and `"${h:nope}"` are both
+            // `:nope` is not a modifier); this was the one that did not.
+            //
+            // A leading digit is not an identifier, which is what keeps `"$h:2"`,
+            // `"$h:/path"`, `"$h:$port"` and a bare `"$h:"` reading as the text they
+            // always were: punctuation and numerals were never in the claim.
+            if length == 0 {
                 break;
+            }
+            if !modifier_name(&value[..length]) {
+                return Err(ParseErrorKind::UnknownModifier(value[..length].to_string()));
             }
             // An abutting `(` after a modifier that **can take one** is an argument
             // list, and this scan has nowhere to put it: it stops at the character,
@@ -5817,6 +5828,51 @@ fn defers_to_a_command_list(expression: &Expr, one_word: bool) -> bool {
 /// is a name a write accepts. The previous whole-string check was anchored to the
 /// compatibility lexer's ASCII-only scan instead, which is how `café = 5` bound a
 /// variable while `export CAFÉ = x` was refused as an invalid name.
+/// The byte length of the identifier `text` starts with, or `0` when it starts with
+/// something that is not one.
+///
+/// The same rule [`valid_name`] applies to a whole string, asked of a prefix — an
+/// alphabetic or `_` head, then alphanumerics, `_`, and *interior* `-`. Scanning by
+/// anything narrower splits an identifier in half and hands the halves different
+/// meanings: an alphanumeric-only scan read `upper_case` as the modifier `:upper`
+/// plus the text `_case`, so `"$h:upper_case"` was `HOST_case` where the unquoted and
+/// braced spellings both reported an unknown modifier. A name is claimed whole or not
+/// at all.
+fn name_prefix(text: &str) -> usize {
+    let mut chars = text.char_indices().peekable();
+    let Some((_, head)) = chars.next() else {
+        return 0;
+    };
+    if !head.is_alphabetic()
+        && (head != '_'
+            || !chars
+                .peek()
+                .is_some_and(|(_, next)| *next == '_' || next.is_alphanumeric()))
+    {
+        return 0;
+    }
+    let mut end = head.len_utf8();
+    // A `-` only continues the name when something continues *it*, so a trailing one
+    // is punctuation rather than part of the identifier — the rule `valid_name`
+    // spells as "no name ends in a hyphen".
+    while let Some((offset, c)) = chars.peek().copied() {
+        if c == '_' || c.is_alphanumeric() {
+            end = offset + c.len_utf8();
+            chars.next();
+        } else if c == '-'
+            && text[offset + 1..]
+                .chars()
+                .next()
+                .is_some_and(|next| next == '_' || next.is_alphanumeric())
+        {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    end
+}
+
 pub(crate) fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {

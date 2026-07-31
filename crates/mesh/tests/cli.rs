@@ -2610,6 +2610,100 @@ fn a_braced_interpolation_takes_an_expression_across_lines() {
     );
 }
 
+/// `:name` is reserved by the **shape** of what follows the colon, not by whether
+/// that name is in `MODIFIER_NAMES`. Asking the list meant the reading depended on
+/// the list's contents: `"$h:nope"` was the text `host:nope` until the day `:nope`
+/// was implemented, at which point it silently became a chain — so introducing a
+/// modifier would break scripts that never mentioned it. Every other spelling
+/// already reserved the shape; the bare-in-string one asked the list.
+#[test]
+fn a_modifier_name_is_reserved_by_shape_not_by_the_name_list() {
+    // The three spellings of the same chain agree, whether or not the name is one
+    // mesh implements. Agreement is the assertion — a future `:nope` must not be
+    // able to change any of these.
+    for name in ["nope", "upperb", "port", "latest"] {
+        for source in [
+            format!("h = host\nputs $h:{name}\n"),
+            format!("h = host\nputs \"${{h:{name}}}\"\n"),
+            format!("h = host\nputs \"$h:{name}\"\n"),
+            format!("h = host\ny = \"$h:{name}\"\n"),
+        ] {
+            let out = run_with_input(&source);
+            assert_eq!(out.status.code(), Some(2), "{source}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("is not a modifier"),
+                "{source}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    // The identifier is scanned by the **same grammar** `valid_name` states — an
+    // alphabetic or `_` head, then alphanumerics, `_` and interior `-` — not by
+    // "alphanumeric run". A narrower scan splits a name in half and gives the halves
+    // different meanings: `"$h:upper_case"` was `HOST_case`, the modifier `:upper`
+    // plus the text `_case`, where both other spellings reported the unknown
+    // `:upper_case`. A name is claimed whole or not at all. Raised in review.
+    for name in ["upper_case", "_foo", "upper-case", "upperb"] {
+        for source in [
+            format!("h = host\nputs $h:{name}\n"),
+            format!("h = host\nputs \"${{h:{name}}}\"\n"),
+            format!("h = host\nputs \"$h:{name}\"\n"),
+        ] {
+            let out = run_with_input(&source);
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{source}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr)
+                    .contains(&format!("`:{name}` is not a modifier")),
+                "{source}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    // A **trailing** hyphen is punctuation, not part of the name, so the modifier
+    // before it still resolves and the hyphen stays text — the rule `valid_name`
+    // spells as "no name ends in a hyphen".
+    let trailing = run_with_input("h = host\nputs \"$h:upper-\"\n");
+    assert_eq!(String::from_utf8_lossy(&trailing.stdout), "HOST-\n");
+
+    // An *interior* hyphen does continue the name, which is the consequence worth
+    // knowing: `"$h:upper-case"` is one unknown modifier, not `:upper` followed by
+    // the text `-case`. Loud rather than silent, and the same answer the unquoted
+    // spelling has always given — text after a chain wants a brace or a character
+    // that cannot be in a name.
+    let interior = run_with_input(
+        "h = host\nputs \"${h:upper}-case\"\nputs \"$h:upper/case\"\nputs \"$h:upper case\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&interior.stdout),
+        "HOST-case\nHOST/case\nHOST case\n",
+        "{}",
+        String::from_utf8_lossy(&interior.stderr)
+    );
+
+    // What is *not* an identifier was never claimed and still is not, so the text
+    // that reads as text keeps doing so. A leading digit is the line: `:8080` is a
+    // port, `:port` is a modifier name that happens not to exist yet.
+    let text = run_with_input(
+        "h = host\np = 80\n\
+         puts \"$h:2\" \"$h:8080\" \"$h:/path\" \"$h:\" \"$h:$p\"\n\
+         puts \"http://x\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&text.stdout),
+        "host:2 host:8080 host:/path host: host:80\nhttp://x\n",
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+
+    // And a name the list *does* hold still works in all three, which is the other
+    // half: the list decides whether a claimed name works, never whether it was
+    // claimed.
+    let works = run_with_input("h = host\nputs $h:upper\nputs \"${h:upper}\"\nputs \"$h:upper\"\n");
+    assert_eq!(String::from_utf8_lossy(&works.stdout), "HOST\nHOST\nHOST\n");
+}
+
 /// A bare `$name:mod` chain in a `"…"` string reads the same wherever the string
 /// sits. The merge that folds a chain into the reference it follows ran in
 /// `command_word` and nowhere else, so `puts "$x:upper"` was `AB` while
@@ -2632,12 +2726,12 @@ fn a_quoted_modifier_chain_reads_the_same_in_every_position() {
          func g() { return \"$x:upper\" }\nputs g()\n\
          b = if true { \"$x:upper\" }\nputs $b\n\
          if \"$x:upper\" == AB { puts compared }\n\
-         puts \"pre-$x:upper-post\"\n\
+         puts \"pre-$x:upper/post\"\n\
          c = \"\"\nc += \"$x:upper\"\nputs $c\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "AB\nAB\nAB\nAB\nAB\nAB\nAB\ncompared\npre-AB-post\nAB\n",
+        "AB\nAB\nAB\nAB\nAB\nAB\nAB\ncompared\npre-AB/post\nAB\n",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -2676,14 +2770,12 @@ fn a_quoted_modifier_chain_reads_the_same_in_every_position() {
         "h = host\np = 80\n\
          puts \"$h:$p\"\n\
          y = \"$h:$p\"\nputs $y\n\
-         puts \"$h:nope\"\n\
-         z = \"$h:nope\"\nputs $z\n\
          w = \"a:upper\"\nputs $w\n\
-         puts \"$h:2\" \"$h:\" \"$h:/path\"\n",
+         puts \"$h:2\" \"$h:\" \"$h:/path\" \"$h:8080\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&literal.stdout),
-        "host:80\nhost:80\nhost:nope\nhost:nope\na:upper\nhost:2 host: host:/path\n",
+        "host:80\nhost:80\na:upper\nhost:2 host: host:/path host:8080\n",
         "{}",
         String::from_utf8_lossy(&literal.stderr)
     );
@@ -22460,13 +22552,24 @@ fn a_modifier_chain_survives_punctuation_after_it() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // A name that is not a modifier still ends the chain and stays text, and a name
-    // run together with following letters is not a modifier at all.
-    let out = run_with_input("x = ab\nputs \"$x:nosuch\"\nputs \"a$x:upperb\"\n");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "ab:nosuch\naab:upperb\n"
-    );
+    // A name that is not a modifier is **claimed anyway** and reported, because the
+    // shape reserves it and the name list only decides whether it works. Both of
+    // these read as text while the list decided, which meant implementing `:nosuch`
+    // would have silently changed a script that never mentioned it. A name run
+    // together with following letters is one identifier, so it is one unknown
+    // modifier rather than a modifier plus text.
+    for source in [
+        "x = ab\nputs \"$x:nosuch\"\n",
+        "x = ab\nputs \"a$x:upperb\"\n",
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{source}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("is not a modifier"),
+            "{source}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 /// An argument-taking modifier inside a `$…` interpolation is reported, and the
@@ -22523,20 +22626,21 @@ fn an_interpolated_modifier_cannot_take_arguments() {
     // arguments* is the shape. After an argument-free modifier a `(` is ordinary
     // text and always was, which the first line here would have broken: the braced
     // form the message points at rejects `${$x:upper(foo)}` outright. Raised in
-    // review as a P2. A gap is a separate argument, a name that is not a modifier is
-    // text, and a `(` with no `$` in front of the word never was a chain.
+    // review as a P2. A gap is a separate argument, and a `(` with no `$` in front
+    // of the word never was a chain. (`"$x:nosuch(1)"` is not here: an unknown
+    // modifier is now reported for its *name* before its arguments are reached —
+    // see `a_modifier_chain_survives_punctuation_after_it`.)
     let out = run_with_input(
         "x = ab\n\
          puts \"$x:upper(foo)\"\n\
          puts \"$x:upper (1)\"\n\
-         puts \"$x:nosuch(1)\"\n\
          puts \"a:get(b)\"\n\
          puts \"($x:upper)\"\n\
          puts \"[  a  ]:trimstart\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "AB(foo)\nAB (1)\nab:nosuch(1)\na:get(b)\n(AB)\n[  a  ]:trimstart\n"
+        "AB(foo)\nAB (1)\na:get(b)\n(AB)\n[  a  ]:trimstart\n"
     );
     assert!(
         out.status.success(),
