@@ -1400,9 +1400,15 @@ hyphen between — the third payoff of that one spacing rule.
   so `FOO=1 a | FOO=2 b` gives each side its own and `FOO=1 a && b` leaves `b`
   alone. A run of them is one prefix (`TZ=UTC LANG=C date`), `+=` appends, and a
   run with no command after it is the assignment it always was — `x=1` is
-  unchanged. Like `export`, the prefix writes the **environment**, so it collides
-  with the shell binding `FOO=bar` writes; that collision is deliberate, since a
-  prefix that wrote a shell binding would give the child nothing.
+  unchanged. Like `export`, the prefix reaches the **environment** rather than
+  binding a shell name, since a prefix that wrote a shell binding would give the
+  child nothing. More precisely — and this is the authoritative statement, refined
+  from an earlier "writes the environment, and deliberately collides with a shell
+  binding" — **for the region the name lives on the environment rung and only
+  there**: a shell binding of the same name is *masked* for the duration, not
+  duplicated, and restored on the way out. See
+  [Shadowing, bounded](#variables-and-assignment) for why the masking matters and
+  what it means for writes made while the region is live.
   A whole **function** scoping its environment implicitly stays
   the deferred *isolation* question (see [Open questions](#open-questions)) —
   `with` is explicit, which is the property that made it decidable first.
@@ -1533,7 +1539,11 @@ the pieces only hold together as one:
   `PATH = /opt/bin:$PATH` bind a local, let `$PATH` read that local straight back
   and *confirm* the value, and change nothing whatsoever about what runs. The
   fallback manufactures that trap; the next bullet removes it.
-- ***No shadowing, at any rung.*** A binding may not be created where the name is
+- ***No shadowing, at any rung*** — more precisely, **no unbounded, unmarked
+  second binding** of a name; rebinding one for a bounded, marked region is
+  exactly what `NAME=value cmd` and `with` are for, and is untouched (see
+  [Shadowing, bounded](#variables-and-assignment) below, which is the statement to
+  read this bullet by). A binding may not be *created* where the name is
   already visible further out — not local over session, not session over
   environment. `PATH = /x` is refused, naming `export`, in the same teaching-error
   style as the bare-`export` refusal (`parser.rs:5530`). The payoff is that
@@ -1657,9 +1667,188 @@ cannot change a working program's meaning, but it is a real dent in fail-loud.
 ("list value needs `...`") unless a path-type value `:`-joins when a byte context
 demands one, which is arguably just the export serialization above applied one
 step earlier. Removing an environment entry still has no spelling, so
-`unset PATH` would drop a binding rather than the entry. And whether the
-one-command prefix `NAME=value cmd` rides on this or on
-[`with`](#variables-and-assignment)'s remains open either way.*
+`unset PATH` would drop a binding rather than the entry.*
+
+**Shadowing, bounded — what the ban actually bans.** The **one-command prefix**
+(`NAME=value cmd`) is [settled](#variables-and-assignment), and its whole purpose
+is to make a name mean something else for one command: `TZ=UTC date`,
+`LANG=C sort`, `PATH=/opt/bin tool` are all overrides of an entry that already
+exists. That is *shadowing*, and it is the point — so a rule announced as "no
+shadowing" needs saying more precisely, because taken literally it would forbid
+the most useful line in the shell.
+
+What the ban forbids is an **unbounded, unmarked second binding** of a name. It
+does not forbid rebinding a name for a **bounded, explicitly marked region**,
+which is what the prefix and `with NAME=value { … }` are for. Three properties
+separate the two, and the prefix has all three:
+
+- **One value, not a second binding.** A bounded override *replaces* what the name
+  already means rather than adding a candidate beside it, so `$NAME` still has
+  exactly one answer and the precedence question the ban exists to close stays
+  closed. Getting this right takes care, and the next paragraph spells it out —
+  "the prefix writes the environment" is not sufficient on its own.
+- **Bounded.** The value is restored on the way out, however the command or block
+  leaves — a stage's prefix does not outlive the stage.
+- **Marked.** You wrote the prefix, or the `with`. Nothing is implicit.
+
+So the ladder's rule is better stated as: **a name has one binding at a time, and
+any name may be rebound for a bounded, explicitly marked region.** That is not a
+restriction on shadowing's *use*; it is a requirement that shadowing be scoped and
+visible. mesh bans the accident, not the capability.
+
+**A prefix overrides the name, not a rung.** "The prefix writes the environment"
+is the right rule for what a *child* inherits and the wrong rule for what the
+override *means*, because a name need not be on the environment rung when the
+prefix runs. Take `FOO` uninherited, so a plain `FOO=bar` is permitted and binds
+a session name; then `FOO=baz f`. If the prefix only wrote an environment entry,
+both rungs would hold `FOO`, and a **mesh function** `f` reading `$FOO` would
+resolve outward to the session binding and see `bar` — while an **external** `f`
+would see `baz` from its environment. Same line, two meanings, chosen by
+something the writer cannot see at the call site. That is the precedence question
+back again, and it would make bounded overrides unreliable in exactly the case
+they are reached for.
+
+So a prefix (and `with`) puts the name on **the environment rung and only there**
+for the region, masking rather than duplicating, and restores on the way out:
+
+- on the **environment** rung — replace the entry for the region;
+- on the **session** rung — **mask** the shell binding and install the
+  environment entry, so there is still exactly one live binding;
+- **nowhere** — install the environment entry for the region, and drop it after.
+
+Masking rather than keeping a matched pair is the whole point. A pair would be a
+*second binding* of the name — the very thing the "one value" property above says
+a bounded override must not create — and two copies can diverge the moment
+anything writes one of them. One live binding cannot.
+
+The **local** rung is absent from that list because a prefix cannot reach it. A
+prefix names something a *child* will inherit, and a `_` name is by definition
+never exported, so `_FOO=baz g` is not an unspecified case but a **syntax error**
+— refused where it is written, with the diagnostic saying that `_` names do not
+cross into the environment. There is nothing to define for the local rung; the
+existing rule already forecloses it. (This is one more place the disjoint-name
+reading pays: the refusal is decidable from the name's spelling alone, with no
+lookup.)
+
+The invariant is one sentence, and it is what the "one value" property above
+promises: **for the region, `$NAME` reads `value` and a child sees
+`NAME=value`** — whichever rung the name was on, and whether the command is a
+function or an external. The alternative, rejecting the prefix when a shell
+binding exists, was considered and dropped: it fails a common line for a reason
+invisible at the call site (`FOO` happens to also be a session variable), and it
+buys nothing the masking does not.
+
+The invariant underneath all of this is worth stating on its own, because it is
+what the ban *is* once the bounded case is admitted: **a name is on at most one
+rung at a time** — never two; zero is just an unbound name. No-shadow is that
+sentence; masking preserves it through a
+region; and every question about writes during a region answers itself from it.
+
+**Writes made while the region is live** therefore need no new rule — only the
+existing ban, applied to the state the region has established:
+
+- **`export FOO = qux`** writes the one live binding, so `$FOO` reads `qux` and
+  the next child sees `qux`. Still one rung, and the region restores what it
+  saved on the way out.
+- **`global FOO = qux`** may *update* a masked session binding, but may not
+  *create* one — because during the region `FOO` is live on the environment rung,
+  and creating a session binding there is exactly the shadow the ban forbids. The
+  test is whether a session binding **exists** under the enclosing masks, not
+  which region put the mask on: a nested `with` must not change whether an
+  explicit session write is legal, and helpers that add an override would
+  otherwise silently break their callers' `global`. So
+  `FOO=bar; with FOO=one { with FOO=two { global FOO = qux } }` updates the
+  session `FOO`, exactly as the same statement one level out would.
+- **`global unset FOO`** reaches the same masked binding and **removes** it, and
+  the removal survives the region — an explicit deletion is not something to
+  silently undo. Afterwards `FOO` is on no rung at all, which the invariant is
+  fine with: *at most* one, never two.
+- **plain `FOO = qux`** (and bare `FOO += qux`) takes the *same* create-vs-update
+  test, not a blanket refusal. At top level the session **is** the current scope,
+  so a plain assignment names the rung `global` names, and the two must agree: it
+  **updates** a masked session binding, and is **refused** only where there is
+  none to update and it would therefore create a binding beside the live
+  environment entry. Anything stricter would make adding a `with` silently change
+  what an ordinary top-level assignment means, which is the writes-stay-put rule
+  broken from the other side. (Inside a function a plain assignment names the
+  *local* rung and must be `_`-prefixed, so a bare `FOO = qux` there is already a
+  different error and never reaches this test.)
+
+The split is create-vs-update throughout, in other words, and it belongs to the
+*write*, not to the spelling that names the rung: `global`, a top-level plain
+assignment, and the bare append are one rule seen three ways. Updating a masked
+binding is always fine — it cannot make a second binding, and the region restores
+to one rung by construction. Creating one beside a live environment entry is
+always refused, whatever spelling asks for it.
+
+**What a region restores is what the region itself installed** — its environment
+entry, and the mask — not the masked binding's value. That is what lets `global`
+and `global unset` mean something durable from inside a region, and it fixes the
+restoration order for nesting: masks lift innermost-first, each region putting
+back the environment entry it saved, and no region rewrites a session binding it
+did not write.
+
+Both halves of the `global` rule matter. Permitting the *creating* form would
+leave `with FOO=baz { global FOO = qux }` — with `FOO` originally only in the
+environment — populating both rungs once the original entry is restored, so
+`$FOO` would read `qux` while children inherited the old value: a collision
+manufactured by the region and outliving it. Forbidding the *updating* form would
+break `global`'s promise for no gain, since that case restores to one rung by
+construction.
+
+Had the region kept a matched pair instead of masking, none of this would follow:
+`export FOO = qux` would have left `$FOO` reading `baz` while children saw `qux`,
+breaking the invariant mid-region with no rule able to say which copy was right.
+
+**`+=` reads its own target.** An append reads and writes the same place, so the
+scope qualifier that picks the target picks the source too — there is no separate
+rule for where the old value comes from:
+
+- **the prefix `FOO+=baz cmd`** targets the live binding, which is also what
+  `$FOO` reads. With `FOO` uninherited and a session `FOO=bar` in place it appends
+  to `bar`, so `$FOO` reads `barbaz` and the child sees `barbaz`. This is a
+  **change** from the environment-only reading, worth stating because the two
+  disagree: that reading would have appended to an absent entry and passed `baz`.
+  Appending to the entry while `$FOO` read something else would break the
+  one-value promise mid-region.
+- **a bare `FOO += baz`** is *not* the same thing, and must not be read as the
+  prefix without its command. It is an ordinary assignment — neither bounded nor
+  marked — so it takes the ordinary create-vs-update test, exactly as plain
+  `FOO = baz` does: it appends to a shell binding where one exists (including one
+  a region has masked), and is **refused** where `FOO` is on the environment rung
+  with no binding to extend, pointing at `export FOO += baz`. Reading it as the
+  prefix instead would let a bare append mutate a live environment entry with no
+  `export` and no region — the unbounded, unmarked write this whole section
+  exists to forbid.
+- **`global FOO += qux`** targets the session rung, so it reads the session
+  binding — *through* any masks. In `FOO=bar; with FOO=baz { global FOO += qux }`
+  that is `bar`, giving `barqux` on the session rung, which survives the region
+  like any other `global` write. It is **not** `bazqux`: `baz` is the live
+  environment value, and `global` did not name the environment.
+- **`export FOO += qux`** targets the environment rung. Where an entry exists it
+  reads and extends it — inside a region, the region's own value. Where the name
+  is instead a **shell binding**, `export` **migrates** it: the name moves to the
+  environment rung rather than gaining an entry beside the binding, so
+  `FOO=bar; export FOO += qux` leaves `FOO=barqux` in the environment and no
+  session binding. Migration is what the one-rung invariant requires of `export`
+  generally, not a rule invented for the appending form — it is also what makes
+  the documented copy-it-in idiom `export NAME = $NAME` (`parser.rs:5530`) land on
+  one rung instead of two.
+
+"What `$NAME` reads" is therefore the right source only for the prefix, where the
+target *is* the live binding. A qualifier moves both ends together.
+
+This also settles the collision the prefix rule flags as deliberate — that
+`NAME=value cmd` writes the environment while a plain `FOO=bar` binds a shell
+name. The two are different constructs, not two spellings of one, and the ladder
+makes the distinction enforceable: where `FOO` is already an environment entry, a
+plain `FOO=bar` is **refused**, and the diagnostic names all three things the
+writer might have meant — `export FOO = bar` to change it for real, `FOO=bar cmd`
+to override it for one command, `with FOO=bar { … }` to override it for a block.
+Where no entry exists, a plain `FOO=bar` binds a shell name exactly as before.
+The prefix's **scoping and stage-binding** are untouched — it still binds to a
+stage, so `FOO=1 a | FOO=2 b` gives each side its own and `FOO=1 a && b` leaves
+`b` alone. Its **`+=`** is the one thing this does change, as set out above.
 
 ### Quoting and escaping
 
@@ -4834,7 +5023,9 @@ to avoid" rather than promising the latter as done.
 - **Bare environment references (`$PATH`) — decided for now, and reversible**
   ([Variables and assignment](#variables-and-assignment)). The environment becomes
   a third scope rung below local and session; reads fall outward to it on
-  presence; no binding may shadow one further out; and `_`-prefixed
+  presence; no name may take an unbounded second binding — rebinding one for a
+  bounded, marked region is what `NAME=value cmd` and `with` are for, and stays
+  untouched; and `_`-prefixed
   function-locals — **parameters included, no exemption** — keep that ban static
   and modular. Adopted to be lived with rather than settled on paper: the
   underscore tax on every function body is the piece most likely to be reversed.
