@@ -2423,13 +2423,15 @@ was re-checked against `main` rather than taken from the PR text.
       paths that build a word agree on what a word is. Access folds too, not just
       modifiers: `"$m.a"` and `"$xs[1]"` in value position were the same silence.
 
-      What it changes is bounded by what the merge already claimed: only a name
-      that *is* a modifier is folded, so `"$h:$p"`, `"$h:nope"`, `"$h:2"` and
-      `"$h:/path"` keep reading as text. A value string that changes meaning is one
-      holding a real `$name:modifier` chain — which command position already read
-      that way, so the strings at risk are the ones that were only ever *written*
-      in value position. Every case that moved went from a silent wrong answer to
-      the right answer or a named error: `"$x:sort"` now says
+      What it changes is bounded by what the *shape* claims — `"$h:$p"`, `"$h:2"`
+      and `"$h:/path"` keep reading as text, since none of those is an identifier.
+      An identifier after the colon is claimed whether or not it names a modifier
+      (see "`:name` is reserved by shape" under Decisions made), so `"$h:nope"` is
+      now reported rather than the text it used to be. A value string that changes
+      meaning is one holding a `$name:identifier` chain — which command position
+      already read that way, so the strings at risk are the ones that were only ever
+      *written* in value position. Every case that moved went from a silent wrong
+      answer to the right answer or a named error: `"$x:sort"` now says
       `not implemented yet` where it rendered `abc:sort`, `"$x:split(-)"` names the
       braced spelling where it rendered `a-b:split(-)`, and `"$n:upper"` on an
       integer says `requires a string` where it rendered `5:upper`. The whole
@@ -3413,6 +3415,22 @@ reasoning, and the open ones are at the bottom.
       inherited stdin.
 
 ## Decisions made
+
+- **`:name` is reserved by *shape*, not by the name list** (mikelward, decided).
+  What follows the colon is claimed when it is an identifier; whether that
+  identifier names a modifier decides only whether it *works*, never whether it was
+  claimed. The alternative — ask `MODIFIER_NAMES` and fall back to literal text —
+  makes the reading depend on the list's contents, so implementing a new modifier
+  would silently change scripts that never mentioned it. Introducing `:port` must
+  not be able to reinterpret `"$h:port"`.
+
+  Unquoted and braced spellings already reserved the shape; bare-in-string asked
+  the list, so `"$h:nope"` was the text `host:nope` while `$h:nope` and
+  `"${h:nope}"` were both `` `:nope` is not a modifier ``. Fixed in
+  `variable_access_prefix`, which now claims any identifier and reports an unknown
+  one. A leading digit is not an identifier, which is what keeps `"$h:2"`,
+  `"$h:8080"`, `"$h:/path"`, `"$h:$port"` and a bare `"$h:"` reading as the text
+  they always were.
 
 - **Merge method:** rebase. **Toolchain:** floating `stable`. **Loop autonomy:**
   proceed with best call, documented + overridable; pause only for grammar-level

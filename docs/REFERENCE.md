@@ -1895,7 +1895,10 @@ and double-quoted interpolation, in every position a word can be written; braced
 form puts the modifier inside the braces (`${file:stem}`).
 
 **`:` followed by an identifier is reserved by the grammar**, so a name that is not
-a modifier is a syntax error rather than literal text:
+a modifier is a syntax error rather than literal text. The *shape* is what reserves
+it, never the list of names mesh implements — otherwise adding a modifier would
+silently change what an existing string means, and `"$h:port"` would be text until
+the day `:port` shipped:
 
 ```
 puts ubuntu:latest
@@ -1934,7 +1937,8 @@ The braced body takes the name **sigil-less**, exactly as the argument-free
 `${file:stem}` does, so adding an argument does not change how the head reads.
 Only an *abutting* `(` after a name that **takes** arguments is this shape; after
 an argument-free modifier a `(` is ordinary text, so `"$x:upper(foo)"` is
-`AB(foo)`, and `"$x:upper (1)"` and `"$x:nosuch(1)"` keep their readings too.
+`AB(foo)` and `"$x:upper (1)"` keeps its reading. `"$x:nosuch(1)"` reports the
+unknown `:nosuch` instead — the name is resolved before its arguments are reached.
 
 A bare `$name:mod` chain inside a `"…"` string reads the same wherever the string
 sits, so `puts "$x:upper"` and `y = "$x:upper"` both give `AB`, and the error above
