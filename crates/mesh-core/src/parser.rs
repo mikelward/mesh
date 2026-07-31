@@ -318,7 +318,8 @@ pub enum ParseErrorKind {
     /// something that has a working spelling rather than something mesh cannot
     /// do: a `$…` reference is scanned by its characters and stops at the `(`,
     /// so the arguments became literal text and the modifier ran with none. The
-    /// braced expression form `${$env:get(HOME, none)}` takes them.
+    /// braced form `${env:get(HOME, none)}` takes them, sigil-less like the
+    /// argument-free `${file:stem}`.
     InterpolatedModifierArguments(String),
     /// Input nested past [`MAX_DEPTH`]. Its own variant because the failure is a
     /// *resource* limit rather than a shape the grammar rejects: the source may be
@@ -395,7 +396,7 @@ impl std::fmt::Display for ParseError {
             ParseErrorKind::InterpolatedModifierArguments(name) => write!(
                 f,
                 "syntax error: `:{name}` takes arguments, which a `$…` interpolation \
-                 cannot pass; brace it as an expression (`\"${{$x:{name}(…)}}\"`)"
+                 cannot pass; brace it instead (`\"${{x:{name}(…)}}\"`)"
             ),
             ParseErrorKind::UnknownGlobQualifier(text) => write!(
                 f,

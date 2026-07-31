@@ -1897,22 +1897,23 @@ an expression:
 ```
 puts "$env:get(HOME, none)"
 mesh: syntax error: `:get` takes arguments, which a `$…` interpolation cannot
-pass; brace it as an expression (`"${$x:get(…)}"`)
+pass; brace it instead (`"${x:get(…)}"`)
 
-puts "${$env:get(HOME, none)}"    # /home/user
+puts "${env:get(HOME, none)}"     # /home/user
+puts "${$env:get(HOME, none)}"    # the same — the `$` is optional here
 ```
 
-Note the `$` **inside** the braces: `${…}` holds an expression, where a bare
-`env` is the string `env` rather than the variable. Only an *abutting* `(` after
-a name that **takes** arguments is this shape; after an argument-free modifier a
-`(` is ordinary text, so `"$x:upper(foo)"` is `AB(foo)`, and `"$x:upper (1)"` and
-`"$x:nosuch(1)"` keep their readings too.
+The braced body takes the name **sigil-less**, exactly as the argument-free
+`${file:stem}` does, so adding an argument does not change how the head reads.
+Only an *abutting* `(` after a name that **takes** arguments is this shape; after
+an argument-free modifier a `(` is ordinary text, so `"$x:upper(foo)"` is
+`AB(foo)`, and `"$x:upper (1)"` and `"$x:nosuch(1)"` keep their readings too.
 
 > **Known gap.** A bare `$name:mod` chain inside a `"…"` string is read in
 > **command position** only, so `puts "$x:upper"` is `AB` while `y = "$x:upper"`
 > binds the literal `ab:upper` — and the error above is reported only where the
 > chain is read, which is the same set plus interpolated heredoc bodies. The
-> braced form (`"${$x:upper}"`) is consistent in both positions and is the
+> braced form (`"${x:upper}"`) is consistent in both positions and is the
 > spelling to reach for. Tracked as rough edge 11 in `TODO.md`.
 
 A name mesh **reserves** for a modifier it has not built yet — `:sort`, `:lines`,
