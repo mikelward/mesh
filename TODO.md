@@ -2161,7 +2161,7 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Eleven have since been fixed, one half fixed
+matched back to the discussion. Twelve have since been fixed, one half fixed
 (marked `~`); two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
@@ -2439,14 +2439,58 @@ was re-checked against `main` rather than taken from the PR text.
       cannot complete. Related to the open `$sh.complete` item under "Beyond M3 —
       Interactive completion", though the likelier fix is that a wrapper's spec
       should be the spec of whatever it forwards to.
-- [ ] **23. `'…'` is not literal, which surprises on paste.** mesh processes
+- [x] **23. `'…'` is not literal, which surprises on paste.** mesh processes
       escapes inside single quotes as well as double, so a pasted sed/awk/grep
       program is a *syntax error* (`invalid escape \(`) rather than a working
       command. `r'…'` is the right answer and works — the edge is that the failure
       arrives on paste, which is exactly when the reader is least likely to know
-      the raw form exists, and that the diagnostic does not mention it. A mesh
-      string is also single-line, so a multi-line sed script still has to be split
-      across `-e` expressions.
+      the raw form exists, and that the diagnostic does not mention it.
+
+      **Fixed, and the entry's second claim was wrong.** It said "a mesh string is
+      also single-line, so a multi-line sed script still has to be split across
+      `-e` expressions". Not so: a script file has always taken one, because the
+      whole file is parsed as a unit. What was single-line was the **line-at-a-time
+      reader** — piped stdin and interactive — which returned a hard error for an
+      unclosed quote while buffering an unclosed `{`. So the two readers disagreed
+      about the same source, and the disagreement bit exactly where paste happens.
+
+      The tokenizer's "ran out of input" errors — an unclosed quote, `$(` or `${`
+      — now reach the reader as `Incomplete`, the same signal an open brace gives,
+      and the continuation prompt that already existed shows while it waits. At
+      true end of input every caller still converts an incomplete parse back into
+      its error, so a quote that never closes is reported rather than swallowed;
+      what changes is *when*, and that the following line is string content.
+
+      The diagnostic names the raw form now: ``invalid escape \(; for text holding
+      its own backslashes (a sed or awk program, a Windows path) use a raw string,
+      `r'…'` ``.
+
+      **Only the quote characters continue.** A bare `${x` also ends the input,
+      but nothing later can complete it: `variable_end`'s `valid_variable_access`
+      rejects the newline, so buffering it consumed a following `}` into a
+      reference that still could not parse, and with no `}` at all swallowed
+      every command after it through EOF. An unclosed `$(` or `${` *inside* a
+      string keeps its old hard error for the same reason — continuing it is a
+      separate question from continuing the string around it. Both raised in
+      review.
+- [ ] **Decide what Ctrl-D should do with pending input.** `Signal::CtrlD =>
+      Some(Step::Exit(last))` (`repl.rs`) never looks at `pending`, so an
+      interactive session with a half-typed construct exits silently with the
+      *previous* status. Deliberate for a half-typed `func` — the comment says
+      "abandoning any in-progress `func`" — and reedline only emits Ctrl-D on an
+      empty editor line, so it reads as "I mean to leave" rather than "tell me
+      what is wrong". Raised in review against the entry above, which extends the
+      same treatment to a half-typed string.
+
+      What makes it worth a decision rather than a shrug: the *other* readers
+      disagree. Piped EOF, a script, and `-n` all convert an incomplete parse
+      back into its error and exit 2. So the same unclosed quote is a reported
+      syntax error through three doors and a silent exit 0 through the fourth —
+      the exact class of reader disagreement edge 23 was about. Either Ctrl-D
+      reports and exits 2 like the rest, or abandonment is the documented
+      contract for every construct and the others are the odd ones out. Changing
+      it means changing what Ctrl-D does to a half-typed `func`, which is why it
+      is not folded into edge 23.
 - [ ] **24. No NUL-delimited read.** `gets` takes no delimiter and `"\0"` is
       `invalid escape`, so `find -print0 | while read -d ''` has no translation.
       `each0` delegates to `xargs -0` instead, which means it can only run

@@ -1515,6 +1515,33 @@ plus `\"` in double quotes and `\'` in single. `"…"` also takes `\$`. An unkno
 escape is a syntax error — including `\0`, which is not in the set because a NUL
 cannot cross `execve` or the environment.
 
+Note `'…'` takes escapes too, unlike every other shell, so a pasted program that
+carries its own backslashes needs the **raw** form. The error says so:
+
+```
+sed 's/\(a\)/[\1]/' file
+mesh: syntax error: invalid escape \(; for text holding its own backslashes
+(a sed or awk program, a Windows path) use a raw string, `r'…'`
+```
+
+**Every quoted form spans lines.** A string runs until its closing quote, wherever
+that falls:
+
+```mesh
+sed r's/x/y/
+s/a/b/' file
+```
+
+Interactively and on piped input the reader waits for the closing quote, showing
+the continuation prompt while it does — the same as an open `{`. The cost is the
+same too: a quote you never close swallows what follows until you close it or
+press Ctrl-C, and the error arrives at end of input rather than on the line that
+opened it.
+
+This is the **quotes only**. A bare `${x` cannot be continued — a reference is
+scanned by its characters and a newline ends it — so it is reported on its own
+line, and what follows still runs.
+
 Adjacent quoted and bare pieces concatenate into one argument: `--flag='a b'` is
 a single argument, `""` is one empty argument.
 
