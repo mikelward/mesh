@@ -137,7 +137,10 @@ impl MeshExec {
         // opened the same `history.sqlite3` under the runner's real `$HOME` —
         // and opening one is not read-only: startup runs an `UPDATE` over the
         // table, so each session takes a write lock on a file every other
-        // session is also opening.
+        // session is also opening. That is shared mutable state between tests
+        // whatever else it causes, and it is the standing suspect for
+        // `start_pty_shell: no prompt arrived; the shell is still running`,
+        // where the shell is alive and silent with the prompt not yet drawn.
         let mut state = b"XDG_STATE_HOME=".to_vec();
         state.extend(private_state_home().as_os_str().as_bytes());
         environment.push(CString::new(state).unwrap());
@@ -3521,10 +3524,14 @@ fn blank_line_harness(exec: &MeshExec) -> i32 {
 #[test]
 fn a_jobdone_hook_fires_where_the_done_notice_prints() {
     let exec = MeshExec::new(isolated_config_home());
+    // No space in the tag: these paths are written into `sh -c '…'` command
+    // lines, where an unquoted one would split `[ -e … ]` into two words and the
+    // gate would never open.
+    let gates = fresh_dir("jobdone_gates");
     let harness = unsafe { libc::fork() };
     assert!(harness >= 0);
     if harness == 0 {
-        unsafe { libc::_exit(jobdone_hook_harness(&exec)) };
+        unsafe { libc::_exit(jobdone_hook_harness(&exec, &gates)) };
     }
     await_pty_harness(harness);
 }
@@ -3557,7 +3564,58 @@ fn pty_settle_until(master: RawFd, seen: &mut Vec<u8>, marker: &[u8]) -> bool {
 /// A pty, because this is a prompt-lifecycle hook: the notice and the hook both
 /// belong to the interactive loop, and a piped script never reaches it. The
 /// job's own status is what the hook is for, so it is one no default produces.
-fn jobdone_hook_harness(exec: &MeshExec) -> i32 {
+/// Make a fifo, the harness's one exact signal that a process has **ended**.
+fn make_fifo(path: &Path) -> bool {
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::mkfifo(name.as_ptr(), 0o600) == 0 }
+}
+
+/// Open a fifo for reading and wait for the writer to open, write, and go.
+///
+/// Non-blocking, because a blocking open waits for a writer that a broken test
+/// would never send and there would be no deadline to hit. That costs an
+/// ambiguity — with no writer yet, a read answers `EAGAIN`, and once one has
+/// been and gone it answers end of file, but an empty fifo nobody ever opened
+/// can answer end of file too. Requiring a byte first tells those apart: the
+/// writer sends one before it exits, so end of file *after* a byte means the
+/// process is gone, which is the whole question.
+fn read_fifo_to_end(path: &Path) -> bool {
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let fd = unsafe { libc::open(name.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+    if fd < 0 {
+        return false;
+    }
+    let mut ready = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut wrote_something = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let over = loop {
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        if unsafe { libc::poll(&mut ready, 1, 50) } < 0 {
+            break false;
+        }
+        let mut chunk = [0_u8; 64];
+        let count = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if count > 0 {
+            wrote_something = true;
+        } else if count == 0 && wrote_something {
+            break true;
+        }
+    };
+    unsafe { libc::close(fd) };
+    over
+}
+
+fn jobdone_hook_harness(exec: &MeshExec, gates: &Path) -> i32 {
     let Some(shell) = start_pty_shell(exec, None) else {
         return 110;
     };
@@ -3760,11 +3818,59 @@ fn jobdone_hook_harness(exec: &MeshExec) -> i32 {
     // leave whatever its own handlers queued for a later pass, and at shutdown
     // there is no later pass. Two jobs, staggered so the second finishes while
     // the first one's handler is sleeping.
+    //
+    // Every ordering here is carried by a **fifo**, because each one is about a
+    // process having *terminated* and nothing a process does itself can say
+    // that. A file it touches before exiting cannot: it can be descheduled
+    // between the touch and the exit, which is the race a pair of sleeps had,
+    // only narrower. The end of a fifo arrives when the last writer closes,
+    // and the kernel closes a process's descriptors after it is gone — so end
+    // of file is exactly "this job has terminated", and it is the same answer
+    // under any load.
+    //
+    // The open blocks in both directions too, which is what removes the *other*
+    // half. A job cannot start before its reader arrives, so nothing has to be
+    // gated on a duration at either end:
+    //
+    // - job one waits for the harness, which reads its fifo once the shell is
+    //   idle at the prompt with the drain already past — the state this case is
+    //   about;
+    // - job two waits for the **handler**, which reads its fifo before running
+    //   `jobs`, so "finishes while the first one's handler is running" is a
+    //   rendezvous rather than a hope, and `jobs` cannot run until it has ended.
+    let one = gates.join("one");
+    let two = gates.join("two");
+    if !make_fifo(&one) || !make_fifo(&two) {
+        return 161;
+    }
+    // Quoted for mesh, and reached through `$1` on the shell side, so a
+    // temporary directory holding a space or a metacharacter is just a path.
+    // The apostrophe is the one character that would end the quote it sits in,
+    // so it is escaped — `'…\'…'` is how mesh spells one inside single quotes.
+    //
+    // A path that is not UTF-8 cannot be written into a command line at all,
+    // and answering with a mangled one would fail somewhere further on with no
+    // hint of why. It stops here instead.
+    let quoted = |path: &Path| {
+        path.to_str()
+            .map(|path| format!("'{}'", path.replace('\'', "\\'")))
+    };
+    let (Some(one_word), Some(two_word)) = (quoted(&one), quoted(&two)) else {
+        return 163;
+    };
     for line in [
-        "func chain(id, cmd, status) { puts JOBDONE=$id/$status; sleep 0.5; jobs }\n",
-        "on jobdone j1 chain\n",
-        "sh -c 'sleep 0.2; exit 3' &\n",
-        "sh -c 'sleep 0.7; exit 4' &\n",
+        // Only for the *first* job. The handler runs for both, and by the
+        // second there is no writer left on that fifo — a `cat` there would
+        // wait for one that has already been and gone.
+        format!(
+            "func chain(id, cmd, status) {{ puts JOBDONE=$id/$status; if $status == 3 {{ sh -c 'cat \"$1\" > /dev/null' _ {} }}; jobs }}\n",
+            two_word
+        ),
+        "on jobdone j1 chain\n".to_owned(),
+        // A byte before the exit, so end of file means "a writer opened and then
+        // left" rather than "no writer ever came".
+        format!("sh -c 'printf x; exit 3' > {one_word} &\n"),
+        format!("sh -c 'printf x; exit 4' > {two_word} &\n"),
     ] {
         if !pty_write(shell.master, line.as_bytes()) {
             return 151;
@@ -3774,10 +3880,11 @@ fn jobdone_hook_harness(exec: &MeshExec) -> i32 {
         };
         seen.extend_from_slice(&window);
     }
-    // Long enough for the first job to end and not the second, and it ends while
-    // the shell waits for input, so the drain at the top of the loop has already
-    // run and nothing has noticed it yet.
-    std::thread::sleep(std::time::Duration::from_millis(400));
+    // Reading here releases job one and waits for it to be over. The shell is
+    // idle at its prompt throughout, so nothing has noticed it.
+    if !read_fifo_to_end(&one) {
+        return 162;
+    }
     // A bare `exit`, with no `jobs` to do the noticing. `exit` is a builtin and
     // forks nothing, so no wait runs on the way past either: unless the exit
     // path reaps, the shell leaves without the notice or the hook, having
