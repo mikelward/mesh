@@ -4498,7 +4498,17 @@ impl Parser<'_> {
     /// spelling, so a run the lexer split on punctuation (`./x`, `a.b`, `x[0]`)
     /// comes back as the one word it looks like. `pieces` is what the leading
     /// token contributed and `span` is where it sat.
-    fn word_run(&mut self, pieces: Vec<WordPiece>, span: Range<usize>) -> Expr {
+    ///
+    /// Ends by folding an access or modifier chain into the reference it follows,
+    /// exactly as [`command_word`](Self::command_word) does. Doing it in only one of
+    /// the two made the same string mean two things by where it sat: `puts
+    /// "$x:upper"` printed `AB` while `y = "$x:upper"` bound the literal
+    /// `ab:upper`, and the value-position reading was silent. §Modifiers states the
+    /// rule without qualifying by position, so the divergence was a bug against the
+    /// documented behavior rather than a choice.
+    ///
+    /// [`command_word`]: Parser::command_word
+    fn word_run(&mut self, pieces: Vec<WordPiece>, span: Range<usize>) -> Result<Expr, ParseError> {
         let start = span.start;
         let mut end = span.end;
         let mut pieces = pieces;
@@ -4542,13 +4552,19 @@ impl Parser<'_> {
             self.position += 1;
             pieces.extend(next_pieces);
         }
-        Expr::Scalar(Spanned {
+        let pieces = merge_command_variable_access(pieces).map_err(|kind| ParseError {
+            kind,
+            // The merge works on piece text, which carries no offsets of its own, so
+            // the word is the narrowest span honestly available — as in `command_word`.
+            span: start..end,
+        })?;
+        Ok(Expr::Scalar(Spanned {
             value: Word {
                 pieces,
                 qualifiers: None,
             },
             span: start..end,
-        })
+        }))
     }
 
     /// Most nested constructs descend through here — a parenthesized group, a list
@@ -4780,7 +4796,7 @@ impl Parser<'_> {
                         span: token.span,
                     }))
                 } else {
-                    Ok(self.word_run(word.pieces, token.span))
+                    self.word_run(word.pieces, token.span)
                 }
             }
             // A word can begin with punctuation the expression grammar otherwise
@@ -4791,13 +4807,13 @@ impl Parser<'_> {
             // the same or `x = ./foo` is a syntax error while `puts ./foo` works.
             // Member access never lands here — a postfix `.` is consumed after a
             // value, so the only `.` that can start an expression is a path's.
-            TokenKind::Dot => Ok(self.word_run(
+            TokenKind::Dot => self.word_run(
                 vec![WordPiece::Text {
                     text: ".".into(),
                     quote: QuoteMode::Bare,
                 }],
                 token.span,
-            )),
+            ),
             // `..` is the range token, and stays one everywhere a range can be
             // written — `..3`, `1..`, a bare `..`. A `/` attached to it cannot
             // continue a range, though, since no operand starts with one, so
@@ -4809,13 +4825,13 @@ impl Parser<'_> {
                             if word_starts_with_slash(word))
                 }) =>
             {
-                Ok(self.word_run(
+                self.word_run(
                     vec![WordPiece::Text {
                         text: "..".into(),
                         quote: QuoteMode::Bare,
                     }],
                     token.span,
-                ))
+                )
             }
             TokenKind::Range | TokenKind::RangeInclusive => {
                 self.position -= 1;
@@ -4879,7 +4895,7 @@ impl Parser<'_> {
                 let TokenKind::Word(word) = token.value else {
                     unreachable!("`bare_map_key` checked the token kind")
                 };
-                self.word_run(word.pieces, token.span)
+                self.word_run(word.pieces, token.span)?
             } else {
                 self.expression()?
             };

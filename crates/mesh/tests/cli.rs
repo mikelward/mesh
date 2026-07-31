@@ -2610,6 +2610,91 @@ fn a_braced_interpolation_takes_an_expression_across_lines() {
     );
 }
 
+/// A bare `$name:mod` chain in a `"…"` string reads the same wherever the string
+/// sits. The merge that folds a chain into the reference it follows ran in
+/// `command_word` and nowhere else, so `puts "$x:upper"` was `AB` while
+/// `y = "$x:upper"` bound the literal `ab:upper` — the same string meaning two
+/// things by position, with the wrong one silent. §Modifiers states the rule
+/// without qualifying by position, so this was a bug against the documented
+/// behavior. Rough edge 11's remaining half.
+#[test]
+fn a_quoted_modifier_chain_reads_the_same_in_every_position() {
+    // Every position a word can be written, against the command position that was
+    // already right. Listed rather than sampled because the defect *was* a position
+    // the merge did not reach.
+    let out = run_with_input(
+        "x = ab\n\
+         puts \"$x:upper\"\n\
+         y = \"$x:upper\"\nputs $y\n\
+         ys = [\"$x:upper\"]\nputs ...$ys\n\
+         m = [k: \"$x:upper\"]\nputs $m.k\n\
+         func f(v) { puts $v }\nf(\"$x:upper\")\n\
+         func g() { return \"$x:upper\" }\nputs g()\n\
+         b = if true { \"$x:upper\" }\nputs $b\n\
+         if \"$x:upper\" == AB { puts compared }\n\
+         puts \"pre-$x:upper-post\"\n\
+         c = \"\"\nc += \"$x:upper\"\nputs $c\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "AB\nAB\nAB\nAB\nAB\nAB\nAB\ncompared\npre-AB-post\nAB\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Access chains fold in value position too, not just modifiers — the merge is
+    // one step for `.member`, `[index]` and `:modifier` alike.
+    let access = run_with_input(
+        "m = [a: 1]\nputs \"$m.a\"\n\
+         xs = [p q]\nputs \"$xs[1]\"\n\
+         p = \"src/main.rs\"\ny = \"$p:base:upper\"\nputs $y\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&access.stdout), "1\nq\nMAIN.RS\n");
+
+    // The diagnostics reach value position with the chain, which is the other half
+    // of what the silence cost: each of these bound a literal before.
+    for (source, expected) in [
+        (
+            "x = abc\ny = \"$x:sort\"\n",
+            "modifier :sort is not implemented yet",
+        ),
+        ("x = \"a-b\"\ny = \"$x:split(-)\"\n", "brace it instead"),
+        ("n = 5\ny = \"$n:upper\"\n", "requires a string"),
+    ] {
+        let out = run_with_input(source);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(expected),
+            "{source} did not report {expected}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Only a name that *is* a modifier is claimed, so ordinary text is untouched —
+    // and this is what bounds the change: a string that was literal stays literal
+    // unless it holds a real chain, exactly as command position already read it.
+    let literal = run_with_input(
+        "h = host\np = 80\n\
+         puts \"$h:$p\"\n\
+         y = \"$h:$p\"\nputs $y\n\
+         puts \"$h:nope\"\n\
+         z = \"$h:nope\"\nputs $z\n\
+         w = \"a:upper\"\nputs $w\n\
+         puts \"$h:2\" \"$h:\" \"$h:/path\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&literal.stdout),
+        "host:80\nhost:80\nhost:nope\nhost:nope\na:upper\nhost:2 host: host:/path\n",
+        "{}",
+        String::from_utf8_lossy(&literal.stderr)
+    );
+
+    // A word run that is not a chain still assembles: the merge is the last step of
+    // `word_run`, not a replacement for it.
+    let runs =
+        run_with_input("y = ./foo\nputs $y\nz = ../x\nputs $z\nm = [host: 1]\nputs ...$m:keys\n");
+    assert_eq!(String::from_utf8_lossy(&runs.stdout), "./foo\n../x\nhost\n");
+}
+
 #[test]
 fn both_spellings_of_a_modifier_chain_agree() {
     // The property, rather than the instances. `${x:m}` and `$x:m` are the same

@@ -2437,22 +2437,31 @@ was re-checked against `main` rather than taken from the PR text.
       necessary, and the test asserts both spellings so the advice cannot drift
       from what works again.
 
-      **Found alongside, not fixed:** the bare chain is read in *command* position
-      only. `puts "$x:upper"` is `AB`, while `y = "$x:upper"` binds the literal
-      `ab:upper` — the merge step that attaches a chain to a preceding reference
-      runs in `command_word` and nowhere else. So the same string means two things
-      depending on where it sits, and the value-position reading is silent. The
-      braced form is consistent in both. The diagnostic above inherits the same
-      boundary — it is reported where the chain is read — which is why
-      `docs/REFERENCE.md` now carries the gap rather than a rule that holds in
-      one position; raised in review as a P2.
+      **Found alongside, since fixed:** the bare chain was read in *command*
+      position only. `puts "$x:upper"` was `AB`, while `y = "$x:upper"` bound the
+      literal `ab:upper` — the merge step that attaches a chain to a preceding
+      reference ran in `command_word` and nowhere else, so the same string meant
+      two things depending on where it sat and the value-position reading was
+      silent. A bug against the **documented** behavior rather than a design
+      choice: §Modifiers says they work in double-quoted interpolation without
+      qualifying by position. Raised in review as a P2.
 
-      Note this makes the divergence a bug against the **documented** behavior,
-      not a design choice: §Modifiers says they work in double-quoted
-      interpolation without qualifying by position. Fixing it means running the
-      merge on every word, which changes what an existing value string means
-      whenever it happens to hold `$name:word` — worth taking on its own rather
-      than as a side effect of a diagnostic.
+      **Fixed** by ending `word_run` — the value-position counterpart of
+      `command_word` — with the same `merge_command_variable_access`, so the two
+      paths that build a word agree on what a word is. Access folds too, not just
+      modifiers: `"$m.a"` and `"$xs[1]"` in value position were the same silence.
+
+      What it changes is bounded by what the merge already claimed: only a name
+      that *is* a modifier is folded, so `"$h:$p"`, `"$h:nope"`, `"$h:2"` and
+      `"$h:/path"` keep reading as text. A value string that changes meaning is one
+      holding a real `$name:modifier` chain — which command position already read
+      that way, so the strings at risk are the ones that were only ever *written*
+      in value position. Every case that moved went from a silent wrong answer to
+      the right answer or a named error: `"$x:sort"` now says
+      `not implemented yet` where it rendered `abc:sort`, `"$x:split(-)"` names the
+      braced spelling where it rendered `a-b:split(-)`, and `"$n:upper"` on an
+      integer says `requires a string` where it rendered `5:upper`. The whole
+      existing suite passed unchanged.
 
       **Also found alongside, also not fixed: an interpolation drops a modifier
       `expand::Modifier::from_name` does not know.** `expansion_variable`
