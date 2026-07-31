@@ -3487,6 +3487,118 @@ reasoning, and the open ones are at the bottom.
 
 ## Decisions needed
 
+- [ ] **Should a `"…"` string require braces to introduce an interpolation?**
+      Raised by mikelward as "the interpolation syntax is ugly and special-casey",
+      then narrowed over a long back-and-forth. Bare `$var` **outside** quotes is not
+      in question and stays, chains included — `puts $p:base`, `if $xs:len > 5`,
+      `cd $dir:real` are untouched by everything below. The question is only what a
+      `$` means *inside* a `"…"` string.
+
+      **The proposal.** Inside a string, only a braced form interpolates. A `$`
+      outside those braces is an ordinary character.
+
+      ```
+      "{$foo}"          the value          "$foo"          not an interpolation
+      "{$foo:upper}"    a chain            "cost: $5.00"   text
+      "{$file}.bak"     value, then text   "awk '$1'"      text
+      "{$m.a}"          member access
+      "{1 + 2}"         any expression
+      ```
+
+      **What it settles.** The complaint that started this is `${foo:upper}` against
+      `${foo}:upper`: the brace delimits a *name* in one reading and an *expression*
+      in the other, so the rule learned from `$foo:upper` — the chain attaches to the
+      reference — is contradicted by the third spelling. With no bare-in-string form
+      there is no competing rule to learn, and the brace has one job. That is also
+      why JS `${…}` and Ruby `#{…}` do not feel illogical despite the identical
+      inside/outside distinction: their opener is atomic and neither has a bare form.
+
+      It also disposes of three entries in this file rather than fixing them:
+      rough edge 10 (`"$file.bak"` is member access, not text) cannot arise, the
+      command-vs-value position divergence cannot arise, and the shape-not-list rule
+      under "Decisions made" becomes moot — nothing after a name is ever scanned, so
+      no future modifier can reinterpret an existing string. Forward compatibility
+      stops being a rule to enforce and becomes a property of the grammar.
+      `variable_access_prefix` and its whole bug class are deleted, not shrunk.
+
+      **The bracket is a separate, smaller question.** `{$x}` versus `${x}`: putting
+      the sigil inside removes the name-delimiting reading structurally, since
+      `{foo}` cannot mean "the variable foo, delimited" when it has no `$`. But once
+      the bare-in-string form is gone, `${x}` is unambiguous too — so `{$x}` buys
+      visible grouping and costs an escape for `{` in every string. Note mesh already
+      has `'…'` (no interpolation) and `r'…'` (raw), so JSON, awk programs and format
+      strings have somewhere to live that pays neither escape. Decide it separately;
+      it is not what makes the design work.
+
+      **The footgun, and why it should be an error rather than a warning.** The
+      danger is `"$HOME/bin"` quietly becoming literal text. A warning is the worst
+      answer, because it means the code still runs while nagging. Make `$name`
+      inside a `"…"` string a **permanent syntax error** — "write `{$name}`, or
+      `\$name` for a literal" — and there is never a version in which the string
+      silently means something new. The escape cost does not rise: writing a literal
+      `$name` in a string already costs `\$` today. `"$5.00"`, `"awk '$1'"` and a
+      bare `"$ "` stay untouched, since a `$` before a non-identifier was never an
+      interpolation.
+
+      **The open question is muscle memory, and it splits in two.**
+
+      | | what happens | cost |
+      |---|---|---|
+      | the reflex `"$var"` | loud error naming both fixes | one-time, nothing silent |
+      | composition `"$a/$b"` | `"{$a}/{$b}"` | real, unavoidable |
+
+      Only the second is a standing cost, and mesh has an unusual reason to think it
+      is small: **unquoted is already safe here.** There is no word splitting and no
+      re-globbing, so `f = "two words.txt"; puts $f` and `mkdir -p $d` and
+      `g = "*"; puts $g` all do the right thing without quotes. The bash reflex to
+      quote defends against a hazard mesh does not have, so most `"$var"` a shell
+      user would write becomes bare `$var` here — not `{$var}`. Quoting in mesh is
+      for *composition*, which is the only case that pays.
+
+      **What would settle it.** How often real mesh code does genuine composition
+      inside a string. A crude count of this repo's docs gives ~54 interpolations
+      inside `"…"` against ~321 bare, which points the right way but is weak evidence
+      — documentation demonstrates features rather than reflecting normal use. The
+      corpus that would answer it is `mikelward/conf#226`, the ~1800-line port: count
+      quoted interpolations that genuinely compose against those that are a bare name
+      standing alone. Not yet done — mikelward asked to think about footguns and
+      simplicity first.
+
+- [ ] **Format string + positional arguments, instead of or beside interpolation?**
+      Raised by mikelward alongside the bracket question: what about Python's
+      `str.format`, absl `Substitute`, or `printf` — a format string taking
+      arguments, rather than a string that references values itself.
+
+      **As a replacement: no, and the reason is that mesh already banked the win.**
+      The case for parameterized-over-interpolated — in SQL, in logging, in shell —
+      is that the data can never be re-read as syntax. mesh gets that from typed
+      values and no implicit word splitting: `$user` holding `; rm -rf /` is
+      already one argument. So the safety argument is spent before the syntax
+      question starts, and what remains is aesthetics paid for on the most common
+      operation in the language: `"$user@$host:$port/$path"` becomes four holes and
+      four fillers held apart, with positional mismatch as a new error class. The
+      direction of travel elsewhere is *toward* interpolation for the same reason —
+      Python has `%`, `.format` and f-strings and f-strings won; C# added `$"…"`
+      on top of `String.Format`; every shell has `printf` **beside** interpolation,
+      never instead of it.
+
+      It is worth recording that it *would* be the largest simplification of the
+      three options: the string becomes inert data, so `variable_access_prefix` and
+      the machinery for re-parsing an expression nested inside a string token both
+      go, not just the former. That is a real argument, and it loses to ergonomics
+      rather than to correctness.
+
+      **As an addition: yes, and there is a gap here already.** Width, precision
+      and alignment (`%5.2f`, column padding) cannot be expressed by interpolation
+      in any language without a mini format language inside the braces — Python's
+      `{:>10.2f}` is a format string relocated, not avoided. Nor can a *reusable*
+      format string: one bound to a name, used at several call sites, or swapped
+      for i18n. Interpolation is single-use by construction. mesh has neither:
+      `:format` is in the reserved modifier list but `DESIGN.md` scopes it to
+      `Instant` (`$t:format("%F %T")`) and it is unimplemented, so there is no
+      general facility. Worth adding as a builtin beside interpolation; decide its
+      placeholder spelling with the bracket question above, since a `{}` hole in a
+      format string and a `{…}` interpolation would want to agree.
 - [ ] **Regex literal + absolute-path rule** *(direction chosen — see the block in
       [`DESIGN.md`](DESIGN.md) "Quoting and escaping")*. **Keep `/…/`** as the regex
       literal; in a match slot a leading-slash word is a regex only when it is a clean
