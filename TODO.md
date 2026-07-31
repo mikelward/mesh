@@ -2424,6 +2424,24 @@ was re-checked against `main` rather than taken from the PR text.
       `requires a string or collection` — and `~` errors outright, saying its
       left operand must be a string. `body`, `recent` and `shift-options` each
       classify a text copy and then forward the original argument.
+
+      **Re-checked, and mostly working as designed.** `f 2` binding an integer is
+      the documented rule — types come from the value, not the name — and `:len`
+      refusing an integer is that rule being consistent rather than a gap. The
+      workaround is also milder than this entry claims: `"$x"` gives the text
+      back in one interpolation, and `"$x" ~ re("^-[0-9]+\$")` matches fine. No
+      "classify a copy and forward the original" is needed.
+
+      What is worth keeping is narrower. The typing is **not uniform across the
+      shapes a reader would treat as one category**: `-2` is an integer but
+      `-2.5` is a string, because there is no float type, so "a negative numeric
+      option" is not one thing to test for. And `--2` is neither — it is
+      ``unknown flag `--2` ``. A function taking `-N`-style options has to handle
+      three readings of what its caller thinks is one.
+
+      The real bug found while re-checking this is separate and worse — a
+      function argument does not keep the text it was given. See "A numeric-looking
+      argument loses its spelling" below.
 - [ ] **21. `files` is a reserved value-call name, so the shortcut cannot be
       written.** `alias files = package files` is a *syntax error* — `files` is a
       built-in value call and cannot be a function name — rather than a
@@ -2566,6 +2584,40 @@ was re-checked against `main` rather than taken from the PR text.
 
 Small items rescued from pull requests that were closed as superseded — the bulk
 of each PR had landed by another route, but these pieces had not.
+
+- [ ] **A numeric-looking argument loses its spelling through a mesh binding.**
+      Found while re-checking rough edge 20, which is about something else. A
+      word that parses as a decimal integer is bound as one and re-rendered from
+      the number, so the text the caller wrote does not survive:
+
+      ```
+      $ mesh -c 'wrapper func w(...rest) { printf "[%s]\n" ...$rest }
+                 w 007'
+      [7]
+      $ mesh -c 'printf "[%s]\n" 007'
+      [007]
+      ```
+
+      `007` → `7`, `08` → `8`, `+5` → `5`, `-0` → `0`. `1_0`, `0x10` and `1e3`
+      are unaffected, since they stay strings.
+
+      What makes it a bug rather than the type rule being consistent is **where
+      it does not happen**. A direct external argument keeps its spelling, and so
+      does `$sh.args` — a script run with `007 +5 -2 08` sees all four as
+      written. It is `func` parameters, `...rest`, `alias`, and `x = 007` that
+      lose it. So putting a mesh function in front of a command changes what the
+      command receives, silently, which is the one thing a wrapper must not do —
+      and that config is 130 aliases and 53 wrappers, every one of them a place
+      this can bite.
+
+      `chmod 0755` survives it by luck, because chmod re-parses octal either way.
+      A zero-padded identifier, a version segment, or anything else where the
+      digits are text does not.
+
+      Worth deciding as one question with `$sh.args`, which already keeps the
+      spelling: either an argument is text until something asks it to be a
+      number, or the integer binding keeps the source text alongside the value.
+      The second is what makes `$x + 1` and `"$x"` both answer correctly.
 
 - [ ] **Decide whether a non-interactive shell should start process groups for
       its pipelines.** `run_pipeline` takes its job-control decision from
