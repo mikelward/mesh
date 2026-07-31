@@ -268,6 +268,15 @@ mesh$ <strong>puts $sh.status ...$sh.pipestatus</strong>
 Read them in **one** command when you want both: reading either is itself a
 command, so a first `puts` would replace what a second one reports.
 
+`not` in front of a command inverts what it reports:
+
+<pre>
+mesh$ <strong>not test -e words.txt &amp;&amp; puts missing</strong>
+mesh$ <strong>not sh -c 'exit 3'</strong>
+mesh$ <strong>puts $sh.status</strong>
+0
+</pre>
+
 ## Background jobs
 
 `&` runs a command in the background and hands you back the prompt. Bind it and
@@ -657,6 +666,15 @@ Chain another test with `else if`:
 <pre>
 mesh$ <strong>if false { puts no } else if true { puts yes }</strong>
 yes
+</pre>
+
+`not` in front of a condition branches on the command having *failed*:
+
+<pre>
+mesh$ <strong>if not test -d .git { puts "not a repository" } else { puts repository }</strong>
+repository
+mesh$ <strong>if not test -e CHANGELOG.md { puts "no changelog yet" }</strong>
+no changelog yet
 </pre>
 
 An `if` is also a value in an assignment. The selected body's final line is the

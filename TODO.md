@@ -2201,13 +2201,81 @@ was re-checked against `main` rather than taken from the PR text.
       a second implementation. One bash behavior to **not** copy: its special-
       builtin rule, where `FOO=bar export …` leaks `FOO` into the shell
       permanently.
-- [ ] **3. Negating a *command's* status has no spelling.** `if not cmd` is
+- [x] **3. Negating a *command's* status had no spelling.** `if not cmd` was
       ``syntax error: expected `{` `` — `not` starts a **value**, deliberately, so
-      it never claims `not foo`. Together with 15 below that leaves no direct way
-      to branch on "this command failed": the command has to run as a statement,
+      it never claims `not foo`. Together with 15 below that left no direct way
+      to branch on "this command failed": the command had to run as a statement,
       `$sh.status` be read into a name, and the `if` test that. Predicates written
-      as value functions (`if not have-command(x)`) are fine; it is the external
-      command that has nowhere to go.
+      as value functions (`if not have-command(x)`) were fine; it was the external
+      command that had nowhere to go.
+
+      **Fixed:** a `not` with no value after it negates the operand's *status*, so
+      `not test -f $config` reads as it does in every other shell. Which of the two
+      readings applies is decided by the same `value_start_in` the position already
+      uses, asked one token later — `not $ready` and `not have(x)` are values and
+      rewind to the expression parser, `not ls` is a command — so nothing that parsed
+      as a value before parses as a command now. `command_negations` is that one
+      test, and both an `if` / `while` condition and a plain statement call it, so
+      the word has one meaning wherever it is written. A run of `not`s folds by
+      parity as it already did for values, and a pipeline negates as a whole. A
+      command needs a **word** to name it, which is what keeps `not = 5` the syntax
+      error it already was rather than `command not found: =`.
+
+      **In a condition the negation is a reading**, not a second run, so it sits
+      outside the operand (`Executable::Not`) rather than inside the pipeline: the
+      command still publishes the code it really exited with, and `$sh.pipestatus`
+      keeps its per-stage breakdown. `if not sh -c 'exit 130' { puts $sh.status }`
+      answers `130` where bash's `!` has flattened it to `1` — which is 15's
+      guarantee, kept rather than undone one level up.
+
+      **As a statement the negated code is the result**, since there is no branch to
+      carry it: `not sh -c 'exit 3'` exits `0`. That is the rule a value statement
+      already followed — bare `false` exits `1`, and so does `1 == 2` — so `not` is
+      not manufacturing a kind of status mesh lacked. `$sh.pipestatus` follows
+      `$sh.status` here and reports one stage, by `run_recorded`'s existing invariant
+      that the breakdown always describes the run that produced the status: a `0`
+      explained by a `3` would break it. The two positions differing is the point
+      rather than a wart — the same split a value *condition* (publishes nothing) and
+      a value *statement* (publishes its truthiness) already have.
+
+      Where the two positions disagreed before `not` existed, the negation inherits
+      the disagreement rather than papering over it: a spaced `>` is a comparison in
+      a condition and a redirection in a statement, so `not $n > 2` negates a
+      comparison in one and a redirected command in the other — exactly what each
+      does without the `not`.
+
+      **A guard that skipped its statement is exempt.** `not cmd if false` ran
+      nothing, so there is no status to negate and the previous command's still
+      stands — `Produced::Nothing` says which, and it is the same exemption every
+      other guard already has. Without it the inherited failure flipped to success:
+      `false; not puts BAD if false && puts RAN` ran `RAN` where the un-negated line
+      does not. A **list-pattern binding** needed asking for too: `value_start_in`
+      answers for the `[` alone, so `not [head ...tail] = $xs` rewound and lost the
+      negation while the un-negated binding worked. The exemption then needed a
+      **baseline of its own**: a `while` header starts at `Produced::Nothing` and the
+      list-pattern arm answers without touching it, so the loop's own first test
+      looked like a skipped guard and `while not [a] = [x]` ran backwards both ways.
+      The answer is to ask the **tree**, not the field: a pattern test always ran, and
+      `Produced::Nothing` describes only the shapes that reach the funnel that sets
+      it. Writing the field instead — a baseline set before recursing — fixed the
+      direction and then cost the loop its no-pass `""`, since a completed test
+      looked like a *pass*. All four raised in review.
+
+      **Only two positions gained the command reading**, because they are the two
+      where a command can be written: a condition and a statement. A postfix guard
+      and an assignment's right-hand side parse a value expression and nothing else,
+      so `not` there is the value operator alone — `puts ok if not test -e /` passes
+      those words to `puts`, exactly as the un-negated guard does.
+
+      **Not backgroundable.** `not cmd &` is refused: the status to invert arrives
+      when the job is waited on, not when it is launched, so inverting at launch
+      would report the negation of "started successfully" and leave the job's real
+      code un-negated in the table.
+
+      **One property worth naming**, since a value operand wins: the *programs*
+      `true` and `false` are not reachable through `not`. Nothing is lost by it — a
+      boolean and a command exiting `0` mean the same thing, so `not true` and
+      `not /bin/true` answer alike, as do `not false` and `not /bin/false`.
 - [x] **4. A `/…/` regex literal ends at the first `[`, `(`, `{`, `|`, `:`, `,`,
       `;`, `<`, `>` or `&`.** Fixed with the "Loose ends" entry it shares — see
       *A bare `/…/` literal cannot hold a space or an unbalanced paren* — so

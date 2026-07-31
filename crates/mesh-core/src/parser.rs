@@ -537,6 +537,17 @@ pub enum UnsetTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Executable {
     Pipeline(Pipeline),
+    /// `not cmd` in a **condition** — the negation of what the wrapped statement's
+    /// status says, so `if not test -f x { … }` branches on the command having
+    /// failed. Only [`Parser::condition`] builds it, and only when what follows the
+    /// `not` is not a value: before a value the word is the ordinary
+    /// [`UnaryOp::Not`] operator, which the expression parser owns.
+    ///
+    /// The negation is a *reading* of a status, not a second run of it, which is
+    /// why it sits outside the wrapped node rather than inside the pipeline: the
+    /// command still publishes the code it really exited with, so the branch reads
+    /// `130` from a Ctrl-C where bash's `!` has flattened it to `1`.
+    Not(Box<Executable>),
     Assignment {
         pattern: BindingPattern,
         append: bool,
@@ -2601,6 +2612,23 @@ impl Parser<'_> {
         if self.word("export") && !self.assignment_follows(1) {
             return self.export();
         }
+        // `not cmd` on its own line negates the command's status, by the same rule and
+        // the same discriminator a condition uses — one meaning for the word in both
+        // positions. A statement has no branch to carry the answer, so the negated
+        // code *is* the result: `run_recorded` publishes it, and its own invariant
+        // keeps `$sh.pipestatus` describing the run that produced it.
+        //
+        // Ahead of `assignment_start`, so the probes below reset to the operand rather
+        // than to the `not` — rewinding past it would hand the line back to the
+        // expression parser with the negation still on it.
+        let negations = self.command_negations(false);
+        let negate = |executable| {
+            if negations % 2 == 1 {
+                Executable::Not(Box::new(executable))
+            } else {
+                executable
+            }
+        };
         let assignment_start = self.position;
         if let Some(key) = self.env_target() {
             if matches!(
@@ -2612,7 +2640,7 @@ impl Parser<'_> {
                     self.expect(&TokenKind::Equal, "`=`")?;
                 }
                 let value = self.expression()?;
-                return Ok(Executable::EnvAssignment { key, append, value });
+                return Ok(negate(Executable::EnvAssignment { key, append, value }));
             }
             self.position = assignment_start;
         }
@@ -2626,12 +2654,12 @@ impl Parser<'_> {
                     self.expect(&TokenKind::Equal, "`=`")?;
                 }
                 let value = self.expression()?;
-                return Ok(Executable::MemberAssignment {
+                return Ok(negate(Executable::MemberAssignment {
                     target,
                     append,
                     value,
                     global: false,
-                });
+                }));
             }
             self.position = assignment_start;
         }
@@ -2657,21 +2685,23 @@ impl Parser<'_> {
                 } else {
                     self.expression()?
                 };
-                return Ok(Executable::Assignment {
+                return Ok(negate(Executable::Assignment {
                     global: false,
                     pattern,
                     append,
                     value,
-                });
+                }));
             }
             self.position = assignment_start;
         }
+        // Unreachable with a negation: `command_negations` gives the run back when a
+        // value follows, so `negations` is zero here and `negate` is the identity.
         if self.value_start() {
             let expression = self.expression()?;
             let guard = self.guard()?;
-            return Ok(Executable::Expression { expression, guard });
+            return Ok(negate(Executable::Expression { expression, guard }));
         }
-        self.pipeline().map(Executable::Pipeline)
+        self.pipeline().map(Executable::Pipeline).map(negate)
     }
 
     fn pipeline(&mut self) -> Result<Pipeline, ParseError> {
@@ -3947,7 +3977,92 @@ impl Parser<'_> {
         Ok(expression)
     }
 
+    /// A leading `not` run that negates a **command's** status, counted and consumed;
+    /// `0` when the word is the value operator instead, with the position rewound.
+    ///
+    /// `not` is reserved, so it never names a command — but it only ever started a
+    /// **value**, which left "this command failed" with no spelling at all: the
+    /// command had to run as a statement, `$sh.status` be read into a name, and the
+    /// `if` test that. A `not` whose operand is not a value negates the operand's
+    /// *status* instead, so `not test -f x` reads as it does in every other shell.
+    ///
+    /// Which reading applies is decided by the same [`value_start_in`] the position
+    /// already uses, asked one token later: `not $ready` and `not have(x)` are values
+    /// and rewind to the expression parser, `not ls` is a command. Nothing that
+    /// parsed as a value before parses as a command now, since the discriminator is
+    /// the one that was already there.
+    ///
+    /// The run is counted here rather than folded by the caller because `not not cmd`
+    /// has to cancel *before* the operand is read: only the whole run says whether a
+    /// value follows it.
+    ///
+    /// [`value_start_in`]: Parser::value_start_in
+    fn command_negations(&mut self, in_condition: bool) -> usize {
+        let start = self.position;
+        // `not:upper` is a chain on the text `not`, as in `not_expression`.
+        let mut negations = 0_usize;
+        while !self.carries_attached_modifier() && self.take_word("not") {
+            negations += 1;
+        }
+        if negations == 0 {
+            return 0;
+        }
+        // A **list-pattern binding** is asked for first, because `value_start_in`
+        // answers for the `[` alone and a list literal really is a value: without
+        // this, `not [head ...tail] = $xs` rewinds and the negation is lost, while
+        // the un-negated binding is a condition that works. The `=` is what tells
+        // the two apart, so the trial parse looks for it rather than for the
+        // bracket.
+        //
+        // Otherwise a command needs a **word** to name it, and a value operand
+        // belongs to the expression parser. Either way the whole run is given back,
+        // so the negations are folded in one place rather than two — and `not = 5`
+        // stays the syntax error it already was rather than becoming
+        // `command not found: =`.
+        let negates = if self.same(&TokenKind::LBracket) {
+            self.binding_assignment_follows()
+        } else {
+            matches!(
+                self.peek().map(|token| &token.value),
+                Some(TokenKind::Word(_))
+            ) && !self.value_start_in(in_condition)
+        };
+        if !negates {
+            self.position = start;
+            return 0;
+        }
+        negations
+    }
+
+    /// Does a binding pattern followed by `=` / `+=` start here? A trial parse,
+    /// rewound either way — only a full parse of the pattern says where the operator
+    /// after it sits, since a list pattern nests and `...rest` spans.
+    fn binding_assignment_follows(&mut self) -> bool {
+        let start = self.position;
+        let follows = self.binding_pattern().is_ok()
+            && matches!(
+                self.peek().map(|token| &token.value),
+                Some(TokenKind::Equal | TokenKind::PlusEqual)
+            );
+        self.position = start;
+        follows
+    }
+
+    /// A condition, with any leading `not` run folded in — see [`command_negations`].
+    ///
+    /// [`command_negations`]: Parser::command_negations
     fn condition(&mut self) -> Result<Executable, ParseError> {
+        let negations = self.command_negations(true);
+        let condition = self.bare_condition()?;
+        Ok(if negations % 2 == 1 {
+            Executable::Not(Box::new(condition))
+        } else {
+            condition
+        })
+    }
+
+    /// The condition proper: an assignment, a value, or a command.
+    fn bare_condition(&mut self) -> Result<Executable, ParseError> {
         let start = self.position;
         // `not` never opens a binding, since it is reserved — see `value_start`. Left
         // out, `if not = 5` would bind a variable whose name can never be spoken in
@@ -6825,6 +6940,75 @@ mod tests {
             complete("$env.HOME = /tmp").statements[0].and_or.first,
             Executable::EnvAssignment { .. }
         ));
+    }
+
+    /// One word, two readings, and the operand decides which: `not` before a value is
+    /// the [`UnaryOp::Not`] operator the expression parser owns, and `not` before
+    /// anything else negates a command's status. Asserted on the tree because the two
+    /// agree on the *answer* for a bool — `if not false` is true either way — so a
+    /// behavioral test alone would not notice the command reading swallowing values.
+    #[test]
+    fn not_negates_a_command_only_when_no_value_follows() {
+        // A condition and a statement are checked against the *same* operand list,
+        // because one rule serving both positions is the claim being made.
+        let negation = |source: &str| match &complete(source).statements[0].and_or.first {
+            Executable::If(node) => (*node.condition).clone(),
+            other => other.clone(),
+        };
+
+        for operand in [
+            "ls",
+            "test -f y",
+            "ls | cat",
+            "out = $(ls)",
+            // A list-pattern binding: `value_start_in` answers for the `[` alone, so
+            // without asking for the `=` behind it the negation was rewound and lost.
+            "[head ...tail] = $xs",
+        ] {
+            for source in [format!("if {operand} {{ x }}"), operand.to_owned()] {
+                let negated = source.replacen(operand, &format!("not {operand}"), 1);
+                assert!(
+                    !matches!(negation(&source), Executable::Not(_)),
+                    "{source} negated without a `not`"
+                );
+                assert!(
+                    matches!(negation(&negated), Executable::Not(_)),
+                    "{negated} did not negate a command"
+                );
+            }
+        }
+
+        // A command needs a **word** to name it. Without one there is nothing whose
+        // status could be negated, so the line is left to fail as the value it is
+        // rather than becoming `command not found: =`.
+        for source in ["if not = 5 { x }", "not = 5"] {
+            assert!(parse(source).is_err(), "{source} parsed");
+        }
+
+        // A value operand keeps the expression reading, negations and all — and an
+        // even run cancels rather than wrapping twice.
+        for operand in ["$b", "false", "have(y)", "not ls"] {
+            for source in [
+                format!("if not {operand} {{ x }}"),
+                format!("not {operand}"),
+            ] {
+                assert!(
+                    !matches!(negation(&source), Executable::Not(_)),
+                    "{source} was read as a negated command"
+                );
+            }
+        }
+
+        // Where the two positions already disagreed, the negation inherits the
+        // disagreement rather than papering over it: a spaced `>` is a comparison in
+        // a condition and a redirection in a statement, so `not $n > 2` negates a
+        // comparison in one and a redirected command in the other — exactly what each
+        // position does without the `not`.
+        assert!(!matches!(
+            negation("if not $n > 2 { x }"),
+            Executable::Not(_)
+        ));
+        assert!(matches!(negation("not $n > 2"), Executable::Not(_)));
     }
 
     #[test]

@@ -1267,6 +1267,20 @@ fn run_executable(
     }
     match node {
         Pipeline(pipeline) => run_ast_pipeline(pipeline, background, last, in_function, shell),
+        // The negation of a status that ran. Two things are not statuses and pass
+        // through unchanged: an **evaluation error**, since an invalid program
+        // answered nothing, and a statement its own trailing **guard** skipped —
+        // `not cmd if false` ran nothing, so the previous command's status still
+        // stands rather than being inverted. `Produced::Nothing` is what says which,
+        // and it is the same exemption a guard already has everywhere else.
+        Not(operand) => match run_executable(operand, background, last, in_function, shell) {
+            Step::Continue(code)
+                if shell.control.is_none() && shell.produced != Produced::Nothing =>
+            {
+                Step::Continue(u8::from(code == 0))
+            }
+            step => step,
+        },
         Assignment {
             pattern,
             append,
@@ -1534,6 +1548,12 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
     use parser::Executable::*;
     Some(match node {
         Pipeline(_) => return None,
+        // A negation is not a job. The status to invert arrives when the job is
+        // waited on, not when it is launched, so inverting here would report the
+        // negation of "started successfully" and leave the job's real code
+        // un-negated in the table. `j = cmd &` then `not $j:wait` is the shape that
+        // works today.
+        Not(_) => "a negated command",
         Expression { .. } => "an expression",
         Assignment { .. } => "an assignment",
         Unset { .. } => "an `unset`",
@@ -1864,6 +1884,44 @@ fn condition_status(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Option<u8>, Step> {
+    // `if not cmd` — run the operand, publish its real status, and negate only the
+    // answer this returns. The command still reports the code it exited with, so
+    // the branch can read a `130` from Ctrl-C where the negation alone would say
+    // `1`; `$sh.pipestatus` keeps its per-stage breakdown for the same reason.
+    if let parser::Executable::Not(operand) = condition {
+        // Whether there is anything to negate is "did the operand run", and
+        // `Produced::Nothing` answers that for every shape that reaches the funnel
+        // at the end of this function — a condition its own trailing guard skipped
+        // ran nothing, so the previous status stands, which is the same exemption
+        // the un-negated path takes.
+        //
+        // The list-pattern arm just below returns *before* that funnel and never
+        // touches `produced`, so for that one shape the field describes whatever ran
+        // previously and cannot be asked. The tree can: a pattern test always ran.
+        // Reading the stale field made a `while`'s own first test look like a
+        // skipped guard and flipped the loop both ways; writing the field instead —
+        // a baseline set here — made a completed test look like a *pass* and cost
+        // the loop its no-pass `""`. Asking the shape does neither. Both raised in
+        // review.
+        let pattern_test = matches!(
+            &**operand,
+            parser::Executable::Assignment {
+                pattern: parser::BindingPattern::List(_),
+                append: false,
+                ..
+            }
+        );
+        let Some(code) = condition_status(operand, last, in_function, shell)? else {
+            return Ok(None);
+        };
+        return Ok(Some(
+            if pattern_test || shell.produced != Produced::Nothing {
+                u8::from(code == 0)
+            } else {
+                code
+            },
+        ));
+    }
     if let parser::Executable::Assignment {
         pattern,
         append: false,
