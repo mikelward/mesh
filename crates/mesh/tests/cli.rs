@@ -17969,6 +17969,281 @@ fn a_leading_not_negates_a_value_in_every_position() {
     );
 }
 
+/// `not` before something that is **not** a value negates a *command's* status, so
+/// `if not test -f x { … }` branches on the command having failed. Until this landed
+/// that was `syntax error: expected `{`` and there was no direct spelling for it at
+/// all: the command had to run as a statement, `$sh.status` be read into a name, and
+/// the `if` test that. Rough edge 3 from the config port.
+#[test]
+fn a_leading_not_negates_a_commands_status_in_a_condition() {
+    let out = run_with_input(
+        "if not test -f /nonexistent-mesh-path { puts missing } else { puts wrong }\n\
+         if not test -d / { puts wrong } else { puts present }\n\
+         if not not test -d / { puts double } else { puts wrong }\n\
+         n = 0\n\
+         while not test $n -eq 2 { n = $n + 1 }\n\
+         puts \"looped=$n\"\n\
+         if false { puts wrong } else if not test -d / { puts wrong } else { puts chained }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "missing\npresent\ndouble\nlooped=2\nchained\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A bare command word reads as a command here, where the value reading used to
+    // claim it and fail at *runtime* with `a string is not a condition`.
+    let bare = run_with_input("if not sh -c 'exit 1' { puts failed }\n");
+    assert_eq!(String::from_utf8_lossy(&bare.stdout), "failed\n");
+
+    // The negation is a reading of a status, not a second run of it, so the command
+    // still publishes what it really exited with — `130` from a Ctrl-C where bash's
+    // `!` has flattened it to `1`. That is rough edge 15's guarantee, kept.
+    let detail = run_with_input("if not sh -c 'exit 130' { puts \"then=$sh.status\" }\n");
+    assert_eq!(String::from_utf8_lossy(&detail.stdout), "then=130\n");
+
+    // A pipeline negates as a whole, and keeps its per-stage breakdown.
+    let piped = run_with_input(
+        "if not sh -c 'exit 3' | sh -c 'exit 7' \
+         { puts \"failed=$sh.status\" ...$sh.pipestatus }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&piped.stdout), "failed=7 3 7\n");
+
+    // An assignment condition negates the capture status its right-hand side lends
+    // it, and the binding is still made either way.
+    let assigned = run_with_input(
+        "if not out = $(sh -c 'echo hi; exit 1') { puts \"took $out\" } else { puts wrong }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&assigned.stdout), "took hi\n");
+
+    // `not` prefers the value reading whenever a value follows, so the *programs*
+    // `true` and `false` are not reachable through it. That costs nothing
+    // observable, and this is what says so: a boolean and a command exiting `0`
+    // mean the same thing, so both readings pick the same branch. Were the
+    // discriminator ever to move, this pair would disagree before anything else did.
+    for (word, program, expected) in [
+        ("true", "/bin/true", "else\n"),
+        ("false", "/bin/false", "then\n"),
+    ] {
+        for operand in [word, program] {
+            let out = run_with_input(&format!(
+                "if not {operand} {{ puts then }} else {{ puts else }}\n"
+            ));
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                expected,
+                "`not {operand}`"
+            );
+        }
+    }
+
+    // A list-pattern binding is a condition, not a value, so the negation reaches it
+    // too: `[` alone reads as a list literal, and without asking for the `=` behind
+    // it the negation was rewound and the line became `syntax error: expected `{``
+    // while the un-negated binding worked. Raised in review.
+    let patterns = run_with_input(
+        "if not [head ...tail] = [a b] { puts wrong } else { puts \"matched $head\" }\n\
+         if not [a b c] = [1 2] { puts mismatch } else { puts wrong }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&patterns.stdout),
+        "matched a\nmismatch\n",
+        "{}",
+        String::from_utf8_lossy(&patterns.stderr)
+    );
+
+    // A `while` header starts at `Produced::Nothing`, and the list-pattern arm of
+    // `condition_status` answers without touching it — so the negation's
+    // skipped-guard exemption mistook a completed pattern test for a guard and left
+    // it unnegated, flipping the loop both ways. Both first-test outcomes, against
+    // the un-negated pair that says which way is right. Raised in review.
+    for (source, expected) in [
+        (
+            "while not [a] = [x] { puts ENTERED\nbreak }\nputs done\n",
+            "done\n",
+        ),
+        (
+            "while not [a b] = [x] { puts ENTERED\nbreak }\nputs done\n",
+            "ENTERED\ndone\n",
+        ),
+        (
+            "while [a] = [x] { puts ENTERED\nbreak }\nputs done\n",
+            "ENTERED\ndone\n",
+        ),
+        (
+            "while [a b] = [x] { puts ENTERED\nbreak }\nputs done\n",
+            "done\n",
+        ),
+        // A negated *command* as a `while`'s first test travels the same path.
+        (
+            "while not test -f /nonexistent-mesh-path { puts ENTERED\nbreak }\nputs done\n",
+            "ENTERED\ndone\n",
+        ),
+        (
+            "while not test -d / { puts ENTERED\nbreak }\nputs done\n",
+            "done\n",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{source}");
+    }
+
+    // A negated header that runs no pass keeps the loop's no-pass value, which is
+    // what says the negation did not turn a completed test into a *pass*. The
+    // un-negated form on each line is the answer being matched: a pattern test that
+    // takes no pass yields `\"\"`, and a command header already yielded `0` before
+    // any of this — the negation changes neither. Raised in review.
+    for (source, expected) in [
+        (
+            "func g() { while not [a] = [x] { 7 } }\nv = g()\nputs \"[$v]\"\n",
+            "[]\n",
+        ),
+        (
+            "func g() { while [a b] = [x] { 7 } }\nv = g()\nputs \"[$v]\"\n",
+            "[]\n",
+        ),
+        (
+            "func g() { while false { 7 } }\nv = g()\nputs \"[$v]\"\n",
+            "[]\n",
+        ),
+        (
+            "func g() { while not test -d / { 7 } }\nv = g()\nputs \"[$v]\"\n",
+            "[0]\n",
+        ),
+        (
+            "func g() { while test -d /nonexistent-mesh-path { 7 } }\nv = g()\nputs \"[$v]\"\n",
+            "[0]\n",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{source}");
+    }
+
+    // A condition its own trailing guard skipped ran nothing, so there is no status
+    // to negate and the previous command's still stands — the same exemption the
+    // un-negated condition takes. Inverting the inherited status instead picked the
+    // opposite branch from the un-negated form. Raised in review.
+    for (source, expected) in [
+        (
+            "false\nif not puts BAD if false { puts THEN } else { puts ELSE }\n",
+            "ELSE\n",
+        ),
+        (
+            "false\nif puts BAD if false { puts THEN } else { puts ELSE }\n",
+            "ELSE\n",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{source}");
+    }
+
+    // The value reading is untouched wherever a value follows the word — including
+    // `not not`, which folds in one place rather than two.
+    let values = run_with_input(
+        "b = false\n\
+         if not $b { puts variable }\n\
+         if not 1 == 2 { puts comparison }\n\
+         if not false { puts literal }\n\
+         xs = [a b]\n\
+         if not $xs:len > 5 { puts modifier }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&values.stdout),
+        "variable\ncomparison\nliteral\nmodifier\n"
+    );
+}
+
+/// The same `not`, one statement later: with no branch to carry the answer, the
+/// negated status **is** the result. That is the rule a value statement already
+/// follows — bare `false` exits `1` — so this is one word with one meaning in both
+/// positions rather than a second construct.
+#[test]
+fn a_leading_not_negates_a_commands_status_in_a_statement() {
+    let out = run_with_input(
+        "not sh -c 'exit 1'\n\
+         puts \"failed=$sh.status\"\n\
+         not sh -c 'exit 0'\n\
+         puts \"passed=$sh.status\"\n\
+         not not sh -c 'exit 1'\n\
+         puts \"double=$sh.status\"\n\
+         not sh -c 'exit 1' && puts connector\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "failed=0\npassed=1\ndouble=1\nconnector\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `$sh.pipestatus` follows `$sh.status` rather than describing the run beneath
+    // it: the negation produced the code, so there is one stage and no breakdown
+    // that would explain a `0` by a `3`. `run_recorded` already states this as an
+    // invariant; a condition keeps the breakdown because the negation is only a
+    // reading there.
+    let piped = run_with_input(
+        "not sh -c 'exit 3' | sh -c 'exit 7'\nputs \"st=$sh.status\" ...$sh.pipestatus\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&piped.stdout), "st=0 0\n");
+
+    // Shapes that used to be a syntax error because the value reading claimed them,
+    // and now run as the commands they look like.
+    let claimed = run_with_input(
+        "not true foo\n\
+         puts \"program=$sh.status\"\n\
+         not true | cat\n\
+         puts \"pipeline=$sh.status\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&claimed.stdout),
+        "program=1\npipeline=1\n",
+        "{}",
+        String::from_utf8_lossy(&claimed.stderr)
+    );
+
+    // A negation is not a job: the status to invert arrives when the job is waited
+    // on, not when it is launched, so backgrounding one is refused rather than
+    // reporting the negation of "started successfully".
+    let backgrounded = run_with_input("not sh -c 'exit 1' &\n");
+    assert_eq!(String::from_utf8_lossy(&backgrounded.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&backgrounded.stderr).contains("backgrounding a negated command"),
+        "{}",
+        String::from_utf8_lossy(&backgrounded.stderr)
+    );
+
+    // A statement its own trailing guard skipped ran nothing, so the negation has no
+    // status to invert and the previous command's stands — otherwise the inherited
+    // failure flipped to success and a following `&&` ran. Raised in review.
+    let guarded = run_with_input("false\nnot puts BAD if false && puts RAN\nputs done\n");
+    assert_eq!(String::from_utf8_lossy(&guarded.stdout), "done\n");
+
+    // A postfix guard and an assignment's right-hand side take a value expression
+    // and nothing else, so `not` there is the value operator alone — the limit those
+    // positions already have without it, since a guard given a command is not a
+    // guard. Pinned because `docs/REFERENCE.md` claimed the command reading was
+    // uniform across every position, which it is not. Raised in review.
+    let guarded_value = run_with_input("puts ok if not test -e /\n");
+    assert_eq!(
+        String::from_utf8_lossy(&guarded_value.stdout),
+        "ok if not test -e /\n"
+    );
+    let assigned = run_with_input("x = not test -e /\n");
+    assert_eq!(assigned.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&assigned.stderr).contains("syntax error"),
+        "{}",
+        String::from_utf8_lossy(&assigned.stderr)
+    );
+
+    // The value reading still wins wherever a value follows, so a statement `not`
+    // over a bool is the operator it always was.
+    let values = run_with_input(
+        "not true\nputs \"true=$sh.status\"\nnot false\nputs \"false=$sh.status\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&values.stdout), "true=1\nfalse=0\n");
+}
+
 /// `not` is a **reserved word**, so it never names a command however the line
 /// continues. Keeping a command of that name reachable is what the old
 /// "only when what follows is value-shaped" test was for, and paying for it meant

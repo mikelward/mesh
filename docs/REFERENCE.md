@@ -2180,19 +2180,31 @@ membership (`in`), and boolean `not`, `and`, and `or`. Ordered comparisons
 require two integers or two strings; arithmetic never implicitly parses a
 string (use `:int` explicitly). Comparisons cannot be chained.
 
-`not` is a **reserved word**. A leading one always negates a value, so
-`if not $b { … }` and `while not $b { … }` are conditions rather than a command of
-that name, matching the postfix guard (`puts x if not $b`) and the assignment
-(`x = not $b`) that already read it so. It never names a command, however the line
-continues:
+`not` is a **reserved word**, and it negates one of two things: a **value**, or a
+**command's status**. Which one is decided by the operand — a value after it is the
+boolean operator, anything else is a command whose exit status is inverted. Both
+readings are available in a **condition** (`if` / `while`) and in **statement**
+position, which are the two places a command can be written at all:
 
-```
-not foo              # negates the string "foo" — not a command
-not true foo         # a syntax error, not an invocation
-not true | cat       # a syntax error: a value cannot be a pipeline stage
+```mesh
+not $b               # the value operator
+not have-command(x)  # likewise — a call is a value
+not false            # likewise — `true` / `false` are boolean literals
+
+not test -f $config  # negates the command's status: 0 if the file is missing
+not grep -q x $file  # `puts found unless …` spelled the other way round
+not sh -c $probe | cat   # a pipeline negates as a whole
 ```
 
-The escape hatches are the ones any reserved word has — a path or a quoted word:
+A **postfix guard** and an **assignment's right-hand side** take a value expression
+and nothing else, so `not` there is the value operator alone — the same limit those
+positions already have without it. A guard given a command is not a guard (see
+[Postfix guards](#postfix-guards--if-and-unless)), so `puts ok if not test -e /`
+passes those words to `puts` as arguments, and `x = not test -e /` is a syntax
+error at the operands. Use a full `if` for a command condition.
+
+`not` still never names a command *itself*, however the line continues. The escape
+hatches are the ones any reserved word has — a path or a quoted word:
 
 ```mesh
 ./not foo            # runs the program `not`
@@ -2202,7 +2214,31 @@ The escape hatches are the ones any reserved word has — a path or a quoted wor
 `not` as *data* is untouched, since only the command-word position is reserved:
 `puts not` prints it and `x = "not"` stores it. A run of `not`s folds to its
 **parity** — `not not not $x` is `not $x`, and any even run is the `not not $x` that
-coerces truthiness to a bool without inverting it.
+coerces truthiness to a bool without inverting it. The same parity applies to a
+negated command.
+
+Because a value operand wins, the *programs* `true` and `false` are not reachable
+through `not` — but nothing is lost by it, since a boolean and a command exiting `0`
+mean the same thing: `not true` and `not /bin/true` both answer false. A command
+needs a word to name it, so `not = 5` stays a syntax error rather than trying to run
+`=`.
+
+As a **statement**, the negated status is the result, and `$sh.status` carries it —
+the rule a value statement already follows, where bare `false` exits `1`:
+
+```mesh
+not sh -c 'exit 3'          # status 0
+not diff old new && puts differed
+```
+
+`$sh.pipestatus` follows `$sh.status`, so a negated statement reports one stage: the
+negation produced the code, so there is no per-stage breakdown that explains it. In a
+**condition** the negation is only a reading and the command publishes its own code,
+so the breakdown survives there — see [Conditionals](#conditionals).
+
+A negated command cannot be backgrounded (`not cmd &` is refused): the status to
+invert arrives when the job is waited on, not when it is launched. Bind the job and
+negate the wait instead.
 
 The same **whole-statement** rule governs a **word operand** on its own, which is how
 a variable names a command. A word is a *value* only when the value is the whole
@@ -2419,6 +2455,27 @@ if diff old new {
 A **value** condition has no status to report, so it leaves the previous
 command's standing — the same rule a guard that skipped its statement follows.
 The `if` itself still reports its *body's* status, not its condition's.
+
+`not` before a condition negates it. Before a **value** it is the boolean operator
+of [Operators and matching](#operators-and-matching); before anything else it
+negates the *command's* status, which is how a condition says "this failed":
+
+```mesh
+if not test -f $config { puts "no config" }
+if not sh -c $probe | grep -q ready { puts "not ready" }
+while not mountpoint -q /mnt { sleep 1 }
+
+if not $ready { … }        # the value operator — `$ready` is a value
+if not have-command(fzf) { … }   # likewise, a call is a value
+```
+
+A pipeline negates as a whole, and `not not` cancels. The negation is a *reading*
+of the status, not a second run of it, so the command still publishes the code it
+really exited with and `$sh.pipestatus` keeps its per-stage breakdown:
+
+```mesh
+if not sh -c 'exit 130' { puts $sh.status }   # 130, not 1
+```
 
 ## List patterns
 
