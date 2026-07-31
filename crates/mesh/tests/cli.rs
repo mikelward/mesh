@@ -3222,28 +3222,35 @@ fn stop_pty_shell(shell: PtyShell) -> bool {
         ))
         .is_some();
     }
+    // Read — and keep answering — until the session closes the pty, rather than
+    // waiting in `waitpid` with nobody at the other end.
+    //
+    // A shell on its way out paints one more prompt, and reedline asks the
+    // terminal where the cursor is before it draws. Left unanswered, the line
+    // editor gives up and mesh reports `line editor error: The cursor position
+    // could not be read within a normal duration` and leaves with **1** — so an
+    // `exit 0` that names its own status ended up not having it. That is the
+    // `notify_reaches_the_terminal_and_a_quick_command_does_not` flake, read off
+    // a CI failure once these diagnostics could reach the log.
+    let parting = pty_read_to_end(shell.master);
     let mut status = 0;
     let reaped = unsafe { libc::waitpid(shell.mesh, &mut status, 0) } == shell.mesh;
-    // Read only when something went wrong, so the ordinary path is byte for byte
-    // what it was. The shell has been reaped by now, so this drains what it left
-    // buffered and then meets end of file.
-    let parting = |master| visible_tail(&pty_read_to_end(master));
     let why = if !reaped {
         Some("the shell could not be waited for".to_owned())
     } else if !libc::WIFEXITED(status) {
         Some(format!(
             "the shell was killed by signal {}; last words: {}",
             libc::WTERMSIG(status),
-            parting(shell.master)
+            visible_tail(&parting)
         ))
     } else if libc::WEXITSTATUS(status) != 0 {
         // `exit 0` names its own status, so a nonzero one here means the line
-        // never ran as written — the input reached the shell as something else,
-        // and what it echoed back is the evidence for what.
+        // never ran as written — and what the session said last is the evidence
+        // for why.
         Some(format!(
             "`exit 0` left with {} instead; last words: {}",
             libc::WEXITSTATUS(status),
-            parting(shell.master)
+            visible_tail(&parting)
         ))
     } else {
         None
@@ -3313,7 +3320,11 @@ fn pty_read_to_end(master: RawFd) -> Vec<u8> {
         if count <= 0 {
             break;
         }
+        let fresh = seen.len().saturating_sub(3);
         seen.extend_from_slice(&chunk[..count as usize]);
+        // A session on its way out still asks where the cursor is, and a reader
+        // that only drains is not a terminal. See [`stop_pty_shell`].
+        answer_cursor_queries(master, &seen[fresh..]);
     }
     seen
 }
