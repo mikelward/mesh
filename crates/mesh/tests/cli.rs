@@ -75,6 +75,17 @@ struct MeshExec {
     envp: Vec<*const libc::c_char>,
 }
 
+/// A state directory no other session shares.
+///
+/// `fresh_dir` names by tag and process id, which collides for callers in the
+/// same process — and here every caller *is* in the same process, so the counter
+/// is what makes it private.
+fn private_state_home() -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    fresh_dir(&format!("state_{}", NEXT.fetch_add(1, Ordering::Relaxed)))
+}
+
 impl MeshExec {
     fn new(config_home: &Path) -> Self {
         Self::with_environment(config_home, &[])
@@ -101,7 +112,14 @@ impl MeshExec {
             // `OSC 633`. `NO_COLOR` suppresses a styled value's attributes, so a
             // suite run with it set would see no SGR at all.
             .filter(|(name, _)| {
-                name != "XDG_CONFIG_HOME" && name != "TERM_PROGRAM" && name != "NO_COLOR"
+                // `XDG_STATE_HOME` is replaced below rather than added to: a
+                // duplicate entry does not win, since a lookup answers with the
+                // *first* one, and the session would keep the inherited history
+                // database the private one exists to get away from.
+                name != "XDG_CONFIG_HOME"
+                    && name != "XDG_STATE_HOME"
+                    && name != "TERM_PROGRAM"
+                    && name != "NO_COLOR"
             })
             .filter(|(name, _)| !extra.iter().any(|(replaced, _)| name == replaced))
             .map(|(name, value)| {
@@ -114,6 +132,15 @@ impl MeshExec {
         let mut config = b"XDG_CONFIG_HOME=".to_vec();
         config.extend(config_home.as_os_str().as_bytes());
         environment.push(CString::new(config).unwrap());
+        // A **state** home of its own, which is where the history database
+        // lives. Left to what the suite inherited, every session in the run
+        // opened the same `history.sqlite3` under the runner's real `$HOME` —
+        // and opening one is not read-only: startup runs an `UPDATE` over the
+        // table, so each session takes a write lock on a file every other
+        // session is also opening.
+        let mut state = b"XDG_STATE_HOME=".to_vec();
+        state.extend(private_state_home().as_os_str().as_bytes());
+        environment.push(CString::new(state).unwrap());
         for (name, value) in extra {
             environment.push(CString::new(format!("{name}={value}")).unwrap());
         }
