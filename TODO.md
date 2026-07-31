@@ -2211,7 +2211,7 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Thirteen have since been fixed; two are tracked
+matched back to the discussion. Fourteen have since been fixed; two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
 
@@ -2426,10 +2426,43 @@ was re-checked against `main` rather than taken from the PR text.
       `user@host: dir` (§"Beyond M3 — Terminal integration") with
       `$sh.options.osc-title` to turn it off, but there is no way for a config to
       *supply* the text — so the choice is mesh's title or no title.
-- [ ] **9. A newline inside an unclosed `(…)` ends the expression** unless it
+- [x] **9. A newline inside an unclosed `(…)` ends the expression** unless it
       follows an operator, so a two-line `x = (1` / `+ 2)` is
       ``syntax error: expected `)` `` where `docs/REFERENCE.md` reads as
       continuing. Either the parser or the reference is wrong; decide which.
+
+      **Fixed: the parser was.** Three of the four newline positions in a group
+      already worked — after the `(`, after an operator, before the `)` — and only
+      an operator *opening* the next line was refused, which is the spelling a
+      wrapped sum is usually written in. So this was one missing skip rather than
+      a rule anyone had chosen: `primary` stepped over newlines at the edges of a
+      group and `binary` stepped over them after taking an operator, but nothing
+      looked past one to find the operator in the first place.
+
+      A group and a `${ … }` body hold **one expression**, so a newline in them can
+      only be layout. `Parser::grouped` counts those, `Parser::wraps` steps over a
+      newline when what follows continues the expression, and `Parser::source`
+      clears the count — a block or a `$( … )` written inside a group is back to
+      statements, where a newline separates again.
+
+      The skip is **speculative**: the newlines go back unless the operator is
+      really there, so an unclosed group still reports where it runs out instead of
+      eating the lines after it. `${ … }` had the identical gap and the identical
+      fix, and its own comment already claimed it wrapped "the way a `( … )` group
+      does" — true of both, in three positions out of four.
+
+      A `[ … ]` list is unchanged and deliberately differs: it holds several things,
+      so `[1` / `2]` is two elements. The reference now says which bracket means
+      which rather than leaving "line breaks continue the statement" to imply both.
+
+      The rule is handed off in **one** place, `Parser::postfix`, rather than at
+      each construct that separates items. Everything a wrapped expression can
+      descend into is reached from there — the `[ … ]` and `{ … }` a `primary`
+      opens, the `( … )` argument lists the postfix loop reads — and clearing at
+      each was how `([1` / `+ 2])` came to be the one-element `[3]` while the
+      identical bare list was a syntax error. A group written *inside* one of them
+      turns wrapping back on, so `[1, (2` / `+ 3)]` is two elements with the second
+      wrapped.
 - [ ] **10. `"$var.suffix"` in a string is member access, not text.**
       `"$file.bak"` looks up `bak` in `$file` and fails with `value is not a map`
       — at **runtime**, so a rarely-taken branch carries it silently until it is

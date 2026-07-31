@@ -1024,6 +1024,7 @@ pub fn parse(source: &str) -> Result<ParseOutcome, ParseError> {
         source_len: source.len(),
         depth: 0,
         regex_slot: false,
+        grouped: 0,
     };
     match parser.source(None) {
         Ok(tree) => Ok(ParseOutcome::Complete(tree)),
@@ -1152,6 +1153,7 @@ pub(crate) fn params_prefix_status(list: &str) -> PrefixStatus {
         source_len: list.len(),
         depth: 0,
         regex_slot: false,
+        grouped: 0,
     }
     .parameters_prefix()
 }
@@ -1778,6 +1780,7 @@ fn capture_in_string(
         source_len: end,
         depth,
         regex_slot: false,
+        grouped: 0,
     };
     Ok((Expr::Capture(parser.source(Some(TokenKind::RParen))?), end))
 }
@@ -1911,12 +1914,13 @@ fn braced_expression_in_string(
         source_len: end,
         depth,
         regex_slot: false,
+        // A newline inside the braces is layout, not a terminator — the body is
+        // one expression, so it wraps the way a `( … )` group does, mid-expression
+        // included. Without this the trailing `Newline` sat where the `}` was
+        // expected and a body that merely broke across lines was a syntax error,
+        // while `$( … )` and a bare group both took it.
+        grouped: 1,
     };
-    // A newline inside the braces is layout, not a terminator — the body is one
-    // expression, so it wraps the way a `( … )` group does. Without this the
-    // trailing `Newline` sat where the `}` was expected and a body that merely
-    // broke across lines was a syntax error, while `$( … )` and a bare group both
-    // took it.
     parser.newlines();
     let expression = parser.expression()?;
     parser.newlines();
@@ -2479,6 +2483,13 @@ struct Parser<'a> {
     /// How many nested constructs deep [`Parser::primary`] currently is, so that
     /// input can be *refused* before the recursive descent runs out of stack.
     depth: usize,
+    /// How many enclosing `( … )` groups or `${ … }` bodies the parse is inside.
+    ///
+    /// Those hold exactly **one expression**, so a newline in them cannot be
+    /// separating anything and is layout — see [`Parser::wraps`]. Cleared by
+    /// [`Parser::source`], since a block or a capture written inside a group is
+    /// back to statements, where a newline separates again.
+    grouped: usize,
 }
 
 /// How deep a nesting the parser accepts before reporting [`ParseErrorKind::TooDeep`].
@@ -4023,9 +4034,53 @@ impl Parser<'_> {
         self.or_expression()
     }
 
+    /// Step over a newline inside `( … )` or `${ … }` when what follows it
+    /// continues the expression.
+    ///
+    /// Those constructs hold one expression, so a newline in them separates
+    /// nothing and is layout — `(1` / `+ 2)` is `(1 + 2)`, which is what
+    /// `docs/REFERENCE.md` has always said and what a group already did for a
+    /// newline right after the `(`, right before the `)`, or straight after an
+    /// operator. Only the operator-*leading* line was left out, and it is the one
+    /// spelling a wrapped sum is usually written in.
+    ///
+    /// **Speculative**: the newlines go back unless `continues` finds what it was
+    /// looking for. Consuming them unconditionally would let an unclosed group eat
+    /// the lines after it and report far from the `(`, where `(1` followed by an
+    /// ordinary statement should still say `expected `)`` right there.
+    fn wraps(&mut self, continues: impl FnOnce(&Self) -> bool) -> bool {
+        if self.grouped == 0 || !self.same(&TokenKind::Newline) {
+            return false;
+        }
+        let newline = self.position;
+        self.newlines();
+        if continues(self) {
+            return true;
+        }
+        self.position = newline;
+        false
+    }
+
+    /// Would an operator here extend an expression being parsed at `minimum`?
+    ///
+    /// Precedence is part of the question: a weaker operator belongs to an outer
+    /// call, which asks again and takes the newline itself, so answering "no" here
+    /// hands it over intact rather than eating the layout on its behalf.
+    fn continues_binary(&self, minimum: u8) -> bool {
+        if minimum <= 5 && (self.same(&TokenKind::Range) || self.same(&TokenKind::RangeInclusive)) {
+            return true;
+        }
+        self.binary_op()
+            .is_some_and(|(_, precedence, _)| precedence >= minimum)
+    }
+
     fn or_expression(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.and_expression()?;
-        while self.take_word("or") {
+        loop {
+            self.wraps(|parser| parser.word("or"));
+            if !self.take_word("or") {
+                break;
+            }
             self.newlines();
             left = Expr::Binary {
                 left: Box::new(left),
@@ -4038,7 +4093,11 @@ impl Parser<'_> {
 
     fn and_expression(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.not_expression()?;
-        while self.take_word("and") {
+        loop {
+            self.wraps(|parser| parser.word("and"));
+            if !self.take_word("and") {
+                break;
+            }
             self.newlines();
             left = Expr::Binary {
                 left: Box::new(left),
@@ -4211,6 +4270,7 @@ impl Parser<'_> {
         let mut left = self.prefix()?;
         let mut compared = false;
         loop {
+            self.wraps(|parser| parser.continues_binary(minimum));
             if minimum <= 5
                 && (self.same(&TokenKind::Range) || self.same(&TokenKind::RangeInclusive))
             {
@@ -4302,7 +4362,29 @@ impl Parser<'_> {
         parsed
     }
 
+    /// An **operand**, so [`Parser::grouped`] does not apply inside it.
+    ///
+    /// This is the one place the group's "a newline is layout" rule is handed off.
+    /// Everything a wrapped expression can descend into is reached from here — the
+    /// `[ … ]` and `{ … }` a `primary` opens, the `( … )` argument lists this loop
+    /// reads — and every one of them holds *several* things, so a newline in one
+    /// separates rather than wraps. Clearing at the single point they share beats
+    /// clearing at each, which is how `([1 ⏎ + 2])` came to be the one-element
+    /// `[3]` while the identical `[1 ⏎ + 2]` was a syntax error. Raised in review
+    /// as a P2, against the list; call arguments had it too.
+    ///
+    /// A `( … )` written *inside* one of them turns it back on, since that arm
+    /// sets the count itself — `[1, (2 ⏎ + 3)]` is two elements, the second
+    /// wrapped. Restored on the way out, so the operator loop that called this
+    /// still sees the group it is in.
     fn postfix(&mut self) -> Result<Expr, ParseError> {
+        let grouped = std::mem::take(&mut self.grouped);
+        let value = self.postfix_operand();
+        self.grouped = grouped;
+        value
+    }
+
+    fn postfix_operand(&mut self) -> Result<Expr, ParseError> {
         let mut value = self.primary()?;
         // A glob's attached `(…)` is its qualifier list, so it is read before the
         // call loop below ever sees the `(` — `*(d)` narrows the glob rather than
@@ -4880,7 +4962,13 @@ impl Parser<'_> {
         }
         if self.eat(&TokenKind::LParen).is_some() {
             self.newlines();
-            let value = self.expression()?;
+            // One expression, so every newline in here is layout — including one
+            // that lands mid-expression, which is the case `newlines` on its own
+            // could not reach. See [`Parser::wraps`].
+            self.grouped += 1;
+            let value = self.expression();
+            self.grouped -= 1;
+            let value = value?;
             self.newlines();
             self.expect(&TokenKind::RParen, "`)`")?;
             return Ok(Expr::Group(Box::new(value)));
@@ -6193,6 +6281,7 @@ mod tests {
                 tokens,
                 depth: 0,
                 regex_slot: false,
+                grouped: 0,
             };
             // The whole source, which is what the value parse would consume here.
             let end = parser.tokens.len();

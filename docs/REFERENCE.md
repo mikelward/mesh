@@ -354,6 +354,23 @@ Line breaks inside an unclosed `{ … }`, `[ … ]`, `( … )`, or quote continu
 statement too, so a block or a list literal may span lines without a `\`.
 Interactively the continuation prompt is `...`.
 
+What a continued line break *means* is whatever the bracket holds. A `( … )`
+group and a `${ … }` body hold **one expression**, so a newline in them separates
+nothing and is layout — it may fall anywhere, the operator ending a line or
+opening the next:
+
+```mesh
+x = (1
+     + 2)         # 3 — the operator may lead
+x = (1 +
+     2)           # 3 — or trail
+```
+
+A `[ … ]` list and a `{ … }` block hold **several** things, so there a newline is
+a separator like any other: `[1` / `2]` is a two-element list, not a wrapped sum.
+A group still holds exactly one expression however it is spaced, so a second one
+on the next line is a syntax error rather than a statement list.
+
 ### Pipelines and sequencing
 
 ```
