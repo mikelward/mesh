@@ -3074,16 +3074,43 @@ fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
             rest = &rest[close..];
         } else if let Some(value) = rest.strip_prefix(':') {
             let end = value.find(':').unwrap_or(value.len());
-            // A `from_name` miss is dropped rather than reported: the miss does not
-            // mean the name is unimplemented, only that `expand` is not where it
-            // lives — the regex flags and `:capture` are implemented in
-            // `apply_argument_free_modifier`, on the other side of a layer this path
-            // cannot reach. Reporting it here mislabeled them. Left as it was, and
-            // recorded in TODO.md: the fix is to unify the two paths, not to guess
-            // from the name.
-            if let Some(modifier) = expand::Modifier::from_name(&value[..end]) {
-                modifiers.push(modifier);
-            }
+            let name = &value[..end];
+            // A `from_name` miss is *carried*, never dropped. `expand` implements 35
+            // of the 83 modifiers the parser accepts, and dropping the rest let a
+            // chain quietly lose a step: `"${s:lines:len}"` answered 3 — the length
+            // of the string — for a `:len` that had been asked of the lines. The
+            // remaining ones live in `apply_argument_free_modifier`, past a layer
+            // `expand` cannot reach, so this path cannot run them; what it can do is
+            // say so, in the words that path would have used, when the chain gets
+            // there. Carried rather than raised here so the steps before it report
+            // first — `${s:keys:lines}` is a `:keys` problem, and an unbound root is
+            // an unbound root.
+            modifiers.push(match expand::Modifier::from_name(name) {
+                Some(modifier) => expand::ModifierStep::Apply {
+                    modifier,
+                    name: name.to_string(),
+                },
+                None if name == "capture" => expand::ModifierStep::Unavailable {
+                    name: name.to_string(),
+                    // Implemented, but for a call rather than a value — calling it
+                    // unimplemented would be the mislabel the silence was there to
+                    // avoid. The reason is the invocation, not the value, so a
+                    // pattern hears the same thing everything else does.
+                    message: CAPTURE_NEEDS_A_CALL.to_string(),
+                    regex_message: CAPTURE_NEEDS_A_CALL.to_string(),
+                },
+                None => expand::ModifierStep::Unavailable {
+                    name: name.to_string(),
+                    message: if parser::modifier_requires_arguments(name) {
+                        format!("modifier :{name} requires an argument")
+                    } else {
+                        format!("modifier :{name} is not implemented yet")
+                    },
+                    // What `apply_argument_free_modifier` tells a pattern: the four
+                    // flags are the whole of what one takes.
+                    regex_message: format!("modifier :{name} is not valid for a regex"),
+                },
+            });
             rest = &value[end..];
         } else {
             unreachable!("parser validated variable access")
@@ -3444,10 +3471,7 @@ fn eval_expr(
                     arguments: call_arguments,
                 } = value.as_ref()
                 else {
-                    return runtime_error(
-                        ":capture applies to a call — write `f(…):capture`, or `$(…)` for a \
-                         command's output",
-                    );
+                    return runtime_error(CAPTURE_NEEDS_A_CALL);
                 };
                 return capture_call(callee, call_arguments, last, in_function, shell);
             }
@@ -3537,9 +3561,7 @@ fn eval_expr(
         // (`GRAMMAR.md`), so by the time a call could reject it the very call it was
         // meant to capture has already run uncaptured. Refusing the value means there
         // is nothing to call.
-        E::ModifierRef(name) if name == "capture" => runtime_error(
-            ":capture applies to a call — write `f(…):capture`, or `$(…)` for a command's output",
-        ),
+        E::ModifierRef(name) if name == "capture" => runtime_error(CAPTURE_NEEDS_A_CALL),
         E::ModifierRef(name) => Ok(Value::Function(vars::FuncValue::modifier(name.clone()))),
     }
 }
@@ -3985,12 +4007,8 @@ fn glob_path_argument(
 /// `$r:i` it is defined to mean.
 fn apply_argument_free_modifier(name: &str, mut value: Value) -> Result<Value, Step> {
     if let Value::Regex(regex) = &mut value {
-        match name {
-            "i" | "ignorecase" => regex.case_insensitive = true,
-            "m" | "multiline" => regex.multi_line = true,
-            "s" | "dotall" => regex.dot_matches_new_line = true,
-            "x" | "extended" => regex.ignore_whitespace = true,
-            _ => return runtime_error(format!("modifier :{name} is not valid for a regex")),
+        if !expand::set_regex_flag(regex, name) {
+            return runtime_error(format!("modifier :{name} is not valid for a regex"));
         }
         compile_regex(regex).map_err(runtime_message)?;
         return Ok(value);
@@ -4392,6 +4410,11 @@ fn single_string_argument(
         _ => runtime_error(format!("modifier :{name} argument must be a string")),
     }
 }
+
+/// `:capture` wraps an **invocation** rather than transforming a value, so every
+/// place that meets it on a value says the same thing.
+const CAPTURE_NEEDS_A_CALL: &str =
+    ":capture applies to a call — write `f(…):capture`, or `$(…)` for a command's output";
 
 fn runtime_message(message: impl std::fmt::Display) -> Step {
     note!("mesh: {message}");
@@ -5457,14 +5480,11 @@ fn checked_div(left: i64, right: i64) -> Result<i64, String> {
         .ok_or_else(|| "numeric overflow".into())
 }
 
+/// Build the pattern, which is also how a flag change is validated — `:x` can turn
+/// a pattern that parsed into one that does not. Lives in [`expand`] so the
+/// reference path validates by the same rule this one does.
 fn compile_regex(value: &RegexValue) -> Result<regex::Regex, String> {
-    regex::RegexBuilder::new(&value.pattern)
-        .case_insensitive(value.case_insensitive)
-        .multi_line(value.multi_line)
-        .dot_matches_new_line(value.dot_matches_new_line)
-        .ignore_whitespace(value.ignore_whitespace)
-        .build()
-        .map_err(|error| format!("invalid regex: {error}"))
+    expand::compile_regex(value)
 }
 
 fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value, String> {

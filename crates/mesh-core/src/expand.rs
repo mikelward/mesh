@@ -120,11 +120,78 @@ impl Modifier {
     }
 }
 
+/// One step of a reference's modifier chain.
+///
+/// A name this path has no implementation for is **carried** rather than rejected
+/// when the reference is built, so the steps before it still run — and still report
+/// first. Reporting at build time named the wrong step: `${s:keys:lines}` blamed
+/// `:lines` for a chain that never got past `:keys` requiring a map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModifierStep {
+    /// `name` rides along because a pattern reads some names differently from
+    /// every other value — `:x` is `extended` there and the executable-file filter
+    /// elsewhere — and which one is meant cannot be known until the value is.
+    Apply { modifier: Modifier, name: String },
+    /// A name this path has no [`Modifier`] for.
+    ///
+    /// `name` is kept because one set *can* be applied here after all — the regex
+    /// flags, which need only the value to know they apply. Both messages are
+    /// ready-made because which names take arguments, and which live elsewhere, is
+    /// the caller's knowledge; choosing between them is this layer's, since only it
+    /// has the value. `regex_message` is what a **pattern** hears for a name that is
+    /// not a flag, and differs wherever the reason is not the value's type —
+    /// `:capture` needs an invocation whatever it is applied to.
+    Unavailable {
+        name: String,
+        message: String,
+        regex_message: String,
+    },
+}
+
+impl ModifierStep {
+    fn name(&self) -> &str {
+        match self {
+            ModifierStep::Apply { name, .. } | ModifierStep::Unavailable { name, .. } => name,
+        }
+    }
+}
+
+/// Build `value` into a usable pattern, or say why it cannot be one.
+///
+/// Shared with the caller so both spellings of a flag change validate identically:
+/// `:x` turns `#` into a comment introducer, so a pattern that parsed without it
+/// can fail to parse with it.
+pub(crate) fn compile_regex(value: &crate::vars::RegexValue) -> Result<regex::Regex, String> {
+    regex::RegexBuilder::new(&value.pattern)
+        .case_insensitive(value.case_insensitive)
+        .multi_line(value.multi_line)
+        .dot_matches_new_line(value.dot_matches_new_line)
+        .ignore_whitespace(value.ignore_whitespace)
+        .build()
+        .map_err(|error| format!("invalid regex: {error}"))
+}
+
+/// Set the flag `name` spells on a pattern, reporting whether it named one.
+///
+/// The four flags are the whole of what a pattern takes, so a name that is not one
+/// of them does not apply to a pattern either. Shared with the caller's dispatcher
+/// so the two spellings of the same chain cannot drift.
+pub(crate) fn set_regex_flag(regex: &mut crate::vars::RegexValue, name: &str) -> bool {
+    match name {
+        "i" | "ignorecase" => regex.case_insensitive = true,
+        "m" | "multiline" => regex.multi_line = true,
+        "s" | "dotall" => regex.dot_matches_new_line = true,
+        "x" | "extended" => regex.ignore_whitespace = true,
+        _ => return false,
+    }
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarRef {
     pub name: String,
     pub accesses: Vec<Access>,
-    pub modifiers: Vec<Modifier>,
+    pub modifiers: Vec<ModifierStep>,
     pub quoted: bool,
 }
 
@@ -167,6 +234,9 @@ pub enum ExpandError {
     UnboundVar(String),
     UnsetEnv(String),
     Unsupported(String),
+    /// A modifier this path cannot apply, reported when the chain reaches it. The
+    /// message is built by the caller, so it renders verbatim.
+    ModifierUnavailable(String),
     ListNeedsSpread(String),
     /// A map has no such key. Its own variant because `Unsupported` renders as
     /// "… not supported yet", which reads as an unimplemented feature — and a
@@ -209,6 +279,7 @@ impl std::fmt::Display for ExpandError {
             ExpandError::UnboundVar(n) => write!(f, "{n}: unbound variable"),
             ExpandError::UnsetEnv(k) => write!(f, "$env.{k}: not set"),
             ExpandError::Unsupported(s) => write!(f, "{s}: not supported yet"),
+            ExpandError::ModifierUnavailable(message) => write!(f, "{message}"),
             ExpandError::ListNeedsSpread(n) => {
                 write!(f, "${n}: list value needs `...` in command arguments")
             }
@@ -871,8 +942,40 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
             },
         };
     }
-    for modifier in &vref.modifiers {
-        value = apply_modifier(value, *modifier)?;
+    for step in &vref.modifiers {
+        // A pattern takes the regex flags, and takes them *first*: `:x` names the
+        // `extended` flag here and `Modifier::Exec` everywhere else, so consulting
+        // the shared name table before the value is known answers the wrong one.
+        // This is the one value the path can finish for itself either way.
+        if let Value::Regex(regex) = &mut value
+            && set_regex_flag(regex, step.name())
+        {
+            // A flag can invalidate a pattern that parsed without it, so the change
+            // is validated here rather than left to whatever matches with it later
+            // — otherwise the broken value travels on, and `f ${r:x}` succeeds where
+            // `f $r:x` reports the parse error.
+            compile_regex(regex).map_err(ExpandError::ModifierUnavailable)?;
+            continue;
+        }
+        value = match step {
+            ModifierStep::Apply { modifier, .. } => apply_modifier(value, *modifier)?,
+            // Not a flag, so the report is whichever the value is owed — the
+            // type-shaped one for a pattern, except where the reason is not the
+            // type at all (`:capture` needs an invocation, whatever it meets).
+            ModifierStep::Unavailable {
+                message,
+                regex_message,
+                ..
+            } => {
+                return Err(ExpandError::ModifierUnavailable(
+                    if matches!(value, Value::Regex(_)) {
+                        regex_message.clone()
+                    } else {
+                        message.clone()
+                    },
+                ));
+            }
+        };
     }
     Ok(value)
 }
@@ -1724,9 +1827,9 @@ fn has_glob_meta(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Access, ExpandError, Modifier, VarRef, accessible_c, apply_modifier, apply_tilde,
-        entries_pattern, get_value, has_glob_meta, join_value, map_strings, resolve_value,
-        split_value, words_value,
+        Access, ExpandError, Modifier, ModifierStep, VarRef, accessible_c, apply_modifier,
+        apply_tilde, entries_pattern, get_value, has_glob_meta, join_value, map_strings,
+        resolve_value, split_value, words_value,
     };
     use crate::vars::{Value, Vars};
 
@@ -2065,7 +2168,10 @@ mod tests {
         let reference = VarRef {
             name: "env".into(),
             accesses: vec![Access::Member(key.into())],
-            modifiers: vec![Modifier::Len],
+            modifiers: vec![ModifierStep::Apply {
+                modifier: Modifier::Len,
+                name: "len".into(),
+            }],
             quoted: false,
         };
 

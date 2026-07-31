@@ -1676,6 +1676,28 @@ designed, and the cross-references say where the fuller note lives.
       `Modifier` an argument list would let the cheap path take the whole shape and
       retire the split, and is the change to make if the two paths start to drift.
 
+- [x] **The reference path dropped every modifier it could not apply** — *fixed*.
+      `expand` implements 35 of the 83 modifiers the parser accepts, and
+      `expansion_variable` dropped a `from_name` miss rather than reporting it, on
+      the grounds that the miss meant "implemented elsewhere" rather than
+      "unimplemented". The cost was a chain that quietly lost a step:
+      `"${s:lines:len}"` answered **3** — the length of the string — for a `:len`
+      that had been asked of the lines, where every other spelling of the same thing
+      said `modifier :lines is not implemented yet`. A wrong answer, not a missing
+      one, and silent.
+
+      It now reports, in the words `apply_argument_free_modifier` would have used:
+      `requires an argument` for one that takes them, the call-specific message for
+      `:capture` (implemented, but for a call — the mislabel the silence was avoiding
+      is now avoided by naming it), and `is not implemented yet` otherwise. That
+      message is shared as `CAPTURE_NEEDS_A_CALL` rather than written out three
+      times.
+
+      Still true, and still the deeper fix: the two paths implement modifiers
+      separately, and this only makes the weaker one *honest* about what it cannot
+      do. Unifying them — one dispatcher both reach — is what stops the sets
+      diverging again.
+
 ## Beyond M3 — The predicate vocabulary
 
 - [ ] **`:kind` and `:where`** — the name-resolution half of the predicate

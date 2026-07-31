@@ -2581,6 +2581,180 @@ fn a_braced_interpolation_takes_an_expression_across_lines() {
 }
 
 #[test]
+fn a_modifier_the_reference_path_cannot_apply_is_reported() {
+    // `expand` implements 35 of the 83 modifiers the parser accepts, and used to
+    // drop the rest rather than report them — so a chain quietly lost a step.
+    // `"${s:lines:len}"` answered 3, the length of the *string*, for a `:len` that
+    // had been asked of the lines. A wrong answer, not a missing one.
+    let out = run_with_input("s = \"a\\nb\"\nputs \"${s:lines:len}\"\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("modifier :lines is not implemented yet"),
+        "stderr was {stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+
+    // Every spelling agrees — braced, bare, and the expression path that was right
+    // all along. Agreeing is the point: the reference path is the one that differed.
+    let bare = run_with_input("s = \"a\\nb\"\nputs ${s:lines:len}\n");
+    let expression = run_with_input("s = \"a\\nb\"\nputs $s:lines:len\n");
+    for out in [&bare, &expression] {
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("modifier :lines is not implemented yet"),
+            "stderr was {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A modifier that needs arguments says so rather than reading as unimplemented.
+    let out = run_with_input("xs = [a b]\nputs \"${xs:join}\"\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("modifier :join requires an argument"),
+        "stderr was {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `:capture` *is* implemented — for a call, not a value — so it keeps that
+    // message here too rather than being mislabeled "not implemented yet".
+    let out = run_with_input("p = \"a:b\"\nputs \"${p:capture}\"\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(":capture applies to a call"),
+        "stderr was {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The report waits its turn. An unapplicable modifier is carried to its place
+    // in the chain, so a step *before* it still reports first — raising it while the
+    // reference was being built pointed at the wrong thing to fix: `${s:keys:lines}`
+    // is a `:keys` problem, and an unbound root is an unbound root.
+    let out = run_with_input("s = abc\nputs \"${s:keys:lines}\"\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(":keys: requires a map"),
+        "stderr was {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_with_input("puts \"${nope:lines}\"\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nope: unbound variable"),
+        "stderr was {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The regex flags are the one set this path can finish for itself: a pattern
+    // takes those four and nothing else, so the value is all it needs to know they
+    // apply. Reporting them unavailable would have been a *false* claim — they are
+    // implemented, and the `$`-sigil spelling applies them.
+    let out = run_with_input(
+        "r = re(abc)\n\
+         if \"ABC\" ~ ${r:i} { puts braced }\n\
+         if \"ABC\" ~ $r:i { puts sigil }\n\
+         if \"ABC\" ~ ${r:ignorecase} { puts long }\n\
+         if \"ABC\" ~ ${r} { puts unflagged }\n",
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // No `unflagged`: the flag is what makes it match, so its absence is the proof
+    // the flag did something.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "braced\nsigil\nlong\n"
+    );
+
+    // `:x` is the sharp one: `extended` on a pattern, and `Modifier::Exec` — the
+    // executable-file filter — on everything else. The name table alone answers the
+    // wrong one, so the value has to decide. `re("a b")` matches `ab` only with the
+    // flag, which is what makes this an assertion rather than a coincidence.
+    let out = run_with_input(
+        "r = re(\"a b\")\n\
+         if \"ab\" ~ ${r:x} { puts braced }\n\
+         if \"ab\" ~ $r:x { puts sigil }\n\
+         if \"ab\" ~ ${r:extended} { puts long }\n\
+         if \"ab\" ~ ${r} { puts unflagged }\n",
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "braced\nsigil\nlong\n"
+    );
+
+    // A flag can invalidate a pattern that parsed without it — `:x` makes `#` a
+    // comment introducer, so `(#)` loses its closing paren — and that has to be
+    // caught where the flag is applied. Left to whatever matches later, the broken
+    // value travels on and a function accepts it.
+    let dir = fresh_dir("regex_flag_validation");
+    let script = dir.join("invalid.mesh");
+    std::fs::write(
+        &script,
+        "r = re(\"(#)\")\nfunc f(p) { puts ok }\nf ${r:x}\n",
+    )
+    .expect("write script");
+    let out = run_script_with_stdin(&script, isolated_config_home(), b"");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid regex"),
+        "stderr was {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("ok"),
+        "the invalid pattern reached the function: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // And the other meaning survives: on a path `:x` is still the executable test.
+    let out = run_with_input("p = /bin/sh\nq = /etc/hostname\nputs \"${p:x} ${q:x}\"\n");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true false\n");
+
+    // On anything but a pattern those names are unavailable again, which is what
+    // the other spelling says too.
+    let out = run_with_input("s = abc\nputs \"${s:i}\"\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("modifier :i is not implemented yet"),
+        "stderr was {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A name that is not a flag gets what a pattern is owed, which is not always the
+    // type-shaped answer: `:lines` is wrong *for a pattern*, but `:capture` is wrong
+    // because it needs an invocation — true of every value — so it keeps its own
+    // message rather than being told patterns do not take it.
+    let out = run_with_input("r = re(a)\nputs \"${r:lines}\"\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("modifier :lines is not valid for a regex"),
+        "stderr was {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_with_input("r = re(a)\nputs \"${r:capture}\"\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(":capture applies to a call"),
+        "stderr was {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The modifiers `expand` does implement are untouched.
+    let out = run_with_input(
+        "s = ab\nxs = [a b]\nm = [k: [a b]]\nputs \"${s:upper} ${xs:len} ${m.k:len}\"\n",
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "AB 2 2\n");
+}
+
+#[test]
 fn a_braced_reference_takes_a_modifiers_arguments() {
     // `${xs:len}` is the sigil-less *reference*, and adding an argument must not
     // change what the body means. It used to: `:join(" ")` was not a valid access,
