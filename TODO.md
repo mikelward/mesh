@@ -2801,10 +2801,21 @@ of each PR had landed by another route, but these pieces had not.
       Seen on a single CPU (`taskset -c 0 cargo test --workspace`, which is the
       sharpest reproduction):
 
-      - `a_jobdone_hook_fires_where_the_done_notice_prints`, phase 155 — 4
-        failures in 9 runs, the most frequent of the lot.
+      - ~~`a_jobdone_hook_fires_where_the_done_notice_prints`, phase 155~~ —
+        **fixed**. Both jobs are gated on files now rather than staggered by
+        sleeps, so the order the case needs is stated instead of raced: the
+        first job waits for a gate the harness opens once the shell is idle at
+        its prompt, and the second waits for one the handler opens before it
+        sleeps. Six full-suite runs pinned to one CPU, all green, against four
+        failures in six before.
       - `the_title_setting_turns_the_title_off_and_back_on`, phase 140.
       - `vs_code_gets_its_own_dialect_and_the_command_line`, phase 170.
+
+      The CI sightings below are all fixed: the decorations one by the
+      type-ahead fix, `new_foreground_job_does_not_receive_sigcont` by spelling
+      the teardown `exit 0`, and the notify one by answering the terminal while
+      the session leaves (mikelward/mesh#321) — which was the whole family's
+      clearest statement. Kept as the record of what each turned out to be.
 
       Seen in **CI**, on a two-core runner at ordinary speed, each once and each
       a different test — mikelward/mesh#318, across three pushes:
@@ -2816,10 +2827,9 @@ of each PR had landed by another route, but these pieces had not.
         and the shell did not leave cleanly.
       - `notify_reaches_the_terminal_and_a_quick_command_does_not`.
 
-      The job-done one is the only one with a cause already named, and it is in
-      the test: it sleeps 400ms expecting a `sleep 0.2` job to have ended and a
-      `sleep 0.7` job not to have, which on a loaded machine is not a safe bet.
-      That is the "no sleeps" rule owed a real fix, not a longer sleep.
+      The job-done one had the only cause already named — a 400ms sleep
+      expecting a `sleep 0.2` job to have ended and a `sleep 0.7` job not to
+      have, which on a loaded machine is not a safe bet — and it is fixed.
 
       For the rest, the thing to establish first is whether they share a cause.
       Every one of them is a harness that stops reading the pty at some point,
