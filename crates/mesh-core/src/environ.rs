@@ -106,8 +106,8 @@ fn split_path(raw: &str) -> Vec<Value> {
 
 /// Names the process environment cannot hold, reported rather than hit.
 ///
-/// `set_var` **panics** on an empty key, a `=` in one, or a NUL — they are
-/// `EINVAL` at the syscall, and `std` turns that into an abort. A
+/// `set_var` and `remove_var` **panic** on an empty key, a `=` in one, or a NUL —
+/// they are `EINVAL` at the syscall, and `std` turns that into an abort. A
 /// literal `$env.KEY` could never reach them, since the parser proved it a
 /// `valid_name` first; a computed `$env[$name]` is the first key a *user* supplies
 /// that is only known at run time, so this is where it gets checked.
@@ -153,6 +153,22 @@ pub(crate) fn write(key: &str, value: Value, append: bool) -> Result<(), String>
     // environment here races with nothing — the same reasoning `cd` relies on
     // when it updates `$env.PWD`.
     unsafe { env::set_var(key, value) };
+    Ok(())
+}
+
+/// Remove `$env.KEY` from the process environment, so children stop inheriting it.
+///
+/// Removing what is not there is an **error**, matching what `unset` already does
+/// for a name and for a place inside a binding: nothing missing is forgiven, so a
+/// typo says so rather than passing silently. It is the read side's message, so a
+/// failed removal and a failed read describe the same absence the same way.
+pub(crate) fn remove(key: &str) -> Result<(), String> {
+    check_key(key)?;
+    if env::var_os(key).is_none() {
+        return Err(format!("$env.{key}: not set"));
+    }
+    // SAFETY: single-threaded execution loop, as `write` above relies on.
+    unsafe { env::remove_var(key) };
     Ok(())
 }
 
@@ -303,7 +319,7 @@ mod tests {
         assert!(!is_path_var("Path"));
     }
 
-    /// The three names `set_var` aborts on. A literal `$env.KEY`
+    /// The three names `set_var` / `remove_var` abort on. A literal `$env.KEY`
     /// could never carry one — the parser proved it a name first — so this guard
     /// exists for the computed `$env[$n]`, whose key is a run-time value.
     #[test]

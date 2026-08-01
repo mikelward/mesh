@@ -1651,8 +1651,16 @@ rules: the path may mix members and indices, a negative index counts from the en
 nothing missing along it is forgiven, and the removal is local-by-default with
 `global unset $m.key` to reach the outer binding. Removing from a list **shifts**
 what follows, so `unset $xs[0]` drops the first element rather than leaving a hole.
-Names and places may be mixed in one statement (`unset p $m.k q`), and `$env` /
-`$sh` are no more places here than they are on the assignment side.
+Names and places may be mixed in one statement (`unset p $m.k q`).
+
+`$env` **is** a place here, exactly as it is on the assignment side —
+`unset $env.KEY` and `unset $env[$name]` remove the entry from the process
+environment, so children stop inheriting the name rather than inheriting it empty
+(see [The environment](#the-environment)). It is not a scope, so `global` does not
+apply to it. `$sh` is still no place: writable is not the same as removable, so
+even [`$sh.options`](#shoptions) is refused by name — a setting is a question the
+shell asks itself every prompt, and removing one would leave it with no answer
+rather than restore a default.
 
 ```mesh
 x = outer
@@ -1787,6 +1795,19 @@ for name, value in $changes {
     $env[$name] = $value
 }
 ```
+
+**`unset` removes an entry**, through either spelling, so a child sees the name as
+unset rather than as empty — a distinction `${VAR-default}` turns on in every
+POSIX shell:
+
+```mesh
+unset $env.EDITOR
+unset $env[$name]
+```
+
+Removing what is not there is a loud error, as it is for any other `unset`
+target. The environment is the process's rather than a scope's, so `global` does
+not apply to either the write or the removal — both are already global.
 
 A computed name is only known once it is evaluated, so the three names the
 process **cannot** hold are reported there: an empty name, one containing `=`, and

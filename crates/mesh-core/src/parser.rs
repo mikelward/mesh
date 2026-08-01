@@ -546,6 +546,11 @@ pub enum UnsetTarget {
     /// exactly as [`Executable::MemberAssignment`] carries its target, so both go
     /// through one path parser.
     Member(String),
+    /// An environment entry — `unset $env.KEY`, `unset $env[$name]` — removed from
+    /// the process environment rather than from a scope. Its own variant for the
+    /// reason [`Executable::EnvAssignment`] is: `$env` holds bytes in a table
+    /// children inherit, not typed values in a binding.
+    Env(EnvKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5811,6 +5816,12 @@ impl Parser<'_> {
                 let span = self.tokens[self.position].span.clone();
                 self.position += 1;
                 targets.push(UnsetTarget::Name(Spanned { value: name, span }));
+            } else if let Some(key) = self.env_target() {
+                // Ahead of `member_target`, which excludes `$env` for the same
+                // reason the assignment side does: the environment's entries are
+                // bytes in the process, so removing one is `environ`'s job rather
+                // than a walk into a bound collection.
+                targets.push(UnsetTarget::Env(key));
             } else if let Some(target) = self.member_target() {
                 targets.push(UnsetTarget::Member(target));
             } else {
@@ -7273,6 +7284,19 @@ mod tests {
             assert_eq!(key, &expected, "{source}");
         }
 
+        // The same two shapes name an entry to remove, so a write and a removal
+        // cannot disagree about what `$env[…]` means.
+        for source in ["unset $env.HOME", "unset $env[$n]"] {
+            let Executable::Unset { targets, .. } = &complete(source).statements[0].and_or.first
+            else {
+                panic!("expected an unset for {source}");
+            };
+            assert!(
+                matches!(targets.as_slice(), [UnsetTarget::Env(_)]),
+                "{source}"
+            );
+        }
+
         // Not places: a second access, a modifier, and a slice — each describes a
         // derived value, and the environment has nothing inside an entry to reach
         // into. They fall through to the expression parser, whose own error is the
@@ -7290,6 +7314,12 @@ mod tests {
                 !parsed_as_env,
                 "{source} parsed as an environment assignment"
             );
+        }
+
+        // And they are no more places for a removal than for a write — `unset`
+        // asks the same `env_target`, so there is one answer for both.
+        for source in ["unset $env", "unset $env.PATH[0]", "unset $env[0..2]"] {
+            assert!(parse(source).is_err(), "{source} parsed as an unset");
         }
     }
 

@@ -1328,6 +1328,26 @@ fn run_executable(
                         }
                         continue;
                     }
+                    // An environment entry, removed from the process rather than
+                    // from a scope.
+                    parser::UnsetTarget::Env(key) => {
+                        // `global` picks which *scope* a removal lands in, and the
+                        // environment has none — it is the process's, whatever
+                        // function is running. The same answer `$sh` gives, for the
+                        // same reason.
+                        let removed = if *global {
+                            Err("`global` cannot apply to `$env`: an environment entry is \
+                                 the process's, not a scope's"
+                                .to_owned())
+                        } else {
+                            env_key(key, &shell.vars).and_then(|key| environ::remove(&key))
+                        };
+                        if let Err(error) = removed {
+                            note!("mesh: unset: {error}");
+                            status = 1;
+                        }
+                        continue;
+                    }
                     parser::UnsetTarget::Name(name) => name,
                 };
                 if crate::vars::is_reserved_namespace(&name.value) {
