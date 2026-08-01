@@ -105,7 +105,7 @@ file as tasks land.
 - [x] Replace the incremental command lexer with the clean-break expression and
       block parser.
   - [x] Fix the parser grammar, precedence, attachment, and completeness contract
-        in [`PARSER.md`](PARSER.md).
+        in [`GRAMMAR.md`](GRAMMAR.md).
   - [x] Emit a span-carrying token stream without performing structural parsing.
   - [x] Parse tokens into command, expression, and block AST nodes.
   - [x] Route parser-owned expression errors through `parser::parse` at
@@ -4089,20 +4089,17 @@ reasoning, and the open ones are at the bottom.
       the non-files, which none of the three does. Worth folding the three type
       filters (`expand::qualifies`, `matches_file_filter`, `directory_entries`)
       into one while doing it.
-- [ ] **Make `GRAMMAR.md` the current grammar.** Its header says it is a
+- [x] **Make `GRAMMAR.md` the current grammar.** Its header said it was a
       task-by-task record of the pre-M3 language and "**not** the current
       execution grammar", pointing at `PARSER.md` for the parser and
-      `docs/REFERENCE.md` for the user-facing surface. That leaves a file named
-      after the grammar that nobody should read for the grammar, and it catches
-      people out — two changes in this area have now documented current behavior
-      into it by mistake. Either rewrite it as the M3 grammar it is named for,
-      folding in what `PARSER.md` and the reference already state, or retire it to
-      `docs/history/` so the name stops promising something it does not deliver.
-      Rewriting is the better end state: a single EBNF for the implemented
-      language is the thing neither of the other two documents provides.
+      `docs/REFERENCE.md` for the user-facing surface. That left a file named
+      after the grammar that nobody should read for the grammar, and it caught
+      people out — two changes in this area documented current behavior into it
+      by mistake. Rewritten as a single EBNF for the implemented language, with
+      `PARSER.md` folded in and deleted.
 - [ ] **A glob inside a list literal nests instead of contributing elements.**
-      `GRAMMAR.md` says each scalar element uses the word-expansion rules, "so a
-      glob can contribute zero or more elements", but `xs = [*.txt]` is a list of
+      A list element is a word, and a word containing a glob metacharacter
+      expands to zero or more matches everywhere else, but `xs = [*.txt]` is a list of
       **one** element that is itself the match list — `$xs:len` is `1`, and
       `puts $xs` reports `a list inside a list has no rendering`. `[z *.txt]`
       measures `2` the same way. Either the element expansion should splice its

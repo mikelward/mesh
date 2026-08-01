@@ -4,9 +4,9 @@ How to build, test, and lay out the mesh implementation. For *what* mesh is and
 the language design, see [`DESIGN.md`](DESIGN.md); for the milestone plan, see
 [`ROADMAP.md`](ROADMAP.md).
 
-The clean-break M3 parser target and precedence rules live in
-[`PARSER.md`](PARSER.md). [`GRAMMAR.md`](GRAMMAR.md) continues to describe only
-the subset accepted by the current implementation.
+[`GRAMMAR.md`](GRAMMAR.md) is the grammar the implementation accepts today —
+tokens, statements, value expressions, precedence, and the rules that tell a
+command from a value.
 
 > **Status:** M0–M3 have landed, so this is a working shell with a working
 > language — typed values, functions, `if` / `for` / `match`, pipelines,
@@ -191,7 +191,7 @@ mesh/
 │       └── src/lib.rs      # e.g. TIOCSCTTY, typed for libc::ioctl per platform
 ├── DESIGN.md               # vision + language design (the "why/what")
 ├── DEVELOPMENT.md          # this file (the "how to build")
-├── GRAMMAR.md              # the grammar actually implemented so far (grows per task)
+├── GRAMMAR.md              # the grammar the parser accepts today (EBNF + precedence)
 ├── ROADMAP.md              # milestones M0 → beyond
 ├── TODO.md                 # current-milestone checklist
 └── docs/                   # TOUR.md, REFERENCE.md (implemented), INTRO/PROMPT (design),

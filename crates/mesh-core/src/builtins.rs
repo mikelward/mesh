@@ -284,7 +284,7 @@ pub(crate) fn usage_options(usage: &str) -> impl Iterator<Item = &str> {
 /// symbol, and a construct's other half by the word a reader would ask about —
 /// `help else` is a question about `if`, so it answers with `if`.
 ///
-/// Not the grammar: `PARSER.md` has that, and a copy of it here would be wrong
+/// Not the grammar: `GRAMMAR.md` has that, and a copy of it here would be wrong
 /// within a release. This is the one-screen reminder of what a mesh line can be,
 /// which is what a reader in front of a prompt is asking for. What it does owe
 /// is *reachability* — every reserved word the parser knows and every operator a
