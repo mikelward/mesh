@@ -463,6 +463,35 @@ file as tasks land.
       top level has no caller, so `return` there stays an error. Missing and
       unreadable files answer `127` / `126`, the statuses `mesh FILE` uses.
       Deferred: arguments for a sourced file, which need `shift` / `set --`.
+- [ ] **Should `logout.mesh` run for a *non-interactive* login shell?** It does
+      today — the gate is `options.login` alone (`repl.rs`, in the function that
+      runs on the way out) — and bash's equivalent does not: `~/.bash_logout` is
+      read by an **interactive** login shell. Checked both ways rather than
+      assumed:
+
+      ```
+      mesh -l --norc -c 'puts body'   → body, then logout.mesh runs
+      bash --login    -c 'echo body'  → body, and .bash_logout does not
+      bash --login -i                 → .bash_logout runs on the way out
+      ```
+
+      `DESIGN.md` §"Startup and invocation" says only "on login-shell exit", so
+      it does not settle the interactivity half either way, and nothing chose
+      this — it is what the one-condition gate happened to do. Worth deciding
+      deliberately, in either direction: a `mesh -l -c …` in a cron entry or an
+      `ssh host command` runs a teardown file written for a human leaving a
+      terminal, which is the argument for bash's rule; against it, `logout.mesh`
+      is the file for "this login session is over" and a non-interactive login
+      session is still over.
+
+      Surfaced asking a nearby design question — whether an **`on logout`**
+      event is worth having for interactive login shells. The lean is no: `on
+      exit` registered from `login.mesh` already fires only for login shells,
+      because `login.mesh` only runs in one, so the registration site does the
+      filtering and `logout` would be a second hook on the same instant with an
+      ordering question attached. The one case it would serve is a handler in a
+      **shared** `rc.mesh` that self-gates, and that wants one bit of state —
+      there is no `$sh.login` today — rather than a new event.
 - [x] **A leading `not` starts a value.** `if not $b { … }` and `while not $b { … }`
       read as conditions rather than a command named `not`, matching the postfix
       guard and an assignment's right-hand side, which already parsed an expression
@@ -734,6 +763,51 @@ file as tasks land.
 - [ ] The rest of `$sh.*`: the hook maps, `$sh.complete`, and `$sh.signal`.
       `$sh.options` has landed, along with the per-key mutability the rest of the
       configuration half needs.
+- [ ] **Signal handling, end to end.** Nothing user-facing exists yet. What the
+      shell does with signals today is entirely for its own account: interactively
+      it **ignores** INT/QUIT/TSTP/TTOU/TERM (`ignore_interactive_signals`,
+      `repl.rs`) and does not handle **HUP** at all, and non-interactively every
+      signal keeps its default disposition. The one piece of catch-and-resume
+      machinery is `exec.rs`'s `SigintCatcher`, which exists so a blocking wait
+      can be interrupted — the flag-and-check shape the rest of this should
+      follow.
+
+      Four pieces, roughly in dependency order:
+  - [ ] **The registry, and its spelling.** `DESIGN.md` §"Signals" specifies
+        `$sh.signal.<NAME>` insertion-ordered maps (`INT`, `TERM`, `HUP`, …,
+        without the `SIG` prefix); `on int NAME FUNC` should work too. **Both, over
+        one store** — the reason that is cheap right now is that the map surface
+        does not exist yet, so there is nothing to reconcile: hooks live in a
+        single flat `Vec<Hook>` keyed by `(event, name)` on `PromptConfig`, and
+        whoever builds `$sh.signal.*` can make it a *view* over that rather than
+        a second registry. Two stores that drift is the failure mode to design
+        out, and today there is only one to preserve.
+  - [ ] **Whether signal names share the event namespace.** `HookEvent` is a
+        closed enum parsed from one flat set of lowercase words (`preprompt`,
+        `precd`, `jobdone`, `exit`); adding `int` / `term` / `hup` to it puts two
+        different kinds of thing in one namespace. The collision to settle first
+        is **`exit`**: bash's `trap` conflates the EXIT pseudo-signal with real
+        ones, while `DESIGN.md` keeps them apart — `$sh.exit` is called "the
+        EXIT-pseudo-signal trap … already defined with the hooks", i.e. a
+        lifecycle moment that happens to have a signal-shaped name. If signals
+        share the namespace, `on exit` must keep meaning the lifecycle event.
+        A prefix (`on signal INT`, `on sig:int`) is the alternative.
+  - [ ] **Exiting because of a signal** — recorded in full with the `exit` hook
+        entry under "External tool integration": bash runs its EXIT trap for the
+        catchable fatal signals and re-raises so the parent still sees `128 + N`,
+        and mesh runs nothing. Depends on the plumbing here, not on the registry.
+  - [ ] **The three things `DESIGN.md` explicitly defers**: whether a handler
+        may **suppress** a default (swallow Ctrl-C), exact SIGINT delivery
+        mid-pipeline, and per-signal masking while a handler runs.
+
+      Constraints that hold whatever is chosen: a handler cannot run *in* the
+      signal handler (nothing mesh executes is async-signal-safe), so it is
+      record-and-dispatch — a flag or self-pipe the main loop notices, with the
+      wait loops in `exec.rs` made interruptible rather than `SA_RESTART`.
+      **SIGKILL and SIGSTOP cannot be caught**, an OS rule, so registering for
+      them is an error rather than a handler that never fires. And per
+      `DESIGN.md`, `$sh.status` / `$sh.pipestatus` are snapshotted and restored
+      across a handler, as `run_hooks` already does for every other hook.
 - [ ] **`$sh.options` values are booleans, and its keys are flat.** Both hold for
       every setting that exists, and neither is a decision against the alternatives
       — they are simply what was needed. Two things would force the shape open, and
