@@ -1430,13 +1430,16 @@ designed, and the cross-references say where the fuller note lives.
       JSON null, a nested array, and a non-integer number become mesh values,
       which is the same question a `:json` modifier or a `from-json` builtin
       would have to answer anyway.
-- [ ] **`$env` writes under a computed key, and a bulk env-diff apply.** Only a
-      literal `$env.KEY` is an assignment target today (§"The environment" in
-      `docs/REFERENCE.md`), so a loop over a computed diff cannot write it — the
-      narrowest blocker in the integration document and probably the easiest to
-      lift. The tool-facing shape worth considering is applying a **map** as one
-      transaction (a key set, a null unset), so a malformed payload is a
-      diagnostic rather than a half-applied environment.
+- [ ] **A bulk env-diff apply.** The **writes** this entry was mostly about have
+      landed: `$env[$name] = value` writes under a computed key and
+      `unset $env[$name]` removes an entry, so a loop over a computed diff applies
+      it today (§"The environment" in `docs/REFERENCE.md`, and rough edge 5). What
+      is left is the **transaction**: applying a whole map at once, so a payload
+      that is malformed half way through is a diagnostic rather than a
+      half-applied environment. That needs the spelling for "remove this name"
+      settled first — a map's values are mesh values, and mesh has no null to
+      carry direnv's and mise's "unset this" convention. See "Reading structured
+      output" above; the two questions are one decision.
 - [ ] **Decide the stance on generated code.** Every tool ships
       `eval "$(tool init zsh)"`. mesh has no `eval`, and `source` takes exactly
       one file operand — no pipe, no string, no `-` — so the published install
