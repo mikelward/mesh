@@ -173,7 +173,37 @@ stacks duplicates. That is precisely the bash `PROMPT_COMMAND` bug the keying
 exists to prevent, and `DESIGN.md` calls re-source safety the reason for the
 design.
 
-**Lean: (b).** It removes the stutter without giving up identity.
+**Deferred — (b) is not being taken.** It reads well, but two things came up
+that the stutter does not outweigh:
+
+- **It ties the hook's identity to the function's *name*, so renaming stacks
+  rather than replaces.** `on exit bye` keys on `bye`; rename the function to
+  `farewell`, re-source, and you have *two* hooks. Both **run** — `Funcs::define`
+  replaces the names a file defines but never removes the ones it stops
+  defining, so `bye` is still callable in that session and the old handler fires
+  alongside the new one:
+
+  ```text
+  func bye(s) { puts BYE } ; on exit bye bye
+  func farewell(s) { puts FAREWELL } ; on exit farewell farewell
+  → BYE
+    FAREWELL
+  ```
+
+  Keying exists to make re-sourcing safe, and this makes it safe only while
+  nothing is renamed: the `PROMPT_COMMAND` stacking bug returning by a side
+  door. (A *fresh* shell has neither the stale definition nor the stale hook, so
+  the symptom is a long-lived session's, which is the one an interactive shell
+  has.)
+- **The sugar is backwards.** A lambda has no name to derive, so `on exit bye`
+  works while `on exit func(s) { … }` still needs an explicit key. The terse form
+  is available for the pre-defined function and absent for inline logic, which is
+  the more interactive case and the reason to want it.
+
+It also does not survive into the map: `$sh.exit.<key> = …` must always name a
+key, so the stutter returns there as `$sh.exit.bye = bye`. That makes it a
+builtin-only affordance, which is a poor trade for a surface meant to be one
+registry seen two ways.
 
 ## D3 — Should registration require the function to exist?
 
@@ -236,6 +266,58 @@ registered one way and removed the other.
 nearly free today and gets harder with every feature that reads
 `shell.prompt.hooks` directly.
 
+**What (a) actually requires: one *authority*, not one location.** Hooks live on
+`Shell::prompt.hooks` in `repl.rs` while `$sh` is built in `vars.rs`, so
+`shell_namespace()` cannot currently see them — but that is a plumbing problem,
+not an ownership one, and an earlier revision of this section wrongly concluded
+the store had to move onto `Vars`.
+
+A snapshot is not a second store. `shell_namespace()` already rebuilds an
+ephemeral map on every read — `$sh.options` included, whose authority is the
+`Options` on `Vars` — so a `$sh.<event>` map rebuilt from `shell.prompt.hooks`
+on each read, with writes and removals mutating that same vector, is (a) with no
+relocation at all. The namespace builder just has to be *given* the hooks, or
+move up to a `Shell`-level adapter that has both.
+
+What makes it (b) is a snapshot that becomes **authoritative** — written to
+directly, or rebuilt only sometimes — so that the two copies can disagree. That
+is the thing to design out, and it is cheaper than moving state.
+
+The rest is then the shape `$sh.options` already has, and the refusals matter as
+much as the writes:
+
+| | `$sh.options` today | `$sh.<event>` |
+| --- | --- | --- |
+| whole-map assign | refused: *"assign one setting at a time"* | refuse likewise |
+| one key | assigns that setting | register, replacing in place |
+| deeper | refused | refused — `$sh.exit.k.member` reaches *inside a handler* |
+| removal | — | `unset`, the `on --remove` spelling |
+
+Refusing `$sh.exit = [ … ]` is the important one: a map literal that omits a key
+would have to mean either "leave it" or "remove it", and a config that guessed
+wrong would silently drop every other handler for that event — the composition
+property the keying exists to protect.
+
+The deeper refusal is for a reason of its own, and not D5's: `$sh.exit.k.member`
+is reaching *inside a handler value*, which has no members to reach. D5's nested
+shape is the different path `$sh.signal.<NAME>.<key>`, and the two do not
+constrain each other.
+
+**Not blocked by D1.** Handlers are `String`s today, so a map view over them
+prints fine, and `$sh.exit:repr` writes back as source. Both stop working once
+values are callables: `puts` refuses a function, and `:repr` refuses it too and
+*should* — a lambda has no literal form, and `:repr`'s guarantee is that what it
+returns reads back.
+
+What survives either way is `$sh.<event>:keys`, which never touches a value, so
+the **identities** stay listable and it is the handlers that go dark. Rendering
+those needs a **new callable-value renderer** — `type` does not already compute
+it, and saying otherwise here was wrong: `whence::signature` runs for a *named*
+entry in `Funcs`, while a `Value::Function` out of the map falls through to the
+bare `a function`. [`TODO.md`](../TODO.md) tracks that work. Not this decision's
+problem either way, and not function-specific: a map holding a job handle is
+already unprintable the same way.
+
 ## D5 — How are signals spelled?
 
 The crux is a shape difference that is easy to miss. Events are **top-level**
@@ -247,6 +329,22 @@ revision of this section got wrong: **the two surfaces can address one store by
 different paths.** Nothing requires `on`'s first operand to be the map path.
 What non-mirroring costs is derivability — someone who learns `on int` does not
 thereby know where it lives in `$sh`.
+
+**A nested map path is not blocked, though it looks like it might be.** An
+earlier revision claimed every nesting-preserving option waited on the
+`$sh.options.complete.probe` question. It does not. That path is refused *inside
+the `options` branch*, which accepts exactly one boolean-setting key and says so
+in its own terms — not by the parser or the `$sh` namespace forbidding depth:
+
+```text
+$sh.options.complete.probe = false   → a setting is a boolean, with nothing inside it
+$sh.signal.INT.note = x              → $sh: no `signal` in this map
+```
+
+The second failure is a *missing entry*, not a rejected depth. So a
+`$sh.signal.<NAME>.<key>` branch can implement `DESIGN.md`'s nesting on its own
+terms, and whether **settings** eventually spell their extra level as a submap
+or a dotted key is a separate decision that neither waits on the other.
 
 **(a) Flatten both** — `on int k f` ↔ `$sh.int.k`. Simple, but abandons
 `DESIGN.md`'s nesting and puts lifecycle events and signals in one flat set,
