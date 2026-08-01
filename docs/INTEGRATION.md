@@ -106,8 +106,10 @@ is a fork in the road, and it should be taken deliberately.
 does not, and (1) never as the default path.** Concretely: mesh should be able
 to read a structured payload (JSON is what these tools emit) and apply an
 environment diff, a completion answer, or a prompt fragment from it. That single
-capability covers direnv, mise, carapace, and atuin's search output at once —
-and it is the one thing on this list mesh cannot do at all today.
+capability covers direnv, carapace, and atuin's search output at once — and it is
+the one thing on this list mesh cannot do at all today. **mise needs one thing
+beyond it**, a source that reports removals rather than a target state; see
+[the environment section](#direnv-mise-nvm--the-environment).
 
 **What that costs, since it means a parser:** nothing new. `serde_json` is
 already in the tree — reedline depends on it, so it is compiled into every mesh
@@ -369,8 +371,17 @@ All of class 6 have one shape: a hook fires, the tool computes a set of
 environment changes, the shell applies them. bash and zsh apply them by
 `eval`ing `export` statements. mesh should apply them from data.
 
-**What each offers.** `direnv export json` prints the diff as JSON (a `null`
-value meaning "unset this"). `mise env --json` does the same. `nvm` and `pyenv`
+**What each offers.** `direnv export json` prints the **diff** as JSON, a `null`
+value meaning "unset this". `mise env --json` prints JSON too, but whether it is
+the same *shape* is **unconfirmed** and matters: `mise env` is documented as
+exporting the vars that activate mise once, which is a **target state** rather than
+a diff, and a target state cannot express a removal by omission — an absent key
+reads as "unchanged". If that is right, mise needs a stateful source of its own
+rather than the same bridge, since nothing downstream can infer from a target state
+which names mise set last time and should now go. Raised in review on
+mikelward/mesh#341 against mise 2026.4.28; not reproduced here, as neither tool is
+installed in this checkout. **Confirm against a real `mise` before building the
+mise half.** `nvm` and `pyenv`
 are shell functions rather than binaries and are the hardest of the set — pyenv
 at least degrades to its `PATH` shims, which need no integration at all since
 `$env.PATH` is already a real list.
@@ -383,16 +394,79 @@ at least degrades to its `PATH` shims, which need no integration at all since
 - ~~Writing `$env` under a computed key.~~ **Landed:** `$env[$name] = value` is
   the writing twin of the computed read, so a loop over a diff applies it
   directly (`for name, value in $changes { $env[$name] = $value }`).
-  `unset $env[$name]` is the other half — the `null` in a direnv or mise diff
-  means "unset this", and until now there was no way to remove an environment
-  entry at all, only to empty one.
+  `unset $env[$name]` is the other half — the `null` in a direnv diff means
+  "unset this", and until now there was no way to remove an environment entry at
+  all, only to empty one.
 - **Reading the payload.** JSON again — the same gap carapace hits. This is the
-  only thing still missing for direnv and mise.
+  only thing still missing for **direnv**; mise additionally needs its payload
+  shape confirmed, per the note above.
 
-A plausible end state is an `env-apply` that takes a map and applies it as one
-transaction, so the tool-facing contract is "print a map" and the failure mode is
-a diagnostic rather than a half-applied environment. The pieces it would be built
-from all exist now; what it adds over the loop above is the transaction.
+**The end state, decided** — bind the payload, then apply it on the branch where
+the producer succeeded:
+
+```mesh
+if json = "$(direnv export json)" {
+    env-apply --json $json
+}
+```
+
+`env-apply` is one builtin that parses the payload, splits it, validates the whole
+thing, and only then touches the environment.
+
+**The quotes are load-bearing too.** A capture is one string today, but
+[`DESIGN.md`](../DESIGN.md) has `$(cmd)` becoming a newline-split **list** with
+`"$(cmd)"` as the one-string form (tracked in `TODO.md`). Quoting now keeps this
+spelling correct on both sides of that change, and it still preserves the
+producer's status, since an assignment takes it from a quoted right-hand side
+just as readily.
+
+**The binding is load-bearing, not style.** Passing the capture straight in —
+`env-apply --json "$(direnv export json)"` — **discards direnv's exit status**:
+[only an assignment keeps a capture's status](REFERENCE.md#pipelines-and-sequencing),
+and interpolating one into a command leaves that command's own status instead. A
+hook that failed while still printing parseable JSON would then have its output
+applied anyway, which is the one outcome a transaction exists to prevent. Binding
+first is what the language already tells you to do when a capture's failure
+matters.
+
+**Not a pipeline, deliberately.** `direnv export json | env-apply --json` is the
+spelling that reads best and it cannot work: every stage of a `|` runs in its own
+process, a builtin included, so the writes would land in a forked child and vanish
+when it exited — see
+[Pipelines and sequencing](REFERENCE.md#pipelines-and-sequencing). Verified rather
+than reasoned about: a function writing `$env` on the right of a `|` leaves the
+parent unchanged. Taking the payload as an **argument** keeps `env-apply` an ordinary
+statement in the session process, which is where an environment write has to
+happen. `DESIGN.md` marks "the last stage of a pipeline runs in the current shell"
+as *planned*; the argument form owes nothing to it, and should not wait for it.
+
+Two questions had to be answered to get there, and the second answers the first.
+
+**How a removal is spelled: `unset $env[$name]`.** It is the verb the language
+already has, so nothing new is invented. In particular there is no sentinel
+*value* meaning "remove" — mesh has [no null](../DESIGN.md), that rule is
+load-bearing rather than incidental, and inventing a `none` to carry one tool's
+wire convention would pay a language-wide cost for an integration.
+
+**Where the split lives: inside the bridge.** direnv hands over a single object
+mixing both operations (`{"FOO": "bar", "BAZ": null}`), so something has to decide
+which keys take a write and which take an `unset`. If no mesh map can hold the
+null, that split cannot happen in mesh code — so it happens before any mesh value
+exists. The alternative, a reader handing back both halves for mesh to apply,
+was rejected on two counts: it needs a value-function call, since
+`[sets removes] = $(cmd)` does not bind — a capture is **one string**
+([Command substitution](REFERENCE.md#command-substitution--)), not a pair to
+destructure — and more decisively **it is not a transaction**, since a second loop
+failing partway leaves the environment half applied, which is the exact failure
+this feature exists to prevent.
+
+That the payload is a string is worth stating plainly, because `env-apply` is
+built around it: the `if json = "$(direnv export json)"` above binds one string, and
+the builtin parses it. Nothing here hands mesh a list.
+
+The useful consequence: **`from-json` never has to answer the null question for
+this.** What a general JSON reader does with a null is now a separate, smaller
+decision, driven by carapace and atuin, where refusing one is defensible.
 
 ## Everything else, briefly
 
@@ -421,7 +495,7 @@ matching entry under "Beyond M3 — External tool integration" in
 | 3 | **A line-buffer API for widgets** | Same, and required *with* (2) — a binding that cannot touch the buffer is useless to fzf | Not designed. Needs: read buffer and cursor, replace, insert at cursor, accept-line, redraw after a full-screen program |
 | 4 | **`$sh.complete`, extended** | carapace, fzf-tab, dynamic completers | Map is a known TODO; the fallback key, the callable contract, and candidate descriptions are not specified |
 | 5 | **Reading structured output (JSON)** | carapace, direnv, mise, atuin | Nothing exists. The alternative is a mesh-defined line format plus upstream asks |
-| ~~6~~ | ~~**`$env` writes under a computed key**~~, and a bulk env-diff apply | direnv, mise, keychain, asdf | **Landed** for the writes: `$env[$name] = value` and `unset $env[$name]`. A bulk apply as one transaction is still unbuilt, and waits on (5) for the payload |
+| ~~6~~ | ~~**`$env` writes under a computed key**~~, and a bulk env-diff apply | direnv, keychain, asdf — **not mise on its own** | **Landed** for the writes: `$env[$name] = value` and `unset $env[$name]`. A bulk apply as one transaction is still unbuilt, and waits on (5) for the payload. mise needs one thing more: `mise env --json` looks like a *target state*, which cannot express a removal, so directory-exit cleanup needs a stateful source this row does not deliver — see [the environment section](#direnv-mise-nvm--the-environment) |
 | 7 | **`$sh.prompt` segment map**, multi-line external output, `fill` | starship as *a* segment rather than *the* prompt; right prompts | Designed in [`PROMPT.md`](PROMPT.md), unbuilt |
 | 8 | **A decision on generated code** — `source -` / `run`, versus data-only | Every tool's published install line | See [The bootstrap problem](#the-bootstrap-problem). Recommendation: data-first, no string `eval` |
 | 9 | **`$sh.options.complete.probe`** | Turning mesh's own probe off when carapace is authoritative | Blocked on nested keys in the flat settings map |
@@ -445,10 +519,12 @@ The order that works:
    tools that need them cannot be integrated any other way.
 2. Decide (8), then specify (12): what an `init mesh` output may contain, and
    which integrations are data rather than code.
-3. Ship the data path (5, 6) so direnv, mise, and carapace need no upstream
-   change at all — they already print what mesh would read.
+3. Ship the data path (5, 6) so direnv and carapace need no upstream change at
+   all — they already print what mesh would read. mise needs a removal-reporting
+   source as well, so it is not finished by this step.
 4. Then send the upstream patches, against a documented API.
 
-Steps 1 and 3 between them cover starship, zoxide, direnv, mise, carapace, and
-atuin's recording half without a single upstream change. That is most of the
+Steps 1 and 3 between them cover starship, zoxide, direnv, carapace, and atuin's
+recording half without a single upstream change — and mise except for its
+removals. That is most of the
 toolbox, and it is the argument for doing the shell-side work first.
