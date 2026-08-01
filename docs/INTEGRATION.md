@@ -70,7 +70,7 @@ eval "$(starship init bash)"
 can do neither half: there is **no `eval`**, and `source` takes exactly one file
 operand — no pipe, no string, no `-`:
 
-```
+```text
 mesh$ puts 'x = 1' | source
 mesh: source: needs a file to run
 mesh$ puts 'x = 1' | source -
@@ -355,7 +355,7 @@ zsh workaround is not available here: **a function cannot shadow a builtin**, so
 wrapping `cd` — what every directory-tracking tool does under zsh — is refused
 by design.
 
-```
+```text
 mesh$ func cd(dir) { zoxide add $dir }
 mesh: func: `cd` is a reserved name and cannot be a function name
 ```

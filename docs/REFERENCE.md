@@ -8,7 +8,7 @@ grows as features land.
 
 ## Invocation
 
-```
+```text
 mesh                       # interactive when stdin and stdout are terminals
 mesh script.mesh a b c     # run a script; a b c become $sh.args
 mesh -c "puts hi" a b      # run a command string; a b become $sh.args
@@ -62,7 +62,7 @@ script to name.
 A script is read and parsed as a single unit, so a syntax error anywhere in the
 file rejects the whole thing and nothing runs. A **parse** error says where:
 
-```
+```text
 mesh: deploy.mesh:42:5: syntax error: unclosed `(`
 ```
 
@@ -324,7 +324,7 @@ shorter `--no-history` alias) to keep history in memory for that session instead
 A line is a command: the first word names it, the rest are arguments. Words are
 separated by spaces.
 
-```
+```text
 command arg1 arg2 …
 ```
 
@@ -373,7 +373,7 @@ on the next line is a syntax error rather than a statement list.
 
 ### Pipelines and sequencing
 
-```
+```mesh
 cmd | cmd          # stdout of the left becomes stdin of the right
 cmd |& cmd         # stdout *and* stderr, both to the next stage
 cmd && cmd         # run the right one only if the left succeeded
@@ -532,7 +532,7 @@ An unknown command prints `command not found` and sets a failing status. When
 another shell spells the same thing differently, the message names mesh's
 spelling in a parenthetical, so the reflex has somewhere to go:
 
-```
+```text
 mesh$ read line
 mesh: command not found: read (mesh spells this `gets`)
 mesh$ local x = 5
@@ -828,7 +828,7 @@ parsed:
 | `!$` | Its last argument |
 | `!*` | All of its arguments, separated by spaces |
 
-```
+```text
 mesh$ mkdir -p build/out
 mesh$ cd !$
 cd build/out
@@ -1170,7 +1170,7 @@ in the table with a status to hand back, and `-r` leaves it there.
 **A job that is stopped when it is given up does not outlive the shell**, under
 either form, and `disown` says so:
 
-```
+```text
 mesh$ disown
 mesh: disown: [1] is stopped and will not survive the shell; `bg %1` first
 ```
@@ -1186,7 +1186,7 @@ first and the disown holds.
 A `disown -h` job stays in the table, so it can stop *after* it was given up.
 The exemption is void just the same, and the shell says so on the way out:
 
-```
+```text
 mesh: exit: [1] is stopped, so it will not survive the shell
 ```
 
@@ -1486,7 +1486,7 @@ The same expansion, asked for as a [value call](#functions), so it answers with 
 | `files(dir = ".")` | The files directly in `dir`. |
 | `dirs(dir = ".")` | The subdirectories of `dir`. |
 
-```
+```mesh
 for d in dirs() { puts "$d/" }     # walk the working directory
 for f in files(src) { … }          # or a named one
 found = glob("*.log")              # bind the list and reuse it
@@ -1535,7 +1535,7 @@ cannot cross `execve` or the environment.
 Note `'…'` takes escapes too, unlike every other shell, so a pasted program that
 carries its own backslashes needs the **raw** form. The error says so:
 
-```
+```text
 sed 's/\(a\)/[\1]/' file
 mesh: syntax error: invalid escape \(; for text holding its own backslashes
 (a sed or awk program, a Windows path) use a raw string, `r'…'`
@@ -1581,7 +1581,7 @@ double-quoted string.
 
 ## Variables
 
-```
+```mesh
 name = value          # spaced form
 name=value            # unspaced form
 ```
@@ -1722,7 +1722,7 @@ words and `"…"`, never in `'…'` or `r'…'`.
 `$m.key = value` and `$xs[0] = value` write **into** a bound collection rather
 than rebinding the name, along a path that may mix members and indices:
 
-```
+```mesh
 config = [name: mesh, tags: [a b], nested: [depth: 1]]
 $config.name = shell            # replace a value
 $config.owner = me              # add a key
@@ -1918,7 +1918,7 @@ it, never the list of names mesh implements — otherwise adding a modifier woul
 silently change what an existing string means, and `"$h:port"` would be text until
 the day `:port` shipped:
 
-```
+```text
 puts ubuntu:latest
 mesh: syntax error: `:latest` is not a modifier; quote the whole word to keep it
 as text (`"x:latest"`), or brace the name when it comes from a variable
@@ -1942,7 +1942,7 @@ stop at a `(`, so a modifier that takes arguments has nowhere to put them there.
 That is a syntax error naming the spelling that does work — `${…}`, whose body is
 an expression:
 
-```
+```text
 puts "$env:get(HOME, none)"
 mesh: syntax error: `:get` takes arguments, which a `$…` interpolation cannot
 pass; brace it instead (`"${x:get(…)}"`)
@@ -2440,7 +2440,7 @@ silently treated as either a glob or regex.
 
 ## Conditionals
 
-```
+```mesh
 if command { body }
 if command { body } else { body }
 if command { body } else if command { body }
@@ -2729,7 +2729,7 @@ match $sig {
 
 ## Functions
 
-```
+```mesh
 func name(params) { body }    # define a named function
 name arg ...                  # call it; args bind to the positionals
 return [ N ]                  # exit the body early (or a sourced file — see `source`)
@@ -2738,7 +2738,7 @@ return [ N ]                  # exit the body early (or a sourced file — see `
 Define a callable with `func`. Parameters are **named** — reference them as
 `$name` in the body, never `$1`:
 
-```
+```mesh
 func greet(name) {
   puts "hi, $name"
 }
@@ -2751,7 +2751,7 @@ greet world          # -> hi, world
   `--name = default`), and a trailing **rest** (`...name`). Names must be distinct
   and cannot be `env`.
 
-  ```
+  ```mesh
   func deploy(target, --region = us-west, --force, --tag = latest, ...hosts) {
     # target  required positional
     # region  valued flag, defaults to us-west
@@ -2885,7 +2885,7 @@ greet world          # -> hi, world
   A block's last expression can be a bare value, including a **lone integer
   literal**:
 
-  ```
+  ```mesh
   func answer() { 42 }
   x = answer()                        # 42, an integer
   ```
@@ -2895,7 +2895,7 @@ greet world          # -> hi, world
   write `return -3` or `(-3)`. mesh has no float literals, so `3.5` is still just
   a word.
 
-  ```
+  ```mesh
   func double(n) { return $n * 2 }
   x = double(21)                      # x is 42
   ```
@@ -2927,7 +2927,7 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
   a **function value** — an anonymous function, using the same signature grammar
   as a declaration. Bind it, then value-call it through the variable:
 
-  ```
+  ```mesh
   double = func(x) { $x * 2 }
   y = $double(5)                      # y is 10
 
@@ -2957,7 +2957,7 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
   (its stdout and stderr), and `.status` (the exit int). Read them with ordinary
   field access.
 
-  ```
+  ```mesh
   func build() { puts compiling
     return ok }
   r = build():capture
@@ -2998,7 +2998,7 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
   **callable** and apply it to every element of a list — written inline, or reached
   through a variable:
 
-  ```
+  ```mesh
   xs = [1 2 3 4]
   doubled = $xs:map(func(x) { $x * 2 })          # [2 4 6 8]
   evens   = $xs:filter(func(x) { $x % 2 == 0 })  # [2 4]
