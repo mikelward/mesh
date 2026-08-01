@@ -17118,10 +17118,16 @@ fn unsetting_a_missing_element_is_a_loud_error() {
         assert!(stderr.contains(message), "{source} gave {stderr}");
     }
 
-    // `$env` is not a place here, so removing an entry from the environment is
-    // still not spelled this way.
-    let out = run_with_input("unset $env.PATH\n");
-    assert_eq!(out.status.code(), Some(2));
+    // `$env` is a place here too, and a missing entry is the same loud error — in
+    // the words a failed *read* of it uses, so the two describe one absence one
+    // way.
+    let out = run_with_input("unset $env.MESH_TEST_ABSENT\n");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("$env.MESH_TEST_ABSENT: not set"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // `$sh` parses as one, and is refused by name instead — including the
     // settings, which are writable but not removable.
@@ -22526,6 +22532,72 @@ puts $env.MESH_TEST_QUOTED
     assert_eq!(String::from_utf8_lossy(&out.stdout), "/mesh-test-bin\n");
 }
 
+/// An environment entry can be **removed**, through either spelling. Before this
+/// there was no way at all: a value could be emptied but not taken away, so a
+/// child could not be made to see the name as unset.
+#[test]
+fn an_environment_entry_can_be_removed() {
+    let out = run_with_input(
+        r#"$env.MESH_TEST_GONE = here
+n = MESH_TEST_ALSO
+$env[$n] = here
+unset $env.MESH_TEST_GONE
+unset $env[$n]
+puts $env:get(MESH_TEST_GONE, gone) $env:get(MESH_TEST_ALSO, gone)
+"#,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "gone gone\n");
+
+    // Removed for children too, and distinguishably from having been emptied —
+    // the distinction `${VAR-default}` turns on in every POSIX shell.
+    let out = run_with_input(
+        "$env.MESH_TEST_GONE = here\nunset $env.MESH_TEST_GONE\n\
+         sh -c 'printf \"%s\\n\" \"${MESH_TEST_GONE-absent}\"'\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "absent\n");
+
+    // `global` names a scope, and the environment has none — the answer `$sh`
+    // gives for the same reason.
+    let out = run_with_input("$env.MESH_TEST_GONE = here\nglobal unset $env.MESH_TEST_GONE\n");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("`global` cannot apply to `$env`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The direnv / mise shape both halves exist for: a diff arrives as data, is
+/// applied in a loop, and is taken back off the same way — with no name spelled
+/// out in the source. A `null` in one of those diffs means "unset this", which is
+/// why the removal is half the contract rather than a nicety.
+#[test]
+fn a_map_of_changes_can_be_applied_and_undone_as_a_loop() {
+    let out = run_with_input(
+        r#"changes = [MESH_TEST_A: alpha, MESH_TEST_B: beta]
+for name, value in $changes {
+    $env[$name] = $value
+}
+sh -c 'printf "%s %s\n" "$MESH_TEST_A" "$MESH_TEST_B"'
+for name, _ in $changes {
+    unset $env[$name]
+}
+sh -c 'printf "[%s%s]\n" "$MESH_TEST_A" "$MESH_TEST_B"'
+"#,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "alpha beta\n[]\n");
+}
+
 /// A computed key is the first environment name a *user* supplies that the parser
 /// never saw, and `set_var` / `remove_var` **panic** on the three the process
 /// cannot hold. Each is a diagnostic instead.
@@ -22538,6 +22610,7 @@ fn an_impossible_environment_name_is_reported_rather_than_hit() {
             "n = \"A\\u{0}B\"\n$env[$n] = x\n",
             "cannot contain a NUL byte",
         ),
+        ("n = \"A=B\"\nunset $env[$n]\n", "cannot contain `=`"),
     ] {
         let out = run_with_input(source);
         assert!(!out.status.success(), "{source}");
@@ -22565,6 +22638,8 @@ fn only_a_single_env_access_is_a_place() {
         "n = FOO\n$env[$n][0] = x\n",
         "$env[0..2] = x\n",
         "$env = [A: 1]\n",
+        "unset $env\n",
+        "unset $env.PATH[0]\n",
     ] {
         let out = run_with_input(source);
         assert_eq!(out.status.code(), Some(2), "{source}");

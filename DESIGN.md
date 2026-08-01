@@ -1507,10 +1507,15 @@ zsh the `${(P)var}` flag, ksh namerefs (`typeset -n`). mesh has **no** by-name a
 to the variable
 namespace, deliberately so far — the intended answer is to put such values in a
 **map** and index it (`$colors[$name]`), which is first-class and needs no `eval`.
-Because `$env` / `$sh` are already maps, indirect *environment* access falls out
-for free (`$env[$name]`). Open question: is a map always enough, or is a narrow
-by-name facility (read, perhaps write) warranted for genuine metaprogramming?
-Leaning: maps only — revisit only if a real need survives the reframe.)*
+Because `$env` / `$sh` are already maps, indirect *environment* **reading** fell
+out for free (`$env[$name]`); the matching **write** and removal did not, and were
+added deliberately so the pair is symmetric — `$env[$name] = value` and
+`unset $env[$name]` resolve the subscript through the same resolver the read uses.
+That is the whole of by-name access mesh has, and it is confined to the namespace
+that is a real table in the process. Open question, still open for the *variable*
+namespace: is a map always enough, or is a narrow by-name facility warranted for
+genuine metaprogramming? Leaning: maps only — revisit only if a real need survives
+the reframe.)*
 
 **Bare environment references, and one scope ladder** *(decided for now — the
 strong form, adopted to be tried in real use and reversible if it does not hold

@@ -2363,11 +2363,49 @@ was re-checked against `main` rather than taken from the PR text.
       fallback is deliberate — a partial command has to stay buffered rather than
       erroring — but it swallows the diagnostic for any condition that was clearly
       meant as a value. Nothing else in the file makes a wrong answer this quiet.
-- [ ] **5. `$env[$name] = value` — no dynamically-named environment write.**
-      `$env:get(NAME, default)` reads by computed name and has no writing twin, so
-      a generic "parse this tool's `shellenv` output and apply it" helper cannot be
-      written at all; every tool's variables have to be named literally, which is
+- [x] **5. `$env[$name] = value` — no dynamically-named environment write.**
+      `$env:get(NAME, default)` reads by computed name and had no writing twin, so
+      a generic "parse this tool's `shellenv` output and apply it" helper could not
+      be written at all; every tool's variables had to be named literally, which is
       why `setup-fnm` and `setup-brew` are each hand-written.
+
+      **Fixed.** The asymmetry was narrower than this entry said: `$env[$name]`
+      already *read* by computed name, falling out of a bare `$env` being the whole
+      table — exactly as `DESIGN.md` predicted when it said indirect environment
+      access comes for free. What was missing was that the same spelling was not a
+      **place**. It is now, for both a write and a removal, and both resolve the
+      subscript through the one `subscript_key` a read goes through, so the pair
+      cannot drift into two notions of what a computed key is.
+
+      **`unset $env.KEY` landed with it**, and that half was a gap nothing had
+      recorded: there was no way to remove an environment entry at all, only to
+      empty one, so a child could not be made to see a name as unset — the
+      distinction `${VAR-default}` turns on in every POSIX shell. It is the
+      loud-when-missing removal every other `unset` target already is, and it takes
+      no `global`, since the environment is the process's rather than a scope's.
+
+      **A run-time key needed a run-time check.** `set_var` and `remove_var`
+      *panic* on an empty name, a `=` in one, or a NUL — `EINVAL` at the syscall,
+      which `std` turns into an abort. A literal `$env.KEY` could never carry one,
+      because the parser proved it a name first; a computed key is the first
+      environment name a user supplies that the parser never sees, so
+      `environ::check_key` reports those three instead. It checks **only** those
+      three rather than re-applying `valid_name`: `$env:keys` answers with every
+      name the process really has, so a round trip over the listing has to be able
+      to write back a name mesh's own grammar could not spell.
+
+      **Still one access, deliberately.** `$env.PATH[0] = …`, `$env.PATH:dedup = …`
+      and `$env[0..2] = …` stay syntax errors, for a write and an `unset` alike — a
+      slice or a modifier names a derived value, and an entry is bytes with nothing
+      inside it to reach into. `export`, `with`, and the `NAME=value` prefix keep
+      taking a spelled-out name only, since each is a header whose names are read at
+      parse time; `$env[…]` in the body covers the computed case.
+
+      **The payoff is wider than the `shellenv` helper this entry was about.**
+      `docs/INTEGRATION.md` called the missing write "the narrowest blocker in the
+      whole document" — it is what direnv, mise, and nvm all need, since each one's
+      contract is a computed diff applied in a loop, with a `null` meaning "unset
+      this". Those now want only a JSON reader.
 - [x] **6. A syntax error carried no line or column, and there was no way to
       check a file without running it.** A config that *generates* mesh source (see 26) had no way to check
       the generated file before sourcing it, so its only test was whether sourcing

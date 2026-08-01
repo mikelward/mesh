@@ -52,8 +52,8 @@ equivalent because it has no mesh problem.
 Classes 2 and 3 work **today** — the directory hooks class 3 was waiting on have
 landed. Class 4 waits on `$sh.complete`. Class 5 is the big hole: mesh has no
 configurable keybindings and no way for code to read or replace the line being
-edited. Class 6 has its hook now and waits on a way to apply a computed set of
-environment changes.
+edited. Class 6 has its hook now and can apply a computed set of environment
+changes; what it still waits on is a way to read the tool's payload.
 
 ## The bootstrap problem
 
@@ -381,18 +381,19 @@ at least degrades to its `PATH` shims, which need no integration at all since
 - ~~A hook that fires at the right time.~~ **Landed:** `precd` runs before the
   move and `postcd` after it, around every actual `cd`. direnv hooks `PROMPT_COMMAND`
   under bash because bash has nothing better; here it can hook the move itself.
-- **Writing `$env` under a computed key.** Only a literal `$env.KEY` is an
-  assignment target today, so a loop over a diff cannot write it
-  (`k = FOO; $env[$k] = bar` → `syntax error: expected a statement separator`).
-  This is the narrowest blocker in the whole document and probably the easiest
-  to fix.
-- **Reading the payload.** JSON again — the same gap carapace hits.
+- ~~Writing `$env` under a computed key.~~ **Landed:** `$env[$name] = value` is
+  the writing twin of the computed read, so a loop over a diff applies it
+  directly (`for name, value in $changes { $env[$name] = $value }`).
+  `unset $env[$name]` is the other half — the `null` in a direnv or mise diff
+  means "unset this", and until now there was no way to remove an environment
+  entry at all, only to empty one.
+- **Reading the payload.** JSON again — the same gap carapace hits. This is the
+  only thing still missing for direnv and mise.
 
 A plausible end state is an `env-apply` that takes a map and applies it as one
-transaction (set, and unset for a null), so the tool-facing contract is "print a
-map" and the failure mode is a diagnostic rather than a half-applied
-environment. That plus a JSON reader — the hook half is done — covers direnv and
-mise completely.
+transaction, so the tool-facing contract is "print a map" and the failure mode is
+a diagnostic rather than a half-applied environment. The pieces it would be built
+from all exist now; what it adds over the loop above is the transaction.
 
 ## Everything else, briefly
 
