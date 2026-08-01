@@ -4548,13 +4548,32 @@ spoken for the name.
 flags — several must, since `kill -9`, `disown -a`, `prompt --reset` and
 `on --remove` are their spellings — and `puts` "takes no flags" means it has
 none *of its own*, not that its `--help` is data. Two consequences, and they are the
-same for both kinds of command:
+same for both kinds of command.
+
+**A builtin is not a third kind of command.** It works the way a function and an
+external do, and any place it does not is a bug until it has been argued for —
+`puts` is mesh's own code with a documented signature, not a special case. The one
+split that *is* principled runs elsewhere: an **external** takes bytes, so
+`curl $url` must pass `--foo` if that is what `$url` holds, while everything mesh
+owns can know more than the bytes. Two rules with a stated reason, never three.
 
 - **A word that *is* `--help` asks for help, wherever it came from.** `x = --help;
   puts $x` prints the usage, and so does `f $x` on a function. mesh's expansion
   safety is about never *splitting* or *globbing* a value — it was never a promise to
   launder a word that is a flag, and a shell in which `$x` could smuggle one past
   option parsing would be the surprising one.
+
+  *(This reading is under revision. It is right that a flag stays a flag through a
+  variable, and wrong about how that is known: today `x = --help` and
+  `a = "--help"` both bind the string `'--help'`, so "is this a flag" can only be
+  re-derived from the characters — and a consumer that sniffs text cannot tell the
+  two apart. That is what let `f $w` bind an option because `$w` happened to hold
+  `--sleep=0`, which is the data-decides-the-call reading ruled out everywhere
+  else. The direction is a `Flag` **value**, decided where it is written, so the
+  word carries what it is instead of being guessed at; `x = --help` is a flag and
+  `a = "--help"` is text. Decidability then sits at the assignment, as it already
+  does for `x = 7` against `x = 007` and for `g = *.md`. `TODO.md` carries the
+  design and its open questions.)*
 - **`--` ends the options and is consumed.** Who consumes it depends on who has
   options to end: a command **with** options owns its terminator, because only it
   knows where its options stop (`kill -- -9 %1` looks for a job named `-9`;

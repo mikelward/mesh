@@ -2990,6 +2990,87 @@ thing a reader takes on trust.*
       standing in the same place. Deciding it needs an answer to "is command
       position argv-shaped or call-shaped for a func?", which is a design
       question rather than a bug fix.
+- [ ] **Make a builtin work the way a function does, not its own way.**
+      *Standing principle, from the repo owner: a builtin behaves the same as a
+      function and an external unless we have explicitly agreed otherwise.* A
+      builtin is not a third category, and every place it is one is a bug until
+      argued for.
+
+      The live instance is option reading. An in-shell `func` is meant to read its
+      options from the call site; a builtin reads argv, so a word arriving in a
+      variable is a flag to `puts` and data to a `func`. An **external** genuinely
+      cannot follow — argv is bytes, and `curl $url` must pass `--foo` if that is
+      what `$url` holds — so the end state is two rules with a stated reason, not
+      three, and a builtin belongs on the mesh-owned side.
+
+      Likely subsumed by the `Flag` value below, which reaches builtins without
+      threading call-site information down the argv path. Worth keeping as its own
+      entry because the principle is broader than flags.
+
+- [ ] **A value call cannot ask for the generated `--help`.** `f(--help)` reports
+      ``unknown flag `--help` `` and `f(...$x)` with a `--help` element does the
+      same, while both command spellings print the usage. Not a flag-handling gap —
+      every *declared* flag works identically in both spellings, and a function
+      that declares its own `--help` observes it in a value call — but an
+      **interception** gap: `dispatch_function_call` answers `--help` before
+      binding, and the value path does not go through it, so the word reaches the
+      ordinary binder and finds no such parameter. The fix is to share that
+      interception rather than duplicate it.
+
+- [ ] **A `Flag` value type, so a word that is an option carries that rather than
+      being sniffed for it.** The answer to the whole "what is an option" family,
+      arrived at after the call-site rule closed one half of it and could not
+      close the other without cost.
+
+      **The idea.** An option becomes a *value*, decided where it is written:
+
+      ```mesh
+      x = --help        # a flag
+      a = "--help"      # a string — quoted, so it is text
+      w = "--sleep=0"   # a string
+
+      f $x              # asks for help: the value *is* a flag
+      f $a              # data
+      f $w              # data
+      ```
+
+      **Why sniffing was the wrong substitute.** Today `x = --help` and
+      `a = "--help"` both bind the string `'--help'` — indistinguishable — so
+      every consumer had to re-derive intent from the characters. That is what
+      made `f $w` bind an option because `$w` happened to hold `--sleep=0`, and
+      it is why the two call spellings disagreed: each guessed separately.
+
+      **Decidability moves rather than disappearing**, and mesh already works this
+      way. `x = 7` binds an integer where `x = 007` binds a string; `g = *.md`
+      binds a list of paths. You cannot tell from `f $x` what `$x` is — you can
+      tell from the line that made it, and that is the rule for every other typed
+      value here: `Glob`, `Regex`, `Job`, `Stream`.
+
+      **What it buys.**
+
+      - One source of truth. The call-site predicate exists twice today — once on
+        `parser::Expr` for value calls, once on `expand::Word` for command
+        position (see the closed #362) — and the two must agree forever. They
+        drifted within an hour of the second being written, on a rule that had
+        taken eleven review rounds to get right. A value that knows what it is
+        needs neither copy.
+      - `x = --help; f $x` keeps working, which the call-site approach had to
+        break.
+      - The builtin principle becomes reachable: a `Flag` arriving at a builtin is
+        just a value, like a job handle, rather than call-site information that
+        has to be threaded down the argv path.
+
+      **Open before building.**
+
+      - What does `--tag=v2` bind — a flag carrying a value, or a flag and a
+        value? `--tag=$w` must still take its value from `$w`.
+      - How does a flag render at the **argv boundary**? `curl $x` has to send
+        `--help` as bytes, so it needs a text form, unlike a job handle.
+      - What do `:type` and `:repr` answer, and does `$x == "--help"` hold?
+      - Does a bare `--` bind a terminator value, or stay syntax?
+      - What happens to `wrapper func`, which exists to switch flag reading off —
+        with typed flags there may be nothing to switch.
+
 - [ ] **A modifier on a dashed word applies to the whole word, so a value call
       cannot use one on an option at all.** Found auditing 17. The underlying
       behavior is **pre-existing** — a chain has always transformed the name
