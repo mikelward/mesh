@@ -855,11 +855,20 @@ have:
 | Tab | Complete — see [Tab completion](#tab-completion) |
 | Alt-. | Insert the previous command's last argument; press again to walk back |
 | Ctrl-C | Abandon the line, buffered block and all, and re-prompt |
-| Ctrl-D | Exit, on an empty line |
+| Ctrl-D | Delete the character under the cursor; on an **empty** line, exit — but only when nothing is buffered behind it |
 
 Ctrl-C **abandons** rather than runs: nothing executes and `$sh.status` is left
 as it was. A line that opens a block or a quote keeps reading at the `...`
 continuation prompt until it balances, and Ctrl-C drops the whole thing.
+
+Ctrl-D is `delete-char` first, as it is in bash: with characters on the line it
+deletes the one under the cursor, and at the end of the line there is nothing to
+delete, so nothing happens. Only on an **empty** line does it mean end-of-input,
+and there it exits **only when nothing is buffered behind that line** — at the
+`...` prompt, with a block or heredoc part-way through, it does nothing. Those
+lines are input still in hand, and Ctrl-D never throws typed text away. That
+keeps the two gestures distinct: Ctrl-D leaves, Ctrl-C discards. Press Ctrl-C to
+drop the block, then Ctrl-D to leave.
 
 The line is drawn in bold unless `$sh.options.bold-input` is off, and bracketed
 paste is always on, so a pasted multi-line block arrives as text to read rather

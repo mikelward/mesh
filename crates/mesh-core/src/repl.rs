@@ -9654,7 +9654,17 @@ fn persist_logical_history(
         return Ok(());
     }
     let completed = completed_command(signal, pending, gate);
-    if completed.is_none() && !matches!(signal, Signal::CtrlC | Signal::CtrlD) {
+    // `Ctrl-C` is the only abandonment: it drops the buffer, so the raw rows
+    // reedline saved for its lines go with it. `Ctrl-D` used to be the other
+    // one, and dropping the rows was right while it exited; now that it is a
+    // no-op with input buffered, those lines are still in hand and still on
+    // their way to a logical command, so their rows have to stay — and the
+    // caller's count of them has to keep climbing across the keypress. Deleting
+    // here would lose a row *per ignored press* and then leave the count one
+    // too high, so completing the command would take an unrelated entry with
+    // it. `Ctrl-D` on an empty buffer exits and never reaches this line: it
+    // returns above, where `pending` is empty.
+    if completed.is_none() && !matches!(signal, Signal::CtrlC) {
         return Ok(());
     }
 
@@ -11033,8 +11043,11 @@ fn ignore_interactive_signals() -> io::Result<()> {
 /// incomplete. Extracted from the read loop so the interactive control flow is
 /// unit-testable without a terminal.
 ///
-/// `Ctrl-D` on an empty line exits (and abandons any in-progress `func`);
-/// `Ctrl-C` cancels the current line/buffer and re-prompts, keeping the status.
+/// `Ctrl-D` arrives here only on an empty editor line — reedline handles it as
+/// `delete-char` when the line has characters on it — so the question is only
+/// whether the buffer *behind* that line makes it an end of input. It exits when
+/// that buffer is **empty** and does nothing when it is not; `Ctrl-C` cancels the
+/// current line/buffer and re-prompts, keeping the status.
 fn handle_signal(
     signal: Signal,
     last: u8,
@@ -11119,10 +11132,25 @@ fn handle_signal(
             semantic_mark(marks, SemanticMark::CommandDone(status));
             Some(step)
         }
-        // Ctrl-D (EOF) exits with the last status, abandoning any in-progress
-        // `func` — the buffered lines are dropped as the shell leaves. reedline
-        // only emits this on an empty editor line, so a half-typed line is safe.
-        Signal::CtrlD => Some(Step::Exit(last)),
+        // Ctrl-D is end-of-input, so it says "there is no more" — which is only
+        // true when there is none. reedline emits it on an empty editor *line*,
+        // which answers for the line and not for the buffer behind it: a `func`
+        // body or a heredoc part-way through is input still in hand. Exiting there
+        // dropped it and left on a status describing the *previous* command, which
+        // said nothing about either.
+        Signal::CtrlD if pending.is_empty() => Some(Step::Exit(last)),
+        // Otherwise nothing at all, with no special case for a continuation line
+        // or for a particular construct: the buffer is the whole test. Throwing
+        // a buffer away is `Ctrl-C`'s job, and the two gestures stay distinct —
+        // one leaves, one discards.
+        //
+        // This arm only ever sees an *empty editor line*, because reedline
+        // handles the key itself when the line has characters on it
+        // (`engine.rs`: `EditCommand::Delete` — `delete-char`, as in bash) and
+        // emits no signal. So the choice here is only ever "the line is empty:
+        // does the buffer behind it make that an end of input?", never a choice
+        // about typed text.
+        Signal::CtrlD => None,
         _ => {
             // Ctrl-C: cancel the current line (and any buffered `func` body) and
             // re-prompt, keeping the status.
@@ -12218,6 +12246,73 @@ mod tests {
 
         assert_eq!(recall.arguments, ["public"]);
         drop(current);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_ignored_ctrl_d_leaves_the_buffered_rows_alone() {
+        // Ctrl-D with input buffered runs nothing and keeps the buffer, so it
+        // must keep the buffer's rows too. Deleting them here would take a
+        // prior command per press, and leave the caller's count one too high so
+        // that completing the command took a second unrelated row with it.
+        let path = temporary_history_path("history.sqlite3");
+        prepare_history_path(&path).unwrap();
+        let session = Reedline::create_history_session_id();
+        let mut saved = TimestampedHistory(
+            SqliteBackedHistory::with_file(path.clone(), session, Some(SystemTime::now().into()))
+                .unwrap(),
+        );
+        // An earlier command, finished and stored, plus the first line of a
+        // `func` still being typed — the rows reedline saves as they are
+        // submitted.
+        for line in ["puts public", "func f() {"] {
+            let mut item = HistoryItem::from_command_line(line);
+            item.session_id = session;
+            saved.save(item).unwrap();
+        }
+        // Ctrl-D at the continuation prompt: no-op, and the count of raw rows
+        // carries across it because the loop `continue`s without resetting it.
+        persist_logical_history(
+            &mut saved,
+            session,
+            &Signal::CtrlD,
+            "func f() {\n",
+            &HeredocGate::default(),
+            1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            saved
+                .search(SearchQuery::everything(SearchDirection::Backward, session))
+                .unwrap()
+                .len(),
+            2,
+            "an ignored Ctrl-D should delete nothing"
+        );
+        // Then `}` finishes it, the way it would have without the keypress.
+        let mut item = HistoryItem::from_command_line("}");
+        item.session_id = session;
+        saved.save(item).unwrap();
+        persist_logical_history(
+            &mut saved,
+            session,
+            &Signal::Success("}".into()),
+            "func f() {\n",
+            &HeredocGate::default(),
+            2,
+            false,
+        )
+        .unwrap();
+
+        let commands: Vec<_> = saved
+            .search(SearchQuery::everything(SearchDirection::Backward, session))
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.command_line)
+            .collect();
+        assert_eq!(commands, ["func f() {\n}", "puts public"]);
+        drop(saved);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -13935,11 +14030,35 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_exits_even_mid_function_definition() {
-        // With a `func` body still buffered, Ctrl-D still exits (abandoning it).
+    fn ctrl_d_does_nothing_while_input_is_buffered() {
+        // One rule, keyed on the buffer: a `func` body and a heredoc are both
+        // input still in hand, so Ctrl-D is inert and the buffer survives it —
+        // discarding one is Ctrl-C's job.
+        for buffered in ["func f() {\n", "cat <<EOF\n", "if true {\n"] {
+            let mut shell = Shell::new();
+            let mut pending = String::from(buffered);
+            let mut gate = HeredocGate::default();
+            assert_eq!(
+                handle_signal(Signal::CtrlD, 4, &mut shell, &mut pending, &mut gate),
+                None,
+                "Ctrl-D should be a no-op with {buffered:?} buffered"
+            );
+            assert_eq!(pending, buffered, "the buffer should survive Ctrl-D");
+        }
+    }
+
+    #[test]
+    fn ctrl_c_then_ctrl_d_exits_the_buffer_it_cleared() {
+        // Ctrl-C empties the buffer, which is what makes the next Ctrl-D leave:
+        // the two gestures compose rather than each needing its own escape.
         let mut shell = Shell::new();
         let mut pending = String::from("func f() {\n");
         let mut gate = HeredocGate::default();
+        assert_eq!(
+            handle_signal(Signal::CtrlC, 4, &mut shell, &mut pending, &mut gate),
+            Some(Step::Continue(4))
+        );
+        assert!(pending.is_empty());
         assert_eq!(
             handle_signal(Signal::CtrlD, 4, &mut shell, &mut pending, &mut gate),
             Some(Step::Exit(4))
