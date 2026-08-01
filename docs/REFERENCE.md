@@ -3155,7 +3155,7 @@ func dir-info() { style(tilde-pwd(), fg: blue) }    # a prompt segment
 The argument-taking modifiers that work today are `:split`, `:join`, `:get`, the
 affix family (`:stripstart`, `:stripend`, `:trimstart`, `:trimend`), the replace
 family (`:replaceall`, `:replacestart`, `:replaceend`), and `:map` / `:filter` /
-`:each`; the rest of the `DESIGN.md` set (`:match`, `:has`, `:words`, `:lines`,
+`:each`; the rest of the `DESIGN.md` set (`:match`, `:has`, `:lines`,
 the first-only `:replace`, the time and sort families) is not implemented, and
 neither are the regex capture modifiers or a capture backreference in a
 replacement. One of them **spread** at a command boundary
