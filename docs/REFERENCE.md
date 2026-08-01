@@ -3081,6 +3081,15 @@ greet world          # -> hi, world
     hold. A **spread** is the exception, and the reason to write one:
     `f(...$args)` does read a `--force` element as the option, which is how a
     wrapper forwards flags it was handed.
+  - **An option's value must be one string.** `--tag=$xs` with a list reports
+    rather than binding, and so does `--tag=*.txt`, since a glob is a list
+    however many paths it matched — including none. The command spelling of a
+    glob *does* bind, and the two differ for a reason rather than by oversight:
+    command position is argv, where a pattern expands to several **words** and
+    the last `--tag=` wins, while a value call passes one typed value per
+    argument. Binding the last match there would make an option's value depend on
+    which files happen to be on disk and drop the rest silently. Bind the value
+    you mean first, or use the command spelling.
   - **`--` ends flag parsing** — everything after a bare `--` is positional/rest,
     even if it begins with `--`.
   - **Defaults** are evaluated at call time, in the call's fresh scope, only when

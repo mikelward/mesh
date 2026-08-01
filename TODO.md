@@ -3016,9 +3016,34 @@ thing a reader takes on trust.*
       to match. Not folded into 17, which settles *whether* a token is an option
       rather than what a modifier attaches to; that is the same question the
       "Text glued to a bare value argument" loose end circles.
-- [ ] **A dashed word whose value globs stops being an option.**
-      Third of the same family, found in review on 17 and **pre-existing** —
-      reproduced on a binary built before that change. With `--tag=a.txt` on disk:
+- [x] **A dashed word whose value globs stops being an option.** *Fixed — by
+      reporting, not by binding.* An option's value must be one string, and a glob
+      is a `Value::List` however many paths it matched, so the value call now says
+      so instead of letting the word fall through to the positionals with the
+      option silently unset.
+
+      **This is not the answer the entry below predicted**, which was that it
+      would flip to `tag=a.txt` and match the command spelling. Binding the last
+      match is what command position does, and it would put back exactly what
+      bf79900 removed — a value decided by which files happen to be on disk,
+      silently dropping the rest. The two spellings legitimately differ here:
+      command position is argv, so a pattern expands to several *words* and the
+      last `--tag=` wins; a value call passes one typed value per argument.
+
+      What made the choice rather than the taste: an explicitly written list
+      already gets exactly this answer. `--tag=$xs` reports "list value needs
+      `...`" in **both** spellings, so a glob — the same shape arriving by another
+      route — now gets the same answer instead of a second rule for it. Matching
+      nothing reports too, since the empty list is still a list; the command
+      spelling drops it silently, which is the argv boundary showing through.
+
+      `repl.rs`, the `Positional` arm of the call scan;
+      `a_glob_after_the_option_separator_is_not_one_value` in
+      `crates/mesh/tests/cli.rs` replaces the pinning test.
+
+      The original report, for the record. Found in review on 17 and
+      **pre-existing** — reproduced on a binary built before that change. With
+      `--tag=a.txt` on disk:
 
       ```
       f(--tag=*.txt)    # value:   tag=none, the pattern arrives as a positional
@@ -3037,10 +3062,10 @@ thing a reader takes on trust.*
       glob after the `=` binds any more, single match included. Strictly less
       surprising than before, since the answer no longer varies with the
       directory, but it is now a plain divergence from the command spelling
-      rather than a cardinality quirk. Pinned by
-      `a_glob_after_the_option_separator_does_not_yet_bind_in_a_value_call` in
-      `crates/mesh/tests/cli.rs`, which flips to `tag=a.txt n=0` when this is
-      fixed.
+      rather than a cardinality quirk. That widening is also what decided the fix
+      against the command spelling's answer: once *every* glob is a list, binding
+      one means picking a match out of it, and the entry above says why that is the
+      wrong direction to move.
 
       All three entries here — this, the modifier one above, and the command
       position one — are the same shape: a dashed word is classified from its
@@ -3051,6 +3076,17 @@ thing a reader takes on trust.*
       list, or bytes that came from the filesystem. Worth one rule for "what a
       dashed word means once evaluated" rather than three symptom fixes that
       would each answer it differently.
+
+      **The list half is now answered, and the rule generalizes rather than
+      patching one symptom:** an option's value must be **one string**, whatever
+      route produced it — written as a list, globbed into one, or anything else
+      that is not a single string. That is deliberately the same answer
+      `--tag=$xs` already gave, which is why it closes a gap instead of adding a
+      case. Two remain, and the rule above constrains both: the **modifier** one
+      wants the chain to attach after the `=` so the option's value is still one
+      string once transformed, and the **command position** one still needs its
+      own answer to "is command position argv-shaped or call-shaped for a func?"
+      before anything can be decided there.
 - [x] **18. A bare `...$list` in command position runs nothing.** `xs = [echo hi]`
       followed by `...$xs` produces no output and no error — the head has to be
       bound out and used as the command word. The condition half of this —

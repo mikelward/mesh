@@ -1649,7 +1649,7 @@ pub(crate) fn get_value(value: Value, key: Value, default: Value) -> Result<Valu
 
 /// The word a diagnostic uses for a value's type. Local to the modifiers here so
 /// they can name what they were handed without reaching into the runtime.
-fn value_kind(value: &Value) -> &'static str {
+pub(crate) fn value_kind(value: &Value) -> &'static str {
     match value {
         Value::String(_) => "a string",
         Value::Styled(_) => "a styled string",
