@@ -1209,7 +1209,7 @@ and it would break `find . -exec grep foo {} +`. Every shell draws this line
 somewhere: bash needs `$(( ))`, fish needs `math`, and nushell and PowerShell put it
 exactly where mesh does.
 
-**Operators** *(decided)*. `+`, `*`, `/`, `%`, with the usual precedence. Division
+**Operators** *(decided)*. `+`, `-`, `*`, `/`, `%`, with the usual precedence. Division
 and remainder follow **Rust and bash**: the quotient truncates toward zero and the
 remainder takes the sign of the **dividend**, so `-7 / 2` is `-3`, `-7 % 2` is `-1`,
 and `(a / b) * b + a % b == a` holds. That also agrees with `:ms` / `:secs`, which
@@ -1222,7 +1222,49 @@ precedence rule of its own, and the modifier form matches `$m:int` / `$a:ms` —
 giving the negative-exponent case somewhere honest to fail, an integer power having
 no answer there.
 
-*(TODO: how binary `-` is spelled — a spaced infix `-` is already glob exclusion.)*
+**Binary `-`, and the glob-exclusion collision** *(decided)*. `-` subtracts
+numbers and takes the **difference of lists**, dispatching on its operands — one
+operator over two operand types, exactly as `+` already concatenates strings,
+extends lists, merges maps and adds integers.
+
+There turns out to be no collision to legislate, because bare glob literals are
+[eager](#globbing): they touch the filesystem and hand back a plain list. So by
+the time `-` evaluates, `* - *.bak` is a *list* minus a *list*, and glob exclusion
+**is** list difference rather than a second meaning of the operator. The parse
+never forks either — `-` always reads as binary minus, and only evaluation asks
+what it was handed.
+
+```mesh
+* - *.bak                      # every file except the backups
+[a b c] - [b]                  # [a c]
+```
+
+Three rules the list form needs, none of them glob-specific:
+
+- **The left order is kept**, and every occurrence of a removed element goes, so
+  the result is "the left list with those values taken out" rather than a set.
+- **Removing what is not there is fine**, unlike the [`unset`](#variables-and-assignment)
+  family's fail-loud rule. `* - *.bak` in a directory with no backups is the
+  ordinary case, not a mistake worth reporting — an exclusion names a *filter*,
+  where `unset` names a thing the writer believes exists.
+- **Elements compare by value**, the same equality `:dedup` and `==` use.
+
+Mixed operands (`[a] - 1`, `5 - [a]`) are a loud error that names both accepted
+shapes, since neither reading is recoverable.
+
+**A glob-led statement has to be classified as a value**, and today it is not:
+`outranks_a_command` promotes a bare leading scalar only when it is an integer, a
+boolean, or quoted, so `* - *.bak` on its own line stays a *command pipeline* and
+tries to **run the first matching file** — `command not found: a.txt`, verified.
+A bracketed list leads with a non-scalar and is already classified as a value, which
+is why `[a b c] - [b]` reaches evaluation and the glob form does not. Making the
+headline spelling work therefore means teaching that classification about a
+glob-led expression, not only implementing the list operation; inside parentheses
+the question does not arise. Raised in review on mikelward/mesh#341.
+
+What keeps all of this off kebab-case names is the
+[operators-need-spaces](#globbing) rule: `a-b` is one name, `a - b` is the
+operator, `$a-$b` interpolates with a literal hyphen.
 
 **Literals** *(decided)*. Decimal, plus `0x` / `0o` / `0b` prefixes — `0xff`,
 `0o755`, `0b1011`. Underscores group digits, following **Python's placement rule**:
