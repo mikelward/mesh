@@ -3930,13 +3930,19 @@ fn eval_expr(
     match expr {
         E::Scalar(word) => {
             let word = expansion_word(&word.value, last, in_function, shell)?;
+            // A glob is a **list** however many paths it matched; only a word that
+            // did not touch the filesystem collapses to the one value it expanded
+            // to. Asked after the fact — "did this produce exactly one?" — the two
+            // are indistinguishable, and a pattern's type came to depend on the
+            // directory's contents.
+            let globs = expand::word_globs(&word);
             expand::expand_values(vec![word], &shell.vars)
                 .map_err(|e| {
                     note!("mesh: {e}");
                     Step::Error(1)
                 })
                 .map(|mut v| {
-                    if v.len() == 1 {
+                    if v.len() == 1 && !globs {
                         v.pop().unwrap()
                     } else {
                         Value::List(v)
