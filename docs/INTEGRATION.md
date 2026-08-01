@@ -137,12 +137,12 @@ The interesting version passes starship the context it wants, all of which mesh
 already exposes as values:
 
 ```mesh
-global cmd-elapsed = 0
-func record-time(cmd, status, elapsed) { global cmd-elapsed = $elapsed }
+global _cmd_elapsed = 0
+func record-time(cmd, status, elapsed) { global _cmd_elapsed = $elapsed }
 on postexec timing record-time
 
 func refresh-prompt() {
-  prompt "$(starship prompt --status=${sh.status} --jobs=${sh.jobs:len} --cmd-duration=${cmd-elapsed})"
+  prompt "$(starship prompt --status=${sh.status} --jobs=${sh.jobs:len} --cmd-duration=${_cmd_elapsed})"
 }
 on preprompt renderer refresh-prompt
 ```
@@ -151,14 +151,13 @@ on preprompt renderer refresh-prompt
 starship asks for), and `postexec`'s `elapsed` in milliseconds are all
 implemented, so nothing here is aspirational.
 
-**A naming wrinkle every integration hits.** The stash above is `cmd-elapsed`,
-not `_cmd_elapsed`: a mesh name must **start with a letter**, so the
-leading-underscore convention every shell config uses to mark a private global is
-a syntax error here (`_x = 1` parses as a command called `_x`; `global _x = 1`
-does not parse at all). Kebab and underscore are both fine *after* the first
-character. Worth knowing because every integration in this document needs one or
-two private globals to carry state between hooks — and because `PROMPT.md` and
-`INTRO.md` both write `_cmd_time` in their examples.
+**The private-global convention works.** The stash above is `_cmd_elapsed`,
+which is the name every bash/zsh config would give it: a mesh name starts with a
+letter **or `_`**, so the leading underscore that marks a private global carries
+over unchanged, and kebab and underscore are both fine after the first character.
+Worth stating because every integration in this document needs one or two private
+globals to carry state between hooks. Only the **bare** `_` is reserved — it is
+the discard.
 
 **One thing to know.** Do not set `STARSHIP_SHELL=zsh` or `=bash`. Those make
 starship wrap its escape sequences in the shell-specific
@@ -192,16 +191,16 @@ atuin is two features that arrive together, and they land very differently.
 `precmd`, and mesh has those:
 
 ```mesh
-global atuin-id = ""
+global _atuin_id = ""
 
 func atuin-start(cmd) {
-  global atuin-id = $(atuin history start -- $cmd)
+  global _atuin_id = $(atuin history start -- $cmd)
 }
 
 func atuin-end(cmd, status, elapsed) {
-  if $atuin-id != "" {
-    atuin history end --exit $status --duration ($elapsed * 1000000) $atuin-id
-    global atuin-id = ""
+  if $_atuin_id != "" {
+    atuin history end --exit $status --duration ($elapsed * 1000000) $_atuin_id
+    global _atuin_id = ""
   }
 }
 

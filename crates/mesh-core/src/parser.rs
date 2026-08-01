@@ -283,7 +283,6 @@ pub enum ParseErrorKind {
     ChainedComparison,
     Expected(&'static str),
     ReservedParameter(String),
-    ReservedFunctionName(String),
     /// A quoted command after `alias NAME =` — `alias ll = 'ls -l'`. bash needs
     /// the quotes because its alias body is a *string*; mesh's is real syntax,
     /// so they turn the command into one word naming no program.
@@ -426,12 +425,6 @@ impl std::fmt::Display for ParseError {
                 "syntax error: a value argument cannot have text attached; separate it \
                  with a space, or quote the whole word — `\"pre$(…)post\"`"
             ),
-            ParseErrorKind::ReservedFunctionName(name) => {
-                write!(
-                    f,
-                    "syntax error: `{name}` is a built-in value call and cannot be a function name"
-                )
-            }
             ParseErrorKind::QuotedAliasCommand(text) => write!(
                 f,
                 "syntax error: an alias takes a command, not a string; write it \
@@ -2142,6 +2135,51 @@ fn word_is_quoted(word: &Word) -> bool {
     })
 }
 
+/// The spelling a token contributes when it is glued to the name in front of it,
+/// or `None` when it ends the name instead.
+///
+/// Deliberately the **same** table a bare command word is assembled from
+/// ([`token_word_pieces`]), so a candidate definition name covers every spelling
+/// that would have been one word in command position — `a.b`, `a:b`, `a[0]`.
+/// Anything the runtime check would reject has to arrive here whole, or it is
+/// rejected by the *parser* instead and takes the rest of its file down with it,
+/// which is the failure mode reading the name unjudged exists to remove.
+///
+/// Every piece, `=` included: whether `=` ends a name is not a fact about names
+/// but about the **form** being read, so it belongs to the caller —
+/// [`name_piece`], which knows which one it is.
+fn glued_name_text(kind: &TokenKind) -> Option<String> {
+    if let TokenKind::Word(word) = kind {
+        return (!word_is_quoted(word)).then(|| word.text());
+    }
+    let text: String = token_word_pieces(kind)?
+        .iter()
+        .map(|piece| match piece {
+            WordPiece::Text { text, .. } => text.as_str(),
+            _ => "",
+        })
+        .collect();
+    Some(text)
+}
+
+/// The spelling a token contributes to a definition name, for the form being read.
+///
+/// `alias` is the only form with a separator: `alias NAME = COMMAND` is told from
+/// a command by that `=`, so there it has to end the name however tightly it is
+/// written, or `alias co=vcs` would read as defining `co=vcs` with no `=` after it
+/// and stop being a definition. A `func` has `(` for that job and no use for `=`,
+/// so there it is an ordinary piece of a bare word — `func a=b()` reaches the
+/// runtime check and costs only its own definition, where excluding it put the
+/// whole-file parse error back.
+///
+/// `+=` is a separator for neither, so it is always ordinary.
+fn name_piece(kind: &TokenKind, alias: bool) -> Option<String> {
+    if alias && matches!(kind, TokenKind::Equal) {
+        return None;
+    }
+    glued_name_text(kind)
+}
+
 fn merge_command_variable_access(pieces: Vec<WordPiece>) -> Result<Vec<WordPiece>, ParseErrorKind> {
     let mut coalesced = Vec::with_capacity(pieces.len());
     for piece in pieces {
@@ -3162,11 +3200,38 @@ impl Parser<'_> {
     /// the spelling mesh wants rather than letting it fall through to a
     /// command-not-found.
     fn alias_definition_follows(&self) -> bool {
+        let mut index = self.position + 1;
+        let Some(first) = self.tokens.get(index) else {
+            return false;
+        };
+        // Wide enough to claim every *attempt* at a definition, which is a
+        // different question from whether the name is any good — that one belongs
+        // to [`definition_name`](Self::definition_name), and it has to be reached
+        // to be asked. So a **quoted** word is claimed here and rejected there:
+        // `alias "foo" = …` is unmistakably an alias being defined, and answering
+        // `expected a name` says what is wrong with it, where declining leaves the
+        // far less useful `command not found: alias`.
+        if !matches!(first.value, TokenKind::Word(_)) && name_piece(&first.value, true).is_none() {
+            return false;
+        }
+        // The name may be a run the lexer split — `a.b` is `a` `.` `b` — and the
+        // definition has to claim those too, or a bad name would report the far
+        // less useful `command not found: alias` instead of what is wrong with it.
+        //
+        // A quoted piece is claimed here for the same reason the first one is:
+        // `alias ."foo" = …` is a definition being attempted, and stopping the scan
+        // at the quote loses the `=` that says so.
+        let mut end = first.span.end;
+        index += 1;
+        while let Some(next) = self.tokens.get(index)
+            && next.span.start == end
+            && (matches!(next.value, TokenKind::Word(_)) || name_piece(&next.value, true).is_some())
+        {
+            end = next.span.end;
+            index += 1;
+        }
         matches!(
-            self.tokens.get(self.position + 1).map(|t| &t.value),
-            Some(TokenKind::Word(_))
-        ) && matches!(
-            self.tokens.get(self.position + 2).map(|t| &t.value),
+            self.tokens.get(index).map(|t| &t.value),
             Some(TokenKind::Equal)
         )
     }
@@ -3194,13 +3259,10 @@ impl Parser<'_> {
     fn alias_def(&mut self) -> Result<Executable, ParseError> {
         let start = self.peek().map(|t| t.span.start).unwrap_or_default();
         self.take_word("alias");
-        let name = self.name()?;
-        // The same names `function` refuses, and for the same reason: `re x`
-        // would run this definition while `re(x)` still built a regex, so the
-        // name would mean different things depending on how it was called.
-        if RESERVED_FUNCTION_NAMES.contains(&name.as_str()) {
-            return Err(self.error(ParseErrorKind::ReservedFunctionName(name)));
-        }
+        // An alias desugars to a `wrapper func`, so it is named by the same rules
+        // and reports them the same way: read here, judged where the definition
+        // runs.
+        let name = self.definition_name(true)?;
         self.expect(&TokenKind::Equal, "`=`")?;
         self.newlines();
         let mut command = self.command()?;
@@ -3298,15 +3360,11 @@ impl Parser<'_> {
 
     fn function(&mut self, wrapper: bool) -> Result<Executable, ParseError> {
         self.take_word("func");
-        let name = self.name()?;
-        // `re(...)`, `style(...)` and the `glob` family answer with a built-in value.
-        // A function of one of those names would be reachable as a command (`re x`)
-        // but never as a value call, since `re(x)` always builds a regex and
-        // `dirs(x)` always lists a directory — so reserve the names rather than ship
-        // a function that behaves differently depending on how it is called.
-        if RESERVED_FUNCTION_NAMES.contains(&name.as_str()) {
-            return Err(self.error(ParseErrorKind::ReservedFunctionName(name)));
-        }
+        // Taken as written and judged when the definition runs — see
+        // [`definition_name`](Self::definition_name). The rules themselves (no
+        // reserved word, no built-in value call, no dotted name) live at the one
+        // runtime check in `repl.rs`.
+        let name = self.definition_name(false)?;
         let parameters = self.parameters()?;
         // "Parses no flags of its own" is the whole content of the marker, so a
         // declared flag contradicts it: help would list the flag and completion
@@ -5281,6 +5339,71 @@ impl Parser<'_> {
             }),
         }
     }
+
+    /// The name a `func` or an `alias` is defining, read **without judging it**.
+    ///
+    /// Unlike [`name`](Self::name), which is the general "a name goes here" reader,
+    /// this accepts any bare word and hands the text on for the definition to
+    /// reject when it runs. That is what keeps one bad name from costing the whole
+    /// file it was generated into: every rule about what a definition may be called
+    /// now reports the same way, at the same moment, and takes only its own
+    /// definition down.
+    ///
+    /// It has to read the shapes no name may have, which means gluing back what the
+    /// lexer split. `a.b` arrives as `a` `.` `b`, so adjacent word and dot tokens
+    /// with nothing between them are one candidate; anything else ends it, and
+    /// `func f()` still stops at the `(` because `(` is neither.
+    fn definition_name(&mut self, alias: bool) -> Result<String, ParseError> {
+        let token = self
+            .next()
+            .ok_or_else(|| self.eof(ParseErrorKind::UnexpectedEnd))?;
+        // A quoted word is a string, not a name — there is no call spelling for
+        // one — so this stays the general "expected a name" rather than becoming a
+        // rule about which names are allowed.
+        if matches!(&token.value, TokenKind::Word(word) if word_is_quoted(word)) {
+            return Err(ParseError {
+                kind: ParseErrorKind::Expected("a name"),
+                span: token.span,
+            });
+        }
+        // The **first** piece goes through the same table as the glued ones, so a
+        // candidate that opens with lexer-split punctuation — `.foo`, which starts
+        // on a `Dot` — is read whole rather than rejected here. Requiring a `Word`
+        // to start would put the parse error back for exactly the names that most
+        // need the runtime one, and take the rest of the file with it. What is left
+        // over answers `None` and is still `expected a name`: `(`, `=`, a redirect.
+        let Some(mut name) = name_piece(&token.value, alias) else {
+            return Err(ParseError {
+                kind: ParseErrorKind::Expected("a name"),
+                span: token.span,
+            });
+        };
+        let mut end = token.span.end;
+        while let Some(next) = self
+            .tokens
+            .get(self.position)
+            .filter(|t| t.span.start == end)
+        {
+            // A quoted piece glued on is the same rule as a quoted first piece — a
+            // string is not a name — and has to be *claimed* to be reported, so
+            // `alias ."foo" = …` answers `expected a name` rather than stopping the
+            // name early and failing on the `=` that is not where it now looks.
+            if matches!(&next.value, TokenKind::Word(word) if word_is_quoted(word)) {
+                return Err(ParseError {
+                    kind: ParseErrorKind::Expected("a name"),
+                    span: next.span.clone(),
+                });
+            }
+            let Some(text) = name_piece(&next.value, alias) else {
+                break;
+            };
+            end = next.span.end;
+            name.push_str(&text);
+            self.position += 1;
+        }
+        Ok(name)
+    }
+
     fn at_command_end(&self) -> bool {
         self.at_end()
             || matches!(

@@ -1431,13 +1431,18 @@ designed, and the cross-references say where the fuller note lives.
       `carapace`. Deliberately *after* the hooks and the decision above: a
       `tool init mesh` emitting registrations mesh cannot parse is worse than no
       target at all, since it looks supported and is not.
-- [ ] **A name cannot start with `_`** (`parser.rs:1440`, `:4651` require an
+- [x] **A name cannot start with `_`** (`parser.rs:1440`, `:4651` require an
       alphabetic first character), so the private-global convention every shell
       config uses is a syntax error in exactly the variables these hooks ask
       users to create. Already tracked — see "Reserve only bare `_` as discard,
       allow `_name`" under "Icebox / decide later", where the integration case
       and the two follow-ons (the diagnostic, and the design-doc examples that do
       not parse) are recorded.
+
+      **Done**, along with both follow-ons — `valid_name` takes a `_` head as
+      long as something follows it. `docs/INTEGRATION.md` said this was a wrinkle
+      every integration hits and stashed its starship timing in `cmd-elapsed` to
+      dodge it; it now uses `_cmd_elapsed`, the name the convention asks for.
 - [ ] **Hint and highlighter hooks.** Not external tools, but the
       zsh-autosuggestions / syntax-highlighting experience users arrive
       expecting. reedline supports both and mesh exposes neither.
@@ -2319,9 +2324,13 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Fourteen have since been fixed; two are tracked
+matched back to the discussion. Eighteen have since been fixed; two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
+
+*Keep the count above in step with the checkboxes below — it went stale once
+already, reading `fourteen` against sixteen boxes, which is exactly the sort of
+thing a reader takes on trust.*
 
 - [x] **1. A `...rest` function refused an unknown long flag.** A plain `func`
       scanned every `--`-leading argument against its signature, which broke both
@@ -2775,12 +2784,17 @@ was re-checked against `main` rather than taken from the PR text.
       function argument does not keep the text it was given. See "A numeric-looking
       argument loses its spelling" below.
 - [ ] **21. `files` is a reserved value-call name, so the shortcut cannot be
-      written.** `alias files = package files` is a *syntax error* — `files` is a
-      built-in value call and cannot be a function name — rather than a
-      shadowing, and `re`, `style`, `link`, `glob` and `dirs` are the same.
-      The other three shells in that config all define this shortcut; mesh has no
-      spelling for it, which makes it the one name the port had to drop rather
-      than translate.
+      written.** `alias files = package files` is refused — `files` is a built-in
+      value call and cannot be a function name — rather than shadowing, and `re`,
+      `style`, `link`, `glob` and `dirs` are the same. The other three shells in
+      that config all define this shortcut; mesh has no spelling for it, which
+      makes it the one name the port had to drop rather than translate.
+
+      *Narrowed by 27, not closed by it.* This used to be a **syntax error**,
+      which cost the whole file the alias sat in; it is now a runtime error
+      against that one definition, so the rest of a config survives it. What this
+      entry is actually about — that there is no spelling for the shortcut — is
+      untouched.
 - [ ] **22. An alias cannot be tab-completed.** `co --` offers nothing:
       completion builds a spec from a function's generated help, which a wrapper
       leaves empty by design, and it cannot fall back to probing because the name
@@ -2862,7 +2876,7 @@ was re-checked against `main` rather than taken from the PR text.
       mode for definitions derived from an ssh config — none of which `eval` has.
       A `func` bound to a computed name, or a way to define into the function
       table from a value, would retire all of it.
-- [ ] **27. Three separate rules decide what can be a function name, and only one
+- [x] **27. Three separate rules decide what can be a function name, and only one
       of them is a runtime error.** A leading underscore is a syntax error
       (`expected a name`, so `_exit` became `safe-exit`), a dot is a syntax error
       (recorded in `DESIGN.md`, mikelward/mesh#293), a built-in value call is a
@@ -2873,6 +2887,41 @@ was re-checked against `main` rather than taken from the PR text.
       filters names through `type -t` before emitting rather than emitting and
       hoping. The underscore rule is the icebox item *Reserve only bare `_` as
       discard, allow `_name`* reached from a second direction.
+
+      **One rule was already gone.** `_exit` defines and calls fine on `main`: the
+      icebox item landed, so a leading underscore is a name and only the bare `_`
+      — the discard — is refused. The entry above is the state at the port, kept
+      for the record; `safe-exit` is no longer the workaround it was.
+
+      **Fixed, the rest.** `func` and `alias` now read the name **without judging
+      it** and hand the text to one runtime check, so every rule reports the same
+      way, at the same moment, with the same blast radius — the definition itself
+      and nothing else. Reading it unjudged means gluing back what the lexer
+      splits (`a.b` arrives as `a` `.` `b`), which is also what lets `alias a.b =
+      …` reach the check instead of answering `command not found: alias`. The four
+      reasons, one message each:
+
+      | Name | Reported as |
+      | --- | --- |
+      | `puts` | `` `puts` is a reserved name and cannot be a function name`` |
+      | `files` | `` `files` is a built-in value call and cannot be a function name`` |
+      | `a.b` | `` `a.b` cannot be a function name: a `.` reads as member access …`` |
+      | `_` | `` `_` is the discard name and cannot be a function name`` |
+      | `2x` | `` `2x` is not a name: a name starts with a letter or `_` …`` |
+
+      A generated file is no longer all-or-nothing, which is the cost this entry
+      was really about: the bad definition reports and every other one in the file
+      still defines. So the ssh-host generator can emit and let the shell say,
+      rather than filtering through `type -t` first. `a.b` also gained a message
+      that names the problem — it used to answer ``expected `(` ``, pointing at the
+      dot without saying what was wrong with it.
+
+      **What did not change:** which names are refused. A dotted name is still not
+      definable — `DESIGN.md` §"Functions" defers that on its own merits (the
+      question is value-call position against member access), and this entry was
+      about the *shape* of the refusal, not its content. A quoted `func "files"()`
+      is still the parse-time `expected a name`, because that is a rule about a
+      name being a name rather than about which names are taken.
 - [x] **28. A failing capture did not bind the name, and execution continued.**
       The single most costly edge in the port. `x = $(sh -c "echo x; exit 3")`
       left `x` **unbound** and discarded the output, so the next `$x` failed with
@@ -4077,13 +4126,20 @@ reasoning, and the open ones are at the bottom.
       `modifier :lines is not implemented yet`). Landing the split is what makes
       `:raw` mean anything, since `:raw` is defined as the member that turns it
       off.
-- [ ] **Reserve only bare `_` as discard, allow `_name`.** Today a name must
+- [x] **Reserve only bare `_` as discard, allow `_name`.** Today a name must
       start with a letter, so a leading underscore is rejected wholesale (`_` and
       `_x` alike) — `_` is the discard pattern (`DESIGN.md`). Reconsider narrowing
       the reservation to **bare `_` only**, letting `_name` (underscore + letters)
       be a valid identifier, the common "intentional / private / unused-but-named"
       convention. Would touch `read_name` (allow a `_` head as long as the whole
       token isn't just `_`) and the `GRAMMAR.md` name rule.
+
+      **Done, and the entry above is the state when it was written.** `valid_name`
+      takes a `_` head as long as something follows it, so `_x = 1`,
+      `global _cmd_time = 0s`, `func f(_a)` and `func _exit()` all work, and only
+      the bare `_` is reserved. Both sub-items below went with it: there is no rule
+      left to hide, and the `docs/PROMPT.md` / `docs/INTRO.md` examples parse as
+      written.
 
       **A motivating case, from `docs/INTEGRATION.md`:** every hook-based
       integration with an external tool needs a private global to carry state
@@ -4093,16 +4149,25 @@ reasoning, and the open ones are at the bottom.
       is not only a "unused-but-named" nicety; it is the naming convention users
       arrive with for exactly the variables mesh's hook API asks them to create.
       Two further notes:
-  - [ ] **The diagnostic hides the rule.** `_x = 1` parses as a *command* and
+  - [x] **The diagnostic hides the rule.** `_x = 1` parses as a *command* and
         reports `command not found: _x`; `global _x = 1` reports
         `syntax error: expected a name`. Neither says a name cannot start with
         `_`, so the reader looks for a missing program or a typo. Worth fixing
-        even if the reservation stands — the rule should name itself.
-  - [ ] **Two design docs already assume it works.** `docs/PROMPT.md` and
+        even if the reservation stands — the rule should name itself. **Moot:**
+        both spellings bind now.
+  - [x] **Two design docs already assume it works.** `docs/PROMPT.md` and
         `docs/INTRO.md` both write `global _cmd_time = 0s`, which today's parser
         rejects. PROMPT.md is labeled a design target, but the naming is not one
         of the things it flags as unbuilt, so the example reads as writable and
-        is not. Either fix the examples or allow the name.
+        is not. Either fix the examples or allow the name. **Moot:** the examples
+        run as written.
+  - [ ] **The two spellings disagree about the bare `_`.** Found re-checking the
+        above, and the one piece still open: `_ = 1` reports
+        `command not found: _` — the discard read as a command word, the old
+        diagnostic complaint surviving on the one name that is still reserved —
+        while `global _ = 1` **silently succeeds**, binding nothing and answering
+        `0`. One of the two is wrong and neither says what the rule is. The
+        discard should presumably refuse a value in both spellings, and say so.
 - [ ] **Optional commas + word×list distribution in list literals.** Two related
       list ergonomics, motivated by the bash `mv foo{,bak}` idiom (rename
       `foo` → `foobak` in one word):

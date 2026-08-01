@@ -1192,6 +1192,57 @@ fn located(text: &str, offset: usize, shell: &Shell) -> String {
 /// Parse and run one input unit against the session. `in_function` is true while
 /// running a function body: there a `return` unwinds; at top level it is a
 /// recoverable error.
+/// Why `name` cannot name a `func` or an `alias`, or `None` when it can.
+///
+/// **One rule, one moment, one blast radius.** These four questions used to be
+/// answered in three places and two kinds of failure — a reserved word here at
+/// runtime, and a built-in value call, a dotted name and a malformed name in the
+/// parser, where rejecting the definition rejected the *whole file* it sat in. A
+/// file of generated definitions was therefore all-or-nothing: one name the
+/// generator should have filtered cost every other definition in it. Answering
+/// here means a bad name reports where the definition runs and takes only itself
+/// down, which is what the reserved-word rule already did.
+///
+/// The reasons, in the order a reader would ask them:
+///
+/// - a **reserved word** or **builtin** resolves first, so the definition could
+///   never be reached;
+/// - a **built-in value call** is the opposite problem — `re(x)` always builds a
+///   regex, so such a function would be reachable as a command and never as a
+///   call;
+/// - a **dot** is member access, so `a.b` has no call spelling (`DESIGN.md`
+///   §"Functions" defers whether it ever should);
+/// - anything else that is not a name at all, `_` — which is the discard — first,
+///   since "not a name" is unhelpful for a word the reader chose deliberately.
+fn definition_name_problem(name: &str) -> Option<String> {
+    if matches!(name, "func" | "return" | "fail" | "not") || builtins::is_builtin(name) {
+        return Some(format!(
+            "`{name}` is a reserved name and cannot be a function name"
+        ));
+    }
+    if parser::value_builtin(name) {
+        return Some(format!(
+            "`{name}` is a built-in value call and cannot be a function name"
+        ));
+    }
+    if name.contains('.') {
+        return Some(format!(
+            "`{name}` cannot be a function name: a `.` reads as member access, so a dotted \
+             name has no call spelling"
+        ));
+    }
+    if name == "_" {
+        return Some("`_` is the discard name and cannot be a function name".to_owned());
+    }
+    if !parser::valid_name(name) {
+        return Some(format!(
+            "`{name}` is not a name: a name starts with a letter or `_` and continues with \
+             letters, digits, `_`, and single `-`s"
+        ));
+    }
+    None
+}
+
 fn run_line(text: &str, last: u8, in_function: bool, shell: &mut Shell) -> Step {
     // Input the parser rejected never reaches `run_recorded`, so this is the only
     // place its status can be published. Without it the shell carries 2 to the
@@ -1594,10 +1645,8 @@ fn run_executable(
             body,
             wrapper,
         } => {
-            if matches!(name.as_str(), "func" | "return" | "fail" | "not")
-                || builtins::is_builtin(name)
-            {
-                note!("mesh: func: `{name}` is a reserved name and cannot be a function name");
+            if let Some(reason) = definition_name_problem(name) {
+                note!("mesh: func: {reason}");
                 return Step::Error(2);
             }
             // Parameter names are already validated (distinct, not `env`) by the
