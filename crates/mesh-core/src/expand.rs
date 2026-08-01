@@ -598,14 +598,29 @@ fn scalar_literal(word: &Word) -> Option<Value> {
 /// anything else stays a string. Used both for bare literal arguments and for the
 /// attached value of a valued `--flag=value`, so `--n=2` is the integer `2` just
 /// like a positional `2` or the flag's default expression.
+///
+/// A word types as an integer only when its text is that integer's **own**
+/// spelling — [`crate::parser::canonical_integer`], the same predicate the parser
+/// uses to tell a value from a command word. An `i64` carries no record of how it
+/// was written, so anything else is re-rendered from the number and the caller's
+/// text is gone: `007` reached a command as `7`, `+5` as `5`, `-0` as `0`. That
+/// made putting a mesh function in front of a command change what the command
+/// receives — the one thing a wrapper must not do — while a direct external
+/// argument and `$sh.args` both kept the spelling, so the loss depended on whether
+/// a `func` happened to be in the way.
+///
+/// The cost is that a non-canonical numeral is text and no longer does arithmetic
+/// — `007 + 1` is an error where it was `8`. That is the deliberate half of the
+/// trade: a numeral whose spelling matters is almost always an identifier (a
+/// mode, a version segment, a zero-padded index) rather than a quantity, and text
+/// that silently renumbers itself is the worse failure of the two. `$n:int + 1`
+/// asks for the conversion, which is the rule every other string already follows.
 pub(crate) fn typed_scalar(text: &str) -> Value {
     match text {
         "true" => Value::Boolean(true),
         "false" => Value::Boolean(false),
-        _ => text
-            .parse()
-            .map(Value::Integer)
-            .unwrap_or_else(|_| Value::String(text.to_owned())),
+        _ => crate::parser::canonical_integer(text)
+            .map_or_else(|| Value::String(text.to_owned()), Value::Integer),
     }
 }
 

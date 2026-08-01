@@ -1424,8 +1424,38 @@ so the exponent form always means float, as in Python. Two lexing rules follow: 
 followed by `.5`; and the `0x` / `0o` / `0b` prefixes take neither, an integer being
 the only thing a radix literal names.
 
-*(TODO: whether a leading zero means octal. Today `007` silently parses as `7`,
-which is the one answer that is certainly wrong.)*
+A leading zero means **neither octal nor decimal**: `007` is the *string* `007`.
+The open question here used to be octal-or-decimal, and the note recorded that
+`007` silently parsing as `7` was "the one answer that is certainly wrong" — it
+was, and the reason generalizes past leading zeros. An integer carries no record
+of how it was written, so any spelling that is not the number's own is lost the
+moment it binds. A **decimal** literal is therefore an integer only when its text
+is that integer's own spelling, which leaves `007`, `08`, `+5` and `-0` as
+strings.
+
+The rule is scoped to decimal on purpose, and says nothing about the grouped and
+radix forms decided above. `1_0` and `0x10` are integers under those rules and
+`1e3` is a float; they are strings *today* only because none of the three is
+implemented yet, which is an implementation state rather than a decision. When
+they land, each brings its own canonical spelling — the question this rule
+answers for them is not "integer or string" but *which* text round-trips, and
+`0x10` printing back as `16` would lose a spelling exactly as `007` did.
+
+That keeps the spelling wherever it travels, which is what the bug was: a word
+passed through a `func` parameter, `...rest`, `alias`, or an assignment came out
+renumbered, while a direct external argument and `$sh.args` kept it — so putting
+a mesh function in front of a command changed what the command received. The
+cost is that `007 + 1` is an error asking for `$n:int + 1`, the rule every other
+string already follows; a numeral whose spelling matters is usually an
+identifier (a mode, a version segment, a zero-padded index) rather than a
+quantity. Octal is unaffected: `0o755` is the spelling that says what it means,
+and it is an integer under the radix rule above once that form is implemented.
+
+One consequence worth stating, since it is what makes this a *language* rule
+rather than a binding rule: a bare word that is not a typed literal names a
+**command**, so `007` in statement position runs a program of that name where a
+bare `7` is a discarded value. The parser's value-or-command test and the
+argument-typing rule ask one shared predicate so they cannot answer differently.
 
 **Value positions only.** All of this governs *in-shell* values; the process
 boundary stays bytes. `chmod 0644 f` passes `0644` and `ls 1_000` names the

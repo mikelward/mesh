@@ -2415,7 +2415,25 @@ then `puts ...$xs`). `:has(VALUE)` also remains unimplemented.
 
 Bare decimal literals and `true` / `false` produce typed integer and boolean
 values. Arithmetic requires integers, comparisons return booleans, and strings
-are never implicitly parsed as numbers. Integers and booleans have canonical
+are never implicitly parsed as numbers.
+
+A decimal literal types as an integer only when its text is that integer's **own**
+spelling, so `7` and `-2` are integers while `007`, `08`, `+5` and `-0` are
+strings. An integer carries no record of how it was written, so anything else
+would be re-rendered from the number and the text lost — `007` reached a command
+as `7`, and putting a `func` in front of a command changed what the command
+received. Spelling wins because a numeral whose spelling matters is usually an
+identifier rather than a quantity: a mode, a version segment, a zero-padded
+index. Arithmetic on one asks for the conversion (`$n:int + 1`), which is the
+rule every other string already follows.
+
+`1_0`, `0x10` and `1e3` are also strings today, but for a different reason: the
+grouped, radix and exponent forms are **not implemented yet**. `DESIGN.md`
+decides them as integer and float literals, so this is a gap rather than the rule
+above — and when they land, each will have to settle which text *it* renders back
+to, since `0x10` returning as `16` would lose a spelling exactly as `007` did.
+
+Integers and booleans have canonical
 command/interpolation renderings (`42`, `true`, and `false`). Lists and maps keep
 requiring an explicit spread, access, or modifier at the byte-oriented command
 boundary. A whole typed value, including a list or map, passes unchanged as one
