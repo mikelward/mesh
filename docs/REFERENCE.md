@@ -3055,6 +3055,14 @@ greet world          # -> hi, world
     may appear in any order and are not consumed as positionals; a repeated valued
     flag takes its **last** value. An argument that begins with `--` but names no
     declared flag is a loud error.
+  - **In a value call, a flag is read from the call site, not from the value.**
+    Only a `--name` written as a literal word there is an option, so `f($w)` and
+    `f("--sleep=0")` pass data even when the text begins with `--` — the same
+    rule as everywhere else that quoting makes a value, and it keeps what a call
+    means readable from the line rather than from what a variable happens to
+    hold. A **spread** is the exception, and the reason to write one:
+    `f(...$args)` does read a `--force` element as the option, which is how a
+    wrapper forwards flags it was handed.
   - **`--` ends flag parsing** — everything after a bare `--` is positional/rest,
     even if it begins with `--`.
   - **Defaults** are evaluated at call time, in the call's fresh scope, only when

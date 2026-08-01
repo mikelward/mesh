@@ -9001,11 +9001,25 @@ fn evaluate_value_arguments<'p>(
             return Ok((positionals, switches_on, flag_values));
         }
         match argument {
+            // Two neighbouring questions with two different answers: `bare` is how
+            // the bound value *types*, and `dashes` is whether a leading `--` names
+            // an option at all. Only a `--name` written at the call site is one, so
+            // `f($w)` and `f("--sleep=0")` hand over data — a string that merely
+            // looks like a flag reaches the parameter instead of being scanned as
+            // one. Reading that from the *runtime* value made `f($w)` work or fail
+            // on what `$w` happened to hold, against the decidability rule
+            // `DESIGN.md` keeps everywhere else, and against quoting making a value
+            // in every other position.
+            //
+            // They must stay separate: `--tag="v2"` is an option whose *value* is
+            // not bare, so answering both with `is_bare_literal_word` stopped
+            // scanning it and pushed the whole token through as a positional.
             parser::Argument::Positional(_) => scan_call_value(
                 name,
                 params,
                 value,
                 bare,
+                starts_with_bare_dashes(expression),
                 flags_enabled,
                 &mut flags_ended,
                 &mut positionals,
@@ -9021,6 +9035,13 @@ fn evaluate_value_arguments<'p>(
                 // through the same scan: a `--` element terminates option parsing
                 // and a `--flag` element binds its option, exactly as in command
                 // mode. Elements are values, not literal tokens, so none is `bare`.
+                //
+                // They *are* scanned for flags, unlike a plain positional, and the
+                // split is the point rather than an inconsistency: writing `...`
+                // is the explicit "these are arguments, flags included" gesture —
+                // the forwarding channel a wrapper needs — where `f($w)` says
+                // "this is one value". Both readings stay legible from the line,
+                // which is what a runtime scan cost.
                 Value::List(items) => {
                     for item in items {
                         scan_call_value(
@@ -9028,6 +9049,7 @@ fn evaluate_value_arguments<'p>(
                             params,
                             item,
                             false,
+                            true,
                             flags_enabled,
                             &mut flags_ended,
                             &mut positionals,
@@ -9084,6 +9106,7 @@ fn scan_call_value<'p>(
     params: &'p [parser::Param],
     value: Value,
     bare: bool,
+    dashes_are_flags: bool,
     flags_enabled: bool,
     flags_ended: &mut bool,
     positionals: &mut Vec<Value>,
@@ -9092,6 +9115,7 @@ fn scan_call_value<'p>(
 ) -> Result<(), Step> {
     if flags_enabled
         && !*flags_ended
+        && dashes_are_flags
         && let Value::String(text) = &value
     {
         if text == "--" {
@@ -9106,6 +9130,110 @@ fn scan_call_value<'p>(
     }
     positionals.push(value);
     Ok(())
+}
+
+/// Was this argument **written** as a dashed option — a bare `--name` at the call
+/// site — whatever its attached *value* is made of?
+///
+/// The line the rule draws is the `=`. Everything up to and including it names
+/// which option binds, so it has to be literal text the reader wrote; everything
+/// after it is that option's value and may be quoted or expanded freely.
+///
+/// Deliberately distinct from [`is_bare_literal_word`], which asks the *other*
+/// question: how the bound value types. Answering both with that one read
+/// `--tag="v2"` and `--tag=$w` as positionals, since neither is a bare word as a
+/// whole, and a function declaring only `--tag` answered
+/// `expected 0 argument(s), got 1`.
+///
+/// Requiring the name and not merely the dashes is the other half. With just a
+/// leading-`--` test, `f(--$name)` and `f(--"force")` passed — the first piece is
+/// the bare text `--` — and the option that bound was chosen by the runtime name,
+/// which is precisely the data-decides-the-call reading this predicate exists to
+/// stop. So a first piece carrying no `=` has to be the *whole* word: `--force`
+/// and the bare `--` terminator qualify, a composed name does not.
+///
+/// A **postfix chain** is a composition of the name in its own right, and the `=`
+/// is no barrier to it — see the comment in the body. All three halves raised in
+/// review.
+fn starts_with_bare_dashes(expression: &parser::Expr) -> bool {
+    // A postfix chain disqualifies the word outright, `=` or not. In value mode a
+    // chain applies to the **whole** word rather than to the part after the `=`,
+    // so it can always rewrite the name: `--TAG=V9:lower` evaluates to
+    // `--tag=v9` and would bind a declared `--tag` that the reader never wrote.
+    // There is no position in the word where the `=` stops it.
+    //
+    // That is a divergence from command position, which applies the chain to the
+    // value and answers `unknown flag --TAG` for the same text. Command position
+    // is the right one, and `TODO.md` carries it as its own entry — but it is a
+    // question about where a modifier attaches, not about what counts as an
+    // option, so it is not settled here. Until it is, this predicate cannot admit
+    // a chained word without letting a modifier pick the option, which is the one
+    // thing it exists to prevent. `f(--tag=$w:lower)` is therefore data; bind the
+    // transformed value first (`t = $w:lower`, then `f(--tag=$t)`) to pass it.
+    //
+    // Nothing to unwrap, then: a chained word is an `Expr::Modifier`, so requiring
+    // a bare `Expr::Scalar` refuses it already. `--tag=$m.key` and `--tag=$xs[0]`
+    // are *not* chains despite appearances — a member or index inside a word is an
+    // ordinary variable piece, so both stay attached values.
+    let parser::Expr::Scalar(word) = expression else {
+        return false;
+    };
+    let Some(parser::WordPiece::Text {
+        text,
+        quote: parser::QuoteMode::Bare,
+        ..
+    }) = word.value.pieces.first()
+    else {
+        return false;
+    };
+    // The `=` ends the name, so anything after this piece is the option's value
+    // and may be quoted or expanded. Without one the name would run on into
+    // whatever follows, and only nothing may — which admits `--force` and the bare
+    // `--` terminator while refusing `--$name` and `--"force"`.
+    let name = text.split_once('=').map_or(text.as_str(), |(name, _)| name);
+    // Bare text is not automatically *literal* text: a glob is spelled in bare
+    // characters and resolved against the filesystem, so `f(--*)` picks its option
+    // from whatever files happen to sit in the working directory — a `--force` on
+    // disk turns it into the declared switch. That is the same data-decides-the-call
+    // reading as `--$name`, arriving through the one composition that needs no
+    // punctuation to mark it. Only the *name* is restricted: a glob after the `=`
+    // is an ordinary value, since it cannot change which option binds.
+    //
+    // `expand`'s own predicate rather than a second copy of the rule, so the two
+    // cannot drift: a metacharacter added there would otherwise leave this
+    // admitting a name the filesystem chooses. It asks whether the text *globs*,
+    // not merely whether it carries metacharacters — an unmatched `[` has the
+    // syntax but no pattern `glob` will accept, so `--bad[` is literally itself
+    // and stays the `unknown flag` the command spelling reports. Refusing on the
+    // characters alone turned that diagnostic into a silent positional.
+    //
+    // Both halves are asked, because either alone admits a word the other catches.
+    // The **whole word** has to glob for the filesystem to be consulted at all, and
+    // the **name** has to glob for what comes back to differ in the part that picks
+    // the option. `--fo*=bad[` has the second without the first: the unmatched `[`
+    // makes the complete word unglobbable, so it is the literal text written and
+    // can no more choose an option than `--bad[` can — refusing it on the name
+    // alone swallowed the `unknown flag --fo*` that command position reports.
+    //
+    // "Whole word" means every piece, not this first one: `--fo*=x$v[` closes
+    // nothing until its third piece, and reading only the first called it a glob.
+    // Interpolated pieces stand in as placeholders exactly as they do in
+    // [`expand::word_globs`], since a value is literal to expansion and cannot
+    // complete a class the bare text left open. Asking `expand` rather than
+    // rebuilding the test is the whole point — sharing half of it is what produced
+    // the two rounds before this one. All four raised in review.
+    let word_globs = expand::segments_glob(word.value.pieces.iter().map(|piece| match piece {
+        parser::WordPiece::Text {
+            text,
+            quote: parser::QuoteMode::Bare,
+            ..
+        } => (text.as_str(), true),
+        parser::WordPiece::Text { text, .. } => (text.as_str(), false),
+        parser::WordPiece::Variable { .. } | parser::WordPiece::Value { .. } => ("", false),
+    }));
+    text.starts_with("--")
+        && !(word_globs && expand::text_globs(name))
+        && (text.contains('=') || word.value.pieces.len() == 1)
 }
 
 /// Is `expression` a single unquoted literal word? Such an argument types like the

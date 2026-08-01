@@ -1908,7 +1908,7 @@ fn has_glob_meta(text: &str) -> bool {
 /// The one place the answer is decided, because [`expand_word`] and [`word_globs`]
 /// both need it and a word that expanded literally but was *called* a glob became a
 /// one-element list: `x = a[` bound `['a[']` where it had always bound the string.
-fn segments_glob<'a>(segments: impl Iterator<Item = (&'a str, bool)> + Clone) -> bool {
+pub(crate) fn segments_glob<'a>(segments: impl Iterator<Item = (&'a str, bool)> + Clone) -> bool {
     segments
         .clone()
         .any(|(text, expandable)| expandable && has_glob_meta(text))
@@ -1942,6 +1942,22 @@ pub(crate) fn word_globs(word: &Word) -> bool {
             Piece::Text { text, expandable } => (text.as_str(), *expandable),
             Piece::Var(_) | Piece::Value(_) => ("", false),
         }))
+}
+
+/// Would this text **glob** — carry glob syntax the expander can actually
+/// interpret, and so resolve against the filesystem rather than standing for
+/// itself?
+///
+/// One wholly expandable segment put to [`segments_glob`], so the value-call
+/// option scan and the expander cannot answer differently. Sharing the whole
+/// test rather than just the metacharacter set is the point: asking only
+/// `has_glob_meta` there refused a name that can never glob (`--bad[` is an
+/// unmatched class, so expansion keeps the literal) and silently turned an
+/// `unknown flag` into a positional. The scan needs exactly this distinction —
+/// a name the filesystem might choose (`--*`) against one that merely looks
+/// like it. Raised in review.
+pub(crate) fn text_globs(text: &str) -> bool {
+    segments_glob(std::iter::once((text, true)))
 }
 
 #[cfg(test)]

@@ -4,6 +4,31 @@ The working front — concrete, checkable tasks for the current and next
 milestone. The stable milestone arc is in [`ROADMAP.md`](ROADMAP.md); update this
 file as tasks land.
 
+## Decisions needing review
+
+Calls autopilot made without asking, each one chosen for being cheap to undo.
+Delete an entry once you have agreed with it or reversed it.
+
+- [ ] **#357 closed as superseded rather than rebased.** Both of its fixes had
+      landed on `main` by another route while it was open — the alias routing as
+      `0c00091`, the invalid-pattern fix as `9acae60` — with equivalent tests
+      under different names. Verified the branch is not an ancestor of `main`
+      first, so this is real overlap and not a merge already made. The
+      alternative was to rebase it and keep whatever remained; nothing remained.
+      *Reversible:* reopen the PR, the branch is untouched.
+- [ ] **`text_globs` defined in terms of `segments_glob`** when the two collided
+      in the 17 rebase, rather than kept as a second spelling of the same rule.
+      Both doc comments argued for one predicate, and half-sharing this rule is
+      what caused round 9 of that review. The alternative keeps them independent
+      and accepts the drift risk. *Reversible:* it is a one-line body.
+- [ ] **The glob-after-`=` follow-up was re-scoped, not fixed, inside 17.** The
+      rebase widened it (see the entry below), and fixing it there would have
+      reopened a nine-round review to settle a rule about what a dashed word
+      means once evaluated — which is the whole family's question, not that PR's.
+      Pinned by a test instead, so it cannot go quiet. The alternative was to
+      fold the fix in. *Reversible:* it is still an open entry with a failing-on-
+      fix test attached.
+
 ## M0 — It runs `ls` ✅ (done)
 
 - [x] Cargo workspace, edition 2024, MSRV 1.85, `rust-toolchain.toml`
@@ -2904,11 +2929,129 @@ thing a reader takes on trust.*
       has to be able to follow every component, so there is no partial answer to
       give — the same reason `:type` errors where the yes/no file tests answer
       `false`.
-- [ ] **17. A value call scans an argument by its *runtime* value.** `f($word)`
+- [x] **17. A value call scans an argument by its *runtime* value.** `f($word)`
       reports ``unknown flag `--sleep` `` when `$word` happens to hold
       `--sleep=0`, so data that merely looks like a flag cannot be passed to a
       plain `func` at all. This is 1 again, one level down: `wrapper func` fixed
       the *command* position, and a value call still has no equivalent.
+
+      **Fixed by asking the call site instead of the value.** Only a `--name`
+      written as a literal word where the call is written is an option; `f($w)`
+      and `f("--sleep=0")` hand over data. That is the "quoting makes a value"
+      rule every other position already follows, and it restores decidability —
+      what `f($w)` means is readable from the line rather than from what `$w`
+      turned out to hold.
+
+      Answered by a predicate of its own, `starts_with_bare_dashes`, and the
+      separation is load-bearing rather than incidental. `is_bare_literal_word`
+      answers a *different* question — how a bound value types, which is what
+      keeps `--n=2` an integer and `--n="2"` a string — and stays untouched.
+      Reusing it here was the first attempt and it broke every composed attached
+      value (`--tag="v2"`, `--tag=$w`), since those are not bare words as a whole
+      even though the `--tag=` the reader wrote is. The two questions look alike
+      and diverge exactly where it matters.
+
+      The rule the new predicate applies: an option is a `--name` **written at
+      the call site**, and the `=` is the boundary — the name must be literal
+      text, the value after it may be quoted, expanded or globbed. Three things
+      count as composing the name, all refused: another word piece
+      (`--$name`, `--"force"`), a postfix chain (`--FORCE:lower`, and
+      `--TAG=V9:lower` too, since a chain applies to the whole word and the `=`
+      does not stop it), and a name that **globs** (`--*`, which needs no
+      punctuation to mark it and so resolves against the filesystem).
+
+      "Globs" and not "contains a metacharacter": expansion only globs a pattern
+      `glob` accepts, so an unmatched `[` falls back to literal text and `--bad[`
+      is exactly the characters written — an unknown flag, as it is in command
+      position. Refusing on the characters alone turned that diagnostic into a
+      silent positional. `expand::text_globs` carries both halves so the scan and
+      the expander cannot drift apart.
+
+      **Spread stays scanned, deliberately.** `f(prod, ...$args)` still reads a
+      `--force` element as the option, because writing `...` is the explicit
+      "these are arguments, flags included" gesture — the channel a wrapper needs
+      to forward through. `f($w)` says "this is one value". Both readings stay
+      legible from the line, which is what the runtime scan cost.
+
+      One test moved rather than broke: a modifier-reference row asserted
+      ``$m("--x")`` was `unknown flag`. The bare spelling `$m(--x)` still is; the
+      quoted one is data now, and is asserted as such.
+      `repl.rs` `scan_call_value`.
+- [ ] **Command position scans a runtime value for flags too.** Found auditing
+      17: `f $w` with `$w` holding `--sleep=0` reports ``unknown flag `--sleep` ``
+      exactly as the value call did, so a plain `func` in command position still
+      cannot be handed flag-shaped data. `wrapper func` is the opt-in workaround
+      on the *callee* side, not a fix.
+
+      Left out of 17 on purpose, because the same move does not obviously
+      transfer. An **external** command genuinely cannot be fixed this way —
+      argv is bytes, and `curl $url` has to pass `--foo` if that is what `$url`
+      holds — so making a mesh `func` read its own position differently would
+      trade one inconsistency for another, between a func and an external
+      standing in the same place. Deciding it needs an answer to "is command
+      position argv-shaped or call-shaped for a func?", which is a design
+      question rather than a bug fix.
+- [ ] **A modifier on a dashed word applies to the whole word, so a value call
+      cannot use one on an option at all.** Found auditing 17. The underlying
+      behavior is **pre-existing** — a chain has always transformed the name
+      along with the value — but 17 changed what that costs, so the reproduction
+      below is the *current* one rather than the one that entry was opened with:
+
+      ```
+      w = v7
+      f(--tag=$w:upper)      # value:   --TAG=V7/none  — data, `tag` left at its default
+      f prod --tag=$w:upper  # command: prod/V7        — binds `--tag`
+      ```
+
+      Command position applies the chain to the **value** and binds the option.
+      A value call applies it to the **whole word**, which would rewrite the name
+      — `--tag=` becomes `--TAG=` — so 17 refuses a chained dashed word outright
+      rather than let a modifier choose which option binds. Correct as far as it
+      goes, but it leaves no value-call spelling for "this option, with a
+      transformed value": you have to bind first (`t = $w:upper`, then
+      `f(--tag=$t)`).
+
+      The command reading is the useful one — nobody writes a modifier meaning to
+      transform a flag's own name — so the fix is for a value call to attach the
+      chain to the part after the `=`, at which point 17's refusal can be relaxed
+      to match. Not folded into 17, which settles *whether* a token is an option
+      rather than what a modifier attaches to; that is the same question the
+      "Text glued to a bare value argument" loose end circles.
+- [ ] **A dashed word whose value globs stops being an option.**
+      Third of the same family, found in review on 17 and **pre-existing** —
+      reproduced on a binary built before that change. With `--tag=a.txt` on disk:
+
+      ```
+      f(--tag=*.txt)    # value:   tag=none, the pattern arrives as a positional
+      f --tag=*.txt     # command: tag=a.txt
+      ```
+
+      A glob evaluates to a `Value::List`, and `scan_call_value` only inspects
+      `Value::String`, so the list falls through to the positionals instead of
+      binding.
+
+      **Widened since it was written.** The entry originally said *multi-match*,
+      because at the time a single match collapsed to a scalar and bound normally,
+      so option-ness depended on how many files the pattern happened to match.
+      "Make a glob a list however many paths it matched" (bf79900) removed that
+      dependence — correctly, and for its own reasons — which also means **no**
+      glob after the `=` binds any more, single match included. Strictly less
+      surprising than before, since the answer no longer varies with the
+      directory, but it is now a plain divergence from the command spelling
+      rather than a cardinality quirk. Pinned by
+      `a_glob_after_the_option_separator_does_not_yet_bind_in_a_value_call` in
+      `crates/mesh/tests/cli.rs`, which flips to `tag=a.txt n=0` when this is
+      fixed.
+
+      All three entries here — this, the modifier one above, and the command
+      position one — are the same shape: a dashed word is classified from its
+      *text*, then evaluated, and evaluation can produce something the
+      classification did not anticipate. 17 closed the half where the answer must
+      not depend on runtime data at all; what is left is the half where a word
+      genuinely *is* an option and its evaluation yields a rewritten name, or a
+      list, or bytes that came from the filesystem. Worth one rule for "what a
+      dashed word means once evaluated" rather than three symptom fixes that
+      would each answer it differently.
 - [x] **18. A bare `...$list` in command position runs nothing.** `xs = [echo hi]`
       followed by `...$xs` produces no output and no error — the head has to be
       bound out and used as the command word. The condition half of this —
@@ -3474,6 +3617,11 @@ of each PR had landed by another route, but these pieces had not.
       - `new_foreground_job_does_not_receive_sigcont`, phase 27 — `exit` written,
         and the shell did not leave cleanly.
       - `notify_reaches_the_terminal_and_a_quick_command_does_not`.
+      - `new_foreground_job_does_not_receive_sigcont` again, phase **22**, on
+        mikelward/mesh#351 — a **new** phase for this test, so the `exit 0`
+        teardown fix above did not cover it and the family is not closed. Passed
+        three consecutive local runs and the branch touches only value-call
+        option scanning, so it is the runner rather than the change.
 
       The job-done one had the only cause already named — a 400ms sleep
       expecting a `sleep 0.2` job to have ended and a `sleep 0.7` job not to
