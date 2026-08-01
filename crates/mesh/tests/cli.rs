@@ -16730,6 +16730,36 @@ fn the_split_family_carries_two_letter_aliases() {
 }
 
 #[test]
+fn an_alias_splits_a_capture_exactly_as_its_long_name_does() {
+    // An alias is the same modifier, so it has to bind a capture's *raw* bytes too.
+    // Recognized by name, it did not: `:ns` took the value path and split output the
+    // default had already trimmed, so it dropped the trailing newline of a
+    // `-print0` name that `:nulls` keeps — the two spellings the reference calls
+    // equivalent disagreeing on the last field. Raised in review.
+    let dir = fresh_dir("alias_splits_a_capture");
+    let payload = dir.join("names");
+    std::fs::write(&payload, "we\nird\0plain\n\0").expect("write NUL-separated names");
+    let out = run_with_input(&format!(
+        "puts $(cat {0}):nulls:repr\nputs $(cat {0}):ns:repr\nputs $(printf \"a\\tb\\n\"):tabs:repr\nputs $(printf \"a\\tb\\n\"):ts:repr\n",
+        payload.display()
+    ));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(lines[0], lines[1], "`:ns` disagreed with `:nulls`");
+    assert_eq!(lines[2], lines[3], "`:ts` disagreed with `:tabs`");
+    // Named rather than only compared, so both agreeing on the *trimmed* answer
+    // would still fail: the newline is the byte the raw path exists to keep.
+    assert_eq!(lines[0], "['we\\nird', 'plain\\n']");
+    assert_eq!(lines[2], "['a', 'b\\n']");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn a_split_modifier_binds_the_captures_raw_bytes() {
     // `DESIGN.md` §"Command substitution": a split modifier *replaces* a capture's
     // default handling rather than running after it, so it sees the bytes the
