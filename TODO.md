@@ -4415,6 +4415,30 @@ a one-line edit. Every claim below was checked against the built shell.
       `modifier :lines is not implemented yet`). Landing the split is what makes
       `:raw` mean anything, since `:raw` is defined as the member that turns it
       off.
+
+      **The default was re-opened and confirmed: newlines.** The alternative on
+      the table was *no* split — `$(cmd)` stays one string, lists only ever on
+      request — which the scalar-heavy evidence genuinely supports: across this
+      repo's docs the scalar captures (`$(pwd)`, `$(hostname)`,
+      `$(vcs prompt-info)`, `$(id -un)`, `$(git branch --show-current)`)
+      outnumber the list-wanting ones (`$(ls)`, `$(seq …)`) by several times over,
+      and today a one-element list is not a near-miss for a
+      string but a cliff: `xs = ["/tmp"]; puts "at $xs now"` is an error
+      (``list value needs `...` in command arguments``) and `$xs == "/tmp"` is
+      `false`. That cost is knowingly accepted. What decides it is the asymmetry
+      of the failure, not the frequency: wanting a scalar and getting a list is
+      *loud* and the fix is two characters (`"$(cmd)"`), while wanting lines and
+      getting a blob is *silent* — exactly the `for line in $(…)` wrong answer
+      this entry is about. See `DESIGN.md` §"Command substitution" for the
+      written-up decision.
+  - [ ] **`:nulls` splits on NUL only — never on both.** Recorded here because
+        it is the easy thing to get wrong when the split lands: the tempting
+        implementation applies the default newline split first and then hands the
+        pieces to the modifier, which tears exactly the filenames `find -print0`
+        exists to protect. A split modifier **replaces** the default and runs
+        against the raw capture bytes; the same holds for `:tabs`, `:words` and
+        `:split(SEP)`. `:lines` is the explicit spelling of the default, not a
+        second pass over it.
 - [x] **Reserve only bare `_` as discard, allow `_name`.** Today a name must
       start with a letter, so a leading underscore is rejected wholesale (`_` and
       `_x` alike) — `_` is the discard pattern (`DESIGN.md`). Reconsider narrowing

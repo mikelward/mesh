@@ -622,7 +622,11 @@ puts "$(id -un)@$(hostname)"     # glue it to text by quoting the whole word
 
 - **Trailing newlines are trimmed**, all of them; interior ones are kept, so
   `$(printf "a\nb\n")` is the two-line string `a\nb` and not a list. Split it
-  when you want the lines (`lines = $(cat log):split("\n")`).
+  when you want the lines (`lines = $(cat log):split("\n")`). *This is the
+  interim shape, not the settled one:* `DESIGN.md` §"Command substitution" makes
+  the default a **newline split into a list**, with `"$(cmd)"` the one-string
+  form, so `for line in $(…)` today runs once over the whole blob rather than
+  per line. Write the `:split("\n")` above until that lands.
 - **Only stdout is captured.** The command's stderr goes where the shell's does,
   so a diagnostic still reaches the terminal instead of ending up in the value.
 - **The result is one literal value** — never re-split on spaces, never re-globbed

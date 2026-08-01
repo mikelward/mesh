@@ -139,8 +139,24 @@ classic word-splitting footgun. But it is only the default: a split modifier
 **replaces** it and runs against the raw capture (see [Modifiers](#modifiers)),
 so the default split never destroys bytes that an explicit splitter needs. In
 particular, splitting is applied *once*, not layered on top of the newline
-split — `:nulls` sees the raw output (so `find -print0` filenames containing
-newlines survive), and `:raw` keeps the trailing newline the default would trim.
+split — `:nulls` splits on NUL and **nothing else**, seeing the raw output (so
+`find -print0` filenames containing newlines survive intact rather than being
+torn in half by a newline split that already ran), and `:raw` keeps the trailing
+newline the default would trim.
+
+**A no-split default was considered and rejected.** The tally in this repo's own
+docs leans scalar — `$(pwd)`, `$(hostname)`, `$(id -un)`,
+`$(git branch --show-current)` outnumber the list-wanting uses several times
+over — and a list default does tax that case: a one-element list neither
+interpolates into `"…"` nor compares equal to the string it holds, so
+`p = $(pwd)` is a cliff rather than a nudge. The cost is accepted because the
+scalar escape is **quoting** — `"$(cmd)"`, two characters, a spelling shell users
+already reach for — whereas the opposite default puts the burden on
+`for line in $(…)`, which is the case that goes silently *wrong* rather than
+loudly awkward when it gets the other shape. That asymmetry, not the raw
+frequency, is what decides it. It is also why this is not fish's
+`| string collect` (see [Footguns we avoid](#fish)): the escape there is a
+pipeline, here it is a quote.
 
 ### Modifiers
 
@@ -226,7 +242,7 @@ byte capture and replace the default newline split:
 ```
 $(cmd):lines        # split raw bytes on newlines (explicit form of the default)
 $(cmd):words        # split on whitespace runs (opt-in; the old IFS behavior)
-$(cmd):nulls        # split on NUL   (find -print0 / xargs -0; newline-safe)
+$(cmd):nulls        # split on NUL *only* (find -print0 / xargs -0; newline-safe)
 $(cmd):tabs         # split on tab   (TSV)
 $(cmd):raw          # no split; raw bytes including the trailing newline
 $(cmd):split(":")    # split on an arbitrary separator
@@ -5095,12 +5111,14 @@ to avoid" rather than promising the latter as done.
   **explicit and stable**, and makes the **list-vs-scalar choice part of the
   capture** rather than a post-hoc rescue: `$(cmd)` is a list (default newline
   split, opt-in `:words` / `:nulls` / `:tabs` / `:split`, a defined
-  [trailing-empty-field rule](#modifiers)), and `$(cmd):raw` is one string. You ask
-  for the shape you want up front, so a value is never auto-split against your
-  intent and then un-split with `string collect`. The empty cases are each clean
-  and stated ([Modifiers](#modifiers)): an empty list capture is `[]`, and an empty
-  `:raw` (scalar) capture is `""` — [no null](#variables-and-assignment) either
-  way, so neither needs a guard.
+  [trailing-empty-field rule](#modifiers)), and `"$(cmd)"` is one string — quoting,
+  not a rescue pipeline, is how you ask for a scalar, with `$(cmd):raw` the
+  variant that also keeps the trailing newline. You ask for the shape you want up
+  front, so a value is never auto-split against your intent and then un-split with
+  `string collect`. The empty cases are each clean and stated
+  ([Modifiers](#modifiers)): an empty list capture is `[]`, and an empty scalar
+  capture is `""` — [no null](#variables-and-assignment) either way, so neither
+  needs a guard.
 - **Non-POSIX breaks muscle memory.** fish dropped `$(...)`, `&&` / `||` (for
   years), `export`, and more, so familiar reflexes stop working. mesh keeps the
   POSIX **spine** — `$()`, `&&` / `||`, `~`, redirection — so those reflexes
