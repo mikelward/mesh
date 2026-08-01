@@ -104,10 +104,41 @@ fn split_path(raw: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Names the process environment cannot hold, reported rather than hit.
+///
+/// `set_var` **panics** on an empty key, a `=` in one, or a NUL — they are
+/// `EINVAL` at the syscall, and `std` turns that into an abort. A
+/// literal `$env.KEY` could never reach them, since the parser proved it a
+/// `valid_name` first; a computed `$env[$name]` is the first key a *user* supplies
+/// that is only known at run time, so this is where it gets checked.
+///
+/// It checks only what actually panics, deliberately, rather than re-applying
+/// `valid_name`: `$env:keys` answers with every name the process really has, so a
+/// round trip over them (`for k in $env:keys { $env[$k] = … }`) must not fail on a
+/// name that mesh's own grammar could not spell.
+fn check_key(key: &str) -> Result<(), String> {
+    let problem = if key.is_empty() {
+        "be empty"
+    } else if key.contains('=') {
+        "contain `=`"
+    } else if key.contains('\0') {
+        "contain a NUL byte"
+    } else {
+        return Ok(());
+    };
+    // Debug-quoted, so an empty name is visible and a NUL is spelled rather than
+    // written into the diagnostic as itself.
+    Err(format!(
+        "$env[{key:?}]: an environment name cannot {problem}"
+    ))
+}
+
 /// Write `$env.KEY`, appending to the current value when `append`.
 ///
-/// Returns the message to report when the value cannot cross the boundary.
+/// Returns the message to report when the name or the value cannot cross the
+/// boundary.
 pub(crate) fn write(key: &str, value: Value, append: bool) -> Result<(), String> {
+    check_key(key)?;
     let value = if append {
         append_bytes(key, value)?
     } else {
@@ -270,6 +301,28 @@ mod tests {
         // Case matters: the environment is case-sensitive, so `Path` is a
         // different, ordinary variable.
         assert!(!is_path_var("Path"));
+    }
+
+    /// The three names `set_var` aborts on. A literal `$env.KEY`
+    /// could never carry one — the parser proved it a name first — so this guard
+    /// exists for the computed `$env[$n]`, whose key is a run-time value.
+    #[test]
+    fn a_name_the_process_cannot_hold_is_an_error_not_a_panic() {
+        for (key, expected) in [
+            ("", "cannot be empty"),
+            ("A=B", "cannot contain `=`"),
+            ("A\0B", "cannot contain a NUL byte"),
+        ] {
+            let error = check_key(key).unwrap_err();
+            assert!(error.contains(expected), "{key:?} gave {error}");
+        }
+
+        // Only those three. A name mesh's own grammar could not spell still
+        // passes, because `$env:keys` can answer with one and a round trip over
+        // the listing has to be able to write what it read.
+        for key in ["PATH", "MY-VAR", "MY VAR", "lower", "1LEADING"] {
+            assert!(check_key(key).is_ok(), "{key:?}");
+        }
     }
 
     /// A listing is built from the pairs it was handed, so an entry whose **name**

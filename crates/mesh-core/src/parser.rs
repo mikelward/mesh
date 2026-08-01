@@ -523,6 +523,20 @@ pub enum AndOrOp {
     Or,
 }
 
+/// Which entry an `$env` write or removal names.
+///
+/// The two spellings the environment has as a *place*, kept in one type so a
+/// write and a removal cannot disagree about what `$env[…]` means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvKey {
+    /// `$env.KEY` — spelled out, and checked by the parser.
+    Literal(String),
+    /// `$env[…]` — the raw subscript text, resolved to a name at run time by the
+    /// same `subscript_key` a read goes through, so `$env[$n] = v` writes exactly
+    /// the entry `$env[$n]` reads.
+    Computed(String),
+}
+
 /// One thing an `unset` names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnsetTarget {
@@ -564,13 +578,13 @@ pub enum Executable {
         targets: Vec<UnsetTarget>,
         global: bool,
     },
-    /// `$env.KEY = value` — a write to the process environment rather than to a
-    /// mesh binding. Separate from [`Executable::MemberAssignment`] because `$env`
-    /// is a reserved namespace whose entries are bytes, not typed values: only
-    /// strings cross, and the write reaches the real environment so children
-    /// inherit it.
+    /// `$env.KEY = value`, `$env[$name] = value` — a write to the process
+    /// environment rather than to a mesh binding. Separate from
+    /// [`Executable::MemberAssignment`] because `$env` is a reserved namespace
+    /// whose entries are bytes, not typed values: only strings cross, and the
+    /// write reaches the real environment so children inherit it.
     EnvAssignment {
-        key: String,
+        key: EnvKey,
         append: bool,
         value: Expr,
     },
@@ -3864,18 +3878,27 @@ impl Parser<'_> {
         })
     }
 
-    /// A bare `$env.KEY` in assignment position, consumed on a match.
+    /// A bare `$env.KEY` or `$env[…]` in assignment position, consumed on a match.
     ///
-    /// Only a plain member is a place you can assign: `$env` alone names the
-    /// whole namespace, and an index, slice, or modifier (`$env.PATH:dedup`)
-    /// describes a derived value rather than a variable, so none of them is an
-    /// assignment target. Those fall through and parse as ordinary expressions,
-    /// which is where their real error message comes from.
+    /// **Exactly one access.** `$env` alone names the whole namespace, and a
+    /// second access or a modifier (`$env.PATH[0]`, `$env.PATH:dedup`) describes a
+    /// derived value rather than a place, so none of them is a target. Those fall
+    /// through and parse as ordinary expressions, which is where their real error
+    /// message comes from.
     ///
-    /// The key is checked with the same rule reads use, so anything spellable as
-    /// `$env.KEY` is also assignable — including a kebab name like
-    /// `$env.MY-VAR`, which the environment permits and mesh can read.
-    fn env_target(&mut self) -> Option<String> {
+    /// A **member** is checked here with the same rule reads use, so anything
+    /// spellable as `$env.KEY` is also assignable — including a kebab name like
+    /// `$env.MY-VAR`, which the environment permits and mesh can read. A
+    /// **subscript** names the entry its text resolves to, which is only known
+    /// once it is evaluated, so the text rides along and `environ` does the
+    /// checking. That is what gives the computed read `$env[$name]` a writing
+    /// twin.
+    ///
+    /// A subscript holding `..` is refused, because that is how
+    /// `expansion_variable` tells a slice from a key: a slice names a copy of a
+    /// run of entries, not a place. It costs a literal key that contains `..`,
+    /// which the read side cannot spell either.
+    fn env_target(&mut self) -> Option<EnvKey> {
         let TokenKind::Word(word) = &self.peek()?.value else {
             return None;
         };
@@ -3888,14 +3911,25 @@ impl Parser<'_> {
         else {
             return None;
         };
-        let key = name.strip_prefix("$env.").or_else(|| {
-            name.strip_prefix("${env.")
-                .and_then(|k| k.strip_suffix('}'))
-        })?;
-        if !valid_name(key) {
+        let rest = name
+            .strip_prefix("${")
+            .and_then(|value| value.strip_suffix('}'))
+            .or_else(|| name.strip_prefix('$'))?
+            .strip_prefix("env")?;
+        let key = if let Some(member) = rest.strip_prefix('.') {
+            if !valid_name(member) {
+                return None;
+            }
+            EnvKey::Literal(member.to_owned())
+        } else if rest.starts_with('[') && subscript_end(rest) == Some(rest.len()) {
+            let subscript = &rest[1..rest.len() - 1];
+            if subscript.contains("..") {
+                return None;
+            }
+            EnvKey::Computed(subscript.to_owned())
+        } else {
             return None;
-        }
-        let key = key.to_owned();
+        };
         self.next();
         Some(key)
     }
@@ -5762,7 +5796,11 @@ impl Parser<'_> {
             self.expect(&TokenKind::Equal, "`=`")?;
         }
         let value = self.expression()?;
-        Ok(Executable::EnvAssignment { key, append, value })
+        Ok(Executable::EnvAssignment {
+            key: EnvKey::Literal(key),
+            append,
+            value,
+        })
     }
 
     fn unset(&mut self, global: bool) -> Result<Executable, ParseError> {
@@ -7212,6 +7250,47 @@ mod tests {
             complete("$env.HOME = /tmp").statements[0].and_or.first,
             Executable::EnvAssignment { .. }
         ));
+    }
+
+    /// Both `$env` places, and the shapes that are not one. A computed key is
+    /// carried as its raw subscript text, because which entry it names is a
+    /// run-time question — the same one the matching *read* asks.
+    #[test]
+    fn an_env_place_is_a_member_or_one_subscript() {
+        for (source, expected) in [
+            ("$env.HOME = /tmp", EnvKey::Literal("HOME".into())),
+            ("${env.MY-VAR} = x", EnvKey::Literal("MY-VAR".into())),
+            ("export HOME = /tmp", EnvKey::Literal("HOME".into())),
+            ("$env[$n] = x", EnvKey::Computed("$n".into())),
+            ("$env[\"HOME\"] = x", EnvKey::Computed("\"HOME\"".into())),
+            ("${env[$n]} += x", EnvKey::Computed("$n".into())),
+        ] {
+            let Executable::EnvAssignment { key, .. } =
+                &complete(source).statements[0].and_or.first
+            else {
+                panic!("expected an environment assignment for {source}");
+            };
+            assert_eq!(key, &expected, "{source}");
+        }
+
+        // Not places: a second access, a modifier, and a slice — each describes a
+        // derived value, and the environment has nothing inside an entry to reach
+        // into. They fall through to the expression parser, whose own error is the
+        // one worth reporting.
+        for source in [
+            "$env.PATH[0] = /x",
+            "$env.PATH:dedup = x",
+            "$env[$n][0] = x",
+            "$env[0..2] = x",
+            "$env = x",
+        ] {
+            let parsed_as_env = matches!(parse(source), Ok(ParseOutcome::Complete(tree))
+                if matches!(tree.statements[0].and_or.first, Executable::EnvAssignment { .. }));
+            assert!(
+                !parsed_as_env,
+                "{source} parsed as an environment assignment"
+            );
+        }
     }
 
     /// One word, two readings, and the operand decides which: `not` before a value is
