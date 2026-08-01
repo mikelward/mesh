@@ -859,6 +859,78 @@ than the string the argv boundary would have produced.
       `puts $xs`, `puts $xs > out` and `puts $xs | cat` agree. Only a word ordinary
       expansion *cannot* render takes the typed route — value typing reads a bare
       literal as a number, and `puts 007` has to print `007`.
+- [ ] **Render a value with no literal form usefully, not merely by shape.**
+      The *shape* is already available — `type` reports `a function`,
+      `a job handle`, `a stream handle` for a bound one. What is missing is
+      anything more informative than that, and any way to get it out of a
+      **collection**: `puts $sh.stdin` refuses, `$sh.stdin:repr` refuses, and a
+      map holding a job handle is unprintable by both — so this is not about
+      functions, and the task is a detailed renderer rather than a second
+      shape display. The concrete case is a hook
+      map once handlers become callables (`docs/HOOKS.md` D1) — though the gap
+      there is narrower than the whole map: `$sh.<event>:keys` keeps working,
+      since `:keys` consumes only keys and never renders a value, and `DESIGN.md`
+      names `$sh.preprompt:keys` as the introspection surface. So the *identities*
+      stay visible and it is the **handlers** that go dark. For hooks that is the
+      lesser half — a key is what you remove or replace by — which is part of why
+      this is worth doing but not urgent.
+
+      The `str`/`repr` split itself is built and settled. `puts` shows how a
+      collection *reads*; `:repr` writes the mesh source you would have typed and
+      recurses into elements, so `["a\nb", "c"]:repr` is `['a\nb', 'c']` where
+      `puts` gives three ambiguous lines.
+
+      **Preference recorded: usefulness over round-trip.** Being able to see a
+      job or a function matters more than the guarantee that everything printed
+      reads back. Three ways to get there, and the cost differs:
+
+  - [ ] **Relax `:repr`** to write a `<…>` shape where there is no literal.
+        Simplest to use — one thing to reach for — but it retires a stated
+        promise: `docs/REFERENCE.md` says "whatever `:repr` returns, reading it
+        back gives the same value", and names elision as "the one thing `:repr`
+        must not do". The blast radius is **two** callers, not one: `:repr`
+        itself (`expand.rs`) and `whence::detail` (`whence.rs`), which builds
+        `type`'s detail line and today falls back to the bare shape when there is
+        no literal — so relaxing the writer would silently turn `a function` into
+        `a function: <func …>`. Decide whether that is wanted or whether the new
+        rendering needs its own path leaving `to_literal` exact.
+
+        **And there is a third dependency, deferred rather than absent.**
+        `DESIGN.md` says of `:repr`, in the same sentence that forbids
+        approximation, "it is the writer half of the **subshell value channel**",
+        and §"Isolation and subshells" keeps that channel open with mesh's own
+        literal syntax as its appealing encoding — the child writes the value as
+        the text you would have typed, the parent reads it back. Today's
+        `fork { … }` yields only a status, so nothing depends on the guarantee
+        *yet*; but a lossy `<…>` cannot be reconstructed, so relaxing the writer
+        forecloses that design rather than merely retiring a promise. Superseding
+        it is a legitimate choice — it is not decided either — but it has to be
+        made deliberately and not as a side effect.
+  - [ ] **A second modifier** — `:show` — leaving `:repr` exact. Two things to
+        explain, but each keeps one promise, and `:show` can recurse as `:show`
+        the way `:repr` recurses as `:repr`.
+  - [ ] **Reach `type`'s output as a value.** Cheapest in *new concepts*, but
+        not as cheap as it looks, and an earlier revision oversold it. `type`
+        computes a signature only for a **named** entry in `Funcs`
+        (`whence::signature`); a bound `Value::Function` falls through to
+        `shape` and yields the bare `a function`:
+
+        ```text
+        func greet(name, loud = false) { … } ; type greet  → func greet(name, loud = …)
+        f = func(x, y) { … }                 ; type f      → a function
+        ```
+
+        A hook map holds the *values*, so exposing today's machinery would
+        describe every handler as `a function` and be no more useful than the
+        shape already is. This route needs a `FuncValue` renderer — and one that
+        recurses into collections — before it is worth anything, which is most
+        of the work the other two routes also need. What it saves is the new
+        surface, not the implementation.
+
+      Whichever is chosen, one thing must hold: a description must not make the
+      value **bytes**. `puts` refusing a function is what stops a lambda reaching
+      argv or `$env.*`, and that refusal should survive any of these.
+
 - [x] **One flag rule for builtins and functions.** Settled: builtins parse flags —
       several must, since `kill -9`, `disown -a`, `prompt --reset` and
       `on --remove` are their spellings — and `DESIGN.md`'s "`puts` takes no
