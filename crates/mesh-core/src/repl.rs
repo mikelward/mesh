@@ -2804,7 +2804,24 @@ fn iteration_values(value: Value, binding_count: usize) -> Result<Vec<Vec<Value>
         (Value::Map(_), _) => Err("map iteration requires `for key, value in map`".into()),
         (_, 2) => Err("two loop bindings require a map value".into()),
         (Value::List(values), 1) => Ok(values.into_iter().map(|value| vec![value]).collect()),
-        (value, 1) => Ok(vec![vec![value]]),
+        // A scalar is **refused** rather than run once. Running once is what makes
+        // a line loop over text a silent wrong answer — `for line in $text` looks
+        // like it iterates lines and instead binds the whole blob — and that is the
+        // one shape in the language where getting a list wrong says nothing. Every
+        // other boundary is already loud: argv, interpolation and list-pattern
+        // binding all refuse the wrong shape, and a map refuses a single binder
+        // just above. `[…]` is the one-element spelling, and it reads as one.
+        (value, 1) => {
+            let kind = value_kind(&value);
+            let split = if matches!(value, Value::String(_)) {
+                ", or `:lines` to iterate its lines"
+            } else {
+                ""
+            };
+            Err(format!(
+                "a loop needs a list, not {kind}; write `[…]` to iterate one value{split}"
+            ))
+        }
         (_, _) => Err("a loop requires one binding, or two bindings for a map".into()),
     }
 }

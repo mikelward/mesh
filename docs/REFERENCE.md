@@ -2762,9 +2762,22 @@ bindings are rejected before any value is committed.
 
 ## Loops
 
-`for name in value { body }` runs the body once for each top-level list element or
-expanded word. An element containing whitespace remains one value when read
-through `$name`; braces may span lines. Empty lists run the body zero times.
+`for name in list { body }` runs the body once for each top-level element. An
+element containing whitespace remains one value when read through `$name`;
+braces may span lines. Empty lists run the body zero times.
+
+A value that is **not a list is refused**, rather than run once — that is what
+made `for line in $text` a silent wrong answer, binding the whole blob while
+reading as though it iterated lines. The diagnostic names both fixes, since
+which one is meant depends on what the string holds:
+
+```mesh
+for x in [$s] { … }        # one value, iterated once
+for x in $s:lines { … }    # its lines
+```
+
+Globs, ranges, `$sh.args` and any bound list are already lists and are
+unaffected — a glob is a list however many paths it matched.
 Bounded integer ranges use the same half-open/inclusive spelling as slices, and
 ordered maps use two binders and retain insertion order:
 
