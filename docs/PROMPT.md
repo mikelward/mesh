@@ -14,7 +14,7 @@ real prompt.
 
 ## What it renders
 
-```
+```text
 took 3s
 ──────────────────────────────────────────────────────────────
 mikel@host ~/src/mesh main
@@ -28,7 +28,7 @@ something to say.
 
 ## `rc.mesh`
 
-```
+```mesh
 # Record each command's run time — the shell measures it and hands a `Duration`
 # to postexec; we just stash it so the prompt can say "took 3s". Side effects like
 # this live in hooks; the prompt segments below stay pure renderers.

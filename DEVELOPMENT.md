@@ -115,6 +115,7 @@ Two layers, both run by `cargo test --workspace`:
 ```sh
 cargo test --workspace          # everything
 cargo test -p mesh --test cli   # just the end-to-end (integration) tests
+cargo test -p mesh --test docs  # just the documentation examples
 ```
 
 Convention (from `AGENTS.md`): **a change isn't done until it's covered.** When
@@ -164,7 +165,8 @@ mesh/
 │   ├── mesh/               # thin shell executable
 │   │   ├── Cargo.toml
 │   │   ├── src/main.rs     # calls mesh_core::run
-│   │   └── tests/cli.rs    # end-to-end tests driving the built binary
+│   │   ├── tests/cli.rs    # end-to-end tests driving the built binary
+│   │   └── tests/docs.rs   # parses every mesh example in the documentation
 │   ├── mesh-core/          # reusable shell implementation
 │   │   ├── Cargo.toml
 │   │   ├── src/

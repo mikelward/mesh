@@ -26,7 +26,7 @@ manifest with no package of its own. A bare `cargo install` — which installs t
 current directory, like `cargo install --path .` — therefore fails from the root
 with:
 
-```
+```text
 error: found a virtual manifest instead of a package manifest
 ```
 
