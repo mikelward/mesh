@@ -1,20 +1,23 @@
 # The hook registry: what exists, and what to decide
 
 `DESIGN.md` §"Hooks and the prompt" specifies hooks as **insertion-ordered maps
-of named callables** — `$sh.preprompt.git = …`. What is built is a builtin,
-`on EVENT NAME FUNCTION`, over a flat list. The two are meant to be the same
-registry seen from two angles, and nothing has yet had to reconcile them.
+of named callables** — `$sh.preprompt.git = …`. What was built first was a
+builtin, `on EVENT NAME FUNCTION`, over a flat list. The two are meant to be the
+same registry seen from two angles, and nothing had yet had to reconcile them.
 
 This document works out what reconciling them costs. It was written after the
 `exit` hook was extended to every exit path, and after the question of how
 signal handlers should be spelled came up — both of which push on the same seam.
+D4, the reconciliation itself, has since been taken.
 
 No decision below gates another; a couple are merely cheaper taken early, and
 [Suggested order](#suggested-order) says which and why.
 
-Nothing here is decided. Each section ends with a lean, not a ruling. The
-checkable list this produced lives in [`TODO.md`](../TODO.md) under
-"Beyond M3 — The environment" and "Beyond M3 — External tool integration".
+**D4 has since been decided and built** — the map surface is a view over one
+store; see that section for what shipped. The other five are still open, and each
+of those sections ends with a lean rather than a ruling. The checkable list this
+produced lives in [`TODO.md`](../TODO.md) under "Beyond M3 — The environment" and
+"Beyond M3 — External tool integration".
 
 As in [`INTEGRATION.md`](INTEGRATION.md), every "today" claim below was run
 against a built `mesh`, and every error message is the shell's own rather than a
@@ -24,17 +27,22 @@ reading of the source.
 
 ## What exists today
 
-One surface: the `on` builtin.
+Two surfaces over one store — the `on` builtin, and the `$sh.<event>` map D4
+added.
 
 ```mesh
 func arrived(from) { puts "now in $(pwd)" }
 on postcd trace arrived        # EVENT NAME FUNCTION
 on --remove postcd trace
+
+$sh.postcd.trace = arrived     # the same write
+unset $sh.postcd.trace         # the same removal
 ```
 
 Seven events, a closed set — `preprompt`, `preexec`, `postexec`, `precd`,
 `postcd`, `jobdone`, `exit`. Storage is a flat `Vec<Hook>`, where
-`Hook { event, name, function: String }` lives on `PromptConfig`.
+`Hook { event, name, function: String }` lives in `Hooks` on `Vars`; the map a
+read sees is rebuilt from it per access.
 
 Five behaviors are already right, and are the ones worth not losing:
 
@@ -53,17 +61,18 @@ eager.
 ## What `DESIGN.md` promises that is not built
 
 ```mesh
-$sh.preprompt.git = …                       # the map surface — no $sh.preprompt exists
-$sh.postcd.fetch = func() { vcs auto-fetch & }   # a callable as the value
-$sh.signal.INT.note = func() { … }          # signals, nested under `signal`
-unset $sh.preprompt.jobs                    # removal by unset
+$sh.preprompt.git = …                       # the map surface — built (D4)
+$sh.postcd.fetch = func() { vcs auto-fetch & }   # a callable as the value — not built
+$sh.signal.INT.note = func() { … }          # signals, nested under `signal` — not built
+unset $sh.preprompt.jobs                    # removal by unset — built (D4)
 ```
 
-Three gaps, each verified:
+Two gaps left, each verified:
 
-- **No map surface.** `puts $sh.preprompt` → ``mesh: $sh: no `preprompt` in this map``.
 - **No callable values.** `on exit e func(s) { … }` → `mesh: a function value has
-  no text form`. The stored handler is a `String`.
+  no text form`, and `$sh.exit.e = func() { }` → ``mesh: $sh.exit.e: a handler is
+  a function's name; a callable value is not stored yet``. The stored handler is
+  a `String`.
 - **No commands as handlers.** `on exit e echo` → ``mesh: on: `echo` is not a
   function``, though `DESIGN.md` says "a command name or a callable".
 
@@ -262,52 +271,72 @@ represents today's `Vec` exactly.
 is added beside the list rather than over it. The failure mode is drift: a hook
 registered one way and removed the other.
 
-**Lean: (a), emphatically** — and the reason to write it down now is that (a) is
-nearly free today and gets harder with every feature that reads
-`shell.prompt.hooks` directly.
+**Decided: (a), and built.** `$sh.<event>` is a view over the one store; `on
+EVENT NAME FUNCTION` and `$sh.<event>.NAME = FUNCTION` are the same write, and
+`unset $sh.<event>.NAME` is `on --remove EVENT NAME`. Documented under
+[Custom prompts and hooks](REFERENCE.md#custom-prompts-and-hooks); the anti-drift
+property is tested in **both** directions, since drift is the failure mode.
 
-**What (a) actually requires: one *authority*, not one location.** Hooks live on
+**What (a) actually required: one *authority*, not one location.** Hooks lived on
 `Shell::prompt.hooks` in `repl.rs` while `$sh` is built in `vars.rs`, so
-`shell_namespace()` cannot currently see them — but that is a plumbing problem,
-not an ownership one, and an earlier revision of this section wrongly concluded
-the store had to move onto `Vars`.
+`shell_namespace()` could not see them — but that was a plumbing problem, not an
+ownership one, and an earlier revision of this section wrongly concluded the
+store *had* to move onto `Vars`.
 
 A snapshot is not a second store. `shell_namespace()` already rebuilds an
 ephemeral map on every read — `$sh.options` included, whose authority is the
-`Options` on `Vars` — so a `$sh.<event>` map rebuilt from `shell.prompt.hooks`
-on each read, with writes and removals mutating that same vector, is (a) with no
-relocation at all. The namespace builder just has to be *given* the hooks, or
-move up to a `Shell`-level adapter that has both.
+`Options` on `Vars` — so a `$sh.<event>` map rebuilt from the hook list on each
+read, with writes and removals mutating that same vector, is (a) wherever the
+vector lives. The namespace builder just has to be *given* the hooks.
 
-What makes it (b) is a snapshot that becomes **authoritative** — written to
-directly, or rebuilt only sometimes — so that the two copies can disagree. That
-is the thing to design out, and it is cheaper than moving state.
+Giving it them is what the store move settled, and the choice was between two
+plumbings rather than between one store and two. `$sh` is resolved in
+`expand::resolve_value`, deep in expansion, holding only `&Vars`: reaching the
+hooks from there meant either moving them onto `Vars` — a field, two accessors,
+and seven call sites in `repl.rs` — or threading a second parameter through the
+~10 `vars: &Vars` signatures in `expand.rs` and their callers. The move is the
+smaller change, and it puts the hooks beside `Options`, which is already there
+for the same reason.
 
-The rest is then the shape `$sh.options` already has, and the refusals matter as
-much as the writes:
+What would have made it (b) is a snapshot that became **authoritative** — written
+to directly, or rebuilt only sometimes — so that two copies could disagree. That
+is the thing designed out: `Hooks` is the only mutable state, and the map is
+built from it per read.
 
-| | `$sh.options` today | `$sh.<event>` |
+The rest is the shape `$sh.options` already had, and the refusals matter as much
+as the writes:
+
+| | `$sh.options` | `$sh.<event>` |
 | --- | --- | --- |
-| whole-map assign | refused: *"assign one setting at a time"* | refuse likewise |
-| one key | assigns that setting | register, replacing in place |
+| whole-map assign | refused: *"assign one setting at a time"* | refused: *"assign one handler at a time"* |
+| one key | assigns that setting | registers, replacing in place |
 | deeper | refused | refused — `$sh.exit.k.member` reaches *inside a handler* |
-| removal | — | `unset`, the `on --remove` spelling |
+| `+=` | refused | refused — a name is replaced, not combined |
+| removal | refused: the key set is fixed | `unset`, the `on --remove` spelling |
 
 Refusing `$sh.exit = [ … ]` is the important one: a map literal that omits a key
 would have to mean either "leave it" or "remove it", and a config that guessed
 wrong would silently drop every other handler for that event — the composition
 property the keying exists to protect.
 
+Two smaller things fell out of building it. A map is present for **every** event
+from the start, so `$sh.exit.k = f` has somewhere to land and `$sh.preprompt:len`
+answers `0` rather than failing before anything is registered. And the map path
+makes the **same** validity check the builtin does — a name absent from `Funcs`
+is refused either way — because a handler one surface would reject must not be
+admissible through the other, or "one registry" is true of the storage and false
+of what may enter it.
+
 The deeper refusal is for a reason of its own, and not D5's: `$sh.exit.k.member`
 is reaching *inside a handler value*, which has no members to reach. D5's nested
 shape is the different path `$sh.signal.<NAME>.<key>`, and the two do not
 constrain each other.
 
-**Not blocked by D1.** Handlers are `String`s today, so a map view over them
-prints fine, and `$sh.exit:repr` writes back as source. Both stop working once
-values are callables: `puts` refuses a function, and `:repr` refuses it too and
-*should* — a lambda has no literal form, and `:repr`'s guarantee is that what it
-returns reads back.
+**Was not blocked by D1**, and shipping it first bore that out. Handlers are
+`String`s, so a map view over them prints fine and `$sh.exit:repr` writes back as
+source (`['e': 'bye']`). Both stop working once values are callables: `puts`
+refuses a function, and `:repr` refuses it too and *should* — a lambda has no
+literal form, and `:repr`'s guarantee is that what it returns reads back.
 
 What survives either way is `$sh.<event>:keys`, which never touches a value, so
 the **identities** stay listable and it is the handlers that go dark. Rendering
@@ -443,13 +472,15 @@ D4 or the callable case became a breaking change; that was wrong, for the reason
 D1 now gives, and the correction is the useful part — none of these six is a
 gate on the others, so they can be taken in whatever order suits.
 
+**D4 was taken first**, against the order below, and nothing about D1 got harder
+for it: widening what a handler value may be is additive to a shipped
+string-only map, exactly as D1 says.
+
 Ordered by what is cheapest to do early rather than by dependency:
 
 1. **D1** — callable values. Everything else is a little easier after it, and
    `DESIGN.md`'s documented examples need it to be true.
-2. **D4** — the map surface as a view over the one store. The *view-not-second-store*
-   part is the bit that gets harder with each new direct reader of
-   `shell.prompt.hooks`, and it is nearly free today.
+2. ~~**D4**~~ — done: the map surface is a view over the one store.
 3. **D6** — prefix binding, before the event set grows enough to make a
    signature change painful. A handler whose positionals are all required, with
    no rest, is one that breaks if an event gains an argument later; a `...rest`

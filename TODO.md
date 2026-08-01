@@ -760,24 +760,33 @@ file as tasks land.
       finished, and whether it is keyed by job id rather than positional (a
       pipeline's stages have an order; a set of jobs has ids). Worth deciding
       before anything depends on the scalar being the whole answer.
-- [ ] The rest of `$sh.*`: the hook maps, `$sh.complete`, and `$sh.signal`.
-      `$sh.options` has landed, along with the per-key mutability the rest of the
-      configuration half needs.
+- [x] The **hook maps**: `$sh.preprompt` … `$sh.exit`, one per event, as a view
+      over the one store — `docs/HOOKS.md` D4. `on EVENT NAME FUNCTION` and
+      `$sh.<event>.NAME = FUNCTION` are the same write, `unset $sh.<event>.NAME`
+      is `on --remove EVENT NAME`, and the map is rebuilt from the store per
+      read so no second copy exists to drift. Whole-map assignment, `+=`, a
+      deeper path, and removing the map itself are all refused, in the shape
+      `$sh.options` established. The store moved from `PromptConfig` to a `Hooks`
+      on `Vars` (`crates/mesh-core/src/hooks.rs`) so the read path can reach it:
+      `$sh` is resolved in `expand::resolve_value` holding only `&Vars`, and a
+      field beside `Options` is a smaller change than a second parameter through
+      every expansion signature.
+- [ ] The rest of `$sh.*`: `$sh.complete` and `$sh.signal`. `$sh.options` has
+      landed, along with the per-key mutability the rest of the configuration
+      half needs.
 
-      For the hook maps specifically, the options are worked out in
-      [`docs/HOOKS.md`](docs/HOOKS.md) — what `on` does today, what `DESIGN.md`
-      promises that is not built, and six decisions with their trade-offs.
-      **None of the six gates another**, so they can be taken in any order; two
-      are merely cheaper early. The map wants to be a **view over the one
-      store** rather than a second one beside it, which gets harder with each
-      new direct reader of `shell.prompt.hooks`. And **arity is exact in both
-      directions** for a handler whose positionals are all required, so every one
-      written before prefix binding lands is one that breaks if an event ever
-      gains an argument — a `...rest` parameter or an optional trailing
-      positional already absorbs the surplus, which makes this a preference
-      rather than a deadline. The rest — callable handler values, an
-      optional hook name derived from the function, whether registration keeps
-      its eager existence check, and how signals are spelled — are independent.
+      For the hooks, the remaining options are worked out in
+      [`docs/HOOKS.md`](docs/HOOKS.md) — what the two surfaces do today, what
+      `DESIGN.md` promises that is not built, and six decisions with their
+      trade-offs, of which D4 is now taken. **None of the six gates another**, so
+      the rest can be taken in any order. **Arity is exact in both directions**
+      for a handler whose positionals are all required, so every one written
+      before prefix binding lands is one that breaks if an event ever gains an
+      argument — a `...rest` parameter or an optional trailing positional already
+      absorbs the surplus, which makes this a preference rather than a deadline.
+      The others — callable handler values, an optional hook name derived from
+      the function, whether registration keeps its eager existence check, and how
+      signals are spelled — are independent.
 - [ ] **Signal handling, end to end.** Nothing user-facing exists yet. What the
       shell does with signals today is entirely for its own account, and the
       boundary is the **terminal-owning loop** rather than interactivity:
@@ -794,12 +803,12 @@ file as tasks land.
   - [ ] **The registry, and its spelling.** `DESIGN.md` §"Signals" specifies
         `$sh.signal.<NAME>` insertion-ordered maps (`INT`, `TERM`, `HUP`, …,
         without the `SIG` prefix); `on int NAME FUNC` should work too. **Both, over
-        one store** — the reason that is cheap right now is that the map surface
-        does not exist yet, so there is nothing to reconcile: hooks live in a
-        single flat `Vec<Hook>` keyed by `(event, name)` on `PromptConfig`, and
-        whoever builds `$sh.signal.*` can make it a *view* over that rather than
-        a second registry. Two stores that drift is the failure mode to design
-        out, and today there is only one to preserve.
+        one store** — and the lifecycle maps are now the worked example of that:
+        hooks live in a single flat `Vec<Hook>` keyed by `(event, name)` in
+        `Hooks` on `Vars`, `$sh.<event>` is rebuilt from it per read, and both
+        surfaces write through the same register/remove pair. Whoever builds
+        `$sh.signal.*` should extend that rather than start a second registry.
+        Two stores that drift is the failure mode to design out.
   - [ ] **Whether signal names share the event namespace.** `HookEvent` is a
         closed enum parsed from one flat set of lowercase words (`preprompt`,
         `precd`, `jobdone`, `exit`); adding `int` / `term` / `hup` to it puts two

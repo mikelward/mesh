@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::hooks::{HookEvent, Hooks};
 use crate::options::Options;
 
 #[derive(Debug, Clone)]
@@ -745,6 +746,10 @@ pub struct Vars {
     /// holds a reader too, so a write here reaches the next keystroke. See
     /// [`crate::options`].
     options: Arc<Options>,
+    /// Every registered hook, the one store behind both `on` and the
+    /// `$sh.<event>` maps. Here rather than on the shell because `$sh` is
+    /// resolved with only this in hand — see [`crate::hooks`].
+    hooks: Hooks,
 }
 
 /// One level of input: where it came from, and its path when it has one.
@@ -815,6 +820,7 @@ impl Default for Vars {
                 source: String::new(),
             }],
             options: Arc::new(Options::default()),
+            hooks: Hooks::default(),
         }
     }
 }
@@ -904,6 +910,17 @@ impl Vars {
     /// [`crate::options`].
     pub fn options(&self) -> &Arc<Options> {
         &self.options
+    }
+
+    /// The registered hooks, for dispatch and for the `$sh.<event>` read view.
+    pub fn hooks(&self) -> &Hooks {
+        &self.hooks
+    }
+
+    /// The registered hooks, to register into or remove from. The one store both
+    /// `on` and `$sh.<event>` write through — see [`crate::hooks`].
+    pub fn hooks_mut(&mut self) -> &mut Hooks {
+        &mut self.hooks
     }
 
     /// Replace the outermost input — the one the invocation itself established.
@@ -1087,10 +1104,21 @@ impl Vars {
                 "source".to_owned(),
                 Value::String(self.input().source.clone()),
             ),
-            // The one writable entry. Read like any other map, but assigned
-            // through `Options` rather than into this snapshot.
+            // Writable. Read like any other map, but assigned through `Options`
+            // rather than into this snapshot.
             ("options".to_owned(), Value::Map(self.options.entries())),
         ];
+        // One map per event, always present — an event with no handlers reads as
+        // the empty map rather than as a missing entry, so `$sh.exit.k = f` has
+        // somewhere to land and `$sh.exit:keys` answers before anything is
+        // registered. Rebuilt per access from the one store, like everything
+        // else here; `Hooks` is the authority (see [`crate::hooks`]).
+        entries.extend(HookEvent::ALL.into_iter().map(|event| {
+            (
+                event.key().to_owned(),
+                Value::Map(self.hooks.entries(event)),
+            )
+        }));
         entries.extend(self.shell.iter().cloned());
         Value::Map(entries)
     }

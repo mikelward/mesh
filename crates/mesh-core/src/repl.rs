@@ -35,6 +35,9 @@ use crate::builtins::{self, Builtin, Multiplexer, NOTIFY_LIMIT};
 use crate::completion::{CompletionCache, CompletionSpec, ValueHint, man_pages, rank_candidates};
 use crate::expand::{Piece, VarRef, Word};
 use crate::funcs::{FuncDef, Funcs};
+#[cfg(test)]
+use crate::hooks::Hook;
+use crate::hooks::HookEvent;
 use crate::options::{Opt, Options};
 use crate::vars::{self, Decoration, RegexValue, Style, StyledValue, Value, Vars};
 use crate::{environ, exec, expand, parser, whence};
@@ -206,43 +209,13 @@ enum Produced {
     Nothing,
 }
 
+/// What `prompt` sets: the custom prompt string, or `None` for the built-in one.
+///
+/// Not the `preprompt` hooks, which belong to [`crate::hooks`] with the other
+/// six events — this is only the text.
 #[derive(Default)]
 struct PromptConfig {
     text: Option<String>,
-    hooks: Vec<Hook>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HookEvent {
-    PrePrompt,
-    PreExec,
-    PostExec,
-    PreCd,
-    PostCd,
-    JobDone,
-    Exit,
-}
-
-impl HookEvent {
-    fn parse(name: &str) -> Option<Self> {
-        match name {
-            "preprompt" => Some(Self::PrePrompt),
-            "preexec" => Some(Self::PreExec),
-            "postexec" => Some(Self::PostExec),
-            "precd" => Some(Self::PreCd),
-            "postcd" => Some(Self::PostCd),
-            "jobdone" => Some(Self::JobDone),
-            "exit" => Some(Self::Exit),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Hook {
-    event: HookEvent,
-    name: String,
-    function: String,
 }
 
 impl Shell {
@@ -3355,7 +3328,7 @@ fn assign_into_member(
 ) -> Result<(), String> {
     let (root, steps) = resolve_path(target, "assign to", &shell.vars)?;
     if root == "sh" {
-        return assign_into_shell(target, &steps, &value, append, global, &shell.vars);
+        return assign_into_shell(target, &steps, &value, append, global, shell);
     }
     // Through `Vars::update`, so a failed path leaves no local shadow behind: the
     // write runs on a copy and is installed only once the whole thing succeeds.
@@ -3364,13 +3337,15 @@ fn assign_into_member(
     })
 }
 
-/// `$sh.options.KEY = …` — the writable corner of the shell's own namespace.
+/// `$sh.options.KEY = …`, `$sh.<event>.NAME = …` — the writable corners of the
+/// shell's own namespace.
 ///
 /// `$sh` is not a variable, so none of the machinery above applies: the namespace
 /// a read sees is a snapshot built per access, and writing into that would land in
-/// a copy nobody keeps. The settings are reached through [`Options`] instead, and
-/// everything else in `$sh` is refused *by name*, so the message says which entry
-/// and why rather than leaving the user to infer it from a rejected `=`.
+/// a copy nobody keeps. The settings are reached through [`Options`] instead, the
+/// hooks through [`Hooks`](crate::hooks::Hooks), and everything else in `$sh` is
+/// refused *by name*, so the message says which entry and why rather than leaving
+/// the user to infer it from a rejected `=`.
 ///
 /// `DESIGN.md` §"Read-only vs. writable within `$sh`" is the list this enforces:
 /// the runtime entries are the shell's authoritative state, so config cannot
@@ -3381,25 +3356,26 @@ fn assign_into_shell(
     value: &Value,
     append: bool,
     global: bool,
-    vars: &vars::Vars,
+    shell: &mut Shell,
 ) -> Result<(), String> {
-    // `global` governs which *scope* a write lands in, and `$sh` has none — it is
-    // the session's, whatever function is running. Silently accepting the word
-    // would suggest there is another `$sh` somewhere that this one is not.
     if global {
-        return Err(
-            "`global` cannot apply to `$sh`: it is the session's, not a scope's".to_owned(),
-        );
+        return Err(global_has_no_shell_scope());
     }
     let (top, rest) = steps.split_first().expect("the parser required one access");
     let (PathStep::Member(entry) | PathStep::Subscript(entry)) = top;
+    if let Some(event) = HookEvent::parse(entry) {
+        return assign_hook(target, event, rest, value, append, shell);
+    }
     if entry != "options" {
-        return Err(if shell_has_entry(entry, vars) {
-            format!("`$sh.{entry}` is read-only; only `$sh.options` may be assigned")
+        return Err(if shell_has_entry(entry, &shell.vars) {
+            format!(
+                "`$sh.{entry}` is read-only; only `$sh.options` and the hook maps may be assigned"
+            )
         } else {
             no_shell_entry(entry)
         });
     }
+    let vars = &shell.vars;
     match rest {
         // `$sh.options = …` wholesale. Refused rather than validated key by key:
         // a map literal that omits a setting would have to mean either "leave it"
@@ -3435,6 +3411,85 @@ fn shell_has_entry(entry: &str, vars: &vars::Vars) -> bool {
 /// read do not describe one namespace two different ways.
 fn no_shell_entry(entry: &str) -> String {
     format!("$sh: no `{entry}` in this map")
+}
+
+/// `global` governs which *scope* a write or a removal lands in, and `$sh` has
+/// none — it is the session's, whatever function is running. Silently accepting
+/// the word would suggest there is another `$sh` somewhere that this one is not.
+///
+/// Shared by the assignment and the removal so the two cannot drift: both reach
+/// the same mutable state, and `$env` gives the same answer for the same reason.
+fn global_has_no_shell_scope() -> String {
+    "`global` cannot apply to `$sh`: it is the session's, not a scope's".to_owned()
+}
+
+/// `$sh.<event>.NAME = FUNCTION` — the map spelling of `on EVENT NAME FUNCTION`.
+///
+/// The same write, not a parallel one: it lands in the one
+/// [`Hooks`](crate::hooks::Hooks) store, so what is registered here is what `on
+/// --remove` removes and what dispatch runs. That is `docs/HOOKS.md` D4's
+/// "one authority", and the validation is shared for the same reason — a handler
+/// the builtin would refuse must not be admissible through the map, or the two
+/// surfaces disagree about what a hook may be.
+fn assign_hook(
+    target: &str,
+    event: HookEvent,
+    rest: &[PathStep],
+    value: &Value,
+    append: bool,
+    shell: &mut Shell,
+) -> Result<(), String> {
+    match rest {
+        // `$sh.exit = [ … ]` wholesale. Refused: a map literal that omits a key
+        // would have to mean either "leave that handler" or "remove it", and a
+        // config that guessed wrong would silently drop every other handler for
+        // the event — the composition the keying exists to protect.
+        [] => Err(format!(
+            "assign one handler at a time, as `$sh.{}.NAME = function`",
+            event.key()
+        )),
+        [PathStep::Member(name) | PathStep::Subscript(name)] => {
+            // `+=` would have to mean "run both", which is what a second *name*
+            // is for. Registering under one key is a replacement by definition.
+            if append {
+                return Err(format!("{target}: a handler is set with `=`, not `+=`"));
+            }
+            let Value::String(function) = value else {
+                return Err(hook_value_error(target, value));
+            };
+            // The check `on` makes, in the same words bar the prefix: absence
+            // from `Funcs` is a typo, and reporting it at the assignment beats
+            // reporting it when the event fires and nobody is reading.
+            if shell.funcs.get(function).is_none() {
+                return Err(format!("{target}: `{function}` is not a function"));
+            }
+            shell.vars.hooks_mut().register(event, name, function);
+            Ok(())
+        }
+        // A handler is a name, so there is nothing under one to reach into. Not
+        // `$sh.signal.<NAME>.<key>`'s question: that path nests *events*, this
+        // one is reaching inside a handler value.
+        _ => Err(format!(
+            "{target}: a handler is a function's name, with nothing inside it"
+        )),
+    }
+}
+
+/// Why a value cannot be a handler.
+///
+/// A callable gets its own sentence because `DESIGN.md` writes the map form with
+/// a lambda (`$sh.postcd.fetch = func() { … }`) — so the answer is "not yet",
+/// which is `docs/HOOKS.md` D1, rather than "never".
+fn hook_value_error(target: &str, value: &Value) -> String {
+    match value {
+        Value::Function(_) => {
+            format!("{target}: a handler is a function's name; a callable value is not stored yet")
+        }
+        other => format!(
+            "{target}: a handler is a function's name, got {}",
+            value_kind(other)
+        ),
+    }
 }
 
 /// The entry an `$env` place names: spelled out, or resolved through the same
@@ -3491,35 +3546,74 @@ fn resolve_path(
 fn unset_member(target: &str, global: bool, shell: &mut Shell) -> Result<(), String> {
     let (root, steps) = resolve_path(target, "unset", &shell.vars)?;
     if root == "sh" {
-        return Err(unset_shell_error(target, &steps, &shell.vars));
+        return unset_from_shell(target, &steps, global, shell);
     }
     shell
         .vars
         .update(&root, global, |root| remove_at(root, &steps, target))
 }
 
-/// Why nothing in `$sh` can be removed.
+/// `unset $sh.<event>.NAME` — the map spelling of `on --remove EVENT NAME` — and
+/// why nothing else in `$sh` can be removed.
 ///
-/// Writable is not the same as removable. `$sh.options` has a **fixed** set of
-/// keys — each one is a question the shell asks itself every prompt — so removing
-/// one would leave that question with no answer rather than restoring a default.
-/// Assigning is the way back, and it is the only way that says which value you
-/// meant.
-fn unset_shell_error(target: &str, steps: &[PathStep], vars: &vars::Vars) -> String {
+/// Writable is not the same as removable, and the two writable corners differ on
+/// exactly that. `$sh.options` has a **fixed** set of keys — each one is a
+/// question the shell asks itself every prompt — so removing one would leave that
+/// question with no answer rather than restoring a default. A hook map's keys are
+/// the user's own, and removing one is how a handler is retired, so `unset` is
+/// the removal `DESIGN.md` gives it.
+///
+/// `global` is refused first, before the entry is even looked at, exactly as the
+/// assignment side does — now that one path through here *mutates*, accepting the
+/// word would quietly remove a session hook while claiming a scope that does not
+/// exist.
+fn unset_from_shell(
+    target: &str,
+    steps: &[PathStep],
+    global: bool,
+    shell: &mut Shell,
+) -> Result<(), String> {
+    if global {
+        return Err(global_has_no_shell_scope());
+    }
     let (top, rest) = steps.split_first().expect("the parser required one access");
     let (PathStep::Member(entry) | PathStep::Subscript(entry)) = top;
+    if let Some(event) = HookEvent::parse(entry) {
+        return match rest {
+            // The map itself is the event's registry, not a handler. Removing it
+            // would have to mean "drop every handler", which is a loop over the
+            // names — and saying so beats silently emptying it.
+            [] => Err(format!(
+                "`$sh.{}` cannot be removed; it is the hook map itself",
+                event.key()
+            )),
+            [PathStep::Member(name) | PathStep::Subscript(name)] => {
+                // Unlike `on --remove`, which is a config asserting a hook is
+                // gone, `unset` names a place — and the wording is `remove_at`'s
+                // for any other map, since that is the failure it is.
+                if shell.vars.hooks_mut().remove(event, name) {
+                    Ok(())
+                } else {
+                    Err(format!("{target}: no `{name}` in this map"))
+                }
+            }
+            _ => Err(format!(
+                "{target}: a handler is a function's name, with nothing inside it"
+            )),
+        };
+    }
     if entry == "options" {
-        return if rest.is_empty() {
+        return Err(if rest.is_empty() {
             "`$sh.options` cannot be removed; it is the settings map itself".to_owned()
         } else {
             format!("{target}: a setting cannot be removed; assign it instead")
-        };
+        });
     }
-    if shell_has_entry(entry, vars) {
+    Err(if shell_has_entry(entry, &shell.vars) {
         format!("`$sh.{entry}` is read-only")
     } else {
         no_shell_entry(entry)
-    }
+    })
 }
 
 /// Remove the entry a resolved path's last step names, as the whole effect of the
@@ -7572,7 +7666,7 @@ fn change_directory(args: &[String], shell: &mut Shell) -> Step {
 /// skipping the event, would hide the move entirely from something like a
 /// directory tracker.
 fn run_cd_hooks(event: HookEvent, path: &Path, shell: &mut Shell) {
-    if !shell.prompt.hooks.iter().any(|hook| hook.event == event) {
+    if !shell.vars.hooks().any(event) {
         return;
     }
     let argument = Value::String(path.to_string_lossy().into_owned());
@@ -7650,10 +7744,10 @@ fn configure_hook(args: &[String], shell: &mut Shell) -> Step {
             let Some(event) = HookEvent::parse(event) else {
                 return invalid_hook();
             };
-            shell
-                .prompt
-                .hooks
-                .retain(|hook| hook.event != event || hook.name != *name);
+            // Removing what was never registered is not an error: `on --remove`
+            // is how a config makes sure a hook is gone, and it should not have
+            // to know whether it was there.
+            shell.vars.hooks_mut().remove(event, name);
             Step::Continue(0)
         }
         _ => register_hook_operands(args, shell),
@@ -7686,20 +7780,7 @@ fn register_hook(event: HookEvent, name: &str, function: &str, shell: &mut Shell
         note!("mesh: on: `{function}` is not a function");
         return Step::Error(1);
     }
-    if let Some(hook) = shell
-        .prompt
-        .hooks
-        .iter_mut()
-        .find(|hook| hook.event == event && hook.name == name)
-    {
-        hook.function = function.to_string();
-    } else {
-        shell.prompt.hooks.push(Hook {
-            event,
-            name: name.to_string(),
-            function: function.to_string(),
-        });
-    }
+    shell.vars.hooks_mut().register(event, name, function);
     Step::Continue(0)
 }
 
@@ -8278,13 +8359,7 @@ fn run_jobdone_hooks(shell: &mut Shell) {
 }
 
 fn run_hooks(event: HookEvent, args: Vec<Value>, shell: &mut Shell) {
-    let hooks: Vec<String> = shell
-        .prompt
-        .hooks
-        .iter()
-        .filter(|hook| hook.event == event)
-        .map(|hook| hook.function.clone())
-        .collect();
+    let hooks = shell.vars.hooks().functions(event);
     // Hook arguments are computed values (command text, status, elapsed), not
     // user syntax, so none is a bare literal token — and none is flag syntax, so
     // flag parsing is disabled and every value binds positionally. Without this a
@@ -14060,8 +14135,8 @@ mod tests {
         );
         assert_eq!(run_line(&script, 0, false, &mut shell), Step::Continue(0));
         assert_eq!(
-            shell.prompt.hooks,
-            vec![Hook {
+            shell.vars.hooks().all(),
+            [Hook {
                 event: HookEvent::PrePrompt,
                 name: "refresh".into(),
                 function: "second".into(),
@@ -14130,7 +14205,7 @@ mod tests {
             ),
             Some(Step::Continue(0))
         );
-        assert_eq!(shell.prompt.hooks.len(), 2);
+        assert_eq!(shell.vars.hooks().all().len(), 2);
     }
 
     #[test]
