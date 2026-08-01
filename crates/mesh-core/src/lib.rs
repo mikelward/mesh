@@ -32,6 +32,7 @@ mod environ;
 mod exec;
 mod expand;
 mod funcs;
+mod hooks;
 mod options;
 pub mod parser;
 mod reaper;

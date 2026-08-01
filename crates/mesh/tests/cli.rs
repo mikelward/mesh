@@ -1754,6 +1754,132 @@ fn an_exit_from_a_startup_file_still_runs_the_exit_hook() {
 }
 
 #[test]
+fn the_hook_map_and_the_builtin_are_one_store() {
+    // `docs/HOOKS.md` D4: `on` is sugar over the map, not a parallel registry.
+    // The property has to hold in **both** directions, because drift is the
+    // failure mode — a hook registered one way and removed the other.
+
+    // Registered by the builtin, read through the map.
+    let out = run_with_input(
+        "func bye(status) { puts BYE }\n\
+         on exit e bye\n\
+         puts $sh.exit\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "e: bye\nBYE\n");
+
+    // Written through the map, removed by the builtin — and gone from dispatch,
+    // which is the half that a second store would get wrong.
+    let out = run_with_input(
+        "func bye(status) { puts BYE }\n\
+         $sh.exit.e = bye\n\
+         on --remove exit e\n\
+         puts $sh.exit:len\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+
+    // Registered by the builtin, removed through the map.
+    let out = run_with_input(
+        "func bye(status) { puts BYE }\n\
+         on exit e bye\n\
+         unset $sh.exit.e\n\
+         puts gone\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "gone\n");
+
+    // Written through the map, and it *runs* — the same dispatch, keyed the
+    // same way, so a second write to the name replaces rather than stacks.
+    let out = run_with_input(
+        "func bye(status) { puts \"BYE $status\" }\n\
+         func later(status) { puts LATER }\n\
+         $sh.exit.e = bye\n\
+         $sh.exit.e = later\n\
+         exit 2\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "LATER\n");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn a_hook_map_reads_before_anything_is_registered() {
+    // Every event has a map from the start, so `$sh.exit.k = f` has somewhere to
+    // land and a config can ask what is registered without a "no such entry".
+    let out = run_with_input("puts $sh.exit:len $sh.preprompt:len $sh.jobdone:len\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0 0 0\n");
+}
+
+#[test]
+fn the_hook_map_refuses_what_the_builtin_would_refuse() {
+    for (source, message) in [
+        // A map literal that omits a key would have to mean either "leave that
+        // handler" or "remove it"; neither reading is safe for a config that
+        // meant the other.
+        (
+            "$sh.exit = [e: bye]\n",
+            "assign one handler at a time, as `$sh.exit.NAME = function`",
+        ),
+        // The check `on` makes, so a typo cannot enter by the other door.
+        (
+            "$sh.exit.e = nosuch\n",
+            "$sh.exit.e: `nosuch` is not a function",
+        ),
+        // A handler is a name — there is nothing inside one to reach.
+        (
+            "func bye(s) { }\n$sh.exit.e.deep = bye\n",
+            "$sh.exit.e.deep: a handler is a function's name, with nothing inside it",
+        ),
+        (
+            "$sh.exit.e = 7\n",
+            "$sh.exit.e: a handler is a function's name, got an integer",
+        ),
+        // `DESIGN.md` writes the map form with a lambda, so the answer is "not
+        // yet" rather than "never" — `docs/HOOKS.md` D1.
+        (
+            "$sh.exit.e = func() { }\n",
+            "$sh.exit.e: a handler is a function's name; a callable value is not stored yet",
+        ),
+        // Registering under a name *is* a replacement, so "run both" has no
+        // spelling here; a second name is how two handlers coexist.
+        (
+            "func bye(s) { }\n$sh.exit.e += bye\n",
+            "$sh.exit.e: a handler is set with `=`, not `+=`",
+        ),
+        (
+            "unset $sh.exit\n",
+            "`$sh.exit` cannot be removed; it is the hook map itself",
+        ),
+        // The wording any other map's failed removal uses.
+        ("unset $sh.exit.e\n", "$sh.exit.e: no `e` in this map"),
+        // `global` names a scope, and `$sh` has none — the answer the assignment
+        // side and `$env` both give. Refused rather than ignored: this path
+        // *removes* a session hook, so accepting the word would quietly retire a
+        // handler while claiming a scope that does not exist.
+        (
+            "func bye(s) { }\non exit e bye\nfunc f() { global unset $sh.exit.e }\nf\n",
+            "`global` cannot apply to `$sh`: it is the session's, not a scope's",
+        ),
+        (
+            "func f() { global unset $sh.status }\nf\n",
+            "`global` cannot apply to `$sh`",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(1), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source} gave {stderr}");
+    }
+
+    // Refused means unchanged, not "removed anyway, with a complaint": the
+    // handler the `global unset` above named still fires on the way out.
+    let out = run_with_input(
+        "func bye(status) { puts BYE }\n\
+         on exit e bye\n\
+         func f() { global unset $sh.exit.e }\n\
+         f\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "BYE\n");
+}
+
+#[test]
 fn glob_expands_and_sorts_matches() {
     let dir = fresh_dir("glob_match");
     std::fs::write(dir.join("b.ext"), "").unwrap();
@@ -21034,7 +21160,8 @@ fn the_sh_namespace_lists_its_runtime_entries() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "status pipestatus pid ppid uid version interactive width stdin stdout stderr \
-         jobs origin source options name args\n"
+         jobs origin source options preprompt preexec postexec precd postcd jobdone exit \
+         name args\n"
     );
 
     // A mistyped key is still a loud error, and `status` is not a reserved
@@ -21236,7 +21363,7 @@ fn the_settings_map_refuses_everything_but_a_boolean_by_name() {
         // And the read-only entries stay read-only, by name.
         (
             "$sh.status = 3\n",
-            "`$sh.status` is read-only; only `$sh.options` may be assigned",
+            "`$sh.status` is read-only; only `$sh.options` and the hook maps may be assigned",
         ),
         ("$sh.nope = 3\n", "$sh: no `nope` in this map"),
     ] {

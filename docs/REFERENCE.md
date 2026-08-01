@@ -210,7 +210,8 @@ Positional arguments are a real list — `$sh.args` — not `$1` / `$@` / `$#`:
 `sh` is a reserved name: it cannot be assigned, used as a function parameter, or
 bound by a pattern. (Only `sh` itself is reserved — an ordinary variable may still
 be called `status`, `name`, or `args`.) Everything in `$sh` is read-only except
-[`$sh.options`](#shoptions), the settings map.
+[`$sh.options`](#shoptions), the settings map, and the seven
+[hook maps](#custom-prompts-and-hooks) (`$sh.preprompt` … `$sh.exit`).
 
 The rest of the read-only runtime surface:
 
@@ -337,8 +338,10 @@ no-op, since there is no other `$sh` for it to name.
 Bracketed paste has no setting on purpose: with it off a pasted newline arrives as
 Enter, so every line but the last runs before you can read it.
 
-The hook maps in `DESIGN.md` — `$sh.prompt`, `$sh.preexec`, `$sh.complete`,
-`$sh.signal` — are not implemented yet.
+The lifecycle hook maps — `$sh.preprompt`, `$sh.preexec`, and the five others —
+are the other writable part of `$sh`; see
+[Custom prompts and hooks](#custom-prompts-and-hooks). `$sh.complete` and
+`$sh.signal`, which `DESIGN.md` also describes, are not implemented yet.
 
 ---
 
@@ -1336,8 +1339,9 @@ on preprompt renderer refresh-prompt
 
 Hooks are session-local and run in registration order. Re-registering the same
 event/name pair replaces it in place, making configuration safe to reload.
-Remove one with `on --remove event name`. `preprompt` hooks run only
-for primary prompts, not multiline continuation prompts.
+Remove one with `on --remove event name`, or through the
+[hook map](#the-hook-maps). `preprompt` hooks run only for primary prompts, not
+multiline continuation prompts.
 
 | Event | Function parameters | When it runs |
 | --- | --- | --- |
@@ -1419,6 +1423,44 @@ Three rules make them predictable:
 - **A `cd` that fails runs neither.** A destination that does not exist is
   reported before `precd`; if the move itself then fails — a directory that
   cannot be entered — the failure is reported and no `postcd` is owed.
+
+### The hook maps
+
+Each event is also a map under `$sh`, keyed by hook name — `$sh.exit`,
+`$sh.postcd`, one per event. It is the same registry `on` writes, not a copy, so
+either spelling registers, replaces and removes what the other sees:
+
+```mesh
+func clean-up(status) { rm -rf $work-dir }
+
+$sh.exit.tmp = clean-up          # the same write as `on exit tmp clean-up`
+puts ...$sh.exit:keys            # tmp
+unset $sh.exit.tmp               # the same removal as `on --remove exit tmp`
+```
+
+A map is present for every event from the start, so `$sh.preprompt:len` answers
+`0` rather than failing before anything is registered. Reading one is reading a
+snapshot: assigning a whole map to a name copies the handlers of that moment, and
+writing into that copy registers nothing.
+
+A handler is written as a function's **name**, the same thing `on` takes, and it
+is resolved when the event fires — redefining the function changes what the hook
+runs. `DESIGN.md` also writes the map form with a lambda
+(`$sh.postcd.fetch = func() { … }`); that is not accepted yet.
+
+The map is strict for the same reason the settings map is:
+
+```mesh
+$sh.exit = [tmp: clean-up]   # error: assign one handler at a time
+$sh.exit.tmp = clean-ip      # error: `clean-ip` is not a function
+$sh.exit.tmp += clean-up     # error: a handler is set with `=`, not `+=`
+unset $sh.exit               # error: it is the hook map itself
+```
+
+Refusing the whole-map assignment is the important one: a map literal that left
+out a key would have to mean either "leave that handler alone" or "remove it",
+and a config that guessed wrong would silently drop every other handler for the
+event. Naming one key at a time has no such question.
 
 This is the currently implemented prompt API. The structured `$sh.prompt` map,
 styled segments, and `fill`/`rule`, described as the eventual prompt design in
@@ -1762,10 +1804,15 @@ Names and places may be mixed in one statement (`unset p $m.k q`).
 `unset $env.KEY` and `unset $env[$name]` remove the entry from the process
 environment, so children stop inheriting the name rather than inheriting it empty
 (see [The environment](#the-environment)). It is not a scope, so `global` does not
-apply to it. `$sh` is still no place: writable is not the same as removable, so
-even [`$sh.options`](#shoptions) is refused by name — a setting is a question the
-shell asks itself every prompt, and removing one would leave it with no answer
-rather than restore a default.
+apply to it. In `$sh` only a [hook](#the-hook-maps) can be removed —
+`unset $sh.exit.tmp` is `on --remove exit tmp` — because writable is not the same
+as removable and the two writable corners differ on exactly that. A hook map's
+keys are yours, and retiring a handler is what removing one means; the
+[settings](#shoptions) are a fixed set, so `unset $sh.options.bold-input` is
+refused rather than restoring a default. Everything else in `$sh` is read-only,
+and is refused by name. `$sh` is no more a scope here than it is on the
+assignment side, so `global unset $sh.exit.tmp` is refused too rather than
+removing the hook.
 
 ```mesh
 x = outer
