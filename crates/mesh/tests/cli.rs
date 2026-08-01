@@ -16942,6 +16942,17 @@ fn a_fixed_separator_split_refuses_a_list_under_its_own_name() {
     assert!(stderr.contains(":nulls"), "{stderr}");
     assert!(stderr.contains("requires a string"), "{stderr}");
     assert!(!out.status.success());
+
+    // Which holds for an alias too, and did not: the modifier is known internally
+    // by its long name, so `:ns` was reported as `:nulls` — a spelling the line
+    // does not contain, and the same misdirection one sentence up.
+    for (written, other) in [(":ns", ":nulls"), (":ws", ":words"), (":ls", ":lines")] {
+        let aliased = run_with_input(&format!("xs = [\"a\" \"b\"]\nys = $xs{written}\n"));
+        let stderr = String::from_utf8_lossy(&aliased.stderr);
+        assert!(stderr.contains(written), "{stderr}");
+        assert!(!stderr.contains(other), "{stderr}");
+        assert!(!aliased.status.success());
+    }
 }
 
 #[test]
