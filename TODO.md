@@ -4140,21 +4140,52 @@ a one-line edit. Every claim below was checked against the built shell.
       is expected), `+ * / %` with Rust/bash truncation and dividend-signed
       remainder, `:pow(n)` rather than `**`, and `0x`/`0o`/`0b` literals with
       Python-rule `_` separators. Still open under this direction:
-  - [ ] **Implement it.** The semantics are settled in `DESIGN.md`; no code
-        exists yet — `+=` is still the only operator, `puts ($n + 3)` is a
-        syntax error, and `1_000` / `0xff` parse as strings. Blocked on the two
-        questions below, since binary `-` cannot be deferred past the first
-        `$a - $b` and the literal rule has to be decided before any are parsed.
-  - [ ] **How subtraction is spelled.** `*`, `/` and `%` are unclaimed, but a
-        spaced infix `-` is already **glob exclusion** (`*.txt - *.bak`), and both
-        it and arithmetic want value positions, so `$a - $b` is ambiguous on its
-        face. Options: type-directed dispatch (ints subtract, globs/lists exclude),
-        which is what `+=` already does and what the proposed `-=` is specced to
-        do; a modifier form (`$a:minus($b)`, matching `$m:int` / `$a:ms`); or
-        leaving it to the parenthesised context, inside which no glob can appear.
-        `~` is **not** available — it is mesh's infix match operator. No other
-        shell has this collision, since bash's `$((a-b))` and fish's `math` both
-        put arithmetic inside a delimiter.
+  - [ ] **Finish implementing it.** The **operators** landed since this was
+        written: `+ - * / %` all evaluate, in both contexts, with the decided
+        signs — `(-10 / 3)` is `-3` and `(-10 % 3)` is `-1`, so truncation toward
+        zero and a dividend-signed remainder are both real, and `(1 / 0)` and an
+        overflowing `+` are loud errors.
+
+        What is still missing is the **literals** and `:pow`. `0xff`, `0o755`,
+        `0b1011` and `1_000` all still parse as **strings**, so `x = 1_000` binds
+        text and `$x + 1` fails with `expected integer` — the shape most likely to
+        be read as a bug, since the literal looks typed. `$b:pow(3)` is not a
+        modifier yet. The leading-zero question below still gates the literals.
+  - [x] **How subtraction is spelled.** *Decided: type-directed dispatch* — see
+        §"Binary `-`, and the glob-exclusion collision" in `DESIGN.md`. It is what
+        `+` already does across strings, lists, maps and integers, so `-` doing it
+        is symmetric rather than novel.
+
+        The collision this entry worried about turns out not to exist. Bare glob
+        literals are **eager** — verified: `g = *` binds a list of paths, and
+        `$g:type` answers per element — so by the time `-` evaluates, `* - *.bak`
+        is a list minus a list. Glob exclusion **is** list difference, not a second
+        meaning, and the parse never forks: `-` always reads as binary minus and
+        only evaluation asks what it was handed. The modifier form and the
+        parenthesis-only form are both unnecessary.
+  - [ ] **Implement `-` and its list form.** Subtraction on two integers works
+        today; nothing else does. `(* - *.bak)`, `($xs - $ys)` and `([a b] - 1)`
+        all answer `expected integer`, so the list difference is unbuilt and the
+        error message needs to name both accepted shapes rather than only the
+        numeric one. Nothing depends on the current behavior, so this is additive.
+
+        **Two pieces, not one.** Besides the operation, a **glob-led statement has
+        to be classified as a value**. `outranks_a_command` (`parser.rs:6022`)
+        promotes a bare leading scalar only when it is an integer, a boolean or
+        quoted, so a bare `* - *.bak` stays a command pipeline and tries to run the
+        first match — `command not found: a.txt`, verified. `[a b c] - [b]` leads
+        with a non-scalar and is already classified as a value, which is why it
+        reaches evaluation instead. Implementing only the list difference would
+        leave the documented headline spelling still executing a file. Raised in
+        review on mikelward/mesh#341.
+  - [ ] **The spacing rule is not enforced as written.** `DESIGN.md` says `-` is an
+        operator "*only* with surrounding spaces" — the rule that keeps kebab-case
+        names like `last-cmd-time` safe. The implementation requires only the
+        **leading** space: `(5 -3)` answers `2` and `($a -$b)` answers `2`, while
+        `(5- 3)` is a syntax error. Harmless while `-` is integer-only, and sharper
+        once `-*.bak` could plausibly read as one word. Settle it deliberately —
+        either enforce both sides or write down that the leading space is what
+        matters — rather than letting the two drift further apart.
   - [ ] **Whether a leading zero means octal.** `007` parses as `7` today, silently
         dropping the zeros — the one answer that is certainly wrong. Either it is
         octal (C, POSIX `$(( ))`, and the `chmod` tradition), which forces `08` and
