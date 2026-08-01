@@ -180,7 +180,10 @@ There are four kinds of modifier, and the difference matters:
 - **`:repr`** stands apart from all of these: it does not transform a value, it
   **writes one down** — the mesh source you would have typed to get it back, as a
   string. It takes *any* type rather than a category, and its contract is
-  **round-trip, not display**: parsing the result yields an equal value, which is
+  **round-trip, not display**: parsing the result yields **the same value, and of
+  the same type**. Both halves are required — equality alone would admit `1.0`
+  written as `1`, since [`1 == 1.0`](#arithmetic), and `1` and `1.0` divide
+  differently. That is
   what forces a string to be quoted even when it would read as a bare word (`42`
   vs `'42'`) and keeps `[]` and `[:]` apart. That is what distinguishes it from
   [`puts`](#builtins), which *displays* a collection — one element or `key: value`
@@ -1020,9 +1023,11 @@ concatenates strings, extends lists, and merges maps, while `Duration` and
 **`:int`** modifier parses a string to an integer, **fail-loud** — the inverse of
 the canonical int→decimal rendering, erroring on non-numeric input rather than
 silently yielding `0`. So `$line:words:get(0, "0"):int` sums a column and
-`$good:int < $bad:int` compares numerically. *(A float type and a `:num` parse are
-deferred — mesh has no non-integer number type today; add both together if the need
-appears.)*
+`$good:int < $bad:int` compares numerically. *(The need appeared, and both landed
+in the design together as that note said they should: see **Floats** under
+[Arithmetic](#arithmetic) for the `f64` type and the `:num` parse. `:int` keeps its
+own job — a string the program means as an integer should fail loud when it is
+`3.5`, not quietly widen.)*
 
 ### Globbing
 
@@ -1183,8 +1188,9 @@ interactively, **prompt** on no match instead of only warning.)*
 ### Arithmetic
 
 Integers are **`i64`**, signed, and every operation is **checked** — overflow is a
-loud error, never a wrap. There is no float and no unsigned type; `Duration` and
-`Instant` carry their own closed arithmetic, defined with the time model.
+loud error, never a wrap. There is a **float** (`f64`, below) but no unsigned type
+and no arbitrary-precision integer; `Duration` and `Instant` carry their own closed
+arithmetic, defined with the time model.
 
 **Where arithmetic happens** *(decided)*. A bare word is a command, so arithmetic
 needs a context that is unambiguously a value. There are two, following nushell and
@@ -1209,10 +1215,13 @@ and it would break `find . -exec grep foo {} +`. Every shell draws this line
 somewhere: bash needs `$(( ))`, fish needs `math`, and nushell and PowerShell put it
 exactly where mesh does.
 
-**Operators** *(decided)*. `+`, `-`, `*`, `/`, `%`, with the usual precedence. Division
-and remainder follow **Rust and bash**: the quotient truncates toward zero and the
-remainder takes the sign of the **dividend**, so `-7 / 2` is `-3`, `-7 % 2` is `-1`,
-and `(a / b) * b + a % b == a` holds. That also agrees with `:ms` / `:secs`, which
+**Operators** *(decided)*. `+`, `-`, `*`, `/`, `%`, with the usual precedence.
+**Integer** division and remainder follow **Rust and bash**: the quotient truncates
+toward zero and the remainder takes the sign of the **dividend**, so `-7 / 2` is
+`-3`, `-7 % 2` is `-1`, and `(a / b) * b + a % b == a` holds. That identity is
+integer-only, and stops holding the moment either operand is a
+[float](#arithmetic), where `/` is fractional rather than truncating — see there
+for how a float remainder is defined. That also agrees with `:ms` / `:secs`, which
 already truncate toward zero. (Python, Ruby and Perl floor instead, giving `-4` and
 `1` — mesh does not.) Division by zero is a **loud error**.
 
@@ -1266,6 +1275,130 @@ What keeps all of this off kebab-case names is the
 [operators-need-spaces](#globbing) rule: `a-b` is one name, `a - b` is the
 operator, `$a-$b` interpolates with a literal hyphen.
 
+**Floats** *(decided)*. A second number type, **`f64`**. Two things forced it. A
+shell gets used as a calculator, where integer-only arithmetic stops paying. And
+without it `3.5` is not a number but a *word*, which makes `9.5 < 10.5` answer
+**`false`** — `<` compares two strings lexically, exactly as specified, and the
+result is still wrong. That is the only place mesh returns a quiet wrong answer
+rather than an error, and it is reason enough on its own.
+
+**Take Rust's operation wherever Rust has one.** Integer `/` truncating toward
+zero, `%` as `fmod`, and checked overflow are Rust's own semantics, adopted rather
+than specified — every numeric rule mesh writes down itself is one it can get
+wrong, and the review of this section proved that the hard way. Where an
+*arithmetic* edge is unstated below, Rust's answer is the intended one.
+
+**Rendering is excluded from that rule**, because Rust's `{}` never switches to
+exponent form — it prints `1e300` as 301 digits. Digit *selection* is Rust's
+(shortest round-trip); the exponent switch is mesh's own, below.
+
+**Where mesh diverges, it diverges deliberately.** Each of these buys something
+the [fail-loud](#variables-and-assignment) model needs, so none should be
+"simplified" back toward Rust. The list is the notable ones rather than a closed
+set — an earlier draft claimed "and only three" and was twice wrong, which is
+itself the argument against counting:
+
+- **A normalized value space — no NaN, no infinity, no negative zero.** Rust
+  yields all three (`-4.0 % 2.0` is `-0` there, and prints that way); mesh raises
+  on the first two and folds `-0.0` into `0.0`. That is what keeps `<` a total
+  order, `==` an equivalence, and rendering single-valued.
+- **Implicit widening.** Rust has none — `1i64 + 1.0f64` does not compile — while
+  mesh promotes the integer, because a shell used as a calculator cannot ask for
+  casts.
+- **Cross-type comparison.** Rust does not offer it at all, so `1 == 1.0` and
+  `1 < 1.5` are mesh's own and have to be written by hand; that is the one place
+  hand-rolling is unavoidable, and the exactness rule below is why.
+- **Checked float-to-integer conversion.** Rust's `as` saturates silently, so
+  `1e20:int` would answer `i64::MAX`; mesh raises instead, per `:int` below.
+
+**`/` does not change.** Two integers divide to an integer, truncating toward zero
+as above; a float appears only when an operand is one.
+
+```mesh
+(10 / 3)                       # 3      — unchanged
+(10.0 / 3)                     # 3.3333333333333335
+($xs:len / 2)                  # still an index
+```
+
+This is C, Go, Java and Rust, and it is the reason **no `//` operator is needed** —
+Python only wants one because its `/` always floats. It also means the time model's
+`$a:ms / $b:ms` stays ordinary integer division, so the argument made there needs no
+revision. Where two integers *should* divide fractionally, multiplying one by `1.0`
+is the spelling (`$hits * 1.0 / $total`); no cast function is wanted, since a float
+literal already says it.
+
+**Widen freely, compare exactly.** Mixed arithmetic promotes the integer, so
+`(1 + 1.5)` is `2.5`. Comparison and equality must **not** go through that
+promotion — `i64`→`f64` is lossy above 2⁵³, and nanosecond `Duration`s live well
+past it, so comparing by cast would lose precision in the range mesh actually uses.
+That is the same silent wrong answer floats are being added to remove. Python
+compares the two exactly for this reason; JavaScript before BigInt is the
+cautionary tale.
+
+**`1 == 1.0` is true**, and equality stays type-strict against everything else
+(`1 == "1"` is still false). This is a **choice**, not something rendering forces:
+`42` and `"42"` already display identically and compare unequal, so "renders the
+same" has never implied "is the same" here. The reason is that every language that
+widens on mixed arithmetic — Python, Lua, Ruby — compares numerically across its
+number types, and an arithmetic `1 == 1.0` answering false is a trap in a
+calculator. The comparison is exact, per the rule above, not a promotion to `f64`.
+
+`Hash` has to agree, since `:dedup` is a `HashSet<Value>` and `[1 1.0]:dedup` must
+collapse to one element: an integral float **that fits `i64`** hashes as that
+integer. One that does not (`1e20`) is no integer's equal anyway, so it hashes as
+a float — collapsing those onto `i64::MAX` would only manufacture collisions. Rust derives
+neither `Hash` nor `Eq` for `f64`, so both are written by hand — which banning NaN
+below is what makes legitimate.
+
+**No NaN and no infinity, ever.** Division or remainder by zero, and overflow, are
+**loud errors** — the rule checked integer arithmetic already follows. The payoff
+is that the value space stays totally ordered: `<` is a total order, `==` an
+equivalence, and sorting needs no special case. `-0.0` normalizes to `0.0`.
+
+**Rendering** is shortest round-trip, and switches to exponent form for large and
+small magnitudes rather than printing `1e300` as 301 digits — Python's thresholds
+are a sane starting point, not a commitment. Display drops a trailing `.0`, so
+`(6.0 / 3)` shows `2`; a shell should not announce the type of an answer.
+
+**`:repr` keeps the type that display drops**, writing an integral float as
+`1.0`. Its contract is that the output reads back as the *same* value, not merely
+an equal one — the reason `42` and `'42'` are already spelled apart there — and
+`1` would read back as an integer, which divides differently.
+
+**`%` stays dividend-signed** for floats as for integers, so `(-10 % 3)` and
+`(-10.0 % 3.0)` are both `-1`. Python answers `2` here; mesh diverges deliberately
+and has since the integer rule was set, and one operator cannot have two sign
+conventions. The operation is **`fmod`** — C's `fmod`, Rust's `%` — which is
+already dividend-signed; a zero divisor is a loud error, as it is for `/`.
+
+The [integer identity](#arithmetic) `(a / b) * b + a % b == a` is integer-only and
+does not carry over, since float `/` does not truncate.
+
+*(The numeric edges — which quotient `fmod` uses, what a naive
+`a - trunc(a / b) * b` expansion loses at scale, where the domain stops — are
+implementation detail rather than language decisions, and are recorded with their
+counterexamples in the `TODO.md` entry. Kept out of here deliberately: writing
+them as prose invited three separate corrections in review without changing a
+single decision.)*
+
+**`:num`** parses a string to a number — the `:int` twin, fail-loud on non-numeric
+input, yielding an integer where the text names one and a float otherwise. `:int`
+on a float truncates toward zero, and a result outside `i64` is a **loud range
+error**, never a clamp — the same refusal `:int` already gives an out-of-range
+string.
+
+*(Deferred, with the reasons, so they are not re-litigated from scratch. **Decimal
+and rational** would fix `0.1 + 0.2` and `1/3` respectively; each costs a
+dependency, and binary-float rounding is what every language a mesh user already
+knows does. **Arbitrary-precision integers** would retire overflow as a category,
+but `i64` covers every realistic shell quantity — file sizes to ~9.2 exabytes,
+nanosecond timestamps to 2262 — overflow is already *safe* rather than merely
+absent, and a bignum does not remove the boundary checks that indices, exit codes
+and `Duration` nanos need, it relocates them. If a calculator doing factorials
+makes it real, the shape to reach for is promote-on-overflow behind the same
+integer face, which changes no user-visible rule except that overflow stops
+erroring.)*
+
 **Literals** *(decided)*. Decimal, plus `0x` / `0o` / `0b` prefixes — `0xff`,
 `0o755`, `0b1011`. Underscores group digits, following **Python's placement rule**:
 exactly one, only between two digits, so `1_000_000` is fine while `_1`, `1_`, and
@@ -1273,6 +1406,12 @@ exactly one, only between two digits, so `1_000_000` is fine while `_1`, `1_`, a
 non-Western grouping work for nothing — `1_00_00_000` (one crore) and `1_0000_0000`
 (一億) are as valid as `1_000_000`. Rust is looser still and accepts `1_` and `1__0`;
 no grouping convention wants those.
+
+A literal is a **float** when it carries a `.` or an `e` — `3.5`, `1e10`, `2.5e-3` —
+so the exponent form always means float, as in Python. Two lexing rules follow: a
+`.` must have a digit on **both** sides, so `1..5` stays a range rather than `1.`
+followed by `.5`; and the `0x` / `0o` / `0b` prefixes take neither, an integer being
+the only thing a radix literal names.
 
 *(TODO: whether a leading zero means octal. Today `007` silently parses as `7`,
 which is the one answer that is certainly wrong.)*
@@ -3577,8 +3716,11 @@ to a bool):
   **not** in the set — for a ratio, drop to an integer first with `:ms` / `:secs`,
   which **truncate toward zero** (`(now() - $t):ms` drops any sub-millisecond
   remainder toward zero); then
-  `$a:ms / $b:ms` is ordinary integer division, so no float or rational type has to
-  be introduced. A `Duration`
+  `$a:ms / $b:ms` is ordinary integer division, so the time model needs no
+  non-integer type of its own. (A [float](#arithmetic) exists for other reasons,
+  and keeping `/` integer on two integers is what leaves this argument standing;
+  `$a:ms * 1.0 / $b:ms` is the spelling when a fractional ratio is what you
+  want.) A `Duration`
   is **signed** — `Instant - Instant` goes negative for a future instant (so a
   future-dated file's `age` is just negative, not an error or a saturated zero),
   rendering with a leading `-` (`-3s`). `Instant` and `Duration` are
