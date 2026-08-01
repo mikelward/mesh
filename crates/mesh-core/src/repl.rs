@@ -2163,14 +2163,33 @@ fn run_ast_match(node: &parser::MatchExpr, last: u8, in_function: bool, shell: &
 fn condition_ran(condition: &parser::Executable, shell: &Shell) -> bool {
     match condition {
         parser::Executable::Not(operand) => condition_ran(operand, shell),
-        parser::Executable::Expression { guard: None, .. }
-        | parser::Executable::Assignment {
-            pattern: parser::BindingPattern::List(_),
-            append: false,
-            ..
-        } => true,
+        parser::Executable::Expression { guard: None, .. } => true,
+        other if tests_a_value(other) => true,
         _ => shell.produced != Produced::Nothing,
     }
+}
+
+/// An assignment condition whose answer comes from the **value** rather than
+/// from a command it ran: every list pattern, which is a shape check, and any
+/// other pattern whose right-hand side is not a capture, which is the presence
+/// test. Both are answered by arms of [`condition_status`] that return *before*
+/// the funnel maintaining `Produced`, so every reader that would otherwise
+/// consult that field has to recognize them from the shape instead — the field
+/// still describes whatever ran previously.
+///
+/// Missing the second shape here cost `while not x = f()` its first pass: a
+/// `while` starts with `Produced::Nothing`, so the `not` arm read a completed
+/// test as a skipped guard and handed back the status unnegated.
+fn tests_a_value(condition: &parser::Executable) -> bool {
+    matches!(
+        condition,
+        parser::Executable::Assignment {
+            pattern,
+            append: false,
+            value,
+            ..
+        } if matches!(pattern, parser::BindingPattern::List(_)) || !capture_tail(value)
+    )
 }
 
 fn condition_status(
@@ -2190,22 +2209,17 @@ fn condition_status(
         // ran nothing, so the previous status stands, which is the same exemption
         // the un-negated path takes.
         //
-        // The list-pattern arm just below returns *before* that funnel and never
-        // touches `produced`, so for that one shape the field describes whatever ran
-        // previously and cannot be asked. The tree can: a pattern test always ran.
+        // The two value-testing arms just below return *before* that funnel and
+        // never touch `produced`, so for those shapes the field describes whatever
+        // ran previously and cannot be asked. The tree can — `tests_a_value` names
+        // them, and both always run.
         // Reading the stale field made a `while`'s own first test look like a
         // skipped guard and flipped the loop both ways; writing the field instead —
         // a baseline set here — made a completed test look like a *pass* and cost
         // the loop its no-pass `""`. Asking the shape does neither. Both raised in
-        // review.
-        let pattern_test = matches!(
-            &**operand,
-            parser::Executable::Assignment {
-                pattern: parser::BindingPattern::List(_),
-                append: false,
-                ..
-            }
-        );
+        // review, as was widening this from list patterns alone once the presence
+        // test joined them.
+        let pattern_test = tests_a_value(operand);
         let Some(code) = condition_status(operand, last, in_function, shell)? else {
             return Ok(None);
         };
@@ -2231,12 +2245,73 @@ fn condition_status(
         if shell.control.is_some() {
             return Ok(None);
         }
+        // Ahead of the match, because whether a name *may* be bound is a property
+        // of the pattern and must not depend on what the right-hand side turned
+        // out to be: `if [env] = [1]` reported the reserved name while
+        // `if [env] = "notalist"` took `else` in silence, since a mismatch never
+        // reached the validation inside `commit`. Raised in review.
+        if let Err(message) = validate_patterns(std::slice::from_ref(pattern)) {
+            return Err(runtime_message(message));
+        }
         return match pattern_bindings(pattern, &value) {
             Ok(Some(bindings)) => {
                 commit_bindings(bindings, &mut shell.vars);
                 Ok(Some(0))
             }
             Ok(None) => Ok(Some(1)),
+            Err(message) => Err(runtime_message(message)),
+        };
+    }
+    // `if x = f()` / `while line = next()` — an assignment condition over a
+    // **value** asks whether there *is* one. It used to fall through to the
+    // command path below and report the assignment statement's status, which is
+    // "the binding worked" and therefore always `0`: every such condition was
+    // true, and a loop written to end on a falsy sentinel ran one extra pass and
+    // then tripped over it.
+    //
+    // `DESIGN.md` §"Empty `\"\"` / `[]` truthiness" settles what is asked: it
+    // "tests *presence* rather than truth — and there the answer follows from
+    // `false` being mesh's 'no result': only `false` is absent, so `\"\"`, `[]`
+    // and `0` all bind and take the branch." That is what lets a function answer
+    // `false` for "found nothing" and be tested for it.
+    //
+    // Absent binds nothing, the rule the two neighbors already state: a
+    // list-pattern mismatch "selects `else` without changing any bindings"
+    // (`docs/REFERENCE.md` §Conditionals), and `gets` at end of input leaves
+    // `var` unchanged. So the `else` sees what the name held before, never the
+    // sentinel.
+    //
+    // A capture-tailed right-hand side is left alone, so `if out = $(diff a b)`
+    // still branches on the diff rather than on there being output.
+    // `capture_tail` answers that from the syntax, the same way the assignment
+    // *statement* picks between its own `0` and the capture's status.
+    if let parser::Executable::Assignment {
+        pattern,
+        append: false,
+        value,
+        global,
+    } = condition
+        && !capture_tail(value)
+    {
+        let bound = eval_operand_of(value, last, in_function, shell)?;
+        if shell.control.is_some() {
+            return Ok(None);
+        }
+        // Before the absent answer, for the same reason as the arm above: an
+        // invalid binding target is invalid whatever the value turned out to be.
+        // `if env = true` reported the reserved name and `if env = false` took
+        // `else` in silence, which made a name's legality depend on runtime data.
+        // Raised in review.
+        if let Err(message) = validate_patterns(std::slice::from_ref(pattern)) {
+            return Err(runtime_message(message));
+        }
+        if bound == Value::Boolean(false) {
+            return Ok(Some(1));
+        }
+        // A list pattern never reaches here — the arm above claims every one of
+        // them, capture-tailed or not — so the only failures left are real ones.
+        return match bind_pattern(pattern, &bound, &mut shell.vars, *global) {
+            Ok(()) => Ok(Some(0)),
             Err(message) => Err(runtime_message(message)),
         };
     }

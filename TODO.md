@@ -2964,13 +2964,58 @@ thing a reader takes on trust.*
       `each0` delegates to `xargs -0` instead, which means it can only run
       **programs** where its sibling `each` can call a mesh function — the one
       capability gap between the pair.
-- [ ] **25. A value function's exit status cannot be reached, and `$(f)` around
+- [x] **25. A value function's exit status cannot be reached, and `$(f)` around
       one captures nothing.** `y = $(v)` on a value function binds the empty
       string, so bash's `find_up x && …` has no mesh spelling; a falsy return
       value stands in, which is why `find-up` answers `""` on a miss rather than a
       status. `"$(f(x))"` inside a string silently yields nothing too. Related to
       the open *`$( … )` around a value-producing statement* item under "Loose
       ends".
+
+      **Most of this was already stale.** The two-channel model `DESIGN.md`
+      §"Result and `return`" records as *decided; shipped* really is shipped, so a
+      value function's status is reachable four ways: `return false` reports `1`
+      and `return true` / `return 5` / `return "s"` report `0`; `fail` and `fail
+      123` report `1` and `123`; `f():capture` hands back a record with `.status`
+      beside `.value`; and because only `false` fails, `find-up(x) && …` chains
+      exactly as the bash idiom does.
+
+      `$(f)` capturing nothing is **correct**, not a gap. `$( … )` is a *stdout*
+      capture and a well-behaved value function does not print, so there is
+      nothing there to take — the same reason `m = $(5 + 0)` binds `""`. Three
+      spellings already read the value channel: `x = f()`, `"${f()}"` inside a
+      string, and a bare `f()` as an argument. Nothing to build.
+
+      **What was actually broken was the test, not the function.** An assignment
+      condition over a value never asked about the value: a `Name` pattern fell
+      through to the command path and reported the *assignment statement's*
+      status, which is "the binding worked" and so always `0`. Every `if x = …`
+      was true, whatever it bound. Only the list-pattern arm did a real test.
+
+      Worse than a wrong branch, it broke termination — the `while gets line { …
+      }` shape `DESIGN.md` pins its contract on:
+
+      ```
+      while n = nxt($n) { puts "n=$n" }
+      n=1 / n=2 / n=3 / n=false
+      mesh: comparison requires two integers or two strings
+      ```
+
+      Fixed by giving `condition_status` an arm of its own for a value
+      right-hand side, ahead of the command fall-through: evaluate, and answer
+      `1` when the value is `false` and `0` otherwise — the presence test
+      `DESIGN.md` §"Empty `\"\"` / `[]` truthiness" already specifies, where
+      `""`, `[]` and `0` are all results and only `false` is absent. Absent binds
+      nothing, matching the two neighbors that already say so: a list-pattern
+      mismatch "selects `else` without changing any bindings", and `gets` at end
+      of input leaves `var` unchanged.
+
+      Scoped by `capture_tail`, the same syntax-only test the assignment
+      *statement* uses to pick between its own `0` and the capture's status, so
+      `if out = $(diff a b)` keeps branching on the diff. And the presence test
+      belongs to the **condition** only — a plain `x = false` statement still
+      reports `0`, so a following `&&` is not silently skipped.
+      `repl.rs` `condition_status`; `docs/REFERENCE.md` §Conditionals.
 - [ ] **26. No `eval` and no dynamically-named `func`**, so "define one function
       per name in this list" — what a VCS-subcommand loop and an ssh-host alias
       loop both do — has to write a file and source it. That turns a private
@@ -3515,7 +3560,7 @@ of each PR had landed by another route, but these pieces had not.
       is what keeps `f * > summary` from globbing the file the redirection is about to
       create. Evaluated at assembly time they ran *before* every word, so
       `puts $n > "$(g)"` wrote what `g` had just assigned.
-- [ ] **`$( … )` around a value-producing statement fails with the value as a status.**
+- [x] **`$( … )` around a value-producing statement fails with the value as a status.**
       Pre-existing, and surfaced by review on the value-argument PR. The capture reads
       the inner statement's status, and an expression statement's status is derived from
       its *value*, so any non-zero one is read as a failure:
@@ -3530,6 +3575,13 @@ of each PR had landed by another route, but these pieces had not.
       `capture_source` wants "did the body fail", and `status_of` on a value is not that
       question. Nothing to do with argument position: `m = $(5 + 0)` has always done
       this. It shows up more now only because the form is reachable in more places.
+
+      **Gone.** Re-measured while closing edge 25: both lines now leave status `0`
+      and bind `m`, so no value is read as a failure any more. What is left is not
+      a bug — `$( … )` is a *stdout* capture, an expression statement prints
+      nothing, so `m` is `""` in both cases. Reading the value channel is `x = 5 +
+      0`, or `"${f()}"` in a string. Closed on measurement rather than on a fix
+      in this branch; the status half went with whatever settled `status_of`.
 - [ ] **Text glued to a *bare* value argument.** `pre$(x)post` and `f()x` are a loud
       syntax error pointing at `"pre$(…)post"`, the quoted spelling that works, because
       handing over three arguments where one was written would be silently wrong. The
