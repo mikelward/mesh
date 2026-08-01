@@ -4185,6 +4185,53 @@ a one-line edit. Every claim below was checked against the built shell.
         meaning, and the parse never forks: `-` always reads as binary minus and
         only evaluation asks what it was handed. The modifier form and the
         parenthesis-only form are both unnecessary.
+  - [ ] **Implement floats.** The model is decided — see §"Floats" under
+        *Arithmetic* in `DESIGN.md`. `f64`; `/` unchanged on two integers, so no
+        `//`; widen on mixed arithmetic but **compare exactly**, never through an
+        `i64`→`f64` cast; `1 == 1.0` with `Hash` agreeing, since `:dedup` is a
+        `HashSet<Value>`; no NaN and no infinity, float `/0` and overflow being
+        loud errors as the integer ones already are; shortest round-trip rendering
+        with exponent form beyond some large/small magnitude — Python's ±(10¹⁶,
+        10⁻⁴) are a reasonable starting point, deliberately **not** settled here;
+        `%` being `fmod`; and `:num` as the string→number parse.
+
+        **The governing rule is to take Rust's operation wherever Rust has one** —
+        integer `/`, `%` as `fmod`, checked overflow — so an unstated *arithmetic*
+        edge means "whatever Rust does". Rendering is **excluded**: Rust's `{}`
+        never uses exponent form, printing `1e300` as 301 digits, so the digit
+        selection is Rust's and the exponent switch is mesh's. The notable
+        divergences — not a closed list — are a **normalized value space** (no
+        NaN, no infinity, no negative zero; Rust yields all three, `-4.0 % 2.0`
+        being `-0` there), implicit widening, cross-type comparison (which Rust
+        does not provide, so it is the one unavoidable hand-roll), and checked
+        float-to-integer conversion (Rust's `as` saturates; `:int` raises).
+
+        **Two traps to watch for when building it**, both found in review. Float `%`
+        is `fmod` — the *truncating* remainder, explicitly not IEEE 754's
+        `remainder`, which rounds to nearest-even and answers `-1` where
+        `fmod(3, 2)` is `1` — computed directly, never `a - trunc(a / b) * b`: above 2⁵³ the
+        rounded quotient loses what the subtraction needs (`1e20 % 3.0` is `1`, the
+        expansion gives `0`), and `1e308 % 1e-308` overflows its intermediate to
+        infinity for a finite answer. `%` by a zero divisor is a loud error like
+        `/` is, since `fmod(x, 0.0)` is `NaN` — integer `5 % 0` already reports
+        `division by zero`, and the float case must not diverge. And `:int` on a float outside `i64` is a loud
+        range error — Rust's `as` cast saturates silently, which is exactly the
+        wrong answer the checked model exists to prevent.
+
+        **`:repr` is a separate channel from display.** Display drops a trailing
+        `.0`, but `:repr` must keep it — an integral float writes as `1.0`, since
+        `:repr`'s contract is that its output reads back as the same value, and `1`
+        would read back an integer where `1 / 2` is `0` and `1.0 / 2` is `0.5`. The
+        same reason `42` and `'42'` are already spelled apart there. Also from the
+        #341 review.
+
+        The bug this closes: `9.5 < 10.5` answers **`false`** today, because `3.5`
+        is a word rather than a number and `<` compares two strings lexically. It
+        is the one place mesh returns a quiet wrong answer instead of an error.
+
+        Sequencing note — the float literal and the still-unbuilt `0x` / `0o` /
+        `0b` / `_` forms are the same lexer path, and the leading-zero question
+        gates both, so they want doing together rather than twice.
   - [ ] **Implement `-` and its list form.** Subtraction on two integers works
         today; nothing else does. `(* - *.bak)`, `($xs - $ys)` and `([a b] - 1)`
         all answer `expected integer`, so the list difference is unbuilt and the
