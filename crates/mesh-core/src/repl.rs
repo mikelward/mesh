@@ -9024,18 +9024,53 @@ fn evaluate_value_arguments<'p>(
             // They must stay separate: `--tag="v2"` is an option whose *value* is
             // not bare, so answering both with `is_bare_literal_word` stopped
             // scanning it and pushed the whole token through as a positional.
-            parser::Argument::Positional(_) => scan_call_value(
-                name,
-                params,
-                value,
-                bare,
-                starts_with_bare_dashes(expression),
-                flags_enabled,
-                &mut flags_ended,
-                &mut positionals,
-                &mut switches_on,
-                &mut flag_values,
-            )?,
+            parser::Argument::Positional(_) => {
+                let written_dashed = starts_with_bare_dashes(expression);
+                // A word written as an option whose value is not one string. The
+                // only way to reach here is a glob after the `=`: it evaluates to
+                // a `Value::List` however many paths it matched, and the scan
+                // below inspects `Value::String`, so the word fell through to the
+                // positionals — the option silently unset and the pattern arriving
+                // as data.
+                //
+                // Reported rather than bound, because a list attached to an option
+                // is already an error when it is written as one: `--tag=$xs` says
+                // "list value needs `...`" in both spellings. A glob is the same
+                // shape arriving by a different route, so it gets the same answer
+                // instead of a second rule. Binding the last match would be the
+                // command spelling's answer, but it would put back exactly what
+                // "a glob is a list however many paths it matched" (bf79900)
+                // removed — a value that depends on which files happen to be
+                // there, silently dropping the rest.
+                if flags_enabled
+                    && !flags_ended
+                    && written_dashed
+                    && !matches!(value, Value::String(_))
+                {
+                    // The flag itself is checked first. An undeclared name or a
+                    // switch is a mistake in the line the reader wrote, where the
+                    // value's shape is a consequence of what is on disk — saying
+                    // "not a list" about `--bogus=*.txt` is true and useless.
+                    if let Some(flag) = written_option_name(expression) {
+                        resolve_written_flag(name, params, flag, true)?;
+                    }
+                    let kind = expand::value_kind(&value);
+                    note!("mesh: {name}: an option's value must be one string, not {kind}");
+                    return Err(Step::Error(2));
+                }
+                scan_call_value(
+                    name,
+                    params,
+                    value,
+                    bare,
+                    written_dashed,
+                    flags_enabled,
+                    &mut flags_ended,
+                    &mut positionals,
+                    &mut switches_on,
+                    &mut flag_values,
+                )?
+            }
             parser::Argument::Named(key, _) => {
                 reject_option_after_terminator(name, key, flags_ended)?;
                 bind_named_option(name, params, key, value, &mut switches_on, &mut flag_values)?;
@@ -9270,6 +9305,56 @@ fn is_bare_literal_word(expression: &parser::Expr) -> bool {
 /// `2` while `--n="2"` stays a string. Shared by command mode and value mode: the
 /// two spellings are interchangeable (`DESIGN.md` §"Calling for a value"), so
 /// `f(prod, --force)` binds the same switch as `f(prod, force: true)`.
+/// The parameter a written `--flag` names, or the call-site error that stops the
+/// call before anything about its *value* matters.
+///
+/// Shared so those two diagnostics have one copy each. The value-shape check in
+/// the call scan has to run these first: `f(--bogus=*.txt)` and `f(--force=*.txt)`
+/// otherwise reported that the value is a list, which is true and useless — the
+/// flag does not exist, or takes no value at all, and that is what the reader has
+/// to fix. Reporting the value's shape first masked it. Raised in review.
+fn resolve_written_flag<'p>(
+    name: &str,
+    params: &'p [parser::Param],
+    flag: &str,
+    has_value: bool,
+) -> Result<&'p parser::Param, Step> {
+    use parser::ParamKind;
+    let declared = params.iter().find(|param| {
+        param.name == flag && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
+    });
+    let Some(declared) = declared else {
+        note!("mesh: {name}: unknown flag `--{flag}`");
+        return Err(Step::Error(2));
+    };
+    if matches!(declared.kind, ParamKind::Switch) && has_value {
+        note!("mesh: {name}: flag `--{flag}` is a switch and takes no value");
+        return Err(Step::Error(2));
+    }
+    Ok(declared)
+}
+
+/// The option name a word was **written** with, when it was written as one.
+///
+/// Only sound alongside [`starts_with_bare_dashes`], which is what establishes
+/// that the first piece is literal text the reader typed — the same call-site
+/// reading, asked for the name rather than for whether there is one.
+fn written_option_name(expression: &parser::Expr) -> Option<&str> {
+    let parser::Expr::Scalar(word) = expression else {
+        return None;
+    };
+    let parser::WordPiece::Text {
+        text,
+        quote: parser::QuoteMode::Bare,
+        ..
+    } = word.value.pieces.first()?
+    else {
+        return None;
+    };
+    let body = text.strip_prefix("--")?;
+    Some(body.split_once('=').map_or(body, |(flag, _)| flag))
+}
+
 fn bind_dashed_option<'p>(
     name: &str,
     params: &'p [parser::Param],
@@ -9283,19 +9368,9 @@ fn bind_dashed_option<'p>(
         Some((flag, value)) => (flag, Some(value.to_owned())),
         None => (body, None),
     };
-    let declared = params.iter().find(|param| {
-        param.name == flag && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
-    });
-    let Some(declared) = declared else {
-        note!("mesh: {name}: unknown flag `--{flag}`");
-        return Err(Step::Error(2));
-    };
+    let declared = resolve_written_flag(name, params, flag, inline.is_some())?;
     match &declared.kind {
         ParamKind::Switch => {
-            if inline.is_some() {
-                note!("mesh: {name}: flag `--{flag}` is a switch and takes no value");
-                return Err(Step::Error(2));
-            }
             switches_on.insert(declared.name.as_str());
         }
         ParamKind::Flag(_) => {

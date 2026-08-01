@@ -12220,19 +12220,24 @@ fn a_glob_cannot_choose_which_option_binds() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The name-side glob refusal is scoped to the name, so a glob *after* the `=` is
-/// never reached by it — but it does not bind either, and that is a recorded gap
-/// rather than this rule at work. A pattern evaluates to a `Value::List` whatever
-/// it matched, and `scan_call_value` inspects only `Value::String`, so the word
-/// falls through to the positionals. Pinned here because the two spellings
-/// disagree: the command form binds, the value form does not.
+/// An option's value has to be one string, and a glob after the `=` is not one —
+/// it evaluates to a `Value::List` however many paths it matched. That is now
+/// **reported** rather than falling through to the positionals with the option
+/// silently unset.
 ///
-/// See the "a glob after `=` stops being an option" follow-up in `TODO.md`. That
-/// entry was written for a *multi-match* pattern; the glob-is-a-list rule has
-/// since widened it to every glob, single match included. Fixing it flips the
-/// value-call row below to `tag=a.txt n=0`.
+/// Reported rather than bound to the last match, which is what the command
+/// spelling does. The two legitimately differ here: command position is argv, so a
+/// pattern expands to several *words* and the last `--tag=` wins, while a value
+/// call passes one typed value per argument. Binding the last match would put back
+/// exactly what "a glob is a list however many paths it matched" (bf79900)
+/// removed — a value decided by which files happen to be on disk, silently
+/// dropping the rest.
+///
+/// The answer matches what an explicitly written list already gets:
+/// `--tag=$xs` says "list value needs `...`" in *both* spellings, so this closes a
+/// gap rather than opening a second rule for the same shape.
 #[test]
-fn a_glob_after_the_option_separator_does_not_yet_bind_in_a_value_call() {
+fn a_glob_after_the_option_separator_is_not_one_value() {
     let dir = fresh_dir("glob_option_value");
     std::fs::write(dir.join("--tag=a.txt"), "").unwrap();
     let run = |call: &str| {
@@ -12247,22 +12252,73 @@ fn a_glob_after_the_option_separator_does_not_yet_bind_in_a_value_call() {
             .stdin(Stdio::null())
             .output()
             .expect("run");
-        String::from_utf8_lossy(&out.stdout).into_owned()
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     };
 
-    assert_eq!(
-        run("f(--tag=*.txt)"),
-        "tag=none n=1\n",
-        "the pattern is a list, so it reaches the positionals instead of `--tag`"
+    let (stdout, stderr) = run("f(--tag=*.txt)");
+    assert!(
+        stderr.contains("an option's value must be one string, not a list"),
+        "{stdout:?} / {stderr:?}"
     );
+    assert_eq!(stdout, "", "the call must not run with `--tag` unset");
+
+    // Matching nothing is still a list — the empty one — so it reports too. The
+    // command spelling drops it silently instead, which is the argv boundary
+    // showing through rather than a second answer to the same question.
+    std::fs::remove_file(dir.join("--tag=a.txt")).unwrap();
+    let (_, stderr) = run("f(--tag=*.txt)");
+    assert!(
+        stderr.contains("an option's value must be one string, not a list"),
+        "{stderr:?}"
+    );
+    std::fs::write(dir.join("--tag=a.txt"), "").unwrap();
+
     assert_eq!(
-        run("f --tag=*.txt"),
+        run("f --tag=*.txt").0,
         "tag=a.txt n=0\n",
-        "the command spelling binds it — this is the divergence being pinned"
+        "the command spelling still binds — argv expands a pattern to words"
     );
+
+    // The flag is checked before its value's shape. An undeclared name or a switch
+    // is a mistake in the line the reader wrote; the value being a list is a
+    // consequence of what is on disk, so reporting that first said something true
+    // and useless while hiding the fix. Raised in review.
+    let masked = |call: &str| {
+        std::fs::write(
+            dir.join("run.mesh"),
+            format!("func f(--force, --tag = none, ...rest) {{ puts ok }}\n{call}\n"),
+        )
+        .unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    std::fs::write(dir.join("--bogus=a.txt"), "").unwrap();
+    std::fs::write(dir.join("--force=a.txt"), "").unwrap();
+    assert!(
+        masked("f(--bogus=*.txt)").contains("unknown flag `--bogus`"),
+        "{:?}",
+        masked("f(--bogus=*.txt)")
+    );
+    assert!(
+        masked("f(--force=*.txt)").contains("switch and takes no value"),
+        "{:?}",
+        masked("f(--force=*.txt)")
+    );
+    // And each reports the same thing with a literal value, so the glob is not
+    // what produces the diagnostic — the flag is.
+    assert!(masked("f(--bogus=v2)").contains("unknown flag `--bogus`"));
+    assert!(masked("f(--force=v2)").contains("switch and takes no value"));
     // A literal after the `=` binds in both, so the difference is the glob and not
     // the attached-value form itself.
-    assert_eq!(run("f(--tag=v2)"), "tag=v2 n=0\n");
+    assert_eq!(run("f(--tag=v2)").0, "tag=v2 n=0\n");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
