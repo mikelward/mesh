@@ -2053,6 +2053,64 @@ fn glob_qualifiers_filter_by_the_boolean_tests() {
 }
 
 #[test]
+fn a_loop_refuses_a_value_that_is_not_a_list() {
+    // Running a scalar once is what made a line loop over text a silent wrong
+    // answer: `for line in $text` reads as "iterate the lines" and instead bound
+    // the whole blob, with nothing said. It is the one shape in the language where
+    // getting a list wrong was quiet — argv, interpolation and list-pattern
+    // binding all refuse the wrong shape loudly, and a map already refuses a
+    // single binder. The message names both fixes, since which one is meant
+    // depends on whether the string is text-with-lines or one value.
+    let text = run_with_input("s = \"a b\"\nfor x in $s { puts $x }\n");
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(
+        stderr.contains("a loop needs a list, not a string"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("`[…]`"), "{stderr}");
+    assert!(stderr.contains("`:lines`"), "{stderr}");
+    assert!(!text.status.success());
+
+    // A non-string scalar has no lines to offer, so it is not told about `:lines`.
+    let number = run_with_input("for x in 3 { puts $x }\n");
+    let stderr = String::from_utf8_lossy(&number.stderr);
+    assert!(
+        stderr.contains("a loop needs a list, not an integer"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(":lines"), "{stderr}");
+
+    // The two spellings the message names both work, and mean different things.
+    let fixed = run_with_input(
+        "s = \"a\\nb\"\nfor x in [$s] { puts \"one=[$x]\" }\nfor x in $s:lines { puts \"line=[$x]\" }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&fixed.stdout),
+        "one=[a\nb]\nline=[a]\nline=[b]\n"
+    );
+}
+
+#[test]
+fn the_shapes_a_loop_still_takes_are_unaffected() {
+    // Everything that was already a list keeps working — the guardrail refuses
+    // scalars, not the ordinary spellings.
+    let dir = fresh_dir("loop_shapes_unaffected");
+    std::fs::write(dir.join("only.rs"), "").expect("one file");
+    let out = run_with_input(&format!(
+        "cd {}\nfor f in *.rs {{ puts glob=$f }}\nfor i in 1..=2 {{ puts range=$i }}\n\
+         xs = [a b]\nfor x in $xs {{ puts list=$x }}\nfor k, v in [k: v] {{ puts \"map=$k/$v\" }}\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "glob=only.rs\nrange=1\nrange=2\nlist=a\nlist=b\nmap=k/v\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_glob_is_a_list_however_many_paths_it_matched() {
     // A pattern's *type* must not depend on the directory's contents. A single
     // match used to collapse to the scalar every other one-value word collapses
@@ -19045,7 +19103,8 @@ fn a_capture_interpolates_inside_double_quotes() {
 fn an_interpolated_capture_crosses_whole() {
     // Quoted, so the output is one argument however many spaces and glob characters
     // it contains — the rule an interpolated variable already follows. A shell that
-    // re-split here is where `for f in "$(ls)"` goes wrong.
+    // re-split here is where `for f in "$(ls)"` goes wrong. The loop spells its one
+    // element with `[…]`, since a loop takes a list and a capture is not one.
     let dir = fresh_dir("interpolated_capture_whole");
     std::fs::write(dir.join("apple"), "").unwrap();
     std::fs::write(dir.join("banana"), "").unwrap();
@@ -19055,7 +19114,7 @@ fn an_interpolated_capture_crosses_whole() {
          x = \"$(puts 'a b')\"\n\
          puts $x:len\n\
          puts \"$(puts '*')\"\n\
-         for w in \"$(puts one)\" {{ puts item=$w }}\n",
+         for w in [\"$(puts one)\"] {{ puts item=$w }}\n",
         dir.display()
     ));
     assert_eq!(
