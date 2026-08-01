@@ -52,6 +52,14 @@ pub enum Modifier {
     /// word-split. A **split** modifier, so it consumes one string and yields a
     /// list; the argument-taking member of the family is `:split(SEP)`.
     Words,
+    /// The fixed-separator split modifiers — `:lines`, `:nulls`, `:tabs`. Each is
+    /// `:split(SEP)` with the separator spelled by the name, terminator semantics
+    /// and all, so the three cannot drift from the general form or each other.
+    /// `:lines` is the explicit spelling of a capture's **default** split, not a
+    /// second pass over it.
+    Lines,
+    Nulls,
+    Tabs,
     /// This value written as the mesh source you would have typed for it, as a
     /// string. The inverse of reading a literal, so `$x:repr` on a value that
     /// has no literal form is an error rather than an approximation — see
@@ -106,6 +114,9 @@ impl Modifier {
             "trimend" => Self::TrimEnd,
             "int" => Self::Int,
             "words" => Self::Words,
+            "lines" => Self::Lines,
+            "nulls" => Self::Nulls,
+            "tabs" => Self::Tabs,
             "repr" => Self::Repr,
             "exists" => Self::Exists,
             "type" => Self::Type,
@@ -1325,6 +1336,12 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
         // mapping element-wise: `$line:words` and `$line:split(" ")` have to agree
         // about what a list subject means, and `split_value` refuses one.
         Modifier::Words => words_value(value),
+        // The same family, and the same one-string rule: each is `:split(SEP)` with
+        // the separator the name spells, so a subject that `:split` refuses is
+        // refused here too and the diagnostic names the modifier the reader wrote.
+        Modifier::Lines | Modifier::Nulls | Modifier::Tabs => {
+            split_named(value, name, fixed_separator(modifier))
+        }
         _ => match value {
             Value::String(value) => Ok(Value::String(modify_string(value, modifier))),
             Value::List(values) => values
@@ -1367,12 +1384,37 @@ pub(crate) fn split_value(value: Value, separator: &str) -> Result<Value, Expand
             message: "separator must not be empty".into(),
         });
     }
+    split_named(value, "split", separator)
+}
+
+/// The separator each fixed-separator split modifier spells.
+fn fixed_separator(modifier: Modifier) -> &'static str {
+    match modifier {
+        Modifier::Lines => "\n",
+        Modifier::Nulls => "\0",
+        Modifier::Tabs => "\t",
+        // `split_named`'s callers pick the separator; only the three above have one
+        // baked into the name, and the dispatch above reaches here with no other.
+        _ => unreachable!("not a fixed-separator split modifier"),
+    }
+}
+
+/// [`split_value`] with the modifier name to blame in a diagnostic — `:nulls` says
+/// `:nulls`, not `:split`. The separator is never empty on these paths.
+fn split_named(value: Value, name: &str, separator: &str) -> Result<Value, ExpandError> {
     let Value::String(text) = value else {
         return Err(ExpandError::Modifier {
-            name: "split".into(),
+            name: name.into(),
             message: "requires a string".into(),
         });
     };
+    Ok(split_text(&text, separator))
+}
+
+/// Split `text` on `separator` with **terminator** semantics, the one place that
+/// rule lives: every split modifier and the default capture split come through
+/// here, so they cannot come to disagree about a trailing blank.
+pub(crate) fn split_text(text: &str, separator: &str) -> Value {
     let mut fields: Vec<Value> = text
         .split(separator)
         .map(|s| Value::String(s.into()))
@@ -1381,7 +1423,7 @@ pub(crate) fn split_value(value: Value, separator: &str) -> Result<Value, Expand
     while matches!(fields.last(), Some(Value::String(s)) if s.is_empty()) {
         fields.pop();
     }
-    Ok(Value::List(fields))
+    Value::List(fields)
 }
 
 /// `:words` — turn a string into a list by splitting on runs of whitespace, the
@@ -1619,6 +1661,9 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::TrimEnd => "trimend",
         Modifier::Int => "int",
         Modifier::Words => "words",
+        Modifier::Lines => "lines",
+        Modifier::Nulls => "nulls",
+        Modifier::Tabs => "tabs",
         Modifier::Repr => "repr",
         Modifier::Exists => "exists",
         Modifier::Type => "type",
@@ -1744,6 +1789,9 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         Modifier::Real
         | Modifier::Int
         | Modifier::Words
+        | Modifier::Lines
+        | Modifier::Nulls
+        | Modifier::Tabs
         | Modifier::Len
         | Modifier::First
         | Modifier::Last
@@ -1902,6 +1950,44 @@ mod tests {
         assert!(matches!(
             split_value(list(&["a", "b"]), ":"),
             Err(ExpandError::Modifier { name, .. }) if name == "split"
+        ));
+    }
+
+    /// The three fixed-separator members are `:split(SEP)` with the name choosing
+    /// the separator, so the terminator rule holds for them without restating it.
+    #[test]
+    fn the_fixed_separator_splits_spell_their_own_separator() {
+        let cases = [
+            (Modifier::Lines, "a\nb\n"),
+            (Modifier::Nulls, "a\0b\0"),
+            (Modifier::Tabs, "a\tb\t"),
+        ];
+        for (modifier, text) in cases {
+            assert_eq!(
+                apply_modifier(Value::String(text.into()), modifier),
+                Ok(list(&["a", "b"])),
+                "{modifier:?} split {text:?} wrong"
+            );
+        }
+    }
+
+    /// The point of `:nulls`: it splits on NUL and nothing else, so a `find -print0`
+    /// name holding a newline arrives whole rather than torn at the newline.
+    #[test]
+    fn nulls_leaves_a_newline_inside_a_field_alone() {
+        assert_eq!(
+            apply_modifier(Value::String("we\nird\0plain\0".into()), Modifier::Nulls),
+            Ok(list(&["we\nird", "plain"]))
+        );
+    }
+
+    /// A split consumes one string, so the diagnostic has to name the modifier the
+    /// reader wrote — blaming `:split` for a `:nulls` sends them to the wrong line.
+    #[test]
+    fn a_fixed_separator_split_refuses_a_list_under_its_own_name() {
+        assert!(matches!(
+            apply_modifier(list(&["a", "b"]), Modifier::Nulls),
+            Err(ExpandError::Modifier { name, .. }) if name == "nulls"
         ));
     }
 
