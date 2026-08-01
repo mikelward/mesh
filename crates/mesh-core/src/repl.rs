@@ -5932,8 +5932,23 @@ fn capture_split_modifier(
 /// The split family plus `:raw`, per `DESIGN.md` §"Modifiers". Nothing else does:
 /// `$(pwd):dir` is a *value* modifier and asks its question of the capture's value,
 /// trailing newline already gone.
+///
+/// The fixed-separator members are recognized through [`expand::Modifier::from_name`]
+/// rather than by a second list of names, so a member and its two-letter alias
+/// cannot answer differently. Spelled out, they did: `:ns` fell through to the value
+/// path and split output the default had already trimmed, so it dropped the newline
+/// `$(find . -print0):nulls` keeps in the last name.
 fn is_capture_split(name: &str) -> bool {
-    matches!(name, "raw" | "lines" | "nulls" | "tabs" | "words" | "split")
+    matches!(name, "raw" | "split")
+        || matches!(
+            expand::Modifier::from_name(name),
+            Some(
+                expand::Modifier::Lines
+                    | expand::Modifier::Nulls
+                    | expand::Modifier::Tabs
+                    | expand::Modifier::Words
+            )
+        )
 }
 
 fn eval_if_expr(
