@@ -455,6 +455,47 @@ mesh$ <strong>$env.PATH = $env.PATH:dedup</strong>
 Only strings cross into the environment, so a list or map has to be joined
 first — mesh says so rather than inventing a rendering.
 
+To set a name for **one command** and no longer, put it in front of the command,
+the way every other shell spells it:
+
+<pre>
+mesh$ <strong>TZ=UTC date</strong>
+Sat Aug  1 05:00:00 UTC 2026
+mesh$ <strong>sh -c 'echo [$TZ]'</strong>
+[]
+</pre>
+
+Take as many as you like, and `+=` appends just as it does for `$env.PATH`:
+`TZ=UTC LANG=C sort names.txt`, `PATH+=/opt/bin mytool`. The entries are put back
+afterwards — a name that was unset goes back to *unset*, which a child can tell
+apart from empty.
+
+A prefix binds to one **stage**, so each side of a pipe gets its own and an `&&`
+right-hand side gets none:
+
+<pre>
+mesh$ <strong>FOO=1 sh -c 'echo $FOO' | FOO=2 sh -c 'echo $FOO; cat'</strong>
+2
+1
+</pre>
+
+Note which namespace that writes. A prefix sets the **environment**, because what
+the child inherits is the point; a bare `FOO=bar` with no command after it is an
+ordinary assignment and binds a shell variable no child ever sees.
+
+For a whole block rather than one command, `with` is the same idea with braces,
+and puts the environment back however the body leaves — normally, through a
+failing command, or through `return`, `break` or `continue`:
+
+<pre>
+mesh$ <strong>with TZ=UTC LANG=C {</strong>
+...   <strong>date</strong>
+... <strong>}</strong>
+Sat Aug  1 05:00:00 UTC 2026
+</pre>
+
+Unlike `fork`, neither costs a process.
+
 ## Lists preserve structure
 
 Square brackets build a list. Lists may contain other lists, and mesh never
