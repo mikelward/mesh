@@ -4752,6 +4752,13 @@ fn modifier_step(name: &str) -> expand::ModifierStep {
             message: CAPTURE_NEEDS_A_CALL.to_string(),
             regex_message: CAPTURE_NEEDS_A_CALL.to_string(),
         },
+        // Implemented, but for a `$(…)` rather than a value, and for the same reason
+        // — the bytes it wants are gone by the time a value modifier could ask.
+        None if name == "raw" => expand::ModifierStep::Unavailable {
+            name: name.to_string(),
+            message: RAW_NEEDS_A_CAPTURE.to_string(),
+            regex_message: RAW_NEEDS_A_CAPTURE.to_string(),
+        },
         None => expand::ModifierStep::Unavailable {
             name: name.to_string(),
             message: if parser::modifier_requires_arguments(name) {
@@ -5157,6 +5164,13 @@ fn single_string_argument(
 /// place that meets it on a value says the same thing.
 const CAPTURE_NEEDS_A_CALL: &str =
     ":capture applies to a call — write `f(…):capture`, or `$(…)` for a command's output";
+
+/// `:raw` names bytes only a `$(…)` still has, so it is the one member of the split
+/// family with nothing to say about a value. Every place that meets it on one says
+/// this rather than "not implemented yet", which is what the generic answer claimed
+/// — a modifier that works being reported as a feature still to come.
+const RAW_NEEDS_A_CAPTURE: &str = ":raw applies to a capture — write `$(…):raw` for the bytes untrimmed; a value \
+     that is already in a variable is an ordinary string";
 
 fn runtime_message(message: impl std::fmt::Display) -> Step {
     note!("mesh: {message}");

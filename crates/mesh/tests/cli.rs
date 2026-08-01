@@ -16838,6 +16838,23 @@ fn raw_is_the_no_split_member_and_keeps_the_trailing_newline() {
         String::from_utf8_lossy(&arity.stderr)
     );
     assert!(!arity.status.success());
+
+    // Off a capture it has no bytes to hand back, and it says *that*. It fell
+    // through to the generic answer instead — "modifier :raw is not implemented
+    // yet", of a modifier that works — which reads as a feature still to come and
+    // leaves the reader with no reason to try `$(…):raw`. `:capture` is refused
+    // this way for the same reason one arm up.
+    for source in [
+        "x = \"hi\"\nputs $x:raw\n",
+        "x = \"hi\"\nputs \"${x:raw}\"\n",
+        "xs = [\"a\"]\nputs $xs:map(:raw)\n",
+    ] {
+        let value = run_with_input(source);
+        let stderr = String::from_utf8_lossy(&value.stderr);
+        assert!(stderr.contains(":raw applies to a capture"), "{stderr}");
+        assert!(!stderr.contains("not implemented yet"), "{stderr}");
+        assert!(!value.status.success(), "{source}");
+    }
 }
 
 #[test]
