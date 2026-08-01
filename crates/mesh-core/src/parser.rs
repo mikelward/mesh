@@ -281,6 +281,13 @@ pub enum ParseErrorKind {
     /// line instead of re-parsing the body after every line it reads.
     UnterminatedHeredoc(String),
     ChainedComparison,
+    /// A range whose start or end is itself a range — `1 .. 2 .. 3`, and the
+    /// spellings that reach the same shape through an operand (`1 .. ..3`).
+    /// Refused for the reason a chained comparison is: the second operator has no
+    /// reading that means anything, so accepting it only defers the complaint to
+    /// evaluation, where it arrives as "endpoints must be integers" and names
+    /// neither the operator nor the line's real problem.
+    ChainedRange,
     Expected(&'static str),
     ReservedParameter(String),
     /// `_ = value` — the discard used as a place. It is a *pattern element*, so it
@@ -371,6 +378,9 @@ impl std::fmt::Display for ParseError {
             }
             ParseErrorKind::ChainedComparison => {
                 write!(f, "syntax error: comparisons cannot be chained")
+            }
+            ParseErrorKind::ChainedRange => {
+                write!(f, "syntax error: ranges cannot be chained")
             }
             ParseErrorKind::Expected(expected) if expected.starts_with("an empty command") => {
                 write!(f, "syntax error: {}", expected.trim_start_matches("an "))
@@ -4387,11 +4397,21 @@ impl Parser<'_> {
     fn binary(&mut self, minimum: u8) -> Result<Expr, ParseError> {
         let mut left = self.prefix()?;
         let mut compared = false;
+        // A leading `..` is read whole by `primary`, so the first operand can
+        // already *be* a range without the loop having built one. Seeding from it
+        // is what makes `..1 .. 2` answer like `1 .. 2 .. 3` instead of slipping
+        // past a counter that only watches the loop.
+        let mut ranged = matches!(left, Expr::Range { .. });
         loop {
             self.wraps(|parser| parser.continues_binary(minimum));
             if minimum <= 5
                 && (self.same(&TokenKind::Range) || self.same(&TokenKind::RangeInclusive))
             {
+                // Reported before the operator is consumed, so the span covers the
+                // `..` that cannot be there rather than whatever follows it.
+                if ranged {
+                    return Err(self.error(ParseErrorKind::ChainedRange));
+                }
                 let inclusive = self.eat(&TokenKind::RangeInclusive).is_some();
                 if !inclusive {
                     self.position += 1;
@@ -4400,13 +4420,14 @@ impl Parser<'_> {
                 let end = if self.at_expression_end() {
                     None
                 } else {
-                    Some(Box::new(self.binary(6)?))
+                    Some(Box::new(self.range_endpoint()?))
                 };
                 left = Expr::Range {
                     start: Some(Box::new(left)),
                     end,
                     inclusive,
                 };
+                ranged = true;
                 continue;
             }
             let Some((op, precedence, comparison)) = self.binary_op() else {
@@ -5297,6 +5318,25 @@ impl Parser<'_> {
         Ok(result)
     }
 
+    /// An endpoint, refused if it is itself a range.
+    ///
+    /// The operand tier is `binary(6)`, above range, so the *loop* can never hand
+    /// one back — but `primary` reads a leading `..` as a whole range, which is
+    /// how `1 .. ..3` reaches the shape `1 .. 2 .. 3` is refused for. Checked
+    /// here so both spellings answer the same way, rather than one at parse time
+    /// and the other at evaluation.
+    fn range_endpoint(&mut self) -> Result<Expr, ParseError> {
+        let start = self.position;
+        let end = self.binary(6)?;
+        if matches!(end, Expr::Range { .. }) {
+            return Err(ParseError {
+                kind: ParseErrorKind::ChainedRange,
+                span: self.tokens[start].span.start..self.previous_end(),
+            });
+        }
+        Ok(end)
+    }
+
     fn range(&mut self, start: Option<Expr>) -> Result<Expr, ParseError> {
         let inclusive = self.eat(&TokenKind::RangeInclusive).is_some();
         if !inclusive {
@@ -5305,7 +5345,7 @@ impl Parser<'_> {
         let end = if self.at_expression_end() {
             None
         } else {
-            Some(Box::new(self.binary(6)?))
+            Some(Box::new(self.range_endpoint()?))
         };
         Ok(Expr::Range {
             start: start.map(Box::new),
@@ -5625,10 +5665,47 @@ impl Parser<'_> {
             // Text that is not an expression at all is a command — including a partial
             // one, which the command parser reports as incomplete so the reader asks
             // for more instead of erroring.
+            //
+            // A **chaining** error is the exception, and the one kind of failure that
+            // can still claim the statement. It is not "this was never a value": the
+            // parse got an operand, an operator, a second operand, and only then a
+            // second operator of a tier that takes one. Handing that back to command
+            // position reads the operators as arguments, so `$x .. 2 .. 3` *runs* `$x`
+            // with `.. 2 .. 3` after it, and the diagnostic the value parse already
+            // had is thrown away.
+            Err(error)
+                if matches!(
+                    error.kind,
+                    ParseErrorKind::ChainedRange | ParseErrorKind::ChainedComparison
+                ) =>
+            {
+                self.chaining_error_claims_statement(saved)
+            }
             Err(_) => false,
         };
         self.position = saved;
         claims
+    }
+
+    /// Does a chaining error claim the statement, or does the command reading still win?
+    ///
+    /// The same two questions a *successful* probe answers, asked of a parse that has no
+    /// tree to ask them of. Skipping them was a real regression: `puts .. 2 .. 3` and
+    /// `echo == x == y` are command lines whose arguments merely look like operators,
+    /// and `${cmd}==a==b` is one unbroken word naming a program. All three became syntax
+    /// errors when any chaining failure claimed the statement outright.
+    ///
+    /// The run is measured to where the parse *stopped* — the second operator — since
+    /// that is as much text as the value reading ever accounted for.
+    fn chaining_error_claims_statement(&mut self, start: usize) -> bool {
+        if self.is_one_command_word(start, self.position) {
+            return false;
+        }
+        self.position = start;
+        // Only the leading operand, which is all `outranks_a_command` reads: a bare word
+        // keeps the command reading, while an integer, boolean, quoted word, variable,
+        // list, group, or capture has no command spelling to keep.
+        matches!(self.prefix(), Ok(operand) if outranks_a_command(&operand))
     }
 
     /// Is the token run the value parse just consumed spellable as **one command word**?
@@ -6749,6 +6826,47 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_range_cannot_be_chained() {
+        // Every spelling that puts a range where an endpoint belongs, including the
+        // two that reach it through an operand rather than through the loop:
+        // `1 .. ..3` builds its end in `primary`, and `..1 .. 2` arrives with the
+        // *first* operand already a range.
+        for source in [
+            "x = 1 .. 2 .. 3",
+            "x = 1 ..= 2 ..= 3",
+            "x = 1..2..3..4",
+            "x = 1.. ..3",
+            "x = .. ..3",
+            "x = ..1..2",
+        ] {
+            assert!(
+                matches!(
+                    parse(source),
+                    Err(ParseError {
+                        kind: ParseErrorKind::ChainedRange,
+                        ..
+                    })
+                ),
+                "{source} should be refused as a chained range"
+            );
+        }
+        // Grouping is the way to say it, as it is for a comparison, and every
+        // one-operator spelling is untouched — including the open-ended ones, whose
+        // missing endpoint must not read as a chain.
+        for source in [
+            "x = (1 .. 2) .. 3",
+            "x = 1..2",
+            "x = 1..=2",
+            "x = 1..",
+            "x = ..3",
+            "x = ..",
+            "x = [1..2, 3..4]",
+        ] {
+            assert!(parse(source).is_ok(), "{source} should still parse");
+        }
     }
 
     #[test]

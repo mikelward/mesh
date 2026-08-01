@@ -3918,14 +3918,17 @@ because a docs consolidation is the wrong place to change the language — but e
 is a candidate for a parser fix instead, at which point the grammar entry becomes
 a one-line edit. Every claim below was checked against the built shell.
 
-- [ ] **A range chain parses and then fails at run time.** `Parser::binary`
-      `continue`s its operator loop after building an `Expr::Range`, so
-      `1 .. 2 .. 3` is `(1..2)..3` — accepted by `mesh -n`, then refused by the
-      engine with `range endpoints must be integers`. The comparison tier has an
-      explicit guard (`ChainedComparison`, `a < b < c`) and the range tier does
-      not. Either add the guard, so the error names the real problem at the real
-      place, or decide chaining is meaningful. Documented as left-associative
-      because that is what it does today.
+- [x] **A range chain parsed and then failed at run time.** `Parser::binary`
+      `continue`d its operator loop after building an `Expr::Range`, so
+      `1 .. 2 .. 3` was `(1..2)..3` — accepted by `mesh -n`, then refused by the
+      engine with `range endpoints must be integers`, which named neither the
+      operator nor the line's real problem. Fixed by giving the range tier the
+      guard the comparison tier already had: `ChainedRange`, reported at the
+      second `..`. It covers the two spellings that reach the same shape through
+      an *operand* rather than through the loop — `1 .. ..3`, whose end `primary`
+      reads whole, and `..1 .. 2`, which arrives with the first operand already a
+      range — so every way of writing it answers alike. Group to say it
+      (`(1 .. 2) .. 3` parses, and is the engine's problem from there).
 
 - [ ] **A parameter list refuses the newline an argument list accepts.**
       `g(1` ⏎ `, 2)` parses; `func f(x = 1` ⏎ `, y)` is ``expected `,` or `)` ``.

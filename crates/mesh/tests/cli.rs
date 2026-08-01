@@ -11101,6 +11101,112 @@ fn option_terminator_passes_help_to_a_function_as_data() {
 }
 
 #[test]
+fn a_chained_range_is_a_syntax_error_rather_than_a_run_time_one() {
+    // The complaint used to arrive from the engine as "range endpoints must be
+    // integers", which named neither the operator nor the line's real problem.
+    let out = run_with_input("puts (1 .. 2 .. 3)\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ranges cannot be chained"), "{stderr}");
+    assert!(!stderr.contains("endpoints must be integers"), "{stderr}");
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+
+    // Grouping says it, as it does for a comparison — and still fails at run time,
+    // since a range is not an integer. That is the engine's call, not the parser's.
+    let grouped = run_with_input("puts ((1 .. 2) .. 3)\n");
+    let grouped_stderr = String::from_utf8_lossy(&grouped.stderr);
+    assert!(
+        !grouped_stderr.contains("ranges cannot be chained"),
+        "{grouped_stderr}"
+    );
+}
+
+#[test]
+fn a_chaining_error_is_not_handed_back_to_command_position() {
+    // A statement is probed as a value first and falls back to a command when the
+    // value parse fails — but a chaining error is not "never a value", and handing
+    // it back reads the operators as *arguments*. `$x .. 2 .. 3` ran `echo` with
+    // `.. 2 .. 3` after it, silently, and `1 .. 2 .. 3` blamed a missing command
+    // named `1`. Both spellings, and both chaining tiers, must report the chain.
+    for (source, expected) in [
+        ("1 .. 2 .. 3\n", "ranges cannot be chained"),
+        ("x = echo\n$x .. 2 .. 3\n", "ranges cannot be chained"),
+        ("if 1 .. 2 .. 3 { puts y }\n", "ranges cannot be chained"),
+        ("1 == 2 == 3\n", "comparisons cannot be chained"),
+        ("x = echo\n$x in 2 in 3\n", "comparisons cannot be chained"),
+    ] {
+        let out = run_with_input(source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(expected), "{source:?} gave {stderr}");
+        assert!(
+            !stderr.contains("command not found"),
+            "{source:?} dispatched a command: {stderr}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{source:?} ran something: {:?}",
+            out.stdout
+        );
+    }
+
+    // A body is parsed when the definition is read, so the chain reports there and
+    // the call that follows finds nothing defined — the pair
+    // `a_function_body_is_parsed_when_defined` already asserts for a comparison.
+    let body = run_with_input("func f() { 1 .. 2 .. 3 }\nf\n");
+    let body_stderr = String::from_utf8_lossy(&body.stderr);
+    assert!(
+        body_stderr.contains("ranges cannot be chained"),
+        "{body_stderr}"
+    );
+    assert!(
+        body_stderr.contains("command not found: f"),
+        "{body_stderr}"
+    );
+
+    // The claim is narrow: a `<` or `>` after a command word is still a redirect,
+    // which is what keeps `1 < 2 < 3` the command reading it has always been.
+    let redirect = run_with_input("puts hi > /dev/null\nputs done\n");
+    assert_eq!(String::from_utf8_lossy(&redirect.stdout), "done\n");
+    let spaced = run_with_input("xs = [1,2,3]\nif $xs:len > 2 { puts big }\n");
+    assert_eq!(String::from_utf8_lossy(&spaced.stdout), "big\n");
+}
+
+#[test]
+fn chaining_shaped_arguments_stay_command_arguments() {
+    // The other half of the claim above, and the half that is easy to lose: text
+    // whose *arguments* look like a chain is still a command line. A bare word
+    // leading the statement keeps the command reading, so these operators are
+    // arguments and the chaining guard never sees a statement to claim.
+    for (source, stdout) in [
+        ("puts .. 2 .. 3\n", ".. 2 .. 3\n"),
+        ("puts a == b == c\n", "a == b == c\n"),
+        ("puts .. 2\n", ".. 2\n"),
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), stdout, "{source:?}");
+        assert!(out.stderr.is_empty(), "{source:?}: {:?}", out.stderr);
+    }
+
+    // An unbroken run is one command word however operator-shaped its middle, which
+    // is the `${cmd}.exe` / `${cmd}-1` rule reaching a chain. It names a program,
+    // and the reported failure is that no such program exists.
+    for (source, missing) in [
+        ("x = echo\n${x}==a==b\n", "command not found: echo==a==b"),
+        (
+            "x = echo\n${x}..bak..baz\n",
+            "command not found: echo..bak..baz",
+        ),
+    ] {
+        let out = run_with_input(source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(missing), "{source:?}: {stderr}");
+        assert!(
+            !stderr.contains("cannot be chained"),
+            "{source:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn a_single_line_function_definition_works() {
     let out = run_with_input("func sq(x) { puts $x $x }\nsq 3\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "3 3\n");

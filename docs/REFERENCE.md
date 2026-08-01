@@ -2335,7 +2335,8 @@ Value expressions support integer arithmetic (`+`, `-`, `*`, `/`, `%`), unary
 `-`, equality (`==`, `!=`), ordered comparisons (`<`, `<=`, `>`, `>=`),
 membership (`in`), and boolean `not`, `and`, and `or`. Ordered comparisons
 require two integers or two strings; arithmetic never implicitly parses a
-string (use `:int` explicitly). Comparisons cannot be chained.
+string (use `:int` explicitly). Comparisons cannot be chained, and neither can
+ranges: `1 .. 2 .. 3` is a syntax error, since a range is not an endpoint.
 
 `not` is a **reserved word**, and it negates one of two things: a **value**, or a
 **command's status**. Which one is decided by the operand — a value after it is the
