@@ -28,7 +28,6 @@ Delete an entry once you have agreed with it or reversed it.
       Pinned by a test instead, so it cannot go quiet. The alternative was to
       fold the fix in. *Reversible:* it is still an open entry with a failing-on-
       fix test attached.
-
 ## M0 — It runs `ls` ✅ (done)
 
 - [x] Cargo workspace, edition 2024, MSRV 1.85, `rust-toolchain.toml`
@@ -3455,7 +3454,25 @@ of each PR had landed by another route, but these pieces had not.
       which bash reads as two assignments and mesh reports as a missing
       separator.
 
-- [ ] **A numeric-looking argument loses its spelling through a mesh binding.**
+- [x] **A numeric-looking argument loses its spelling through a mesh binding.**
+      *Fixed.* A word types as an integer only when its text is that integer's own
+      spelling, so `007`, `08`, `+5` and `-0` stay strings and reach a command as
+      written. `parser::canonical_integer` round-trips the rendering rather than
+      scanning for zeros or signs, so it cannot fall out of step with how an
+      integer prints, and both `Word::bare_integer` and `expand::typed_scalar` ask
+      it — the parser's value-or-command test and the argument typing cannot
+      disagree about which words are integers.
+
+      **Which of the two options below that is.** The first: an argument is text
+      until something asks it to be a number. Not the second (an integer binding
+      carrying its source text alongside the value), even though the lean here was
+      for that one — it touches every `Value::Integer` site where this is one
+      predicate. The cost is that `007 + 1` is an error where it was `8`, asking
+      for `$n:int + 1`; that is the rule `REFERENCE.md` already states for every
+      other string, so it makes the typing more uniform rather than carving an
+      exception. **Confirmed by the repo owner** rather than left as an autopilot
+      guess. The second option remains the thing to build if the arithmetic is
+      wanted back, and it is what makes `$x + 1` and `"$x"` both answer.
       Found while re-checking rough edge 20, which is about something else. A
       word that parses as a decimal integer is bound as one and re-rendered from
       the number, so the text the caller wrote does not survive:
@@ -3469,7 +3486,8 @@ of each PR had landed by another route, but these pieces had not.
       ```
 
       `007` → `7`, `08` → `8`, `+5` → `5`, `-0` → `0`. `1_0`, `0x10` and `1e3`
-      are unaffected, since they stay strings.
+      are unaffected, since nothing types them as integers to lose the spelling
+      through — those forms are **unimplemented**, not decided as strings.
 
       What makes it a bug rather than the type rule being consistent is **where
       it does not happen**. A direct external argument keeps its spelling, and so
@@ -3488,6 +3506,33 @@ of each PR had landed by another route, but these pieces had not.
       spelling: either an argument is text until something asks it to be a
       number, or the integer binding keeps the source text alongside the value.
       The second is what makes `$x + 1` and `"$x"` both answer correctly.
+
+- [ ] **Consider refusing a bare numeral in statement position outright.**
+      `007` and `0755` are strings, so they are bare words, so they name commands
+      — consistent with every other bare word, and the repo owner flagged that it
+      is still not what someone typing `0755` at a prompt means. Three readings
+      were on the table:
+
+      1. **What ships today.** A command word like any other. `command not found`
+         now carries a note saying the word was read as a string (`rename_note`,
+         `builtins.rs`), which covers the confusing case — a numeral with no such
+         program — without touching what a word *is*.
+      2. **A discarded value**, like a bare `7`. Ergonomic, but it carves an
+         exception into the bare-word rule and makes a real program named `007`
+         unreachable without `./007`.
+      3. **A diagnostic** — refuse in statement position and name both readings
+         (`./007` to run it, `puts 007` to print it), *even when* a program of
+         that name exists, on the grounds that this is the one position where the
+         two readings collide and guessing either way is worse than asking.
+
+      (1) and the note are in; (3) is what this entry is for. It needs
+      intercepting command dispatch **before** the spawn rather than decorating
+      the not-found, since the point is to refuse a name that resolves — so it has
+      to compose with builtins, functions and aliases, which is why it is not a
+      one-liner on top of the note. The predicate is settled either way: a word
+      that parses as an `i64` without being canonical, which is exactly the set
+      whose category this rule decides. Deliberately *not* the broader
+      "starts with a digit" — `2to3` and `7z` are ordinary program names.
 
 - [ ] **Decide whether a non-interactive shell should start process groups for
       its pipelines.** `run_pipeline` takes its job-control decision from
@@ -4490,7 +4535,15 @@ a one-line edit. Every claim below was checked against the built shell.
         `0b1011` and `1_000` all still parse as **strings**, so `x = 1_000` binds
         text and `$x + 1` fails with `expected integer` — the shape most likely to
         be read as a bug, since the literal looks typed. `$b:pow(3)` is not a
-        modifier yet. The leading-zero question below still gates the literals.
+        modifier yet.
+
+        **Not blocked.** The leading-zero question below used to gate these and is
+        now decided, so this is ready to build. What it hands the work is a
+        requirement rather than a wait: a literal form has to settle which text it
+        renders back to before it binds as an `i64`, or it loses the spelling the
+        way `007` did — `0x10` coming back as `16`, `1_000` as `1000`. Keeping the
+        source text is the open half of that question and `DESIGN.md` §"Literals"
+        states it.
   - [x] **How subtraction is spelled.** *Decided: type-directed dispatch* — see
         §"Binary `-`, and the glob-exclusion collision" in `DESIGN.md`. It is what
         `+` already does across strings, lists, maps and integers, so `-` doing it
@@ -4548,8 +4601,12 @@ a one-line edit. Every claim below was checked against the built shell.
         is the one place mesh returns a quiet wrong answer instead of an error.
 
         Sequencing note — the float literal and the still-unbuilt `0x` / `0o` /
-        `0b` / `_` forms are the same lexer path, and the leading-zero question
-        gates both, so they want doing together rather than twice.
+        `0b` / `_` forms are the same lexer path, so they want doing together
+        rather than twice. The leading-zero question that used to gate both is
+        **decided** and no longer blocks either; what it leaves them is the
+        requirement that each form settle which text it renders back to, since a
+        float has the same exposure — `1e3` returning as `1000` loses a spelling
+        exactly as `007` did.
   - [ ] **Implement `-` and its list form.** Subtraction on two integers works
         today; nothing else does. `(* - *.bak)`, `($xs - $ys)` and `([a b] - 1)`
         all answer `expected integer`, so the list difference is unbuilt and the
@@ -4573,16 +4630,24 @@ a one-line edit. Every claim below was checked against the built shell.
         once `-*.bak` could plausibly read as one word. Settle it deliberately —
         either enforce both sides or write down that the leading space is what
         matters — rather than letting the two drift further apart.
-  - [ ] **Whether a leading zero means octal.** `007` parses as `7` today, silently
-        dropping the zeros — the one answer that is certainly wrong. Either it is
-        octal (C, POSIX `$(( ))`, and the `chmod` tradition), which forces `08` and
-        `09` to become **errors** as invalid octal digits, or a multi-digit literal
-        with a leading zero is rejected outright and `0o007` is the only octal
-        spelling (Python 3's answer). Note the usual argument for the C form does
-        not apply here: file modes travel as **command arguments**, which never
-        parse as integers, so `chmod 0644 f` is unaffected either way — the octal
-        reading would only ever govern `n = 007`, where nobody is writing a mode,
-        while `n = 09` breaking is a real cost.
+  - [x] **Whether a leading zero means octal** — *decided: neither.* `007` is the
+        **string** `007`, and `0o007` is the only octal spelling, which is Python
+        3's answer arrived at by a different route. Both options this entry offered
+        assumed the word was a *number* and asked which one; the answer is that it
+        is not a number at all, because an integer carries no record of how it was
+        written and `007` bound as one came back `7`. So a decimal literal is an
+        integer only when its text is that integer's own spelling, which takes
+        `08` and `09` with it — as strings rather than as the "invalid octal digit"
+        errors the C reading would have forced, so the cost this entry worried
+        about does not arrive.
+
+        The entry's own reasoning held up and is worth keeping: the usual argument
+        for the C form does not apply, since file modes travel as **command
+        arguments** and never parse as integers, so `chmod 0644 f` was unaffected
+        either way. What it missed is that `n = 007` was not harmless either —
+        `chmod $n f` after it passed `7`. See `DESIGN.md` §"Literals" for the rule
+        and *A numeric-looking argument loses its spelling* above for the bug that
+        settled it.
 - [x] **What `fg` does with a job that has already finished** — *decided: hand
       back the status the job already carries*, which is the reason a completed
       job is kept in the table at all. `JobTable::info` polls with

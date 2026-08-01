@@ -184,6 +184,20 @@ const REPLACED: &[(&str, &str)] = &[
 /// dead end, or one that names a builtin, which only `command` can have looked
 /// past. `None` for every other name — a typo gets the plain message.
 pub(crate) fn rename_note(name: &str) -> Option<String> {
+    // A numeral that is not an integer's own spelling is a **string**, so it is a
+    // bare word and names a command like any other. That is consistent, and it is
+    // also the last thing someone typing `0755` at a prompt expects, so the
+    // not-found says which reading it took rather than leaving them to infer it.
+    //
+    // Deliberately only the words whose category this rule decides — text that
+    // parses as an `i64` without being canonical. A broader "starts with a digit"
+    // test would attach this to `2to3` and `7z`, which are ordinary program names
+    // and have nothing to do with it.
+    if name.parse::<i64>().is_ok() && crate::parser::canonical_integer(name).is_none() {
+        return Some(format!(
+            "`{name}` is a string, not the number it looks like; `puts {name}` prints it"
+        ));
+    }
     // A builtin's name only reaches an external lookup through `command`, which
     // is defined to look past the builtins. Saying so beats a bare "not found"
     // for a name the reader can see in `help`.

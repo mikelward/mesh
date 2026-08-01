@@ -7371,9 +7371,17 @@ fn output_words(
 ///
 /// Only a handle takes this route: everything else keeps exactly the text ordinary
 /// expansion produces. That distinction is load-bearing, because a job builtin's
-/// options are not just data. Expanding them as values types `-0` as the integer
-/// `0` and drops the sign along with it, which turns `kill -0 $pid` — ask whether
-/// it is alive — into `kill 0 $pid`, and pid 0 is *the caller's own process group*.
+/// options are not just data — retyping one changes what the builtin was asked to
+/// do, and it is the builtin rather than the shell that reads them.
+///
+/// The example that used to be here is worth keeping as history: value expansion
+/// typed `-0` as the integer `0` and dropped the sign with it, turning
+/// `kill -0 $pid` — ask whether it is alive — into `kill 0 $pid`, and pid 0 is
+/// *the caller's own process group*. That specific hazard is now closed upstream:
+/// a word types as an integer only when its text is that integer's own spelling,
+/// so `-0` stays the string `-0` down the value path too. The bypass no longer
+/// rests on it, and `kill_takes_signal_zero_as_a_liveness_probe` pins the outcome
+/// from the other side. Raised in review.
 ///
 /// A handle becomes **`%id`** rather than a bare id on purpose: `fg 2` and
 /// `fg %2` mean the same job, but for `kill` a bare number is a *pid*, and `$j`
@@ -7387,8 +7395,10 @@ fn job_reference_word(word: &Word, vars: &Vars, name: &str) -> Result<Option<Vec
     // A word can produce several values — `kill ...$handles` spreads a list, and
     // `kill` takes independent targets — so this is about the word as a whole:
     // a handle anywhere in it means the word names jobs, and every value it
-    // produced is converted. A word with no handle in it is left alone, which is
-    // what keeps an option like `-0` the text it was written as.
+    // produced is converted. A word with no handle in it is left alone, so an
+    // option reaches the builtin as the text it was written as — no longer the
+    // only thing keeping `-0` from becoming `0`, since it does not type as an
+    // integer either, but still what keeps the two paths from disagreeing.
     // A map is included so a plain one still gets the job builtin's own answer:
     // "a map is not a job" says what is wrong, where the generic argv message
     // ("needs `...`") advises a spread that would not help.

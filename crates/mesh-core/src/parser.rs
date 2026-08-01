@@ -146,7 +146,8 @@ impl Word {
             .collect()
     }
 
-    /// The `i64` this word spells, when it is a single **bare** run of text.
+    /// The `i64` this word spells, when it is a single **bare** run of text and
+    /// that text is the integer's own spelling — see [`canonical_integer`].
     ///
     /// Concatenated text is not enough to go on: `4"2"`, `42""`, and `4\2` all
     /// compose to `42`, but expansion keeps the quoted and escaped pieces and
@@ -162,7 +163,7 @@ impl Word {
                     text,
                     quote: QuoteMode::Bare,
                 },
-            ] => text.parse().ok(),
+            ] => canonical_integer(text),
             _ => None,
         }
     }
@@ -1206,6 +1207,15 @@ fn negative_literal(minus: &Span, operand: &Expr) -> Option<Expr> {
     let Expr::Scalar(word) = operand else {
         return None;
     };
+    // Only an **attached** sign folds. Spaced, the reader wrote an operation, and
+    // folding it built a literal they did not: `- 0` became the text `-0`, which is
+    // not `0`'s own spelling, so it typed as a string and `$x + 1` stopped working.
+    // `- 007` was worse — it bound the string `-007` where negating a string has to
+    // report, as `- abc` does. Adjacency is the whole distinction, and the spans
+    // already carry it. Raised in review.
+    if minus.end != word.span.start {
+        return None;
+    }
     // Whether the signed text parses is the whole test — exact on its own, so
     // there is no second shape check to drift out of step with it.
     let text = format!("-{}", word.value.bare_word()?);
@@ -1221,6 +1231,26 @@ fn negative_literal(minus: &Span, operand: &Expr) -> Option<Expr> {
         // The sign is part of the literal now, so the span covers it.
         span: minus.start..word.span.end,
     }))
+}
+
+/// The `i64` `text` spells, when `text` is that integer's **own** spelling.
+///
+/// `007`, `08`, `+5` and `-0` all parse, but an `i64` carries no record of how it
+/// was written, so binding one and rendering it back loses the text: `007` reached
+/// a command as `7`. Round-tripping the rendering is the exact test, rather than a
+/// scan for leading zeros or signs, so it cannot fall out of step with how an
+/// integer prints.
+///
+/// The **one** place that question is answered. [`Word::bare_integer`] asks it to
+/// decide whether a word is a value rather than a command word, and
+/// [`crate::expand::typed_scalar`] asks it to decide how an argument binds; the two
+/// disagreeing meant a program named `007` on `PATH` was claimed as a value and
+/// silently skipped in statement position while binding as the string it is
+/// everywhere else. Sharing half a rule is how that happens — raised in review.
+pub(crate) fn canonical_integer(text: &str) -> Option<i64> {
+    text.parse::<i64>()
+        .ok()
+        .filter(|number| number.to_string() == text)
 }
 
 /// A parse error that only means "the input ran out" — the reader buffers on it

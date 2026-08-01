@@ -1227,10 +1227,26 @@ fn link_needs_a_text_a_url_and_a_scheme() {
 fn puts_does_not_retype_a_written_argument() {
     // Integer parsing governs value positions, not argument words (`DESIGN.md`
     // §"Literals"), so what was written is what is printed — a leading zero and a
-    // sign survive. A *variable* holding `007` really is the integer 7.
+    // sign survive.
+    //
+    // A binding keeps them too, now. `n = 007` used to hold the integer 7 and
+    // print `7`, so passing a word through a variable — or through a `func`
+    // parameter, which types the same way — rewrote it. An `i64` has no record of
+    // how it was spelled, so the only way to keep the text was not to leave it:
+    // a word types as an integer only when its text is that integer's own
+    // spelling, and `007` is not.
     let out = run_with_input("puts 007 -0 +5 1.50\nn = 007\nputs $n\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "007 -0 +5 1.50\n7\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "007 -0 +5 1.50\n007\n"
+    );
     assert!(out.stderr.is_empty());
+
+    // The canonical spelling still types as an integer, so this narrows what is
+    // *typed* rather than stopping the typing.
+    let canonical = run_with_input("n = 7\nputs ($n + 1)\nm = -2\nputs ($m + 1)\n");
+    assert_eq!(String::from_utf8_lossy(&canonical.stdout), "8\n-1\n");
+    assert!(canonical.stderr.is_empty());
 }
 
 #[test]
@@ -7755,10 +7771,14 @@ fn kill_takes_signal_zero_as_a_liveness_probe() {
     // `kill -0` sends nothing and reports whether the target exists and could be
     // signalled — how a script asks whether something is still running.
     //
-    // The sign matters as much as the zero: expanding a job builtin's arguments
-    // as typed values turned `-0` into the integer `0`, and `kill 0 $pid` sends
-    // to *the caller's own process group*. Arguments other than handles keep the
-    // text ordinary expansion gives them, so the option survives as written.
+    // The sign matters as much as the zero — `kill 0 $pid` signals *the caller's
+    // own process group*. Two things keep it now, and this test is the outer one:
+    // a word types as an integer only when its text is that integer's own
+    // spelling, so `-0` is a string wherever it travels, and arguments other than
+    // job handles keep the text ordinary expansion gives them anyway. The typing
+    // rule is newer; the comment here used to name the handle bypass as the only
+    // thing standing between `-0` and `0`, which stopped being true when `-0`
+    // stopped typing as an integer.
     let out = run_with_input(
         "sleep 5 &\nkill -0 $sh.jobs[1].pid\nputs live=$sh.status\nkill -s 0 $sh.jobs[1].pid\nputs spelled=$sh.status\n",
     );
@@ -15489,6 +15509,149 @@ fn integer_and_boolean_values_remain_typed() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// A wrapper must hand a command the argument it was given, byte for byte.
+///
+/// It did not: a word that parsed as a decimal integer was bound as one and
+/// re-rendered from the number, so `007` reached the command as `7`. What made it
+/// a bug rather than the type rule being consistent is where it *didn't* happen —
+/// a direct external argument and `$sh.args` both kept the spelling, so putting a
+/// mesh function in front of a command silently changed what the command
+/// received, which is the one thing a wrapper must not do.
+///
+/// Each row runs through a wrapper and directly, and the two are asserted equal
+/// **to each other** as well as to the text written, so a future change that loses
+/// the spelling in both places still fails rather than agreeing on the wrong
+/// answer.
+#[test]
+fn a_wrapper_hands_on_the_spelling_it_was_given() {
+    for word in ["007", "08", "+5", "-0", "1_0", "0x10", "1e3", "7", "-2"] {
+        let wrapped = run_with_input(&format!("func w(...rest) {{ puts ...$rest }}\nw {word}\n"));
+        let direct = run_with_input(&format!("puts {word}\n"));
+        let wrapped = String::from_utf8_lossy(&wrapped.stdout).into_owned();
+        let direct = String::from_utf8_lossy(&direct.stdout).into_owned();
+        assert_eq!(wrapped, format!("{word}\n"), "a wrapper rewrote {word:?}");
+        assert_eq!(
+            wrapped, direct,
+            "{word:?} differs depending on whether a func is in the way"
+        );
+    }
+
+    // Narrowing what is *typed*, not stopping it: the canonical spelling is still
+    // an integer and still does arithmetic.
+    let typed = run_with_input("func f(n) { puts ($n + 1) }\nf 7\nf -2\n");
+    assert_eq!(String::from_utf8_lossy(&typed.stdout), "8\n-1\n");
+
+    // The spelling-preserving forms are strings, so arithmetic on one asks for the
+    // conversion explicitly — the rule `REFERENCE.md` already states for every
+    // other string.
+    let explicit = run_with_input("func f(n) { puts ($n:int + 1) }\nf 007\n");
+    assert_eq!(String::from_utf8_lossy(&explicit.stdout), "8\n");
+}
+
+/// A word that is not a typed literal names a **command**, so the typing rule and
+/// the parser's value-or-command test have to agree about which words those are.
+///
+/// They did not: `typed_scalar` called `007` a string while `Word::bare_integer`
+/// still claimed it as an integer, so `outranks_a_command` read it as a value and
+/// a program named `007` on `PATH` was silently skipped in statement position —
+/// no output, no diagnostic. Both now ask `parser::canonical_integer`. Raised in
+/// review.
+#[test]
+fn a_noncanonical_numeral_names_a_command_and_a_canonical_one_does_not() {
+    let dir = fresh_dir("numeral_command");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["007", "7"] {
+        let path = bin.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\necho ran {name}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let path_with_bin = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |source: &str| {
+        let script = dir.join("run.mesh");
+        std::fs::write(&script, source).unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .env("PATH", &path_with_bin)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // `007` is a string, so it is a command word.
+    assert_eq!(run("007\n"), "ran 007\n");
+    // And it runs where a status is wanted, rather than reporting that a string is
+    // not a condition.
+    assert_eq!(run("if 007 { puts yes }\n"), "ran 007\nyes\n");
+    // `7` is a typed literal, so it stays a discarded value even with a program of
+    // that name on PATH — this is the half that must not move.
+    assert_eq!(run("7\n"), "");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Being a command word is consistent, and it is still not what someone typing
+/// `0755` at a prompt expects — so `command not found` says which reading it took
+/// instead of leaving them to infer it from silence.
+///
+/// Runs against an **empty** `PATH` rather than the ambient one. Asserting that a
+/// name is not found is asserting something about the machine, and the first
+/// version of this asserted it about `7z` — which GitHub's runners ship, so it
+/// passed locally and failed in CI. The directory being empty is the whole
+/// premise, so it has to be built rather than assumed.
+#[test]
+fn a_numeral_that_is_not_a_command_says_it_was_read_as_a_string() {
+    let dir = fresh_dir("numeral_not_found");
+    let empty = dir.join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let run = |source: &str| {
+        let script = dir.join("run.mesh");
+        std::fs::write(&script, source).unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .env("PATH", &empty)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    let stderr = run("0755\n");
+    assert!(
+        stderr.contains("command not found: 0755")
+            && stderr.contains("is a string, not the number it looks like"),
+        "{stderr:?}"
+    );
+
+    // Scoped to the words this rule decides. `2to3` and `7z` are ordinary program
+    // names that happen to start with a digit, and a broader test would have
+    // attached the note to them.
+    for name in ["2to3", "7z"] {
+        let stderr = run(&format!("{name}\n"));
+        assert!(
+            stderr.contains(&format!("command not found: {name}")),
+            "{stderr:?}"
+        );
+        assert!(
+            !stderr.contains("is a string"),
+            "{name} is not a numeral: {stderr:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -23985,7 +24148,12 @@ fn folding_the_sign_claims_literals_and_nothing_else() {
         // Folded: a bare magnitude that fits. The third is the whole reason the
         // fold exists — it has no positive counterpart to negate.
         ("x = -5", "-5"),
-        ("x = -0", "0"),
+        // The sign still folds here — `-0` is one bare word, not a runtime
+        // negation — but the word it folds to keeps its spelling rather than
+        // typing as the integer 0, since `0` is not how it was written. What
+        // folds and what types are separate questions, and this row is the one
+        // place they give different answers.
+        ("x = -0", "-0"),
         ("x = -9223372036854775808", "-9223372036854775808"),
         ("x = 9223372036854775807", "9223372036854775807"),
         // Not folded: the operand is not a bare literal, so the negation stays
@@ -24001,6 +24169,13 @@ fn folding_the_sign_claims_literals_and_nothing_else() {
         ("x = -abc", "-abc"),
         ("x = --5", "--5"),
         ("x = 3 - 5", "-2"),
+        // **Spaced, the sign does not fold** — the reader wrote an operation, so it
+        // stays one and negates at runtime. That is what keeps `- 0` the integer
+        // `0`: folded, it built the text `-0`, which is not `0`'s own spelling and
+        // so typed as a *string*, taking `$x + 1` with it. Adjacency is the whole
+        // distinction and the rows below pin both sides of it.
+        ("x = - 0", "0"),
+        ("x = - 5", "-5"),
     ] {
         let out = run_with_input(&format!("{source}\nputs $x\n"));
         assert!(
@@ -24018,7 +24193,18 @@ fn folding_the_sign_claims_literals_and_nothing_else() {
     // Nothing to fold into, so these stay negations over operands that are not
     // integers — a loud error rather than a quiet string. A quoted `5` is a
     // string on purpose; past the range there is no literal in reach.
-    for source in ["x = -\"5\"", "x = -99999999999999999999"] {
+    for source in [
+        "x = -\"5\"",
+        "x = -99999999999999999999",
+        // Spaced, so it is a negation of the *string* `007` — which reports, as
+        // negating any other string does. Attached, `-007` is one word and keeps
+        // its spelling; the two forms answering differently is the point.
+        "x = - 007",
+        // The smallest integer needs its sign attached, since spaced there is no
+        // literal in reach: the magnitude alone does not fit an `i64`, so it is a
+        // string by the time the negation would apply.
+        "x = - 9223372036854775808",
+    ] {
         let out = run_with_input(&format!("{source}\nputs $x\n"));
         assert!(!out.status.success(), "{source:?} should have failed");
         assert!(
