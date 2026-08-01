@@ -2857,24 +2857,46 @@ thing a reader takes on trust.*
       string keeps its old hard error for the same reason — continuing it is a
       separate question from continuing the string around it. Both raised in
       review.
-- [ ] **Decide what Ctrl-D should do with pending input.** `Signal::CtrlD =>
-      Some(Step::Exit(last))` (`repl.rs`) never looks at `pending`, so an
-      interactive session with a half-typed construct exits silently with the
-      *previous* status. Deliberate for a half-typed `func` — the comment says
+- [x] **Decide what Ctrl-D should do with pending input.** `Signal::CtrlD =>
+      Some(Step::Exit(last))` (`repl.rs`) never looked at `pending`, so an
+      interactive session with a half-typed construct exited silently with the
+      *previous* status. Deliberate for a half-typed `func` — the comment said
       "abandoning any in-progress `func`" — and reedline only emits Ctrl-D on an
-      empty editor line, so it reads as "I mean to leave" rather than "tell me
+      empty editor line, so it read as "I mean to leave" rather than "tell me
       what is wrong". Raised in review against the entry above, which extends the
       same treatment to a half-typed string.
 
-      What makes it worth a decision rather than a shrug: the *other* readers
+      What made it worth a decision rather than a shrug: the *other* readers
       disagree. Piped EOF, a script, and `-n` all convert an incomplete parse
-      back into its error and exit 2. So the same unclosed quote is a reported
+      back into its error and exit 2. So the same unclosed quote was a reported
       syntax error through three doors and a silent exit 0 through the fourth —
-      the exact class of reader disagreement edge 23 was about. Either Ctrl-D
-      reports and exits 2 like the rest, or abandonment is the documented
-      contract for every construct and the others are the odd ones out. Changing
-      it means changing what Ctrl-D does to a half-typed `func`, which is why it
-      is not folded into edge 23.
+      the exact class of reader disagreement edge 23 was about.
+
+      **Resolved as neither of the two options the entry framed.** Reporting and
+      exiting 2 makes Ctrl-D destroy the buffer to complain about it, and
+      documenting abandonment blesses losing it. The rule that came out instead
+      is about the *buffer*, not about constructs: **Ctrl-D exits only when the
+      input buffer is completely empty, and does nothing at all otherwise** — no
+      special case for a continuation line, for a `func`, for a heredoc, or for
+      an unclosed string. It keeps the gestures distinct: Ctrl-D leaves, Ctrl-C
+      discards. Press Ctrl-C then Ctrl-D and you get the old behavior,
+      deliberately, in two keystrokes.
+
+      Scope, since the rule is easy to overstate (and the first draft of these
+      docs did): this governs only the *signal*, which reedline emits solely on
+      an empty editor line. With characters on the line reedline never signals
+      at all — it runs `EditCommand::Delete`, so Ctrl-D is `delete-char` there,
+      as in bash, and at the end of a line it finds nothing to delete. Raised by
+      Codex against wording that claimed Ctrl-D "does nothing at all" on a
+      non-empty line; the behavior was right, the claim was not.
+
+      The reader disagreement is still real but no longer a *silent* exit: the
+      other three readers hit a genuine end of input, where there is no more to
+      come, so converting the incomplete parse to an error is right for them.
+      Ctrl-D at a prompt is not an end of input — the session is still there and
+      the buffer is still in hand — so it now declines to answer for it.
+      `repl.rs` `handle_signal`; `docs/REFERENCE.md` key table + paragraph;
+      `DESIGN.md` signals.
 - [ ] **24. No NUL-delimited read.** `gets` takes no delimiter and `"\0"` is
       `invalid escape`, so `find -print0 | while read -d ''` has no translation.
       `each0` delegates to `xargs -0` instead, which means it can only run

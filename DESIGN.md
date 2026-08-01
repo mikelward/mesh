@@ -3911,8 +3911,12 @@ signals never end your session; only a lost terminal (SIGHUP) does:
   fresh prompt (never exits the shell). While a foreground command runs, SIGINT
   goes to *that* [job](#job-control)'s process group; the shell stays up and the
   next prompt shows its interrupted [status](#variables-and-assignment).
-- **`Ctrl-D` / EOF** — on an **empty** line, exit the shell; on a non-empty line it
-  does nothing, so a stray `Ctrl-D` can't drop you mid-command. An
+- **`Ctrl-D` / EOF** — `delete-char` on a non-empty line, as in bash: it deletes
+  the character under the cursor, and at the end of a line there is none, so
+  nothing happens. It means EOF only on an **empty** line, and even then exits
+  only when the input buffer behind that line is empty too — with a block or
+  heredoc still open it does nothing, so a stray `Ctrl-D` can't drop you
+  mid-construct. Discarding a buffer is `Ctrl-C`'s job. An
   **`$sh.options.ignore-eof`** setting can require a second press.
 - **`Ctrl-Z` / SIGTSTP** — suspend the foreground job to a **stopped**
   [job](#job-control); at an idle prompt (no foreground job) it is **ignored** —
@@ -5018,7 +5022,7 @@ to avoid" rather than promising the latter as done.
   `$sh.history` accessor, cross-session sync, dedup policy, and secret redaction.
 - **Interactive signals — decided** ([Signals](#signals)): interactive defaults
   (`Ctrl-C` abandons the line / interrupts the foreground job but never kills the
-  shell; `Ctrl-D` EOFs on an empty line; `Ctrl-Z` suspends; `SIGWINCH` redraws;
+  shell; `Ctrl-D` EOFs on an empty input buffer; `Ctrl-Z` suspends; `SIGWINCH` redraws;
   `SIGHUP` exits, `SIGTERM` ignored). User handlers are the keyed **`$sh.signal.<NAME>`**
   hook maps (no bash `trap`), with `$sh.exit` as the EXIT trap. Remaining: whether
   a handler may suppress a default, and mid-pipeline SIGINT delivery.
