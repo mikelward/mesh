@@ -2102,7 +2102,7 @@ is reported in either. That was once true in command position only — the value
 reading bound the literal `ab:upper`, silently — which is why the braced form is
 still the safer habit in code that has to run on an older mesh.
 
-A name mesh **reserves** for a modifier it has not built yet — `:sort`, `:lines`,
+A name mesh **reserves** for a modifier it has not built yet — `:sort`, `:has`,
 `:replace`, and the rest of the `DESIGN.md` set — parses, then reports a
 loud `not implemented yet` in a value context rather than a silent no-op. That is
 a different failure from an unknown name, which never parses.
@@ -2134,6 +2134,7 @@ a different failure from an unknown name, which never parses.
 | `:repr` | any value with a literal form | The value written as the mesh source you would have typed for it, as a string. |
 | `:tty` | stream handle | Is that stream a terminal? The `test -t N` replacement — see [`$sh.args` and `$sh.name`](#shargs-and-shname). |
 | `:words` | string | Split on runs of whitespace into a list — the IFS word-split. Never yields an empty element. |
+| `:lines` / `:nulls` / `:tabs` | string | Split on newline / NUL / tab into a list. Each is `:split(SEP)` with the separator its name spells. |
 | `:split(SEP)` | string | Split on the literal separator into a list. |
 | `:join(SEP)` | list | Fold the list into a string, `SEP` between elements. |
 | `:get(KEY, DEFAULT)` | map or list | **Total** access — `DEFAULT` when the key or index is absent. |
@@ -2229,10 +2230,16 @@ The whitespace is the **ASCII** set (` `, `\t`, `\n`, `\r`, and the vertical and
 form feeds). A non-breaking space is *data* — it appears inside filenames — so it
 stays in the field rather than splitting it.
 
-Both are **split** modifiers, which consume exactly one string: neither maps
-element-wise over a list, and a list subject is a loud `requires a string`. To
-take a list of lines apart, hand `:words` over as a callable — `$lines:map(:words)`
-— which works because it takes no argument.
+`:lines`, `:nulls` and `:tabs` are the fixed-separator members of the same family
+— each is `:split(SEP)` with the separator its name spells, terminator rule and
+all, so `"a\nb\n":lines` is `[a b]` and `"a\n\nb\n":lines` is `[a "" b]`. The
+useful one is `:nulls`, which splits on NUL and **nothing else**: a `find -print0`
+name that contains a newline arrives whole rather than torn at the newline.
+
+All of these are **split** modifiers, which consume exactly one string: none maps
+element-wise over a list, and a list subject is a loud `requires a string` naming
+the modifier that was written. To take a list of lines apart, hand `:words` over
+as a callable — `$lines:map(:words)` — which works because it takes no argument.
 
 `:get(KEY, DEFAULT)` is the **total** accessor, where `$m.key` and `$xs[i]` fail
 loud: it answers `DEFAULT` when the key or index is absent, which is what makes
@@ -2315,11 +2322,11 @@ Every modifier here is a value modifier, so each **maps element-wise over a
 list** — `$paths:stripend(".js")` rewrites each path — except `:get`, which
 consumes the collection as a whole.
 
-`:split` operates on the **already-evaluated** value, so a `$(…)` capture has had
-its trailing newline trimmed before `:split` runs (`$(printf "a:\n"):split(":")`
-is `[a]`). Binding a split modifier to a substitution's *raw* bytes — the
-`DESIGN.md` split-modifier behavior, shared with the not-yet-built `:lines` /
-`:nulls` / `:raw` family — is deferred. Argument-taking modifiers work in expression position (an assignment right-hand
+Every split modifier operates on the **already-evaluated** value, so a `$(…)`
+capture has had its trailing newline trimmed before the split runs
+(`$(printf "a:\n"):split(":")` is `[a]`). Binding one to a substitution's *raw*
+bytes — the `DESIGN.md` behavior, which is also what `:raw` needs to mean
+anything — is deferred; `:raw` is still unbuilt. Argument-taking modifiers work in expression position (an assignment right-hand
 side or other value context) and in command-argument position
 (`echo $dirs:join(":")`). Not yet: the **spread** of one at a command boundary —
 `puts ...$x:split(":")` is a syntax error, so bind it first (`xs = $x:split(":")`,

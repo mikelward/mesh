@@ -3150,25 +3150,25 @@ fn both_spellings_of_a_modifier_chain_agree() {
 
 #[test]
 fn a_modifier_the_reference_path_cannot_apply_is_reported() {
-    // `expand` implements 35 of the 83 modifiers the parser accepts, and used to
-    // drop the rest rather than report them — so a chain quietly lost a step.
-    // `"${s:lines:len}"` answered 3, the length of the *string*, for a `:len` that
-    // had been asked of the lines. A wrong answer, not a missing one.
-    let out = run_with_input("s = \"a\\nb\"\nputs \"${s:lines:len}\"\nputs after\n");
+    // `expand` implements a minority of the modifiers the parser accepts, and used
+    // to drop the rest rather than report them — so a chain quietly lost a step.
+    // `"${s:sort:len}"` answers the length of the *string* for a `:len` that had
+    // been asked of the sorted value. A wrong answer, not a missing one.
+    let out = run_with_input("s = \"a\\nb\"\nputs \"${s:sort:len}\"\nputs after\n");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("modifier :lines is not implemented yet"),
+        stderr.contains("modifier :sort is not implemented yet"),
         "stderr was {stderr}"
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 
     // Every spelling agrees — braced, bare, and the expression path that was right
     // all along. Agreeing is the point: the reference path is the one that differed.
-    let bare = run_with_input("s = \"a\\nb\"\nputs ${s:lines:len}\n");
-    let expression = run_with_input("s = \"a\\nb\"\nputs $s:lines:len\n");
+    let bare = run_with_input("s = \"a\\nb\"\nputs ${s:sort:len}\n");
+    let expression = run_with_input("s = \"a\\nb\"\nputs $s:sort:len\n");
     for out in [&bare, &expression] {
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("modifier :lines is not implemented yet"),
+            String::from_utf8_lossy(&out.stderr).contains("modifier :sort is not implemented yet"),
             "stderr was {}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -16436,7 +16436,7 @@ fn a_capture_that_returns_still_unwinds_rather_than_yielding() {
 fn split_operates_on_the_trimmed_capture_value() {
     // `:split` is a value modifier for now: a `$(…)` capture has its trailing
     // newline trimmed before the split runs, so the newline is not a field. Raw
-    // split-modifier binding (DESIGN.md) lands with the `:lines`/`:nulls` family.
+    // split-modifier binding (DESIGN.md) is what `:raw` is waiting on.
     let out = run_with_input("x = $(printf \"a:\\n\"):split(\":\")\nputs $x:len\nputs ...$x\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\na\n");
     assert!(
@@ -16499,6 +16499,54 @@ fn words_is_a_split_modifier_so_it_refuses_a_list() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(!out.status.success());
+}
+
+#[test]
+fn the_fixed_separator_splits_are_split_with_the_name_choosing_the_separator() {
+    // `:lines` / `:nulls` / `:tabs` are not their own rule: each is `:split(SEP)`,
+    // terminator semantics and all, so a trailing delimiter contributes no field
+    // and an interior one still does.
+    let out = run_with_input(
+        "puts \"a\\nb\\n\":lines:len\nputs \"a\\n\\nb\\n\":lines:len\nputs \"a\\tb\\t\":tabs:first\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n3\na\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn nulls_splits_on_nul_and_leaves_a_newline_in_the_name() {
+    // The whole point of `-print0`: a filename may contain a newline, and a split
+    // that also broke on newlines would hand back half a name. `find -print0` is
+    // the source, so the fixture is written as those bytes.
+    let dir = fresh_dir("nulls_keeps_a_newline");
+    let payload = dir.join("names");
+    std::fs::write(&payload, "we\nird\0plain\0").expect("write NUL-separated names");
+    let out = run_with_input(&format!(
+        "names = $(cat {}):nulls\nputs $names:len\nputs $names:first\n",
+        payload.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\nwe\nird\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_fixed_separator_split_refuses_a_list_under_its_own_name() {
+    // Same one-string rule as `:split` and `:words`. The diagnostic has to name
+    // the modifier that was *written* — blaming `:split` for a `:nulls` sends the
+    // reader to a line that does not exist.
+    let out = run_with_input("xs = [\"a\" \"b\"]\nys = $xs:nulls\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(":nulls"), "{stderr}");
+    assert!(stderr.contains("requires a string"), "{stderr}");
     assert!(!out.status.success());
 }
 
