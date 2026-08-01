@@ -4630,6 +4630,25 @@ contract can't hold if the hooks are deferred to function return. The pending
 handler that itself `cd`s elsewhere (allowed — its change just doesn't
 re-dispatch) can't make a *relative* outer `cd` land somewhere unintended.
 
+**The `exit` hook fires however the session ends** — `exit`, Ctrl-D, the end of
+a script or a `-c` string, an `exit` from a startup file. It is where a session
+tears down what it set up, and a script cleaning up after itself is that case as
+much as an interactive session is, so tying it to the prompt loop would miss the
+half that needs it most. It is handed the status the shell is leaving with (the
+argument to `exit N`, or the last command's status otherwise) — bash's `$?`
+inside a `trap … EXIT`. A `fork { … }` subshell leaving is *not* the session
+ending and runs no handler.
+
+*(TODO — **exiting because of a signal**. bash runs its EXIT trap for the
+catchable fatal signals and re-raises afterwards, so the parent still sees
+`128 + N`; only `SIGKILL` escapes. mesh runs nothing there yet. Open with it:
+whether the handler should be **told** it was a signal. bash's answer is no —
+`$?` in the trap is the last command's status, not `128 + N`, so a handler
+cannot tell a clean finish from a kill — and mesh copies that for now. Passing
+`128 + N` would let it tell them apart and would match what the caller waits
+for, at the cost of that encoding meaning two things: today it says a **child**
+died on a signal.)*
+
 **Status is snapshotted across hook dispatch.** The submitted command's exit
 status (and pipeline stage statuses) are captured before `postexec` / `preprompt`
 run, and **`$sh.status` and `$sh.pipestatus` are restored** to them for the

@@ -976,10 +976,48 @@ fn run_logout(options: &StartupOptions, last: u8, shell: &mut Shell) -> u8 {
         shell.jobs.reap();
     }
     run_jobdone_hooks(shell);
+    // After the drain above, so a handler that tears down what `jobdone` was
+    // writing to has seen every job first, and before `logout.mesh`, so a
+    // session's own teardown runs before the login shell's.
+    //
+    // Here rather than at the interactive `exit`, for the reason the drain is
+    // here: this is the one function every exit path arrives at. Dispatching it
+    // where the *prompt loop* leaves meant a script, a `-c` string, piped stdin,
+    // and an `exit` from a startup file all left without running it — so the
+    // cleanup case the hook exists for, a script removing its temp directory,
+    // was the case it did not cover.
+    //
+    // `last` is the status the shell is leaving with, which is bash's `$?` in an
+    // EXIT trap: the argument to `exit N`, or the last command's status for a
+    // bare `exit` or an end of input.
+    run_hooks(
+        HookEvent::Exit,
+        vec![Value::Integer(i64::from(last))],
+        shell,
+    );
     if options.login
         && let Some(path) = config_dir().map(|dir| dir.join("logout.mesh"))
     {
         let _ = run_config_file(&path, last, shell);
+    }
+    // Reaped again, not only drained. The `exit` handler and `logout.mesh` are
+    // arbitrary code and can take arbitrarily long, so a job can finish *while
+    // one of them runs* — after the reap above has already looked. Draining
+    // alone would not find it: `take_finished` empties a queue that only `reap`
+    // fills, so with no second look there is nothing queued, and the job leaves
+    // with neither its `[N] Done` nor its `jobdone` hook.
+    //
+    // This is the case `docs/REFERENCE.md` calls out as the exception to "every
+    // job is reported before the `exit` hook" — a completion the handler itself
+    // brings about, by running `jobs` or by taking long enough that one lands
+    // while it does. The `jobs` half needs only the drain, since the builtin
+    // reaps on its own account; the "takes long enough" half needs this.
+    //
+    // Last look of the session either way, so what it finds is reported here or
+    // never — which is what makes it worth a second pass on a path that is
+    // about to leave.
+    if shell.vars.owns_terminal() {
+        shell.jobs.reap();
     }
     // Again, because `logout.mesh` is a script like any other and can report a
     // job itself. Cheap when nothing is queued, and it makes the guarantee whole
@@ -9924,25 +9962,9 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
                 match handle_signal(signal, last, &mut shell, &mut pending, &mut gate) {
                     None => continue, // an unfinished `func` body: read the next line
                     Some(Step::Exit(code)) => {
-                        // Before the `exit` hook, not just before leaving. That
-                        // hook is where a session tears down what it set up —
-                        // `DESIGN.md` gives closing a job-publish file as the
-                        // example — so a `jobdone` after it would be writing to
-                        // something already closed. `run_logout` drains too, and
-                        // still needs to: it is the path every *other* exit
-                        // takes, including one from a startup file that never
-                        // reaches this arm.
-                        //
-                        // Reaped first for the reason given there: a job that
-                        // ended while this line was being typed has been noticed
-                        // by nobody, and `exit` forks nothing that would notice.
-                        shell.jobs.reap();
-                        run_jobdone_hooks(&mut shell);
-                        run_hooks(
-                            HookEvent::Exit,
-                            vec![Value::Integer(i64::from(code))],
-                            &mut shell,
-                        );
+                        // The reap, the `jobdone` drain, and the `exit` hook all
+                        // live in `run_logout` now — ordered there, and shared
+                        // with every other way a session ends.
                         return ExitCode::from(run_logout(options, code, &mut shell));
                     }
                     Some(Step::Continue(code) | Step::Error(code)) => last = code,

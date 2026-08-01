@@ -1672,6 +1672,87 @@ fn a_precd_hook_that_wanders_cannot_redirect_the_move() {
 }
 
 #[test]
+fn the_exit_hook_runs_when_a_non_interactive_session_ends() {
+    // The cleanup case the hook exists for — a script tearing down what it set
+    // up — is a script, not a prompt. Reaching the end of the source is an exit
+    // like any other, so it runs there too and not only on an explicit `exit`.
+    let out = run_with_input(
+        "func bye(status) { puts \"bye $status\" }\n\
+         on exit e bye\n\
+         puts working\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "working\nbye 0\n");
+}
+
+#[test]
+fn the_exit_hook_is_given_the_status_the_shell_leaves_with() {
+    // bash's `$?` in an EXIT trap: the argument to `exit N`, and for a bare
+    // `exit` the status of whatever ran last.
+    let explicit = run_with_args(&[
+        "-c",
+        "func bye(status) { puts \"bye $status\" }\non exit e bye\nexit 3\n",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&explicit.stdout), "bye 3\n");
+    assert_eq!(explicit.status.code(), Some(3));
+
+    let inherited = run_with_args(&[
+        "-c",
+        "func bye(status) { puts \"bye $status\" }\non exit e bye\nfalse\nexit\n",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&inherited.stdout), "bye 1\n");
+    assert_eq!(inherited.status.code(), Some(1));
+}
+
+#[test]
+fn a_script_file_runs_its_exit_hook() {
+    let path = script(
+        "exit_hook_script",
+        "func bye(status) { puts \"bye $status\" }\non exit e bye\nputs running\n",
+    );
+    let out = run_with_args(&[path.to_str().expect("utf-8 script path")]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "running\nbye 0\n");
+    let _ = std::fs::remove_dir_all(path.parent().expect("script directory"));
+}
+
+#[test]
+fn a_subshell_leaving_does_not_run_the_exit_hook() {
+    // `fork` exits a *process*, not the session. Firing there would run a
+    // session's teardown while the session is still going — and run it twice,
+    // once in the child and again for real on the way out.
+    let out = run_with_input(
+        "func bye(status) { puts \"bye $status\" }\n\
+         on exit e bye\n\
+         fork { exit 7 }\n\
+         puts \"back $sh.status\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "back 7\nbye 0\n");
+}
+
+#[test]
+fn an_exit_from_a_startup_file_still_runs_the_exit_hook() {
+    // The startup files run before the session has a prompt or a line of source
+    // to read, so an `exit` in one leaves by a path of its own. It owes the hook
+    // it just registered all the same.
+    let home = fresh_dir("exit_hook_rc");
+    let rc = home.join("rc.mesh");
+    std::fs::write(
+        &rc,
+        "func bye(status) { puts \"bye $status\" }\non exit e bye\nexit 5\n",
+    )
+    .expect("write rc");
+    let out = mesh_command()
+        .args(["-i", "--rcfile"])
+        .arg(&rc)
+        .args(["-c", "puts unreached"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run mesh");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bye 5\n");
+    assert_eq!(out.status.code(), Some(5));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn glob_expands_and_sorts_matches() {
     let dir = fresh_dir("glob_match");
     std::fs::write(dir.join("b.ext"), "").unwrap();
@@ -4659,6 +4740,128 @@ fn jobdone_hook_harness(exec: &MeshExec, gates: &Path) -> i32 {
     };
     if first > bye || second > bye {
         return 160;
+    }
+    0
+}
+
+#[test]
+fn a_job_finishing_during_the_exit_handler_is_still_reported() {
+    let exec = MeshExec::new(isolated_config_home());
+    // No space in the tag, for the reason the harness above gives: these paths
+    // go into `sh -c '…'` command lines.
+    let gates = fresh_dir("exit_handler_late_job");
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(late_job_harness(&exec, &gates)) };
+    }
+    await_pty_harness(harness);
+}
+
+/// A job that ends *while the `exit` handler is running* still gets its notice
+/// and its `jobdone` hook.
+///
+/// `docs/REFERENCE.md` names this as the exception to "every job is reported
+/// before the `exit` hook" — a completion the handler itself brings about, here
+/// by taking long enough that one lands while it runs. The reap on the way out
+/// has already looked by then, and draining alone cannot find it, since
+/// `take_finished` empties a queue that only `reap` fills. So this passes only
+/// if the exit path looks a **second** time, after the handler has returned.
+fn late_job_harness(exec: &MeshExec, gates: &Path) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 170;
+    };
+    let mut seen = shell.startup.clone();
+    // A fifo, not a sleep: the question is whether a job has *terminated*, and
+    // only the kernel closing its descriptors answers that under any load.
+    let gate = gates.join("late");
+    if !make_fifo(&gate) {
+        return 171;
+    }
+    let Some(gate_word) = gate
+        .to_str()
+        .map(|path| format!("'{}'", path.replace('\'', "\\'")))
+    else {
+        return 172;
+    };
+    for line in [
+        "func done(id, cmd, status) { puts LATEJOB=$id/$status }\n",
+        "on jobdone j done\n",
+    ] {
+        if !pty_write(shell.master, line.as_bytes()) {
+            return 173;
+        }
+        let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+            return 174;
+        };
+        seen.extend_from_slice(&window);
+    }
+    // Blocked opening the fifo for writing: the job exists but cannot finish
+    // until a reader arrives, and the only reader is the `exit` handler below.
+    // So it is still running when the shell begins to leave, and the reap that
+    // happens *before* the handler has nothing to find — which is what makes
+    // this the second look's case and not the first's.
+    if !pty_write(
+        shell.master,
+        format!("sh -c 'printf x; exit 5' > {gate_word} &\n").as_bytes(),
+    ) {
+        return 175;
+    }
+    let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+        return 176;
+    };
+    let Some(pid) = announced_pid(&window) else {
+        return 177;
+    };
+    seen.extend_from_slice(&window);
+    // The handler releases the job, then waits for it to be *reapable* rather
+    // than merely closed: end of file says it has begun to leave, and the shell
+    // cannot reap it until the kernel has published its wait status.
+    for line in [
+        format!(
+            "func bye(status) {{ sh -c 'cat \"$1\" > /dev/null; {REAPABLE}' _ {gate_word} {pid}; puts EXITHOOK }}\n"
+        ),
+        "on exit e bye\n".to_owned(),
+    ] {
+        if !pty_write(shell.master, line.as_bytes()) {
+            return 178;
+        }
+        let Some((window, _)) = pty_read_until_command_done(shell.master) else {
+            return 179;
+        };
+        seen.extend_from_slice(&window);
+    }
+    // A bare `exit`, with nothing to do the noticing: `exit` is a builtin and
+    // forks nothing, and this handler runs no `jobs` of its own — that is the
+    // other half of the documented exception, and it is not the half under test.
+    if !pty_write(shell.master, b"exit 0\n") {
+        return 180;
+    }
+    // To end of file: the last bytes and the end arrive together, so a reader
+    // that stops at a prompt cannot see what the shell says on its way out.
+    let parting = pty_read_to_end(shell.master);
+    let mut status = 0;
+    let reaped = unsafe { libc::waitpid(shell.mesh, &mut status, 0) } == shell.mesh;
+    unsafe { libc::close(shell.master) };
+    if !reaped || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return 181;
+    }
+    // Both halves — the `[N] Done` notice, and the hook that accompanies it.
+    // Either one alone would mean the two had come apart.
+    if occurrences(&parting, b"Done (5)") != 1 || occurrences(&parting, b"LATEJOB=1/5\r\n") != 1 {
+        return 182;
+    }
+    // And after the handler, not before it. The job had not finished when the
+    // first reap ran, so a pass here can only have come from the second.
+    let at = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|p| p == needle);
+    let (Some(hook), Some(bye)) = (
+        at(&parting, b"LATEJOB=1/5\r\n"),
+        at(&parting, b"EXITHOOK\r\n"),
+    ) else {
+        return 183;
+    };
+    if hook < bye {
+        return 184;
     }
     0
 }

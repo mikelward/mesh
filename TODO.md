@@ -1259,6 +1259,40 @@ designed, and the cross-references say where the fuller note lives.
       shell-aware match beside `source` / `gets` / `type`, since the hooks are
       the shell's; `builtins::cd` split into `cd_target` (resolve, no move) and
       `cd_change` (move) so the hooks can run between them.
+- [x] **`exit` hook on every exit path** — *landed*. `on exit NAME FUNC` had
+      been dispatched from the interactive loop's `Step::Exit` arm alone, so a
+      script, a `-c` string, piped stdin, and an `exit` from a startup file all
+      left without running it — the cleanup case the hook exists for was the
+      case it did not cover. Dispatch moved into `run_logout`, the one function
+      every exit path already arrives at (it is where the `jobdone` drain and
+      the title reset live for the same reason). Ordering is unchanged: the
+      drain still precedes the handler, and the handler still precedes
+      `logout.mesh`.
+
+      The status handed to the handler is **bash's `$?` in a `trap … EXIT`** —
+      the argument to `exit N`, the last command's status for a bare `exit` or
+      an end of input. Verified against bash rather than assumed.
+
+      Two follow-ups, both deliberately out of that change:
+  - [ ] **Exiting because of a signal.** bash runs its EXIT trap for the
+        catchable fatal signals — SIGTERM, SIGHUP, SIGINT — and then re-raises
+        so the parent still sees `128 + N`; only SIGKILL escapes it. mesh runs
+        nothing: non-interactively every signal keeps its default disposition,
+        and interactively INT/QUIT/TSTP/TTOU/TERM are ignored outright
+        (`repl.rs:ignore_interactive_signals`) while HUP is not handled at all.
+        Wants a handler that records the signal and lets the main loop leave
+        through `run_logout`, then re-raises — the flag-and-check shape
+        `exec.rs`'s `SigintCatcher` already uses for a wait it must interrupt.
+        A blocking `waitpid` on a foreground child is the case to get right:
+        bash does not wait for the child, it goes promptly.
+  - [ ] **Whether that handler should be told it was a signal.** bash says
+        no — `$?` inside the EXIT trap of a script killed by SIGTERM is `0`,
+        not `143`, so a bash handler cannot tell "finished cleanly" from "was
+        killed", and the `128 + N` exists only in what the parent waits for.
+        mesh copies bash for now. Worth revisiting: passing `128 + N` would let
+        a handler distinguish the two and would match the number the caller
+        goes on to see, at the cost of giving that encoding a second meaning
+        (today it says *a child* died on a signal, not that this shell did).
 - [ ] **Keybindings from `rc.mesh`.** Deferred in `DESIGN.md` (§"Line editing"),
       and the reason reedline was chosen. Nothing binds Ctrl-R to atuin, Ctrl-T
       to fzf, or anything to anything.
