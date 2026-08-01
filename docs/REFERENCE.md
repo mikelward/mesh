@@ -1263,7 +1263,7 @@ for primary prompts, not multiline continuation prompts.
 | `precd` | `target` | Before the working directory changes, still in the old one. `target` is where it is about to go. |
 | `postcd` | `previous` | After it has changed, in the new directory. `previous` is where it came from. |
 | `jobdone` | `id, command, status` | Once per background job the shell finds finished, alongside its `[N] Done` notice. |
-| `exit` | `status` | Before an interactive shell exits normally. |
+| `exit` | `status` | Before the shell exits, however the session ended. `status` is the status it is leaving with. |
 
 ```mesh
 func command-started(cmd) { puts "running $cmd" }
@@ -1277,6 +1277,24 @@ on postexec log command-finished
 `jobdone` runs where the `[N] Done` notice is printed — at the prompt after the
 job ended, not the instant it ended. A job you `wait` for does not reach it: the
 status went to the caller, which is what the hook is there to tell you.
+
+`exit` runs on **every** way a session ends: `exit`, Ctrl-D, the end of a
+script or a `-c` string, and an `exit` from a startup file. It is the hook for
+tearing down what a session set up, and a script cleaning up after itself is as
+much that case as an interactive session is.
+
+```mesh
+func clean-up(status) { rm -rf $work-dir }
+on exit tmp clean-up
+```
+
+`status` is what the shell is leaving with — the argument to `exit N`, or the
+last command's status for a bare `exit` or an end of input. It matches bash's
+`$?` inside a `trap … EXIT`.
+
+Two things it does not cover yet. A shell **killed by a signal** runs nothing;
+so does one that dies on `SIGKILL`, which no shell can catch. And a `fork { … }`
+subshell leaving is not the session ending, so it runs no handler.
 
 On the way out, every job the shell knows about is reported **before** the
 `exit` hook, so a handler that tears down what `jobdone` was writing to can rely
