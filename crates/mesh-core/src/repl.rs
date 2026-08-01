@@ -87,6 +87,23 @@ struct Shell {
     /// `$sh.postcd.track = func(from) { cd $from }` would recurse until the
     /// stack ran out.
     in_cd_hooks: bool,
+    /// The **first** evaluation error the current input raised that nothing can
+    /// answer for any more, if any.
+    ///
+    /// A file's status is its last statement's, which is right for a command's
+    /// result and wrong for a breakage: the statements after a failure overwrite
+    /// the evidence, so by the time control returns to the `source` there is
+    /// nothing left to gate on. This remembers it instead. Scoped to one input —
+    /// [`run_sourced_text`] swaps in a fresh one and puts the enclosing file's
+    /// back — so a nested `source` reports its own file rather than its caller's.
+    input_error: Option<u8>,
+    /// The error the executable that just ran reported, while an enclosing `||`
+    /// could still answer for it.
+    ///
+    /// Separate from `input_error` because those are the two states an error can
+    /// be in, and only one of them is recoverable. [`Shell::settle_error`] moves
+    /// an error between them, at the moment nothing can reach back to it.
+    pending_error: Option<u8>,
 }
 
 impl Shell {
@@ -95,6 +112,29 @@ impl Shell {
     fn record_status(&mut self, status: u8, stages: Vec<u8>) {
         self.vars.set_status(status, stages);
         self.status_records += 1;
+    }
+
+    /// Move a still-answerable error out of reach, keeping the first.
+    ///
+    /// Called where execution has moved past the statement that raised it.
+    /// Nothing reaches back once something else has run — a `||` answers for the
+    /// failure of the executable in front of it and no other — so from that
+    /// moment the error is one the file never answered for. This is what tells
+    /// the two errors in `if true { $first; $second } || puts handled` apart: the
+    /// `||` answers for `$second`, which was the `if`'s outcome, while `$first`
+    /// was settled by `$second` running.
+    fn settle(&mut self, error: Option<u8>) {
+        if let Some(code) = error
+            && self.input_error.is_none()
+        {
+            self.input_error = Some(code);
+        }
+    }
+
+    /// [`settle`](Self::settle) for whatever is currently pending.
+    fn settle_error(&mut self) {
+        let pending = self.pending_error.take();
+        self.settle(pending);
     }
 
     /// Copy the live job table into the variable store, where `$sh.jobs` reads
@@ -221,6 +261,8 @@ impl Shell {
             status_records: 0,
             title_written: false,
             in_cd_hooks: false,
+            input_error: None,
+            pending_error: None,
         }
     }
 }
@@ -901,7 +943,18 @@ fn run_sourced_text(text: &str, path: &Path, last: u8, shell: &mut Shell) -> Ste
     shell
         .vars
         .push_input(vars::Origin::Sourced, path.to_string_lossy().into_owned());
+    // This file's own frame, so what it reports is what *it* broke on and the
+    // enclosing file's tally survives a nested `source`.
+    let enclosing = shell.input_error.take();
+    let enclosing_pending = shell.pending_error.take();
     let step = run_line(text, last, false, shell);
+    // The file is over, so there is no statement left for an enclosing `||` to
+    // answer through — whatever its last one left pending is a failure it never
+    // answered for. A `source … || fallback` in the *caller* still recovers, since
+    // that happens against the caller's own record.
+    shell.settle_error();
+    let broke = std::mem::replace(&mut shell.input_error, enclosing);
+    shell.pending_error = enclosing_pending;
     shell.vars.pop_input();
     let step = match step {
         // `return` from a sourced file's top level ends *that file* and nothing
@@ -909,6 +962,17 @@ fn run_sourced_text(text: &str, path: &Path, last: u8, shell: &mut Shell) -> Ste
         // source returns to its own caller rather than unwinding the whole stack.
         Step::Return(_, code) => Step::Continue(code),
         step => step,
+    };
+    // A file that broke says so, whatever it went on to end with. The status alone
+    // could not carry this: it is the last statement's, so an `env.mesh` that gave
+    // up on line 3 and printed a banner on line 40 reported success over a shell
+    // holding the old `PATH`, and the only way to notice was for the file to report
+    // at every point it could fail. A command's nonzero *status* is untouched —
+    // `grep` finding nothing is a result, not a breakage — and `return` does not
+    // clear it either, since a file cannot un-break by leaving early.
+    let step = match (step, broke) {
+        (Step::Continue(_) | Step::Error(_), Some(code)) => Step::Error(code),
+        (step, _) => step,
     };
     // `source` is a **status-producing command**, so whatever the file's last
     // statement produced stops here. Without this the file's value carries out
@@ -935,17 +999,33 @@ fn run_startup_files(
     mut last: u8,
     shell: &mut Shell,
 ) -> Step {
+    // The first file that broke. Kept across the rest of the sequence for the same
+    // reason a single file keeps it across its own statements: the startup set's
+    // status would otherwise be the *last* file's, so a fine `rc.mesh` would report
+    // success over an `env.mesh` that never finished setting `PATH`.
+    let mut broke = None;
     for path in startup_files(options, interactive) {
         match run_config_file(&path, last, shell) {
             // A startup file that ends on an evaluation error has already reported
             // it, and it is no more a reason to skip the remaining files than a
             // failing command in it is: `rc.mesh` still runs after a typo in
             // `env.mesh`. Only `exit` stops the sequence.
-            Step::Continue(code) | Step::Error(code) => last = code,
+            Step::Continue(code) => last = code,
+            Step::Error(code) => {
+                last = code;
+                broke.get_or_insert(code);
+            }
             flow => return flow,
         }
     }
-    Step::Continue(last)
+    let Some(code) = broke else {
+        return Step::Continue(last);
+    };
+    // Published, or the fix would be invisible where it matters: each file records
+    // its own status as it finishes, so `$sh.status` at the first prompt would
+    // still be the last file's — the very reading that hid the broken one.
+    shell.record_status(code, vec![code]);
+    Step::Error(code)
 }
 
 fn run_logout(options: &StartupOptions, last: u8, shell: &mut Shell) -> u8 {
@@ -1166,6 +1246,11 @@ fn run_source(
     // order to tell an invalid program from a command's status.
     let mut errored = false;
     for statement in &source.statements {
+        // Held aside while this statement runs. Whether it settles turns on whether
+        // this statement *ran*, which is not known until it has — and taking it out
+        // of the way also lets this statement record an error of its own rather
+        // than being masked by the older one.
+        let carried = shell.pending_error.take();
         let step = run_statement(statement, status, in_function, shell);
         // A statement a guard skipped **ran nothing**, so it neither carries a
         // status of its own nor says anything about the one before it. Clearing
@@ -1182,8 +1267,32 @@ fn run_source(
             Step::Error(code) => {
                 status = code;
                 errored = true;
+                // Remembered for the whole input, where `errored` only records how
+                // this body *ended*, so a sourced file can report that something in
+                // it broke after later statements have moved the status on.
+                //
+                // Held as *pending* — an enclosing `||` may still answer for it, and
+                // this is the outcome such a `||` would be answering for. Already
+                // pending means this statement is a nested one's error on its way
+                // out, which is the same error, so the inner reading stands.
+                if shell.pending_error.is_none() {
+                    shell.pending_error = Some(code);
+                }
             }
-            flow => return flow,
+            flow => {
+                // The statement that raised this control flow ran, so what it was
+                // carrying is out of reach on the way out.
+                shell.settle(carried);
+                return flow;
+            }
+        }
+        // Nothing ran only when a guard skipped this statement **and** it raised
+        // nothing of its own — a guard that failed is something having run. In that
+        // one case the earlier failure is still answerable, so it goes back.
+        if !executed && shell.pending_error.is_none() {
+            shell.pending_error = carried;
+        } else {
+            shell.settle(carried);
         }
         if executed {
             produced = shell.produced;
@@ -1230,6 +1339,16 @@ fn run_and_or(
     }
     let mut step = run_recorded(&node.first, background, last, in_function, shell);
     for (op, executable) in &node.rest {
+        // Is what comes next a **recovery**? Two things have to hold, and each rules
+        // out a case that looks like one:
+        //
+        // - `||`, because `&&` runs on the left *succeeding*: there is no failure
+        //   for it to answer for, and one recorded inside a left side that went on
+        //   to succeed was left behind rather than reported.
+        // - the left ended in an **error** rather than a nonzero *status*. A `||`
+        //   over `if true { $nope; false }` is answering for what `false` returned;
+        //   nothing has answered for the `$nope`.
+        let recovering = matches!(op, parser::AndOrOp::Or) && matches!(step, Step::Error(_));
         // An evaluation error chains like any other failure: it left a status, so
         // `h() || fallback` runs the fallback rather than abandoning the list. Only
         // `exit` and `return` are control flow that skips the rest.
@@ -1241,7 +1360,29 @@ fn run_and_or(
             parser::AndOrOp::Or => status != 0,
         };
         if run {
-            step = run_recorded(executable, background, status, in_function, shell);
+            // Drop the answered-for failure **before** the recovery runs, rather
+            // than after it succeeds, so what the recovery itself raises lands on a
+            // clear record: `$first || fb` still reports an `fb` that broke on its
+            // own way to succeeding, because nothing answered for *that*.
+            //
+            // Only the pending one, which is the failure this `||` is answering
+            // for. An error the left side settled on the way — `if true { $first;
+            // $second }` settles `$first` when `$second` runs — is already out of
+            // reach and stays on the record.
+            let carried = shell.pending_error;
+            if recovering {
+                shell.pending_error = None;
+            }
+            let attempt = run_recorded(executable, background, status, in_function, shell);
+            if shell.produced == Produced::Nothing {
+                // Its own guard skipped it, so nothing ran: `$nope || puts x if
+                // false` recovered nothing and answered for nothing. It neither
+                // takes the failure off the record nor replaces the list's outcome,
+                // which is still the one in front of it.
+                shell.pending_error = carried;
+            } else {
+                step = attempt;
+            }
         }
     }
     step
@@ -1962,6 +2103,27 @@ fn run_ast_match(node: &parser::MatchExpr, last: u8, in_function: bool, shell: &
 /// strength of it — the placeholder an unwinding expression yields is not an
 /// answer. Each caller decides what "no answer" means for it; none of them may
 /// treat it as false.
+/// Did the condition just evaluated actually **run** something?
+///
+/// `Produced::Nothing` is [`condition_status`]'s answer for "its own trailing
+/// guard skipped it", but the two arms that return *before* that funnel never
+/// touch the field, so for those shapes it describes whatever ran previously.
+/// Both of them always run, so the shape answers where the field cannot — the
+/// same reading the `not` arm inside `condition_status` takes, and for the same
+/// reason.
+fn condition_ran(condition: &parser::Executable, shell: &Shell) -> bool {
+    match condition {
+        parser::Executable::Not(operand) => condition_ran(operand, shell),
+        parser::Executable::Expression { guard: None, .. }
+        | parser::Executable::Assignment {
+            pattern: parser::BindingPattern::List(_),
+            append: false,
+            ..
+        } => true,
+        _ => shell.produced != Produced::Nothing,
+    }
+}
+
 fn condition_status(
     condition: &parser::Executable,
     last: u8,
@@ -2333,6 +2495,14 @@ impl StageEnv<'_> {
 fn env_carries_a_value(bindings: &[parser::EnvBinding]) -> bool {
     bindings.iter().any(|binding| match &binding.value {
         parser::Expr::Scalar(word) => word_carries_a_value(&word.value),
+        // A bare variable reference runs no code, exactly as one inside a word
+        // does not — `A=$x` and `A="$x"` differ in spelling and in nothing else, so
+        // they must not differ in *where* they are evaluated. They did: the quoted
+        // one was read here and the bare one deferred into the stage's fork, where
+        // a failure could only come back as an exit status.
+        parser::Expr::Variable(_) => false,
+        // Everything else stays deferred, which is the safe direction: a capture or
+        // a call has to run in the stage's own process.
         _ => true,
     })
 }
@@ -2435,10 +2605,37 @@ fn run_ast_while(
     // Both are the same mistake, so both are undone the same way: snapshot after
     // each pass, put it back on the way out.
     let mut pass_record = None;
+    // Whether a pass has run, so the *re*-test can be told from the first test.
+    let mut tested_before = false;
     shell.loop_depth += 1;
     loop {
         if let Some(condition) = condition {
-            match condition_status(condition, previous, in_function, shell) {
+            // Re-testing puts the finished pass's error out of reach, the same way
+            // starting another statement does: the test is what runs next, and a
+            // `||` after this loop would be answering for *that*. Without it, a
+            // pass that failed and a test that then failed are one pending error,
+            // and recovering the test silently recovers the pass as well.
+            //
+            // A `for` has no analogue because nothing runs between its last pass
+            // and its exit, so there the pass's error is still the loop's to be
+            // answered for. The asymmetry is the rule holding, not an exception to
+            // it: what settles an error is something else having run.
+            // Held aside across the test, and settled only if the test **ran** —
+            // its own trailing guard may skip it (`while cmd if $done { … }`), and
+            // a test that ran nothing is not something else having run.
+            let carried = if tested_before {
+                shell.pending_error.take()
+            } else {
+                None
+            };
+            tested_before = true;
+            let tested = condition_status(condition, previous, in_function, shell);
+            if condition_ran(condition, shell) || shell.pending_error.is_some() {
+                shell.settle(carried);
+            } else {
+                shell.pending_error = carried;
+            }
+            match tested {
                 Ok(Some(0)) => {}
                 Ok(Some(_)) => break,
                 // The condition raised `break`/`continue`. It sits inside this
@@ -5637,18 +5834,34 @@ fn eval_body(
                         // A tail that runs answers for the body, clearing an earlier
                         // statement's error the way the next statement does in
                         // `run_source`. One a guard skipped answers for nothing, so
-                        // the earlier error still stands.
-                        Ok(true) => eval_expr(expression, last, in_function, shell),
+                        // the earlier error still stands — and stays *answerable*,
+                        // since nothing has run since it.
+                        Ok(true) => {
+                            shell.settle_error();
+                            eval_expr(expression, last, in_function, shell)
+                        }
                         Ok(false) if errored => Err(Step::Error(last)),
                         Ok(false) if recorded => Ok(shell.result.clone()),
                         Ok(false) => Ok(Value::String(String::new())),
-                        Err(step) => Err(step),
+                        // The guard ran and *failed*, which is still the guard
+                        // having run — so an earlier statement's failure is out of
+                        // reach, and only the guard's own is left for a `||` around
+                        // the call to answer for. Skipping this settle let one `||`
+                        // clear both.
+                        Err(step) => {
+                            shell.settle_error();
+                            Err(step)
+                        }
                     };
                 }
+                // Unguarded, so these always run: an earlier statement's failure is
+                // out of reach from here.
                 parser::Executable::If(node) => {
+                    shell.settle_error();
                     return eval_if_expr(node, last, in_function, shell);
                 }
                 parser::Executable::Match(node) => {
+                    shell.settle_error();
                     return eval_match_expr(node, last, in_function, shell);
                 }
                 parser::Executable::For {
@@ -5656,11 +5869,14 @@ fn eval_body(
                     iterable,
                     body,
                 } => {
+                    shell.settle_error();
                     return eval_for_expr(bindings, iterable, body, last, in_function, shell);
                 }
                 _ => {}
             }
         }
+        // Held aside exactly as in `run_source`, and settled on the same condition.
+        let carried = shell.pending_error.take();
         let step = run_statement(statement, last, in_function, shell);
         let executed = shell.produced != Produced::Nothing;
         match step {
@@ -5678,8 +5894,23 @@ fn eval_body(
             Step::Error(code) => {
                 last = code;
                 errored = true;
+                // As in `run_source`: held pending so an enclosing `||` can still
+                // answer for it. `errored` is this body's own classification and
+                // says nothing to the file — a successful tail clears it, which is
+                // exactly the case that used to lose the error entirely.
+                if shell.pending_error.is_none() {
+                    shell.pending_error = Some(code);
+                }
             }
-            flow => return Err(flow),
+            flow => {
+                shell.settle(carried);
+                return Err(flow);
+            }
+        }
+        if !executed && shell.pending_error.is_none() {
+            shell.pending_error = carried;
+        } else {
+            shell.settle(carried);
         }
         recorded |= executed;
         if shell.control.is_some() {

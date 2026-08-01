@@ -111,6 +111,52 @@ itself uses, so the same failure answers the same however it is reached. A **syn
 error rejects the whole file**, so none of it runs and a broken rc cannot leave a
 half-defined config.
 
+**A file that broke says so**, whatever it went on to end with. Ordinarily a
+file's status is its last statement's, which is what you want for a *result* — a
+`grep` that found nothing, a `diff` that found a difference — and useless for a
+*breakage*, because the statements after the failure overwrite it. So the two are
+kept apart: a command's nonzero status is reported as-is, while an unhandled
+**evaluation error** — a syntax error, an unbound variable, a bad definition name
+— is remembered, and the first one the file raised becomes this `source`'s status
+even if every later line succeeds. That is what makes the gate writable:
+
+```mesh
+source ~/.config/mesh/local-env.mesh && source ~/.config/mesh/local-rc.mesh
+```
+
+**Handling the failure is what takes it back** — and only that. A file that
+catches its own has not broken, so `f || fallback` reports success, however deep
+the `f` that broke failed and whichever construct raised it:
+`if true { $nope } || puts handled` is the same case.
+
+An `||` answers for the failure it recovered, and for nothing else. Three things
+follow, and each is a case that looks handled and is not:
+
+| | |
+| --- | --- |
+| `$first`<br>`… || puts handled` | an error already standing from earlier in the file survives a later, unrelated recovery |
+| `$first \|\| fb`, where `fb` raises its own | the recovery answered for `$first`; nothing answered for what `fb` broke on |
+| `if true { $first; $second } \|\| puts handled` | the `\|\|` answers for the `if`'s outcome, `$second`; `$first` went out of reach when `$second` began |
+| `if true { $nope; false } \|\| puts handled` | the `\|\|` is answering for what `false` *returned* — a status, not the error |
+
+*Leaving* is not handling either. `break`, `continue` and `return` end the
+construct around them successfully, but nothing answered for the error on the way
+out, so `for x in [a] { $nope; break }` is still a file that broke — as is a
+`return` from the file itself, which cannot un-break it by leaving early. And
+`&&` runs on its left side *succeeding*, so it never answers for anything.
+
+The rule underneath all of that is **something else having run** — actually run,
+not merely been reached. A statement a guard skipped runs nothing, so it settles
+nothing and answers for nothing: the failure in front of `puts handled if false`
+is still there afterwards, and one in front of a skipped statement is still
+recoverable. An error is answerable until execution moves past it — the next
+statement, the next `while` test — and after that only the thing it was the
+outcome *of* can be answered for.
+That is why `while cond { … $nope } || fallback` reports the break (the loop
+tested again after the failing pass, so the `||` answers for the test) while
+`for x in [a] { $nope } || fallback` does not (nothing ran between the pass and
+the loop's exit, so the failure is still the loop's own).
+
 **`return` leaves a sourced file**, and `source` reports the returned value's
 status; a bare `return` carries the last status, as a bare `exit` does. `exit` still
 ends the **shell**, from a sourced file included, since `source` runs in this shell
@@ -312,6 +358,15 @@ variables and functions remain available for the session.
 
 `--rcfile FILE` replaces `rc.mesh`, while `--norc` skips the interactive RC
 file. Neither option skips `env.mesh` or the login files.
+
+Each startup file is a sourced file and reports itself the same way, so the
+[breakage rule](#source) applies to it. A file that fails does **not** stop the
+sequence — `rc.mesh` still runs after a typo in `env.mesh`, since one broken file
+is no more a reason to skip the rest than one failing command in it is — but it is
+no longer *covered* by one that ran fine. The first file that broke is what the
+set reports, and `$sh.status` at the first prompt says so, rather than showing the
+last file's success over a shell holding the `PATH` `env.mesh` never finished
+setting.
 
 Interactive command history is saved under `$XDG_STATE_HOME` — see
 [History and recall](#history-and-recall). Pass `--no-save-history` (or the

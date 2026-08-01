@@ -2889,7 +2889,7 @@ was re-checked against `main` rather than taken from the PR text.
       124 over what it printed first), so the bytes thrown away were the answer.
       With several captures in one right-hand side the last decides, as in bash.
       `capture-or-empty` is no longer needed for this.
-- [ ] **29. `source` reports failure only through the status, and a file's status
+- [x] **29. `source` reports failure only through the status, and a file's status
       is its last statement's.** So a sequence of sources has to be gated by hand
       — an `env.mesh` that stopped parsing followed by an `rc.mesh` that still
       does would report success over a shell holding the old `PATH` — *and* a
@@ -2897,6 +2897,32 @@ was re-checked against `main` rather than taken from the PR text.
       because by the time control returns every later statement has overwritten
       the evidence. Both local-override files in the config carry a report at the
       point of failure for that reason.
+
+      **Fixed:** a sourced file now reports **that it broke**, whatever it went on
+      to end with. The distinction is one mesh already draws internally and had
+      never surfaced: a command's nonzero *status* is a **result** — `grep` finding
+      nothing, `diff` finding a difference — and stays exactly as it was, while an
+      unhandled **evaluation error** (a syntax error, an unbound variable, a bad
+      definition name) is a **breakage**, and the first one a file raises becomes
+      that `source`'s status even if forty later lines succeed. So
+      `source local-env.mesh && source local-rc.mesh` now does the gating those
+      files were reporting by hand.
+
+      **Handled means handled.** Only errors that reach the file's own top level
+      count, so `f || fallback` — including an `f` that broke several frames down —
+      leaves nothing behind and the file reports success. Without that, `||` inside
+      a config would be unusable.
+
+      **The startup set keeps the same promise.** Its status was the *last* file's,
+      so a `login.mesh`/`rc.mesh` that ran fine reported success over an `env.mesh`
+      that gave up before it finished setting `PATH` — the case this entry names.
+      The first file that broke is now what the set reports, and it is published,
+      so `$sh.status` at the first prompt says so. Later files still **run** after
+      an earlier one fails, which was never the complaint.
+
+      **Not changed:** a script's own statements. `mesh script.mesh` still exits on
+      its last statement's status, as bash does; this is about what a *caller*
+      learns from `source`, which had no other channel.
 - [x] **30. No force-interactive flag.** `mesh -i -s` was `unknown option -i`.
       The port added what it cost a config: nothing past
       `return unless $sh.interactive` could be exercised without a pty, so
@@ -2936,7 +2962,23 @@ of each PR had landed by another route, but these pieces had not.
 
       Fixing it means a forked stage reporting its control outcome back, which is
       the same missing channel the piped `gets` line count needs (rough edge 6).
-      Worth doing once, for both.
+      Worth doing once, for all of them — because there is a third.
+
+      **An evaluation *error* raised in a fork is lost the same way**, and rough
+      edge 29 gave it teeth: a sourced file now reports a breakage its statements
+      never answered for, and that record is process-local, so `fork { $nope }`,
+      a background job, and a stage that really must defer all leave the parent
+      with a *status* where an error happened. A status is a result — that is the
+      whole distinction 29 turns on — so the file reads as fine. What crosses the
+      fork today is one exit code, and no code can mean "this was invalid input"
+      without stealing it from the programs that already use it.
+
+      Narrowed rather than fixed, in the commit that closed 29: a prefix whose
+      value is a bare `$x` runs no code, so it is read in the parent like the
+      quoted `"$x"` beside it instead of deferring — `A=$nope true | cat` reports
+      now (`env-prefix-in-a-stage`). That removes the case a reviewer hit and an
+      inconsistency between two spellings of the same thing; it does not touch the
+      general hole, which needs the channel above.
 
 - [ ] **Consider making a bare `FOO=bar` an environment assignment, and `$FOO`
       an environment reference.** Raised when the `NAME=value cmd` prefix landed,
