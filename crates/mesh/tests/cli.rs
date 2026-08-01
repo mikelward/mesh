@@ -2441,6 +2441,85 @@ fn empty_list_spreads_to_no_arguments() {
 }
 
 #[test]
+fn a_bare_spread_statement_runs_the_list_as_a_command() {
+    // `...$xs | cat` always ran the list, because a pipeline stage takes the
+    // command reading. The bare statement did not: the expression parser claimed
+    // it, built a `UnaryOp::Spread`, and the statement discarded the value — no
+    // output, no error, status 0. One position disagreeing with the other was the
+    // whole bug.
+    let one = run_with_input("xs = [echo hi]\n...$xs\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&one.stdout), "hi\nafter\n");
+    assert!(one.stderr.is_empty(), "{:?}", one.stderr);
+
+    // The tail elements are the command's arguments, as they are in every other
+    // spread position.
+    let args = run_with_input("xs = [echo a b]\n...$xs\n");
+    assert_eq!(String::from_utf8_lossy(&args.stdout), "a b\n");
+
+    // The status is the command's own, which is what makes the form usable in a
+    // list — reporting the discarded value's 0 hid a failure.
+    let status = run_with_input("xs = [false]\n...$xs\nst = $sh.status\nputs \"st=$st\"\n");
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "st=1\n");
+
+    // Nothing to run, and the existing "words all expanded away" rule already
+    // says that is a status-0 no-op rather than an error.
+    let empty = run_with_input("xs = []\n...$xs\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&empty.stdout), "after\n");
+    assert!(empty.stderr.is_empty(), "{:?}", empty.stderr);
+}
+
+#[test]
+fn a_spread_keeps_its_other_readings() {
+    // The fix moves the *statement* reading only. A pipeline stage already ran the
+    // list and still does; an argument spread is untouched; and a condition keeps
+    // the loud refusal settled in 03c22a9 rather than quietly gaining a command
+    // reading on the back of this change.
+    let piped = run_with_input("xs = [echo hi]\n...$xs | cat\n");
+    assert_eq!(String::from_utf8_lossy(&piped.stdout), "hi\n");
+
+    let argument = run_with_input("xs = [a b]\necho ...$xs\n");
+    assert_eq!(String::from_utf8_lossy(&argument.stdout), "a b\n");
+
+    let condition = run_with_input("xs = [echo hi]\nif ...$xs { puts yes }\n");
+    assert!(
+        String::from_utf8_lossy(&condition.stderr).contains("a list is not a condition"),
+        "{:?}",
+        condition.stderr
+    );
+}
+
+#[test]
+fn not_negates_a_bare_spread_command() {
+    // `command_negations` classified the operand by requiring a `Word` to name the
+    // command, so a leading `...` — a `Spread` token — read as a value negation:
+    // `not ...$xs` reported `a list is not a condition` and never invoked the list.
+    // A new command shape has to reach the classifier that decides what `not`
+    // negates. Raised in review.
+    let succeeds =
+        run_with_input("xs = [echo ran]\nnot ...$xs\nst = $sh.status\nputs \"st=$st\"\n");
+    assert_eq!(String::from_utf8_lossy(&succeeds.stdout), "ran\nst=1\n");
+    assert!(succeeds.stderr.is_empty(), "{:?}", succeeds.stderr);
+
+    let fails = run_with_input("xs = [false]\nnot ...$xs\nst = $sh.status\nputs \"st=$st\"\n");
+    assert_eq!(String::from_utf8_lossy(&fails.stdout), "st=0\n");
+
+    // The run is folded before the operand is read, so a doubled `not` cancels.
+    let doubled =
+        run_with_input("xs = [false]\nnot not ...$xs\nst = $sh.status\nputs \"st=$st\"\n");
+    assert_eq!(String::from_utf8_lossy(&doubled.stdout), "st=1\n");
+
+    // In a condition the spread is still a value, so the negated form keeps the
+    // same refusal the un-negated one gets — `value_start_in` is what tells the
+    // two positions apart, so no separate rule was needed here.
+    let condition = run_with_input("xs = [echo hi]\nif not ...$xs { puts yes }\n");
+    assert!(
+        String::from_utf8_lossy(&condition.stderr).contains("a list is not a condition"),
+        "{:?}",
+        condition.stderr
+    );
+}
+
+#[test]
 fn list_literal_preserves_quoted_empty_elements() {
     let out = run_with_input(
         "xs = [\"\" a]\nprintf '<%s>\\n' ...$xs\nxs = [\"\"]\nprintf '<%s>\\n' ...$xs\n",
