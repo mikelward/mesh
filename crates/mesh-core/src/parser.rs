@@ -4298,17 +4298,25 @@ impl Parser<'_> {
         // the two apart, so the trial parse looks for it rather than for the
         // bracket.
         //
-        // Otherwise a command needs a **word** to name it, and a value operand
-        // belongs to the expression parser. Either way the whole run is given back,
-        // so the negations are folded in one place rather than two — and `not = 5`
-        // stays the syntax error it already was rather than becoming
+        // Otherwise a command needs a **word** to name it — or a leading `...`, the
+        // forwarded-rest command, whose head supplies the word at expansion time.
+        // A value operand belongs to the expression parser. Either way the whole run
+        // is given back, so the negations are folded in one place rather than two —
+        // and `not = 5` stays the syntax error it already was rather than becoming
         // `command not found: =`.
+        //
+        // `value_start_in` is what keeps the two positions apart for a spread, so
+        // this needs no `in_condition` test of its own: in a statement it declines
+        // the `...` and the negation lands on the command, while in a condition it
+        // claims it and the run rewinds to the `a list is not a condition` refusal
+        // that reading still gets. Raised in review — the word-only test read
+        // `not ...$xs` as a value negation and never invoked the list.
         let negates = if self.same(&TokenKind::LBracket) {
             self.binding_assignment_follows()
         } else {
             matches!(
                 self.peek().map(|token| &token.value),
-                Some(TokenKind::Word(_))
+                Some(TokenKind::Word(_) | TokenKind::Spread)
             ) && !self.value_start_in(in_condition)
         };
         if !negates {
@@ -5619,6 +5627,21 @@ impl Parser<'_> {
             && next.span.start == word.span.end
         {
             return true;
+        }
+        // A leading `...` is the forwarded-rest **command**, not a value. In command
+        // position a spread is a *word* whose pieces are the bare `...` and the
+        // variable — the shape `expand::spread_var` explodes into argv — which is
+        // why `...$xs | cat` already runs the list. Only the bare statement went the
+        // other way: the expression parser claimed it, built a `UnaryOp::Spread`,
+        // and the statement discarded the value, so `...$xs` alone ran nothing,
+        // printed nothing and reported `0`. One position disagreeing with the other
+        // is the whole bug; this makes both take the command reading.
+        //
+        // Conditions keep theirs. `if ...$xs` is the loud `a list is not a
+        // condition` settled in 03c22a9, and reopening that is a separate question
+        // from what a statement does.
+        if !in_condition && self.same(&TokenKind::Spread) {
+            return false;
         }
         if self.command_reading_claims_statement(in_condition) {
             return false;

@@ -2828,12 +2828,35 @@ thing a reader takes on trust.*
       `--sleep=0`, so data that merely looks like a flag cannot be passed to a
       plain `func` at all. This is 1 again, one level down: `wrapper func` fixed
       the *command* position, and a value call still has no equivalent.
-- [ ] **18. A bare `...$list` in command position runs nothing.** `xs = [echo hi]`
+- [x] **18. A bare `...$list` in command position runs nothing.** `xs = [echo hi]`
       followed by `...$xs` produces no output and no error — the head has to be
       bound out and used as the command word. The condition half of this —
       `if ...$rest` taking the branch without invoking anything — was fixed in
       03c22a9, "Make a condition a bool or a command, with no truthy values", and
       is now a loud `a list is not a condition`; command position is what remains.
+
+      **It was one position disagreeing with another, not a missing feature.**
+      `...$xs | cat` already ran the list, because a pipeline stage takes the
+      command reading, and command position builds a spread as a *word* whose
+      pieces are the bare `...` and the variable — the shape `expand::spread_var`
+      explodes into argv. Only the bare statement went the other way: `value_start_in`
+      let the expression parser claim it, which built a `UnaryOp::Spread` whose
+      value the statement then discarded, so the line ran nothing, printed nothing
+      and reported `0`.
+
+      Fixed by letting command position claim a leading `...` outside a condition,
+      so both spellings agree. The head is the command word and the tail its
+      arguments — no new capability, since `$h ...$t` already spells a runtime
+      command word, and this is the sugar the entry's workaround was standing in
+      for. The status is the command's own, which is what makes the form usable in
+      a `&&` list; an empty list runs nothing at status `0`, the existing "words
+      all expanded away" rule rather than a new case.
+
+      **Conditions deliberately unchanged.** `if ...$xs` keeps the loud refusal
+      03c22a9 settled. Whether a condition should gain a command reading is a
+      separate question from what a statement does, and answering it silently on
+      the back of this change would have reopened a decision without argument.
+      `parser.rs` `value_start_in`.
 - [ ] **19. "Parse my own leading option, forward everything after" has no
       spelling.** A `wrapper func` may declare no flags at all —
       ``a `wrapper func` parses no flags, so it cannot declare `--times` `` — and a
