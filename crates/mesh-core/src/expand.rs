@@ -1886,6 +1886,22 @@ fn has_glob_meta(text: &str) -> bool {
     text.chars().any(|c| matches!(c, '*' | '?' | '['))
 }
 
+/// Does this word expand against the **filesystem**?
+///
+/// A glob's result is a **list** whatever it matched, so the collapse that turns a
+/// single expanded value into a scalar must not apply to it. Without this a
+/// pattern's *type* depended on how many files happened to be on disk — one match
+/// gave a string, two gave a list — so `xs = *(d):len` answered the length of the
+/// only directory's name, and `for f in *.rs` iterated the characters' worth of
+/// nothing when exactly one file matched. That is the run-time-dependent shape
+/// `DESIGN.md` §"Spread / flattening" rules out by name.
+pub(crate) fn word_globs(word: &Word) -> bool {
+    word.qualifiers.is_some()
+        || word.pieces.iter().any(
+            |piece| matches!(piece, Piece::Text { text, expandable: true } if has_glob_meta(text)),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

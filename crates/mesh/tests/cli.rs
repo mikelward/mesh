@@ -2053,6 +2053,35 @@ fn glob_qualifiers_filter_by_the_boolean_tests() {
 }
 
 #[test]
+fn a_glob_is_a_list_however_many_paths_it_matched() {
+    // A pattern's *type* must not depend on the directory's contents. A single
+    // match used to collapse to the scalar every other one-value word collapses
+    // to, so `xs = *(d):len` answered the length of the only directory's **name**
+    // and `for f in *.rs` bound the one filename as a scalar. `DESIGN.md`
+    // §"Spread / flattening" rules out exactly this run-time dependence.
+    let dir = fresh_dir("glob_one_match_is_a_list");
+    std::fs::create_dir(dir.join("sub")).expect("one directory");
+    std::fs::write(dir.join("a.txt"), "").expect("one file");
+    let out = run_with_input(&format!(
+        "cd {}\nxs = *(d)\nputs $xs:len\nys = *(f)\nputs $ys:len\nzs = *\nputs $zs:len\n",
+        dir.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n1\n2\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A word that does *not* reach the filesystem still collapses: `x = a.txt` is
+    // the string, not a one-element list, which is what makes `$x:len` its length.
+    let plain = run_with_input("x = a.txt\nputs $x:len\n");
+    assert_eq!(String::from_utf8_lossy(&plain.stdout), "5\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn glob_qualifiers_work_in_value_position() {
     // The whole point of the feature is the loop header, so the expression path
     // gets the same treatment as the argument one — and a modifier still chains
