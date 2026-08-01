@@ -1565,6 +1565,13 @@ it is the operator (`4 * 3`). A relative path is a value too: `./x`, `../x`, `.`
 and `.*` are all words rather than syntax errors, while `1..3` and `..3` stay
 ranges.
 
+In a value position a pattern's result is a **list** however many paths it
+matched, so `xs = *.rs` is a one-element list when one file matched and
+`$xs:len` counts files rather than the characters of the only name. A word whose
+metacharacters do not form a pattern — an unclosed `[`, say — is the literal text
+it looks like, exactly as in an argument, and so is an ordinary string: `x = a[`
+binds `a[` and `$x:len` is 2. Only a word that reaches the filesystem is a list.
+
 ### Dotfiles
 
 A `*`, `?` or `[…]` never matches the leading `.` of a name, but a **literal**

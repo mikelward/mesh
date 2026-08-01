@@ -2266,6 +2266,32 @@ fn a_glob_is_a_list_however_many_paths_it_matched() {
 }
 
 #[test]
+fn a_pattern_that_does_not_compile_is_the_string_it_looks_like() {
+    // Expansion already answers this: an unclosed class is not a pattern, so `a[`
+    // is the literal text and always has been. Asking "does it carry `*`, `?` or
+    // `[`?" instead answered yes and bound the one-element list `['a[']`, taking
+    // `:len` from 2 to 1 and putting a bracket in every interpolation of it.
+    // Raised in review.
+    let out =
+        run_with_input("x = a[\nputs $x:repr\nputs $x:len\nputs \"<$x>\"\ny = a[b\nputs $y:repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "'a['\n2\n<a[>\n'a[b'\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // An interpolated value is literal to expansion, so it cannot close a class the
+    // bare text left open — the predicate has to stand it in the same way, or the
+    // two would disagree about a word neither of them globs.
+    let interpolated = run_with_input("y = \"b]\"\nx = a[$y\nputs $x:repr\n");
+    assert_eq!(String::from_utf8_lossy(&interpolated.stdout), "'a[b]'\n");
+}
+
+#[test]
 fn glob_qualifiers_work_in_value_position() {
     // The whole point of the feature is the loop header, so the expression path
     // gets the same treatment as the argument one — and a modifier still chains

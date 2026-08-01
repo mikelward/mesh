@@ -624,17 +624,7 @@ fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), Exp
     }
     apply_tilde(&mut pieces);
 
-    // A word globs only if it has glob syntax *and* its expandable segments form a
-    // valid pattern on their own (literals stood in by a placeholder), so an escaped
-    // literal fragment can't complete a broken class in an adjacent expandable
-    // segment. Anything else is the literal text it looks like.
-    let structure: String = pieces
-        .iter()
-        .map(|(t, e)| if *e { t.clone() } else { "a".to_string() })
-        .collect();
-    let matches = if pieces.iter().any(|(t, e)| *e && has_glob_meta(t))
-        && glob::Pattern::new(&structure).is_ok()
-    {
+    let matches = if segments_glob(pieces.iter().map(|(t, e)| (t.as_str(), *e))) {
         glob_matches(&glob_pattern(&pieces))
     } else {
         None
@@ -1891,6 +1881,28 @@ fn has_glob_meta(text: &str) -> bool {
     text.chars().any(|c| matches!(c, '*' | '?' | '['))
 }
 
+/// Do these `(text, expandable)` segments reach the **filesystem**?
+///
+/// They do when they carry glob syntax *and* the expandable ones form a valid
+/// pattern on their own — every literal segment stood in by a placeholder, so an
+/// escaped fragment can't complete a broken class in an adjacent expandable one.
+/// Anything else is the literal text it looks like.
+///
+/// The one place the answer is decided, because [`expand_word`] and [`word_globs`]
+/// both need it and a word that expanded literally but was *called* a glob became a
+/// one-element list: `x = a[` bound `['a[']` where it had always bound the string.
+fn segments_glob<'a>(segments: impl Iterator<Item = (&'a str, bool)> + Clone) -> bool {
+    segments
+        .clone()
+        .any(|(text, expandable)| expandable && has_glob_meta(text))
+        && glob::Pattern::new(
+            &segments
+                .map(|(text, expandable)| if expandable { text } else { "a" })
+                .collect::<String>(),
+        )
+        .is_ok()
+}
+
 /// Does this word expand against the **filesystem**?
 ///
 /// A glob's result is a **list** whatever it matched, so the collapse that turns a
@@ -1900,11 +1912,19 @@ fn has_glob_meta(text: &str) -> bool {
 /// only directory's name, and `for f in *.rs` iterated the characters' worth of
 /// nothing when exactly one file matched. That is the run-time-dependent shape
 /// `DESIGN.md` §"Spread / flattening" rules out by name.
+///
+/// Asked of the word before interpolation, which the structural test allows for:
+/// an interpolated value is literal to expansion, so it stands in as a placeholder
+/// there exactly as it does here and neither can complete the other's pattern.
 pub(crate) fn word_globs(word: &Word) -> bool {
+    // A qualifier list is a filesystem test whatever the pattern did, and it applies
+    // to the literal an invalid one falls back to — so `*[(f)` is still a list, and
+    // an empty one when the literal doesn't qualify.
     word.qualifiers.is_some()
-        || word.pieces.iter().any(
-            |piece| matches!(piece, Piece::Text { text, expandable: true } if has_glob_meta(text)),
-        )
+        || segments_glob(word.pieces.iter().map(|piece| match piece {
+            Piece::Text { text, expandable } => (text.as_str(), *expandable),
+            Piece::Var(_) | Piece::Value(_) => ("", false),
+        }))
 }
 
 #[cfg(test)]
