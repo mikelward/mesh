@@ -396,6 +396,21 @@ pub fn expand_values(words: Vec<Word>, vars: &Vars) -> Result<Vec<Value>, Expand
 /// would the same token passed positionally: a bare `--n=2` is the integer `2`,
 /// while a quoted (`--n="2"`) or interpolated (`--n=$s`) value keeps its expanded
 /// string type. Spread and whole-variable values are never bare.
+/// [`expand_values`] for one word, plus whether it reached the filesystem.
+///
+/// The flag is what decides whether a lone expanded value collapses to a scalar.
+/// Qualifiers count as globbing whatever the pattern did, since `*(d)` asks the
+/// filesystem about every path it kept.
+pub fn expand_word_values(word: Word, vars: &Vars) -> Result<(Vec<Value>, bool), ExpandError> {
+    let qualified = word.qualifiers.is_some();
+    let mut strings = Vec::new();
+    let globbed = expand_word(word, vars, &mut strings)?;
+    Ok((
+        strings.into_iter().map(Value::String).collect(),
+        globbed || qualified,
+    ))
+}
+
 pub fn expand_call_values(
     words: Vec<Word>,
     vars: &Vars,
@@ -610,7 +625,16 @@ fn spread_var(word: &Word) -> Option<&VarRef> {
 /// A word reduced to `(text, expandable)` pieces, after interpolation and tilde.
 type Pieces = Vec<(String, bool)>;
 
-fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), ExpandError> {
+/// Expand one word into `out`, reporting whether it expanded against the
+/// **filesystem** — which the caller needs, because a glob is a list however many
+/// paths it matched while an ordinary word collapses to the one value it made.
+///
+/// Reported *by* expansion rather than re-derived by the caller: the predicate is
+/// subtler than "has a `*` in it" — the expandable segments must also form a valid
+/// pattern on their own — and a second copy of it drifted immediately, binding
+/// `x = a[` as a one-element list where expansion had correctly fallen back to the
+/// literal text.
+fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<bool, ExpandError> {
     // Resolve interpolations first; an interpolated value is literal.
     let mut pieces: Pieces = Vec::new();
     for piece in word.pieces {
@@ -639,6 +663,9 @@ fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), Exp
     } else {
         None
     };
+    // A pattern `glob` refused falls back to its literal text, and a literal is not
+    // a glob — so this is `Some` only when the filesystem was really consulted.
+    let globbed = matches.is_some();
     let mut matches = matches.unwrap_or_else(|| vec![literal(&pieces)]);
     // Qualifiers apply to whatever the word produced, including the literal a
     // pattern `glob` refuses falls back to. Filtering only real matches would let
@@ -648,7 +675,7 @@ fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), Exp
         matches.retain(|path| qualifies(path, qualifiers));
     }
     out.extend(matches);
-    Ok(())
+    Ok(globbed)
 }
 
 /// Does this path satisfy every one of a glob's qualifiers?
@@ -1889,22 +1916,6 @@ fn home() -> Option<String> {
 
 fn has_glob_meta(text: &str) -> bool {
     text.chars().any(|c| matches!(c, '*' | '?' | '['))
-}
-
-/// Does this word expand against the **filesystem**?
-///
-/// A glob's result is a **list** whatever it matched, so the collapse that turns a
-/// single expanded value into a scalar must not apply to it. Without this a
-/// pattern's *type* depended on how many files happened to be on disk — one match
-/// gave a string, two gave a list — so `xs = *(d):len` answered the length of the
-/// only directory's name, and `for f in *.rs` iterated the characters' worth of
-/// nothing when exactly one file matched. That is the run-time-dependent shape
-/// `DESIGN.md` §"Spread / flattening" rules out by name.
-pub(crate) fn word_globs(word: &Word) -> bool {
-    word.qualifiers.is_some()
-        || word.pieces.iter().any(
-            |piece| matches!(piece, Piece::Text { text, expandable: true } if has_glob_meta(text)),
-        )
 }
 
 #[cfg(test)]

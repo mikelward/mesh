@@ -16714,6 +16714,21 @@ fn quoting_a_capture_changes_nothing() {
 }
 
 #[test]
+fn a_pattern_glob_refuses_is_a_literal_string_not_a_list() {
+    // `a[` has glob syntax but is not a valid pattern, so expansion falls back to
+    // the literal text. The glob-is-a-list rule must agree: a second predicate that
+    // only looked for metacharacters bound `x` as `['a[']`, which then had no text
+    // form to interpolate and no argv form at all. Raised in review as a P2.
+    let out = run_with_input("x = a[\nputs $x:repr\nputs \"<$x>\"\n/bin/echo $x\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "'a['\n<a[>\na[\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn the_split_family_carries_two_letter_aliases() {
     // A split is what a line loop and a `-print0` pipeline write on every use, so
     // each fixed-separator member has a systematic initial-plus-`s` alias. They do

@@ -3919,15 +3919,15 @@ fn eval_expr(
             // did not touch the filesystem collapses to the one value it expanded
             // to. Asked after the fact — "did this produce exactly one?" — the two
             // are indistinguishable, and a pattern's type came to depend on the
-            // directory's contents.
-            let globs = expand::word_globs(&word);
-            expand::expand_values(vec![word], &shell.vars)
+            // directory's contents. Expansion reports it rather than this layer
+            // re-deriving it: a pattern `glob` refuses is a literal, not a glob.
+            expand::expand_word_values(word, &shell.vars)
                 .map_err(|e| {
                     note!("mesh: {e}");
                     Step::Error(1)
                 })
-                .map(|mut v| {
-                    if v.len() == 1 && !globs {
+                .map(|(mut v, globbed)| {
+                    if v.len() == 1 && !globbed {
                         v.pop().unwrap()
                     } else {
                         Value::List(v)
