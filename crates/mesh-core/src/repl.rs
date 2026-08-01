@@ -3273,7 +3273,7 @@ fn expansion_word(
                 // Through `eval_operand_of`, which puts `shell.result` /
                 // `shell.produced` back: a piece of a word is an *operand*, so what
                 // it produced must not stand as the enclosing command's result.
-                let value = eval_operand_of(&expression.value, last, in_function, shell)?;
+                let value = eval_word_piece(&expression.value, *quote, last, in_function, shell)?;
                 // Control flow is unwinding — a `return` inside the capture. Stop
                 // rather than expand a word that was never finished; the statement
                 // layer acts on `shell.control`.
@@ -3772,12 +3772,44 @@ fn eval_operand_of(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
+    as_operand(shell, |shell| eval_expr(expr, last, in_function, shell))
+}
+
+/// Run `evaluate` with the operand bookkeeping [`eval_operand_of`] describes, for a
+/// caller that needs something other than a plain [`eval_expr`] in the middle.
+fn as_operand(
+    shell: &mut Shell,
+    evaluate: impl FnOnce(&mut Shell) -> Result<Value, Step>,
+) -> Result<Value, Step> {
     let saved_result = shell.result.clone();
     let saved_produced = shell.produced;
-    let value = eval_expr(expr, last, in_function, shell);
+    let value = evaluate(shell);
     shell.result = saved_result;
     shell.produced = saved_produced;
     value
+}
+
+/// What a `$…` / `${…}` piece of a word contributes.
+///
+/// Inside `"…"` a bare `$(cmd)` is the **one-string** capture (`DESIGN.md`
+/// §"Command substitution"): quoting is how a capture is asked for a scalar, so the
+/// default newline split does not run there and `"$(id -un)@$(hostname)"` glues two
+/// strings rather than erroring on two lists. A capture carrying its own modifiers
+/// is left alone — its chain has already said what shape it wants — and every other
+/// value still meets [`interpolated_value`], which refuses a list as before.
+fn eval_word_piece(
+    expr: &parser::Expr,
+    quote: parser::QuoteMode,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    if let (parser::QuoteMode::Double, parser::Expr::Capture(source)) = (quote, expr) {
+        return as_operand(shell, |shell| {
+            capture_scalar(source, last, in_function, shell)
+        });
+    }
+    eval_operand_of(expr, last, in_function, shell)
 }
 
 /// The value an expression yields when control flow is already unwinding — never
@@ -5749,8 +5781,28 @@ fn capture_raw(
     }
 }
 
-/// What a bare `$(cmd)` yields: the output with its trailing newlines trimmed.
+/// What a bare `$(cmd)` yields: the output **split on newlines**, a list.
+///
+/// The default, per `DESIGN.md` §"Command substitution", because newline-separated
+/// output is the dominant Unix convention (`ls`, `find`, `grep`, `ps`) and a split
+/// on it never breaks on a space in a filename. The terminator rule comes from
+/// [`expand::split_text`], the same one every split modifier uses, so a trailing
+/// blank line is not a phantom element here either.
+///
+/// The one-string forms are `"$(cmd)"` — quoting is how a capture is asked for a
+/// scalar — and `$(cmd):raw`, which additionally keeps the trailing newline.
 fn capture_source(
+    source: &parser::Source,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let output = capture_raw(source, last, in_function, shell)?;
+    Ok(expand::split_text(&output, "\n"))
+}
+
+/// What `"$(cmd)"` yields: one string, trailing newlines trimmed.
+fn capture_scalar(
     source: &parser::Source,
     last: u8,
     in_function: bool,

@@ -260,17 +260,12 @@ exception that ignores whitespace entirely — leading, trailing, and runs — s
 never yields empty elements (the classic IFS word-split). `:raw` does not split
 at all (it is the [no-split capture member](#modifiers), one byte-string).
 
-*(Implementation status.* The split modifiers built so far are `:split(SEP)` and
-`:words`, and both currently behave as **value modifiers**: they operate on the
-already-evaluated string value, not on a substitution's *raw* capture. A `$(…)`
-receiver has therefore already had its trailing newline trimmed by the time they
-run — `$(printf "a:\n"):split(":")` is `[a]`, not `[a "\n"]`. Raw-capture binding
-(a split modifier *replacing* the default trim and running on the raw bytes)
-arrives with the rest of this family — `:lines`, `:nulls`, `:tabs`, `:raw` — none
-of which is built yet. The trim-then-split interim keeps a colon split from
-stapling a trailing newline onto the last field.
+*(Implementation status.* The whole family is built: `:split(SEP)`, `:words`,
+`:lines`, `:nulls`, `:tabs` and `:raw`, along with the raw-capture binding that
+makes them replace a capture's default rather than run after it, and the default
+newline split itself.
 
-Both refuse a **list** subject rather than mapping element-wise, since a split
+They refuse a **list** subject rather than mapping element-wise, since a split
 consumes one string; `$lines:map(:words)` is how a list of lines is taken apart.
 Note this contradicts the `$lines:words` written in the [`:flat`](#spread--flattening)
 TODO, which assumes the auto-mapping every *value* modifier does. That question is

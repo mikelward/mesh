@@ -101,7 +101,10 @@ came before cannot end one. That covers, among others:
   are errors, the prefix parser recursing without skipping the newline, and nor
   before a postfix access — `($m` ⏎ `.a)` is an error. A **capture** is a
   different case again: `$( … )` holds a statement list, so a newline in one
-  separates statements as it would anywhere else.
+  separates statements as it would anywhere else — **unquoted**. Inside `"…"` a
+  capture or a `${ … }` may not span a line: the string scanner stops at the
+  newline and reports the opener unclosed, though the string itself may hold
+  literal newlines. Tracked in `TODO.md`.
 - **After any binary or range operator** — `x = 1 +` ⏎ `2`, `x = 1 ..` ⏎ `3`,
   and `x = true and` ⏎ `false` all parse — and after a trailing `|`, `|&`,
   `&&`, or `||`.
@@ -192,7 +195,10 @@ A **variable** interpolates in bare text and in `"…"`, never in `'…'` or
 `"at $(pwd) now"` and `"${greeting()}"` are word pieces, while a bare
 `pre$(puts x)post` is a syntax error rather than one word, and a bare
 `${$n + 1}` expects a variable name after the brace. Unquoted, a `$( … )` is a
-standalone `capture` in the expression grammar rather than part of a word.
+standalone `capture` in the expression grammar rather than part of a word. The
+two positions also differ in **what the capture yields** — quoted it is one
+string, unquoted it is the newline-split list — but that is evaluation, not
+grammar; see `DESIGN.md` §"Command substitution".
 
 ### Names
 

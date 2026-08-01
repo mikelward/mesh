@@ -4499,7 +4499,7 @@ a one-line edit. Every claim below was checked against the built shell.
       touch this — inside `[…]` the two readings are genuinely ambiguous under
       the current spacing rule, so it needs a decision, not a parser tweak.
       `[*.txt *.txt]` is unaffected, its stars being inside words.
-- [ ] **`$(…)` does not split on newlines.** `capture_source`
+- [x] **`$(…)` does not split on newlines.** `capture_source`
       (`crates/mesh-core/src/repl.rs:4315`) returns one `Value::String` with
       trailing newlines trimmed, but `DESIGN.md` §"Modifiers" specifies the
       default capture as a **newline split → list**, and §"Loops" writes
@@ -4534,6 +4534,45 @@ a one-line edit. Every claim below was checked against the built shell.
         against the raw capture bytes; the same holds for `:tabs`, `:words` and
         `:split(SEP)`. `:lines` is the explicit spelling of the default, not a
         second pass over it.
+
+        **Done.** A split modifier written directly on a `$(…)` binds the raw
+        bytes; once they are in a variable they are an ordinary string, so
+        whether a line binds raw is readable from that line.
+
+      **Done, and the entry above is the state when it was written.** The default
+      is the newline split, `"$(cmd)"` is the one-string form, `$(cmd):raw` is the
+      one that also keeps the trailing newline, and the whole split family
+      (`:lines` `:nulls` `:tabs` `:words` `:split(SEP)` `:raw`) is built. The
+      accepted cost showed up exactly where the entry predicted: ~20 tests and a
+      dozen doc examples wanted a scalar and now write the quotes. One consequence
+      that was *not* predicted is the sub-item below.
+  - [ ] **`...` cannot be written on a capture, which is what the diagnostic
+        asks for.** `/bin/echo $(pwd)` reports ``a list needs `...` to become
+        command arguments``, and `...$(pwd)` is then a syntax error — there is no
+        spread of a value *expression* at the argv boundary, the same gap
+        `...$x:split(":")` hits (`parser.rs` says so in a comment). So the
+        message names a fix that does not parse. The working spellings are
+        `"$(pwd)"` when the answer is one value and `xs = $(pwd)` then
+        `...$xs` when it is not, but a reader hits the dead end first. Two ways
+        out: implement expression spreading at argv, or have the diagnostic name
+        the bind-then-spread form when the value came from a capture. The second
+        is the cheap one and does not foreclose the first. Note the same
+        diagnostic misleads a second way: `...` must be **attached**, so
+        `/bin/echo ... $xs` parses the `...` as an ordinary argument and then
+        reports that `$xs` needs a `...` — complaining about an operator that is
+        sitting right there in the source.
+  - [ ] **A multi-line capture cannot be quoted.** `"$( … )"` spanning a newline
+        is a syntax error — the `"…"` scanner stops at the end of the line, so
+        `x = "$(fork { puts a\n })"` reports ``unclosed `(` `` — while the same
+        capture unquoted parses fine. That was cosmetic while a bare capture was
+        already one string; now that quoting *is* the way to ask for a scalar, it
+        means the scalar form is unreachable by quoting for exactly the captures
+        that hold a block. `$( … ):raw` is the workaround and it is not
+        equivalent: it keeps the trailing newline the quoted form would trim, so
+        the honest spelling today is `:raw:trimend`, which trims more than the
+        default does. A multi-line `"…"` string is otherwise fine (`x = "a\nb"`
+        with a literal newline works), so this is the `$(` / `${` scanner inside a
+        string, not the string itself.
 - [x] **Reserve only bare `_` as discard, allow `_name`.** Today a name must
       start with a letter, so a leading underscore is rejected wholesale (`_` and
       `_x` alike) — `_` is the discard pattern (`DESIGN.md`). Reconsider narrowing
