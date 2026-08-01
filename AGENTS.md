@@ -73,7 +73,8 @@ apply throughout.
   cadence (every half hour or so) until every late comment is handled *and* the
   PR has gone about a day without a new one. Both, not either: at the moment of
   merge "every comment handled" is vacuously true, so the quiet window has to
-  actually elapse.
+  actually elapse. A PR closed without merging gets the same treatment, timed
+  from the close.
 - **Three polling states, so the 5-minute cadence has an end.** Five minutes is
   for a PR with something outstanding: CI running, a review requested, a comment
   unanswered, a merge conflict. Once a PR is green, reviewed, and has nothing
@@ -104,31 +105,43 @@ apply throughout.
   Before arming, reuse or cancel the pending one (`update_trigger`, or
   `delete_trigger` then re-arm) so exactly one check is outstanding.
 - **"Drive" means run the loop automatically**: pick the next task, implement
-  it, open the PR, send it for review, address every comment, merge once CI is
-  green and Codex has left its thumbs up — then pick the next task and go around
-  again. Driving ends when the work runs out or the user says stop, not when one
-  PR merges.
+  it, open the PR, wait for the automatic Codex review, address every comment,
+  merge once CI is green and Codex has left its thumbs up — then pick the next
+  actionable task and go around again. Actionable means ready to build: skip
+  anything explicitly deferred or waiting on a product decision rather than
+  guessing the decision. Driving ends when the work runs out or the user says
+  stop, not when one PR merges.
 - **A red baseline is the next task.** Before pulling anything from `TODO.md`,
   run the suite and get it green. A preexisting failure is work to do, not a
   thing to classify as "unrelated" and step around — deciding it's out of scope
   is exactly the call that goes wrong, and the cost is every later PR merged
-  onto an unverified tree. Fix it first, then pick the task.
-- **"Autopilot" is drive without blocking on the user.** Wherever drive would
-  stop and ask, autopilot takes its best guess and keeps going, preferring the
-  option that is cheapest to undo or change later. Record each guess in
-  `TODO.md` under a `Decisions needing review` heading — what was decided, what
-  the alternative was, and why it's reversible — creating the heading if it
-  isn't there, so nothing guessed silently becomes permanent. While autopilot is
-  in effect it outranks "ask in plain text, then end the turn and wait for the
-  answer"; that rule governs everywhere else. The carve-out is for destructive
-  or irreversible actions *outside* the loop — rewriting shared history,
-  deleting work, anything reaching a system beyond this repo — which still wait
-  for a real answer. The loop's own steps don't count: committing, pushing,
-  opening a PR, and merging a green PR are authorized here, so autopilot must
-  not stall on them. Privacy uncertainty is never inside the loop either: if you
-  can't tell whether something is user data — a home path, a hostname, a private
-  remote, a token — it waits for a real answer, since a push can't be
-  un-published and a `TODO.md` note doesn't retract it.
+  onto an unverified tree. Fix it first, then pick the task. *Code style and
+  tests*' "genuinely unrelated, out of scope" escape hatch is the only way past
+  a red tree, and it needs a real answer from the user — not a call you make on
+  your own, and not one autopilot guesses.
+- **"Autopilot" is drive without blocking on the user.** Wherever drive
+  would stop and ask, autopilot takes its best guess and keeps going,
+  preferring the option that is cheapest to undo or change later. Record
+  each guess in `TODO.md` under a `Decisions needing review` heading — what
+  was decided, what the alternative was, and why it's reversible — creating
+  the heading if it isn't there, so nothing guessed silently becomes
+  permanent. While autopilot is in effect it outranks "ask in plain text,
+  then end the turn and wait for the answer"; that rule governs everywhere
+  else. The carve-out is for destructive or irreversible actions *outside*
+  the loop — rewriting shared history, deleting work, anything reaching a
+  system beyond this repo — which still wait for a real answer. Resetting a
+  pinned merged branch waits too, even though it is inside the loop: the
+  post-merge rule asks precisely because no check can tell what the reset
+  would destroy, and autopilot guessing there is the loss that rule exists
+  to prevent. The loop's own steps don't count: committing, pushing, opening
+  a PR, subscribing to it, reading its CI and review state, arming the next
+  scheduled check, and merging a green PR are authorized here, so autopilot
+  must not stall on them — the carve-out is aimed at destructive writes to
+  systems outside the repo, not at the loop's own GitHub reads and
+  follow-ups. Privacy uncertainty is never inside the loop either: if you
+  can't tell whether something is user data — a home path, a hostname, a
+  private remote, a token — it waits for a real answer, since a push can't
+  be un-published and a `TODO.md` note doesn't retract it.
 
 ## Pull requests
 
@@ -151,7 +164,8 @@ apply throughout.
   comment after merge; stay subscribed and handle each new comment per the rule
   above until they're all answered/resolved *and* the PR has gone about a day
   without a new one — "none have arrived yet" is not the same as "none are
-  coming."
+  coming." A PR closed without merging gets the same treatment, timed from the
+  close rather than from a merge commit that never existed.
 
 ## Git workflow
 
@@ -189,14 +203,23 @@ apply throughout.
   placeholder `<agent>` stands in for whichever prefix you use — don't
   hard-code `claude/` unless you *are* Claude Code.
 - **Merge cue (`merged` / `I merged` / `landed` / merge webhook) runs hygiene
-  *before* engaging with the rest of the message:** `git fetch origin`, cut a
+  *before* engaging with the rest of the message:** `git fetch origin main`, cut a
   fresh `<agent>/<short-topic>` branch off `origin/main`, announce the switch.
 - **After a merge, take a fresh `<agent>/<short-topic>`** — don't reset the
-  merged name onto the new base. Its remote ref still points at the pre-merge
-  tip, so `origin/<branch>..HEAD` keeps spanning the merged commits and
-  unpushed-work checks report your own merged history back at you. When a
-  sandbox pins the branch name, reset it and `--force-with-lease` in the same
-  turn — that's routine on merged history, not something to ask about.
+  merged name onto the new base. Its remote ref still points at the
+  pre-merge tip, so `origin/<branch>..HEAD` keeps spanning the merged
+  commits and unpushed-work checks report your own merged history back at
+  you. When a sandbox pins the branch name so a fresh one isn't available,
+  say so and ask before resetting it. No short check reliably separates
+  "already merged" from "not yet merged" here: a rebase merge rewrites the
+  commits, a squash merge collapses them, `main` moves on underneath so a
+  tip-to-tip diff reports upstream drift as branch work, the remote ref can
+  hold a commit the local one doesn't, and no tree comparison sees the
+  uncommitted work a `--hard` reset would erase. Confirming costs one
+  question in a rare situation; guessing costs someone their work. Don't
+  reach for `--force-with-lease` as the safety net either — fetching updates
+  the remote-tracking ref the lease compares against, so a commit you have
+  already fetched passes the lease unnoticed.
 - **The agent authors; whoever merges takes over the committer line.** A squash
   or rebase merge rewrites the committer to the person who pressed the button —
   the repo owner normally, the agent itself when it merges under *drive* (see
@@ -258,7 +281,9 @@ apply throughout.
   last line of the reply is that question, written out in about a sentence. A
   back-reference ("as asked above") isn't actionable when the question is pages
   back or was never actually put into words; restate it every turn until it's
-  answered. Nothing pending, no line.
+  answered. Nothing pending, no line. This governs replies the user reads: a
+  scheduled check that finds nothing new re-arms silently and produces no reply
+  at all, so there is nothing to restate.
 
 ## Privacy
 
