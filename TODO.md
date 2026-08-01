@@ -3070,8 +3070,20 @@ thing a reader takes on trust.*
         `alpha`. That is what `g = *.md` already does with its matches, and the
         alternative — a flag holding an unevaluated value resolved at the call —
         was rejected as a closure in disguise, which mesh has nothing else like.
-      - How does a flag render at the **argv boundary**? `curl $x` has to send
-        `--help` as bytes, so it needs a text form, unlike a job handle.
+      - ~~How does a flag render at the **argv boundary**?~~ **Decided: a flag has
+        a text form**, the one it was written with. `curl $x` sends `--tag=v2`,
+        `puts $x` prints it, `"$x"` interpolates it. It is a *typed* value that
+        still renders, like an integer or a glob, rather than one with no byte
+        form at all like a job handle — where there genuinely is no text to give,
+        which is not true here.
+
+        The asymmetry this leaves, knowingly: a flag is the first value whose text
+        form **round-trips to different semantics**. `x = --tag=v2` renders
+        `--tag=v2`, but `y = "--tag=v2"` built from that text is a string and will
+        not bind. Same bytes, different meaning — the asymmetry that motivated the
+        type, moved one level down rather than removed. It is the price of the
+        text form, and the text form is what keeps a flag usable at the process
+        boundary, which is where flags mostly go.
       - What do `:type` and `:repr` answer, and does `$x == "--help"` hold?
       - Does a bare `--` bind a terminator value, or stay syntax?
       - What happens to `wrapper func`, which exists to switch flag reading off —
