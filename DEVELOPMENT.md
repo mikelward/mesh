@@ -118,6 +118,15 @@ cargo test -p mesh --test cli   # just the end-to-end (integration) tests
 cargo test -p mesh --test docs  # just the documentation examples
 ```
 
+One suite sits outside `cargo`: `session_start_hook_test.sh` covers
+[`.claude/hooks/session-start.sh`](.claude/hooks/session-start.sh), the hook
+that brings a web session's Rust toolchain up to the `rust-version` floor
+before anything tries to build. CI runs it alongside the Rust tests.
+
+```sh
+sh session_start_hook_test.sh   # stubs rustc/rustup; downloads nothing
+```
+
 Convention (from `AGENTS.md`): **a change isn't done until it's covered.** When
 fixing a bug, add a test that fails before the fix and passes after. Richer
 harnesses (`assert_cmd`, snapshot testing via `insta`) are fine to adopt when the
@@ -135,9 +144,13 @@ cargo clippy --all-targets -- -D warnings        # CI gate
 
 ## Continuous integration
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs fmt, clippy, and the
-test suite on `ubuntu-latest` and `macos-latest` for every push to `main` and
-every pull request.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs fmt, clippy, the
+test suite, and the session-start hook's own tests for every push to `main` and
+every pull request, plus a second job building against the MSRV floor. Every
+job runs on `ubuntu-latest`: the FreeBSD and macOS coverage is `cargo check`
+against those targets — cross-compiled, Zig supplying the macOS C toolchain —
+rather than a runner of that platform, so it catches type errors but never
+executes a test there.
 
 ## Supported systems
 

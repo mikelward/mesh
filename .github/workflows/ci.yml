@@ -27,6 +27,18 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # The SessionStart hook is what keeps a web session's toolchain able to
+      # build this workspace at all, so it gets the same treatment as the Rust
+      # code: a suite that runs on every PR. Its own tests stub rustc/rustup,
+      # so nothing here downloads a toolchain.
+      - name: Shellcheck the session-start hook
+        run: |
+          shellcheck -s bash -S error .claude/hooks/session-start.sh
+          shellcheck -s sh -S error session_start_hook_test.sh
+
+      - name: Test the session-start hook
+        run: sh session_start_hook_test.sh
+
       # FreeBSD needs no cross compiler: nothing in the tree builds C for it
       # (`rusqlite` links a system SQLite rather than bundling one), and `cargo
       # check` never reaches the link step where that library would be needed.
