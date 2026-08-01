@@ -48,6 +48,44 @@ pub(crate) fn set_probe_budget(budget: Duration) {
     PROBE_BUDGET.with(|budget_cell| budget_cell.set(budget));
 }
 
+/// Has this child exited? Asked **without reaping it**.
+///
+/// The `WNOWAIT` is the whole point, and it is what `try_wait` cannot do. Both
+/// probes here put their child in a process group of its own and then
+/// `kill(-pid, SIGKILL)` it, because a child that is a pipeline leaves stages
+/// holding the write end of the pipe and the read never sees EOF. That signal
+/// names a **group by the child's pid** — and a reaped pid is immediately free
+/// for the kernel to hand to somebody else.
+///
+/// So reaping before that kill opens a window in which the number means someone
+/// else's process group. Under parallel probes it does: instrumented over eight
+/// runs of this crate's tests, a group with the reaped child's id was still
+/// alive at that point twice, and killing it takes out another probe's child
+/// before it can write a byte — which shows up as a probe that mysteriously
+/// returned nothing. `WNOWAIT` leaves the zombie in place, so the pid stays
+/// reserved until the caller has signalled the group and reaped deliberately.
+fn exited(pid: libc::pid_t) -> io::Result<bool> {
+    // SAFETY: a zeroed `siginfo_t` is the documented input for `waitid`, which
+    // fills it in, and `pid` names this process's own child.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let answered = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if answered < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // `WNOHANG` with nothing to report succeeds and leaves the struct as it was,
+    // so a zero pid is "still running" rather than an answer about a child.
+    //
+    // SAFETY: reading the union member `waitid` populates for an exited child.
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ValueHint {
     File,
@@ -1036,16 +1074,12 @@ fn rendered_page_with(program: &str, path: &Path) -> Option<String> {
     let stdout = pipe_reader(child.stdout.take());
     let deadline = Instant::now() + probe_budget();
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                // SAFETY: scalar arguments naming the child's own group.
-                unsafe { libc::kill(-group, libc::SIGKILL) };
-                let _ = child.wait();
-                break;
-            }
-            Err(_) => break,
+        match exited(group) {
+            Ok(true) => break,
+            Ok(false) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            // Out of time. The group kill below is what ends it, so there is
+            // nothing to do here that is not done for a child that finished.
+            Ok(false) | Err(_) => break,
         }
     }
     // Unconditionally, not only on the deadline: `man` is a *pipeline* —
@@ -1055,10 +1089,38 @@ fn rendered_page_with(program: &str, path: &Path) -> Option<String> {
     // forever. Killing the group is what closes the last copy. This is why the
     // probe does the same, and why a stub `man` that spawns nothing hid it.
     //
+    // **Before the reap**, which is why the loop above asks `exited` rather than
+    // `try_wait`: see [`exited`]. Reaping first frees the pid, and this signal
+    // names a *group* by that same number.
+    //
     // SAFETY: scalar arguments naming the child's own group, which `pre_exec`
     // made it the leader of, so the shell's own group cannot be signalled.
     unsafe { libc::kill(-group, libc::SIGKILL) };
+    reap(child, "man");
     Some(String::from_utf8_lossy(&join_reader(stdout)).into_owned())
+}
+
+/// Collect a probe child that has been signalled, deciding once what a failed
+/// reap means for both probes.
+///
+/// It means **nothing to the caller's answer**, deliberately: the bytes the
+/// child wrote are what it wrote, and discarding a real answer because the
+/// corpse could not be collected would trade the result for a cleanup detail —
+/// the empty-probe symptom this whole path exists to avoid. So the output
+/// stands either way.
+///
+/// What it must not do is pass unnoticed, and it does not: a `wait` that fails
+/// leaves a zombie for the life of the shell, and this runs once per Tab. In a
+/// debug build that is a panic, because it should be unreachable — the caller
+/// has already seen the child exit through [`exited`], which leaves the zombie
+/// in place, or has just `SIGKILL`ed it, so `waitpid` has something to collect
+/// and `std` retries `EINTR` itself. In release it is swallowed on purpose
+/// rather than by omission: a diagnostic here would print into a half-drawn
+/// completion, and there is no other channel from this path.
+fn reap(mut child: std::process::Child, what: &str) {
+    if let Err(error) = child.wait() {
+        debug_assert!(false, "{what} probe child could not be reaped: {error}");
+    }
 }
 
 /// The value type a curated line spells out.
@@ -1311,23 +1373,24 @@ pub(crate) fn command_help(words: &[String]) -> String {
     let stderr = pipe_reader(child.stderr.take());
     let deadline = Instant::now() + probe_budget();
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                unsafe { libc::kill(-child_group, libc::SIGKILL) };
-                let _ = child.wait();
-                break;
-            }
-            Err(_) => break,
+        match exited(child_group) {
+            Ok(true) => break,
+            Ok(false) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            // Out of time, or the wait itself failed. Either way the group kill
+            // below is what ends the child, so both leave the loop the same way.
+            Ok(false) | Err(_) => break,
         }
     }
+    // The kill comes **before** the reap, deliberately — see [`exited`]. The
+    // child is still a zombie here, so its pid, and with it the group id this
+    // names, cannot yet have been handed to anyone else.
     unsafe {
         libc::kill(-child_group, libc::SIGKILL);
         if shell_group >= 0 {
             libc::tcsetpgrp(libc::STDIN_FILENO, shell_group);
         }
     }
+    reap(child, "--help");
     let mut text = String::from_utf8_lossy(&join_reader(stdout)).into_owned();
     text.push_str(&String::from_utf8_lossy(&join_reader(stderr)));
     text
@@ -2379,6 +2442,35 @@ mod tests {
         assert!(output.contains("--stderr"));
         assert_eq!(fs::read_to_string(args).unwrap(), "subcommand\n--help\n");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn asking_whether_a_child_exited_does_not_reap_it() {
+        // The probes signal `kill(-pid, SIGKILL)` *after* the wait loop says the
+        // child is done, so the pid must still be reserved at that moment. It is
+        // reserved only while the zombie is unreaped — which is exactly what
+        // this asks of `exited`, and what `try_wait` would break.
+        //
+        // Deterministic on purpose: the race it guards against is not, so the
+        // test pins the property the fix rests on rather than trying to lose a
+        // scheduling coin toss on demand.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id() as libc::pid_t;
+
+        while !super::exited(pid).expect("waitid") {
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Asked and answered several times over: `WNOWAIT` must be repeatable,
+        // since the loop polls until the deadline.
+        assert!(super::exited(pid).expect("waitid"));
+
+        // Still ours to reap. Had `exited` consumed it, this would be `ECHILD`,
+        // and the pid — and so the group id the probes signal — would already
+        // have been free for the kernel to reuse.
+        let status = child.wait().expect("the child was not reaped by `exited`");
+        assert!(status.success());
     }
 
     #[test]
