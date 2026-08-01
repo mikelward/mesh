@@ -22488,6 +22488,94 @@ fn a_bare_env_reads_through_its_accessors_rather_than_printing_whole() {
     );
 }
 
+/// `$env[…]` is a **place**, not only a read: the computed spelling that already
+/// answered `$env[$name]` now takes an assignment too, so a name held in a
+/// variable can be written without being spelled out in the source.
+#[test]
+fn a_computed_env_key_writes_the_entry_it_reads() {
+    let out = run_with_input(
+        r#"n = MESH_TEST_COMPUTED
+$env[$n] = one
+puts $env.MESH_TEST_COMPUTED $env[$n] $env:get($n, none)
+$env[$n] += -two
+puts $env[$n]
+$env["MESH_TEST_QUOTED"] = quoted
+puts $env.MESH_TEST_QUOTED
+"#,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "one one one\none-two\nquoted\n"
+    );
+
+    // The write reaches the real environment, which is the whole point of it
+    // being `$env` rather than a binding: a child inherits it.
+    let out = run_with_input(
+        "n = MESH_TEST_CHILD\n$env[$n] = inherited\nsh -c 'printf \"%s\\n\" \"$MESH_TEST_CHILD\"'\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "inherited\n");
+
+    // A path-type name is typed the same way through either spelling, so `+=`
+    // appends an entry rather than concatenating text.
+    let out = run_with_input("n = PATH\n$env[$n] += /mesh-test-bin\nputs $env.PATH[-1]\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/mesh-test-bin\n");
+}
+
+/// A computed key is the first environment name a *user* supplies that the parser
+/// never saw, and `set_var` / `remove_var` **panic** on the three the process
+/// cannot hold. Each is a diagnostic instead.
+#[test]
+fn an_impossible_environment_name_is_reported_rather_than_hit() {
+    for (source, message) in [
+        ("n = \"A=B\"\n$env[$n] = x\n", "cannot contain `=`"),
+        ("n = \"\"\n$env[$n] = x\n", "cannot be empty"),
+        (
+            "n = \"A\\u{0}B\"\n$env[$n] = x\n",
+            "cannot contain a NUL byte",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(message),
+            "{source} gave {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A name mesh's own grammar could not spell is still writable, because
+    // `$env:keys` can hand one back and a round trip over them has to work.
+    let out = run_with_input("n = \"MESH TEST SPACED\"\n$env[$n] = ok\nputs $env[$n]\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+}
+
+/// One access, and only one. A second access or a modifier describes a derived
+/// value rather than a place, and `$env` holds bytes with nothing inside them to
+/// reach into — so these stay the syntax errors they already were.
+#[test]
+fn only_a_single_env_access_is_a_place() {
+    for source in [
+        "$env.PATH[0] = /x\n",
+        "$env.PATH:dedup = [/x]\n",
+        "n = FOO\n$env[$n][0] = x\n",
+        "$env[0..2] = x\n",
+        "$env = [A: 1]\n",
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(2), "{source}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+            "{source} gave {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// The affix family: drop a known prefix/suffix once, or peel a character set.
 #[test]
 fn the_affix_modifiers_strip_once_and_trim_repeatedly() {

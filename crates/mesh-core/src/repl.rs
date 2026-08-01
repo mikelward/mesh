@@ -1363,8 +1363,9 @@ fn run_executable(
                 Ok(_) if shell.control.is_some() => Step::Continue(last),
                 Ok(evaluated_value) => {
                     let captured = capture_status_of(value, shell);
-                    environ::write(key, evaluated_value, *append)
-                        .map_or_else(runtime_message, |_| Step::Continue(captured))
+                    env_key(key, &shell.vars)
+                        .and_then(|key| environ::write(&key, evaluated_value, *append))
+                        .map_or_else(runtime_message, |()| Step::Continue(captured))
                 }
                 Err(step) => step,
             }
@@ -3055,6 +3056,21 @@ fn shell_has_entry(entry: &str, vars: &vars::Vars) -> bool {
 /// read do not describe one namespace two different ways.
 fn no_shell_entry(entry: &str) -> String {
     format!("$sh: no `{entry}` in this map")
+}
+
+/// The entry an `$env` place names: spelled out, or resolved through the same
+/// [`expand::subscript_key`] a *read* goes through.
+///
+/// Sharing that one resolver is the point: it is what makes `$env[$n] = v` write
+/// exactly the entry `$env[$n]` reads, so the pair cannot drift into two different
+/// notions of what a computed key is.
+fn env_key(key: &parser::EnvKey, vars: &vars::Vars) -> Result<String, String> {
+    match key {
+        parser::EnvKey::Literal(key) => Ok(key.clone()),
+        parser::EnvKey::Computed(subscript) => {
+            expand::subscript_key(subscript, vars).map_err(|error| error.to_string())
+        }
+    }
 }
 
 /// Split a target's accesses into steps, resolving subscripts against the variable

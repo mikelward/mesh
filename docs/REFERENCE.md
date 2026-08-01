@@ -1770,6 +1770,30 @@ export EDITOR = vim           # identical to the first line
 export A=1 B=2 C=3            # a whole run at once, unspaced
 ```
 
+**`$env[…]` writes by computed name**, which is the twin of the computed read:
+any expression that names an entry to read names one to write.
+
+```mesh
+name = EDITOR
+$env[$name] = vim             # the same write as $env.EDITOR = vim
+$env[$name] += " -u NONE"
+```
+
+That is what lets a set of changes be applied as *data* rather than as source —
+the shape every `shellenv`-style integration has, and what direnv and mise need:
+
+```mesh
+for name, value in $changes {
+    $env[$name] = $value
+}
+```
+
+A computed name is only known once it is evaluated, so the three names the
+process **cannot** hold are reported there: an empty name, one containing `=`, and
+one containing a NUL. Every other name is allowed, including ones mesh's own
+grammar could not spell as `$env.KEY` — `$env:keys` can hand you one, so a round
+trip over the listing has to be able to write back what it read.
+
 An environment write is **global on purpose**, even inside a function: changing
 what children inherit is the point, so it persists after the function returns.
 To scope one to a block instead, see [`with`](#with--the-environment-for-one-block).
@@ -1836,13 +1860,16 @@ Four rules, all of them POSIX's:
 `$env.CDPATH` is in the environment, so a child process inherits it — a mesh
 script, and a `bash` or `zsh` started from here, all search the same path.
 
-Only a plain `$env.KEY` is an assignment target *here* — any name you can read you
-can also assign, including a kebab name like `$env.MY-VAR`. `$env.PATH[0] = …` and
-`$env.PATH:dedup = …` describe derived values rather than places, so they are
-syntax errors. (An ordinary map or list **does** take an indexed write — see
+An `$env` target takes **exactly one access**: a member (`$env.KEY`) or a
+subscript (`$env[$name]`). Any name you can read you can also assign, including a
+kebab name like `$env.MY-VAR`. `$env.PATH[0] = …`, `$env.PATH:dedup = …`, and
+`$env[0..2] = …` describe derived values rather than places, so they are syntax
+errors. (An ordinary map or list **does** take a write further in — see
 [Member assignment](#member-assignment) — but `$env` holds bytes rather than typed
-values, so it keeps the narrower rule.) Of the other spellings, only `export --list NAME` is still
-unimplemented.
+values, so there is nothing inside an entry to reach into.) Of the other spellings,
+only `export --list NAME` is still unimplemented; `export`, `with`, and the
+`NAME=value` command prefix take a spelled-out name only, since each is a header
+whose names are read at parse time.
 
 `+=` works on the raw bytes already in the environment, so a value that is not
 valid UTF-8 survives being appended to. Reading such a value into mesh still
@@ -2108,7 +2135,9 @@ the whole environment as a map, which is what gives `:get` an ordinary map to
 work on; `$env.NAME` stays the strict read that errors when unset. Note that
 `puts $env` is refused: the path-type names are lists, and a collection nested in
 a collection has no rendering — the same answer `puts` gives for any such map.
-Read it with `$env:keys`, `$env:get(NAME, …)`, or `$env.NAME`.
+Read it with `$env:keys`, `$env:get(NAME, …)`, `$env.NAME`, or — for a name held
+in a variable — `$env[$name]`, which has a
+[writing twin](#the-environment).
 
 ```mesh
 editor = $env:get(EDITOR, vim)
