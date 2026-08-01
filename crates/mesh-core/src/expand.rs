@@ -113,10 +113,15 @@ impl Modifier {
             "trimstart" => Self::TrimStart,
             "trimend" => Self::TrimEnd,
             "int" => Self::Int,
-            "words" => Self::Words,
-            "lines" => Self::Lines,
-            "nulls" => Self::Nulls,
-            "tabs" => Self::Tabs,
+            // The split family carries a two-letter alias each, since a split is
+            // what a line loop or a `-print0` pipeline writes on every use. They
+            // are *systematic* — initial plus `s` — rather than the `test`-derived
+            // single letters `:f` / `:d` / `:l` / `:x`, which is why none of them
+            // collides: `:l` is already `:links`.
+            "words" | "ws" => Self::Words,
+            "lines" | "ls" => Self::Lines,
+            "nulls" | "ns" => Self::Nulls,
+            "tabs" | "ts" => Self::Tabs,
             "repr" => Self::Repr,
             "exists" => Self::Exists,
             "type" => Self::Type,

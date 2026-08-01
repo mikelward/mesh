@@ -16648,14 +16648,15 @@ fn a_capture_that_returns_still_unwinds_rather_than_yielding() {
 }
 
 #[test]
-fn a_capture_splits_on_newlines_by_default() {
-    // `DESIGN.md` §"Command substitution". The terminator rule comes with it, so
-    // the trailing newline every well-behaved command writes is not a phantom
-    // element, and a blank line in the middle still is one.
+fn a_capture_is_one_string_and_a_split_is_spelled() {
+    // Nothing splits implicitly, captures included: `$(cmd)` is the output with its
+    // trailing newlines trimmed, and a caller who wants the lines says so. The
+    // shape is therefore readable from the line rather than inferred from what the
+    // command happened to print.
     let out = run_with_input(
-        "xs = $(printf \"a\\nb\\n\")\nputs $xs:len\nys = $(printf \"a\\n\\nb\\n\")\nputs $ys:len\nputs $(printf \"\"):len\n",
+        "x = $(printf \"a\\nb\\n\")\nputs $x:len\nputs $x:lines:len\nputs $(printf \"\"):len\n",
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n3\n0\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n2\n0\n");
     assert!(
         out.status.success(),
         "{}",
@@ -16664,12 +16665,13 @@ fn a_capture_splits_on_newlines_by_default() {
 }
 
 #[test]
-fn a_line_loop_over_a_capture_runs_once_per_line() {
-    // The case the default exists for. This ran **once**, with the whole blob bound
-    // to `line`, while a capture was one string — a quiet wrong answer, which is why
-    // the split is the default rather than something a caller opts into.
-    let out = run_with_input("for line in $(printf \"a\\nb c\\n\") { puts \"[$line]\" }\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "[a]\n[b c]\n");
+fn a_capture_reaches_an_external_command_without_ceremony() {
+    // The line every bash habit lands on first. A capture is one string, so it
+    // crosses to argv like any other string — no quotes, no spread, and the
+    // `...$(pwd)` dead end (spread cannot attach to an expression) is never
+    // reached from here.
+    let out = run_with_input("/bin/echo $(printf hi) there\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi there\n");
     assert!(
         out.status.success(),
         "{}",
@@ -16678,15 +16680,32 @@ fn a_line_loop_over_a_capture_runs_once_per_line() {
 }
 
 #[test]
-fn quoting_a_capture_asks_for_one_string() {
-    // Quoting is the scalar escape (`DESIGN.md` §"Command substitution"): inside
-    // `"…"` the default split does not run, so a capture interpolates as its text
-    // and glues to neighbors — where an un-quoted one is a list, and a list has no
-    // text form.
+fn a_line_loop_over_a_capture_spells_its_split() {
+    // The case the newline-split default existed for. It is not silent any more:
+    // the bare form is refused and names `:lines`, so the wrong answer that
+    // motivated the split cannot happen while the split stays opt-in.
+    let bare = run_with_input("for line in $(printf \"a\\nb c\\n\") { puts \"[$line]\" }\n");
+    assert!(
+        String::from_utf8_lossy(&bare.stderr).contains("`:lines`"),
+        "{}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert!(!bare.status.success());
+
+    let spelled =
+        run_with_input("for line in $(printf \"a\\nb c\\n\"):lines { puts \"[$line]\" }\n");
+    assert_eq!(String::from_utf8_lossy(&spelled.stdout), "[a]\n[b c]\n");
+}
+
+#[test]
+fn quoting_a_capture_changes_nothing() {
+    // The two spellings agree, which is the point: quoting a capture is not
+    // load-bearing here the way it is in bash, where an unquoted one word-splits.
+    // Both are the trimmed output, and both glue to their neighbors in a word.
     let out = run_with_input(
-        "p = \"$(printf \"a\\nb\\n\")\"\nputs $p:len\nputs \"<$(printf one)/$(printf two)>\"\n",
+        "a = $(printf \"x\\ny\\n\")\nb = \"$(printf \"x\\ny\\n\")\"\nputs ($a == $b)\nputs \"<$(printf one)/$(printf two)>\"\n",
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n<one/two>\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\n<one/two>\n");
     assert!(
         out.status.success(),
         "{}",
@@ -16695,14 +16714,19 @@ fn quoting_a_capture_asks_for_one_string() {
 }
 
 #[test]
-fn an_unquoted_capture_reaching_an_external_names_the_fix() {
-    // The cost the default accepts: a capture is a list, and a list at argv is the
-    // pre-existing hard error rather than a silent flatten. It has to *say* so —
-    // this is the line every bash habit lands on first.
-    let out = run_with_input("/bin/echo $(printf hi)\n");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("..."), "{stderr}");
-    assert!(!out.status.success());
+fn the_split_family_carries_two_letter_aliases() {
+    // A split is what a line loop and a `-print0` pipeline write on every use, so
+    // each fixed-separator member has a systematic initial-plus-`s` alias. They do
+    // not collide with the `test`-derived single letters — `:l` is `:links`.
+    let out = run_with_input(
+        "s = \"a b\\nc\"\nputs $s:ls:len\nputs $s:ws:len\nputs $s:lines:len\nputs /etc:l\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n3\n2\nfalse\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -23506,9 +23530,9 @@ fn a_fork_block_does_not_reap_or_resume_the_shells_jobs() {
 #[test]
 fn a_fork_block_inside_a_capture_still_captures() {
     let out = run_with_input(
-        "before = \"$(pwd)\"\nout = $(fork { puts inside\ncd /\n })\n\
-         after = \"$(pwd)\"\nmoved = $before != $after\n\
-         puts \"captured [$out:first]\"\nputs \"moved $moved\"\n",
+        "before = $(pwd)\nout = $(fork { puts inside\ncd /\n })\n\
+         after = $(pwd)\nmoved = $before != $after\n\
+         puts \"captured [$out]\"\nputs \"moved $moved\"\n",
     );
     let printed = String::from_utf8_lossy(&out.stdout);
     assert!(

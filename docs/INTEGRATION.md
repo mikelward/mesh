@@ -196,7 +196,7 @@ atuin is two features that arrive together, and they land very differently.
 global _atuin_id = ""
 
 func atuin-start(cmd) {
-  global _atuin_id = "$(atuin history start -- $cmd)"
+  global _atuin_id = $(atuin history start -- $cmd)
 }
 
 func atuin-end(cmd, status, elapsed) {
@@ -256,10 +256,10 @@ parts that are a keybinding do not.
 
 ```mesh
 func fcd() {                                   # Alt-C, as a command
-  if dir = "$(fd --type d | fzf)" { cd $dir }
+  if dir = $(fd --type d | fzf) { cd $dir }
 }
 func fv() {                                    # Ctrl-T, as a command
-  if file = "$(fzf)" { vim $file }
+  if file = $(fzf) { vim $file }
 }
 ```
 
@@ -267,8 +267,8 @@ Full-screen handoff works, so fzf draws and restores correctly. A canceled fzf
 exits nonzero (130) having printed nothing, so the selection is **guarded on the
 status**: [a capture hands back its output whatever the command
 exited with](REFERENCE.md#command-substitution--), so an unguarded
-`cd "$(fd --type d | fzf)"` would run `cd ""` on a cancel and report a path error
-for a path the user never asked for. `if dir = "$(…)"` binds the selection and
+`cd $(fd --type d | fzf)` would run `cd ""` on a cancel and report a path error
+for a path the user never asked for. `if dir = $(…)` binds the selection and
 branches on fzf's status in one line, which is the same shape bash's
 `if dir=$(…); then` has.
 
@@ -333,8 +333,8 @@ always win.
 **Half works today.** The query half is a function:
 
 ```mesh
-func z(...args) { cd "$(zoxide query -- ...$args)" }
-func zi() { cd "$(zoxide query -i)" }      # the fzf picker; full-screen handoff is fine
+func z(...args) { cd $(zoxide query -- ...$args) }
+func zi() { cd $(zoxide query -i) }        # the fzf picker; full-screen handoff is fine
 ```
 
 A no-match exits nonzero, so the capture aborts the statement and `cd` does not
@@ -413,11 +413,10 @@ if json = "$(direnv export json)" {
 `env-apply` is one builtin that parses the payload, splits it, validates the whole
 thing, and only then touches the environment.
 
-**The quotes are load-bearing too.** A bare `$(cmd)` is a newline-split **list**;
-`"$(cmd)"` is the one-string form
-([Command substitution](REFERENCE.md#command-substitution--)), and a JSON payload
-is one string. Quoting also preserves the producer's status, since an assignment
-takes it from a quoted right-hand side
+**The quotes are not load-bearing here.** A capture is one string either way
+([Command substitution](REFERENCE.md#command-substitution--)); they are kept
+because the payload is bound and passed as a single argument. The assignment
+preserves the producer's status, since it takes it from its right-hand side
 just as readily.
 
 **The binding is load-bearing, not style.** Passing the capture straight in —
@@ -454,7 +453,7 @@ which keys take a write and which take an `unset`. If no mesh map can hold the
 null, that split cannot happen in mesh code — so it happens before any mesh value
 exists. The alternative, a reader handing back both halves for mesh to apply,
 was rejected on two counts: it needs a value-function call, since
-`[sets removes] = $(cmd)` does not bind — a capture is a list of *lines*
+`[sets removes] = $(cmd)` does not bind — a capture is **one string**
 ([Command substitution](REFERENCE.md#command-substitution--)), not a pair to
 destructure — and more decisively **it is not a transaction**, since a second loop
 failing partway leaves the environment half applied, which is the exact failure
@@ -473,7 +472,7 @@ decision, driven by carapace and atuin, where refusing one is defensible.
 | Tool | Status |
 | --- | --- |
 | ripgrep, fd, bat, eza, delta, jq, difftastic | **Nothing to do.** Plain commands, and their flags complete from their own man page or `--help` |
-| broot (`br`) | **Works today.** It writes a command to a file for the shell to run, and `source` takes a file: `func br(...args) { f = "$(mktemp)"; broot --outcmd $f ...$args; source $f }` |
+| broot (`br`) | **Works today.** It writes a command to a file for the shell to run, and `source` takes a file: `func br(...args) { f = $(mktemp); broot --outcmd $f ...$args; source $f }` |
 | tmux, shpool | Session management is [on the roadmap](../ROADMAP.md); no external integration needed beyond it |
 | iTerm2 / VS Code / WezTerm shell integration | **Already shipped** — `OSC 133`, `OSC 633`, `OSC 7`, titles, and hyperlinks |
 | thefuck, mcfly | Class 5 — same keybinding and buffer gap as atuin |

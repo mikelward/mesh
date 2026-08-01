@@ -15,7 +15,7 @@ The emphasis is interactive use, but fixing the two things that make today's
 interactive shells worse than they need to be:
 
 - **Safer word expansion.** A bare `$x` never word-splits on whitespace or
-  silently glob-expands. The default capture splits on newlines and lists stay
+  silently glob-expands. A capture is one string until a split is spelled, and lists stay
   whole (see [Command substitution](#command-substitution) /
   [Spread](#spread--flattening)) — the footgun is opt-*in*, spelled `...`, not
   opt-out via quoting.
@@ -123,40 +123,40 @@ Everything below is **decided** unless marked *(open)*.
 
 ### Command substitution
 
-A command substitution **captures the command's raw output bytes.** What you get
-back depends on the split that is applied to that capture:
+A command substitution **captures the command's raw output bytes** and becomes
+**one string**, trailing newlines trimmed:
 
 ```
-$(cmd)          # default: split raw bytes on newlines, trim trailing blank -> list
-"$(cmd)"        # one string (trailing newline trimmed)
-$(cmd):nulls    # split the raw bytes on NUL -> list  (newline-safe)
+$(cmd)          # the output, trailing newlines trimmed -> one string
+"$(cmd)"        # the same string; quoting a capture changes nothing
+$(cmd):lines    # split on newlines -> list      (alias :ls)
+$(cmd):nulls    # split on NUL *only* -> list    (alias :ns; find -print0, newline-safe)
 $(cmd):raw      # the raw bytes, unsplit, trailing newline intact
 ```
 
-Newline-splitting is the **default** because it is the dominant Unix convention
-(`ls`, `find`, `grep`, `ps`) and never breaks on spaces in filenames — the
-classic word-splitting footgun. But it is only the default: a split modifier
-**replaces** it and runs against the raw capture (see [Modifiers](#modifiers)),
-so the default split never destroys bytes that an explicit splitter needs. In
-particular, splitting is applied *once*, not layered on top of the newline
-split — `:nulls` splits on NUL and **nothing else**, seeing the raw output (so
-`find -print0` filenames containing newlines survive intact rather than being
-torn in half by a newline split that already ran), and `:raw` keeps the trailing
-newline the default would trim.
+**Nothing splits implicitly, captures included.** That is the same promise that
+makes a bare `$x` safe, applied at the same boundary, and it is what keeps the
+shape a caller wanted readable from the line rather than inferred from what the
+command happened to print. It also keeps the common capture — a path, a hostname,
+a branch name — free of ceremony: `cd $(git rev-parse --show-toplevel)` is a
+string reaching argv like any other.
 
-**A no-split default was considered and rejected.** The tally in this repo's own
-docs leans scalar — `$(pwd)`, `$(hostname)`, `$(id -un)`,
-`$(git branch --show-current)` outnumber the list-wanting uses several times
-over — and a list default does tax that case: a one-element list neither
-interpolates into `"…"` nor compares equal to the string it holds, so
-`p = $(pwd)` is a cliff rather than a nudge. The cost is accepted because the
-scalar escape is **quoting** — `"$(cmd)"`, two characters, a spelling shell users
-already reach for — whereas the opposite default puts the burden on
-`for line in $(…)`, which is the case that goes silently *wrong* rather than
-loudly awkward when it gets the other shape. That asymmetry, not the raw
-frequency, is what decides it. It is also why this is not fish's
-`| string collect` (see [Footguns we avoid](#fish)): the escape there is a
-pipeline, here it is a quote.
+**A newline-split default was considered and rejected.** It is the dominant Unix
+convention and it makes `for line in $(cmd)` correct with no modifier, which is a
+real pull. Two things decided against it. First, it taxes the common case: scalar
+captures outnumber list-wanting ones several times over in this repo's own docs,
+and a list neither interpolates into `"…"` nor reaches an external command
+un-spread, so `cd $(…)` and `"$(…)"` would both need ceremony. Second, and
+decisively, the loop that motivated it is **no longer the silent failure it was**:
+a `for` over a value that is not a list is [refused](#loops-for-while-loop) and
+names `:lines`. Once the quiet wrong answer is loud, the argument for an implicit
+split is only ergonomic — and it is outweighed by the ergonomics of the case that
+is actually more common.
+
+*(Splitting a capture is therefore always explicit. A split modifier still binds
+the **raw** bytes rather than the trimmed value, so `:nulls` sees NULs and nothing
+else and a `find -print0` name holding a newline survives; see
+[Modifiers](#modifiers).)*
 
 ### Modifiers
 
@@ -168,7 +168,7 @@ There are four kinds of modifier, and the difference matters:
 
 - **Split modifiers** (`:lines :words :nulls :tabs :split`) turn a command
   substitution's **raw byte capture** into a list. They *replace* the default
-  newline split and run against the raw bytes — they never run *after* it. Each
+  capture's trim and run against the raw bytes — they never run *after* it. Each
   applies to a `$(…)` capture, producing the list. They apply equally to a
   **plain string value** (`$line:split(":")`, `gets():words`) — there the string's
   own bytes are the input and there is no default split to override; the `$(…)`
@@ -237,7 +237,7 @@ All four kinds:
   any `a:b` construction — is unaffected.
 
 **Split modifiers** (choose the separator). These bind to a substitution's raw
-byte capture and replace the default newline split:
+byte capture, replacing the trim that a bare capture would have applied:
 
 ```
 $(cmd):lines        # split raw bytes on newlines (explicit form of the default)
@@ -261,9 +261,9 @@ never yields empty elements (the classic IFS word-split). `:raw` does not split
 at all (it is the [no-split capture member](#modifiers), one byte-string).
 
 *(Implementation status.* The whole family is built: `:split(SEP)`, `:words`,
-`:lines`, `:nulls`, `:tabs` and `:raw`, along with the raw-capture binding that
-makes them replace a capture's default rather than run after it, and the default
-newline split itself.
+`:lines`, `:nulls`, `:tabs` and `:raw` — the fixed-separator members carrying the
+aliases `:ls`, `:ws`, `:ns`, `:ts` — along with the raw-capture binding that makes
+them bind the bytes rather than the trimmed value.
 
 They refuse a **list** subject rather than mapping element-wise, since a split
 consumes one string; `$lines:map(:words)` is how a list of lines is taken apart.
@@ -3924,7 +3924,7 @@ as-is, familiar.
 reusing syntax already defined:
 
 ```
-for line in $(git status --porcelain) {   # a capture: splits on newlines — safe
+for line in $(git status --porcelain):lines {   # the split is spelled — safe
   …
 }
 for host, addr in $known_hosts {           # a map yields key, value pairs
