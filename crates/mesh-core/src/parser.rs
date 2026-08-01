@@ -283,6 +283,9 @@ pub enum ParseErrorKind {
     ChainedComparison,
     Expected(&'static str),
     ReservedParameter(String),
+    /// `_ = value` — the discard used as a place. It is a *pattern element*, so it
+    /// has a position to discard only inside one.
+    DiscardAssignment,
     /// A quoted command after `alias NAME =` — `alias ll = 'ls -l'`. bash needs
     /// the quotes because its alias body is a *string*; mesh's is real syntax,
     /// so they turn the command into one word naming no program.
@@ -424,6 +427,12 @@ impl std::fmt::Display for ParseError {
                 f,
                 "syntax error: a value argument cannot have text attached; separate it \
                  with a space, or quote the whole word — `\"pre$(…)post\"`"
+            ),
+            ParseErrorKind::DiscardAssignment => write!(
+                f,
+                "syntax error: `_` discards a position and binds nothing, so there is \
+                 nothing to assign to; name it, or drop the `_ =` to run the value for \
+                 its effect"
             ),
             ParseErrorKind::QuotedAliasCommand(text) => write!(
                 f,
@@ -2767,6 +2776,13 @@ impl Parser<'_> {
             }
             self.position = assignment_start;
         }
+        // `_ = …`. The probe below cannot see it — `word_text_at` answers only for a
+        // *name*, and `_` deliberately is not one — so without this it falls past
+        // every assignment path to `command not found: _`, which says nothing about
+        // the rule it broke.
+        if self.word("_") && self.assignment_follows(1) {
+            return Err(self.error(ParseErrorKind::DiscardAssignment));
+        }
         if !self.word("not") && (self.word_text_at(0).is_some() || self.same(&TokenKind::LBracket))
         {
             if let Ok(pattern) = self.binding_pattern()
@@ -4333,6 +4349,11 @@ impl Parser<'_> {
         // `not` never opens a binding, since it is reserved — see `value_start`. Left
         // out, `if not = 5` would bind a variable whose name can never be spoken in
         // command position again, the way `func = 5` and `return = 6` already refuse to.
+        // As in statement position: `if _ = f() { … }` is the discard used as a
+        // place, and reaches no probe below.
+        if self.word("_") && self.assignment_follows(1) {
+            return Err(self.error(ParseErrorKind::DiscardAssignment));
+        }
         if !self.word("not") && (self.word_text_at(0).is_some() || self.same(&TokenKind::LBracket))
         {
             if let Ok(pattern) = self.binding_pattern()
@@ -5865,6 +5886,14 @@ impl Parser<'_> {
             return Err(self.error(ParseErrorKind::Expected(
                 "`=` or `unset` after `global`; it governs an assignment, not a command",
             )));
+        }
+        // `global _ = …`. Refused for the same reason as the bare spelling, and it
+        // reached here rather than being caught alongside it because this path asks
+        // `binding_pattern` directly — which answers `Ignore`, and an `Ignore`
+        // assignment then bound nothing and said nothing. A whole-pattern discard is
+        // the degenerate case; `global [_ x] = …` is still a discarded *position*.
+        if matches!(pattern, BindingPattern::Ignore) {
+            return Err(self.error(ParseErrorKind::DiscardAssignment));
         }
         let append = self.eat(&TokenKind::PlusEqual).is_some();
         if !append {

@@ -12102,6 +12102,46 @@ fn every_rule_about_a_definitions_name_reports_the_same_way() {
 }
 
 #[test]
+fn the_discard_is_a_pattern_element_not_a_place() {
+    // `_` discards a *position* (`DESIGN.md`: it "stays the discard"), so it has
+    // one to discard only inside a pattern. Assigning to it on its own said two
+    // different things and neither named the rule: the bare spelling fell past
+    // every assignment path to `command not found: _`, because those paths ask for
+    // a *name* and `_` deliberately is not one, while `global _ = 1` reached
+    // `binding_pattern`, bound nothing, and reported success.
+    for attempt in [
+        "_ = 1",
+        "_ += 1",
+        "global _ = 1",
+        "global _ += 1",
+        "if _ = 1 { puts x }",
+    ] {
+        let out = run_with_input(&format!("{attempt}\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("`_` discards a position and binds nothing"),
+            "{attempt}: {stderr}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).is_empty(),
+            "{attempt} should not have run"
+        );
+    }
+
+    // A discarded position is untouched — that is what `_` is for — and so is a
+    // name that merely starts with one.
+    let ok = run_with_input(
+        "[_ x] = [1 2]\nputs $x\n\
+         global [_ y] = [3 4]\nputs $y\n\
+         match 1 { _ => { puts arm } }\n\
+         for _ in [5] { puts loop }\n\
+         _keep = 6\nputs $_keep\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&ok.stdout), "2\n4\narm\nloop\n6\n");
+    assert!(ok.stderr.is_empty(), "{:?}", ok.stderr);
+}
+
+#[test]
 fn a_quoted_definition_name_is_a_syntax_error_in_both_spellings() {
     // A string is not a name, which is a rule about a name being a name rather
     // than about which names are taken — so unlike the others it stays a *parse*

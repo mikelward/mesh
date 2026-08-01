@@ -1660,8 +1660,11 @@ name=value            # unspaced form
 ```
 
 A name starts with a letter or `_`, then letters, digits, `_`, and interior `-` (a
-hyphen must sit between two name characters). A bare `_` is not a name. At top
-level, bindings are session-global.
+hyphen must sit between two name characters). A bare `_` is not a name: it is the
+**discard**, which discards a *position* inside a pattern, so `_ = 1` and
+`global _ = 1` are refused — there is no position there to discard, and nothing
+to assign to. Write a name, or write the value on its own to run it for its
+effect. At top level, bindings are session-global.
 
 ### Scope: `global` and `unset`
 
