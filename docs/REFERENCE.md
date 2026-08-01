@@ -2599,6 +2599,28 @@ changing any bindings:
 if [head ...tail] = $items { puts $head ...$tail }
 ```
 
+An **assignment condition over a value** asks whether there *is* one, not
+whether it is true: only `false` is absent, so `""`, `[]` and `0` all bind and
+take the branch. That is what lets a function answer `false` for "found
+nothing" and be tested for it where bash would test a status — and what ends a
+`while` that binds its sentinel:
+
+```mesh
+func find-up(_name) { … }              # a path, or `false` on a miss
+if path = find-up(Makefile) {
+  puts "found $path"
+} else {
+  puts "none above here"
+}
+
+while line = next-line() { puts $line }   # ends when `next-line` answers false
+```
+
+An absent value binds nothing, so the `else` reads whatever the name held
+before — the same rule a list-pattern mismatch and a `gets` at end of input
+already follow. A **capture** right-hand side is unaffected: `if out = $(cmd)`
+still branches on the command's status, with the output bound either way.
+
 A **command** condition is a command that ran, so the body it selects reads its
 status — the code, not just the fact that it failed:
 

@@ -15872,6 +15872,155 @@ fn if_binding_a_capture_branches_on_the_status_with_the_output_bound() {
 }
 
 #[test]
+fn an_assignment_condition_over_a_value_tests_presence_not_truth() {
+    // `DESIGN.md` §"Empty `\"\"` / `[]` truthiness": the assignment-condition RHS
+    // "tests *presence* rather than truth … only `false` is absent, so `\"\"`,
+    // `[]` and `0` all bind and take the branch." Every row is the same `if`, so
+    // the table is the rule: one absent value, and everything else a result.
+    for (rhs, expected) in [
+        ("false", "absent"),
+        ("true", "present"),
+        ("\"\"", "present"),
+        ("0", "present"),
+        ("[]", "present"),
+        ("\"text\"", "present"),
+        ("42", "present"),
+    ] {
+        let out = run_with_input(&format!(
+            "if x = {rhs} {{ puts present }} else {{ puts absent }}\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{expected}\n"),
+            "`if x = {rhs}` should be {expected}"
+        );
+        assert!(out.stderr.is_empty(), "{rhs}: {:?}", out.stderr);
+    }
+}
+
+#[test]
+fn an_absent_assignment_condition_leaves_the_name_as_it_was() {
+    // The rule its two neighbors already state: a list-pattern mismatch "selects
+    // `else` without changing any bindings", and `gets` at end of input leaves
+    // `var` unchanged. So the `else` reads what the name held, never the
+    // sentinel that ended the test.
+    let out = run_with_input("x = kept\nif x = false { puts then } else { puts \"else=[$x]\" }\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "else=[kept]\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_function_answering_false_ends_a_while_that_binds_it() {
+    // The shape `DESIGN.md` pins the contract on. Reporting the *assignment's*
+    // status made every such condition true, so the loop ran one pass past the
+    // end, bound the sentinel, and then tripped over it comparing `false` to an
+    // integer.
+    let out = run_with_input(
+        "func nxt(_n) { if $_n < 3 { $_n + 1 } else { false } }\n\
+         n = 0\n\
+         while n = nxt($n) { puts \"n=$n\" }\n\
+         puts \"done n=$n\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "n=1\nn=2\nn=3\ndone n=3\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_value_function_answering_false_is_testable_where_bash_tests_a_status() {
+    // Rough edge 25's motivating idiom, `find_up x && …`. Both spellings reach
+    // the same answer: the binding condition, and the status `false` carries.
+    let script = "func find-up(_n) { if $_n == \"yes\" { \"/found\" } else { false } }\n";
+
+    let bound = run_with_input(&format!(
+        "{script}\
+         if x = find-up(yes) {{ puts \"hit=$x\" }} else {{ puts miss }}\n\
+         if x = find-up(no) {{ puts \"hit=$x\" }} else {{ puts miss }}\n"
+    ));
+    assert_eq!(String::from_utf8_lossy(&bound.stdout), "hit=/found\nmiss\n");
+
+    let chained = run_with_input(&format!(
+        "{script}\
+         find-up(yes) && puts yes-branch\n\
+         find-up(no) && puts no-branch\n"
+    ));
+    assert_eq!(String::from_utf8_lossy(&chained.stdout), "yes-branch\n");
+}
+
+#[test]
+fn a_reserved_binding_target_is_refused_whatever_the_value_turns_out_to_be() {
+    // Whether a name *may* be bound is a property of the pattern, so it cannot
+    // depend on what the right-hand side evaluated to. Both arms that answer
+    // early — absent, and a list-pattern mismatch — used to skip the validation
+    // that only ran on the way to committing a binding, so the same line was an
+    // error or a silent `else` according to runtime data. Raised in review.
+    for source in [
+        "if env = true { puts then } else { puts else }",
+        "if env = false { puts then } else { puts else }",
+        "if [env] = [1] { puts then } else { puts else }",
+        "if [env] = \"notalist\" { puts then } else { puts else }",
+    ] {
+        let out = run_with_input(&format!("{source}\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("`env` is a reserved name"),
+            "{source} should report the reserved name, got {:?} / {:?}",
+            out.stdout,
+            out.stderr
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).is_empty(),
+            "{source} should select no branch"
+        );
+    }
+}
+
+#[test]
+fn not_negates_a_presence_test_inside_a_while() {
+    // A `while` starts each test with `Produced::Nothing`, and the presence-test
+    // arm answers before the funnel that maintains it. Judging "did the operand
+    // run" from that stale field read a completed test as a guard-skipped one and
+    // handed the status back unnegated, so the loop never entered. The shape says
+    // otherwise — a presence test always runs. Raised in review.
+    let enters = run_with_input(
+        "i = 0\n\
+         while not x = false { i = $i + 1 ; if $i > 2 { break } ; puts \"pass $i\" }\n\
+         puts \"done i=$i\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&enters.stdout),
+        "pass 1\npass 2\ndone i=3\n"
+    );
+
+    // And the negation still has to hold in the other direction: a present value
+    // negates to false, so this one must not enter at all.
+    let skips = run_with_input(
+        "i = 0\n\
+         while not x = \"v\" { i = $i + 1 ; if $i > 2 { break } ; puts \"pass $i\" }\n\
+         puts \"done i=$i\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&skips.stdout), "done i=0\n");
+
+    // The same test outside a loop, where `produced` happened to be set, worked
+    // before the fix and must keep working.
+    let absent = run_with_input("if not x = false { puts then } else { puts else }\n");
+    assert_eq!(String::from_utf8_lossy(&absent.stdout), "then\n");
+    let present = run_with_input("if not x = true { puts then } else { puts else }\n");
+    assert_eq!(String::from_utf8_lossy(&present.stdout), "else\n");
+}
+
+#[test]
+fn a_plain_value_assignment_still_reports_its_own_status() {
+    // The presence test belongs to the *condition*, not to assignment. A
+    // statement still reports that the binding worked, so `x = false` is 0 and a
+    // following `&&` is not silently skipped.
+    let out = run_with_input("x = false\nst = $sh.status\nputs \"st=$st x=$x\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "st=0 x=false\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
 fn text_after_a_capture_does_not_displace_its_status() {
     // Trailing text and variables run nothing, so they cannot take the status from
     // the capture before them — `x = "$(sh -c 'exit 4')suffix"` is 4 in bash and
