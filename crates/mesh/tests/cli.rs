@@ -16433,17 +16433,58 @@ fn a_capture_that_returns_still_unwinds_rather_than_yielding() {
 }
 
 #[test]
-fn split_operates_on_the_trimmed_capture_value() {
-    // `:split` is a value modifier for now: a `$(…)` capture has its trailing
-    // newline trimmed before the split runs, so the newline is not a field. Raw
-    // split-modifier binding (DESIGN.md) is what `:raw` is waiting on.
-    let out = run_with_input("x = $(printf \"a:\\n\"):split(\":\")\nputs $x:len\nputs ...$x\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\na\n");
+fn a_split_modifier_binds_the_captures_raw_bytes() {
+    // `DESIGN.md` §"Command substitution": a split modifier *replaces* a capture's
+    // default handling rather than running after it, so it sees the bytes the
+    // command wrote. The trailing newline is therefore still there to be split on
+    // — this same line answered `[a]` while `:split` was a plain value modifier.
+    let out = run_with_input("x = $(printf \"a:\\n\"):split(\":\")\nputs $x:len\nputs $x:repr\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n['a', '\\n']\n");
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn only_a_modifier_written_on_the_capture_itself_binds_raw() {
+    // Raw binding is a property of `$(cmd):mod`, not of the bytes. Once they are in
+    // a variable they are an ordinary string that the default already trimmed, so
+    // `$x:split` splits *that* — otherwise the rule would depend on where a value
+    // had been, which is not readable from the line.
+    let out = run_with_input("x = $(printf \"a:\\n\")\nputs $x:split(\":\"):len\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn raw_is_the_no_split_member_and_keeps_the_trailing_newline() {
+    // `:raw` is what the default's trim exists to be escaped from, and the only
+    // member of the family that hands back one string rather than a list.
+    let out = run_with_input("x = $(printf \"a\\nb\\n\"):raw\nputs $x:repr\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "'a\\nb\\n'\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Argument-free like the rest of the family, and it says so. `:raw` answers
+    // without consulting the modifier tables, so an argument list would otherwise
+    // be accepted and never evaluated — `:raw(unknown())` quietly yielding the
+    // bytes. Raised in review.
+    let arity = run_with_input("puts $(printf hi):raw(unknown())\n");
+    assert!(
+        String::from_utf8_lossy(&arity.stderr).contains("modifier :raw does not take arguments"),
+        "{}",
+        String::from_utf8_lossy(&arity.stderr)
+    );
+    assert!(!arity.status.success());
 }
 
 #[test]
