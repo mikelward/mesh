@@ -3062,8 +3062,14 @@ thing a reader takes on trust.*
 
       **Open before building.**
 
-      - What does `--tag=v2` bind — a flag carrying a value, or a flag and a
-        value? `--tag=$w` must still take its value from `$w`.
+      - ~~What does `--tag=v2` bind?~~ **Decided: a flag carries an optional
+        value.** `x = --force` and `x = --tag=v2` are one type in two states, so
+        the interesting case — an option *with* its value, held in a variable — is
+        covered. The consequence, accepted knowingly: the value is captured at
+        **assignment**, so `w = alpha; x = --tag=$w; w = beta; f $x` binds
+        `alpha`. That is what `g = *.md` already does with its matches, and the
+        alternative — a flag holding an unevaluated value resolved at the call —
+        was rejected as a closure in disguise, which mesh has nothing else like.
       - How does a flag render at the **argv boundary**? `curl $x` has to send
         `--help` as bytes, so it needs a text form, unlike a job handle.
       - What do `:type` and `:repr` answer, and does `$x == "--help"` hold?
