@@ -16714,6 +16714,33 @@ fn quoting_a_capture_changes_nothing() {
 }
 
 #[test]
+fn an_alias_binds_a_captures_raw_bytes_exactly_as_its_long_name_does() {
+    // An alias must be the same modifier, not a lookalike. `is_capture_split` kept
+    // its own list of the family's names, so a capture written with the long name
+    // bound the raw bytes while the alias fell through to the value path and got
+    // the trimmed ones — `:nulls` kept a trailing newline inside the last field and
+    // `:ns` silently dropped it. Raised in review as a P1.
+    let dir = fresh_dir("alias_binds_raw");
+    let payload = dir.join("names");
+    std::fs::write(&payload, "a\0b\n").expect("NUL-separated, trailing newline");
+    let out = run_with_input(&format!(
+        "puts $(cat {p}):nulls:repr\nputs $(cat {p}):ns:repr\n\
+         puts $(printf \"x\\ny\\n\"):lines:repr\nputs $(printf \"x\\ny\\n\"):ls:repr\n",
+        p = payload.display()
+    ));
+    let printed = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = printed.lines().collect();
+    assert_eq!(lines.len(), 4, "{printed}");
+    assert_eq!(lines[0], lines[1], "`:nulls` and `:ns` disagree: {printed}");
+    assert_eq!(lines[2], lines[3], "`:lines` and `:ls` disagree: {printed}");
+    // And the shared answer is the *raw* one — the trailing newline is inside the
+    // last field, which is what a trimmed subject would have lost.
+    assert_eq!(lines[0], "['a', 'b\\n']", "{printed}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_pattern_glob_refuses_is_a_literal_string_not_a_list() {
     // `a[` has glob syntax but is not a valid pattern, so expansion falls back to
     // the literal text. The glob-is-a-list rule must agree: a second predicate that

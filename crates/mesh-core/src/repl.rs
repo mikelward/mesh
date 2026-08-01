@@ -5927,13 +5927,29 @@ fn capture_split_modifier(
     }
 }
 
-/// Does `name` bind a capture's raw bytes rather than its default value?
+/// Does `name` bind a capture's raw bytes rather than its trimmed value?
 ///
 /// The split family plus `:raw`, per `DESIGN.md` §"Modifiers". Nothing else does:
 /// `$(pwd):dir` is a *value* modifier and asks its question of the capture's value,
 /// trailing newline already gone.
+///
+/// The family is asked for **through `Modifier::from_name`** rather than listed
+/// again here, so an alias cannot mean one thing to the modifier table and another
+/// to this decision — which is exactly what a second list did: `$(cmd):nulls`
+/// bound the raw bytes while `$(cmd):ns` silently took the trimmed ones.
 fn is_capture_split(name: &str) -> bool {
-    matches!(name, "raw" | "lines" | "nulls" | "tabs" | "words" | "split")
+    // `:raw` and `:split` have no `Modifier` — the first is answered by the capture
+    // path itself, the second takes an argument — so they are named directly.
+    matches!(name, "raw" | "split")
+        || matches!(
+            expand::Modifier::from_name(name),
+            Some(
+                expand::Modifier::Lines
+                    | expand::Modifier::Nulls
+                    | expand::Modifier::Tabs
+                    | expand::Modifier::Words
+            )
+        )
 }
 
 fn eval_if_expr(
