@@ -412,36 +412,39 @@ mesh$ <strong>puts $env.HOME</strong>
 
 ## Capturing a command's output
 
-`$(command)` is the command's standard output as a value. By default it is
-**split on newlines** into a list, which is what makes a line loop safe — spaces
-in a filename cannot break it, because nothing splits on spaces:
+`$(command)` is the command's standard output as a value — **one string**, with
+trailing newlines trimmed:
 
 <pre>
-mesh$ <strong>for line in $(git status --porcelain) { puts "[$line]" }</strong>
-[ M DESIGN.md]
-[?? notes.txt]
-</pre>
-
-**Quote it when you want one string.** Inside `"…"` the split does not run, so a
-quoted capture is its text and glues to whatever is beside it:
-
-<pre>
-mesh$ <strong>here = "$(pwd)"</strong>
+mesh$ <strong>here = $(pwd)</strong>
 mesh$ <strong>puts "at $here"</strong>
 at /home/you
 mesh$ <strong>puts "$(id -un)@$(hostname)"</strong>
 you@laptop
 </pre>
 
-The quotes are doing real work: unquoted, `$(pwd)` is a one-element *list*, and a
-list has no text form to interpolate and no argv form to hand an external command
-— `/bin/echo $(pwd)` says so and names the fix. Reach for `"$(cmd)"` whenever the
-answer is one value, and leave it bare when you want the lines.
+Nothing splits on its own — that is the promise mesh keeps that bash does not —
+so when you want the lines you say so:
+
+<pre>
+mesh$ <strong>for line in $(git status --porcelain):lines { puts "[$line]" }</strong>
+[ M DESIGN.md]
+[?? notes.txt]
+</pre>
+
+`:ls` is the short spelling, and `:nulls` (`:ns`) is the one for `find -print0`,
+splitting on NUL only so a newline inside a filename survives. Forget the
+modifier and the loop tells you: a `for` over something that is not a list is
+refused, and names the fix.
+
+Quoting a capture changes nothing here — `$(pwd)` and `"$(pwd)"` are the same
+string. Quote it to glue it to other text in a word, not to defend against
+splitting, which is the habit bash teaches.
 
 What comes back is literal — never re-split on spaces, never re-globbed — and a
 capture whose command fails still hands back what it printed, since a nonzero exit
 is often the answer rather than an error (`diff` says 1 when files differ). Bind
-it with `if out = "$(cmd)" { … } else { … }` when you care which it was.
+it with `if out = $(cmd) { … } else { … }` when you care which it was.
 
 ## Writing the environment
 

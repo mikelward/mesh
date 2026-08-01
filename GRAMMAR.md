@@ -195,10 +195,9 @@ A **variable** interpolates in bare text and in `"…"`, never in `'…'` or
 `"at $(pwd) now"` and `"${greeting()}"` are word pieces, while a bare
 `pre$(puts x)post` is a syntax error rather than one word, and a bare
 `${$n + 1}` expects a variable name after the brace. Unquoted, a `$( … )` is a
-standalone `capture` in the expression grammar rather than part of a word. The
-two positions also differ in **what the capture yields** — quoted it is one
-string, unquoted it is the newline-split list — but that is evaluation, not
-grammar; see `DESIGN.md` §"Command substitution".
+standalone `capture` in the expression grammar rather than part of a word. Both
+positions yield the same value — one string — so the difference is purely
+grammatical; see `DESIGN.md` §"Command substitution".
 
 ### Names
 

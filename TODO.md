@@ -4441,6 +4441,16 @@ a one-line edit. Every claim below was checked against the built shell.
 
 ## Icebox / decide later
 
+- [ ] **`[…]` in command-argument position is not a list.** `f [a b]` reports
+      "expected 1 argument(s), got 2" — the brackets are two ordinary words there,
+      while the identical text in expression position (`x = [a b]`, `for x in
+      [a b]`) is a real list literal. So `puts [a [b c]]` prints the text back
+      rather than a nested list, and there is no way to hand a list literal
+      straight to a call. Found while checking whether `for x in [one]` works (it
+      does — `for`'s iterable is an expression). Decide whether command position
+      should parse a list literal, or whether the words reading is deliberate and
+      the diagnostic should say so.
+
 - [ ] **`$env.PATH` is one more argument for auto-flattening at the boundary.**
       Now that path-type entries are lists, `$env.PATH` needs `...` or a `:join`
       to reach an external command like any other list — consistent, and what
@@ -4539,40 +4549,43 @@ a one-line edit. Every claim below was checked against the built shell.
         bytes; once they are in a variable they are an ordinary string, so
         whether a line binds raw is readable from that line.
 
-      **Done, and the entry above is the state when it was written.** The default
-      is the newline split, `"$(cmd)"` is the one-string form, `$(cmd):raw` is the
-      one that also keeps the trailing newline, and the whole split family
-      (`:lines` `:nulls` `:tabs` `:words` `:split(SEP)` `:raw`) is built. The
-      accepted cost showed up exactly where the entry predicted: ~20 tests and a
-      dozen doc examples wanted a scalar and now write the quotes. One consequence
-      that was *not* predicted is the sub-item below.
-  - [ ] **`...` cannot be written on a capture, which is what the diagnostic
-        asks for.** `/bin/echo $(pwd)` reports ``a list needs `...` to become
-        command arguments``, and `...$(pwd)` is then a syntax error — there is no
+      **Done, then reversed — and the entry above is the state when it was
+      written.** The split family is built and stays: `:lines` `:nulls` `:tabs`
+      `:words` `:split(SEP)` `:raw`, with aliases `:ls` `:ws` `:ns` `:ts`, all
+      binding a capture's raw bytes. The **default** shipped as the newline split
+      and was then taken back out: a capture is one string, and a split is spelled.
+
+      What changed the answer was removing the premise. The split won on
+      *asymmetry* — wanting a scalar and getting a list is loud, wanting lines and
+      getting a blob is silent — and the silence was not really about captures. It
+      was `for` running a scalar once, which made any string look like it iterated.
+      Once a loop refuses a non-list and names `:lines`, both failures are loud,
+      the asymmetry is gone, and only frequency is left — and that argues the other
+      way, scalar captures outnumbering list-wanting ones several times over. The
+      split default also dragged the commonest shell line through the least
+      finished part of the language: `/bin/echo $(pwd)` erroring, `...$(pwd)` not
+      parsing, `[…]` not being a list in command position, no `:flat`.
+  - [x] **`...` cannot be written on a capture, which is what the diagnostic
+        asks for.** `/bin/echo $(pwd)` reported ``a list needs `...` to become
+        command arguments``, and `...$(pwd)` was then a syntax error — there is no
         spread of a value *expression* at the argv boundary, the same gap
-        `...$x:split(":")` hits (`parser.rs` says so in a comment). So the
-        message names a fix that does not parse. The working spellings are
-        `"$(pwd)"` when the answer is one value and `xs = $(pwd)` then
-        `...$xs` when it is not, but a reader hits the dead end first. Two ways
-        out: implement expression spreading at argv, or have the diagnostic name
-        the bind-then-spread form when the value came from a capture. The second
-        is the cheap one and does not foreclose the first. Note the same
-        diagnostic misleads a second way: `...` must be **attached**, so
-        `/bin/echo ... $xs` parses the `...` as an ordinary argument and then
-        reports that `$xs` needs a `...` — complaining about an operator that is
-        sitting right there in the source.
-  - [ ] **A multi-line capture cannot be quoted.** `"$( … )"` spanning a newline
-        is a syntax error — the `"…"` scanner stops at the end of the line, so
-        `x = "$(fork { puts a\n })"` reports ``unclosed `(` `` — while the same
-        capture unquoted parses fine. That was cosmetic while a bare capture was
-        already one string; now that quoting *is* the way to ask for a scalar, it
-        means the scalar form is unreachable by quoting for exactly the captures
-        that hold a block. `$( … ):raw` is the workaround and it is not
-        equivalent: it keeps the trailing newline the quoted form would trim, so
-        the honest spelling today is `:raw:trimend`, which trims more than the
-        default does. A multi-line `"…"` string is otherwise fine (`x = "a\nb"`
-        with a literal newline works), so this is the `$(` / `${` scanner inside a
-        string, not the string itself.
+        `...$x:split(":")` hits. So the message named a fix that does not parse.
+
+        **Moot for captures:** a capture is one string again, so `/bin/echo
+        $(pwd)` just works and this line is unreachable from here. The underlying
+        gap is real but now only reachable through a genuine list — where the
+        message is at least honest about the value's type. Two notes kept for
+        whoever picks it up: `...` must be **attached** (`... $xs` parses the
+        `...` as an ordinary argument and then complains that `$xs` needs one,
+        naming an operator visibly present in the source), and the two exits are
+        implementing expression spread at argv or having the message name the
+        bind-then-spread form.
+  - [x] **A multi-line capture cannot be quoted.** `"$( … )"` spanning a newline
+        is a syntax error — the `"…"` scanner stops at the end of the line — while
+        the same capture unquoted parses fine. **Moot:** quoting a capture no
+        longer changes its value, so nothing needs the quoted spelling. The parser
+        asymmetry survives and is cosmetic again.
+
 - [x] **Reserve only bare `_` as discard, allow `_name`.** Today a name must
       start with a letter, so a leading underscore is rejected wholesale (`_` and
       `_x` alike) — `_` is the discard pattern (`DESIGN.md`). Reconsider narrowing
