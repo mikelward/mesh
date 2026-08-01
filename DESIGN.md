@@ -4550,11 +4550,30 @@ flags — several must, since `kill -9`, `disown -a`, `prompt --reset` and
 none *of its own*, not that its `--help` is data. Two consequences, and they are the
 same for both kinds of command:
 
-- **A word that *is* `--help` asks for help, wherever it came from.** `x = --help;
-  puts $x` prints the usage, and so does `f $x` on a function. mesh's expansion
-  safety is about never *splitting* or *globbing* a value — it was never a promise to
-  launder a word that is a flag, and a shell in which `$x` could smuggle one past
-  option parsing would be the surprising one.
+- **A word that is *written* `--help` asks for help**, and here the two kinds of
+  command diverge — the one place they do. `x = --help; puts $x` prints the usage,
+  because a **builtin** takes argv like an external does and `curl $url` must pass
+  `--foo` if that is what `$url` holds. `f $x` on an in-shell **function** passes
+  data, because a `func` has a signature and what its options are is read from the
+  line that calls it, so `f $w` and `f($w)` mean the same thing.
+
+  The original reading here was that a word which *is* a flag asks to be one
+  wherever it came from, and that a shell letting `$x` smuggle one past option
+  parsing would be the surprising one. That holds on the argv side. It does not
+  hold for a `func`, where it made a call's meaning depend on what a variable
+  happened to contain — the same data-decides-the-call reading ruled out
+  everywhere else, and it left `f $w` and `f($w)` disagreeing about one word.
+  Expansion safety is unchanged either way: nothing here splits or globs a value;
+  what moved is *where* a word gets to be a flag.
+
+  **The builtin's position is a debt, not a decision.** A builtin is *not* a third
+  kind of command: it works the way a function and an external do, and any place
+  it does not is a bug until it has been argued for. It reads argv today only
+  because the call-site reading is not in reach where a builtin parses its
+  options, so `puts $x` still answers the usage. The end state is two rules with a
+  stated reason — mesh-owned commands read the call site, externals take what the
+  bytes say, since `curl $url` must pass `--foo` if that is what `$url` holds —
+  and a builtin belongs on the mesh-owned side. `TODO.md` carries the work.
 - **`--` ends the options and is consumed.** Who consumes it depends on who has
   options to end: a command **with** options owns its terminator, because only it
   knows where its options stop (`kill -- -9 %1` looks for a job named `-9`;

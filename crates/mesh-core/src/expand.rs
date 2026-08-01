@@ -403,43 +403,144 @@ pub fn expand(words: Vec<Word>, vars: &Vars) -> Result<Vec<String>, ExpandError>
 pub fn expand_values(words: Vec<Word>, vars: &Vars) -> Result<Vec<Value>, ExpandError> {
     Ok(expand_call_values(words, vars)?
         .into_iter()
-        .map(|(value, _)| value)
+        .map(|arg| arg.value)
         .collect())
 }
 
-/// Like [`expand_values`], but tags each value with whether it came from a single
-/// **bare literal** word — one unquoted, un-interpolated `Text` piece. The tag
-/// lets a function call type the attached value of `--flag=value` exactly as it
-/// would the same token passed positionally: a bare `--n=2` is the integer `2`,
-/// while a quoted (`--n="2"`) or interpolated (`--n=$s`) value keeps its expanded
-/// string type. Spread and whole-variable values are never bare.
-pub fn expand_call_values(
-    words: Vec<Word>,
-    vars: &Vars,
-) -> Result<Vec<(Value, bool)>, ExpandError> {
+/// One argument of an in-shell function call, with the two things the caller has
+/// to know about *how it was written* rather than what it evaluated to.
+#[derive(Debug, Clone)]
+pub struct CallArg {
+    pub value: Value,
+    /// Came from a single **bare literal** word — one unquoted, un-interpolated
+    /// `Text` piece. Lets a call type the attached value of `--flag=value` exactly
+    /// as it would the same token passed positionally: a bare `--n=2` is the
+    /// integer `2`, while a quoted (`--n="2"`) or interpolated (`--n=$s`) value
+    /// keeps its expanded string type. Spread and whole-variable values are never
+    /// bare.
+    pub bare: bool,
+    /// Was **written** as a dashed word at the call site, so a leading `--` is
+    /// option syntax rather than data.
+    ///
+    /// Read from the word, never from the value it produced. Asking the value
+    /// made what a call means depend on what a variable happened to hold —
+    /// `f $w` bound an option when `$w` held `--sleep=0`, so flag-shaped data
+    /// could not be passed at all, and the same word meant different things in
+    /// the two call spellings. A **spread** marks every element true: writing
+    /// `...` is the explicit "these are arguments, flags included" gesture, and
+    /// it is the channel a wrapper needs to forward flags it was handed.
+    pub written_dashed: bool,
+}
+
+impl CallArg {
+    /// A value with no word behind it — a hook's computed argument, or one the
+    /// shell synthesized. Nothing was written, so a leading `--` is data.
+    pub fn plain_value(value: Value) -> Self {
+        Self {
+            value,
+            bare: false,
+            written_dashed: false,
+        }
+    }
+
+    /// A value that stands for a literal token the reader wrote, used where the
+    /// word itself is no longer in reach (`return`/`fail` operands). `bare` so it
+    /// types like the token; not dashed, since these positions take no options.
+    pub fn written_value(value: Value) -> Self {
+        Self {
+            value,
+            bare: true,
+            written_dashed: false,
+        }
+    }
+}
+
+/// Like [`expand_values`], but keeps what each value's *word* said about itself —
+/// see [`CallArg`].
+pub fn expand_call_values(words: Vec<Word>, vars: &Vars) -> Result<Vec<CallArg>, ExpandError> {
     let mut out = Vec::new();
     for word in words {
+        let arg = |value, bare, written_dashed| CallArg {
+            value,
+            bare,
+            written_dashed,
+        };
         if let Some(vref) = spread_var(&word) {
-            out.extend(spread_values(vref, vars)?.into_iter().map(|v| (v, false)));
-        } else if let Some(value) = whole_value(&word, vars) {
-            out.push((value?, false));
-        } else if let Some(value) = scalar_literal(&word) {
-            out.push((value, true));
-        } else {
-            // A single unquoted, un-interpolated word with no glob metacharacters
-            // is a bare literal. A glob is not: even when it matches exactly one
-            // path the value came from filesystem expansion (like a positional
-            // glob), so it stays a string rather than being typed from its bytes.
-            let bare = matches!(
-                word.pieces.as_slice(),
-                [Piece::Text { text, expandable: true }] if !has_glob_meta(text)
+            out.extend(
+                spread_values(vref, vars)?
+                    .into_iter()
+                    .map(|v| arg(v, false, true)),
             );
-            let mut strings = Vec::new();
-            expand_word(word, vars, &mut strings)?;
-            out.extend(strings.into_iter().map(|s| (Value::String(s), bare)));
+        } else {
+            let written_dashed = word_written_dashed(&word);
+            if let Some(value) = whole_value(&word, vars) {
+                out.push(arg(value?, false, written_dashed));
+            } else if let Some(value) = scalar_literal(&word) {
+                out.push(arg(value, true, written_dashed));
+            } else {
+                // A single unquoted, un-interpolated word with no glob metacharacters
+                // is a bare literal. A glob is not: even when it matches exactly one
+                // path the value came from filesystem expansion (like a positional
+                // glob), so it stays a string rather than being typed from its bytes.
+                let bare = matches!(
+                    word.pieces.as_slice(),
+                    [Piece::Text { text, expandable: true }] if !has_glob_meta(text)
+                );
+                let mut strings = Vec::new();
+                expand_word(word, vars, &mut strings)?;
+                out.extend(
+                    strings
+                        .into_iter()
+                        .map(|s| arg(Value::String(s), bare, written_dashed)),
+                );
+            }
         }
     }
     Ok(out)
+}
+
+/// Was this word **written** as a dashed option — a `--name` the reader typed?
+///
+/// The command-position twin of `repl::starts_with_bare_dashes`, and it has to
+/// answer identically: the two spellings disagreeing about which words are options
+/// is the whole thing the call-site rule exists to stop. Asking only about the
+/// leading `--` — the shape that predicate had before review corrected it — let
+/// `f --$name` and `f --*` bind from runtime data in command position while
+/// `f(--$name)` and `f(--*)` were data, which is the inconsistency inverted rather
+/// than removed. Raised in review.
+///
+/// The line is the `=`. Everything up to and including it names the option and
+/// must be literal text; everything after is that option's value and may be
+/// composed freely, which is what keeps `--tag=$w` an option.
+///
+/// Three compositions are refused, each because something other than the written
+/// line would pick the option:
+///
+/// - **another piece** — `--$name`, `--"force"`: a first piece carrying no `=` has
+///   to be the *whole* word, which admits `--force` and the bare `--` terminator.
+/// - **a name that globs** — `--*`, `--?orce`: the filesystem chooses. Both halves
+///   are asked, as [`segments_glob`] and [`text_globs`] are asked in the value
+///   call: the whole word must reach the filesystem *and* the name must vary, so
+///   `--fo*=bad[` is literal text and stays an `unknown flag`.
+fn word_written_dashed(word: &Word) -> bool {
+    let Some(Piece::Text {
+        text,
+        expandable: true,
+    }) = word.pieces.first()
+    else {
+        return false;
+    };
+    let name = text.split_once('=').map_or(text.as_str(), |(name, _)| name);
+    let globs = word_globs(word)
+        && text_globs(name)
+        && matches!(
+            word.pieces.first(),
+            Some(Piece::Text {
+                expandable: true,
+                ..
+            })
+        );
+    text.starts_with("--") && !globs && (text.contains('=') || word.pieces.len() == 1)
 }
 
 fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> {

@@ -960,10 +960,28 @@ argument by hand, and repeating it walks back through earlier commands.
 
 Every command mesh owns — builtin or function — reads flags by one rule.
 
-**`--help` prints the generated help**, whether it was written or arrived in a
-variable: `x = --help; puts $x` prints the usage, and so does `f $x`. mesh's
-expansion safety is about never *splitting* or *globbing* a value; it was never a
-promise to launder a word that is a flag.
+**`--help` prints the generated help when it is *written*** — `puts --help` and
+`f --help`, and through a spread (`f ...$args`), which is the explicit "flags
+included" gesture.
+
+Arriving in a variable, it depends on what is being called, and the split is the
+argv boundary rather than an inconsistency:
+
+```mesh
+x = --help
+puts $x      # the usage — a builtin takes argv, like an external
+f $x         # data — an in-shell function reads its options from the call site
+```
+
+An in-shell `func` has a signature, so what its options are is decided by the
+line that calls it: `f $w` passes a value whatever `$w` holds, and `f($w)` agrees.
+A **builtin** still reads argv, which is why `puts $x` answers — that is a gap
+being closed rather than a rule, since a builtin is meant to work the way a
+function does. An **external** keeps the argv reading for good: its arguments are
+bytes, and `curl $url` must pass `--foo` if that is what `$url` holds.
+
+mesh's expansion safety was never a promise to launder a word that is a flag; what
+changed is *where* a word gets to be one.
 
 A builtin's `Options:` block lists **its own flags** alongside `--help`, read off
 the usage line rather than written twice — so `type --help` names `-t` and

@@ -1713,7 +1713,12 @@ fn run_executable(
                         .map(|v| eval_expr(v, last, in_function, shell))
                         .transpose()
                     {
-                        Ok(operand) => make_fail(operand.into_iter().map(|v| (v, true)).collect()),
+                        Ok(operand) => make_fail(
+                            operand
+                                .into_iter()
+                                .map(expand::CallArg::written_value)
+                                .collect(),
+                        ),
                         Err(step) => step,
                     }
                 }
@@ -6800,7 +6805,7 @@ enum StageBody {
     Builtin,
     /// A function, with its arguments already expanded as **typed values** — the
     /// same guarantee a plain call gives, so `f $xs` still passes one list.
-    Function(Vec<(Value, bool)>),
+    Function(Vec<expand::CallArg>),
     /// A stage whose words are **not expanded yet**, because one of them carries a
     /// value — `puts $(pwd) | cat`, `cmd f() &`.
     ///
@@ -7180,15 +7185,15 @@ enum Expanded {
     /// (`DESIGN.md` §"Arguments do not word-split").
     Function {
         name: String,
-        args: Vec<(Value, bool)>,
+        args: Vec<expand::CallArg>,
     },
     /// `return`, with its operand typed the way a function call's arguments are.
     /// Resolved here for the same reason a function is: argv would flatten a list
     /// or map on the way past, and a function's result is exactly where those have
     /// to survive (`DESIGN.md` §"Result and `return`").
-    Return(Vec<(Value, bool)>),
+    Return(Vec<expand::CallArg>),
     /// `fail`, whose operand is typed the same way `return`'s is.
-    Fail(Vec<(Value, bool)>),
+    Fail(Vec<expand::CallArg>),
     /// argv for a builtin or an external program.
     Argv(Vec<String>),
 }
@@ -7293,7 +7298,7 @@ fn stage_argument(
 
 /// Run an in-shell function call whose arguments are already expanded: generated
 /// `--help` first, then the call itself.
-fn dispatch_function_call(name: &str, args: Vec<(Value, bool)>, shell: &mut Shell) -> Step {
+fn dispatch_function_call(name: &str, args: Vec<expand::CallArg>, shell: &mut Shell) -> Step {
     // A `wrapper func` reads no flags at all: `--help` belongs to whatever it
     // forwards to, so answering it here would hide the callee's own help — the
     // whole point of `wrapper func g(...args) { command grep ...$args }` is that
@@ -7547,7 +7552,7 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     if words[0] == "return" || words[0] == "fail" {
         let args = words[1..]
             .iter()
-            .map(|word| (expand::typed_scalar(word), true))
+            .map(|word| expand::CallArg::written_value(expand::typed_scalar(word)))
             .collect();
         return if words[0] == "fail" {
             make_fail(args)
@@ -7696,11 +7701,19 @@ fn run_cd_hooks(event: HookEvent, path: &Path, shell: &mut Shell) {
     shell.in_cd_hooks = false;
 }
 
-fn auto_help_requested(args: &[(Value, bool)]) -> bool {
+/// Was `--help` **written** among these arguments?
+///
+/// Read from the call site, never from the value. Testing the runtime string made
+/// `x = --help` followed by `f $x` print the usage while `f($x)` passed the same
+/// value as data — the flag-shaped-data reading #351 removed from option scanning,
+/// left behind here. A spread still asks for help (`f ...$x`), since `...` is the
+/// "flags included" gesture.
+fn auto_help_requested(args: &[expand::CallArg]) -> bool {
     args.iter()
-        .map(|(arg, _)| arg)
-        .take_while(|arg| !matches!(arg, Value::String(value) if value == "--"))
-        .any(|arg| matches!(arg, Value::String(value) if value == "--help"))
+        .take_while(|arg| {
+            !(arg.written_dashed && matches!(&arg.value, Value::String(v) if v == "--"))
+        })
+        .any(|arg| arg.written_dashed && matches!(&arg.value, Value::String(v) if v == "--help"))
 }
 
 fn auto_help_requested_strings(args: &[String]) -> bool {
@@ -8386,7 +8399,7 @@ fn run_hooks(event: HookEvent, args: Vec<Value>, shell: &mut Shell) {
     // flag parsing is disabled and every value binds positionally. Without this a
     // command line of `--` or `--word` would be read as a terminator or flag and
     // a hook declared `func hook(cmd)` would fail with an arity/unknown-flag error.
-    let args: Vec<(Value, bool)> = args.into_iter().map(|value| (value, false)).collect();
+    let args: Vec<expand::CallArg> = args.into_iter().map(expand::CallArg::plain_value).collect();
     // A hook runs on the shell's schedule, not the user's, so what it runs must
     // not become `$sh.status` — the loop already discards the hook's own `Step`
     // for that reason, and a `preprompt` hook that merely prints would otherwise
@@ -8410,9 +8423,10 @@ fn run_hooks(event: HookEvent, args: Vec<Value>, shell: &mut Shell) {
 /// agree about what they carry, or `return` is a narrower channel than falling off
 /// the end. Quoting still separates `return 42` from `return "42"`, as everywhere
 /// else a value is typed from a word.
-fn make_return(args: Vec<(Value, bool)>, last: u8, shell: &Shell) -> Step {
+fn make_return(args: Vec<expand::CallArg>, last: u8, shell: &Shell) -> Step {
     match <[_; 1]>::try_from(args) {
-        Ok([(value, _)]) => {
+        Ok([arg]) => {
+            let value = arg.value;
             let code = status_of(&value);
             Step::Return(value, code)
         }
@@ -8437,9 +8451,9 @@ fn make_return(args: Vec<(Value, bool)>, last: u8, shell: &Shell) -> Step {
 ///
 /// `fail 0` is refused rather than silently succeeding: a `fail` that succeeds is
 /// always a mistake, and the spelling for "leave with success" is `return true`.
-fn make_fail(args: Vec<(Value, bool)>) -> Step {
+fn make_fail(args: Vec<expand::CallArg>) -> Step {
     let code = match <[_; 1]>::try_from(args) {
-        Ok([(value, _)]) => match &value {
+        Ok([arg]) => match &arg.value {
             Value::Integer(code) if (1..=255).contains(code) => {
                 u8::try_from(*code).expect("checked against the u8 range above")
             }
@@ -8467,7 +8481,12 @@ fn make_fail(args: Vec<(Value, bool)>) -> Step {
 /// the last command's status. A list argument counts as **one** positional (it
 /// arrives intact as a list value); a bad argument count or flag is a recoverable
 /// error.
-fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &mut Shell) -> Step {
+fn call_func(
+    name: &str,
+    args: Vec<expand::CallArg>,
+    flags_enabled: bool,
+    shell: &mut Shell,
+) -> Step {
     let (params, body) = match shell.funcs.get(name) {
         Some(def) => (def.params.clone(), def.body.clone()),
         None => {
@@ -8734,7 +8753,15 @@ fn call_callable_for_value(
         body,
         caller_result,
         caller_produced,
-        |shell| bind_arguments(name, params, vec![(argument, false)], false, shell),
+        |shell| {
+            bind_arguments(
+                name,
+                params,
+                vec![expand::CallArg::plain_value(argument)],
+                false,
+                shell,
+            )
+        },
         shell,
     )
 }
@@ -8829,7 +8856,7 @@ fn apply_modifier_ref(name: &str, argument: Value) -> Result<Value, Step> {
 fn bind_arguments(
     name: &str,
     params: &[parser::Param],
-    args: Vec<(Value, bool)>,
+    args: Vec<expand::CallArg>,
     flags_enabled: bool,
     shell: &mut Shell,
 ) -> Result<(), Step> {
@@ -8841,9 +8868,15 @@ fn bind_arguments(
     let mut switches_on: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut flag_values: std::collections::HashMap<&str, Value> = std::collections::HashMap::new();
     let mut flags_ended = false;
-    for (arg, bare) in args {
+    for expand::CallArg {
+        value: arg,
+        bare,
+        written_dashed,
+    } in args
+    {
         if flags_enabled
             && !flags_ended
+            && written_dashed
             && let Value::String(text) = &arg
         {
             if text == "--" {
@@ -14445,7 +14478,9 @@ mod tests {
             assert_eq!(
                 super::call_func(
                     "hook",
-                    vec![(Value::String(line.into()), false)],
+                    vec![super::expand::CallArg::plain_value(Value::String(
+                        line.into()
+                    ))],
                     false,
                     &mut shell,
                 ),
@@ -14453,11 +14488,29 @@ mod tests {
                 "hook should bind {line:?} positionally"
             );
         }
-        // A command-position call (flags enabled) still reads `--foo` as a flag.
+        // A command-position call (flags enabled) reads `--foo` as a flag only when
+        // it was **written** as one. A computed value is data even here — the whole
+        // point of the call-site rule, and what makes `f $w` and `f($w)` agree.
         assert_eq!(
             super::call_func(
                 "hook",
-                vec![(Value::String("--foo".into()), false)],
+                vec![super::expand::CallArg::plain_value(Value::String(
+                    "--foo".into()
+                ))],
+                true,
+                &mut shell,
+            ),
+            Step::Continue(0),
+            "a computed `--foo` binds positionally even with flags enabled"
+        );
+        assert_eq!(
+            super::call_func(
+                "hook",
+                vec![super::expand::CallArg {
+                    value: Value::String("--foo".into()),
+                    bare: true,
+                    written_dashed: true,
+                }],
                 true,
                 &mut shell,
             ),

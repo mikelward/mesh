@@ -25406,3 +25406,135 @@ fn gets_rejects_a_bad_operand() {
         );
     }
 }
+
+/// Command position reads its options from the **call site**, like a value call.
+///
+/// `f $w` bound an option when `$w` happened to hold `--sleep=0`, so flag-shaped
+/// data could not be passed to a `func` at all and the same word meant different
+/// things in the two call spellings. #351 removed that reading from value calls;
+/// this removes it from command position, where it survived in two places — the
+/// option scan and the generated-`--help` interception, which tested the runtime
+/// string for `--help`.
+///
+/// `...` is unaffected and is the point: it is the explicit "these are arguments,
+/// flags included" gesture, and the channel a wrapper needs to forward flags.
+#[test]
+fn a_command_position_call_reads_options_from_the_call_site() {
+    let sig = "func f(--sleep = none, ...rest) { puts \"sleep=$sleep n=$rest:len\" }";
+    let run = |body: &str| {
+        let out = run_with_input(&format!("{sig}\n{body}\n"));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // The change: a value that merely looks like a flag is data in both spellings.
+    for call in ["f $w", "f($w)"] {
+        assert_eq!(
+            run(&format!("w = \"--sleep=0\"\n{call}")).0,
+            "sleep=none n=1\n",
+            "{call} should pass data"
+        );
+    }
+
+    // Written at the call site, it still binds — in both spellings.
+    for call in ["f --sleep=0", "f(--sleep=0)"] {
+        assert_eq!(run(call).0, "sleep=0 n=0\n", "{call} should bind");
+    }
+
+    // And a spread still forwards flags, which is what `...` is for.
+    for call in ["f ...$w", "f(...$w)"] {
+        assert_eq!(
+            run(&format!("w = [\"--sleep=0\"]\n{call}")).0,
+            "sleep=0 n=0\n",
+            "{call} should forward the flag"
+        );
+    }
+
+    // `--help` follows the same rule rather than being carved out of it. It used
+    // to print the usage from a variable, which was the same runtime reading in
+    // the interception rather than in the scan.
+    assert!(
+        run("f --help").0.starts_with("Usage:"),
+        "written `--help` still prints the usage"
+    );
+    assert!(
+        run("x = [--help]\nf ...$x").0.starts_with("Usage:"),
+        "a spread still asks for help"
+    );
+    assert_eq!(
+        run("x = --help\nf $x").0,
+        "sleep=none n=1\n",
+        "`--help` in a variable is data, like any other flag-shaped value"
+    );
+}
+
+/// The two spellings have to refuse the *same* composed names, or the call-site
+/// rule is inverted rather than removed.
+///
+/// The first version of the command-position predicate asked only about the
+/// leading `--` — the shape `starts_with_bare_dashes` had before review corrected
+/// it — so `f --$name` and `f --*` bound from runtime data while `f(--$name)` and
+/// `f(--*)` were data. Every row is asserted as command *and* value, and the two
+/// compared to each other, so a future change that moves one has to move both.
+#[test]
+fn both_call_spellings_refuse_the_same_composed_option_names() {
+    let dir = fresh_dir("composed_both_ways");
+    std::fs::write(dir.join("--force"), "").unwrap();
+    let sig = "func f(target, --force, --tag = none, ...rest) \
+               { puts \"force=$force tag=$tag n=$rest:len\" }";
+    let run = |body: &str| {
+        std::fs::write(dir.join("run.mesh"), format!("{sig}\n{body}\n")).unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Refused in both: the name is composed, so data would pick the option.
+    for (command, value) in [
+        (
+            "name = force\nf prod --$name",
+            "name = force\nf(prod, --$name)",
+        ),
+        ("f prod --*", "f(prod, --*)"),
+        ("f prod --?orce", "f(prod, --?orce)"),
+        ("f prod --\"force\"", "f(prod, --\"force\")"),
+    ] {
+        let (c, v) = (run(command), run(value));
+        assert_eq!(c, v, "{command:?} and {value:?} must agree");
+        assert_eq!(
+            c, "force=false tag=none n=1\n",
+            "{command:?} should be data"
+        );
+    }
+
+    // Bound in both: written literally, or composed only *after* the `=`.
+    for (command, value, expected) in [
+        (
+            "f prod --force",
+            "f(prod, --force)",
+            "force=true tag=none n=0\n",
+        ),
+        (
+            "f prod --tag=v2",
+            "f(prod, --tag=v2)",
+            "force=false tag=v2 n=0\n",
+        ),
+        (
+            "w = v2\nf prod --tag=$w",
+            "w = v2\nf(prod, --tag=$w)",
+            "force=false tag=v2 n=0\n",
+        ),
+    ] {
+        let (c, v) = (run(command), run(value));
+        assert_eq!(c, v, "{command:?} and {value:?} must agree");
+        assert_eq!(c, expected, "{command:?}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -2976,10 +2976,30 @@ thing a reader takes on trust.*
       ``$m("--x")`` was `unknown flag`. The bare spelling `$m(--x)` still is; the
       quoted one is data now, and is asserted as such.
       `repl.rs` `scan_call_value`.
-- [ ] **Command position scans a runtime value for flags too.** Found auditing
-      17: `f $w` with `$w` holding `--sleep=0` reports ``unknown flag `--sleep` ``
-      exactly as the value call did, so a plain `func` in command position still
-      cannot be handed flag-shaped data. `wrapper func` is the opt-in workaround
+- [x] **Command position scans a runtime value for flags too.** *Fixed — an
+      in-shell `func` in command position now reads its options from the call
+      site, like a value call.* `f $w` passes data whatever `$w` holds, `f($w)`
+      agrees, and `f ...$w` forwards flags because `...` is the "flags included"
+      gesture. `expand::CallArg` carries `written_dashed` per argument, read from
+      the word rather than the value; `bind_arguments` and `auto_help_requested`
+      both ask it, the latter being where the same runtime reading had survived.
+
+      **The decision this needed** — "is command position argv-shaped or
+      call-shaped for a func?" — was answered by the repo owner: call-shaped,
+      since `...` already exists as the explicit way to forward flags, so nothing
+      is lost.
+
+      **What it costs.** A `func` is now call-shaped while a **builtin** is still
+      argv-shaped, so `x = --help` then `puts $x` prints the usage and `f $x`
+      passes data. `DESIGN.md` previously asserted the rule was "the same for both
+      kinds of command"; that passage is rewritten rather than quietly falsified.
+      Closing the gap is the entry below — the divergence is a debt this change
+      took on, not a line it meant to draw.
+
+      The original report:
+      `f $w` with `$w` holding `--sleep=0` reported ``unknown flag `--sleep` ``
+      exactly as the value call did, so a plain `func` in command position could
+      not be handed flag-shaped data. `wrapper func` is the opt-in workaround
       on the *callee* side, not a fix.
 
       Left out of 17 on purpose, because the same move does not obviously
@@ -2990,6 +3010,48 @@ thing a reader takes on trust.*
       standing in the same place. Deciding it needs an answer to "is command
       position argv-shaped or call-shaped for a func?", which is a design
       question rather than a bug fix.
+- [ ] **Make builtins read their options from the call site, like functions.**
+      *Standing principle, from the repo owner: a builtin works the same way a
+      function and an external do unless we have explicitly agreed otherwise.* A
+      builtin is not a third category, and every place it behaves like one is a
+      bug until argued for.
+
+      The live instance: command position was made call-shaped for an in-shell
+      `func`, and builtins were left on the argv reading, so
+
+      ```mesh
+      x = --help
+      puts $x      # the usage — builtin
+      f $x         # data — func
+      ```
+
+      A builtin takes `Vec<String>`, so the call-site reading is not in reach
+      where it decides: `auto_help_requested_strings` and each builtin's own
+      option parsing see bytes. Closing it means carrying `expand::CallArg`'s
+      `written_dashed` down the argv path for mesh-owned commands — which is
+      exactly where the byte boundary sits, so it wants doing deliberately rather
+      than by widening a predicate.
+
+      An **external** genuinely cannot follow: argv is bytes, and `curl $url` must
+      pass `--foo` if that is what `$url` holds. So the end state is two rules and
+      a stated reason, not three — mesh-owned commands read the call site,
+      externals take what the bytes say — and a builtin belongs on the mesh-owned
+      side because mesh wrote it and it has a documented signature.
+
+- [ ] **A value call cannot ask for the generated `--help`.** `f(--help)` reports
+      ``unknown flag `--help` `` and `f(...$x)` with a `--help` element does the
+      same, while the command spellings both print the usage. Not a flag-handling
+      gap — every *declared* flag works identically in both spellings, and a
+      function that declares its own `--help` observes it in a value call — but an
+      **interception**: `dispatch_function_call` answers `--help` before binding,
+      and the value-call path does not go through it, so the word reaches the
+      ordinary binder and finds no such parameter.
+
+      Now the one asymmetry left after command position was made call-shaped, and
+      the fix is to share the interception rather than duplicate it: it has to
+      keep the same call-site reading (`written_dashed`), so a written or spread
+      `--help` asks for help and one arriving in a variable is data.
+
 - [ ] **A modifier on a dashed word applies to the whole word, so a value call
       cannot use one on an option at all.** Found auditing 17. The underlying
       behavior is **pre-existing** — a chain has always transformed the name
