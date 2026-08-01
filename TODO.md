@@ -4233,13 +4233,33 @@ a one-line edit. Every claim below was checked against the built shell.
         of the things it flags as unbuilt, so the example reads as writable and
         is not. Either fix the examples or allow the name. **Moot:** the examples
         run as written.
-  - [ ] **The two spellings disagree about the bare `_`.** Found re-checking the
+  - [x] **The two spellings disagree about the bare `_`.** Found re-checking the
         above, and the one piece still open: `_ = 1` reports
         `command not found: _` — the discard read as a command word, the old
         diagnostic complaint surviving on the one name that is still reserved —
         while `global _ = 1` **silently succeeds**, binding nothing and answering
         `0`. One of the two is wrong and neither says what the rule is. The
         discard should presumably refuse a value in both spellings, and say so.
+
+        **Fixed, that way.** `_` discards a *position*, so it has one to discard
+        only inside a pattern; on its own there is nothing to assign to. All four
+        spellings — `_ =`, `_ +=`, `global _ =`, `global _ +=` — now say that, and
+        `if _ = f() { … }` with them. A discarded position is untouched: `[_ x]`,
+        `match`'s `_`, `for _ in`, and `_name` are all unaffected.
+
+        They disagreed because the two paths asked different questions. The bare
+        spelling never reached an assignment path at all — those are gated on
+        `word_text_at`, which answers only for a *name* — so it fell through to a
+        command word. `global` asks `binding_pattern` directly, which answers
+        `Ignore`, and an `Ignore` assignment bound nothing quietly.
+
+        *The road not taken*, in case it is the better one: `_ = f()` could have
+        been **allowed** as an explicit discard, the way Rust's `let _ =` is, which
+        would have made the two spellings agree in the other direction and given a
+        function tail a way to suppress its value. Refused instead because a
+        statement's value is already discarded in statement position, so it buys
+        nothing that `f()` on its own does not — and a form that binds nothing and
+        reports success is the shape this entry was filed against.
 - [ ] **Optional commas + word×list distribution in list literals.** Two related
       list ergonomics, motivated by the bash `mv foo{,bak}` idiom (rename
       `foo` → `foobak` in one word):
