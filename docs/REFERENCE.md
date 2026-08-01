@@ -1873,7 +1873,8 @@ $env[$name] += " -u NONE"
 ```
 
 That is what lets a set of changes be applied as *data* rather than as source —
-the shape every `shellenv`-style integration has, and what direnv and mise need:
+the shape every `shellenv`-style integration has, and what direnv needs (mise too,
+once it has a source that reports removals — see [`INTEGRATION.md`](INTEGRATION.md)):
 
 ```mesh
 for name, value in $changes {

@@ -1417,11 +1417,12 @@ designed, and the cross-references say where the fuller note lives.
         provider must also be exempt from the mtime-keyed spec cache, which has
         no key for a per-word answer.
 - [ ] **Reading structured output.** carapace exports JSON, `direnv export json`
-      is a JSON env diff, `mise env --json` the same, and atuin's search output
-      likewise. mesh cannot parse any of it. Decide between a JSON reader and a
-      mesh-defined line format that upstreams are asked to emit; the former needs
-      no upstream cooperation, which is most of its case. Doing each bridge in
-      Rust instead sidesteps the parser at the cost of building per-tool
+      is a JSON env diff, `mise env --json` prints JSON too (though see the apply
+      entry below — it looks like a *target state* rather than a diff), and atuin's
+      search output likewise. mesh cannot parse any of it. Decide between a JSON
+      reader and a mesh-defined line format that upstreams are asked to emit; the
+      former needs no upstream cooperation, which is most of its case. Doing each
+      bridge in Rust instead sidesteps the parser at the cost of building per-tool
       knowledge into the shell.
       **Cost: none in dependency terms.** `serde_json` is already in the tree —
       reedline depends on it, so it is compiled into every build today
@@ -1430,24 +1431,80 @@ designed, and the cross-references say where the fuller note lives.
       JSON null, a nested array, and a non-integer number become mesh values,
       which is the same question a `:json` modifier or a `from-json` builtin
       would have to answer anyway.
-- [ ] **A bulk env-diff apply.** The **writes** this entry was mostly about have
-      landed: `$env[$name] = value` writes under a computed key and
-      `unset $env[$name]` removes an entry, so a loop over a computed diff applies
-      it today (§"The environment" in `docs/REFERENCE.md`, and rough edge 5). What
-      is left is the **transaction**: applying a whole map at once, so a payload
-      that is malformed half way through is a diagnostic rather than a
-      half-applied environment. That needs the spelling for "remove this name"
-      settled first — a map's values are mesh values, and mesh has no null to
-      carry direnv's and mise's "unset this" convention. See "Reading structured
-      output" above; the two questions are one decision.
+
+      **One of those three is no longer forced by the environment.** The env-diff
+      apply below owns its own `null` handling inside the builtin, so a general
+      reader does not have to invent a mesh value for one just to unblock direnv.
+      (It does **not** finish mise, which additionally needs a source that reports
+      removals — see the apply entry below.) What remains is what carapace and
+      atuin need, and for those refusing a null is a defensible answer. A
+      **non-integer number** is the harder one and is nobody else's to absorb:
+      `Value` is `Integer(i64)` with no float variant, and both of those tools
+      emit floats.
+- [ ] **A bulk env-diff apply — `if json = "$(direnv export json)" { env-apply
+      --json $json }`.** The
+      **writes** this entry was mostly about have landed: `$env[$name] = value`
+      writes under a computed key and `unset $env[$name]` removes an entry, so a
+      loop over a computed diff applies it today (§"The environment" in
+      `docs/REFERENCE.md`, and rough edge 5). What is left is the **transaction**:
+      one builtin that parses the payload, splits it, validates the whole thing,
+      and only then touches the environment, so a payload malformed half way
+      through is a diagnostic rather than a half-applied environment.
+
+      **Shape decided** (see §"direnv, mise, nvm" in `docs/INTEGRATION.md` for the
+      reasoning). A removal is spelled `unset $env[$name]` — the verb the language
+      already has — and there is **no sentinel value** meaning "remove": mesh's
+      no-null rule is load-bearing, and inventing a `none` to carry one tool's wire
+      convention would pay a language-wide cost for an integration. The split
+      between writes and removals therefore lives **inside the builtin**, before
+      any mesh value exists, since a map that cannot hold a null cannot carry the
+      distinction into mesh code.
+
+      The alternative — a reader handing both halves back for mesh to apply — was
+      rejected on two counts: it needs a value-function call, because
+      `[sets removes] = $(cmd)` does not bind — a capture is **one string**, not a
+      pair to destructure — and decisively **it is not a transaction**, since a
+      second loop failing partway leaves exactly the half-applied environment this
+      is meant to prevent. The payload `env-apply` receives is therefore a string,
+      which is what it parses.
+
+      **The payload arrives as an argument, not through a pipe.** A `|` runs every
+      stage in its own process, a builtin included, so
+      `direnv export json | env-apply --json` would write the environment in a
+      forked child and lose all of it on exit — verified, not reasoned about: a
+      function writing `$env` on the right of a `|` leaves the parent unchanged.
+      `DESIGN.md` marks "the last stage of a pipeline runs in the current shell" as
+      *planned*, and the argument form owes nothing to it.
+
+      **And the payload is bound before it is applied**, not interpolated straight
+      in, and it is **quoted**: a capture is one string today, but `DESIGN.md` has
+      `$(cmd)` becoming a newline-split list with `"$(cmd)"` as the one-string
+      form, so the quotes keep this spelling correct across that change. Only an
+      assignment keeps a capture's status (§"Pipelines and sequencing" in
+      `docs/REFERENCE.md`), so `env-apply --json "$(direnv export json)"` would
+      discard direnv's exit code and apply the output of a *failed* hook that still
+      printed parseable JSON — the one outcome a transaction exists to prevent.
+      Both points raised in review on mikelward/mesh#341.
+
+      **mise may not fit the same bridge.** `direnv export json` is a diff whose
+      `null` means "unset this"; `mise env --json` is documented as exporting the
+      vars that activate mise once, which is a **target state**, and a target state
+      cannot express a removal by omission. If that holds, mise needs a stateful
+      source of its own. Unconfirmed here — neither tool is installed in this
+      checkout — so confirm against a real `mise` before building that half. Also
+      from the #341 review.
+
+      What this buys the entry above: `from-json` no longer has to answer the null
+      question on the environment's behalf.
 - [ ] **Decide the stance on generated code.** Every tool ships
       `eval "$(tool init zsh)"`. mesh has no `eval`, and `source` takes exactly
       one file operand — no pipe, no string, no `-` — so the published install
       line cannot work. `DESIGN.md` sketches `atuin init mesh | source`
       (§"Conditionals"), which would need `source -` or a `run TEXT` builtin.
       The three options and the argument for the third (exchange **data**, not
-      code — which needs no `eval` and no upstream change for direnv, mise, and
-      carapace) are written up in `docs/INTEGRATION.md`. This decision gates the
+      code — which needs no `eval` and no upstream change for direnv and
+      carapace, nor for mise beyond a removal-reporting source) are written up in
+      `docs/INTEGRATION.md`. This decision gates the
       one below.
 - [ ] **Publish an integration contract**, so an upstream can add a `mesh`
       target to `atuin init` / `starship init` / `zoxide init` / `direnv hook` /
@@ -2543,9 +2600,11 @@ thing a reader takes on trust.*
 
       **The payoff is wider than the `shellenv` helper this entry was about.**
       `docs/INTEGRATION.md` called the missing write "the narrowest blocker in the
-      whole document" — it is what direnv, mise, and nvm all need, since each one's
-      contract is a computed diff applied in a loop, with a `null` meaning "unset
-      this". Those now want only a JSON reader.
+      whole document" — it is what direnv and nvm need, since their contract is a
+      computed diff applied in a loop with a `null` meaning "unset this". Those now
+      want only a JSON reader. **mise needs one thing more**: its output looks like
+      a target state, which cannot express a removal, so it also wants a source
+      that reports them — see the apply entry under "External tool integration".
 - [x] **6. A syntax error carried no line or column, and there was no way to
       check a file without running it.** A config that *generates* mesh source (see 26) had no way to check
       the generated file before sourcing it, so its only test was whether sourcing
