@@ -5140,13 +5140,13 @@ are called out together because tooling, error recovery, and the Rust data
 representation all depend on them; contracts still marked as needing a decision
 remain under-specified.
 
-- **Grammar and precedence — decided.** [`PARSER.md`](PARSER.md) is the parser
+- **Grammar and precedence — decided.** [`GRAMMAR.md`](GRAMMAR.md) is the parser
   contract: it covers adjacency/concatenation, modifier arguments, value calls,
   ranges, redirects, backgrounding, pipelines, conditional chains, postfix
   guards, and termination. In particular, `a | b && c &` backgrounds the whole
-  `&&` list, while a redirect attaches to the nearest simple command. Keeping the
-  executable subset in [`GRAMMAR.md`](GRAMMAR.md) separate lets implementation
-  progress be recorded without reopening the target grammar.
+  `&&` list, while a redirect attaches to the nearest simple command. It
+  describes what the parser accepts today, so what is still only design lives
+  here rather than there.
 - **Status lifetime.** Define exactly when `$sh.status` changes. Provisional: a
   pipeline's status is its **last stage**, every stage retained in
   [`$sh.pipestatus`](#variables-and-assignment); decide whether a **`pipefail`**

@@ -4071,7 +4071,7 @@ fn eval_expr(
         //
         // `:capture` is the exception, and it has to be refused *here* rather than at
         // the call: it wraps an **invocation** rather than transforming a value
-        // (`GRAMMAR.md`), so by the time a call could reject it the very call it was
+        // (`docs/REFERENCE.md`), so by the time a call could reject it the very call it was
         // meant to capture has already run uncaptured. Refusing the value means there
         // is nothing to call.
         E::ModifierRef(name) if name == "capture" => runtime_error(CAPTURE_NEEDS_A_CALL),
