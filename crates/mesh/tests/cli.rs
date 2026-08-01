@@ -721,7 +721,8 @@ fn a_deferred_command_stage_joins_the_job_table_as_the_program() {
     // A value argument defers the stage, which registers its words *before* the
     // child expands them. Listing that job under `command` would make `%sleep`
     // find nothing, so the same line would be waitable one way and not the other.
-    let out = run_with_input("command sleep $(printf 0.3) &\njobs\nwait %sleep\nputs $sh.status\n");
+    let out =
+        run_with_input("command sleep \"$(printf 0.3)\" &\njobs\nwait %sleep\nputs $sh.status\n");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     // The listing names the program, not the prefix — a value still shows as
@@ -11398,7 +11399,7 @@ fn a_failing_command_in_a_value_block_no_longer_skips_the_binding() {
 #[test]
 fn only_an_explicit_capture_takes_a_blocks_bytes() {
     // `$(…)` is the thing that means "capture", and it still does.
-    let out = run_with_input("x = $(echo hi)\nputs \"<$x>\"\n");
+    let out = run_with_input("x = \"$(echo hi)\"\nputs \"<$x>\"\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "<hi>\n");
 }
 
@@ -13256,7 +13257,7 @@ fn nothing_escapes_a_capture_through_an_inherited_descriptor() {
         substitution.stdout
     );
     if std::path::Path::new("/proc/self/fd").exists() {
-        let listed = run_with_input("y = $(sh -c \"ls /proc/self/fd\")\nputs \"fds=[$y]\"\n");
+        let listed = run_with_input("y = $(sh -c \"ls /proc/self/fd\"):raw\nputs \"fds=[$y]\"\n");
         let seen = String::from_utf8_lossy(&listed.stdout);
         for leaked in ["4", "5"] {
             assert!(
@@ -13266,7 +13267,7 @@ fn nothing_escapes_a_capture_through_an_inherited_descriptor() {
         }
     }
     // Still captures what it should.
-    let plain = run_with_input("z = $(echo hi)\nputs \"[$z]\"\n");
+    let plain = run_with_input("z = \"$(echo hi)\"\nputs \"[$z]\"\n");
     assert_eq!(String::from_utf8_lossy(&plain.stdout), "[hi]\n");
 
     // And an ordinary capture is unaffected by the flag.
@@ -15217,7 +15218,7 @@ fn tilde_expansion_ignores_adjacent_empty_quotes() {
 
 #[test]
 fn captures_command_output_as_an_expression_value() {
-    let out = run_with_input("answer = $(printf 20):int + 22\nputs $answer\n");
+    let out = run_with_input("answer = \"$(printf 20)\":int + 22\nputs $answer\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
     assert!(
         out.status.success(),
@@ -15927,7 +15928,7 @@ fn a_failing_capture_binds_its_output_and_lends_the_assignment_its_status() {
     // The status is read into a name first: `$sh.status` is the *last* statement's,
     // so a `puts` in between would report its own success — as it would in bash.
     let out = run_with_input(
-        "x = $(sh -c 'echo kept; exit 3')\nst = $sh.status\nputs \"x=[$x] status=$st\"\n",
+        "x = \"$(sh -c 'echo kept; exit 3')\"\nst = $sh.status\nputs \"x=[$x] status=$st\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "x=[kept] status=3\n");
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
@@ -15938,15 +15939,16 @@ fn if_binding_a_capture_branches_on_the_status_with_the_output_bound() {
     // `if out = $(cmd)` reads as it does in bash: the status picks the branch and
     // the output is bound on both, which is what makes the failing branch useful.
     let differs = run_with_input(
-        "if out = $(sh -c 'echo changed; exit 1') { puts \"same\" } else { puts \"differ=[$out]\" }\n",
+        "if out = \"$(sh -c 'echo changed; exit 1')\" { puts \"same\" } else { puts \"differ=[$out]\" }\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&differs.stdout),
         "differ=[changed]\n"
     );
 
-    let same =
-        run_with_input("if out = $(echo nothing) { puts \"same=[$out]\" } else { puts differ }\n");
+    let same = run_with_input(
+        "if out = \"$(echo nothing)\" { puts \"same=[$out]\" } else { puts differ }\n",
+    );
     assert_eq!(String::from_utf8_lossy(&same.stdout), "same=[nothing]\n");
 }
 
@@ -16161,8 +16163,8 @@ fn every_assignment_form_takes_its_captures_status() {
     // assignment, so they have to report the command's status too. Raised in
     // review — only the plain arm consumed it at first.
     let out = run_with_input(
-        "$env.MESH_T = $(sh -c 'echo v; exit 3')\nst = $sh.status\nputs \"env=$st/[$env.MESH_T]\"\n\
-         m = [k: old]\n$m.k = $(sh -c 'echo w; exit 4')\nmt = $sh.status\nputs \"member=$mt/[$m.k]\"\n",
+        "$env.MESH_T = \"$(sh -c 'echo v; exit 3')\"\nst = $sh.status\nputs \"env=$st/[$env.MESH_T]\"\n\
+         m = [k: old]\n$m.k = \"$(sh -c 'echo w; exit 4')\"\nmt = $sh.status\nputs \"member=$mt/[$m.k]\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -16184,7 +16186,7 @@ fn a_command_supersedes_a_capture_interpolated_into_its_arguments() {
     // The bare capture is unaffected: `capture_source` records after its own body
     // has run, so the clear inside cannot erase what the capture itself reports.
     let bare =
-        run_with_input("x = $(sh -c 'echo v; exit 3')\nst = $sh.status\nputs \"$st/[$x]\"\n");
+        run_with_input("x = \"$(sh -c 'echo v; exit 3')\"\nst = $sh.status\nputs \"$st/[$x]\"\n");
     assert_eq!(String::from_utf8_lossy(&bare.stdout), "3/[v]\n");
 }
 
@@ -16195,7 +16197,7 @@ fn a_list_pattern_condition_does_not_leak_its_captures_status() {
     // than consumed. It still has to be cleared, or it escapes and decides the
     // enclosing assignment. Raised in review.
     let out = run_with_input(
-        "if result = if [v] = [$(sh -c 'echo ok; exit 3')] { \"matched\" } else { \"miss\" } { puts \"then=[$result]/[$v]\" } else { puts \"else=[$result]/[$v]\" }\n",
+        "if result = if [v] = [\"$(sh -c 'echo ok; exit 3')\"] { \"matched\" } else { \"miss\" } { puts \"then=[$result]/[$v]\" } else { puts \"else=[$result]/[$v]\" }\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -16258,7 +16260,7 @@ fn a_status_transparent_modifier_keeps_the_captures_status() {
     // `:upper` runs nothing, so the capture is still the last thing that recorded a
     // status — `$(cmd):upper` answers for `cmd`. Raised in review.
     let upper = run_with_input(
-        "if x = $(sh -c 'echo kept; exit 3'):upper { puts \"THEN=[$x]\" } else { puts \"ELSE=[$x]\" }\n",
+        "if x = \"$(sh -c 'echo kept; exit 3')\":upper { puts \"THEN=[$x]\" } else { puts \"ELSE=[$x]\" }\n",
     );
     assert_eq!(String::from_utf8_lossy(&upper.stdout), "ELSE=[KEPT]\n");
 
@@ -16318,13 +16320,13 @@ fn an_evaluation_error_from_any_path_aborts_a_capture() {
 fn a_capture_that_ran_nothing_reports_its_own_success() {
     // `$()` ran nothing, so it has no status of its own — the assignment reports 0
     // rather than whatever happened to run before it. Raised in review.
-    let empty = run_with_input("false\nx = $()\nst = $sh.status\nputs \"st=$st x=[$x]\"\n");
+    let empty = run_with_input("false\nx = \"$()\"\nst = $sh.status\nputs \"st=$st x=[$x]\"\n");
     assert_eq!(String::from_utf8_lossy(&empty.stdout), "st=0 x=[]\n");
 
     // Same for a body that is not empty but whose every statement a guard skipped —
     // "ran nothing" is a question about execution, not about the source text.
     let skipped = run_with_input(
-        "false\nx = $(puts skipped if false)\nst = $sh.status\nputs \"st=$st x=[$x]\"\n",
+        "false\nx = \"$(puts skipped if false)\"\nst = $sh.status\nputs \"st=$st x=[$x]\"\n",
     );
     assert_eq!(String::from_utf8_lossy(&skipped.stdout), "st=0 x=[]\n");
 }
@@ -16400,7 +16402,7 @@ fn a_callee_that_ends_on_an_evaluation_error_is_not_a_value() {
     // aborts the caller's statement rather than handing back the empty string.
     // Raised in review as a P1 — `x = $(f())` bound `""` and carried on.
     let captured =
-        run_with_input("func f() { puts $nope }\nx = $(f())\nputs \"bound=[$x]\"\nputs done\n");
+        run_with_input("func f() { puts $nope }\nx = \"$(f())\"\nputs \"bound=[$x]\"\nputs done\n");
     let err = String::from_utf8_lossy(&captured.stderr);
     assert!(err.contains("nope: unbound variable"), "{err}");
     // Never bound, so reading it is the second error — and `done` still runs.
@@ -16410,7 +16412,7 @@ fn a_callee_that_ends_on_an_evaluation_error_is_not_a_value() {
     // A later statement that *does* execute answers for the body, so the same
     // callee ending cleanly is an ordinary value again.
     let recovered =
-        run_with_input("func f() { puts $nope\n  puts kept }\nx = $(f())\nputs \"[$x]\"\n");
+        run_with_input("func f() { puts $nope\n  puts kept }\nx = \"$(f())\"\nputs \"[$x]\"\n");
     assert_eq!(String::from_utf8_lossy(&recovered.stdout), "[kept]\n");
 }
 
@@ -16430,6 +16432,64 @@ fn a_capture_that_returns_still_unwinds_rather_than_yielding() {
         "func f() { x = $(return 1; echo unreachable)\n  puts \"bound=[$x]\" }\nf\nputs after\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
+#[test]
+fn a_capture_splits_on_newlines_by_default() {
+    // `DESIGN.md` §"Command substitution". The terminator rule comes with it, so
+    // the trailing newline every well-behaved command writes is not a phantom
+    // element, and a blank line in the middle still is one.
+    let out = run_with_input(
+        "xs = $(printf \"a\\nb\\n\")\nputs $xs:len\nys = $(printf \"a\\n\\nb\\n\")\nputs $ys:len\nputs $(printf \"\"):len\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n3\n0\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_line_loop_over_a_capture_runs_once_per_line() {
+    // The case the default exists for. This ran **once**, with the whole blob bound
+    // to `line`, while a capture was one string — a quiet wrong answer, which is why
+    // the split is the default rather than something a caller opts into.
+    let out = run_with_input("for line in $(printf \"a\\nb c\\n\") { puts \"[$line]\" }\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[a]\n[b c]\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn quoting_a_capture_asks_for_one_string() {
+    // Quoting is the scalar escape (`DESIGN.md` §"Command substitution"): inside
+    // `"…"` the default split does not run, so a capture interpolates as its text
+    // and glues to neighbors — where an un-quoted one is a list, and a list has no
+    // text form.
+    let out = run_with_input(
+        "p = \"$(printf \"a\\nb\\n\")\"\nputs $p:len\nputs \"<$(printf one)/$(printf two)>\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n<one/two>\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn an_unquoted_capture_reaching_an_external_names_the_fix() {
+    // The cost the default accepts: a capture is a list, and a list at argv is the
+    // pre-existing hard error rather than a silent flatten. It has to *say* so —
+    // this is the line every bash habit lands on first.
+    let out = run_with_input("/bin/echo $(printf hi)\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("..."), "{stderr}");
+    assert!(!out.status.success());
 }
 
 #[test]
@@ -16453,7 +16513,7 @@ fn only_a_modifier_written_on_the_capture_itself_binds_raw() {
     // a variable they are an ordinary string that the default already trimmed, so
     // `$x:split` splits *that* — otherwise the rule would depend on where a value
     // had been, which is not readable from the line.
-    let out = run_with_input("x = $(printf \"a:\\n\")\nputs $x:split(\":\"):len\n");
+    let out = run_with_input("x = \"$(printf \"a:\\n\")\"\nputs $x:split(\":\"):len\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
     assert!(
         out.status.success(),
@@ -18606,10 +18666,10 @@ fn a_stage_evaluates_its_own_value_arguments_in_its_fork() {
     // function — and an external that does not exist, still 127 with the same message.
     let kinds = run_with_input(
         "func f(x) { puts f=$x }\n\
-         /bin/echo $(puts ext) | cat\n\
-         puts $(puts builtin) | cat\n\
-         f $(puts fn) | cat\n\
-         nosuchcmd $(pwd) | cat\n\
+         /bin/echo \"$(puts ext)\" | cat\n\
+         puts \"$(puts builtin)\" | cat\n\
+         f \"$(puts fn)\" | cat\n\
+         nosuchcmd \"$(pwd)\" | cat\n\
          puts status=$sh.status\n",
     );
     assert_eq!(
@@ -19675,7 +19735,7 @@ fn a_leading_not_negates_a_commands_status_in_a_condition() {
     // An assignment condition negates the capture status its right-hand side lends
     // it, and the binding is still made either way.
     let assigned = run_with_input(
-        "if not out = $(sh -c 'echo hi; exit 1') { puts \"took $out\" } else { puts wrong }\n",
+        "if not out = \"$(sh -c 'echo hi; exit 1')\" { puts \"took $out\" } else { puts wrong }\n",
     );
     assert_eq!(String::from_utf8_lossy(&assigned.stdout), "took hi\n");
 
@@ -22545,7 +22605,7 @@ fn an_environment_prefix_binds_to_one_stage() {
     // prefix there — the deferred branch dropped it, so a capture anywhere in the
     // stage silently took the environment away from the command. Raised in review
     // as a P1.
-    let out = run_with_input("MESH_PFX_F=bar sh -c 'printenv MESH_PFX_F' $(printf '') | cat\n");
+    let out = run_with_input("MESH_PFX_F=bar sh -c 'printenv MESH_PFX_F' \"$(printf '')\" | cat\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "bar\n",
@@ -22633,9 +22693,9 @@ fn a_value_bearing_prefix_is_evaluated_in_the_stage() {
 
     // The value still reaches the command — deferring moves the work, it does not
     // drop it — piped and backgrounded alike.
-    let out = run_with_input("A=$(printf deferred) sh -c 'echo [$A]' | cat\n");
+    let out = run_with_input("A=\"$(printf deferred)\" sh -c 'echo [$A]' | cat\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "[deferred]\n");
-    let out = run_with_input("A=$(printf deferred) sh -c 'echo [$A]' &\nwait\n");
+    let out = run_with_input("A=\"$(printf deferred)\" sh -c 'echo [$A]' &\nwait\n");
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("[deferred]"),
         "{}",
@@ -23231,9 +23291,9 @@ fn a_fork_block_does_not_reap_or_resume_the_shells_jobs() {
 #[test]
 fn a_fork_block_inside_a_capture_still_captures() {
     let out = run_with_input(
-        "before = $(pwd)\nout = $(fork { puts inside\ncd /\n })\n\
-         after = $(pwd)\nmoved = $before != $after\n\
-         puts \"captured [$out]\"\nputs \"moved $moved\"\n",
+        "before = \"$(pwd)\"\nout = $(fork { puts inside\ncd /\n })\n\
+         after = \"$(pwd)\"\nmoved = $before != $after\n\
+         puts \"captured [$out:first]\"\nputs \"moved $moved\"\n",
     );
     let printed = String::from_utf8_lossy(&out.stdout);
     assert!(

@@ -568,7 +568,7 @@ shell, and backgrounding one (`puts $(name) > out &`) is refused. The shell reso
 every stage's targets before it forks any of them, and resolves them in parallel so
 `cat < fifo | cmd > fifo` cannot deadlock — so handing the words to the stage while
 the targets stayed here would expand the targets *first*, against the order above.
-Bind it first: `m = $(…)` then `cmd $m > out &`.
+Bind it first: `m = "$(…)"` then `cmd $m > out &`.
 
 A job listing shows a value it has not evaluated as `$(…)` — `puts $(pwd) &` lists as
 `puts $(…)` — since printing it would mean running it in the shell.
@@ -612,25 +612,41 @@ only appears when `PATH` has no `echo` to run.
 
 ### Command substitution — `$(…)`
 
-`$(command)` runs a command and becomes its **standard output, as one string**:
+`$(command)` runs a command and captures its **standard output**. What you get
+back is chosen by how the capture is written:
 
 ```mesh
-here = $(pwd)
-puts "at $(pwd) now"
-puts "$(id -un)@$(hostname)"     # glue it to text by quoting the whole word
+for line in $(git status --porcelain) { … }   # default: the lines, as a list
+here = "$(pwd)"                               # quoted: one string
+blob = $(cat log):raw                         # raw: one string, trailing newline kept
+names = $(find . -print0):nulls               # any split modifier replaces the default
 ```
 
-- **Trailing newlines are trimmed**, all of them; interior ones are kept, so
-  `$(printf "a\nb\n")` is the two-line string `a\nb` and not a list. Split it
-  when you want the lines (`lines = $(cat log):split("\n")`). *This is the
-  interim shape, not the settled one:* `DESIGN.md` §"Command substitution" makes
-  the default a **newline split into a list**, with `"$(cmd)"` the one-string
-  form, so `for line in $(…)` today runs once over the whole blob rather than
-  per line. Write the `:split("\n")` above until that lands.
+- **The default splits on newlines**, yielding a **list**. That is the dominant
+  Unix convention (`ls`, `find`, `grep`, `ps`), and unlike the bash word-split it
+  never breaks on a space in a filename. The separator is a **terminator**, so the
+  trailing newline every well-behaved command writes contributes no element:
+  `$(printf "a\nb\n")` is `[a b]`, a blank line in the *middle* is still an
+  element (`[a "" b]`), and output that is empty or only newlines is `[]`.
+- **Quoting asks for one string.** Inside `"…"` the split does not run, so
+  `"$(pwd)"` is the path and `"$(id -un)@$(hostname)"` glues two of them. This is
+  the spelling to reach for whenever a capture is one value rather than a list —
+  and it is required where a list has no meaning, since interpolating a list is
+  an error and passing an un-spread one to an external command is too:
+  `/bin/echo $(pwd)` reports that it needs `...`. Two gaps to know about there.
+  **`...` cannot be written on a capture** — `...$(pwd)` is a syntax error, the
+  same missing spread-of-an-expression that `...$x:split(":")` hits — so the
+  spelling the diagnostic asks for is `xs = $(pwd)` then `/bin/echo ...$xs`, and
+  `"$(pwd)"` is the one-liner when the answer is one value anyway. And a capture
+  spanning **several lines** cannot be quoted — the `"…"` scanner stops at the
+  newline — so reach for `$( … ):raw` there. Both are tracked in `TODO.md`.
+- **A split modifier replaces the default** rather than running after it, and
+  binds the raw bytes — see [Modifiers](#modifiers). `:raw` is the no-split
+  member: one string with the trailing newline the default trims.
 - **Only stdout is captured.** The command's stderr goes where the shell's does,
   so a diagnostic still reaches the terminal instead of ending up in the value.
-- **The result is one literal value** — never re-split on spaces, never re-globbed
-  — like every other value: `puts $(puts '*')` prints `*`.
+- **Elements are literal** — never re-split on spaces, never re-globbed — like
+  every other value: `puts $(puts '*')` prints `*`.
 - **A failing capture still yields its output**, and the status travels alongside
   it. A nonzero exit is routinely a *result* rather than an error — `diff` exits 1
   for "they differ" and puts the diff on stdout, `grep` exits 1 for "no match",
@@ -640,7 +656,7 @@ puts "$(id -un)@$(hostname)"     # glue it to text by quoting the whole word
   the same here:
 
   ```mesh
-  if out = $(diff old new) {
+  if out = "$(diff old new)" {
     puts "no change"
   } else {
     puts $out                    # the diff, on the branch that has it
@@ -1290,9 +1306,9 @@ directory, and current Git branch before a minimal `> ` input prompt:
 
 ```mesh
 func prompt-context() {
-  host = $(hostname -s)
-  dir = $(pwd)
-  branch = $(sh -c 'git branch --show-current 2>/dev/null || true')
+  host = "$(hostname -s)"
+  dir = "$(pwd)"
+  branch = "$(sh -c 'git branch --show-current 2>/dev/null || true')"
 
   if $branch == "" {
     puts "$host $dir"
@@ -1661,7 +1677,7 @@ What the capture produced crosses **whole** — quoted, so it is never re-split 
 never re-globbed, however many spaces or `*`s it contains. A capture that fails
 substitutes what it printed, the same as anywhere else — and interpolating it into a
 command **loses its status**, since the command reports its own, so bind it with
-`if out = $(…)` first when the failure matters. A syntax error inside it is reported
+`if out = "$(…)"` first when the failure matters. A syntax error inside it is reported
 when the line is parsed. `'…'` and `r"…"` are literal, and `\$(` keeps the text in a
 double-quoted string.
 
@@ -2331,8 +2347,10 @@ output, and it is the whole job of **`:raw`**, the no-split member, which hands
 back one string with the trailing newline the default trims (`$(cmd):raw`).
 
 Raw binding is a property of the *spelling*, not of the bytes: once a capture is
-in a variable it is an ordinary string, so `x = $(cmd)` then `$x:split(":")`
-splits the already-trimmed value. Whether a line binds raw is readable from that
+in a variable it is an ordinary value, so `x = "$(cmd)"` then `$x:split(":")`
+splits the already-trimmed string. (Bound *unquoted*, `x` is the split list, and a
+split modifier refuses a list — so the quotes are what make that second line a
+split at all.) Whether a line binds raw is readable from that
 line. Argument-taking modifiers work in expression position (an assignment right-hand
 side or other value context) and in command-argument position
 (`echo $dirs:join(":")`). Not yet: the **spread** of one at a command boundary —
@@ -2636,7 +2654,7 @@ while line = next-line() { puts $line }   # ends when `next-line` answers false
 
 An absent value binds nothing, so the `else` reads whatever the name held
 before — the same rule a list-pattern mismatch and a `gets` at end of input
-already follow. A **capture** right-hand side is unaffected: `if out = $(cmd)`
+already follow. A **capture** right-hand side is unaffected: `if out = "$(cmd)"`
 still branches on the command's status, with the output bound either way.
 
 A **command** condition is a command that ran, so the body it selects reads its

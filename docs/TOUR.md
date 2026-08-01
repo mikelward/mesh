@@ -412,24 +412,36 @@ mesh$ <strong>puts $env.HOME</strong>
 
 ## Capturing a command's output
 
-`$(command)` is the command's standard output as a value. Trailing newlines are
-trimmed; nothing else is touched:
+`$(command)` is the command's standard output as a value. By default it is
+**split on newlines** into a list, which is what makes a line loop safe — spaces
+in a filename cannot break it, because nothing splits on spaces:
 
 <pre>
-mesh$ <strong>here = $(pwd)</strong>
-mesh$ <strong>puts "at $here"</strong>
-at /home/you
-mesh$ <strong>count = $(cat words.txt | wc -l)</strong>
-mesh$ <strong>puts $count</strong>
-3
+mesh$ <strong>for line in $(git status --porcelain) { puts "[$line]" }</strong>
+[ M DESIGN.md]
+[?? notes.txt]
 </pre>
 
-A capture works in an argument too (`puts $(pwd)`), and inside `"…"`, which is
-how you glue it to text: `puts "$(id -un)@$(hostname)"`. What comes back is one
-literal value — never re-split, never re-globbed — and a capture whose command
-fails still hands back what it printed, since a nonzero exit is often the answer
-rather than an error (`diff` says 1 when files differ). Bind it with
-`if out = $(cmd) { … } else { … }` when you care which it was.
+**Quote it when you want one string.** Inside `"…"` the split does not run, so a
+quoted capture is its text and glues to whatever is beside it:
+
+<pre>
+mesh$ <strong>here = "$(pwd)"</strong>
+mesh$ <strong>puts "at $here"</strong>
+at /home/you
+mesh$ <strong>puts "$(id -un)@$(hostname)"</strong>
+you@laptop
+</pre>
+
+The quotes are doing real work: unquoted, `$(pwd)` is a one-element *list*, and a
+list has no text form to interpolate and no argv form to hand an external command
+— `/bin/echo $(pwd)` says so and names the fix. Reach for `"$(cmd)"` whenever the
+answer is one value, and leave it bare when you want the lines.
+
+What comes back is literal — never re-split on spaces, never re-globbed — and a
+capture whose command fails still hands back what it printed, since a nonzero exit
+is often the answer rather than an error (`diff` says 1 when files differ). Bind
+it with `if out = "$(cmd)" { … } else { … }` when you care which it was.
 
 ## Writing the environment
 
