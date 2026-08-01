@@ -763,11 +763,29 @@ file as tasks land.
 - [ ] The rest of `$sh.*`: the hook maps, `$sh.complete`, and `$sh.signal`.
       `$sh.options` has landed, along with the per-key mutability the rest of the
       configuration half needs.
+
+      For the hook maps specifically, the options are worked out in
+      [`docs/HOOKS.md`](docs/HOOKS.md) — what `on` does today, what `DESIGN.md`
+      promises that is not built, and six decisions with their trade-offs.
+      **None of the six gates another**, so they can be taken in any order; two
+      are merely cheaper early. The map wants to be a **view over the one
+      store** rather than a second one beside it, which gets harder with each
+      new direct reader of `shell.prompt.hooks`. And **arity is exact in both
+      directions** for a handler whose positionals are all required, so every one
+      written before prefix binding lands is one that breaks if an event ever
+      gains an argument — a `...rest` parameter or an optional trailing
+      positional already absorbs the surplus, which makes this a preference
+      rather than a deadline. The rest — callable handler values, an
+      optional hook name derived from the function, whether registration keeps
+      its eager existence check, and how signals are spelled — are independent.
 - [ ] **Signal handling, end to end.** Nothing user-facing exists yet. What the
-      shell does with signals today is entirely for its own account: interactively
-      it **ignores** INT/QUIT/TSTP/TTOU/TERM (`ignore_interactive_signals`,
-      `repl.rs`) and does not handle **HUP** at all, and non-interactively every
-      signal keeps its default disposition. The one piece of catch-and-resume
+      shell does with signals today is entirely for its own account, and the
+      boundary is the **terminal-owning loop** rather than interactivity:
+      `ignore_interactive_signals` is called only from `run_interactive`, where
+      it **ignores** INT/QUIT/TSTP/TTOU/TERM. A session interactive by *flag* —
+      `mesh -i script.mesh`, `mesh -i -c …`, piped `mesh -i` — goes through
+      `run_batch` or `run_piped` and keeps every default disposition, as a plain
+      non-interactive run does. **HUP** is handled nowhere. The one piece of catch-and-resume
       machinery is `exec.rs`'s `SigintCatcher`, which exists so a blocking wait
       can be interrupted — the flag-and-check shape the rest of this should
       follow.
@@ -1351,9 +1369,11 @@ designed, and the cross-references say where the fuller note lives.
   - [ ] **Exiting because of a signal.** bash runs its EXIT trap for the
         catchable fatal signals — SIGTERM, SIGHUP, SIGINT — and then re-raises
         so the parent still sees `128 + N`; only SIGKILL escapes it. mesh runs
-        nothing: non-interactively every signal keeps its default disposition,
-        and interactively INT/QUIT/TSTP/TTOU/TERM are ignored outright
-        (`repl.rs:ignore_interactive_signals`) while HUP is not handled at all.
+        nothing: only the terminal-owning `run_interactive` loop ignores
+        INT/QUIT/TSTP/TTOU/TERM (`repl.rs:ignore_interactive_signals`), while a
+        script, a `-c` string, piped stdin, and even a flag-forced `mesh -i`
+        over any of those keep their default dispositions; HUP is handled
+        nowhere.
         Wants a handler that records the signal and lets the main loop leave
         through `run_logout`, then re-raises — the flag-and-check shape
         `exec.rs`'s `SigintCatcher` already uses for a wait it must interrupt.
