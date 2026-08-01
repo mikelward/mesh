@@ -12018,6 +12018,317 @@ fn a_value_call_accepts_the_dashed_option_spelling() {
 }
 
 #[test]
+fn a_value_call_reads_options_from_the_call_site_not_from_the_data() {
+    // Scanning the *runtime* value meant `f($word)` worked or failed on whatever
+    // `$word` happened to hold: a string that merely looked like a flag was read
+    // as one, so data could not be passed to a plain `func` at all. Only a
+    // `--name` written as a literal word at the call site is an option now, which
+    // is the same "quoting makes a value" rule every other position follows and
+    // keeps the line's meaning readable from the line.
+    let through_a_variable =
+        run_with_input("func f(_a) { puts \"got=[$_a]\" }\nw = \"--sleep=0\"\nf($w)\n");
+    assert_eq!(
+        String::from_utf8_lossy(&through_a_variable.stdout),
+        "got=[--sleep=0]\n"
+    );
+    assert!(
+        through_a_variable.stderr.is_empty(),
+        "{:?}",
+        through_a_variable.stderr
+    );
+
+    // Quoted at the call site is data for the same reason — the text is identical,
+    // so if the runtime value decided, this would still be a flag.
+    let quoted = run_with_input("func f(_a) { puts \"got=[$_a]\" }\nf(\"--sleep=0\")\n");
+    assert_eq!(String::from_utf8_lossy(&quoted.stdout), "got=[--sleep=0]\n");
+
+    // A bare `--name` is still an option, and a bare unknown one is still refused —
+    // this narrows what counts as a flag, it does not stop flags working.
+    let declared =
+        run_with_input("func f(target, --force) { puts \"$target/$force\" }\nf(prod, --force)\n");
+    assert_eq!(String::from_utf8_lossy(&declared.stdout), "prod/true\n");
+
+    let unknown = run_with_input("func f(_a) { puts \"got=[$_a]\" }\nf(--sleep=0)\n");
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("unknown flag `--sleep`"),
+        "{:?}",
+        unknown.stderr
+    );
+
+    // And the typing a bare word carries is untouched: `--n=2` still binds the
+    // integer, which is the other question `bare` answers.
+    let typed = run_with_input("func f(--n = 0) { puts \"n=$n\" }\nf(--n=2)\n");
+    assert_eq!(String::from_utf8_lossy(&typed.stdout), "n=2\n");
+}
+
+#[test]
+fn an_attached_option_value_may_be_quoted_or_expanded() {
+    // Only the `--name=` prefix has to be written at the call site; the value
+    // after the `=` is the option's value however it is formed. Answering "is
+    // this an option?" with the predicate that answers "how does it type?"
+    // conflated the two, so `--tag="v2"` stopped scanning as an option and went
+    // through as a positional — `expected 0 argument(s), got 1` from a function
+    // that declares only `--tag`. Raised in review.
+    for (call, expected) in [
+        ("f(--tag=\"v2\")", "tag=v2\n"),
+        ("w = v9\nf(--tag=$w)", "tag=v9\n"),
+        ("w = v9\nf(--tag=\"$w\")", "tag=v9\n"),
+        ("f(--tag=v2)", "tag=v2\n"),
+        // A member or index reaches the value without wrapping the word — both are
+        // ordinary variable pieces — so these are attached values like the rest.
+        ("m = [key: v2]\nf(--tag=$m.key)", "tag=v2\n"),
+        ("xs = [v2]\nf(--tag=$xs[0])", "tag=v2\n"),
+    ] {
+        let out = run_with_input(&format!(
+            "func f(--tag = none) {{ puts \"tag=$tag\" }}\n{call}\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            expected,
+            "{call} should bind the flag"
+        );
+        assert!(out.stderr.is_empty(), "{call}: {:?}", out.stderr);
+    }
+
+    // The two questions stay apart in the other direction too: a quoted attached
+    // value still keeps its string type where a bare one types like a token.
+    let string_typed = run_with_input("func f(--n = 0) { puts \"n=$n\" }\nf(--n=\"2\")\n");
+    assert_eq!(String::from_utf8_lossy(&string_typed.stdout), "n=2\n");
+}
+
+#[test]
+fn a_composed_option_name_is_data_not_an_option() {
+    // The `=` is where the rule draws its line: the name picks *which* option
+    // binds, so it has to be literal, while the value after it may be composed.
+    // Testing only for a leading `--` let `f(--$name)` through — the first piece
+    // is the bare text `--` — so the runtime name chose the option, which is the
+    // data-decides-the-call reading the call-site rule exists to stop. Raised in
+    // review.
+    for call in [
+        "name = force\nf(--$name)",
+        "f(--\"force\")",
+        // A postfix chain is a composition of the name in its own right. It applies
+        // to the **whole** word — there is no point in the text where the `=` stops
+        // it — so `--FORCE:lower` becomes `--force` and `--TAG=V9:lower` becomes
+        // `--tag=v9`, either of which would bind a flag the reader never wrote.
+        "name = FORCE\nf(--$name:lower)",
+        "f(--FORCE:lower)",
+    ] {
+        let out = run_with_input(&format!(
+            "func f(target, --force) {{ puts \"$target/$force\" }}\n{call}\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "--force/false\n",
+            "{call} should pass `--force` as data, leaving the switch off"
+        );
+        assert!(out.stderr.is_empty(), "{call}: {:?}", out.stderr);
+    }
+
+    // A composed empty name is data too, rather than collapsing onto the bare
+    // `--` terminator that the same characters spell when written literally.
+    let empty = run_with_input("func f(_a) { puts \"got=[$_a]\" }\nf(--\"\")\n");
+    assert_eq!(String::from_utf8_lossy(&empty.stdout), "got=[--]\n");
+
+    // A chain over an *attached* form is data for the same reason, and this is the
+    // case that shows the `=` is no barrier: `--TAG=V9:lower` lowercases the name
+    // along with the value, so admitting it would bind a `--tag` nobody wrote.
+    let attached = run_with_input(
+        "func f(target, --tag = none) { puts \"$target/$tag\" }\nf(--TAG=V9:lower)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&attached.stdout),
+        "--tag=v9/none\n",
+        "a chained attached form is data, not the `--tag` option"
+    );
+
+    // Written literally, both still mean what they always did — this narrows
+    // what counts as an option, it does not stop options or the terminator.
+    let literal =
+        run_with_input("func f(target, --force) { puts \"$target/$force\" }\nf(prod, --force)\n");
+    assert_eq!(String::from_utf8_lossy(&literal.stdout), "prod/true\n");
+
+    let terminator = run_with_input(
+        "func f(--force, ...rest) { puts \"force=$force\"\n puts ...$rest }\nf(--, --force)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&terminator.stdout),
+        "force=false\n--force\n"
+    );
+}
+
+/// A glob needs no punctuation to mark it as composed — it is spelled in the same
+/// bare characters a literal name is — so `--*` passed the call-site test and then
+/// took its option from whatever the working directory happened to hold. In a
+/// scratch directory because the point is a file named `--force` sitting next to
+/// the script.
+#[test]
+fn a_glob_cannot_choose_which_option_binds() {
+    let dir = fresh_dir("glob_option_name");
+    std::fs::write(dir.join("--force"), "").unwrap();
+    // A rest parameter so the switch and the data are both readable: an unbound
+    // switch that arrived as an argument reads `force=false n=1`, a bound one
+    // `force=true n=0`.
+    let run = |call: &str| {
+        std::fs::write(
+            dir.join("run.mesh"),
+            format!("func f(--force, ...rest) {{ puts \"force=$force n=$rest:len\" }}\n{call}\n"),
+        )
+        .unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    assert_eq!(
+        run("f(--*)"),
+        "force=false n=1\n",
+        "a glob must not bind the switch it happens to match"
+    );
+
+    // The other glob metacharacters compose a name just as well.
+    assert_eq!(run("f(--?orce)"), "force=false n=1\n");
+
+    // Written literally the same name still binds, so the refusal is about
+    // globbability and not about the characters `--force` happens to contain.
+    assert_eq!(run("f(--force)"), "force=true n=0\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The name-side glob refusal is scoped to the name, so a glob *after* the `=` is
+/// never reached by it — but it does not bind either, and that is a recorded gap
+/// rather than this rule at work. A pattern evaluates to a `Value::List` whatever
+/// it matched, and `scan_call_value` inspects only `Value::String`, so the word
+/// falls through to the positionals. Pinned here because the two spellings
+/// disagree: the command form binds, the value form does not.
+///
+/// See the "a glob after `=` stops being an option" follow-up in `TODO.md`. That
+/// entry was written for a *multi-match* pattern; the glob-is-a-list rule has
+/// since widened it to every glob, single match included. Fixing it flips the
+/// value-call row below to `tag=a.txt n=0`.
+#[test]
+fn a_glob_after_the_option_separator_does_not_yet_bind_in_a_value_call() {
+    let dir = fresh_dir("glob_option_value");
+    std::fs::write(dir.join("--tag=a.txt"), "").unwrap();
+    let run = |call: &str| {
+        std::fs::write(
+            dir.join("run.mesh"),
+            format!("func f(--tag = none, ...rest) {{ puts \"tag=$tag n=$rest:len\" }}\n{call}\n"),
+        )
+        .unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    assert_eq!(
+        run("f(--tag=*.txt)"),
+        "tag=none n=1\n",
+        "the pattern is a list, so it reaches the positionals instead of `--tag`"
+    );
+    assert_eq!(
+        run("f --tag=*.txt"),
+        "tag=a.txt n=0\n",
+        "the command spelling binds it — this is the divergence being pinned"
+    );
+    // A literal after the `=` binds in both, so the difference is the glob and not
+    // the attached-value form itself.
+    assert_eq!(run("f(--tag=v2)"), "tag=v2 n=0\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn glob_syntax_the_expander_refuses_is_still_a_literal_option_name() {
+    // The restriction is "could this name glob", not "does it contain a
+    // metacharacter". An unmatched `[` has the syntax but no pattern `glob` will
+    // accept, so expansion falls back to the literal text and `--bad[` is exactly
+    // the characters written — an unknown flag, as the command spelling reports.
+    // Refusing on the characters alone turned that diagnostic into a silent
+    // positional, which is a worse answer than the one the rule replaced.
+    let refused = run_with_input("func f(--force, ...rest) { puts \"force=$force\" }\nf(--bad[)\n");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("unknown flag `--bad[`"),
+        "an unglobbable name is literal text: {:?} / {:?}",
+        refused.stdout,
+        refused.stderr
+    );
+
+    // A *valid* pattern is still refused, matches or not — whether it binds must
+    // not depend on what happens to be on disk.
+    let valid = run_with_input(
+        "func f(--force, ...rest) { puts \"force=$force n=$rest:len\" }\nf(--bad[a-z])\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&valid.stdout),
+        "force=false n=1\n",
+        "a well-formed pattern stays data: {}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+
+    // And a plain undeclared name keeps reporting, so the two are told apart by
+    // globbability rather than by both falling through.
+    let plain = run_with_input("func f(--force, ...rest) { puts \"force=$force\" }\nf(--nosuch)\n");
+    assert!(
+        String::from_utf8_lossy(&plain.stderr).contains("unknown flag `--nosuch`"),
+        "{:?}",
+        plain.stderr
+    );
+
+    // An attached value can invalidate the pattern its own name is part of: `--fo*`
+    // globs on its own, but `--fo*=bad[` as a whole does not, so nothing reaches the
+    // filesystem and the word is the text written. Asking only the name refused it
+    // anyway and swallowed the diagnostic — the case that shows the name test alone
+    // is not enough, and that the whole word has to glob before the name matters.
+    // Raised in review.
+    let attached =
+        run_with_input("func f(--force, ...rest) { puts \"force=$force\" }\nf(--fo*=bad[)\n");
+    assert!(
+        String::from_utf8_lossy(&attached.stderr).contains("unknown flag `--fo*`"),
+        "an unglobbable whole word is literal text, name-side pattern or not: {:?} / {:?}",
+        attached.stdout,
+        attached.stderr
+    );
+
+    // And "whole word" is every piece: `--fo*=x$v[` closes nothing until its third,
+    // so reading only the first called it a glob and swallowed the same diagnostic.
+    // An interpolated value is literal to expansion and cannot close the class, which
+    // is why the placeholder stand-in has to be asked of the pieces rather than of
+    // the text alone. Raised in review.
+    let interpolated = run_with_input(
+        "v = x\nfunc f(--force, ...rest) { puts \"force=$force\" }\nf(--fo*=x$v[)\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&interpolated.stderr).contains("unknown flag `--fo*`"),
+        "a later piece can invalidate the pattern too: {:?} / {:?}",
+        interpolated.stdout,
+        interpolated.stderr
+    );
+
+    // The mirror of it still binds: with the name clear of glob syntax, the same
+    // malformed tail is an ordinary attached value, so this is the whole-word test
+    // being scoped by the name rather than replacing it.
+    let named = run_with_input(
+        "v = x\nfunc f(--tag = none, ...rest) { puts \"tag=$tag n=$rest:len\" }\nf(--tag=x$v[)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&named.stdout),
+        "tag=xx[ n=0\n",
+        "{}",
+        String::from_utf8_lossy(&named.stderr)
+    );
+}
+
+#[test]
 fn a_value_call_honors_the_option_terminator_and_scans_spread_elements() {
     // A bare `--` ends option parsing inside a value call too, so a following
     // `--force` reaches the rest parameter as data instead of setting the switch.
@@ -15793,11 +16104,10 @@ fn a_modifier_reference_rejects_what_it_cannot_apply() {
             "`:stem`: expected 1 argument, got 2",
         ),
         // A modifier has no options, so a flag or a named argument has nothing to
-        // bind to.
-        (
-            "m = :stem\ny = $m(\"--x\")\n",
-            "`:stem`: unknown flag `--x`",
-        ),
+        // bind to. Written **bare**, since that is what makes a `--name` an option
+        // at all — the quoted spelling this row used to carry is data now, and is
+        // asserted as such below.
+        ("m = :stem\ny = $m(--x)\n", "`:stem`: unknown flag `--x`"),
         ("m = :stem\ny = $m(p: 1)\n", "`:stem`: unknown option `p:`"),
         // Only a **bare** `:name` is a reference. A quoted or escaped name composes
         // to the same text but must not keep the operator meaning the bare word has,
