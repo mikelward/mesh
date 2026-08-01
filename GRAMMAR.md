@@ -618,8 +618,8 @@ command.
 
 ## Value expressions
 
-Precedence from lowest to highest. Binary tiers associate left except comparison,
-which is non-associative; postfix operations associate left.
+Precedence from lowest to highest. Binary tiers associate left except comparison
+and range, which are non-associative; postfix operations associate left.
 Assignment and command `&&` / `||` are statement grammar and do not appear here.
 
 | Precedence | Forms | Associativity |
@@ -628,7 +628,7 @@ Assignment and command `&&` / `||` are statement grammar and do not appear here.
 | 2 | `and` | left |
 | 3 | `not` | prefix |
 | 4 | `==`, `!=`, `<`, `<=`, `>`, `>=`, `~`, `!~`, `in` | none |
-| 5 | `..`, `..=` | left |
+| 5 | `..`, `..=` | none |
 | 6 | `+`, `-` | left |
 | 7 | `*`, `/`, `%` | left |
 | 8 | prefix `-`, spread `...` | prefix |
@@ -643,10 +643,8 @@ not-expression  = "not" not-expression | comparison ;   # no NL after `not`
 comparison      = range-expression ( compare-op NL* range-expression )? ;
 compare-op      = "==" | "!=" | "<" | "<=" | ">" | ">=" | "~" | "!~" | "in" ;
 range-expression
-                = additive range-tail*
-                | range-head range-tail* ;
-range-head      = ( ".." | "..=" ) additive? ;    # no NL after the operator here
-range-tail      = ( ".." | "..=" ) NL* additive? ;
+                = additive ( ( ".." | "..=" ) NL* additive? )?
+                | ( ".." | "..=" ) additive? ;    # no NL after the operator here
 additive        = multiplicative ( ( "+" | "-" ) NL* multiplicative )* ;
 multiplicative  = prefix ( ( "*" | "/" | "%" ) NL* prefix )* ;
 prefix          = ( "-" | "..." ) prefix | postfix ;
@@ -724,12 +722,15 @@ Ranges sit above comparison and below arithmetic and postfix access, so
 `$xs[1 + 1..$n - 1]` has arithmetic endpoints and `$x in 1..=10` compares `$x`
 with one range. Chained comparisons (`a < b < c`) are errors; use `and`.
 
-A range does **not** get that guard: both endpoints are optional, so `1 .. 2 .. 3`
-parses left-associatively as `(1..2)..3` rather than being refused. It is not
-useful — the outer range's start is a range, and evaluating it says endpoints
-must be integers — but the diagnostic comes from the engine, not the parser. Only
-the tail operator takes newlines after it: `1 ..` ⏎ `2` is one range, while `..` ⏎
-`3` is an open-ended range followed by a separate statement.
+A range gets the same guard, and for the same reason — a range is not an endpoint,
+so `1 .. 2 .. 3` is `ranges cannot be chained` rather than something that parses
+and then fails at evaluation. It covers the spellings that reach that shape
+through an operand too, since both endpoints are optional: `1 .. ..3` and
+`..1 .. 2` answer alike. Group to say it (`(1 .. 2) .. 3` parses, and is the
+engine's problem from there).
+
+Only the **infix** operator takes newlines after it: `1 ..` ⏎ `2` is one range,
+while `..` ⏎ `3` is an open-ended range followed by a separate statement.
 
 A postfix chain is one chain: `$x.a[0]:get(k):len` parses left to right.
 Argument-free modifiers take no empty parentheses — `:first()` is rejected where
@@ -795,6 +796,21 @@ remaining tokens form a complete value expression; quoting the word, or leaving
 no viable guard expression, keeps it a command argument. Keywords are recognized
 only where the grammar expects them, so an ordinary command may still receive
 `if`, `for`, or `match` as an argument.
+
+Rule 3 parses the statement as a value, and a parse that **fails** normally hands
+the text back to the command reading — text that is not an expression is a
+command. A **chaining** error is the exception: `1 .. 2 .. 3` and `$x == 2 == 3`
+are refused as statements rather than run as commands, since the parse got two
+operands and an operator before the second operator arrived, which is not "never
+a value." Handing those back would read the operators as arguments and run `$x`.
+
+The exception is held to the same two tests a *successful* parse takes, so it
+never claims a command line whose arguments merely look like operators. A bare
+word still leads a command (`puts .. 2 .. 3` prints `.. 2 .. 3`, `ls .. ..` lists
+two parent directories), and an unbroken run is still one command word
+(`${cmd}==a==b` names a program). Only where the leading operand has no command
+spelling — an integer, boolean, quoted word, variable, list, group, or capture —
+does the chain win.
 
 ## Completeness and errors
 
