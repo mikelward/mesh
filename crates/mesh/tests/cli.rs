@@ -12046,6 +12046,125 @@ fn a_builtin_value_call_cannot_be_a_function_name() {
 }
 
 #[test]
+fn every_rule_about_a_definitions_name_reports_the_same_way() {
+    // Four rules, one kind of failure. A reserved word was a runtime error while a
+    // built-in value call, a dotted name and a malformed one were *syntax* errors,
+    // so the same mistake was recoverable or fatal depending on which rule happened
+    // to catch it. All four now report where the definition runs and let the next
+    // command through.
+    for (definition, reason) in [
+        ("func puts() { puts x }", "`puts` is a reserved name"),
+        (
+            "func files() { puts x }",
+            "`files` is a built-in value call",
+        ),
+        ("func a.b() { puts x }", "`a.b` cannot be a function name"),
+        ("func _() { puts x }", "`_` is the discard name"),
+        ("func 2x() { puts x }", "`2x` is not a name"),
+        // A colon is one word in command position, so a name carrying one has to
+        // reach the runtime check whole rather than stopping the parser mid-name.
+        // Raised in review: it used to reject the file with ``expected `(` ``.
+        ("func a:b() { puts x }", "`a:b` is not a name"),
+        ("func a[0]() { puts x }", "`a[0]` is not a name"),
+        // Opens on lexer-split punctuation rather than a word. Raised in review:
+        // requiring a `Word` to start put the parse error back for exactly the
+        // names that most need a runtime one.
+        ("func .foo() { puts x }", "`.foo` cannot be a function name"),
+        // `+=` separates nothing — an alias takes `=` and only `=` — so it is an
+        // ordinary piece of a bare word here. Raised in review.
+        ("func a+=b() { puts x }", "`a+=b` is not a name"),
+        // `=` separates an *alias's* name from its command and nothing in a `func`,
+        // so it is ordinary here. Raised in review.
+        ("func a=b() { puts x }", "`a=b` is not a name"),
+        ("alias .foo = puts x", "`.foo` cannot be a function name"),
+        // An alias desugars to a `wrapper func`, so it is named by the same rules
+        // and answers with the same message.
+        ("alias files = puts x", "`files` is a built-in value call"),
+        ("alias a.b = puts x", "`a.b` cannot be a function name"),
+    ] {
+        let out = run_with_input(&format!("{definition}\nputs after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(reason), "{definition}: {stderr}");
+        // Runtime, not syntax: nothing about the input was rejected as unparseable.
+        assert!(!stderr.contains("syntax error"), "{definition}: {stderr}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "after\n",
+            "{definition}"
+        );
+    }
+
+    // A leading underscore is a name, not a rule — only the bare `_`, which is the
+    // discard, is refused.
+    let ok = run_with_input("func _exit() { puts bye }\n_exit\n");
+    assert_eq!(String::from_utf8_lossy(&ok.stdout), "bye\n");
+    assert!(ok.stderr.is_empty(), "{:?}", ok.stderr);
+}
+
+#[test]
+fn a_quoted_definition_name_is_a_syntax_error_in_both_spellings() {
+    // A string is not a name, which is a rule about a name being a name rather
+    // than about which names are taken — so unlike the others it stays a *parse*
+    // error. Both spellings have to reach it: `alias` decides whether a statement
+    // is a definition by looking ahead, and a lookahead narrower than the parser
+    // drops `alias "foo" = …` back to `command not found: alias`, which says
+    // nothing about the name. Raised in review, against a lookahead of mine that
+    // had drifted the other way.
+    for definition in ["func \"foo\"() { puts x }", "alias \"foo\" = puts x"] {
+        let out = run_with_input(&format!("{definition}\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("syntax error: expected a name"),
+            "{definition}: {stderr}"
+        );
+    }
+
+    // The shapes that are not a definition at all still read as commands.
+    let command = run_with_input("alias --help\n");
+    let stderr = String::from_utf8_lossy(&command.stderr);
+    assert!(stderr.contains("command not found: alias"), "{stderr}");
+}
+
+#[test]
+fn one_bad_definition_name_costs_only_its_own_definition() {
+    // What checking the rules at parse time cost: rejecting the definition rejected
+    // the whole *file*, so a generated one was all-or-nothing and `before`, `mid`
+    // and `after` were all lost to the two bad names between them. That is why a
+    // generator had to filter its names rather than emit and let the shell say.
+    let dir = fresh_dir("definition_name_blast_radius");
+    let lib = dir.join("lib.mesh");
+    std::fs::write(
+        &lib,
+        "func before() { puts before }\n\
+         func files() { puts nope }\n\
+         alias mid = puts mid\n\
+         func a.b() { puts nope }\n\
+         func a:b() { puts nope }\n\
+         func .foo() { puts nope }\n\
+         func after() { puts after }\n",
+    )
+    .unwrap();
+
+    let out = run_with_input(&format!(
+        "source {} || puts \"source reported $sh.status\"\nbefore\nmid there\nafter\n",
+        lib.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "source reported 2\nbefore\nmid there\nafter\n"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`files` is a built-in value call"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`a.b` cannot be a function name"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn a_value_call_evaluates_arguments_in_the_callers_scope() {
     // `f($x)` reads the caller's `$x`, not the callee's fresh scope.
     let out = run_with_input("func id(v) { return $v }\nx = outer\ny = id($x)\nputs \"$y\"\n");

@@ -2868,6 +2868,23 @@ func greet(name) {
 greet world          # -> hi, world
 ```
 
+- **Name.** An ordinary name — a letter or `_`, then letters, digits, `_` and
+  single `-`s — that is not already taken. Five words are:
+
+  | Refused | Why |
+  | --- | --- |
+  | a reserved word or builtin (`return`, `puts`, `cd`) | it resolves first, so the definition could never be reached |
+  | a built-in **value call** (`re`, `style`, `link`, `glob`, `files`, `dirs`) | the opposite problem: `re(x)` always builds a regex, so the function would be reachable as a command and never as a call |
+  | anything containing a `.` (`a.b`) | a dot is member access, so a dotted name has no call spelling |
+  | the bare `_` | it is the discard |
+  | anything that is not a name (`2x`) | — |
+
+  Each is reported **where the definition runs**, and costs only that definition:
+  the rest of the file still defines. That is what makes a *generated* file of
+  definitions workable — a name the generator should have filtered says so and
+  takes nothing else with it — and it applies to `alias` identically, since an
+  alias is a `wrapper func`.
+
 - **Signature.** Comma-separated parameters carrying the four roles from
   `DESIGN.md`: a **required positional** (`name`), an **optional positional** with
   a default (`name = value`), a **flag** (a boolean switch `--name` or a valued

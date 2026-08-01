@@ -383,7 +383,23 @@ return   = "return" (ws signed-integer)?    # early exit, inside a body only
   those resolve first and the definition could never be reached. Nor can it be a
   built-in **value call** (`re` / `style` / `link` / `glob` / `files` / `dirs`),
   which is the opposite problem: those always answer with a value, so such a
-  function would be reachable as a command and never as a call.
+  function would be reachable as a command and never as a call. Nor can it
+  contain a `.`, which reads as member access, so a dotted name has no call
+  spelling. Otherwise it is an ordinary name: a letter or `_`, then letters,
+  digits, `_` and single `-`s — the bare `_` is the discard and is refused.
+
+  The grammar therefore takes the name **unjudged** — any bare word, assembled
+  from the same pieces a bare word in *command* position is, so the spellings the
+  lexer splits (`a.b`, `a:b`, `a[0]`) arrive whole rather than stopping the
+  parser mid-name — and every rule above is checked when the definition *runs*.
+  The one piece that ends a name is `=`, and only in an **alias**: `alias NAME =
+  COMMAND` is told from a command by that `=`, while a `func` has `(` for the job
+  and treats `=` as ordinary text (`func a=b()` reports at its own definition). That is deliberate and is what a reader
+  of a generated file depends on: a name the generator should have filtered
+  reports at its own definition and costs only that one, where a parse-time rule
+  would reject the whole file. A **quoted** name is still a syntax error
+  (`expected a name`), since that is a rule about a name being a name rather than
+  about which names are taken.
 - **Call.** A defined name in command position runs the function. Resolution is
   **builtins → functions → external**; the argument count must match the
   positionals (an arity mismatch is a loud, recoverable error). Arguments bind
