@@ -3806,6 +3806,61 @@ reasoning, and the open ones are at the bottom.
       or whether the real question is what mesh should do with a closed
       inherited stdin.
 
+## Parser asymmetries found writing `GRAMMAR.md`
+
+Reading `parser.rs` production by production to write the grammar turned up rules
+that look accidental rather than chosen. Each was **documented as it behaves**,
+because a docs consolidation is the wrong place to change the language — but each
+is a candidate for a parser fix instead, at which point the grammar entry becomes
+a one-line edit. Every claim below was checked against the built shell.
+
+- [ ] **A range chain parses and then fails at run time.** `Parser::binary`
+      `continue`s its operator loop after building an `Expr::Range`, so
+      `1 .. 2 .. 3` is `(1..2)..3` — accepted by `mesh -n`, then refused by the
+      engine with `range endpoints must be integers`. The comparison tier has an
+      explicit guard (`ChainedComparison`, `a < b < c`) and the range tier does
+      not. Either add the guard, so the error names the real problem at the real
+      place, or decide chaining is meaningful. Documented as left-associative
+      because that is what it does today.
+
+- [ ] **A parameter list refuses the newline an argument list accepts.**
+      `g(1` ⏎ `, 2)` parses; `func f(x = 1` ⏎ `, y)` is ``expected `,` or `)` ``.
+      `Parser::arguments` takes `NL*` before the comma and `Parser::parameters`
+      does not. Nothing seems to depend on the difference, and a signature is
+      exactly the thing long enough to want breaking across lines.
+
+- [ ] **A repeated `;` is refused by a check that only looks one token ahead.**
+      `Parser::source` tests `same(Semi) && tokens[position + 1] is Semi` once,
+      right after the statement, and then lets `terminators()` swallow any run.
+      So `puts x;; puts y` is `an empty command` while `puts x;` ⏎ `;; puts y`
+      is fine. The narrow rule is hard to state as anything but "what the code
+      happens to do"; either check the whole run or drop the check.
+
+- [ ] **`$env.PATH[0] = …` reports `expected a statement separator`.** Not a
+      target (an env entry is bytes, with nothing inside to reach into), so it
+      falls through to an ordinary expression and the error lands on the `=`,
+      naming neither the entry nor why it was refused. That is the same shape of
+      complaint that `member_target` already answers for `$sh` by *accepting* the
+      parse and reporting at run time.
+
+- [ ] **`/a/:i:g` says ``:g` is not a modifier`.** `Parser::regex_literal`
+      requires every link in the chain to be a regex flag and abandons the whole
+      regex reading on the first that is not — correct, but the message then comes
+      from the string path and never mentions flags. Naming the flag vocabulary
+      would say what is actually wrong.
+
+- [ ] **Newline layout inside a group covers binary operators but not postfix
+      access.** `Parser::wraps` fires for a continuing binary or range operator,
+      so `(1` ⏎ `+ 2)` parses, while `($m` ⏎ `.a)` is `expected )`. Likewise
+      `not` takes no newline after it (`x = not` ⏎ `true`) where every binary
+      operator does. Both may be deliberate; neither is written down anywhere as
+      a decision.
+
+- [ ] **A bracketed `match` arm cannot be an exact list.** A leading `[` goes
+      straight to `binding_pattern`, so `[1] =>` is `expected a name` and there is
+      no way to spell "matches the one-element list `[1]`" other than binding and
+      comparing in a guard. Compare `1 =>` and `"x" =>`, which do compare.
+
 ## Decisions made
 
 - **`:name` is reserved by *shape*, not by the name list** (mikelward, decided).
