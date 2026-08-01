@@ -14130,6 +14130,229 @@ fn a_sourced_files_lines_are_counted_from_its_own_start() {
 }
 
 #[test]
+fn a_sourced_file_reports_that_it_broke_after_later_statements_moved_on() {
+    // A file's status is its last statement's — right for a command's result, wrong
+    // for a breakage, since the statements after the failure overwrite the evidence.
+    // A caller therefore had nothing to gate on, and a config had to report at every
+    // point it could fail instead of leaving it to whoever sourced it.
+    let dir = fresh_dir("sourced_failure");
+    let broke = dir.join("broke.mesh");
+    std::fs::write(&broke, "puts one\n$nope\nputs tail\n").unwrap();
+    // A command that merely exits nonzero is a *result*, not a breakage, so this
+    // file still reports what its last statement did.
+    let result = dir.join("result.mesh");
+    std::fs::write(&result, "false\nputs tail\n").unwrap();
+
+    let out = run_with_input(&format!(
+        "source {} && puts unreachable\nputs \"broke: $sh.status\"\nsource {} && puts reached\n",
+        broke.display(),
+        result.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "one\ntail\nbroke: 1\ntail\nreached\n"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("nope: unbound variable"), "{stderr}");
+}
+
+#[test]
+fn only_a_failure_something_answered_for_is_kept_off_a_sourced_files_record() {
+    // Which errors a sourced file is held to account for. Handling one takes it
+    // back; *leaving* it behind does not, however the construct around it ended.
+    // Three rounds of review found holes on the "handled" side of this line, each a
+    // shape that merely looked like a recovery, so the whole line is pinned here
+    // rather than the individual shapes that happened to be reported.
+    //
+    // The rule the table encodes: a `||` answers for the failure it recovered —
+    // that failure only, and only when the left side reported an **error** rather
+    // than a nonzero *status*.
+    let dir = fresh_dir("sourced_answered_for");
+    for (name, broke, body) in [
+        // Nothing answered for it.
+        ("plain", true, "$nope\nputs tail\n"),
+        ("compound", true, "if true { $nope }\nputs tail\n"),
+        // Leaving is not handling: each of these ends its construct successfully.
+        ("break", true, "for x in [a] { $nope; break }\nputs tail\n"),
+        (
+            "continue",
+            true,
+            "for x in [a] { $nope; continue }\nputs tail\n",
+        ),
+        (
+            "return",
+            true,
+            "func f() { $nope; return 0 }\nf\nputs tail\n",
+        ),
+        // The recovery broke on its own way to succeeding. It answered for
+        // `$first`, and nothing answered for its own `$second`.
+        (
+            "fallback-raises",
+            true,
+            "func fb() { $second; puts fb-tail }\n$first || fb\nputs done\n",
+        ),
+        // A recovery answers only for its own list, so an error already standing
+        // survives a later, unrelated one.
+        (
+            "earlier-error",
+            true,
+            "$first\nif true { $second || puts inner }\nputs done\n",
+        ),
+        // Two failures inside the *same* left side. The `||` answers for the `if`'s
+        // outcome, which is `$second`; `$first` was already out of reach when
+        // `$second` began, so it is not the `||`'s to answer for. Whether it
+        // survives must not depend on the body's last statement happening to fail
+        // too.
+        (
+            "two-on-the-left",
+            true,
+            "if true { $first; $second } || puts handled\nputs done\n",
+        ),
+        // The recovery's own failure is its last statement rather than its first,
+        // so it is still pending when the recovery returns.
+        (
+            "fallback-raises-last",
+            true,
+            "func fb() { puts x; $second }\n$first || fb\nputs done\n",
+        ),
+        // A body in **value** position runs its own statement loop, so it has to
+        // settle errors on the same boundary: a successful tail otherwise hands
+        // back a plausible value with the failure behind it forgotten. Raised in
+        // review.
+        (
+            "value-body",
+            true,
+            "func f() { $nope; 1 }\nx = f()\nputs done\n",
+        ),
+        (
+            "value-body-in-a-capture",
+            true,
+            "func f() { $nope; 1 }\nx = \"$(f())\"\nputs done\n",
+        ),
+        // A `while` tests again after each pass, so a pass that failed is out of
+        // reach by the time the loop exits: the `||` here answers for the *test*
+        // that failed, not for the body several passes back. Raised in review.
+        (
+            "while-pass-then-retest",
+            true,
+            "global x = 0\nwhile $x == 0 or $second { global x = 1; $first } || puts handled\nputs done\n",
+        ),
+        // The same shape without the intervening test. A `for` runs nothing
+        // between its last pass and its exit, so the pass's failure is still the
+        // loop's, and the `||` answers for it. The asymmetry with `while` is the
+        // rule holding — what settles an error is something else having run.
+        (
+            "for-last-pass-recovered",
+            false,
+            "for x in [a] { $nope } || puts handled\nputs done\n",
+        ),
+        // A guard that skips runs *nothing*, so it settles nothing and answers for
+        // nothing — the rule is "something else ran", not "control reached here".
+        // Both directions, since the two sites got it wrong opposite ways. Raised
+        // in review.
+        (
+            "skipped-statement-settles-nothing",
+            false,
+            "if true { $nope; puts skipped if false } || puts handled\nputs done\n",
+        ),
+        (
+            "skipped-recovery-answers-for-nothing",
+            true,
+            "$nope || puts handled if false\nputs done\n",
+        ),
+        (
+            "skipped-value-tail-settles-nothing",
+            false,
+            "func f() { $nope; 1 if false }\nx = f() || puts handled\nputs done\n",
+        ),
+        // A `while` re-test can be skipped by its own trailing guard, and then the
+        // loop exits having run nothing since the failing pass — so the pass is
+        // still the loop's to be answered for. Raised in review: the re-test
+        // boundary had the same reached-versus-ran mistake as the statement one.
+        // The tail's guard *ran* and failed, which is still something having run —
+        // so the earlier failure settles and only the guard's own is left for the
+        // `||` around the call. Raised in review; without it one `||` cleared both.
+        // An environment prefix on a pipeline stage. A bare `$x` runs no code, so
+        // it is read here rather than deferred into the stage's fork — where a
+        // failure could only have come back as an exit status, indistinguishable
+        // from the command's own. Raised in review.
+        (
+            "env-prefix-in-a-stage",
+            true,
+            "A=$nope true | cat\nputs done\n",
+        ),
+        (
+            "env-prefix-in-a-stage-quoted",
+            true,
+            "A=\"$nope\" true | cat\nputs done\n",
+        ),
+        (
+            "failed-tail-guard-settles-the-earlier",
+            true,
+            "func f() { $first; 1 if $second }\nx = f() || puts handled\nputs done\n",
+        ),
+        (
+            "skipped-while-retest-settles-nothing",
+            false,
+            "global x = 0\nwhile puts test if $x == 0 { global x = 1; $nope } || puts handled\nputs done\n",
+        ),
+        // The `||` is answering for what `false` returned, not for the `$nope`.
+        (
+            "status-not-error",
+            true,
+            "if true { $nope; false } || puts handled\nputs done\n",
+        ),
+        // `&&` runs on the left *succeeding*, so it answers for nothing.
+        (
+            "and-after-error",
+            true,
+            "if true { $nope; puts ok } && puts next\nputs done\n",
+        ),
+        ("chain-none-clean", true, "$a || $b\nputs done\n"),
+        // Answered for.
+        ("recovered", false, "$nope || puts handled\nputs done\n"),
+        (
+            "recovered-through-a-func",
+            false,
+            "func f() { $nope }\nf || puts handled\nputs done\n",
+        ),
+        (
+            "recovered-outside-compound",
+            false,
+            "if true { $nope } || puts handled\nputs done\n",
+        ),
+        (
+            "chain-ends-clean",
+            false,
+            "$a || $b || puts handled\nputs done\n",
+        ),
+        // No error at all: a nonzero status is a result, not a breakage.
+        ("nonzero-status", false, "false\nputs tail\n"),
+        ("clean", false, "puts one\nputs two\n"),
+    ] {
+        let file = dir.join(format!("{name}.mesh"));
+        std::fs::write(&file, body).unwrap();
+
+        let out = run_with_input(&format!(
+            "source {} && puts VERDICT-OK\nsource {} || puts VERDICT-BROKE\n",
+            file.display(),
+            file.display()
+        ));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let verdict = if broke { "VERDICT-BROKE" } else { "VERDICT-OK" };
+        let refuted = if broke { "VERDICT-OK" } else { "VERDICT-BROKE" };
+        assert!(
+            stdout.contains(verdict),
+            "{name}: expected {verdict}\n{stdout}"
+        );
+        assert!(
+            !stdout.contains(refuted),
+            "{name}: unexpected {refuted}\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn an_invalid_utf8_line_still_counts_toward_later_locations() {
     // A bad line that is a whole unit is dropped where it is read, before the
     // dispatch that normally advances the count. It was still read, so a fault on
