@@ -211,7 +211,24 @@ pub(crate) fn apply_modifier_step(
         return Ok(value);
     }
     match step {
-        ModifierStep::Apply { modifier, .. } => apply_modifier(value, *modifier),
+        // Blamed on the name that was **written**, which for an alias is not the
+        // one [`apply_modifier`] knows the modifier by: `$xs:ns` said `:nulls`,
+        // sending the reader to a spelling their line does not contain — the same
+        // misdirection `split_named` exists to avoid between `:nulls` and `:split`.
+        // Only the applied modifier's own blame is rewritten, so a diagnostic that
+        // deliberately names a different one keeps it.
+        ModifierStep::Apply { modifier, name } => {
+            apply_modifier(value, *modifier).map_err(|error| match error {
+                ExpandError::Modifier {
+                    name: blamed,
+                    message,
+                } if blamed == modifier_name(*modifier) => ExpandError::Modifier {
+                    name: name.clone(),
+                    message,
+                },
+                other => other,
+            })
+        }
         ModifierStep::Unavailable { message, .. } => {
             Err(ExpandError::ModifierUnavailable(message.clone()))
         }
