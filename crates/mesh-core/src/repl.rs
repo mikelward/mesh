@@ -4063,6 +4063,23 @@ fn eval_expr(
                 };
                 return capture_call(callee, call_arguments, last, in_function, shell);
             }
+            // A split modifier written on a `$(…)` binds the capture's *raw* bytes,
+            // so — like `:capture` above — it is recognized before the subject is
+            // evaluated. Going through `eval_operand` would hand it a value the
+            // default had already trimmed, which is exactly the layering
+            // `DESIGN.md` §"Command substitution" rules out.
+            if let E::Capture(source) = value.as_ref()
+                && is_capture_split(name)
+            {
+                return capture_split_modifier(
+                    name,
+                    source,
+                    arguments.as_ref(),
+                    last,
+                    in_function,
+                    shell,
+                );
+            }
             let Some(value) = eval_operand(value, last, in_function, shell)? else {
                 return Ok(control_placeholder());
             };
@@ -5672,12 +5689,20 @@ fn capture_tail(expr: &parser::Expr) -> bool {
     }
 }
 
-fn capture_source(
+/// A capture's output **exactly as the command wrote it** — no trim, no split.
+///
+/// Every shape a capture can take is derived from this one function: the trimmed
+/// string a bare `$(cmd)` yields today, and the raw bytes a split modifier binds
+/// to. Deriving them rather than capturing twice is what keeps a split modifier
+/// *replacing* the default rather than running after it (`DESIGN.md` §"Command
+/// substitution") — the raw path and the trimmed one cannot disagree about what
+/// the command produced when there is only one capture.
+fn capture_raw(
     source: &parser::Source,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
-) -> Result<Value, Step> {
+) -> Result<String, Step> {
     let (step, output) =
         capture::with_stdout_captured(shell, |shell| run_source(source, last, in_function, shell))?;
     // A capture that **ran nothing** — `$()`, or a body whose every statement a
@@ -5701,7 +5726,7 @@ fn capture_source(
         // stashed for the caller here: running the body recorded the status the
         // ordinary way, and an assignment whose right-hand side is a capture reads
         // it back through `capture_status_of`.
-        Step::Continue(_) => Ok(Value::String(output.trim_end_matches('\n').to_string())),
+        Step::Continue(_) => Ok(output),
         // An evaluation error is not a status to carry — the program was invalid,
         // and mesh aborts the statement for one wherever it happens (`x = $nope`
         // leaves `x` unbound; `puts "a[$nope]b"` prints nothing). Yielding here
@@ -5722,6 +5747,65 @@ fn capture_source(
         // body unwinding, with no value to yield — so they still propagate.
         step => Err(step),
     }
+}
+
+/// What a bare `$(cmd)` yields: the output with its trailing newlines trimmed.
+fn capture_source(
+    source: &parser::Source,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let output = capture_raw(source, last, in_function, shell)?;
+    Ok(Value::String(output.trim_end_matches('\n').to_string()))
+}
+
+/// A **split modifier** applied straight to a `$(…)`, which binds the capture's
+/// *raw* bytes rather than the value a bare capture would have yielded.
+///
+/// `DESIGN.md` §"Command substitution": a split modifier **replaces** the capture's
+/// default handling instead of layering on top of it, so `:nulls` splits on NUL and
+/// nothing else — a `find -print0` name holding a newline survives — and `:raw`
+/// keeps the trailing newline the default would have trimmed. Only a modifier
+/// written *directly* on the capture binds this way: once the bytes are in a
+/// variable they are an ordinary string, and `$out:nulls` splits that string.
+fn capture_split_modifier(
+    name: &str,
+    source: &parser::Source,
+    arguments: Option<&Vec<parser::Argument>>,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let raw = capture_raw(source, last, in_function, shell)?;
+    // The whole job of `:raw` — the no-split member of the family, and the reason
+    // the others can replace a default without losing the bytes it would trim.
+    if name == "raw" {
+        // Argument-free like every other member, and it has to *say* so: this is
+        // the one arm that answers without consulting the modifier tables, so an
+        // argument list would otherwise be accepted and never evaluated. The
+        // wording is the one `:words(1)` and `:upper(1)` already give.
+        if arguments.is_some() {
+            return runtime_error("modifier :raw does not take arguments");
+        }
+        return Ok(Value::String(raw));
+    }
+    let subject = Value::String(raw);
+    match arguments {
+        Some(arguments) => {
+            eval_modifier_with_arguments(name, subject, arguments, last, in_function, shell)
+        }
+        None => apply_argument_free_modifier(name, subject),
+    }
+}
+
+/// Does `name` bind a capture's raw bytes rather than its default value?
+///
+/// The split family plus `:raw`, per `DESIGN.md` §"Modifiers". Nothing else does:
+/// `$(pwd):dir` is a *value* modifier and asks its question of the capture's value,
+/// trailing newline already gone.
+fn is_capture_split(name: &str) -> bool {
+    matches!(name, "raw" | "lines" | "nulls" | "tabs" | "words" | "split")
 }
 
 fn eval_if_expr(

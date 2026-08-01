@@ -2135,6 +2135,7 @@ a different failure from an unknown name, which never parses.
 | `:tty` | stream handle | Is that stream a terminal? The `test -t N` replacement — see [`$sh.args` and `$sh.name`](#shargs-and-shname). |
 | `:words` | string | Split on runs of whitespace into a list — the IFS word-split. Never yields an empty element. |
 | `:lines` / `:nulls` / `:tabs` | string | Split on newline / NUL / tab into a list. Each is `:split(SEP)` with the separator its name spells. |
+| `:raw` | a `$(…)` capture | The captured bytes as one string, trailing newline intact — the **no-split** member of the split family. |
 | `:split(SEP)` | string | Split on the literal separator into a list. |
 | `:join(SEP)` | list | Fold the list into a string, `SEP` between elements. |
 | `:get(KEY, DEFAULT)` | map or list | **Total** access — `DEFAULT` when the key or index is absent. |
@@ -2322,11 +2323,17 @@ Every modifier here is a value modifier, so each **maps element-wise over a
 list** — `$paths:stripend(".js")` rewrites each path — except `:get`, which
 consumes the collection as a whole.
 
-Every split modifier operates on the **already-evaluated** value, so a `$(…)`
-capture has had its trailing newline trimmed before the split runs
-(`$(printf "a:\n"):split(":")` is `[a]`). Binding one to a substitution's *raw*
-bytes — the `DESIGN.md` behavior, which is also what `:raw` needs to mean
-anything — is deferred; `:raw` is still unbuilt. Argument-taking modifiers work in expression position (an assignment right-hand
+A split modifier written **directly on a `$(…)`** binds the capture's *raw*
+bytes: it replaces what the capture would otherwise have done rather than running
+after it, so `$(printf "a:\n"):split(":")` is `[a "\n"]` — the trailing newline is
+still there to be split on. That is what makes `:nulls` safe on `find -print0`
+output, and it is the whole job of **`:raw`**, the no-split member, which hands
+back one string with the trailing newline the default trims (`$(cmd):raw`).
+
+Raw binding is a property of the *spelling*, not of the bytes: once a capture is
+in a variable it is an ordinary string, so `x = $(cmd)` then `$x:split(":")`
+splits the already-trimmed value. Whether a line binds raw is readable from that
+line. Argument-taking modifiers work in expression position (an assignment right-hand
 side or other value context) and in command-argument position
 (`echo $dirs:join(":")`). Not yet: the **spread** of one at a command boundary —
 `puts ...$x:split(":")` is a syntax error, so bind it first (`xs = $x:split(":")`,
