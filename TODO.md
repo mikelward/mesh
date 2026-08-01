@@ -3551,6 +3551,17 @@ of each PR had landed by another route, but these pieces had not.
       still had it, and the two phase numbers CI reported are precisely their
       status checks. CI is the test.
 
+      **Both now run on `start_pty_shell` / `stop_pty_shell` rather than a copy
+      of them.** Duplication was the actual defect: the drain landed in the
+      shared teardown, and these two kept the pre-drain spelling because they had
+      copied it rather than called it, which is how one bug came to be found
+      three times. Folding them in also gives them the diagnostics — a failure to
+      start or to leave now says *which* step gave way instead of arriving as a
+      bare phase code, which is what made the earlier sightings unreadable. Their
+      phase numbers keep their gaps (20 and 27, 30 and 38) so the codes recorded
+      above still name the same steps. Four harnesses still open a pty inline;
+      none has shown this failure, so they are left alone.
+
 - [ ] **If the syntactic capture-status rule proves too narrow, carry the status
       as evaluation metadata instead.** An assignment takes its right-hand side's
       capture status only when that side syntactically *is* a capture

@@ -3927,8 +3927,11 @@ struct PtyShell {
 /// Start mesh on a fresh pty (in `cwd`, when given) and read up to the first
 /// prompt.
 ///
-/// The six harnesses above each open their own pty inline and predate this; they
-/// are left as they are rather than mechanically rewritten here.
+/// Four harnesses still open their own pty inline and predate this; they are
+/// left as they are rather than mechanically rewritten here. Two more did until
+/// they each reproduced, separately, the teardown bug this helper had already
+/// been fixed for — `sigcont_harness` and `spawn_failure_harness` run on the
+/// shared session now, so the next such fix lands once instead of three times.
 fn start_pty_shell(exec: &MeshExec, cwd: Option<&Path>) -> Option<PtyShell> {
     start_pty_shell_ready(exec, cwd, INPUT_READY)
 }
@@ -6331,121 +6334,41 @@ fn decoration_settings_harness(exec: &MeshExec, directory: &Path) -> i32 {
     0
 }
 
+/// Phase numbers keep their gaps — 30 covers every way the session fails to
+/// start, and 38 every way it fails to leave — so a phase code recorded against
+/// an older run still names the same step. Which step gave way inside those two
+/// is what `pty_start_failed` / `pty_stop_failed` now say in words.
 fn spawn_failure_harness(exec: &MeshExec) -> i32 {
-    let mut master = -1;
-    let mut slave = -1;
-    if open_pty_pair(&mut master, &mut slave) != 0
-        || unsafe { libc::setsid() } < 0
-        || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
-    {
+    let Some(shell) = start_pty_shell(exec, None) else {
         return 30;
-    }
-    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
-    let mesh = unsafe { libc::fork() };
-    if mesh < 0 {
-        return 31;
-    }
-    if mesh == 0 {
-        unsafe {
-            libc::setpgid(0, 0);
-            libc::dup2(slave, libc::STDIN_FILENO);
-            libc::dup2(slave, libc::STDOUT_FILENO);
-            libc::dup2(slave, libc::STDERR_FILENO);
-            libc::close(master);
-            libc::close(slave);
-        }
-        unsafe { libc::_exit(exec_mesh(exec)) };
-    }
-    // Set the group from both sides of fork so tcsetpgrp cannot race the child.
-    if unsafe { libc::setpgid(mesh, mesh) } < 0 && unsafe { libc::getpgid(mesh) } != mesh {
-        return 39;
-    }
-    unsafe { libc::close(slave) };
-    if unsafe { libc::tcsetpgrp(master, mesh) } < 0 || !pty_wait_for_prompt(master) {
-        return 32;
-    }
-    let missing = b"mesh-command-that-does-not-exist\n";
-    if unsafe { libc::write(master, missing.as_ptr().cast(), missing.len()) }
-        != missing.len() as isize
-        || pty_read_until_command_done(master).is_none()
+    };
+    if !pty_write(shell.master, b"mesh-command-that-does-not-exist\n")
+        || pty_read_until_command_done(shell.master).is_none()
     {
         return 33;
     }
-    let command = b"puts recovered\n";
-    if unsafe { libc::write(master, command.as_ptr().cast(), command.len()) }
-        != command.len() as isize
-    {
+    if !pty_write(shell.master, b"puts recovered\n") {
         return 34;
     }
-    let Some((output, _)) = pty_read_until_command_done(master) else {
+    let Some((output, _)) = pty_read_until_command_done(shell.master) else {
         return 35;
     };
     if !output.windows(11).any(|part| part == b"recovered\r\n") {
         return 36;
     }
-    // `exit 0`, not a bare `exit`, because the check below is that the session
-    // *left cleanly* — and a bare `exit` leaves with the last command's status,
-    // so it also asserts that whatever ran last succeeded. That is not this
-    // harness's subject, and it is answerable by anything the terminal put on
-    // the input: a cursor-position reply arriving between the last command and
-    // this line runs as a command of its own and takes the status with it.
-    // `stop_pty_shell` has spelled it `exit 0` for this reason since it was
-    // written; these two harnesses predate it.
-    if unsafe { libc::write(master, b"exit 0\n".as_ptr().cast(), 7) } != 7 {
-        return 37;
-    }
-    // Read — and keep answering — until the session closes the pty, rather than
-    // waiting in `waitpid` with nobody at the other end. A shell on its way out
-    // paints one more prompt and asks the terminal where the cursor is; left
-    // unanswered the line editor gives up and mesh leaves with 1, so the `exit 0`
-    // above ends up not having named its status. `stop_pty_shell` learned this in
-    // 036a7f5 — these two harnesses predate it and kept the raw pattern.
-    let _parting = pty_read_to_end(master);
-    let mut status = 0;
-    if unsafe { libc::waitpid(mesh, &mut status, 0) } != mesh
-        || !libc::WIFEXITED(status)
-        || libc::WEXITSTATUS(status) != 0
-    {
+    if !stop_pty_shell(shell) {
         return 38;
     }
-    unsafe { libc::close(master) };
     0
 }
 
+/// As with `spawn_failure_harness`, the phase numbers keep their gaps: 20 is
+/// every way the session fails to start and 27 every way it fails to leave, so
+/// the phase 27 recorded in `TODO.md` still points at this harness's teardown.
 fn sigcont_harness(exec: &MeshExec) -> i32 {
-    let mut master = -1;
-    let mut slave = -1;
-    if open_pty_pair(&mut master, &mut slave) != 0
-        || unsafe { libc::setsid() } < 0
-        || unsafe { libc::ioctl(slave, mesh_platform::TIOCSCTTY, 0) } < 0
-    {
+    let Some(shell) = start_pty_shell(exec, None) else {
         return 20;
-    }
-    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
-    let mesh = unsafe { libc::fork() };
-    if mesh < 0 {
-        return 21;
-    }
-    if mesh == 0 {
-        unsafe {
-            libc::setpgid(0, 0);
-            libc::dup2(slave, libc::STDIN_FILENO);
-            libc::dup2(slave, libc::STDOUT_FILENO);
-            libc::dup2(slave, libc::STDERR_FILENO);
-            libc::close(master);
-            libc::close(slave);
-        }
-        unsafe { libc::_exit(exec_mesh(exec)) };
-    }
-    // Set the group from both sides of fork so tcsetpgrp cannot race the child.
-    if unsafe { libc::setpgid(mesh, mesh) } < 0 && unsafe { libc::getpgid(mesh) } != mesh {
-        return 28;
-    }
-    unsafe { libc::close(slave) };
-    if unsafe { libc::tcsetpgrp(master, mesh) } < 0 || !pty_wait_for_prompt(master) {
-        return 22;
-    }
-
+    };
     // Extra stages give the first process ample time to install its handler
     // before mesh finishes launching the group. An unconditional group-wide
     // SIGCONT after launch therefore makes "unsolicited" observable.
@@ -6454,43 +6377,18 @@ fn sigcont_harness(exec: &MeshExec) -> i32 {
         command.push_str(" | cat");
     }
     command.push('\n');
-    if unsafe { libc::write(master, command.as_ptr().cast(), command.len()) }
-        != command.len() as isize
-    {
+    if !pty_write(shell.master, command.as_bytes()) {
         return 23;
     }
-    let Some((output, _)) = pty_read_until_command_done(master) else {
+    let Some((output, _)) = pty_read_until_command_done(shell.master) else {
         return 24;
     };
     if output.windows(13).any(|part| part == b"unsolicited\r\n") {
         return 25;
     }
-    // `exit 0`, not a bare `exit`, because the check below is that the session
-    // *left cleanly* — and a bare `exit` leaves with the last command's status,
-    // so it also asserts that whatever ran last succeeded. That is not this
-    // harness's subject, and it is answerable by anything the terminal put on
-    // the input: a cursor-position reply arriving between the last command and
-    // this line runs as a command of its own and takes the status with it.
-    // `stop_pty_shell` has spelled it `exit 0` for this reason since it was
-    // written; these two harnesses predate it.
-    if unsafe { libc::write(master, b"exit 0\n".as_ptr().cast(), 7) } != 7 {
-        return 26;
-    }
-    // Read — and keep answering — until the session closes the pty, rather than
-    // waiting in `waitpid` with nobody at the other end. A shell on its way out
-    // paints one more prompt and asks the terminal where the cursor is; left
-    // unanswered the line editor gives up and mesh leaves with 1, so the `exit 0`
-    // above ends up not having named its status. `stop_pty_shell` learned this in
-    // 036a7f5 — these two harnesses predate it and kept the raw pattern.
-    let _parting = pty_read_to_end(master);
-    let mut status = 0;
-    if unsafe { libc::waitpid(mesh, &mut status, 0) } != mesh
-        || !libc::WIFEXITED(status)
-        || libc::WEXITSTATUS(status) != 0
-    {
+    if !stop_pty_shell(shell) {
         return 27;
     }
-    unsafe { libc::close(master) };
     0
 }
 
