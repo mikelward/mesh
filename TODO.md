@@ -9,6 +9,28 @@ file as tasks land.
 Calls autopilot made without asking, each one chosen for being cheap to undo.
 Delete an entry once you have agreed with it or reversed it.
 
+- [ ] **The flag-equality refusal was scoped to the top-level operands of
+      `==` / `!=`.** Nested pairs (`[--help] == ["--help"]`) and `in`
+      (`--help in ["--help"]`) use total equality and answer `false`. The
+      alternative is a second, fallible comparator recursively walking lists
+      and map values beside `Value::eq`, which is a large change to serve a
+      case nobody writes. Cost recorded: `in` is user-facing, so a quiet
+      `false` there is the same confusion `==` refuses, one operator over.
+      *Reversible:* widening later is possible; unwinding a recursive
+      comparator is not, which is why this went narrow.
+- [ ] **The flag-equality refusal was scoped to the `==` operator, not to
+      `Value` equality.** Codex found that making the underlying equality raise
+      breaks three things that reuse it — `:dedup` is a `HashSet<Value>` whose
+      `Eq` can only answer a bool, list `-` is defined as the same equality
+      (`DESIGN.md`:1270), and `match` literal arms are `==` under first-match
+      traversal, so a `match` with both a `"--help"` arm and a `--help` arm
+      would raise on whichever came first and make the correct one unreachable.
+      Scoping to the operator keeps all three working and still refuses the
+      case the decision was about. The alternative is to make those operations
+      fallible too, which is a much larger change and can still be made later.
+      *Reversible:* it is a scope line in an unbuilt design entry — but note it
+      leaves `==` and `match` disagreeing on this one pair, so `DESIGN.md`:3602
+      needs amending either way.
 - [ ] **#357 closed as superseded rather than rebased.** Both of its fixes had
       landed on `main` by another route while it was open — the alias routing as
       `0c00091`, the invalid-pattern fix as `9acae60` — with equivalent tests
@@ -3070,12 +3092,65 @@ thing a reader takes on trust.*
         `alpha`. That is what `g = *.md` already does with its matches, and the
         alternative — a flag holding an unevaluated value resolved at the call —
         was rejected as a closure in disguise, which mesh has nothing else like.
+
+        **The payload is one *word*, and it keeps that word's type.** Two
+        separate requirements, easily conflated into a wrong one:
+
+        - *Construction must produce a single word.* `xs = [a b];
+          x = --tag=$xs` is an error at the **assignment**, not at the call,
+          and never a stringified `a b`. This is #361's rule relocated: an
+          option's value must be one scalar, so `f(--tag=*.txt)` reports
+          rather than binding a match or dropping the option
+          (`DESIGN.md`:2957, `REFERENCE.md`:3084). Typed flags move where
+          that check runs — call site to construction site — and moving a
+          validation must not weaken it. Construction is the better place:
+          the diagnostic points at the line that made the mistake, which is
+          the whole reason the value is captured at assignment.
+        - *A payload, when there is one, stays a typed scalar rather than a
+          string.* It types the way the written word already types, because
+          dashed and named options are the same option (`DESIGN.md`:3274), so
+          `--n=2` holds the **integer** `2` — pinned today by
+          `an_attached_flag_value_is_a_typed_scalar`. Storing `"2"` would
+          break `x = --n=2; add $x` arithmetic, or force every consumer to
+          re-infer a type that was known at construction, which is the
+          opposite of what capturing it there is for.
+        - *A bare flag has **no** payload — not a boolean one.* This is the
+          "two states" of the decision above, and it must survive into the
+          value: `--force` and `--force=true` are different flags and have to
+          render as themselves. `--force` ≡ `force: true` (`DESIGN.md`:2956)
+          is what the flag means **once it binds to a switch**, not what it
+          stores; a switch is bare-only and a valued flag is attached-only
+          (`DESIGN.md`:2950), so collapsing the bare state to a boolean
+          payload would both lose that distinction and make the text form
+          print `--force=true` for a flag nobody wrote that way. Produce
+          `true` at the binding, not at construction.
       - ~~How does a flag render at the **argv boundary**?~~ **Decided: a flag has
-        a text form**, the one it was written with. `curl $x` sends `--tag=v2`,
-        `puts $x` prints it, `"$x"` interpolates it. It is a *typed* value that
-        still renders, like an integer or a glob, rather than one with no byte
-        form at all like a job handle — where there genuinely is no text to give,
-        which is not true here.
+        a text form**, the one it was written with. `curl $x` sends `--tag=v2`
+        and `"$x"` interpolates it. It is a *typed* value that still renders,
+        like an **integer**, rather than one with no byte form at all like a
+        job handle — where there genuinely is no text to give, which is not
+        true here. The integer is the only precedent to reach for: a glob is
+        the opposite one, since a pattern has no byte form either
+        (`REFERENCE.md`:935) and `argv_words` reports "a pattern cannot be a
+        command argument" rather than passing it (`repl.rs`:5708).
+
+        **Having a text form is not the same as rendering wherever it
+        appears**, and the difference falls exactly on the line the builtin
+        principle draws. `curl $x` renders because mesh does not parse an
+        external's flags — a flag reaching an external is bytes, which is the
+        byte boundary the design already draws. `"$x"` renders because a
+        string context asks for text, not for an option. But `puts $x` is a
+        **call**, and a flag in a call is an *option*: `puts` declares none
+        (`REFERENCE.md`:935 — "it takes no flags"), so `puts $x` reports,
+        exactly as a `func` with no such flag would. Write `puts "$x"` or
+        `puts $x:repr` to print one.
+
+        That is the builtin principle doing its job rather than an exception
+        to it — special-casing `puts` to print a flag is precisely the "a
+        builtin is a third kind of command" move the principle rules out. It
+        is also the type earning its keep: `puts $x` genuinely is ambiguous
+        between *print this* and *pass this option*, and refusing beats
+        guessing.
 
         The asymmetry this leaves, knowingly: a flag is the first value whose text
         form **round-trips to different semantics**. `x = --tag=v2` renders
@@ -3084,10 +3159,152 @@ thing a reader takes on trust.*
         type, moved one level down rather than removed. It is the price of the
         text form, and the text form is what keeps a flag usable at the process
         boundary, which is where flags mostly go.
-      - What do `:type` and `:repr` answer, and does `$x == "--help"` hold?
+      - ~~What does the value-type question answer, what does `:repr` write,
+        and does `$x == "--help"` hold?~~ **Decided: the value type is `flag`,
+        `:repr` writes the literal, and comparing a flag to a string is
+        refused as a type mismatch.** `$x:repr` is `--tag=v2` — the source you
+        would have typed, which is exactly what `:repr` promises.
+
+        **`:repr` is not the text form**, and a flag is the value that makes
+        the difference visible. `:repr`'s contract is round-trip *and of the
+        same type* (`DESIGN.md`:196), which is what forces `42` and `'42'`
+        apart. A flag's payload keeps the written word's type, and an
+        interpolated one stays a string — pinned by
+        `an_interpolated_flag_value_keeps_its_string_type` — so
+        `s = "2"; x = --n=$s` has a **string** payload, and `$x:repr` must
+        write `--n='2'`. Writing the rendered `--n=2` would read back as an
+        integer payload, which is the round-trip contract broken. So `:repr`
+        serializes the payload by *its own* literal form and does not reuse
+        the argv/interpolation rendering.
+
+        No new asymmetry, though — this is exactly what a plain string
+        already does: `puts $s` prints `42` where `$s:repr` writes `'42'`.
+        The flag inherits it through its payload rather than introducing it.
+
+        The **spelling** of the value-type question is not decided, only its
+        answer. `:type` is taken: it is the `find -type` word on a path
+        (`$p:type == dir`, `DESIGN.md`:3736, `REFERENCE.md`:2194). One
+        spelling answering "what kind of value is this" on a flag and "what
+        kind of file is this" on a string is itself the ambiguity this entry
+        keeps refusing elsewhere, so it wants either a separate name for the
+        value-type question or a deliberate argument that a path's file type
+        *is* its type. Nothing here should be implemented as `:type` until
+        that is settled.
+
+        `$x == "--tag=v2"` is an **error** rather than a silent `false`, and
+        this **revises the settled equality rule** rather than following from
+        it. `DESIGN.md`:1349 decides equality across mismatched nonnumeric
+        types as *false* — `1 == "1"` is false, deliberately — with
+        `1 == 1.0` the lone widening exception. A flag would be the first
+        type for which `==` can *raise*, which is a real cost and the reason
+        to name it: every comparison site becomes fallible, where today only
+        arithmetic is.
+
+        The argument for paying it: `1 == "1"` is two pieces of ordinary data
+        and "no, different things" is a useful answer. A flag against its own
+        text form is not that. The string was written *because* someone
+        believed it was the flag — the two render identically by construction
+        (see the text-form decision above), so a `false` here reads as "not
+        that flag" when the truth is "wrong question," and the mistake it
+        hides is precisely the one this type exists to surface. The rejected
+        alternatives: B, quiet `false`, is the shape behind nearly every bug
+        this family has produced — the glob falling through to positionals, a
+        wrapper rewriting an argument — something *answering* where it should
+        have refused. A, compare-equal, re-erases the distinction the type
+        exists to draw: if `x = --tag=v2` equals the string, then
+        `y = "--tag=v2"` is indistinguishable from it again at the one point
+        that asks.
+
+        **The refusal is on the `==` operator, not on `Value` equality.** This
+        is forced: `DESIGN.md`:1270 says list `-` compares elements by "the
+        same equality `:dedup` and `==` use," `:dedup` is a `HashSet<Value>`
+        (`DESIGN.md`:1357) whose `Eq` can only answer a bool, and `match`
+        literal arms are defined in terms of `==` (`DESIGN.md`:3602) under
+        first-match traversal (:3566). Make the *underlying* equality raise
+        and three things break at once: `[--help "--help"]:dedup` and
+        `[--help] - ["--help"]` have nowhere to put the error and would
+        silently answer "unequal" anyway, and a `match` with both a
+        `"--help"` arm and a `--help` arm raises on whichever comes first,
+        making the correct later arm unreachable.
+
+        So the split is operator versus mechanism. `==` and `!=` are where a
+        person states a belief, and a wrong one is worth refusing.
+        `:dedup`, list `-`, hashing and `match` dispatch are mechanisms that
+        need a total answer, and "a flag is not that string" is both true and
+        the useful one there — a `match` naming both arms is someone
+        deliberately telling them apart, which must keep working. The cost,
+        stated so it is not discovered later: `==` and `match` no longer agree
+        on this one pair, which is a real seam in a language that otherwise
+        defines arms *by* `==`. `DESIGN.md`:3602 needs amending to say so
+        rather than being left to imply the opposite.
+
+        **The refusal is exactly the top-level operand pair of `==` / `!=`.**
+        Everything else uses total equality: a nested pair
+        (`[--help] == ["--help"]`) is unequal rather than an error, and `in`
+        (`--help in ["--help"]`) is `false`. Drawing it anywhere else means a
+        second, fallible comparator that recursively walks lists and map
+        values alongside `Value::eq` — a large change to serve a case nobody
+        writes, and one that would have to answer what a *mixed* list means
+        besides. This is the narrow reading on purpose; widening later is
+        possible, unwinding a recursive comparator is not.
+
+        The cost, stated rather than discovered: `--help in ["--help"]` is
+        quietly `false`, which is the same confusion `==` refuses, one
+        operator over. `in` is user-facing, so this is a weaker seam than the
+        `match` one — it is defensible only because `in`'s right operand is a
+        collection that may hold anything, where `==`'s is a single value the
+        writer had in mind.
+
+        Still open on the other axis: whether the refusal covers **flag
+        against string only** — the confusable pair, with flag-against-integer
+        staying an ordinary `false` — or every flag-against-non-flag
+        comparison. Not guessed.
+
+        **A flag is not text, it renders — the integer pattern.** Worth
+        stating because it is easy to get backwards: `Value::eq` short-circuits
+        through `as_text` (`crates/mesh-core/src/vars.rs`:65), and it would
+        look as though a flag's text form drops it into that short-circuit and
+        forces `$x == "--tag=v2"` true. It does not. `as_text` answers for
+        values that **are** text — a string, and a styled string, which is a
+        string carrying attributes — and its own doc note says an integer is
+        "deliberately absent: `1 == \"1\"` is false in mesh and this must not
+        be the thing that changes it."
+
+        A flag belongs with the integer, not with `Styled`. It **renders** at
+        the argv and interpolation boundaries without **being** text, so
+        `as_text` returns nothing for it, `Value::eq` falls through to the
+        variant arms, and flag-against-string lands on the same `_ => false`
+        that `1 == "1"` does — which is precisely where the operator's refusal
+        goes. No hole in the short-circuit, and no conflict with `Styled`,
+        whose equal-to-its-text behavior is right for a value that really is a
+        string.
       - Does a bare `--` bind a terminator value, or stay syntax?
       - What happens to `wrapper func`, which exists to switch flag reading off —
         with typed flags there may be nothing to switch.
+
+- [ ] **Write up "an ambiguous spelling is an error" in `DESIGN.md` as a rule.**
+      It is already the answer mesh keeps reaching independently, and the repo
+      owner named it as a trend worth keeping. Genuine instances to cite:
+      `if $xs` on a list is an error rather than a length test
+      (`DESIGN.md`:3415, alongside `if 0` and `if ""`); an option value that
+      evaluates to something other than one string is reported rather than
+      joined or dropped (#361); and now a flag compared against a string.
+
+      Two things that look like instances and are **not**, worth naming in the
+      write-up so the rule is not overclaimed. `007` is not one: mesh *picks*
+      there — it is the string `007`, it binds, travels and runs as a command
+      (`DESIGN.md`:1427), and the only error is `007 + 1`, which is the
+      ordinary "a string is not a number" rule every string already follows.
+      A glob that matches nothing is not one either: it is an empty list, a
+      chosen answer rather than a refusal.
+
+      Stating the rule once makes the next case a lookup instead of a fresh
+      argument — and, more usefully, makes the *cost* explicit: every refusal
+      is a spelling somebody has to write differently, and the flag-equality
+      decision above shows the sharper version of that cost, where an operator
+      that could not previously fail becomes fallible. The rule earns its
+      place only where the two readings are genuinely both plausible. Not a
+      licence to refuse anything merely unusual.
 
 - [ ] **A modifier on a dashed word applies to the whole word, so a value call
       cannot use one on an option at all.** Found auditing 17. The underlying
