@@ -421,7 +421,7 @@ matching entry under "Beyond M3 — External tool integration" in
 | 3 | **A line-buffer API for widgets** | Same, and required *with* (2) — a binding that cannot touch the buffer is useless to fzf | Not designed. Needs: read buffer and cursor, replace, insert at cursor, accept-line, redraw after a full-screen program |
 | 4 | **`$sh.complete`, extended** | carapace, fzf-tab, dynamic completers | Map is a known TODO; the fallback key, the callable contract, and candidate descriptions are not specified |
 | 5 | **Reading structured output (JSON)** | carapace, direnv, mise, atuin | Nothing exists. The alternative is a mesh-defined line format plus upstream asks |
-| 6 | **`$env` writes under a computed key**, and a bulk env-diff apply | direnv, mise, keychain, asdf | Explicitly ruled out today; the narrowest gap here |
+| ~~6~~ | ~~**`$env` writes under a computed key**~~, and a bulk env-diff apply | direnv, mise, keychain, asdf | **Landed** for the writes: `$env[$name] = value` and `unset $env[$name]`. A bulk apply as one transaction is still unbuilt, and waits on (5) for the payload |
 | 7 | **`$sh.prompt` segment map**, multi-line external output, `fill` | starship as *a* segment rather than *the* prompt; right prompts | Designed in [`PROMPT.md`](PROMPT.md), unbuilt |
 | 8 | **A decision on generated code** — `source -` / `run`, versus data-only | Every tool's published install line | See [The bootstrap problem](#the-bootstrap-problem). Recommendation: data-first, no string `eval` |
 | 9 | **`$sh.options.complete.probe`** | Turning mesh's own probe off when carapace is authoritative | Blocked on nested keys in the flat settings map |
