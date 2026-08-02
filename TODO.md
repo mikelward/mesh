@@ -4208,11 +4208,52 @@ of each PR had landed by another route, but these pieces had not.
       To reproduce under contention, `taskset -c 0 cargo test --workspace` is
       the sharpest form, and is what surfaced the three below.
 
-- [ ] **The pty suite is flaky in CI, in more than one place.** Six distinct
-      failures now, and the pattern that matters is that they are *different
-      tests each time* — so this is one property of the harness rather than six
-      bugs, and it will keep blocking merges until it is taken as its own piece
-      of work.
+- [x] **The pty suite is flaky in CI, in more than one place.** ✅ **Closed.**
+      Eight distinct failures over its life, and the reading that kept it open —
+      *different tests each time, so one property of the harness rather than N
+      bugs* — was right about the shape and wrong about the property. It was
+      never load. Every named cause turned out to be an **ordering the harness
+      asserted instead of establishing**, and the last two were hidden by
+      diagnostics that could not tell the interesting state from the boring one.
+
+      The evidence for closing it: **seven consecutive green runs** at 24 test
+      threads pinned to one CPU — the level that produced every sighting, and
+      which used to fail seven tests per run — three on the fixing branch and
+      four on merged `main`. The two sightings still listed unfixed below
+      (`the_title_setting_turns_the_title_off_and_back_on` phase 140,
+      `vs_code_gets_its_own_dialect_and_the_command_line` phase 170) did not
+      reproduce at that level or in isolation; both went through
+      `start_pty_shell`, so the handover race explains them without needing a
+      cause of their own. They are left listed rather than struck out, since
+      "did not reproduce" is weaker than "diagnosed" — reopen this entry if
+      either returns.
+
+      What it actually was, in the order the causes fell:
+
+      1. **A sleep standing in for a signal's ordering.** `an_interrupt_
+         abandons_a_wait…` waited 400ms of silence as proof a line had been
+         submitted, then interrupted. Silence only implies that on a machine
+         that has already scheduled the shell. Fixed by waiting for the shell's
+         own `133;C` mark, and then for `SigCgt` to show the handler installed —
+         since an early SIGINT meets the ignore and is *discarded*, not queued.
+      2. **A terminal handed over to a shell that had already stopped waiting
+         for it.** `start_pty_shell` — the big one. `wait_until_foreground`
+         signals mesh's own group with SIGTTIN's default disposition, so if the
+         shell checked before the harness handed over, it suspended with nobody
+         to resume it. Fixed by waiting for the stop and *then* handing over.
+      3. **`shell_fate` asking `waitpid` without `WUNTRACED`**, which reports
+         neither a running nor a stopped child — so a suspended shell answered
+         "still running" and a deterministic bug read as a loaded machine for
+         six sightings. This is why (2) took so long to see: the diagnostic
+         could not express the answer.
+
+      The lesson worth keeping is (3) rather than any of the fixes. **Two
+      separate causes here were invisible because the harness could not report
+      the state that would have named them** — the stopped child, and earlier a
+      phase number with no line under it. Both times the fix was cheap once the
+      diagnostic could say what it saw, and both times the wrong conclusion
+      ("load") was reached confidently from evidence that never distinguished
+      it. When a flake resists, suspect the instrument before the machine.
 
       Seen on a single CPU (`taskset -c 0 cargo test --workspace`, which is the
       sharpest reproduction):
