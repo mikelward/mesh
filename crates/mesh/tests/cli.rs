@@ -4070,6 +4070,22 @@ fn start_pty_shell(exec: &MeshExec, cwd: Option<&Path>) -> Option<PtyShell> {
 /// A session speaking VS Code's dialect never writes that mark, so "wait for the
 /// prompt" has to name which prompt-end it is waiting for.
 fn start_pty_shell_ready(exec: &MeshExec, cwd: Option<&Path>, ready: &[u8]) -> Option<PtyShell> {
+    start_pty_shell_gated(exec, cwd, ready, None)
+}
+
+/// [`start_pty_shell_ready`], with a hook run after the fork and before the
+/// terminal changes hands.
+///
+/// Only [`a_shell_that_stopped_for_the_terminal_is_resumed`] passes one, so that
+/// the regression test drives *this* function rather than a copy of it — the
+/// race was here, and a test that rebuilt the startup itself would stay green if
+/// this one regressed.
+fn start_pty_shell_gated(
+    exec: &MeshExec,
+    cwd: Option<&Path>,
+    ready: &[u8],
+    before_handover: Option<&dyn Fn(libc::pid_t) -> bool>,
+) -> Option<PtyShell> {
     // Built before the fork: only async-signal-safe calls are allowed between
     // fork and exec, and allocating a `CString` is not one.
     let directory = cwd.map(|path| {
@@ -4112,8 +4128,38 @@ fn start_pty_shell_ready(exec: &MeshExec, cwd: Option<&Path>, ready: &[u8]) -> O
         return pty_start_failed("could not put the shell in its own process group");
     }
     unsafe { libc::close(slave) };
-    if unsafe { libc::tcsetpgrp(master, mesh) } < 0 {
-        return pty_start_failed("could not hand the terminal to the shell");
+
+    // Hand the terminal over only once the shell has **stopped waiting for it**,
+    // the order `background_startup_harness` uses.
+    //
+    // mesh's `wait_until_foreground` restores SIGTTIN's *default* disposition and
+    // then signals its own group, so that `mesh &` suspends until `fg`. That is
+    // right for a real job-control parent and a trap for a harness that hands the
+    // terminal over after the fork: whoever gets there first decides. Handing it
+    // over eagerly loses whenever the shell reads `tcgetpgrp` first — it then
+    // stops with nobody to resume it, writes nothing at all, and the wait below
+    // gives up with `got 0 bytes` while the shell is still alive. That is the
+    // `start_pty_shell` failure the pty flake entry in `TODO.md` called "a
+    // session that has not been scheduled far enough to speak"; it is not
+    // starvation, and a delay before the handover reproduces it every time.
+    //
+    // Signalling afterwards instead is not enough either, because the check and
+    // the self-signal are not one step: the shell can read the old foreground
+    // group, take a `tcsetpgrp` *and* a `SIGCONT`, and only then stop itself.
+    //
+    // So there is no race to win. This session leader's group is the foreground
+    // one until it says otherwise, so the shell **always** finds itself in the
+    // background and always stops; waiting for that stop and only then handing
+    // over is ordered rather than raced. Not a poll for readiness — the stop is
+    // the shell's own report that it is waiting, and `SIGCONT` is what `fg`
+    // sends.
+    if let Some(gate) = before_handover
+        && !gate(mesh)
+    {
+        return pty_start_failed("the shell never reached the state the test forced");
+    }
+    if let Err(note) = hand_terminal_to_shell(master, mesh) {
+        return pty_start_failed(&note);
     }
     let startup = match pty_read_until_one_of_seen(master, &[ready]) {
         Ok(startup) => startup,
@@ -4261,20 +4307,82 @@ fn say_from_the_harness(who: &str, why: &str) {
 /// reported as an orphan to terminate.
 fn shell_fate(mesh: libc::pid_t) -> String {
     let mut status = 0;
-    match unsafe { libc::waitpid(mesh, &mut status, libc::WNOHANG) } {
+    // `WUNTRACED`, because a *stopped* shell is the interesting case and without
+    // it the answer is indistinguishable from a running one: `waitpid` reports
+    // neither, so this said "still running" for a shell suspended on SIGTTIN and
+    // sent a real cause looking like starvation. Whatever the state, the shell is
+    // then killed and reaped — the diagnostic must not leave one behind.
+    match unsafe { libc::waitpid(mesh, &mut status, libc::WNOHANG | libc::WUNTRACED) } {
+        reaped if reaped == mesh && libc::WIFSTOPPED(status) => {
+            let stopped_on = libc::WSTOPSIG(status);
+            // SIGKILL alone leaves a stopped process stopped, so SIGCONT after it
+            // is what actually delivers the kill and lets the wait below return.
+            unsafe { libc::kill(mesh, libc::SIGKILL) };
+            unsafe { libc::kill(mesh, libc::SIGCONT) };
+            unsafe { libc::waitpid(mesh, &mut status, 0) };
+            format!("the shell is stopped on signal {stopped_on}")
+        }
         0 => {
             unsafe { libc::kill(mesh, libc::SIGKILL) };
             unsafe { libc::waitpid(mesh, &mut status, 0) };
             "the shell is still running".to_owned()
         }
-        reaped if reaped == mesh && libc::WIFEXITED(status) => {
-            format!("the shell exited with {}", libc::WEXITSTATUS(status))
-        }
-        reaped if reaped == mesh && libc::WIFSIGNALED(status) => {
-            format!("the shell was killed by signal {}", libc::WTERMSIG(status))
-        }
+        reaped if reaped == mesh => status_note(status),
         _ => format!("the shell could not be waited for (status {status:#x})"),
     }
+}
+
+/// Say what a reaped `wait` status means, so a caller that has already collected
+/// one reports the cause rather than asking again and being told `ECHILD`.
+fn status_note(status: libc::c_int) -> String {
+    if libc::WIFEXITED(status) {
+        format!("the shell exited with {}", libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        format!("the shell was killed by signal {}", libc::WTERMSIG(status))
+    } else {
+        format!("the shell reported status {status:#x}")
+    }
+}
+
+/// Wait for the shell to stop for the terminal, then give it and resume it.
+///
+/// Shared with [`a_shell_that_stopped_for_the_terminal_is_resumed`], which drives
+/// it with the interleaving forced so the ordering is covered rather than left to
+/// the scheduler.
+fn hand_terminal_to_shell(master: RawFd, mesh: libc::pid_t) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut stopped = false;
+    // A shell that died before it ever reached the stop — a failed child-side
+    // `chdir` is the likely one — is reaped *here*, so its status has to be kept
+    // to be reported. Handing the pid to [`shell_fate`] afterwards would ask
+    // about a child that no longer exists and answer `ECHILD`, turning the one
+    // diagnostic that names the cause into "could not be waited for".
+    let mut early = None;
+    while !stopped && std::time::Instant::now() < deadline {
+        let mut status = 0;
+        match unsafe { libc::waitpid(mesh, &mut status, libc::WNOHANG | libc::WUNTRACED) } {
+            reaped if reaped == mesh && libc::WIFSTOPPED(status) => stopped = true,
+            0 => std::thread::sleep(std::time::Duration::from_millis(1)),
+            reaped if reaped == mesh => {
+                early = Some(status_note(status));
+                break;
+            }
+            _ => break,
+        }
+    }
+    if !stopped {
+        return Err(format!(
+            "the shell never stopped for the terminal; {}",
+            early.unwrap_or_else(|| shell_fate(mesh))
+        ));
+    }
+    if unsafe { libc::tcsetpgrp(master, mesh) } < 0 {
+        return Err("could not hand the terminal to the shell".to_owned());
+    }
+    if unsafe { libc::kill(mesh, libc::SIGCONT) } < 0 {
+        return Err("could not continue the shell".to_owned());
+    }
+    Ok(())
 }
 
 /// Send `exit 0` and require the shell to leave cleanly, so a harness that ends
@@ -5538,6 +5646,78 @@ fn pty_read_until_the_prompt_returns(master: RawFd) -> Option<Vec<u8>> {
         answer_cursor_queries(master, &seen[fresh..]);
     }
     ready_again(&seen).map(|()| seen)
+}
+
+/// A shell that has already suspended itself waiting for the terminal still comes
+/// up once it is handed over.
+///
+/// Drives [`start_pty_shell_gated`] — the **production startup path**, where the
+/// race was — rather than rebuilding the startup here, so a regression at that
+/// call site fails this rather than sailing past a copy.
+///
+/// The interleaving is **established, not timed**: the gate waits until the shell
+/// is actually stopped. Sleeping instead would leave the test passing vacuously
+/// whenever a loaded runner had not scheduled the child yet — the shell would
+/// still be running, the handover would reach it first, and a regression to the
+/// eager version would look green. Ordinary pty tests cannot cover this either:
+/// they pass under both orders, which is how the harness raced here unnoticed
+/// through seven sightings in the flake entry.
+///
+/// The stop is read from `/proc` rather than waited for, because `waitpid`
+/// reports a stop **once** and [`hand_terminal_to_shell`] needs that report
+/// itself. Linux-only for the reason [`wait_until_reapable`] gives, which is
+/// where CI runs and where every sighting came from.
+///
+/// It fails two ways: against a handover that only calls `tcsetpgrp`, the shell
+/// is stopped and nothing resumes it, so no prompt arrives; against a handover
+/// moved back before the gate, the shell is never background, never stops, and
+/// the gate reports.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_shell_that_stopped_for_the_terminal_is_resumed() {
+    let exec = MeshExec::new(isolated_config_home());
+    // Forked like every other pty test, because `start_pty_shell_gated` takes the
+    // session and the controlling terminal of whoever calls it — from the test
+    // thread that would be the shared test process, and the job-control tests
+    // running alongside would lose theirs.
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(stopped_shell_handover_harness(&exec)) };
+    }
+    await_pty_harness(harness);
+}
+
+#[cfg(target_os = "linux")]
+fn stopped_shell_handover_harness(exec: &MeshExec) -> i32 {
+    let stopped = |mesh: libc::pid_t| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            match std::fs::read_to_string(format!("/proc/{mesh}/stat"))
+                .ok()
+                .as_deref()
+                .and_then(process_state)
+            {
+                // `T` is stopped, read the way `wait_until_reapable` reads `Z`.
+                Some('T') => return true,
+                _ => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        false
+    };
+    let Some(shell) = start_pty_shell_gated(exec, None, INPUT_READY, Some(&stopped)) else {
+        return 60;
+    };
+    if unsafe { libc::write(shell.master, b"exit\n".as_ptr().cast(), 5) } != 5 {
+        return 61;
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(shell.mesh, &mut status, 0) } != shell.mesh
+        || !libc::WIFEXITED(status)
+    {
+        return 62;
+    }
+    0
 }
 
 /// The case a setting is actually *for*: an rc file turning a decoration off, so
