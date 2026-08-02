@@ -7969,63 +7969,14 @@ fn report_cwd(enabled: bool) {
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
-    let sequence = format!("\x1b]7;{}\x1b\\", cwd_url(&hostname(), &cwd));
+    let sequence = format!(
+        "\x1b]7;{}\x1b\\",
+        crate::url::file_url(&crate::url::hostname(), &cwd)
+    );
     use std::io::Write as _;
     let mut out = io::stdout();
     let _ = out.write_all(sequence.as_bytes());
     let _ = out.flush();
-}
-
-/// The `file://host/path` URL `OSC 7` carries.
-///
-/// The host is what lets a terminal tell a local directory from one inside an
-/// `ssh` session; an empty host is a valid `file:` URL and the honest answer when
-/// the system will not say what it is called.
-///
-/// Bytes outside RFC 3986's unreserved set are percent-encoded, `/` excepted so
-/// the path keeps its structure. A path is bytes, not text — a directory whose
-/// name is not UTF-8 is still a directory to `cd` into — so this encodes the raw
-/// bytes rather than going through a lossy string first.
-fn cwd_url(host: &[u8], path: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt as _;
-    let mut url = String::from("file://");
-    percent_encode(host, &mut url);
-    percent_encode(path.as_os_str().as_bytes(), &mut url);
-    url
-}
-
-/// Percent-encode into `out`, leaving unreserved bytes and `/` as they are.
-fn percent_encode(bytes: &[u8], out: &mut String) {
-    for &byte in bytes {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
-            out.push(char::from(byte));
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-}
-
-/// This host's name for `OSC 7`, or empty when it cannot be read.
-///
-/// `$env.HOSTNAME` is not consulted: it is not in the environment a login shell
-/// is given on either platform mesh targets, and a stale exported copy would name
-/// the wrong machine after an `ssh`, which is exactly the case the host field is
-/// there to distinguish.
-fn hostname() -> Vec<u8> {
-    let mut buffer = [0_u8; 256];
-    // SAFETY: `gethostname` writes at most `buffer.len()` bytes through the
-    // pointer, which is valid and writable for exactly that many.
-    let read = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
-    if read != 0 {
-        return Vec::new();
-    }
-    // A name too long for the buffer is truncated without a NUL on some
-    // platforms, so fall back to the whole buffer when there is none.
-    let end = buffer
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(buffer.len());
-    buffer[..end].to_vec()
 }
 
 /// How long a title may get, in characters. A title bar is a handful of
@@ -8342,7 +8293,7 @@ fn environment_prompt_title() -> String {
     let user = std::env::var("USER").unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_default();
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    prompt_title(&user, &hostname(), &cwd, home.as_deref())
+    prompt_title(&user, &crate::url::hostname(), &cwd, home.as_deref())
 }
 
 /// Run `jobdone` for every job reported since the last drain, oldest first.
@@ -11980,9 +11931,9 @@ mod tests {
         Invocation, Lookup, MeshPrompt, NOTIFY_LIMIT, PromptMarkers, SemanticMark, Shell,
         StartupOptions, Step, TITLE_LIMIT, TimestampedHistory, argument_completions,
         body_awaits_close, command_line, command_notification, command_position,
-        command_segment_words, command_words, completed_command, cwd_url, deferred_words,
-        duration_words, escape_stripped_width, eval_binary, expand_history_designators,
-        expansion_word, external_stage, func_definition_is_open, handle_signal, help_completions,
+        command_segment_words, command_words, completed_command, deferred_words, duration_words,
+        escape_stripped_width, eval_binary, expand_history_designators, expansion_word,
+        external_stage, func_definition_is_open, handle_signal, help_completions,
         history_designators, history_path_from, input_highlighter, interactive_keybindings,
         interruptible_task, last_argument, mark_sequence, needs_more_input, open_history,
         path_completions_sync, persist_logical_history, prepare_history_path, prompt_title,
@@ -15478,52 +15429,5 @@ mod tests {
         // reports the trailing-text error rather than swallowing later commands.
         assert!(!func_definition_is_open("func f() {} {\n"));
         assert!(!func_definition_is_open("func f() { puts hi } extra {\n"));
-    }
-
-    #[test]
-    fn a_cwd_url_leaves_the_unreserved_set_alone() {
-        assert_eq!(
-            cwd_url(b"host", &PathBuf::from("/home/user")),
-            "file://host/home/user"
-        );
-        // `-`, `.`, `_` and `~` are unreserved, and `/` is the path's structure:
-        // encoding any of them is legal but turns a readable URL into noise.
-        assert_eq!(
-            cwd_url(b"host", &PathBuf::from("/a-b/c.d/e_f/~g")),
-            "file://host/a-b/c.d/e_f/~g"
-        );
-        // An empty host is a valid `file:` URL, and the honest answer when the
-        // system will not say what it is called.
-        assert_eq!(cwd_url(b"", &PathBuf::from("/")), "file:///");
-    }
-
-    #[test]
-    fn a_cwd_url_encodes_everything_a_reader_could_misread() {
-        // A space would end the URL, `%` would start an escape that is not one,
-        // and `#` and `?` would begin a fragment or a query — all of which a
-        // directory name is allowed to contain.
-        assert_eq!(
-            cwd_url(b"host", &PathBuf::from("/tmp/two words")),
-            "file://host/tmp/two%20words"
-        );
-        assert_eq!(
-            cwd_url(b"host", &PathBuf::from("/50%/a#b?c")),
-            "file://host/50%25/a%23b%3Fc"
-        );
-        assert_eq!(
-            cwd_url(b"host", &PathBuf::from("/tmp/café")),
-            "file://host/tmp/caf%C3%A9"
-        );
-    }
-
-    #[test]
-    fn a_cwd_url_encodes_a_path_that_is_not_utf8() {
-        // A directory whose name is not text is still a directory to `cd` into,
-        // so the bytes are encoded as they are rather than replaced on the way
-        // through a `String`.
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt as _;
-        let path = PathBuf::from(OsStr::from_bytes(b"/tmp/\xff\xfe"));
-        assert_eq!(cwd_url(b"host", &path), "file://host/tmp/%FF%FE");
     }
 }
