@@ -3278,7 +3278,143 @@ thing a reader takes on trust.*
         goes. No hole in the short-circuit, and no conflict with `Styled`,
         whose equal-to-its-text behavior is right for a value that really is a
         string.
-      - Does a bare `--` bind a terminator value, or stay syntax?
+      - ~~Does a bare `--` bind a terminator value, or stay syntax?~~
+        **Decided: a terminator value, and a `wrapper func` forwards it
+        rather than consuming it — it travels.** `--` keeps meaning what the
+        writer aimed it at, and **mesh never synthesizes one**.
+
+        Who consumes it, stated so no case is left to inference:
+
+        - **An external never consumes it** — mesh parses none of its flags,
+          so there is nothing of mesh's to end and the word is the callee's.
+          `rm -- -rf` must reach argv as `["rm", "--", "-rf"]` whether it is
+          written directly or forwarded, and the strip that removes it lives
+          inside `if builtins::is_builtin(…)` (`repl.rs`:7573), so an
+          external is already never reached by it.
+        - **Among in-shell callees, `wrapper` is the only passthrough.**
+          Everything else consumes it — a builtin reading no options, a
+          builtin that reads them, and an ordinary `func` even when it
+          declares no flags.
+
+        The case that decides it is forwarding to an external, not the direct
+        call:
+
+        ```
+        wrapper func r(...args) { rm ...$args }
+        r -- -rf
+        ```
+
+        The rejected alternative was `--` as a **bulk-quoting marker**: it
+        would demote the written words after it to text and be consumed,
+        since a text value forwards as data with no terminator needing to
+        survive. That is true right up to the first external, where it
+        fails — the type does not cross the byte boundary. A text `"--force"`
+        and a flag `--force` are the same bytes, so `r -- -rf` would send
+        `["rm", "-rf"]` and the protection the caller explicitly wrote would
+        be gone. Saving it would mean mesh **synthesizing** a `--` back, and
+        that is unacceptable three times over:
+
+        - *It has one insertion point.* `--` in argv means everything after
+          is positional, so protecting the first dashed data argument kills
+          every flag behind it. `cmd --flag $data` can be expressed
+          (`["cmd", "--flag", "--", "-x"]`); `cmd $data --flag` cannot.
+          Reordering to fix it silently changes argument order, which plenty
+          of commands care about.
+        - *Not every command implements `--`.* Inserting one where it is not
+          understood passes a literal argument nobody typed, so the safety
+          fix becomes a corruption exactly where it is least visible.
+        - *It is mesh guessing the callee's grammar*, which the `wrapper
+          func` decision already ruled out — "a wrapper cannot validate the
+          flags it forwards, it does not know the callee's grammar," so
+          validity was relocated to where the grammar is known. Synthesizing
+          a terminator is the same overreach with a friendlier face.
+
+        Under the decided rule none of those arise, because the `--` is still
+        there — the caller wrote it and nobody ate it, so `r -- -rf` forwards
+        to `["rm", "--", "-rf"]`. Mesh picks no insertion point, assumes no
+        support, guesses no grammar. Past the byte boundary the terminator is
+        the user's to write, as in every other shell.
+
+        **The passthrough is `wrapper`, not "no options."** Those are two
+        different conditions and it matters which one is written down, since
+        an implementer following the wrong one would keep `--` for `puts` and
+        for plain no-flag functions, or drop it from wrappers. Three sites
+        handle it today and only the third forwards:
+
+        - a builtin that reads **no** options has the first `--` stripped
+          centrally (`repl.rs`:7588, gated on `builtins::reads_options`), so
+          `puts -- --help` prints `--help`;
+        - a builtin that **does** read options keeps it and consumes it
+          itself, because only it knows where its options stop —
+          `kill -- -9 %1` looks for a job named `-9`;
+        - an **ordinary** `func` consumes it in `bind_arguments`
+          (`repl.rs`:8849, and :9166 for the value-call sibling) whenever
+          flag scanning is on — which it is even for a function declaring no
+          flags at all. A **`wrapper func`** is called with scanning off
+          (`call_func(name, args, !wrapper, shell)`, `repl.rs`:7313), so the
+          guard is skipped entirely and `--` lands in positionals.
+
+        So `DESIGN.md`:4577's "who has options to end" describes the two
+        *builtin* sites and does not extend to functions; the earlier claim
+        here that this was `reads_options` reaching one more case was simply
+        wrong. "Only the first `--` goes" does still cover repeats.
+
+        **What the decision actually changes is narrower than it looks**, and
+        worth stating plainly: a wrapper already forwards `--` today. But it
+        forwards it as the **string** `"--"`, which the next command position
+        re-reads as syntax — the data-decides-the-call path this family
+        exists to close, and the reason `w = "--"; f $w` would end flag
+        parsing. The terminator value preserves the behavior while removing
+        the string round-trip, so the forwarding case keeps working for a
+        reason that survives the rest of the family.
+
+        Also settled by elimination: the demotion could not have happened at
+        **parse** time anyway, since whether the callee is in-shell or
+        external is not known until dispatch.
+
+      - **What is the terminator value, exactly?** *(opened by the decision
+        above — needed before building.)* It cannot be the string `"--"`, or
+        `w = "--"; f $w` would end flag parsing and put back the
+        data-decides-the-call reading this whole family removed. So it is a
+        distinct value. Three of its edges are settled:
+
+        - **A type of its own, not a `Flag` variant.** A `--` is not a flag,
+          so the value-type question answering `flag` would be a small lie of
+          the kind this family keeps punishing; and a flag has a name and an
+          optional payload where this has neither, so folding it in gives
+          every match on a flag's name a nameless case to forget.
+        - **Named `Value::FlagTerminator`**, with the value-type question
+          answering `flag-terminator`. The short name is what mesh's prose
+          uses for `--` (`DESIGN.md`:2999, :4578) but is already overloaded
+          in this repo — **statement** terminator at :3516, :3681 and :5282,
+          and the split sense at :251 ("the delimiter is a terminator, not a
+          separator") — so it needs the qualifier. Prior art does not supply
+          a better one: POSIX gives `--` no single-word name, describing it
+          as a *delimiter* marking the *end of options*, and `delimiter` is
+          exactly the word :251 has already spent. `EndOfOptions` was
+          rejected for saying *options* where mesh predominantly says
+          *flags*, and `FlagSentinel` for being implementation jargon rather
+          than a name for the thing someone typed. *Low conviction on the
+          spelling — renaming it later overturns nothing, since the
+          substantive call is the bullet above.*
+        - **`puts` swallows one; it is never printed.** The decision, but
+          **not** something the existing strip gives for free — the two
+          spellings take different paths and only one of them is covered
+          today. A *written* `puts -- --help` expands to the scalar string
+          `"--"` and meets the central strip in `run_expanded`. A
+          terminator *value* (`x = --; puts $x`) never gets there:
+          `stage_argument` routes `puts` through `output_words`
+          (`repl.rs`:7349), which sends any non-scalar to
+          `rendered_for_output` **during expansion**, so a
+          `Value::FlagTerminator` would be asked for a byte form before the
+          strip runs at all. Implementing this means consuming the typed
+          terminator ahead of `output_words`, not relying on `run_expanded`.
+          The byte-form question does arise here; the decision is that the
+          answer is to consume rather than to render.
+
+        Still open: what `:repr` writes, and how it renders at the argv
+        boundary — it must, for the forwarding case above to work — without
+        reintroducing the `puts $x` problem the text-form decision hit.
       - What happens to `wrapper func`, which exists to switch flag reading off —
         with typed flags there may be nothing to switch.
 
