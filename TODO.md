@@ -3255,10 +3255,86 @@ thing a reader takes on trust.*
         collection that may hold anything, where `==`'s is a single value the
         writer had in mind.
 
-        Still open on the other axis: whether the refusal covers **flag
-        against string only** — the confusable pair, with flag-against-integer
-        staying an ordinary `false` — or every flag-against-non-flag
-        comparison. Not guessed.
+        ~~Still open on the other axis: whether the refusal covers flag
+        against string only, or every flag-against-non-flag comparison.~~
+        **Decided: every flag-against-non-flag comparison refuses**, not just
+        the confusable string pair. `$x == 7` reports as readily as
+        `$x == "--tag=v2"`.
+
+        The narrow version was the cheaper guess and the wide one is the
+        better rule. "Refuse where the two could be confused" needs a judgment
+        about *which* pairs are confusable, and that judgment has to be made
+        again for every type added later; "a flag compares to flags" needs
+        none. It is also the shape the type already has everywhere else —
+        `:type` answers `flag`, `:repr` writes the literal — so equality
+        stopping at the type boundary is the same line drawn once more rather
+        than a special case for strings.
+
+        This is affordable *because* of the constructor below. Refusing the
+        whole cross-type family would be hostile if there were no way to get a
+        flag out of data; there is.
+
+      - **`flag()` builds a flag from a string** *(decided — the escape hatch
+        the typed family needs).* `flag("--force")` is the flag `--force`, and
+        `flag($w)` is how a program turns data into an option deliberately.
+
+        This is the piece that was missing. The type's whole point is that
+        `a = "--help"` is text and cannot bind — decidable at the assignment
+        rather than guessed from characters — but a shell genuinely does need
+        to build options from data sometimes: a flag read from a config file,
+        chosen by a branch, assembled from a name. Without a constructor the
+        only answers were "write it literally" or "give up", and the second is
+        what made the wide equality refusal above look harsh. With one, the
+        rule reads as *say which you mean* rather than as a prohibition.
+
+        It follows `re()`, which is the same move for the same reason: a regex
+        is a type, `/…/` is the literal, and `re($x)` is how a string becomes
+        one on purpose. `re()` is also the precedent for the failure
+        behavior — it is **fail-loud**, so `flag()` should be too.
+
+        The spelling is **decided rather than open**, since the example above
+        would otherwise not be normative and an implementer could not tell
+        which input it accepts. `flag()` takes **the text you would have
+        written** — `flag("--force")`, dashes included — matching `re()`,
+        which takes the pattern's own source rather than some pre-parsed
+        shape. The alternative, `flag("force")` naming the option without its
+        dashes, reads better for assembly (`flag($name)`) but breaks the
+        property the type exists for: the string in hand would not be the
+        thing that renders. Reversible if assembly turns out to dominate — it
+        is one parse — but the argument is not close enough to leave hanging.
+
+        **The name reserves itself, and that is a real cost.** A built-in
+        value call takes its name out of the function namespace:
+        `RESERVED_FUNCTION_NAMES` (`crates/mesh-core/src/parser.rs`:2560) is
+        checked by `definition_name_problem`
+        (`crates/mesh-core/src/repl.rs`:1196), so adding `flag` turns
+        `func flag(…)` into a definition error — "`flag` is a built-in value
+        call and cannot be a function name". Worth being precise about the
+        shape: it is neither a silent hijack nor a function that defines and
+        then never runs, but a rejection at the definition, and the only
+        migration is renaming the function, since a reserved name has no
+        alternate call spelling.
+
+        **Keep the name.** The set already reserves words at least as
+        ordinary — `glob`, `files`, `dirs`, `link` — so this is not a new kind
+        of imposition, and a constructor named anything but its type costs
+        every reader a lookup to spare a function that may not exist. Nothing
+        has shipped, so the break reaches only configs written against an
+        unreleased language. Reversible while the type is unbuilt: renaming a
+        constructor is one edit here and one in the reserved list.
+
+        Open, and worth settling before it is built:
+
+        - **Does it take a payload?** `flag("--tag=v2")` producing a flag with
+          value `v2` falls out of the spelling above; the split form
+          `flag("tag", "v2")` does not, and would need its own rules.
+        - **What does it refuse?** A string that is not flag-shaped
+          (`flag("force")` without its dashes, `flag("")`, `flag("-x")` while
+          short flags are unbuilt) must report rather than invent a flag —
+          the family's rule, and `re()`'s.
+        - **Does `flag("--")` make a terminator?** It should not: a terminator
+          is [its own type](#), not a flag, so this either refuses or a
+          separate constructor makes one. Refusing is the smaller claim.
 
         **A flag is not text, it renders — the integer pattern.** Worth
         stating because it is easy to get backwards: `Value::eq` short-circuits
