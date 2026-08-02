@@ -3412,11 +3412,114 @@ thing a reader takes on trust.*
           The byte-form question does arise here; the decision is that the
           answer is to consume rather than to render.
 
-        Still open: what `:repr` writes, and how it renders at the argv
-        boundary — it must, for the forwarding case above to work — without
-        reintroducing the `puts $x` problem the text-form decision hit.
-      - What happens to `wrapper func`, which exists to switch flag reading off —
-        with typed flags there may be nothing to switch.
+        ~~Still open: what `:repr` writes, and how it renders at the argv
+        boundary.~~ **Decided: `:repr` writes `--`, and so does string
+        interpolation.** `--` parses back to a terminator, so it satisfies
+        `:repr`'s round-trip *and same type* contract; refusing is for values
+        with no literal form, and this plainly has one. `"$t"` renders `--`
+        too, matching what a flag does in a string context, with the same
+        consequence knowingly accepted: the string that comes back is
+        **data**, so `s = "$t"; f $s` passes the text and ends nothing.
+
+      - ~~What happens to `wrapper func`, which exists to switch flag reading
+        off — with typed flags there may be nothing to switch.~~ **Decided:
+        only a `wrapper func` sees the terminator.** An ordinary `func`
+        consumes it, as it does today. A wrapper does not consume it — it
+        **binds it positionally**, like any other argument, so it reaches
+        `...rest` only when the signature puts it there.
+        `wrapper func g(first, ...rest); g -- x` binds `--` to `first`, which
+        is `a_wrapper_func_still_binds_its_positionals` holding: disabling
+        flag parsing does not disable the signature. *Open to reconsideration
+        — see the cost below.*
+
+        The argument is that this keeps `wrapper` a **single concept**:
+        *I do not interpret argument syntax, I pass it on.* It already
+        switches flag scanning off, so having the same act switch terminator
+        consumption off means one switch rather than two rules that must
+        agree — the `text_globs`/`segments_glob` lesson applied before the
+        drift instead of after.
+
+        Who does what, since the three cases differ and the differences are
+        the point:
+
+        - **External** — mesh passes `--` through untouched and takes no view
+          of it. What it *means* is the callee's business: most programs strip
+          it, some treat it as an ordinary operand, and some do not implement
+          it at all — which is the same caveat this entry already gives above
+          for why mesh must never synthesize one. Saying "its `getopt` strips
+          it" would assume a convention mesh has no way to check.
+        - **Builtin** — consumed, and it should be consumed **once**, by
+          whatever processes options, rather than hand-rolled per builtin.
+          Today it is scattered: `repl.rs`:7588 strips centrally for a builtin
+          reading no options, and several places compare the word
+          themselves — `command_line` (`repl.rs`:7478), `configure_hook` for
+          `on` (:7759), `configure_prompt` (:7718),
+          `whence::parse` for `type` (`whence.rs`:281), `Jobs::disown`
+          (`exec.rs`:538), and `kill`, which has two of its own: the
+          opens-the-arguments case (`exec.rs`:2335) and `skip_terminator`
+          (:2352) for the one that follows a signal.
+
+          So this is a **repo-wide migration, not a tidy-up of two builtins**,
+          and the sweep is the work. `grep -rn '"--"'` finds 43 hits across
+          `repl.rs`, `exec.rs`, `whence.rs`, `funcs.rs`, `parser.rs` and
+          `completion.rs`; the list above will go stale, the grep will not.
+
+          **But the sweep is narrower than the grep.** Only the sites that
+          consume a **runtime argument** change, because only those can be
+          handed a `Value::FlagTerminator`; the rest read *text* and must stay
+          string-based. `parser.rs`:3654 strips the `--` off a declared flag
+          name in source, `repl.rs`:11079 asks whether the line being
+          completed was terminated, and `completion.rs` matches prefixes of
+          what was typed — none of them ever sees a value, and rewriting them
+          would break syntax and completion for nothing. Read the grep as
+          *audit* every hit, *migrate* the runtime consumers.
+
+          What makes the audit necessary rather than optional is the failure
+          mode: a runtime consumer left comparing the string keeps working on
+          strings and **silently diverges** from a typed terminator instead of
+          failing to compile.
+
+          **And migrating those consumers is not enough on its own, because a
+          builtin never sees a value today.** `expand_stage` sends every
+          non-function through `stage_argument`, which answers `Vec<String>`
+          (`repl.rs`:7260), and `run_expanded` therefore dispatches every
+          builtin from strings (:7539). A typed terminator handed to `kill`,
+          `on` or `type` is flattened back to `"--"` before any of the
+          inventoried consumers could tell it from string data — so migrating
+          them would change nothing. Either the typed value has to survive
+          builtin dispatch, or it has to be consumed by a shared typed option
+          processor *before* the flattening. This is the same shape as the
+          `puts` case above, where `output_words` renders during expansion:
+          the string boundary sits earlier than it looks, and both times the
+          plan has to name where the typed value stops.
+        - **Function** — an ordinary one consumes it (`bind_arguments`,
+          `repl.rs`:8849, whenever scanning is on); a `wrapper` does not.
+
+        **The cost, which is why this is open.** A plain `func` that forwards
+        without being declared a wrapper loses the caller's terminator
+        silently:
+
+        ```
+        func co(...args) { vcs checkout ...$args }
+        co -- -weird-file
+        ```
+
+        `co` eats the `--`, `-weird-file` reaches `...args` as a string, and
+        `vcs`'s own `getopt` reads it as a flag — the protection the caller
+        wrote is gone, and the failure surfaces at the external, which is the
+        worst place to find it. Two things soften it: `wrapper func` and
+        `alias` exist for exactly this and are the documented way to forward,
+        and a plain func normally *catches* the mistake, since an undeclared
+        flag is a loud error — it is the `--` itself that lets the caller past
+        that check.
+
+        What remains is a call-site asymmetry: `rm -- $f` protects,
+        `myrm -- $f` does not, and the caller cannot tell which without
+        reading the definition. That is mitigated rather than removed by flag
+        *declarations* already working that way. If this proves to bite, the
+        alternative is that every func forwards the terminator — bought at the
+        price of `--` appearing as a stray positional in functions that never
+        forward.
 
 - [ ] **Write up "an ambiguous spelling is an error" in `DESIGN.md` as a rule.**
       It is already the answer mesh keeps reaching independently, and the repo

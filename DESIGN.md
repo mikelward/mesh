@@ -4574,12 +4574,22 @@ owns can know more than the bytes. Two rules with a stated reason, never three.
   `a = "--help"` is text. Decidability then sits at the assignment, as it already
   does for `x = 7` against `x = 007` and for `g = *.md`. `TODO.md` carries the
   design and its open questions.)*
-- **`--` ends the options and is consumed.** Who consumes it depends on who has
+- **`--` ends the options and is consumed** *(under revision — see the `Flag`
+  value entry in [`TODO.md`](TODO.md))*. Who consumes it depends on who has
   options to end: a command **with** options owns its terminator, because only it
   knows where its options stop (`kill -- -9 %1` looks for a job named `-9`;
   `prompt -- --reset` sets that text), while for a command with **no** options there
   is nothing to end, so the terminator is removed before it is reached. Either way
   only the *first* `--` goes, so a literal one stays writable after it.
+
+  *Two parts of that are being replaced. "Who has options to end" describes the
+  two **built-in** cases and does not reach functions: an ordinary `func`
+  consumes the terminator whenever flag scanning is on, which it is even for a
+  signature declaring no flags. And a **`wrapper func`** — which has no options
+  and so would be "removed before it is reached" under the rule above — does the
+  opposite: it never consumes the terminator and binds it positionally, because
+  a wrapper does not interpret argument syntax at all. The rule as written is
+  right for built-ins and wrong for both kinds of function.*
 
 **Generation is lazy.** A spec is generated the first time you complete
 *arguments* for a command with no spec yet, then cached, so later Tabs never
