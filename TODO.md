@@ -4304,6 +4304,14 @@ of each PR had landed by another route, but these pieces had not.
       "did not reproduce" is weaker than "diagnosed" — reopen this entry if
       either returns.
 
+      The `new_foreground_job_does_not_receive_sigcont` phase-22 sighting sits
+      between the two: the step it named survives in history and did contain
+      the handover race, but the phase code fires on either of two conditions
+      and the state that would have settled it was unreportable at the time,
+      so it is **inferred rather than diagnosed**. Its bullet below used to
+      conclude "the family is not closed", which is what this header
+      supersedes — the conclusion, not the sighting's standing as evidence.
+
       What it actually was, in the order the causes fell:
 
       1. **A sleep standing in for a signal's ordering.** `an_interrupt_
@@ -4371,10 +4379,44 @@ of each PR had landed by another route, but these pieces had not.
         and the shell did not leave cleanly.
       - `notify_reaches_the_terminal_and_a_quick_command_does_not`.
       - `new_foreground_job_does_not_receive_sigcont` again, phase **22**, on
-        mikelward/mesh#351 — a **new** phase for this test, so the `exit 0`
-        teardown fix above did not cover it and the family is not closed. Passed
-        three consecutive local runs and the branch touches only value-call
-        option scanning, so it is the runner rather than the change.
+        mikelward/mesh#351 — **best explained by the `start_pty_shell`
+        handover race, but inferred rather than diagnosed.** Recorded at the
+        time as "a new phase for this test, so the `exit 0` teardown fix did
+        not cover it and the family is not closed", and attributed to the
+        runner. The first half was right; the "not closed" conclusion is
+        superseded, and the attribution is now the race rather than the
+        machine.
+
+        What the evidence supports and what it does not: the step **did**
+        contain the race, which is a fact about the code. But phase 22 fires
+        on either of its two conditions, so the code alone does not say which,
+        and a start failure, a hang or a timeout would report identically. The
+        state that would have settled it — a shell stopped on SIGTTIN — was
+        exactly what `shell_fate` could not report until this family was
+        fixed, so no such evidence exists for this sighting and none can be
+        recovered.
+
+        Phase 22 no longer exists — `307df4a` folded this harness onto the
+        shared session helpers — but the step it named is on the record, and it
+        is the race exactly:
+
+        ```
+        if unsafe { libc::tcsetpgrp(master, mesh) } < 0 || !pty_wait_for_prompt(master) {
+            return 22;
+        }
+        ```
+
+        Hand the terminal over, then wait for a prompt, with no wait for the
+        stop and no `SIGCONT`. A shell that had already suspended itself on
+        SIGTTIN never speaks again, so the prompt never arrives. That is the
+        cause fixed in mikelward/mesh#368, and it explains why the sighting
+        looked like the runner: the failure needs only the wrong scheduling
+        order, which a loaded machine makes likelier without being the cause.
+
+        So this sits between the two categories: stronger than the phase-140
+        and phase-170 sightings, which have no identified mechanism at all,
+        and weaker than the causes named in the header, which were reproduced
+        on demand.
       - ~~`an_interrupt_abandons_a_wait_and_leaves_the_jobs_alone`, phase
         **48**, on mikelward/mesh#366~~ — **fixed**, and it was a real race in
         the harness rather than a starved machine. A **seventh** distinct
