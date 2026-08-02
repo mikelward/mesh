@@ -4662,6 +4662,62 @@ fn wait_until_reapable(pid: u32) -> bool {
     false
 }
 
+/// Wait until the shell is **catching** SIGINT rather than ignoring it.
+///
+/// An interactive mesh ignores SIGINT while it owns the terminal, and only a
+/// blocking builtin installs a handler (`exec::SigintCatcher`). A signal sent
+/// before that install meets the ignore and is *discarded* rather than held, so
+/// a harness that interrupts a `wait` has to know the handler is in place — and
+/// nothing is printed when one is, since a wait that announced itself would
+/// spoil the very output the test reads.
+///
+/// The kernel publishes it. `/proc/<pid>/status` carries `SigIgn` and `SigCgt`
+/// masks, and installing moves SIGINT from the first to the second: measured on
+/// this test, `SigIgn` goes `…285007` → `…285005` and `SigCgt` `…440` → `…442`,
+/// which is bit 1 — signal 2 — changing hands.
+///
+/// A missing entry answers yes, which is a **known gap rather than a covered
+/// case** — unlike [`wait_until_reapable`], where a fifo still answers when
+/// `/proc` does not, there is no second mechanism here. Off Linux the
+/// [`COMMAND_START`] wait stands alone, and it cannot close this window: the
+/// mark precedes preexec, parsing and dispatch, and the install follows all
+/// three.
+///
+/// Two things bound the cost. It is **strictly better than what it replaced** —
+/// 400ms of silence did not close the window either, and did not even establish
+/// the submission this does — so no platform regresses. And it can only produce
+/// a *flake*, never a false pass: an unobserved handler means the signal is
+/// discarded and phase 48 reports, which is the loud outcome. Linux is where CI
+/// runs the sharp version of this suite and where every sighting in the flake
+/// entry was seen; the residual non-Linux window is recorded there rather than
+/// left implied.
+///
+/// Closing it portably wants the same masks from `sysctl`'s `kinfo_proc`
+/// (`p_sigignore` / `p_sigcatch`) on the BSDs. That is deliberately not written
+/// blind here: it cannot be exercised from this machine, and untested `unsafe`
+/// for a platform nobody has reproduced a failure on is a worse trade than a
+/// documented gap.
+fn wait_until_sigint_caught(pid: libc::pid_t) -> bool {
+    const SIGINT_BIT: u64 = 1 << (libc::SIGINT - 1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return true;
+        };
+        let caught = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigCgt:"))
+            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok());
+        match caught {
+            // No such field is the no-`/proc` case again, read one layer in.
+            None => return true,
+            Some(mask) if mask & SIGINT_BIT != 0 => return true,
+            Some(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+        }
+    }
+    false
+}
+
 /// The same wait, for the handler to run — mesh has no `/proc` reader, so it
 /// asks a shell.
 ///
@@ -6615,27 +6671,39 @@ fn wait_interrupt_harness(exec: &MeshExec) -> i32 {
             return 45;
         }
 
-        let mut seen = Vec::new();
         // Let the line reach the shell before interrupting anything. Until
         // reedline hands the terminal back, Ctrl-C is a keystroke that cancels
         // the line rather than a signal, so an eager one would interrupt nothing
-        // and leave the wait unstarted. The repaint stops once the line is
-        // submitted, so silence is the evidence that it has been. This also
-        // drains whatever the previous round left unread.
-        loop {
-            if unsafe { libc::poll(&mut ready, 1, 400) } <= 0 {
-                break;
-            }
-            let mut chunk = [0_u8; 256];
-            let count = unsafe { libc::read(master, chunk.as_mut_ptr().cast(), chunk.len()) };
-            if count <= 0 {
-                return 53;
-            }
-            let fresh = seen.len().saturating_sub(3);
-            seen.extend_from_slice(&chunk[..count as usize]);
-            answer_cursor_queries(master, &seen[fresh..]);
+        // and leave the wait unstarted.
+        //
+        // [`COMMAND_START`] is written at exactly that handover, so waiting for
+        // it *states* the ordering. This used to wait for 400ms of silence and
+        // infer the same thing, which is only true on a machine that has already
+        // scheduled the shell — on a loaded one the quiet means the line has not
+        // been read yet, the interrupt lands on nothing, and the wait never
+        // starts. That is the phase-48 failure this test contributed to the pty
+        // flake entry in `TODO.md`.
+        if pty_read_until_one_of(master, &[COMMAND_START]).is_none() {
+            return 53;
         }
-        seen.clear();
+        let mut seen = Vec::new();
+
+        // [`COMMAND_START`] says the line was submitted, but not that the wait is
+        // ready to be interrupted: the mark is written before preexec hooks,
+        // parsing and dispatch, and `wait` installs its handler after all three.
+        // A signal landing in that gap meets the shell's *ignored* disposition
+        // and is discarded rather than held, so the wait would then block with
+        // nothing left to interrupt it — which is phase 48 again by a second
+        // route.
+        //
+        // So wait for the handler itself. That keeps the interrupt **single**,
+        // which is the claim this test exists to make: sending more until one
+        // sticks would pass just as well against a `wait` that ignored its first
+        // Ctrl-C and answered a later one, and that regression has to stay
+        // visible.
+        if !wait_until_sigint_caught(mesh) {
+            return 54;
+        }
 
         // One SIGINT, delivered the way the terminal would deliver it. Nothing
         // is printed on entering the wait, so the *failed* prompt is the evidence
@@ -6993,6 +7061,16 @@ const INPUT_READY: &[u8] = b"\x1b]133;B\x1b\\";
 /// `D` — the command ended, with its status. The shell writes it once, at the
 /// transition, so unlike a prompt it cannot be seen twice for one command.
 const COMMAND_DONE: &[u8] = b"\x1b]133;D;";
+
+/// `C` — the line was submitted and the command is starting.
+///
+/// The mark a harness wants before it interrupts something: it is written after
+/// reedline has handed the terminal back, so up to this point a Ctrl-C is a
+/// keystroke that cancels the line rather than a signal that reaches the
+/// command. Waiting for the mark states that ordering; waiting for *silence*
+/// only guesses at it, and guesses wrong on a machine that has not scheduled
+/// the shell yet.
+const COMMAND_START: &[u8] = b"\x1b]133;C\x1b\\";
 
 /// Act as the small piece of terminal-emulator behavior reedline needs while
 /// waiting for the shell to start taking input.
