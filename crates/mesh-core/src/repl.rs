@@ -1165,6 +1165,26 @@ fn located(text: &str, offset: usize, shell: &Shell) -> String {
 /// Parse and run one input unit against the session. `in_function` is true while
 /// running a function body: there a `return` unwinds; at top level it is a
 /// recoverable error.
+/// The names `func` refuses beyond the ones something else already claims.
+///
+/// Not derived from `builtins::RESERVED_WORDS`, and **not because the current
+/// set is right** — which names belong here is undecided (`TODO.md`, "Which
+/// names `func` should refuse"). Deriving it from `Claim::Command` would change
+/// behavior in two different directions at once, which is why a refactor is the
+/// wrong place to do it:
+///
+/// - `fork` and `and` are *contextual*, so `func fork()` defines **and is
+///   callable** — `a_command_named_fork_is_still_reachable` pins that. Refusing
+///   them would break working definitions.
+/// - `if` is taken in command position, so `func if()` defines and can never be
+///   called: a bare `if` is a syntax error, not a lookup. Refusing it would
+///   break nothing and would turn a silently dead definition into a message.
+///
+/// The second is a real improvement and the first is a regression, so the list
+/// stays as it is until that question is answered rather than being settled
+/// here by side effect.
+const INHERITED_RESERVED_NAMES: &[&str] = &["func", "return", "fail", "not"];
+
 /// Why `name` cannot name a `func` or an `alias`, or `None` when it can.
 ///
 /// **One rule, one moment, one blast radius.** These four questions used to be
@@ -1188,7 +1208,7 @@ fn located(text: &str, offset: usize, shell: &Shell) -> String {
 /// - anything else that is not a name at all, `_` — which is the discard — first,
 ///   since "not a name" is unhelpful for a word the reader chose deliberately.
 fn definition_name_problem(name: &str) -> Option<String> {
-    if matches!(name, "func" | "return" | "fail" | "not") || builtins::is_builtin(name) {
+    if INHERITED_RESERVED_NAMES.contains(&name) || builtins::is_builtin(name) {
         return Some(format!(
             "`{name}` is a reserved name and cannot be a function name"
         ));
@@ -10936,7 +10956,7 @@ impl CompletionState {
         // its own, so both had to be added by name.
         let mut names = commands.clone();
         names.extend(variables.iter().map(|(name, _)| name.clone()));
-        names.extend(builtins::SYNTAX_WORDS.iter().map(|word| (*word).to_owned()));
+        names.extend(builtins::syntax_words().map(str::to_owned));
         names.extend(environ::names());
         names.sort();
         names.dedup();

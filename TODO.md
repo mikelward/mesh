@@ -549,14 +549,14 @@ Delete an entry once you have agreed with it or reversed it.
           place for something a language feature now depends on". A test pins
           `COMMAND_KEYWORDS ⊆ SYNTAX_WORDS`.
 
-          The **drift** half is not done, and marking it so would have removed
-          real work. The words are still written out separately in `SYNTAX`,
-          `SYNTAX_WORDS` and `COMMAND_KEYWORDS` (`builtins.rs`), in
-          `RESERVED_FUNCTION_NAMES` (`parser.rs`:2560), and as literals in
-          `definition_name_problem` (`repl.rs`:1191) — five places, none derived
-          from another. A new reserved word still needs coordinated edits, and
-          the subset test catches only a keyword missing from `SYNTAX_WORDS`,
-          not a parser word missing from both.
+          The **drift** half was not done at the time, and marking it so would
+          have removed real work: the words were written out separately in
+          `SYNTAX`, `SYNTAX_WORDS` and `COMMAND_KEYWORDS` (`builtins.rs`), in
+          `RESERVED_FUNCTION_NAMES` (`parser.rs`), and as literals in
+          `definition_name_problem` (`repl.rs`) — five places, none derived from
+          another. **Since done**, in the entry above: one `RESERVED_WORDS` table
+          with the three views derived from it. What remains is the parser's own
+          `self.word("…")` arms, which the table mirrors but does not drive.
         - **Option A is what shipped**, for the open question the entry leaves
           on resolution order. `type -t if` answers `keyword`, so a bare command
           keyword is reported as syntax rather than resolved past. Evidence, not
@@ -2194,10 +2194,41 @@ designed, and the cross-references say where the fuller note lives.
         (9 call sites) or give `Vars` a view of the defined names. Both paths
         have to land together: a modifier whose answer depends on where it is
         written is the failure this one exists to prevent.
-  - [ ] **Prerequisite: one table, three views — not one predicate.** The three
-        callers ask three different questions, and `and` separates all of them:
-        `help and` must answer, `func and()` is allowed, `and:kind` is not
-        `keyword`. So the views stay distinct:
+  - [x] **Prerequisite: one table, three views — not one predicate.** *Built.*
+        `RESERVED_WORDS` (`builtins.rs`) is one row per reserved word carrying a
+        `Claim` — `Command`, `Contextual` or `ValueCall` — and the three views
+        are derived from it: `syntax_words()` for `help`'s coverage and
+        completion, `is_command_keyword` for `whence` and `:kind`'s `keyword`,
+        `is_value_call` for `func`'s refusal of the value names.
+        `RESERVED_FUNCTION_NAMES` is gone and `parser::value_builtin` delegates.
+        The views stayed distinct as this entry insisted, and `and` still
+        separates all three.
+
+        **What the table caught on the way in.** `fail` was missing from *both*
+        lists it replaces, though the parser takes it in command position on the
+        same line as `return` / `break` / `continue`. So `help fail` answered
+        "not a builtin or a keyword" and `type fail` reported not-found, about a
+        word whose bare form is control flow — exactly the false answer this
+        machinery exists to prevent, sitting in the tree the whole time. Fixed
+        with the table: a `Claim::Command` row and a `SYNTAX` row.
+
+        **What is still written twice.** The parser's own `self.word("…")` arms
+        still spell the words out, and nothing checks a parser arm against the
+        table — which is how `fail` went missing and why finding it took a
+        reviewer rather than a test. A new keyword is three edits, not one
+        (parser arm, table row, `SYNTAX` row), down from five;
+        `every_keyword_the_parser_reserves_is_explained` covers the
+        table→`SYNTAX` leg and nothing covers parser→table. Closing it needs the
+        parser to consult the table, a bigger change than this entry asked for.
+
+        `func`'s policy names are now `INHERITED_RESERVED_NAMES` (`repl.rs`) —
+        named rather than a bare `matches!`, and left underived. Not because the
+        current set is right; see the open question below.
+
+        The original reasoning, kept because it is what the shape has to answer
+        for: the three callers ask three different questions, and `and`
+        separates all of them — `help and` must answer, `func and()` is allowed,
+        `and:kind` is not `keyword`. So the views stay distinct:
 
         | asks | set |
         |---|---|
@@ -2225,6 +2256,34 @@ designed, and the cross-references say where the fuller note lives.
         each view from it, so a new keyword is added once. Demote the test to a
         consumer. Do **not** collapse the views into a single predicate: that
         either misclassifies `and` as `keyword` or stops documenting it.
+  - [ ] **Which names `func` should refuse — undecided, not settled.**
+        `INHERITED_RESERVED_NAMES` is `func` / `return` / `fail` / `not` today.
+        That set is inherited, not chosen: entry 27 changed the *shape* of the
+        refusal and says in as many words that "which names are refused" did not
+        change. Nothing has decided it since, so the current behavior is the
+        question, not the answer.
+
+        The two directions differ, which is why one rule cannot cover both:
+
+        - **Contextual words** (`fork`, `and`, `unless`, `with`, …).
+          `func fork()` defines **and is callable** — a bare `fork` reaches it,
+          which `a_command_named_fork_is_still_reachable` pins. Refusing these
+          would break working definitions.
+        - **Command keywords** (`if`, `for`, `while`, `match`, `loop`, `break`,
+          `continue`, `global`, `unset`, `export`). `func if()` defines
+          successfully and can **never be called**: a bare `if` is a syntax
+          error (`empty command in a pipeline`), not a lookup. The definition is
+          silently dead — the shell accepts something that cannot ever run.
+
+        So the live question is only about the second group: refuse them, so a
+        dead definition reports at the point it is written, or keep accepting
+        them? Refusing breaks nothing that works, and the cost of the status quo
+        is a reader who defines `func if()` and never learns why it does not
+        run. Against it: a blanket refusal has to be checked word by word, since
+        `return` runs the other way — only a *bare* `return` is control flow.
+
+        Deliberately not decided by the table refactor, which preserved the
+        current set rather than settling this by side effect.
   - [ ] **Do not use `syntax_help(name).is_some()` as the oracle.** It is off by
         exactly one: `cmd` is registered as a documentation placeholder for an
         ordinary command line (`builtins.rs:203`) and is reserved by nobody, so
