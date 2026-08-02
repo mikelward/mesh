@@ -1726,6 +1726,43 @@ pub(crate) fn get_value(value: Value, key: Value, default: Value) -> Result<Valu
     }
 }
 
+/// `:has(VALUE)` — membership, the decided spelling (`DESIGN.md` §"Maps"). A map
+/// answers whether the **key** is present and a list whether any element equals
+/// the value — the same two questions `in` asks of each subject, by the same
+/// equality, so the operator and the modifier cannot come to disagree.
+///
+/// Asking a map with anything but a string is a loud error rather than a quiet
+/// `false`, matching `:get`: a key of the wrong *type* is a mistake in the
+/// program, not an absence in the data.
+pub(crate) fn has_value(value: Value, needle: Value) -> Result<Value, ExpandError> {
+    let fail = |message: String| ExpandError::Modifier {
+        name: "has".into(),
+        message,
+    };
+    // Flattened like `:get`'s key: display attributes are rendering-only, so a
+    // styled needle asks about the text it shows.
+    let needle = needle.plain();
+    match value.plain() {
+        Value::Map(entries) => {
+            let key = match needle {
+                Value::String(key) => key,
+                other => {
+                    return Err(fail(format!(
+                        "a map key is a string, got {}",
+                        value_kind(&other)
+                    )));
+                }
+            };
+            Ok(Value::Boolean(entries.iter().any(|(name, _)| *name == key)))
+        }
+        Value::List(values) => Ok(Value::Boolean(values.contains(&needle))),
+        other => Err(fail(format!(
+            "requires a map or a list, got {}",
+            value_kind(&other)
+        ))),
+    }
+}
+
 /// The word a diagnostic uses for a value's type. Local to the modifiers here so
 /// they can name what they were handed without reaching into the runtime.
 pub(crate) fn value_kind(value: &Value) -> &'static str {
@@ -2060,7 +2097,7 @@ pub(crate) fn text_globs(text: &str) -> bool {
 mod tests {
     use super::{
         Access, ExpandError, Modifier, ModifierStep, VarRef, accessible_c, apply_modifier,
-        apply_tilde, entries_pattern, get_value, has_glob_meta, join_value, map_strings,
+        apply_tilde, entries_pattern, get_value, has_glob_meta, has_value, join_value, map_strings,
         resolve_value, split_value, words_value,
     };
     use crate::vars::{Value, Vars};
@@ -2333,6 +2370,51 @@ mod tests {
         assert!(matches!(
             get_value(Value::String("s".into()), Value::Integer(0), Value::Integer(0)),
             Err(ExpandError::Modifier { name, .. }) if name == "get"
+        ));
+    }
+
+    #[test]
+    fn has_asks_a_map_about_its_keys_and_a_list_about_its_elements() {
+        let m = Value::Map(vec![("editor".into(), Value::String("vim".into()))]);
+        assert_eq!(
+            has_value(m.clone(), Value::String("editor".into())),
+            Ok(Value::Boolean(true))
+        );
+        // Present as a *value* but not as a key: a map is asked about keys only.
+        assert_eq!(
+            has_value(m, Value::String("vim".into())),
+            Ok(Value::Boolean(false))
+        );
+        let xs = list(&["a", "b"]);
+        assert_eq!(
+            has_value(xs.clone(), Value::String("b".into())),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            has_value(xs.clone(), Value::String("c".into())),
+            Ok(Value::Boolean(false))
+        );
+        // Equality is the value's own, so an integer element is not the string
+        // that spells it — the same rule `in` follows.
+        assert_eq!(
+            has_value(Value::List(vec![Value::Integer(1)]), Value::Integer(1)),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(has_value(xs, Value::Integer(1)), Ok(Value::Boolean(false)));
+    }
+
+    #[test]
+    fn has_refuses_a_wrong_needle_or_subject_rather_than_answering_false() {
+        // An integer asked of a map is a mistake in the program, not an absence
+        // in the data, so a quiet `false` would bury it — the `:get` rule.
+        assert!(matches!(
+            has_value(Value::Map(vec![]), Value::Integer(0)),
+            Err(ExpandError::Modifier { name, .. }) if name == "has"
+        ));
+        // A string subject is `in`'s substring question, not this modifier's.
+        assert!(matches!(
+            has_value(Value::String("ab".into()), Value::String("a".into())),
+            Err(ExpandError::Modifier { name, .. }) if name == "has"
         ));
     }
 

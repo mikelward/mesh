@@ -6473,6 +6473,7 @@ pub(crate) fn modifier_requires_arguments(name: &str) -> bool {
             | "filter"
             | "each"
             | "get"
+            | "has"
             | "stripstart"
             | "stripend"
             | "replaceall"

@@ -2170,7 +2170,7 @@ is reported in either. That was once true in command position only — the value
 reading bound the literal `ab:upper`, silently — which is why the braced form is
 still the safer habit in code that has to run on an older mesh.
 
-A name mesh **reserves** for a modifier it has not built yet — `:sort`, `:has`,
+A name mesh **reserves** for a modifier it has not built yet — `:sort`,
 `:replace`, and the rest of the `DESIGN.md` set — parses, then reports a
 loud `not implemented yet` in a value context rather than a silent no-op. That is
 a different failure from an unknown name, which never parses.
@@ -2207,6 +2207,7 @@ a different failure from an unknown name, which never parses.
 | `:split(SEP)` | string | Split on the literal separator into a list. |
 | `:join(SEP)` | list | Fold the list into a string, `SEP` between elements. |
 | `:get(KEY, DEFAULT)` | map or list | **Total** access — `DEFAULT` when the key or index is absent. |
+| `:has(VALUE)` | map or list | Membership, as a boolean — a map is asked about a **key**, a list about a value. |
 | `:stripstart(P)` / `:stripend(S)` | string or list | Drop the affix once if it is there; a no-op otherwise. |
 | `:trimstart` / `:trimend` | string or list | Peel whitespace from that end, repeatedly. |
 | `:trimstart(CHARS)` / `:trimend(CHARS)` | string or list | Peel any of `CHARS` from that end, repeatedly. |
@@ -2339,6 +2340,13 @@ xs = [a b c]
 puts $xs:get(9, "-")            # -
 ```
 
+`:has(VALUE)` is the membership guard beside it, answering a boolean: a map is
+asked whether the **key** is present and a list whether any element equals the
+value — the same two questions `in` asks of each subject, by the same equality.
+`if $env:has(SSH_AUTH_SOCK) { … }` is the guard form, and the wrong-type
+refusal is `:get`'s: asking a map with anything but a string is a loud error
+rather than a quiet `false`.
+
 The **affix** family drops a known prefix or suffix **once** — the everyday
 "strip a known extension" reach, with no regex escaping and no interior-match
 surprise (a global `:replaceall(".tar.gz", "")` would also rewrite
@@ -2394,8 +2402,8 @@ The replacement is **literal text**: `$1`-style capture backreferences are not
 implemented, since their spelling is still provisional in `DESIGN.md`.
 
 Every modifier here is a value modifier, so each **maps element-wise over a
-list** — `$paths:stripend(".js")` rewrites each path — except `:get`, which
-consumes the collection as a whole.
+list** — `$paths:stripend(".js")` rewrites each path — except `:get` and
+`:has`, which consume the collection as a whole.
 
 A split modifier written **directly on a `$(…)`** binds the capture's *raw*
 bytes: it replaces what the capture would otherwise have done rather than running
@@ -2411,7 +2419,7 @@ line. Argument-taking modifiers work in expression position (an assignment right
 side or other value context) and in command-argument position
 (`echo $dirs:join(":")`). Not yet: the **spread** of one at a command boundary —
 `puts ...$x:split(":")` is a syntax error, so bind it first (`xs = $x:split(":")`,
-then `puts ...$xs`). `:has(VALUE)` also remains unimplemented.
+then `puts ...$xs`).
 
 Bare decimal literals and `true` / `false` produce typed integer and boolean
 values. Arithmetic requires integers, comparisons return booleans, and strings
@@ -3468,10 +3476,10 @@ func dir-info() { style(tilde-pwd(), fg: blue) }    # a prompt segment
 
 ## Not yet implemented
 
-The argument-taking modifiers that work today are `:split`, `:join`, `:get`, the
-affix family (`:stripstart`, `:stripend`, `:trimstart`, `:trimend`), the replace
-family (`:replaceall`, `:replacestart`, `:replaceend`), and `:map` / `:filter` /
-`:each`; the rest of the `DESIGN.md` set (`:match`, `:has`, `:lines`,
+The argument-taking modifiers that work today are `:split`, `:join`, `:get`,
+`:has`, the affix family (`:stripstart`, `:stripend`, `:trimstart`, `:trimend`),
+the replace family (`:replaceall`, `:replacestart`, `:replaceend`), and `:map` /
+`:filter` / `:each`; the rest of the `DESIGN.md` set (`:match`, `:lines`,
 the first-only `:replace`, the time and sort families) is not implemented, and
 neither are the regex capture modifiers or a capture backreference in a
 replacement. One of them **spread** at a command boundary
