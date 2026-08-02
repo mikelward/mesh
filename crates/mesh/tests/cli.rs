@@ -16068,6 +16068,94 @@ fn real_resolves_symlinks_and_dot_segments_to_an_absolute_path() {
 }
 
 #[test]
+fn url_writes_a_path_as_a_file_url_for_anything_that_takes_one() {
+    // `link` requires a scheme, so linking a local file used to mean building
+    // `file://$host$path` by hand — and getting the host right matters over `ssh`,
+    // which is why `link` will not guess it.
+    let dir = fresh_dir("url_modifier");
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |source: &str| {
+        let script = dir.join("run.mesh");
+        std::fs::write(&script, source).unwrap();
+        let out = mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status,
+        )
+    };
+
+    // A relative path is absolutized against the shell's directory, so the two
+    // spellings of the same file answer alike. Compared to each other rather than
+    // to a literal, since the host is this machine's and the temp root is not
+    // fixed.
+    let (out, err, status) = run("p = report.html\nputs $p:url\n");
+    assert!(status.success(), "{err}");
+    let relative = out.trim_end().to_owned();
+    let (out, err, _) = run(&format!(
+        "p = \"{}/report.html\"\nputs $p:url\n",
+        dir.display()
+    ));
+    assert_eq!(relative, out.trim_end(), "{err}");
+    assert!(relative.starts_with("file://"), "{relative}");
+    assert!(relative.ends_with("/report.html"), "{relative}");
+
+    // Encoded where a reader would misread it, and it does not need the file to
+    // exist — unlike `:real`, which asks the filesystem to follow every component.
+    let (out, err, status) = run("p = \"a b/c#d\"\nputs $p:url\n");
+    assert!(status.success(), "{err}");
+    assert!(out.trim_end().ends_with("/a%20b/c%23d"), "{out}");
+
+    // A path modifier, so it maps element-wise over a list.
+    let (out, err, status) = run("ps = [/x /y]\nputs ...$ps:url\n");
+    assert!(status.success(), "{err}");
+    let urls: Vec<_> = out.trim_end().split(' ').collect();
+    assert_eq!(urls.len(), 2, "{out}");
+    assert!(urls[0].ends_with("/x") && urls[1].ends_with("/y"), "{out}");
+
+    // The empty string would silently become the current directory, which is not
+    // what someone who wrote an empty path meant.
+    let (_, err, status) = run("p = \"\"\nputs $p:url\n");
+    assert!(!status.success());
+    assert!(err.contains(":url:"), "{err}");
+
+    // A `..` after a symlink names two different files: the kernel follows the
+    // link and then applies `..`, while a URL reader removes the dot segment
+    // first. Both targets exist here, so emitting the path would hand out a link
+    // to the wrong one — hence the refusal, and `:real:url` for the resolved form.
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+    std::fs::write(dir.join("a/report"), "lexical\n").unwrap();
+    std::fs::write(dir.join("report"), "kernel\n").unwrap();
+    std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("a/link")).unwrap();
+    let (_, err, status) = run("p = \"a/link/../report\"\nputs $p:url\n");
+    assert!(!status.success(), "{err}");
+    assert!(err.contains(":url:"), "{err}");
+    assert!(err.contains(":real:url"), "{err}");
+
+    // `:real:url` answers, and with the file the *kernel* names — the sibling of
+    // the link's target, not the one lexical normalization would have picked.
+    let (out, err, status) = run("p = \"a/link/../report\"\nputs $p:real:url\n");
+    assert!(status.success(), "{err}");
+    let resolved = std::fs::canonicalize(dir.join("report")).unwrap();
+    assert!(
+        out.trim_end()
+            .ends_with(&resolved.to_string_lossy().into_owned()),
+        "{out}"
+    );
+
+    // A `.` needs no refusal: removing it names the same file either way.
+    let (out, err, status) = run("p = \"./report\"\nputs $p:url\n");
+    assert!(status.success(), "{err}");
+    assert!(out.trim_end().ends_with("/report"), "{out}");
+}
+
+#[test]
 fn value_modifiers_recurse_through_nested_lists() {
     let out = run_with_input("xs = [[a b] c]\nys = $xs:upper\nputs ...$ys[0]\nputs $ys[1]\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "A B\nC\n");

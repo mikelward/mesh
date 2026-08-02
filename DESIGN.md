@@ -283,6 +283,7 @@ member lands next.)*
 | `:stem` | `foo.tar` | basename minus the **last** extension |
 | `:bare` | `foo` | basename minus **all** extensions |
 | `:real` | *(absolute)* | resolved real path |
+| `:url` | *(absolute)* | `file://host/path` URL |
 
 Rules:
 
@@ -292,6 +293,23 @@ Rules:
   `.bashrc:stem`, and `.bashrc:bare` are all `.bashrc` (dotfiles stay whole).
 - `:base` splits into `:bare` + `:exts` (first dot); `:base` also splits into
   `:stem` + `:ext` (last dot) — `foo.tar.gz` is `foo`+`tar.gz` or `foo.tar`+`gz`.
+- `:url` is for handing a path to something that takes a URL rather than a path —
+  `link($report:base, $report:url)`. It carries the **host**, which is what lets a
+  terminal tell a local file from one inside an `ssh` session, and percent-encodes
+  everything a reader could misread (a space would end the URL; `#` would start a
+  fragment). It shares its encoder with `OSC 7`, so the shell and the terminal name
+  a file the same way.
+- `:url` absolutizes a relative path against the shell's directory without
+  resolving symlinks, so it works for a file that does not exist yet — that is the
+  split with `:real`, which asks the filesystem and can fail.
+- `:url` **refuses a `..`**, because the two ends do not agree on what one names.
+  RFC 3986 §5.2.4 has a URL reader remove dot segments *before* opening anything,
+  while the kernel follows each symlink first and applies `..` to wherever it
+  landed: for `a/link/../report` the reader opens `a/report` and the shell means
+  the sibling of `link`'s target. Both can exist, so emitting the path would hand
+  out a link to the wrong file. `:real:url` is the spelling that resolves it. A
+  `.` needs no refusal — removing it names the same file either way. The empty
+  string is refused too, rather than quietly meaning the current directory.
 - `:bare` strips *every* dot-suffix, so on a dotted non-extension name like
   `2024.01.report` it yields `2024`. `:stem` (last only) is the safe default;
   reach for `:bare` when you mean "strip it all." Controlled peeling is also

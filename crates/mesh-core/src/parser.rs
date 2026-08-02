@@ -6571,6 +6571,7 @@ const MODIFIER_NAMES: &[&str] = &[
     "tty",
     "type",
     "upper",
+    "url",
     "values",
     "words",
     "write",
