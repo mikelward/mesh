@@ -4155,13 +4155,69 @@ of each PR had landed by another route, but these pieces had not.
         teardown fix above did not cover it and the family is not closed. Passed
         three consecutive local runs and the branch touches only value-call
         option scanning, so it is the runner rather than the change.
-      - `an_interrupt_abandons_a_wait_and_leaves_the_jobs_alone`, phase **48**,
-        on mikelward/mesh#366 — a **seventh** distinct test, and the strongest
-        evidence yet that the harness is what is being measured: that branch
-        changes `TODO.md` and nothing else, so no code reached the runner at
-        all. The cleanup then terminated two orphan `sleep` processes and the
-        `mesh` under test, so the shell was still holding the job when the
-        phase gave up.
+      - ~~`an_interrupt_abandons_a_wait_and_leaves_the_jobs_alone`, phase
+        **48**, on mikelward/mesh#366~~ — **fixed**, and it was a real race in
+        the harness rather than a starved machine. A **seventh** distinct
+        test, seen on a branch that changed `TODO.md` and nothing else, so no
+        code reached the runner at all.
+
+        The harness waited for **400ms of silence** and took that as proof the
+        line had been submitted, then sent `SIGINT`. Its own comment named the
+        hazard it was guarding — until reedline hands the terminal back a
+        Ctrl-C cancels the line rather than reaching the command, so "an eager
+        one would interrupt nothing and leave the wait unstarted" — but
+        silence only implies the handover on a machine that has already
+        scheduled the shell. On a loaded one the quiet means the line has not
+        been *read* yet, the interrupt lands on nothing, the wait never
+        starts, and phase 48 gives up having never seen `mesh!`.
+
+        The handover has an explicit mark: the shell writes **OSC `133;C`**
+        the moment reedline releases the terminal and the command starts,
+        which is the ordering the silence was guessing at. The wait is now for
+        that mark (`COMMAND_START`, alongside the `COMMAND_DONE` this file
+        already keyed on), so the interrupt cannot precede the submission at
+        any load. Not a longer timeout — the timeout is gone, and the test got
+        **0.8s faster** because the two 400ms silences were pure latency.
+
+        That mark alone is **not sufficient**, which is worth recording
+        because it is the sort of gap a later change could reopen. An
+        interactive shell **ignores** SIGINT, and only `wait` installs a
+        handler (`exec.rs`, `SigintCatcher`) — so a signal landing between
+        `133;C` and that install meets the ignore and is **discarded** rather
+        than held, leaving the wait blocked with nothing left to interrupt it.
+        `SigintCatcher::install` blocks SIGINT across its own swap for exactly
+        this reason, and says so. The mark is written before preexec hooks,
+        parsing and dispatch, all of which precede the install, so it cannot
+        close that window on its own.
+
+        So the harness waits for the **handler itself** before signalling. The
+        kernel publishes the transition: `/proc/<pid>/status` carries `SigIgn`
+        and `SigCgt`, and installing moves SIGINT from one to the other —
+        measured here, `SigIgn` goes `…285007` → `…285005` while `SigCgt` goes
+        `…440` → `…442`, bit 1 changing hands. `wait_until_sigint_caught`
+        polls for that, following `wait_until_reapable`'s precedent including
+        its portability answer: a missing entry proceeds, since there is no
+        `/proc` outside Linux and Linux is where CI runs and where the flake
+        was seen.
+
+        Retrying the interrupt until one sticks was tried first and is
+        **wrong**, which is worth recording because it looks reasonable. It
+        would pass just as well against a `wait` that ignored its first
+        Ctrl-C and answered a later one — and "one Ctrl-C abandons the wait"
+        is the claim this test exists to make, so the retry quietly replaced
+        the assertion with a weaker one. Waiting for an observable ready state
+        and then sending **exactly one** signal keeps the regression visible.
+
+        **Residual, off Linux:** `/proc` is where that ready state is
+        published, so on the BSDs the `133;C` wait stands alone and the
+        ignore window is still open. Unlike `wait_until_reapable`, which has a
+        fifo to fall back on, there is no second mechanism here. It is bounded
+        rather than ignored: nothing regresses, since the 400ms silence did
+        not close that window either, and it can only produce a *flake* — an
+        unobserved handler means a discarded signal and a reported phase 48,
+        never a false pass. Closing it wants `p_sigignore` / `p_sigcatch` out
+        of `sysctl`'s `kinfo_proc`, left unwritten rather than written blind
+        for a platform none of the sightings came from.
 
       The job-done one had the only cause already named — a 400ms sleep
       expecting a `sleep 0.2` job to have ended and a `sleep 0.7` job not to
