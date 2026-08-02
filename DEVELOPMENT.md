@@ -37,6 +37,29 @@ group and registers it in the job table; background stdin defaults to
 Per [`AGENTS.md`](AGENTS.md), install tools via direct binary downloads or
 `cargo install` — **not** `apt`/`apt-get`.
 
+## Quick start
+
+[`Makefile`](Makefile) holds the commands below as one-word targets, so the
+everyday ones need no flag string:
+
+```sh
+make           # debug build (the default target)
+make install   # install the mesh binary into ~/.cargo/bin
+make run       # build and start the shell
+make test      # every suite, cargo and shell alike
+make check     # what CI checks: fmt, clippy, tests — run this before pushing
+make help      # list every target
+```
+
+It is a table of entry points, not a second build system: each target is one
+cargo command, cargo does the work, and `makefile_test.sh` fails if `make check`
+drifts from what [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs.
+`CARGO=...` overrides the cargo binary; `CARGO_INSTALL_ROOT=...` changes where
+`make install` puts the binary.
+
+The rest of this section spells out the underlying commands, which are still the
+thing to reach for when a target doesn't fit.
+
 ## Build system
 
 Cargo, as a **workspace** rooted at [`Cargo.toml`](Cargo.toml).
@@ -118,13 +141,17 @@ cargo test -p mesh --test cli   # just the end-to-end (integration) tests
 cargo test -p mesh --test docs  # just the documentation examples
 ```
 
-One suite sits outside `cargo`: `session_start_hook_test.sh` covers
+Two suites sit outside `cargo`, both run by CI alongside the Rust tests and both
+by `make test`. `session_start_hook_test.sh` covers
 [`.claude/hooks/session-start.sh`](.claude/hooks/session-start.sh), the hook
 that brings a web session's Rust toolchain up to the `rust-version` floor
-before anything tries to build. CI runs it alongside the Rust tests.
+before anything tries to build. `makefile_test.sh` covers the
+[`Makefile`](Makefile): that `make install` names a package that exists, and
+that `make check` is still the set of commands CI runs.
 
 ```sh
 sh session_start_hook_test.sh   # stubs rustc/rustup; downloads nothing
+sh makefile_test.sh             # `make -n` dry runs; builds nothing
 ```
 
 Convention (from `AGENTS.md`): **a change isn't done until it's covered.** When
@@ -172,6 +199,8 @@ The floor is any modern Unix with POSIX job control and a stable Rust toolchain.
 mesh/
 ├── Cargo.toml              # workspace root (members, shared edition/MSRV, lints)
 ├── Cargo.lock              # committed — mesh is a binary
+├── Makefile                # one-line entry points over cargo (make install, make check)
+├── makefile_test.sh        # asserts those entry points match the docs and CI
 ├── rust-toolchain.toml     # pins stable + rustfmt + clippy
 ├── .github/workflows/ci.yml
 ├── crates/

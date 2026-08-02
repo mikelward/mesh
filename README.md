@@ -12,27 +12,23 @@ code.
 
 ## Building
 
-Unix only, stable Rust (pinned via `rust-toolchain.toml`):
+Unix only, stable Rust (pinned via `rust-toolchain.toml`). From a checkout:
 
 ```sh
-cargo run -p mesh      # start the shell
-cargo test --workspace # run the tests
+make install   # build and install the mesh binary into ~/.cargo/bin
+make run       # start the shell
+make check     # everything CI checks: formatting, clippy, the test suites
+make help      # the rest of the targets
 ```
+
+The [`Makefile`](Makefile) is a table of one-line entry points; cargo remains the
+build system, and every target is a single cargo command. `make` on its own is a
+debug build.
 
 ## Installing
 
-This repository is a Cargo workspace, so its root `Cargo.toml` is a *virtual*
-manifest with no package of its own. A bare `cargo install` — which installs the
-current directory, like `cargo install --path .` — therefore fails from the root
-with:
-
-```text
-error: found a virtual manifest instead of a package manifest
-```
-
-Point `--path` at the `mesh` package instead of the workspace root. Installing
-from git needs no such qualifier: `mesh` is the workspace's only installable
-binary, so Cargo selects it automatically.
+The Makefile's `install` target is `cargo install --locked --path crates/mesh`,
+which is worth knowing when installing without a checkout in hand:
 
 ```sh
 cargo install --locked --path crates/mesh                  # from a local checkout
@@ -41,7 +37,19 @@ cargo install --locked --git https://github.com/mikelward/mesh   # straight from
 
 `--locked` installs the exact dependency versions from the committed `Cargo.lock`
 rather than re-resolving to newer ones. Both commands place a `mesh` binary in
-`~/.cargo/bin`.
+`~/.cargo/bin`; set `CARGO_INSTALL_ROOT` to put it elsewhere.
+
+The `--path crates/mesh` is not decoration. This repository is a Cargo
+workspace, so its root `Cargo.toml` is a *virtual* manifest with no package of
+its own, and a bare `cargo install` — which installs the current directory, like
+`cargo install --path .` — fails from the root with:
+
+```text
+error: found a virtual manifest instead of a package manifest
+```
+
+Installing from git needs no such qualifier: `mesh` is the workspace's only
+installable binary, so Cargo selects it automatically.
 
 ## Releases
 
