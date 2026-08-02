@@ -499,6 +499,15 @@ Delete an entry once you have agreed with it or reversed it.
         wording wherever there is no reason to differ (`cd is a shell builtin`,
         `ls is /usr/bin/ls`); keep what mesh has a reason for — the detail line,
         the variable row, and naming what a winner shadows.
+
+        The vocabulary held; the **status** did not, and was fixed later. `-t`
+        answered from the first finding of any kind, and the findings kept aside
+        from the command race are not all resolutions — a contextual syntax word
+        and an unrunnable path operand are described without being reachable. So
+        `type -t and` printed `keyword` and exited `0` while `type and` printed
+        the same word and exited `1`: one name, two answers about whether it
+        resolved. `-t` now asks `Finding::usable` per finding, which is the
+        predicate the sentence form was already using.
   - [x] `func type()` stops being definable once `type` is a builtin, the way
         `func whence()` is refused today. Worth a test pinning that, and one
         pinning that `func what()` / `func where()` still work.

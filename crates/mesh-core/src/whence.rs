@@ -178,12 +178,25 @@ pub(crate) fn type_of(args: &[String], funcs: &Funcs, vars: &Vars) -> u8 {
         let found = look_up(name, funcs, vars);
         // `-t` and `-P` answer about the **winner**, and each has its own notion of
         // failure: `-P` fails on a name that resolves perfectly well as a function,
-        // so neither can lean on `resolved`.
+        // so neither can lean on `resolved`, which asks about the whole report.
+        //
+        // `-t` still has to ask [`Finding::usable`] per finding, though, because it
+        // reaches into `separate` — it must, since `variable` lives there — and
+        // `separate` is exactly where the findings that describe without resolving
+        // are kept: a contextual syntax word, and a path operand that could not be
+        // run. Answering from one made `-t` contradict the sentence form about the
+        // same name, printing `keyword` and succeeding for `and` where `type and`
+        // says the same word and fails.
         if kind || path {
             let answer = if path {
                 found.commands.iter().find_map(external_path)
             } else {
-                found.commands.first().or(found.separate.first()).map(word)
+                found
+                    .commands
+                    .iter()
+                    .chain(&found.separate)
+                    .find(|finding| finding.usable())
+                    .map(word)
             };
             match answer {
                 Some(answer) if !quiet => {

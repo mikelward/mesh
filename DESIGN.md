@@ -4393,6 +4393,16 @@ programs or user functions:
   nothing to print. `variable` is the one word bash has no use for, since its
   `type` does not see bindings.
 
+  **`-t` answers only about something the name can actually be used as.** It
+  looks past the command race — it has to, since `variable` is not in it — and
+  that is also where the findings that *describe without resolving* are kept: a
+  contextual syntax word (`and`, `fork`), and a path operand that exists but
+  cannot be run. Neither is what a bare name reaches, so neither is a `-t`
+  answer: `type -t and` prints nothing and exits `1`, the same as the sentence
+  form, while `type and` still describes the word from the side. Define
+  `func and()` and `-t` says `function`, because the contextual word never
+  outranked it.
+
   **One vocabulary, bash's, everywhere.** The prose says `if is a shell keyword`,
   never "is syntax", so the sentence and `-t` cannot disagree about what a thing
   is, and it follows bash's wording wherever there is no reason to differ — `cd is

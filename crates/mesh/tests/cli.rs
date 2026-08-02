@@ -11312,6 +11312,66 @@ fn type_t_prints_one_bash_word_per_name() {
     assert!(!out.status.success());
 }
 
+/// `-t` and the sentence form answer about the same name, so they agree on
+/// whether it resolved. `-t` reaches into the findings kept aside from the
+/// command race — it must, since `variable` lives there — and that is also where
+/// the ones that *describe without resolving* are kept: a contextual syntax word,
+/// and a path operand that could not be run.
+#[test]
+fn type_t_and_the_sentence_agree_about_a_name_that_does_not_resolve() {
+    let dir = fresh_dir("type_t_agreement");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("plain.txt"), "hi\n").unwrap();
+    // The case under test is the one that reaches resolution and finds *nothing*,
+    // so both namespaces a name can be found in are emptied of `and`: an empty
+    // `PATH` directory, and the environment entry removed. Either would otherwise
+    // make `-t` answer (`file`, `variable`) and pass for the wrong reason — a
+    // lowercase `and` is a legal environment name, and `look_up` reads the
+    // environment as a namespace of its own. Only builtins run here, so nothing
+    // else needs a search path.
+    let empty_path = dir.join("nothing-on-path");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    let script = dir.join("run.mesh");
+    let run = |source: &str| {
+        std::fs::write(&script, source).unwrap();
+        mesh_command()
+            .arg("run.mesh")
+            .current_dir(&dir)
+            .env("PATH", &empty_path)
+            .env_remove("and")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run")
+    };
+
+    // `and` is the discriminating case: it is infix syntax, never a command head,
+    // so a bare one reaches ordinary resolution and finds nothing. The sentence
+    // form describes it and fails; `-t` must not print `keyword` and succeed.
+    let out = run("type -t and\n");
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    assert!(!out.status.success());
+    let sentence = run("type and\n");
+    assert!(!sentence.status.success());
+
+    // The word is still described from the side, and a real definition of that
+    // name is what `-t` answers with — the contextual word never outranks it.
+    assert!(
+        String::from_utf8_lossy(&sentence.stdout).contains("keyword"),
+        "{:?}",
+        String::from_utf8_lossy(&sentence.stdout)
+    );
+    let defined = run("func and() { puts hi }\ntype -t and\n");
+    assert_eq!(String::from_utf8_lossy(&defined.stdout), "function\n");
+    assert!(defined.status.success());
+
+    // A path operand that exists but cannot be run is the other one: `126` on
+    // execution, so it is not something `-t` may answer `file` to.
+    let out = run("type -t ./plain.txt\n");
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    assert!(!out.status.success());
+    assert!(!run("type ./plain.txt\n").status.success());
+}
+
 /// `-P` answers only with a `PATH` hit, ignoring functions and builtins. This is
 /// what retires the hand-rolled `for d in $PATH` loop a portable `shrc` carries,
 /// since `type -P` is not available everywhere.
