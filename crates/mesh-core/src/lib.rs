@@ -38,6 +38,7 @@ pub mod parser;
 mod reaper;
 mod repl;
 mod stack;
+mod url;
 mod vars;
 mod whence;
 
