@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read};
@@ -1040,11 +1041,23 @@ impl CompletionCache {
 /// (which prints its notice and exits 0), yields no options and so falls through
 /// to the probe. Nothing distinguishes those from a page this cannot read, and
 /// none of them should answer.
+///
+/// A formatter that could not be *started* for some other reason gets [`reap`]'s
+/// treatment, and for its reason: a diagnostic here would print into a half-drawn
+/// completion, and there is no other channel from this path.
 fn rendered_page(path: &Path) -> Option<String> {
-    rendered_page_with("man", path)
+    match rendered_page_with("man", path) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            debug_assert!(false, "man could not be started: {error} ({error:?})");
+            None
+        }
+    }
 }
 
-fn rendered_page_with(program: &str, path: &Path) -> Option<String> {
+/// `Err` is the formatter failing to start for a reason that is not its absence;
+/// `Ok(None)` is no such program, which is the documented fall-through.
+fn rendered_page_with(program: &str, path: &Path) -> io::Result<Option<String>> {
     let mut process = Command::new(program);
     process
         .arg("-l")
@@ -1069,7 +1082,16 @@ fn rendered_page_with(program: &str, path: &Path) -> Option<String> {
             Ok(())
         });
     }
-    let mut child = process.spawn().ok()?;
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        // The lookup, not the kind, is what says the formatter is absent:
+        // `execve` answers `ENOENT` for a missing *interpreter* too, so a dead
+        // shebang would otherwise fall through as though nothing were installed.
+        Err(error) if error.kind() == io::ErrorKind::NotFound && nothing_named(program) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     let group = child.id() as libc::pid_t;
     let stdout = pipe_reader(child.stdout.take());
     let deadline = Instant::now() + probe_budget();
@@ -1097,7 +1119,9 @@ fn rendered_page_with(program: &str, path: &Path) -> Option<String> {
     // made it the leader of, so the shell's own group cannot be signalled.
     unsafe { libc::kill(-group, libc::SIGKILL) };
     reap(child, "man");
-    Some(String::from_utf8_lossy(&join_reader(stdout)).into_owned())
+    Ok(Some(
+        String::from_utf8_lossy(&join_reader(stdout)).into_owned(),
+    ))
 }
 
 /// Collect a probe child that has been signalled, deciding once what a failed
@@ -1168,6 +1192,26 @@ fn cache_name(executable: &Path, args: &[String]) -> String {
     executable.hash(&mut hasher);
     args.hash(&mut hasher);
     format!("{:016x}.spec", hasher.finish())
+}
+
+/// Is there no entry of this name at all — [`rendered_page_with`]'s question, for
+/// telling an uninstalled formatter from a broken one?
+///
+/// Anything narrower reads a broken install as an absent one, so this looks where
+/// `execvp` looks and counts what it counts: a dangling symlink is an entry, and
+/// an unset `PATH` is the system default rather than nowhere.
+fn nothing_named(program: &str) -> bool {
+    let search = env::var_os("PATH").unwrap_or_else(crate::whence::default_path);
+    nothing_named_in(program, &search)
+}
+
+fn nothing_named_in(program: &str, search: &OsStr) -> bool {
+    let named = |path: &Path| path.symlink_metadata().is_ok();
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        return !named(path);
+    }
+    !env::split_paths(search).any(|entry| named(&entry.join(program)))
 }
 
 fn resolve_command(command: &str) -> Option<PathBuf> {
@@ -1416,17 +1460,62 @@ fn join_reader(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
 mod tests {
     use super::{
         CompletionCache, CompletionSpec, ValueHint, associated_page, cache_name, command_help,
-        pages_in, rank_candidates, rendered_page_with, resolve_command,
+        nothing_named_in, pages_in, rank_candidates, rendered_page_with, resolve_command,
     };
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::io;
     use std::path::{Path, PathBuf};
     use std::thread;
     use std::time::{Duration, Instant};
 
     fn helper(path: &Path, body: &str) {
-        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        write_program(path, &format!("#!/bin/sh\n{body}"));
+    }
+
+    /// Every executable a test writes goes through here, and it is written by a
+    /// **child** that has exited: `execve` answers `ETXTBSY` while any process
+    /// holds the file open for writing, and another thread's `fork` inherits this
+    /// one's descriptors until it execs.
+    fn write_program(path: &Path, contents: &str) {
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"printf '%s\n' "$2" > "$1" && chmod 755 "$1""#)
+            .arg("sh")
+            .arg(path)
+            .arg(contents)
+            .status()
+            .expect("the helper writer ran");
+        assert!(status.success(), "writing {}: {status}", path.display());
+    }
+
+    /// A bare name is looked for along the search path, and an unset `PATH` means
+    /// the system default rather than nowhere — `execvp` searches it, so a
+    /// formatter found there must still be able to report why it failed to start.
+    #[test]
+    fn a_bare_name_is_looked_for_along_the_search_path() {
+        use std::ffi::OsStr;
+        assert!(!nothing_named_in("sh", OsStr::new("/bin:/usr/bin")));
+        assert!(nothing_named_in("sh", OsStr::new("")));
+        // What an unset `PATH` resolves to, which is where `execvp` would look.
+        assert!(!nothing_named_in("sh", &crate::whence::default_path()));
+        // A path with components is not searched for at all — it names itself.
+        assert!(nothing_named_in(
+            "/nowhere/at/all/man",
+            OsStr::new("/bin:/usr/bin")
+        ));
+    }
+
+    /// The text a stand-in formatter rendered, panicking with the reason it did
+    /// not run — a helper written and executed moments later, from a thread of a
+    /// binary where others are forking, can fail in ways worth telling apart.
+    fn ran(rendered: io::Result<Option<String>>) -> String {
+        match rendered {
+            Ok(Some(text)) => text,
+            Ok(None) => panic!("the stand-in formatter was not found where it was just written"),
+            Err(error) => {
+                panic!("the stand-in formatter could not be started: {error} ({error:?})")
+            }
+        }
     }
 
     fn fresh_temp_dir(name: &str) -> PathBuf {
@@ -1625,7 +1714,7 @@ mod tests {
             &renders,
             "printf '%s\\n' 'OPTIONS' '       -v, --verbose' '           Say more.'",
         );
-        let text = rendered_page_with(&renders.to_string_lossy(), &page).expect("man ran");
+        let text = ran(rendered_page_with(&renders.to_string_lossy(), &page));
         let spec = CompletionSpec::from_man(&text);
         assert_eq!(spec.matching("-"), ["--verbose", "-v"]);
 
@@ -1638,12 +1727,42 @@ mod tests {
             "printf '%s\\n' 'This system has been minimized by removing packages' \\
                  'and content. To restore this content, run unminimize.'",
         );
-        let advisory = rendered_page_with(&stub.to_string_lossy(), &page).expect("the stub ran");
+        let advisory = ran(rendered_page_with(&stub.to_string_lossy(), &page));
         assert!(CompletionSpec::from_man(&advisory).candidates.is_empty());
 
-        // No `man` at all is the same answer, not a panic.
-        let spec = rendered_page_with(&root.join("absent").to_string_lossy(), &page);
-        assert!(spec.is_none());
+        // No `man` at all is the only spawn failure answered as an ordinary
+        // result, so nothing else can hide behind it.
+        let absent = rendered_page_with(&root.join("absent").to_string_lossy(), &page);
+        assert!(matches!(absent, Ok(None)), "{absent:?}");
+
+        // Present but unstartable is what the fall-through must not absorb. A
+        // directory provokes it portably: `execve` refuses one with `EACCES`
+        // even for root, where a cleared permission bit would not.
+        let refused = rendered_page_with(&root.to_string_lossy(), &page);
+        let Err(error) = refused else {
+            panic!("a directory should not have started: {refused:?}");
+        };
+        assert_ne!(error.kind(), io::ErrorKind::NotFound, "{error:?}");
+
+        // The ambiguous one: `execve` says `ENOENT` for a missing interpreter
+        // too, so the kind alone cannot tell a broken install from an absent one.
+        let dead_shebang = root.join("man-dead-shebang");
+        write_program(&dead_shebang, "#!/nonexistent/interpreter\ntrue");
+        let broken = rendered_page_with(&dead_shebang.to_string_lossy(), &page);
+        let Err(error) = broken else {
+            panic!("a dead shebang should not have started: {broken:?}");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error:?}");
+
+        // The same trap one level down: any check that follows the link agrees
+        // with `execve` that nothing is there, but the entry is.
+        let dangling = root.join("man-dangling");
+        std::os::unix::fs::symlink(root.join("gone"), &dangling).unwrap();
+        let broken_link = rendered_page_with(&dangling.to_string_lossy(), &page);
+        let Err(error) = broken_link else {
+            panic!("a dangling link should not have started: {broken_link:?}");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error:?}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1665,7 +1784,7 @@ mod tests {
         );
 
         let started = Instant::now();
-        let text = rendered_page_with(&lingering.to_string_lossy(), &page).expect("man ran");
+        let text = ran(rendered_page_with(&lingering.to_string_lossy(), &page));
         let waited = started.elapsed();
 
         assert_eq!(
