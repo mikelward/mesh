@@ -15,7 +15,8 @@ Delete an entry once you have agreed with it or reversed it.
       alternative is a second, fallible comparator recursively walking lists
       and map values beside `Value::eq`, which is a large change to serve a
       case nobody writes. Cost recorded: `in` is user-facing, so a quiet
-      `false` there is the same confusion `==` refuses, one operator over.
+      `false` there is the same confusion `==` refuses, one operator over —
+      and `:has`, built as `in`'s modifier spelling, now shares that reading.
       *Reversible:* widening later is possible; unwinding a recursive
       comparator is not, which is why this went narrow.
 - [ ] **The flag-equality refusal was scoped to the `==` operator, not to
@@ -1870,7 +1871,11 @@ designed, and the cross-references say where the fuller note lives.
   - [ ] **Capture backreferences in a replacement.** `NEW` is literal text —
         `regex`'s own `$1` expansion is suppressed — because `DESIGN.md` still
         calls the spelling (`${1}` vs `$1`) provisional.
-- [ ] **`:has(VALUE)`.** The parser knows the name; the engine does not.
+- [x] **`:has(VALUE)`** *(landed)* — membership as `DESIGN.md` §"Maps" decides
+      it: a map is asked about a **key**, a list about a value, by the value's
+      own equality — the same two questions `in` answers, so the operator and
+      the modifier cannot disagree. A wrong-type needle or subject is a loud
+      error rather than a quiet `false`, matching `:get`.
 
 - [x] **`postfix` consumes a *spaced* call suffix, so a following group is
       stolen** *(landed — narrowed to `Expr::Modifier`, so `f (1)` still calls

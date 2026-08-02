@@ -4829,6 +4829,15 @@ fn eval_modifier_with_arguments(
             };
             expand::get_value(value, key, default).map_err(runtime_message)
         }
+        // `:has(VALUE)` — membership, the map/list question `in` also answers.
+        // The needle is an ordinary value, so which subjects take which needles
+        // is `expand::has_value`'s to say, as with `:get`.
+        "has" => {
+            let Some([needle]) = value_arguments(name, arguments, last, in_function, shell)? else {
+                return Ok(control_placeholder());
+            };
+            expand::has_value(value, needle).map_err(runtime_message)
+        }
         // The affix family. `:stripstart` / `:stripend` drop a literal affix once
         // if it is there and are a no-op otherwise, and the char-set spellings of
         // `:trimstart` / `:trimend` peel the given characters repeatedly — the
@@ -4969,7 +4978,8 @@ fn value_arguments<const N: usize>(
 ) -> Result<Option<[Value; N]>, Step> {
     if arguments.len() != N {
         return runtime_error(format!(
-            "modifier :{name} takes exactly {N} arguments, got {}",
+            "modifier :{name} takes exactly {N} argument{}, got {}",
+            if N == 1 { "" } else { "s" },
             arguments.len()
         ));
     }

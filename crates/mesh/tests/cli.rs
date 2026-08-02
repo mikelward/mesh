@@ -24707,6 +24707,36 @@ fn env_get_falls_back_where_a_strict_env_read_errors() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("MESH_TEST_ABSENT"));
 }
 
+/// `:has(VALUE)` is the membership guard — the decided spelling, per `DESIGN.md`
+/// §"Maps". A map is asked about a **key**, a list about a **value**, and `$env`
+/// answers as the map it is (`if $env:has(SSH_AUTH_SOCK)`), with a path-type
+/// entry answering as the list it reads as.
+#[test]
+fn has_answers_membership_for_maps_lists_and_the_environment() {
+    let out = run_with_input(
+        r#"m = [editor: vim]
+puts $m:has(editor) $m:has(pager)
+xs = [a b c]
+puts $xs:has(b) $xs:has(z)
+$env.MESH_TEST_PRESENT = here
+puts $env:has(MESH_TEST_PRESENT) $env:has(MESH_TEST_ABSENT)
+$env.PATH += /mesh-test-has
+puts $env.PATH:has(/mesh-test-has)
+k = editor
+puts $m:has($k)
+"#,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true false\ntrue false\ntrue false\ntrue\ntrue\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A bare `$env` is a map whose path-type entries are lists, so `puts $env` meets
 /// the ordinary "a collection inside a collection has no rendering" rule. Pinned
 /// alongside an ordinary nested map, because the point is that `$env` is **not** a
@@ -25649,6 +25679,19 @@ fn a_non_modifier_colon_stays_literal_in_command_position() {
 fn a_misused_modifier_argument_is_a_loud_error() {
     for (source, message) in [
         ("xs = [a]\nputs $xs:get(0)\n", "takes exactly 2 arguments"),
+        (
+            "xs = [a]\nputs $xs:has(a, b)\n",
+            "takes exactly 1 argument,",
+        ),
+        (
+            "xs = [a]\nputs $xs:has\n",
+            "modifier :has requires an argument",
+        ),
+        // A key of the wrong type is a mistake in the program, not an absence in
+        // the data — the `:get` rule, so membership cannot quietly answer false.
+        ("m = [k: v]\nputs $m:has(1)\n", "a map key is a string"),
+        // A string subject is `in`'s substring question, not this modifier's.
+        ("puts \"ab\":has(a)\n", "requires a map or a list"),
         (
             "puts \"a\":replaceall(\"a\", 1)\n",
             "replacement must be a string",
