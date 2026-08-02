@@ -2553,12 +2553,6 @@ fn token_word_pieces(kind: &TokenKind) -> Option<Vec<WordPiece>> {
     }])
 }
 
-/// Names that cannot be user functions because they are built-in **values**,
-/// reachable only through the `name(...)` call form: the `re` / `style` / `link`
-/// constructors, and the `glob` family, which expands rather than constructs but
-/// answers with a value all the same.
-pub const RESERVED_FUNCTION_NAMES: &[&str] = &["re", "style", "link", "glob", "files", "dirs"];
-
 /// The rest parameter an `alias` desugars to. Not a name a user can collide
 /// with: it only ever appears inside the generated body, which nothing else can
 /// see.
@@ -2567,8 +2561,14 @@ const ALIAS_REST: &str = "args";
 /// Does this name call a built-in **value** rather than a command? Asked wherever
 /// a call has to be told apart from a command that merely shares the call spelling
 /// — `f(…):capture` is one, since a command's record has no `.value` to fill in.
+///
+/// These cannot be user functions: they are reachable only through the
+/// `name(...)` call form — the `re` / `style` / `link` constructors, and the
+/// `glob` family, which expands rather than constructs but answers with a value
+/// all the same. The names come from `builtins::RESERVED_WORDS` rather than a
+/// second list here, so adding one is a single edit.
 pub fn value_builtin(name: &str) -> bool {
-    RESERVED_FUNCTION_NAMES.contains(&name)
+    crate::builtins::is_value_call(name)
 }
 
 struct Parser<'a> {

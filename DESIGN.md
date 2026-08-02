@@ -632,13 +632,13 @@ So the prerequisite is **one table outside the test, and three named views over
 it** — not one predicate, because the three callers are asking three different
 questions and a single answer would have to be wrong for two of them:
 
-*(Half of this arrived with the `type` builtin: the `keyword` view is out of the
-test. `COMMAND_KEYWORDS` (`crates/mesh-core/src/builtins.rs`) is a source-level
-constant with `is_command_keyword` over it, and a test pins it as a subset of
-`SYNTAX_WORDS`. **The unification is not done** — `SYNTAX`, `SYNTAX_WORDS`,
-`COMMAND_KEYWORDS`, `RESERVED_FUNCTION_NAMES` and `definition_name_problem`'s
-literals still spell the words out separately, so a new reserved word needs
-coordinated edits and the drift this asks to remove is still there.)*
+*(**Built.** `RESERVED_WORDS` (`crates/mesh-core/src/builtins.rs`) is one row per
+reserved word carrying a `Claim`, and the three views are derived from it —
+`syntax_words()`, `is_command_keyword`, `is_value_call`. Whoever builds `:kind`
+inherits the `keyword` view rather than writing it. One gap remains: the parser's
+own word arms are mirrored by the table, not driven by it, so a new keyword is
+three edits rather than one. The reasoning below is kept because it is what the
+shape has to answer for, not because the work is outstanding.)*
 
 | asks | set |
 |---|---|

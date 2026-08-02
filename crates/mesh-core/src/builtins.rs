@@ -449,6 +449,11 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
         "return [VALUE]",
         "Leave a function, or a sourced file",
     ),
+    (
+        &["fail"],
+        "fail [STATUS]",
+        "Leave the same unit with a nonzero status",
+    ),
     (&["fork"], "fork { … }", "Run a body in a forked child"),
     (
         &["with"],
@@ -475,50 +480,104 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
     ),
 ];
 
-/// Every **word** in [`SYNTAX`] — the entries a reader can complete or type,
-/// as opposed to the operator rows (`+`, `$(`, `"`) and the `command` row for the
-/// generic shape of a line, which are documentation for punctuation and a shape
-/// rather than names.
+/// What the parser does with a reserved word — the one fact the three views over
+/// [`RESERVED_WORDS`] disagree about, and `and` separates all three: `help and`
+/// must answer, `func and()` is allowed, and `and:kind` is not `keyword`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Claim {
+    /// Taken **in command position**, so a bare one never reaches command lookup.
+    Command,
+    /// Claimed only by **what follows it**: `fork` is the subshell keyword only
+    /// before a block, `unless` and `if` are postfix guards after a statement,
+    /// `global` / `unset` / `export` need an assignment, and `and` / `or` / `in`
+    /// are value operators. Each is a legal command word and a legal function
+    /// name — the repo's own `a_command_named_fork_is_still_reachable` covers
+    /// `fork` — so a bare one is an ordinary lookup that ends in `command not
+    /// found` if nothing defines it.
+    Contextual,
+    /// A built-in **value call**. The parser refuses it as a *function* name, but
+    /// a command-position `style …` is still a lookup that reports `command not
+    /// found`, so it is not a command keyword either.
+    ValueCall,
+}
+
+/// Every word the parser reserves, and what it claims.
 ///
-/// The set completion offers for a name argument. Being here does *not* mean the
-/// word is unavailable: `fork`, `unless`, `and` are all legal function names.
-/// For "does a bare one do something", see [`COMMAND_KEYWORDS`].
-pub(crate) const SYNTAX_WORDS: &[&str] = &[
-    "func", "wrapper", "alias", "return", "if", "else", "unless", "match", "for", "in", "while",
-    "loop", "break", "continue", "fork", "with", "global", "unset", "export", "not", "and", "or",
-    // The built-in *value* names, reserved as function names by the same parser
-    // check but reached as value calls rather than in command position.
-    "re", "style", "link", "glob", "files", "dirs",
+/// **The** table: `help`'s coverage, `func`'s refusal and `whence`'s keyword
+/// answer are all derived from it below, so a new reserved word is added here
+/// once instead of in three places that drift apart. The views stay distinct
+/// rather than collapsing into one predicate — that would either misclassify
+/// `and` as a keyword or stop documenting it.
+///
+/// Being listed here does *not* make a word unavailable: only [`Claim::Command`]
+/// means a bare one does something, and `fork`, `unless`, `and` are all legal
+/// function names.
+pub(crate) const RESERVED_WORDS: &[(&str, Claim)] = &[
+    ("func", Claim::Command),
+    ("return", Claim::Command),
+    // Taken on the same parser line as `return` / `break` / `continue`
+    // (`parser.rs`, `Parser::control`), so a bare one is control flow and never a
+    // lookup. It was missing from both hand-maintained lists this table replaces,
+    // which is why `help fail` used to answer "not a builtin or a keyword".
+    ("fail", Claim::Command),
+    ("if", Claim::Command),
+    ("match", Claim::Command),
+    ("for", Claim::Command),
+    ("while", Claim::Command),
+    ("loop", Claim::Command),
+    ("break", Claim::Command),
+    ("continue", Claim::Command),
+    ("global", Claim::Command),
+    ("unset", Claim::Command),
+    ("export", Claim::Command),
+    ("not", Claim::Command),
+    ("wrapper", Claim::Contextual),
+    ("alias", Claim::Contextual),
+    ("else", Claim::Contextual),
+    ("unless", Claim::Contextual),
+    ("in", Claim::Contextual),
+    ("fork", Claim::Contextual),
+    ("with", Claim::Contextual),
+    ("and", Claim::Contextual),
+    ("or", Claim::Contextual),
+    ("re", Claim::ValueCall),
+    ("style", Claim::ValueCall),
+    ("link", Claim::ValueCall),
+    ("glob", Claim::ValueCall),
+    ("files", Claim::ValueCall),
+    ("dirs", Claim::ValueCall),
 ];
 
-/// The words the parser takes **in command position**, so a bare one never
-/// reaches command lookup.
-///
-/// A strict subset of [`SYNTAX_WORDS`], and the distinction is not cosmetic —
-/// most of the rest are **contextual**, claimed only by what follows them:
-/// `fork` is the subshell keyword only before a block, `unless` and `if` are
-/// postfix guards after a statement, `global` / `unset` / `export` need an
-/// assignment, and `and` / `or` / `in` are value operators. Each of those is a
-/// legal command word and a legal function name — the repo's own
-/// `a_command_named_fork_is_still_reachable` covers `fork` — so a bare one is an
-/// ordinary lookup that ends in `command not found` if nothing defines it.
-///
-/// `re`, `style` and `link` are absent for a different reason: the parser refuses
-/// them as *function* names, but a command-position `style …` is still a lookup
-/// that reports `command not found`, since they are value calls.
-///
-/// This is what `whence` asks to decide whether a syntax row is the answer to
-/// "what runs" — a contextual word must not outrank the function or executable
-/// that a bare one would actually reach.
-pub(crate) const COMMAND_KEYWORDS: &[&str] = &[
-    "func", "return", "if", "match", "for", "while", "loop", "break", "continue", "global",
-    "unset", "export", "not",
-];
+fn claim_of(name: &str) -> Option<Claim> {
+    RESERVED_WORDS
+        .iter()
+        .find(|(word, _)| *word == name)
+        .map(|(_, claim)| *claim)
+}
 
-/// Does the parser take a bare `name` in command position? See
-/// [`COMMAND_KEYWORDS`] for why this is narrower than having a `SYNTAX` row.
+/// Every reserved **word** — what `help` owes an answer for, and what completion
+/// offers for a name argument.
+///
+/// The word view, as opposed to [`SYNTAX`]'s operator rows (`+`, `$(`, `"`) and
+/// its `command` row for the generic shape of a line, which document punctuation
+/// and a shape rather than names.
+pub(crate) fn syntax_words() -> impl Iterator<Item = &'static str> {
+    RESERVED_WORDS.iter().map(|(word, _)| *word)
+}
+
+/// Does the parser take a bare `name` in command position?
+///
+/// What `whence` asks to decide whether a syntax row is the answer to "what
+/// runs" — a contextual word must not outrank the function or executable a bare
+/// one would actually reach. Narrower than being in [`RESERVED_WORDS`]: see
+/// [`Claim::Contextual`].
 pub(crate) fn is_command_keyword(name: &str) -> bool {
-    COMMAND_KEYWORDS.contains(&name)
+    claim_of(name) == Some(Claim::Command)
+}
+
+/// Is `name` a built-in value call? The parser refuses these as function names.
+pub(crate) fn is_value_call(name: &str) -> bool {
+    claim_of(name) == Some(Claim::ValueCall)
 }
 
 /// Return the help text for a syntax entry — the keyword shape of what `help`
@@ -1219,9 +1278,9 @@ fn exit(args: &[String], last: u8) -> Builtin {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMAND_KEYWORDS, Decoration, SYNTAX, SYNTAX_WORDS, TABLE, Value, base64, help, is_builtin,
-        is_command_keyword, name_of, names, overview, path_line, reads_options, rename_note,
-        rendered_for_output, syntax_help, usage_options,
+        Claim, Decoration, RESERVED_WORDS, SYNTAX, TABLE, Value, base64, help, is_builtin,
+        is_command_keyword, is_value_call, name_of, names, overview, path_line, reads_options,
+        rename_note, rendered_for_output, syntax_help, syntax_words, usage_options,
     };
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
@@ -1532,10 +1591,10 @@ mod tests {
 
     #[test]
     fn every_keyword_the_parser_reserves_is_explained() {
-        // `SYNTAX_WORDS` mirrors the words `parser.rs` matches on. A keyword the
+        // `RESERVED_WORDS` mirrors the words `parser.rs` matches on. A keyword the
         // parser knows and `help` does not is a reader being told, falsely, that a
         // word they just used is not a keyword.
-        for keyword in SYNTAX_WORDS {
+        for keyword in syntax_words() {
             assert!(syntax_help(keyword).is_some(), "{keyword}");
         }
     }
@@ -1546,7 +1605,7 @@ mod tests {
         // `whence --quiet +` claim the operator resolved. Every syntax *word* is a
         // name; `SYNTAX` also documents operators and a `command` row for the shape
         // of a line, which name nothing.
-        for word in SYNTAX_WORDS {
+        for word in syntax_words() {
             assert!(
                 word.chars().all(|c| c.is_ascii_alphabetic()),
                 "{word} is not a word"
@@ -1609,13 +1668,35 @@ mod tests {
     }
 
     #[test]
-    fn a_command_keyword_is_a_syntax_word_the_parser_always_takes() {
-        // Every command keyword is a syntax word, so `help` explains it and
-        // completion offers it.
-        for keyword in COMMAND_KEYWORDS {
-            assert!(SYNTAX_WORDS.contains(keyword), "{keyword}");
-            assert!(is_command_keyword(keyword), "{keyword}");
+    fn every_reserved_word_appears_once_and_claims_one_thing() {
+        // `claim_of` answers with the first row it finds, so a word listed twice
+        // would take the earlier claim and quietly ignore the later one — the exact
+        // drift the single table exists to stop, reintroduced inside it.
+        let mut seen = std::collections::HashSet::new();
+        for (word, _) in RESERVED_WORDS {
+            assert!(seen.insert(*word), "{word} is listed twice");
         }
+        // Each view is a partition of the table, not an overlapping filter: no word
+        // is both taken in command position and a value call.
+        for (word, claim) in RESERVED_WORDS {
+            assert_eq!(is_command_keyword(word), *claim == Claim::Command, "{word}");
+            assert_eq!(is_value_call(word), *claim == Claim::ValueCall, "{word}");
+        }
+    }
+
+    #[test]
+    fn a_command_keyword_is_a_syntax_word_the_parser_always_takes() {
+        // Being a syntax word is now structural — a command keyword *is* a row in
+        // `RESERVED_WORDS` — so what is left to get wrong is the claim on each row.
+        for keyword in ["func", "return", "if", "match", "for", "while", "not"] {
+            assert!(is_command_keyword(keyword), "{keyword}");
+            assert!(!is_value_call(keyword), "{keyword}");
+        }
+        // `fail` was missing from both lists this table replaces, so `help fail`
+        // answered "not a builtin or a keyword" about a word the parser takes on
+        // the same line as `return`. It is control flow, not a lookup.
+        assert!(is_command_keyword("fail"));
+        assert!(syntax_help("fail").is_some());
         // The contextual words are deliberately *out*. Each is claimed only by what
         // follows it, so a bare one is an ordinary command word — legal as a
         // function name, and `command not found` when nothing defines it. Treating
@@ -1623,13 +1704,20 @@ mod tests {
         for contextual in [
             "fork", "with", "wrapper", "alias", "unless", "else", "and", "or", "in",
         ] {
-            assert!(SYNTAX_WORDS.contains(&contextual), "{contextual}");
             assert!(!is_command_keyword(contextual), "{contextual}");
+            assert!(!is_value_call(contextual), "{contextual}");
         }
         // Refused as *function* names, but a command-position one is still a
         // lookup that reports `command not found` — they are value calls.
-        for constructor in ["re", "style", "link"] {
+        for constructor in ["re", "style", "link", "glob", "files", "dirs"] {
+            assert!(is_value_call(constructor), "{constructor}");
             assert!(!is_command_keyword(constructor), "{constructor}");
+        }
+        // A word nobody reserves gets no claim at all, which is what keeps a real
+        // program of that name reachable.
+        for ordinary in ["cmd", "pwd", "git"] {
+            assert!(!is_command_keyword(ordinary), "{ordinary}");
+            assert!(!is_value_call(ordinary), "{ordinary}");
         }
     }
 
