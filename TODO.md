@@ -4223,21 +4223,48 @@ of each PR had landed by another route, but these pieces had not.
       expecting a `sleep 0.2` job to have ended and a `sleep 0.7` job not to
       have, which on a loaded machine is not a safe bet — and it is fixed.
 
-      **`start_pty_shell` giving up is the one thing left**, and it now reports
-      what it saw. The answer is `got 0 bytes` with the shell still running:
-      nothing written at all, so it is a session that has not been scheduled far
-      enough to speak rather than one that stopped mid-paint. It survives a full
-      30-second budget, and at the oversubscription that reproduces it — 24 test
-      threads pinned to one CPU — unrelated non-pty cases
-      (`a_line_gets_consumes_counts_toward_later_locations`) fail in half the
-      runs too, which is the signal that the machine is what is being measured.
-      At eight threads on one CPU, the level that surfaced every other flake
-      here, it is green.
+      ~~**`start_pty_shell` giving up is the one thing left**~~ — **found, and
+      it was never starvation.** The shell had *stopped itself*, and the
+      diagnostic is what hid it.
 
-      So what is unexplained is narrow: the same failure was seen **once in real
-      CI**, on a two-core runner at ordinary speed, and starvation is a poor fit
-      for that. Left open for the next occurrence, which will say which of the
-      two it was.
+      `wait_until_foreground` (`repl.rs`) restores SIGTTIN's **default**
+      disposition and then signals mesh's own group, so `mesh &` suspends until
+      `fg`. That is right for a real job-control parent and a trap for this
+      harness, which hands the terminal over *after* forking: lose that race and
+      the shell stops before writing a byte, with nobody to resume it. Hence
+      `got 0 bytes` while the shell is still alive — and hence "a session that
+      has not been scheduled far enough to speak," which was the wrong reading.
+      [`shell_fate`] asked `waitpid` without `WUNTRACED`, which reports neither a
+      running nor a stopped child, so a suspended shell answered "still
+      running" and a deterministic bug looked like a loaded machine.
+
+      It reproduces every time: insert a delay before the harness's `tcsetpgrp`
+      and `waitpid`/`WUNTRACED` reports the shell stopped on signal 21.
+      `shell_fate` now asks with `WUNTRACED` and says `stopped on signal N`, so
+      the next occurrence cannot be misread the same way.
+
+      The fix is **ordering, not a rescue**. Signalling `SIGCONT` after the
+      handover was the first attempt and is still racy: the check and the
+      self-signal are not one step, so the shell can read the old foreground
+      group, take both the `tcsetpgrp` and the `SIGCONT`, and only then stop
+      itself — with nothing left to resume it. There is no race to win, so the
+      harness stops trying: this session leader's group is foreground until it
+      says otherwise, so the shell **always** finds itself background and
+      always stops, and the harness waits for that stop before handing over and
+      continuing. That is the order `background_startup_harness` already uses,
+      where the stop is likewise guaranteed rather than hoped for.
+
+      Measured against the level that used to break it — 24 test threads pinned
+      to one CPU — the run goes from **seven failures to none**, three runs
+      running. That includes `a_line_gets_consumes_counts_toward_later_
+      locations`, the non-pty case this entry named as the point where the
+      machine rather than the code is measured; it too is green now, so the
+      earlier reading of that level as simple starvation was too generous to
+      the harness.
+
+      This also explains the sighting that starvation fit worst: the one seen
+      **once in real CI** on a two-core runner at ordinary speed. A race lost to
+      scheduling order needs no starvation, only the wrong order once.
 
       The phase codes now name themselves (`await_pty_harness`, and
       `pty_start_failed` for the six ways a session fails to start), so the next
