@@ -4155,6 +4155,13 @@ of each PR had landed by another route, but these pieces had not.
         teardown fix above did not cover it and the family is not closed. Passed
         three consecutive local runs and the branch touches only value-call
         option scanning, so it is the runner rather than the change.
+      - `an_interrupt_abandons_a_wait_and_leaves_the_jobs_alone`, phase **48**,
+        on mikelward/mesh#366 — a **seventh** distinct test, and the strongest
+        evidence yet that the harness is what is being measured: that branch
+        changes `TODO.md` and nothing else, so no code reached the runner at
+        all. The cleanup then terminated two orphan `sleep` processes and the
+        `mesh` under test, so the shell was still holding the job when the
+        phase gave up.
 
       The job-done one had the only cause already named — a 400ms sleep
       expecting a `sleep 0.2` job to have ended and a `sleep 0.7` job not to
