@@ -511,11 +511,74 @@ Delete an entry once you have agreed with it or reversed it.
   - [x] `func type()` stops being definable once `type` is a builtin, the way
         `func whence()` is refused today. Worth a test pinning that, and one
         pinning that `func what()` / `func where()` still work.
-  - [ ] **This likely closes the `:kind` / `:where` question** in the predicate
-        vocabulary: `type -t` *is* `:kind` and `type -P` *is* `:where`. What a
-        modifier would still add is use in expression position without a capture,
-        which `type(NAME)` returning a map already covers. Re-read that item
-        once this lands.
+  - [x] ~~**This likely closes the `:kind` / `:where` question**~~ — **re-read,
+        and it does not.** `type -t` is not `:kind`; it answers the same
+        *question* in a form the guards cannot use. Three differences, each
+        checkable:
+
+        - **Vocabulary.** `:kind` is `keyword | builtin | func | external |
+          false` (`DESIGN.md` §"Predicate vocabulary"); `-t` is bash's
+          `keyword | builtin | function | file | variable`. `func`/`function`
+          and `external`/`file` are **spelling** — a slashed receiver is
+          "external-or-nothing" for `:kind`, so an executable path operand and a
+          `PATH` hit are one category on both sides. The real gaps are that `-t`
+          has `variable` where `:kind` has no counterpart, and that the two
+          answer differently for a file that exists and cannot run. A guard
+          written against one still does not port, but because the tokens
+          differ, not because the categories do.
+        - **Position.** `:kind` yields a value in expression position —
+          `if $e:kind != false` — and **maps over a list**, which is the shape
+          the config sites take (`for e in [vi vim editline] { … }`). `-t` takes
+          `NAME …` and answers per name, so `$(type -t ...$xs):lines` is one
+          capture rather than one each — but it **loses alignment**: a name that
+          does not resolve contributes no line, so four names can come back as
+          three and nothing says which one dropped. That is what element-wise
+          answering buys, and it is why the guards want a modifier.
+        - **Subject spelling.** `shpool:kind` takes a bare subject; `type -t`
+          takes an argument. Same information, different grammar.
+
+        What *is* now settled, and was the point of re-reading:
+
+        - **Half the prerequisite is built — the half that blocked `:kind`.**
+          That entry asks for two things: the set out of the test, and "one
+          table with a row per word, and each view derived from it". Only the
+          first happened. `COMMAND_KEYWORDS`
+          (`crates/mesh-core/src/builtins.rs`:513) is a real source-level
+          constant with `is_command_keyword` over it, so the `keyword` view no
+          longer lives inside a test — which is what the entry called "the wrong
+          place for something a language feature now depends on". A test pins
+          `COMMAND_KEYWORDS ⊆ SYNTAX_WORDS`.
+
+          The **drift** half is not done, and marking it so would have removed
+          real work. The words are still written out separately in `SYNTAX`,
+          `SYNTAX_WORDS` and `COMMAND_KEYWORDS` (`builtins.rs`), in
+          `RESERVED_FUNCTION_NAMES` (`parser.rs`:2560), and as literals in
+          `definition_name_problem` (`repl.rs`:1191) — five places, none derived
+          from another. A new reserved word still needs coordinated edits, and
+          the subset test catches only a keyword missing from `SYNTAX_WORDS`,
+          not a parser word missing from both.
+        - **Option A is what shipped**, for the open question the entry leaves
+          on resolution order. `type -t if` answers `keyword`, so a bare command
+          keyword is reported as syntax rather than resolved past. Evidence, not
+          a decision — but "one vocabulary in every form" means `:kind` landing
+          on option B would put two answers in the tree, so the cost of B has
+          gone up.
+        - **The contextual-word boundary agrees; the path-operand one is still
+          open.** mikelward/mesh#375 stopped `-t` answering for a finding that
+          is not usable, so both a contextual word and an unrunnable path
+          operand now report nothing with status `1`. For the **contextual
+          word** that matches `:kind`, which `DESIGN.md` already settles as
+          `false` — same rule, different spelling, nothing to reconcile later.
+          For an **unrunnable path** it settles nothing: whether `:kind` answers
+          `false` or `external` for a file that exists but cannot run is
+          explicitly open (`DESIGN.md` §"Predicate vocabulary", the
+          "when nothing runnable is found but a file of that name exists"
+          question), and `-t` cannot decide it — its vocabulary has no
+          path-operand case to decide *with*.
+
+        So the modifier is **not** made redundant. `type(NAME)` is still the
+        thing that would close it — see the entry below, whose map key set is
+        the open part.
 
 - [ ] **`type(NAME)` as a value call**, returning the report as a map
       (`[kind: external, path: /usr/bin/git, shadows: […]]`) rather than text, so

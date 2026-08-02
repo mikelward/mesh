@@ -548,6 +548,13 @@ answered: option A keeps it exactly and `if:kind` stays `keyword`; option B has
 when nothing is found — which is a different contract, not a tweak. Everything
 else in this section holds either way; this paragraph is where the two diverge.
 
+*(Still open, but no longer even-handed: the shipped `type -t` answers `keyword`
+for a bare `if`, which is option A's behavior. That is evidence rather than a
+decision — `-t` is bash's vocabulary and was not written to settle this — but
+"one vocabulary in every form" applies to `:kind` too, so choosing B would put
+two answers about the same word in the tree and now costs a change to `type` as
+well.)*
+
 `keyword` is the one that is easy to miss, and it is **defined by the grammar,
 not by a list of favorites**: a keyword is a word the parser claims *in command
 position*, so that a **bare** name of that spelling never reaches resolution —
@@ -624,6 +631,14 @@ a real program of that name.
 So the prerequisite is **one table outside the test, and three named views over
 it** — not one predicate, because the three callers are asking three different
 questions and a single answer would have to be wrong for two of them:
+
+*(Half of this arrived with the `type` builtin: the `keyword` view is out of the
+test. `COMMAND_KEYWORDS` (`crates/mesh-core/src/builtins.rs`) is a source-level
+constant with `is_command_keyword` over it, and a test pins it as a subset of
+`SYNTAX_WORDS`. **The unification is not done** — `SYNTAX`, `SYNTAX_WORDS`,
+`COMMAND_KEYWORDS`, `RESERVED_FUNCTION_NAMES` and `definition_name_problem`'s
+literals still spell the words out separately, so a new reserved word needs
+coordinated edits and the drift this asks to remove is still there.)*
 
 | asks | set |
 |---|---|
