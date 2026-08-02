@@ -35,9 +35,16 @@ jobs:
         run: |
           shellcheck -s bash -S error .claude/hooks/session-start.sh
           shellcheck -s sh -S error session_start_hook_test.sh
+          shellcheck -s sh -S error makefile_test.sh
 
       - name: Test the session-start hook
         run: sh session_start_hook_test.sh
+
+      # The Makefile is the one-line front door to these same commands, and its
+      # suite asserts the two agree -- so a gate added above must be added there
+      # too, or `make check` quietly stops meaning "what CI runs".
+      - name: Test the Makefile
+        run: sh makefile_test.sh
 
       # FreeBSD needs no cross compiler: nothing in the tree builds C for it
       # (`rusqlite` links a system SQLite rather than bundling one), and `cargo
