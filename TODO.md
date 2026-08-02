@@ -50,6 +50,27 @@ Delete an entry once you have agreed with it or reversed it.
       Pinned by a test instead, so it cannot go quiet. The alternative was to
       fold the fix in. *Reversible:* it is still an open entry with a failing-on-
       fix test attached.
+- [ ] **`:url` accepts a relative path and absolutizes it**, rather than refusing
+      one and telling the writer to make it absolute first. The alternative was
+      the safer default: refusing accepts strictly less, so widening later is a
+      compatible change while narrowing is not. Accepted anyway because refusing
+      breaks the case the modifier exists for, and there is no ambiguity to
+      protect against: a relative path has exactly one meaning, and it is the one
+      every other path modifier already assumes.
+
+      Worth stating what that case is, since `link`'s more common argument is an
+      `https:` URL and that needs no help — it is already a string you have. The
+      only URL awkward to write by hand is the file one, which is why the modifier
+      is this narrow. It is for making local output **clickable**: a test failure,
+      a build error, a generated report, where the point is that the path opens on
+      a click. Those paths are overwhelmingly relative, because that is how tools
+      print them and how you typed them, so refusing relative would decline
+      exactly the input the use case hands it.
+
+      *Reversible, but in the harder direction:* turning acceptance back into a
+      refusal would break any config relying on it. Reviewed and kept as built —
+      left listed rather than deleted, to be judged once it has been used.
+
 ## M0 — It runs `ls` ✅ (done)
 
 - [x] Cargo workspace, edition 2024, MSRV 1.85, `rust-toolchain.toml`
@@ -1018,11 +1039,21 @@ than the string the argv boundary would have produced.
       capability question `style` was designed to avoid comes straight back.
 - [x] **`link(text, url)`** (OSC 8) landed — see §"Terminal integration", where it
       is tracked with the other terminal sequences.
-- [ ] **A `file://` helper for a path.** `link` requires a scheme, so linking a local
-      path today means building `file://$host$path` by hand — and getting the host
-      right matters over `ssh`, which is exactly why `link` will not guess it. A
-      modifier (`$path:url`) reusing `cwd_url`'s encoder is the obvious shape; `OSC 7`
-      already builds the same string for the working directory.
+- [x] **A `file://` helper for a path** — `$path:url`, the shape this entry
+      proposed. `link` requires a scheme, so linking a local path meant building
+      `file://$host$path` by hand, and getting the host right matters over `ssh`,
+      which is why `link` will not guess it. The encoder `OSC 7` already used moved
+      to `crate::url` so the terminal and the shell name a file the same way rather
+      than by two copies that could drift.
+
+      A URL leaves this shell, so a relative path is absolutized against the
+      shell's directory, without resolving symlinks — which is what lets it name a
+      file that does not exist yet. A `..` is **refused**: RFC 3986 §5.2.4 has a
+      URL reader remove dot segments before opening anything, while the kernel
+      follows each symlink first and applies `..` to where it landed, so
+      `a/link/../report` names two files that can both exist. `:real:url` is the
+      resolved form. The empty string is refused rather than quietly meaning the
+      current directory.
 
 ## Beyond M3 — Terminal integration
 

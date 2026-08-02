@@ -70,6 +70,10 @@ pub enum Modifier {
     /// them, but it is the one that **asks the filesystem** rather than slicing
     /// the string, so it can fail where they cannot.
     Real,
+    /// `:url` — this path as a `file://host/path` URL, for anything that takes one
+    /// rather than a path: `link($report:base, $report:url)`. Shares its encoder
+    /// with `OSC 7`, so the terminal and the shell name a file the same way.
+    Url,
     // File tests: `-e`, `find -type`, `-r`, `-w`. Scalar questions about one path,
     // mapping element-wise over a list like the transforms above.
     Exists,
@@ -99,6 +103,7 @@ impl Modifier {
             "stem" => Self::Stem,
             "bare" => Self::Bare,
             "real" => Self::Real,
+            "url" => Self::Url,
             "len" => Self::Len,
             "tty" => Self::Tty,
             "first" => Self::First,
@@ -1297,6 +1302,80 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 message: "requires a path".into(),
             }),
         },
+        // A URL names a file to something that is not this shell — a terminal, a
+        // browser, another machine reading the same `link` — so a relative path
+        // would name nothing once it arrives. It is absolutized against the
+        // process's directory, without resolving symlinks: this touches the
+        // filesystem only to ask where it is, so unlike `:real` it works for a
+        // file that does not exist yet.
+        //
+        // A `..` is refused rather than emitted, because the two ends would not
+        // agree on what it named. RFC 3986 §5.2.4 has a URL reader remove dot
+        // segments *before* opening anything, while the kernel follows each
+        // symlink first and then applies `..` to wherever it landed — so for
+        // `a/link/../report` the reader opens `a/report` and the shell means the
+        // sibling of `link`'s target. Both can exist and differ. `:real:url` is
+        // the spelling that resolves it.
+        Modifier::Url => match value {
+            Value::String(path) if path.is_empty() => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a path, and the empty string is not one".into(),
+            }),
+            Value::String(path) => {
+                let path = std::path::PathBuf::from(&path);
+                let absolute = if path.is_absolute() {
+                    Ok(path)
+                } else {
+                    std::env::current_dir()
+                        .map(|cwd| cwd.join(&path))
+                        .map_err(|error| ExpandError::Modifier {
+                            name: name.into(),
+                            message: format!(
+                                "`{}` is relative and the current directory cannot be read: \
+                                 {error}",
+                                path.display()
+                            ),
+                        })
+                };
+                absolute.and_then(|absolute| {
+                    if absolute
+                        .components()
+                        .any(|part| part == std::path::Component::ParentDir)
+                    {
+                        return Err(ExpandError::Modifier {
+                            name: name.into(),
+                            message: format!(
+                                "`{}` contains `..`, which a URL reader resolves before \
+                                 symlinks and the filesystem resolves after, so the two can \
+                                 name different files: use `:real:url`",
+                                absolute.display()
+                            ),
+                        });
+                    }
+                    Ok(Value::String(crate::url::file_url(
+                        &crate::url::hostname(),
+                        &absolute,
+                    )))
+                })
+            }
+            Value::List(values) => values
+                .into_iter()
+                .map(|value| apply_modifier(value, modifier))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::List),
+            Value::Map(_)
+            | Value::Styled(_)
+            | Value::Integer(_)
+            | Value::Boolean(_)
+            | Value::Regex(_)
+            | Value::Glob(_)
+            | Value::Stream(_)
+            | Value::Job(_)
+            | Value::Function(_) => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: "requires a path".into(),
+            }),
+        },
         // A file test asks one question of one path, so on a list it maps
         // element-wise like any other value modifier.
         Modifier::Exists | Modifier::Type | Modifier::Read | Modifier::Write => match value {
@@ -1674,6 +1753,7 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::Stem => "stem",
         Modifier::Bare => "bare",
         Modifier::Real => "real",
+        Modifier::Url => "url",
         Modifier::Len => "len",
         Modifier::First => "first",
         Modifier::Last => "last",
@@ -1814,6 +1894,7 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         // A path component in `DESIGN.md`'s table, but it reads the filesystem and
         // can fail, so it is handled where a `Result` is available rather than here.
         Modifier::Real
+        | Modifier::Url
         | Modifier::Int
         | Modifier::Words
         | Modifier::Lines
@@ -2287,6 +2368,94 @@ mod tests {
             apply_modifier(list(&[" a", " b"]), Modifier::TrimStart),
             Ok(list(&["a", "b"]))
         );
+    }
+
+    #[test]
+    fn url_encodes_an_absolute_path_under_the_file_scheme() {
+        let Ok(Value::String(url)) =
+            apply_modifier(Value::String("/tmp/two words".into()), Modifier::Url)
+        else {
+            panic!("`:url` of an absolute path should answer with a string");
+        };
+        assert!(url.starts_with("file://"), "{url}");
+        // The host sits between the scheme and the path, so the path is what the
+        // URL ends with — and a space in it is encoded rather than ending the URL.
+        assert!(url.ends_with("/tmp/two%20words"), "{url}");
+    }
+
+    #[test]
+    fn url_absolutizes_a_relative_path_against_the_current_directory() {
+        // A URL leaves this shell, so a relative path would name nothing once it
+        // arrives. Compared against the joined path rather than a literal, so the
+        // test says *which* directory without depending on where it runs.
+        let cwd = std::env::current_dir().expect("a current directory");
+        assert_eq!(
+            apply_modifier(Value::String("report.html".into()), Modifier::Url),
+            apply_modifier(
+                Value::String(cwd.join("report.html").to_string_lossy().into_owned()),
+                Modifier::Url
+            )
+        );
+    }
+
+    #[test]
+    fn url_does_not_need_the_path_to_exist() {
+        // Unlike `:real`, it asks the filesystem only where the process is, so a
+        // file about to be written already has a URL.
+        let Ok(Value::String(url)) = apply_modifier(
+            Value::String("/tmp/nothing-is-here-yet".into()),
+            Modifier::Url,
+        ) else {
+            panic!("`:url` should not need the path to exist");
+        };
+        assert!(url.ends_with("/tmp/nothing-is-here-yet"), "{url}");
+    }
+
+    #[test]
+    fn url_refuses_dot_dot_because_the_two_ends_disagree_about_it() {
+        // RFC 3986 §5.2.4 has a URL reader remove dot segments before opening
+        // anything; the kernel follows symlinks first and applies `..` to where it
+        // landed. For `a/link/../report` those are different files, and both can
+        // exist — so emitting the path unchanged would hand out a link to the
+        // wrong one. `:real:url` is the spelling that resolves it.
+        let refused = apply_modifier(Value::String("/tmp/a/link/../report".into()), Modifier::Url);
+        assert!(
+            matches!(&refused, Err(ExpandError::Modifier { name, .. }) if name == "url"),
+            "{refused:?}"
+        );
+        let Err(ExpandError::Modifier { message, .. }) = refused else {
+            unreachable!()
+        };
+        assert!(message.contains(":real:url"), "{message}");
+        // A `.` needs no refusal: removing it names the same file either way.
+        assert!(matches!(
+            apply_modifier(Value::String("/tmp/./a".into()), Modifier::Url),
+            Ok(Value::String(_))
+        ));
+    }
+
+    #[test]
+    fn url_refuses_the_empty_string_and_a_value_that_is_not_a_path() {
+        // `""` would silently become the current directory, which is not what the
+        // writer of an empty path meant.
+        assert!(matches!(
+            apply_modifier(Value::String(String::new()), Modifier::Url),
+            Err(ExpandError::Modifier { name, .. }) if name == "url"
+        ));
+        assert!(matches!(
+            apply_modifier(Value::Integer(7), Modifier::Url),
+            Err(ExpandError::Modifier { name, .. }) if name == "url"
+        ));
+    }
+
+    #[test]
+    fn url_maps_element_wise_over_a_list() {
+        let Ok(Value::List(urls)) = apply_modifier(list(&["/a", "/b"]), Modifier::Url) else {
+            panic!("`:url` should map over a list like the other path modifiers");
+        };
+        assert_eq!(urls.len(), 2);
+        assert!(matches!(&urls[0], Value::String(url) if url.ends_with("/a")));
+        assert!(matches!(&urls[1], Value::String(url) if url.ends_with("/b")));
     }
 
     #[test]
