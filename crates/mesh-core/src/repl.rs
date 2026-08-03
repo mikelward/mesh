@@ -63,6 +63,12 @@ struct Shell {
     /// shell's code but owns none of its children, so job control is not its to
     /// perform.
     forked: bool,
+    /// How many in-process captures are live. `$(…)` and `:capture` divert this
+    /// very process's descriptors to pipes drained by its own threads, so while
+    /// one is open the process is not `exec`'s to replace — the readers, and the
+    /// restore the diversion owes, would go down with it. A count rather than a
+    /// flag because captures nest.
+    captures: usize,
     loop_depth: usize,
     prompt: PromptConfig,
     /// The **result so far** of the body being run: the value of the last
@@ -229,6 +235,7 @@ impl Shell {
             control: None,
             value_call_status: None,
             forked: false,
+            captures: 0,
             loop_depth: 0,
             prompt: PromptConfig::default(),
             result: Value::String(String::new()),
@@ -2694,6 +2701,10 @@ fn run_forked_block(body: &parser::Source, in_function: bool, shell: &mut Shell)
         // reports every running job as finished — and `$sh.jobs` keeps the
         // snapshot it inherited. The same flag a forked pipeline stage sets.
         shell.forked = true;
+        // Any capture this block was forked inside of belongs to the parent:
+        // its reader threads did not survive the fork, so this process holds no
+        // live capture and `exec` is free to replace it.
+        shell.captures = 0;
         // Seeded at 0, as every other compound body is. A subshell is a fresh
         // boundary: `false; fork { }` reporting 1 would carry a failure from
         // outside it across the very edge the construct exists to draw.
@@ -5378,7 +5389,9 @@ mod capture {
                 let mut text = String::new();
                 err_reader.read_to_string(&mut text).map(|_| text)
             });
+            shell.captures += 1;
             let produced = body(shell);
+            shell.captures -= 1;
             let _ = io::stdout().flush();
             out.restore();
             err.restore();
@@ -5409,7 +5422,9 @@ mod capture {
                 let mut output = String::new();
                 reader.read_to_string(&mut output).map(|_| output)
             });
+            shell.captures += 1;
             let produced = body(shell);
+            shell.captures -= 1;
             let _ = io::stdout().flush();
             diverted.restore();
             (produced, read.join())
@@ -6698,8 +6713,60 @@ fn run_single(
         Err(step) => return step,
     };
     if argv.is_empty() {
-        note!("mesh: redirection with no command is not supported yet");
+        note!("mesh: a redirection needs a command; `exec > f` retargets the shell itself");
         return Step::Error(1);
+    }
+    // A redirected `exec` is read here, in front of the generic builtin
+    // routing, because its stdout duty cannot be met inside the bracket: once
+    // the descriptors swap, a flush writes the old sink's unflushed bytes into
+    // the new target as if they were its own. The targets are expanded *first*
+    // — evaluating one can itself print (`> ${pick()}`), and bytes printed that
+    // way belong to the old sink too — and only then is stdout settled, with a
+    // failure refusing the exec while nothing has been opened or truncated yet.
+    // Backgrounded it falls through to the pipeline path: the stage machinery
+    // installs the targets on the fork itself, whose redirection-only `exec` is
+    // then already done (see `run_stage_in_shell`), and the parent's buffer is
+    // settled by `fork_stage`'s own propagated flush.
+    if argv[0] == "exec" && !background {
+        let terminator_only = redirection_only_exec(&argv);
+        // The same refusal `run_exec` makes: the shell's descriptors are
+        // diverted for the capture, and a permanent retarget underneath it
+        // would be silently undone when the capture puts them back.
+        if terminator_only && shell.captures > 0 {
+            note!("mesh: exec: cannot retarget the shell's descriptors inside a capture");
+            return Step::Error(2);
+        }
+        let opened = match expand_redirs(redirs, last, in_function, shell) {
+            Ok(redirs) => redirs,
+            Err(step) => return step,
+        };
+        // With no program the targets apply to the shell itself, for good —
+        // `DESIGN.md`'s `exec >log` — via `apply_redirections`, whose own
+        // post-expansion flush refuses on failure.
+        if terminator_only {
+            return match exec::apply_redirections(&opened) {
+                Ok(()) => Step::Continue(0),
+                Err((path, err)) => {
+                    note!("mesh: {path}: {err}");
+                    Step::Error(1)
+                }
+            };
+        }
+        // Command-bearing: settle stdout here, where a failure can still refuse
+        // the hand-off, then run under the restoring bracket so a failed exec
+        // puts the descriptors back. `run_exec`'s own flush then finds an empty
+        // buffer.
+        if let Err(error) = io::Write::flush(&mut io::stdout()) {
+            note!("mesh: exec: flushing stdout: {error}");
+            return Step::Error(1);
+        }
+        return match exec::with_redirections(&opened, || run_expanded(argv, last, shell)) {
+            Ok(step) => step,
+            Err((path, err)) => {
+                note!("mesh: {path}: {err}");
+                Step::Error(1)
+            }
+        };
     }
     // A redirected builtin runs in the shell like a redirected function: the
     // targets apply to the shell's own descriptors around the call, so there is
@@ -6898,7 +6965,9 @@ impl Deferred {
     fn empty(self) -> &'static str {
         match self {
             Self::Piped => "empty command in a pipeline",
-            Self::Backgrounded => "redirection with no command is not supported yet",
+            Self::Backgrounded => {
+                "a redirection needs a command; `exec > f` retargets the shell itself"
+            }
         }
     }
 
@@ -6994,12 +7063,27 @@ fn run_stage_in_shell(
     shell: &mut Shell,
 ) -> u8 {
     shell.forked = true;
+    // A capture live at the fork is the parent's: its reader threads are not in
+    // this process, so no capture holds this stage back from an `exec`.
+    shell.captures = 0;
     let step = match body {
         StageBody::Function(args) => dispatch_function_call(&cmd.words[0], args.clone(), shell),
         // Not `builtins::dispatch`: `jobs`, `fg`, `bg`, and the prompt builtins
         // are dispatched by the shell, and would otherwise fall through to an
         // external lookup and report "command not found".
-        StageBody::Builtin => run_expanded(cmd.words.clone(), last, shell),
+        //
+        // A redirection-only `exec` reaching a fork is already done: the stage
+        // machinery installed its targets on this child, which is everything
+        // the form asks for — they hold for the rest of the child's life,
+        // bash's `exec > log &` subshell. Only with redirections to its name; a
+        // truly bare `exec` still reports what it was missing.
+        StageBody::Builtin => {
+            if redirection_only_exec(&cmd.words) && !cmd.redirs.is_empty() {
+                Step::Continue(0)
+            } else {
+                run_expanded(cmd.words.clone(), last, shell)
+            }
+        }
         StageBody::External => unreachable!("an external stage has no in-shell body"),
         // The words are expanded **here**, in the stage's own process, which is the
         // whole point of deferring them: a `$(…)` or a call in one runs where its
@@ -7039,6 +7123,11 @@ fn run_stage_in_shell(
                         if argv.is_empty() {
                             note!("mesh: {}", context.empty());
                             Step::Error(1)
+                        } else if redirection_only_exec(&argv) && !cmd.redirs.is_empty() {
+                            // Already done, as on the eager stage path: this
+                            // child's targets were installed before the body
+                            // ran, and they hold for the rest of its life.
+                            Step::Continue(0)
                         } else if let Some(program) = external_stage(&argv) {
                             // Replaces this process, so nothing below runs on success.
                             return exec::exec_stage(&program);
@@ -7584,6 +7673,111 @@ fn unknown_command_option(flag: &str) -> Step {
     Step::Error(2)
 }
 
+/// Is this argv `exec` with nothing after it but its own `--` terminator — the
+/// redirection-only form, whose targets are the interesting part? `--` only
+/// ends the options, so it must not change which form this is.
+fn redirection_only_exec(words: &[String]) -> bool {
+    words.first().is_some_and(|word| word == "exec")
+        && match &words[1..] {
+            [] => true,
+            [terminator] => terminator == "--",
+            _ => false,
+        }
+}
+
+/// `exec [--] CMD [ARG …]` — replace this process with the program, the
+/// `exec(2)` hand-off (`DESIGN.md` §"Redirection"): on success no shell
+/// survives. The redirection-only form (`exec > log`) never reaches here — the
+/// redirected path applies its targets to the shell for good before dispatch.
+///
+/// Only the leading words are `exec`'s own, exactly as `command` reads its:
+/// `--help` answers with this builtin's help, `--` ends its options, and any
+/// other flag-looking word in front of the program is a usage error rather than
+/// a program name — bash's `-l`/`-a`/`-c` are not built, and reading one as a
+/// program today is what it would have to keep meaning tomorrow.
+///
+/// `CMD` resolves as an **external executable**: functions and builtins have no
+/// process image with which to replace the shell, so `execvp` is the entire
+/// lookup, and a name only they answer to is an error saying why. A failed
+/// replacement follows bash: an interactive session reports and survives, a
+/// script exits with the failure — it asked to become the program, and there is
+/// nothing left it was going to do as itself.
+fn run_exec(args: &[String], shell: &mut Shell) -> Step {
+    const NEEDS_PROGRAM: &str =
+        "exec: needs a program to run, or a redirection to apply to the shell";
+    let program = match args {
+        [] => {
+            note!("mesh: {NEEDS_PROGRAM}");
+            return Step::Error(2);
+        }
+        [flag, ..] if flag == "--help" => return Step::Continue(builtins::print_help("exec")),
+        [terminator, rest @ ..] if terminator == "--" => rest,
+        [flag, ..] if flag.starts_with('-') => {
+            note!(
+                "mesh: exec: {flag}: not an option of `exec`; \
+                 `exec -- {flag}` runs a program of that name"
+            );
+            return Step::Error(2);
+        }
+        rest => rest,
+    };
+    if program.is_empty() {
+        // `exec --`, which named no program either.
+        note!("mesh: {NEEDS_PROGRAM}");
+        return Step::Error(2);
+    }
+    // A live capture's readers are threads of this very process, waiting on
+    // pipes from it; replacing the process would take them with it and the
+    // capture could never settle. bash's `$(exec ls)` works because its capture
+    // is a subshell; mesh's runs in-process, so this asks for something the
+    // shell cannot survive. (A forked stage cleared the count — the readers it
+    // forked under are the parent's.)
+    if shell.captures > 0 {
+        note!("mesh: exec: cannot replace the shell inside a capture");
+        return Step::Error(2);
+    }
+    // The bytes Rust has buffered belong to the shell's stdout, and the program
+    // cannot flush them — an unflushed buffer would vanish behind the exec, and
+    // the program's status would hide the loss. Settle it first and refuse the
+    // hand-off when it cannot be settled. (Under a redirection this runs inside
+    // the bracket against an already-empty buffer: `run_command` flushed before
+    // the swap, where the bytes could still reach the sink they were written
+    // for.)
+    if let Err(error) = io::Write::flush(&mut io::stdout()) {
+        note!("mesh: exec: flushing stdout: {error}");
+        return Step::Error(1);
+    }
+    // The job signals are mesh's to default only when mesh itself ignored them,
+    // which `owns_terminal` records precisely; SIGPIPE goes back regardless,
+    // being Rust's doing rather than the caller's.
+    let error = exec::replace_process(program, shell.vars.owns_terminal());
+    // Only reached when the replacement failed.
+    let name = &program[0];
+    let status = if error.kind() == io::ErrorKind::NotFound && builtins::is_builtin(name) {
+        note!(
+            "mesh: exec: {name} is a builtin; a builtin has no process image to replace the shell"
+        );
+        127
+    } else if error.kind() == io::ErrorKind::NotFound && shell.funcs.get(name).is_some() {
+        note!(
+            "mesh: exec: {name} is a function; a function has no process image to replace the shell"
+        );
+        127
+    } else {
+        exec::spawn_error_code(name, &error)
+    };
+    // Only the top-level interactive shell survives the failure: it has a
+    // prompt to go back to. A script asked to *become* the program, and a
+    // forked child — a `fork` block, a pipeline stage — is the same case one
+    // process down: the statements after its `exec` were written as
+    // unreachable, so it ends with the failure rather than running them.
+    if !shell.forked && shell.vars.interactive() {
+        Step::Continue(status)
+    } else {
+        Step::Exit(status)
+    }
+}
+
 /// Run a command whose words are already expanded: `return`, `command`, generated
 /// help, the prompt and job-control builtins, then the builtin → external chain. A
 /// function has already been resolved by the caller, which still has its unexpanded
@@ -7626,6 +7820,13 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
                 Step::Error(2)
             }
         };
+    }
+    // `exec` is read early for the same reason: its arguments are the program's
+    // (`exec ls --help` is ls's help, not this builtin's), and its resolution is
+    // `execvp`'s alone — the builtin → external chain below has nothing to offer
+    // a command that bypasses both.
+    if words[0] == "exec" {
+        return run_exec(&words[1..], shell);
     }
     if builtins::is_builtin(&words[0]) {
         if auto_help_requested_strings(&words[1..]) {

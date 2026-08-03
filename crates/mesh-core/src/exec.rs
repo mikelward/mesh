@@ -1188,8 +1188,16 @@ fn fork_stage(
     };
 
     // Anything buffered belongs to the parent; flushing first keeps the child
-    // from inheriting it and printing a duplicate.
-    let _ = std::io::stdout().flush();
+    // from inheriting it and printing a duplicate. A flush that *fails* refuses
+    // the fork instead: the child would carry those undeliverable bytes into
+    // its own redirections — its exit flush writes them wherever its stdout was
+    // just pointed — as if they were the stage's output.
+    if let Err(error) = std::io::stdout().flush() {
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("flushing stdout: {error}"),
+        ));
+    }
 
     // SAFETY: fork has no arguments. The child installs its descriptors with
     // async-signal-safe calls alone, and leaves via `_exit` so no destructor
@@ -2409,16 +2417,19 @@ fn signal_number(name: &str) -> Option<libc::c_int> {
     })
 }
 
+/// The signals whose interactive-shell dispositions must not cross `exec`.
+const JOB_SIGNALS: [libc::c_int; 6] = [
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGTSTP,
+    libc::SIGTTIN,
+    libc::SIGTTOU,
+    libc::SIGTERM,
+];
+
 /// Restore signals whose interactive-shell dispositions must not cross exec.
 fn restore_job_signals() -> std::io::Result<()> {
-    for signal in [
-        libc::SIGINT,
-        libc::SIGQUIT,
-        libc::SIGTSTP,
-        libc::SIGTTIN,
-        libc::SIGTTOU,
-        libc::SIGTERM,
-    ] {
+    for signal in JOB_SIGNALS {
         // SAFETY: signal is one of the valid constants above, and SIG_DFL is a
         // valid disposition. This runs in a forked child, before its body.
         if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
@@ -2442,6 +2453,119 @@ fn set_foreground_group(pgid: libc::pid_t) {
         libc::tcsetpgrp(terminal_fd(), pgid);
         libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
     }
+}
+
+/// The path a descriptor resolved to, for an error message. Resolution applies
+/// "last one wins" per descriptor, so match that here.
+fn redirection_path(redirs: &[Redirection], fd: libc::c_int) -> String {
+    redirs
+        .iter()
+        .rev()
+        .find(|redir| redir.fd == fd)
+        .map(|redir| match &redir.target {
+            RedirTarget::Path(path) => path.clone(),
+            RedirTarget::Descriptor(from) => format!("&{from}"),
+            RedirTarget::Close => "&-".to_owned(),
+            RedirTarget::Heredoc(_) => "<<".to_owned(),
+        })
+        .unwrap_or_default()
+}
+
+/// Apply `redirs` to this process's descriptors **for good** — `exec > log`,
+/// which retargets the shell itself, with no command to bound the scope and
+/// nothing restored afterward.
+///
+/// The open/resolve half is [`with_redirections`]'s; what is missing on purpose
+/// is its save-and-restore bracket, which is exactly what this form is not.
+pub(crate) fn apply_redirections(redirs: &[Redirection]) -> Result<(), (String, std::io::Error)> {
+    use std::io::Write;
+
+    // Anything already buffered belongs to the *previous* stdout, and a failed
+    // flush leaves it sitting in the buffer — where the next flush after the
+    // swap would write it into the new target as if it were that target's own.
+    // Settle it first, before any target is opened or truncated, and refuse the
+    // retarget when it cannot be settled.
+    if let Err(error) = std::io::stdout().flush() {
+        return Err(("flushing stdout".to_owned(), error));
+    }
+    let sources = resolve_redirs(
+        redirs,
+        &live_descriptors(redirs),
+        inherited_seed(),
+        Acquire::Now,
+    )?;
+    let closed = sources.closed();
+    let opened = sources_to_files(sources)?;
+    let targets: Vec<libc::c_int> = opened.iter().map(|(fd, _)| *fd).collect();
+    install_descriptors(opened, &closed).map_err(|err| {
+        let target = targets.first().copied().unwrap_or(libc::STDERR_FILENO);
+        (redirection_path(redirs, target), err)
+    })
+}
+
+/// Replace **this** process with `words`, or return why it could not.
+///
+/// The `exec CMD` hand-off: on success nothing of this process survives, so the
+/// function only ever returns an error. Unlike [`Program::exec`]'s forked-child
+/// contract, the caller here is the shell itself and *does* carry on after a
+/// failure — an interactive session survives a failed `exec`, so nothing that
+/// runs before the `execvp` may leave the shell unusable. The caller settles
+/// Rust's stdout buffer before calling: there is no flush here, and unflushed
+/// bytes would be lost with the shell.
+///
+/// Two kinds of disposition must not cross the hand-off, on the fork path's own
+/// reasoning. SIGPIPE is mesh's: Rust starts the process with it ignored, so it
+/// goes back to default **unconditionally** — `exec yes | head -1` must die
+/// quietly, not report `Broken pipe`. The job signals are mesh's only when
+/// `job_signals` says the shell took the terminal and ignored them; a
+/// noninteractive mesh passes its caller's dispositions through untouched, as
+/// the ordinary child path does — a batch runner that launched the script with
+/// SIGINT ignored means it to stay ignored.
+///
+/// Every disposition changed is *saved* — unlike the forked-stage
+/// `restore_job_signals` — because this caller can fail and keep running as the
+/// shell. Without the put-back, the Ctrl-C after a failed interactive `exec`
+/// would end the session instead of canceling a line, and the shell's own
+/// closed-pipe writes would turn from EPIPE into a fatal SIGPIPE.
+pub(crate) fn replace_process(words: &[String], job_signals: bool) -> std::io::Error {
+    let program = match Program::new(words) {
+        Ok(program) => program,
+        Err(error) => return error,
+    };
+    let mut resets = vec![libc::SIGPIPE];
+    if job_signals {
+        resets.extend(JOB_SIGNALS);
+    }
+    let mut saved: Vec<(libc::c_int, libc::sighandler_t)> = Vec::with_capacity(resets.len());
+    for signal in resets {
+        // SAFETY: `signal` is one of the valid constants above, and SIG_DFL is
+        // a valid disposition; the previous one is returned.
+        let previous = unsafe { libc::signal(signal, libc::SIG_DFL) };
+        if previous == libc::SIG_ERR {
+            // Reported rather than fatal: default dispositions are owed to the
+            // program, but refusing the hand-off over them helps nobody — the
+            // program can set its own. Nothing is saved, so the put-back skips
+            // what never changed.
+            note!(
+                "mesh: exec: restoring signal dispositions: {}",
+                std::io::Error::last_os_error()
+            );
+            continue;
+        }
+        saved.push((signal, previous));
+    }
+    // SAFETY: on success nothing of this process survives. On failure the errno
+    // is returned to the shell, which reports it and carries on — the
+    // fork-then-`_exit` contract on `Program::exec` is about a *child* holding a
+    // copy of the shell's state, and this caller is the shell itself.
+    let error = unsafe { program.exec() };
+    // Only reached when the replacement failed: the shell may survive it, so
+    // what the hand-off changed goes back.
+    for (signal, previous) in saved {
+        // SAFETY: putting back a disposition this process held a moment ago.
+        unsafe { libc::signal(signal, previous) };
+    }
+    error
 }
 
 /// Apply `redirs` to **this** process's stdin/stdout for the duration of `body`,
@@ -2492,21 +2616,7 @@ pub(crate) fn with_redirections<T>(
     // Anything already buffered belongs to the *previous* stdout.
     let _ = std::io::stdout().flush();
 
-    // The path a descriptor resolved to, for an error message. `resolve_fds`
-    // applies "last one wins" per descriptor, so match that here.
-    let path_for = |fd: libc::c_int| {
-        redirs
-            .iter()
-            .rev()
-            .find(|redir| redir.fd == fd)
-            .map(|redir| match &redir.target {
-                RedirTarget::Path(path) => path.clone(),
-                RedirTarget::Descriptor(from) => format!("&{from}"),
-                RedirTarget::Close => "&-".to_owned(),
-                RedirTarget::Heredoc(_) => "<<".to_owned(),
-            })
-            .unwrap_or_default()
-    };
+    let path_for = |fd: libc::c_int| redirection_path(redirs, fd);
 
     let mut swapped: Vec<(libc::c_int, libc::c_int)> = Vec::new();
     let restore = |swapped: &mut Vec<(libc::c_int, libc::c_int)>| {
@@ -3265,7 +3375,7 @@ fn install_descriptors(
 }
 
 /// Map a spawn error to a status and report it (`127` not-found, else `126`).
-fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
+pub(crate) fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
     match err.kind() {
         ErrorKind::NotFound => {
             match crate::builtins::rename_note(name) {
@@ -3582,6 +3692,47 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFSIGNALED(status));
         assert_eq!(libc::WTERMSIG(status), libc::SIGINT);
+    }
+
+    #[test]
+    fn a_failed_replace_process_puts_dispositions_back() {
+        // The hand-off sets the job signals to their defaults for the program's
+        // sake; a failed one keeps running as the shell, which needs its ignored
+        // dispositions back or the next Ctrl-C ends the session. Isolated in a
+        // fork like `child_restores_sigint_to_default`, so the process-wide
+        // change cannot touch the harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+            }
+            let error = super::replace_process(&["mesh_test_no_such_program".to_owned()], true);
+            let not_found = error.kind() == std::io::ErrorKind::NotFound;
+            // Reading the dispositions back is another `signal` call. SIGPIPE is
+            // reset unconditionally (Rust starts the process with it ignored),
+            // so its put-back matters to the shell's own EPIPE-not-signal writes
+            // just as SIGQUIT's does to Ctrl-\.
+            let quit_restored =
+                unsafe { libc::signal(libc::SIGQUIT, libc::SIG_DFL) } == libc::SIG_IGN;
+            let pipe_restored =
+                unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) } == libc::SIG_IGN;
+            unsafe {
+                libc::_exit(if not_found && quit_restored && pipe_restored {
+                    0
+                } else {
+                    1
+                })
+            };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "SIGQUIT disposition was not put back after the failed exec"
+        );
     }
 
     #[test]

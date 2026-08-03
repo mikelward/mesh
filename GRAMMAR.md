@@ -855,7 +855,8 @@ The grammar accepts these and the refusal comes when the statement runs, with a
 message naming what is missing rather than a silent reinterpretation. They are
 listed because a `mesh -n` parse check passing does not mean they work:
 
-- A redirection with no command (`> f`).
+- A redirection with no command (`> f`). The refusal names the working
+  spelling: `exec > f` retargets the shell itself.
 - Backgrounding anything but a command or pipeline. `&` on an expression,
   assignment, `if` / `match`, loop, `fork` block, or definition is refused
   rather than run in the foreground.

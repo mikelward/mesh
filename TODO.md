@@ -153,7 +153,8 @@ Delete an entry once you have agreed with it or reversed it.
 - [x] Descriptor redirection to a file: `2>`, `2>>`, and `1>` alongside the
       defaults, on external commands, functions, forked pipeline stages, and
       background commands. The digits must abut the operator, so `echo 2 > f`
-      still writes "2". Deferred: redirection without a command.
+      still writes "2". Deferred: redirection without a command — since landed
+      as `exec` (see *Beyond M3 — `exec`*).
 - [x] Descriptors above 2 (`3< file`, `3> file`, `2>&3`). Redirection state is
       keyed by descriptor rather than a fixed `[Source; 3]`, and anything past
       the standard three is installed by the child itself, since only those have
@@ -2125,6 +2126,31 @@ designed, and the cross-references say where the fuller note lives.
       than a flag that prints a line. Left out rather than half-built — but
       `command -v` is already refused rather than read as a program name, so
       building it later cannot change what a working line meant.
+
+## Beyond M3 — `exec` ✅ (landed)
+
+- [x] `exec [--] CMD [ARG …]` — replace the shell process with the program, the
+      standard `exec(2)` hand-off `DESIGN.md` decided for porting `autosession`
+      and `logexec`: a dispatcher that `exec`s leaves no parent shell behind.
+      `CMD` resolves as an **external executable** — `execvp` is the entire
+      lookup, so functions and builtins are bypassed, and a name only they
+      answer to is an error naming which kind declined (they have no process
+      image with which to replace the shell). Only the leading words are
+      `exec`'s own, exactly as with `command`: `--` ends its options,
+      `exec ls --help` is `ls`'s help, and a flag-looking word in front of the
+      program is a usage error rather than a program name — bash's `-l`/`-a`/`-c`
+      are not built, and reading one as a program today is what it would have to
+      keep meaning tomorrow. With redirections and **no** program (`exec > log`,
+      `exec 3< file`) the targets apply to the shell itself and stay applied —
+      the previously deferred "redirection without a command", now spelled the
+      way bash spells it; a bare `> f` stays an error whose message points at
+      `exec`. A failed replacement follows bash: an interactive session reports
+      and survives, a script exits with the failure (`127` not found, `126` not
+      executable). In a pipeline stage, `fork` block, or backgrounded command it
+      replaces that child and the shell carries on. Inside `$(…)` or `:capture`
+      it is refused: mesh's captures run **in-process**, with reader threads that
+      would go down with the shell they read from — bash's `$(exec ls)` only
+      works because its capture is a subshell.
 
 ## Beyond M3 — Interpolation
 
@@ -5362,6 +5388,14 @@ reasoning, and the open ones are at the bottom.
       deadlocking. Worth deciding deliberately, because the tidy answer (every
       stage resolves and installs in its own child) trades a real property for
       message placement.
+- [ ] **Bare `>&-` writes a file named `-` instead of closing stdout.** With an
+      explicit descriptor (`2>&-`, `1>&-`) the target `-` means close, but with
+      no prefix the parser reads `>&` as the both-streams-to-a-file form and `-`
+      as the file, so `puts hi >&-` creates a file named `-` where bash closes
+      fd 1. Found smoke-testing `exec`. Decide whether bash's special case is
+      wanted or the divergence is deliberate — the file reading is at least
+      consistent with `>& file`, and a real file named `-` stays reachable as
+      `>& ./-` either way.
 - [ ] **`3>&0` with stdin closed.** Reported as accepted-and-destructive with fd 0
       closed by mesh's caller. `live_descriptors` no longer assumes the standard
       three are open — it probes all three — but the reported symptom persists

@@ -892,6 +892,12 @@ impl Vars {
         self.interactive = interactive;
     }
 
+    /// Whether this session is interactive, as recorded above. A failed `exec`
+    /// turns on it: an interactive session survives one, a script does not.
+    pub(crate) fn interactive(&self) -> bool {
+        self.interactive
+    }
+
     /// Record that this process has taken the terminal: the interactive loop
     /// calls it once, after `wait_until_foreground` and `ignore_interactive_signals`
     /// have both succeeded. Nothing else may — the flag is a claim about what this

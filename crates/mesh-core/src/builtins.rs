@@ -47,6 +47,10 @@ const TABLE: &[(&str, &str)] = &[
         "command [--] NAME [ARG ...]",
         "Run a program, past builtins and functions",
     ),
+    (
+        "exec [--] CMD [ARG ...]",
+        "Replace the shell with a program",
+    ),
     ("source FILE", "Run a file's commands in this shell"),
     ("help [NAME ...]", "List the builtins, or explain one"),
     (
