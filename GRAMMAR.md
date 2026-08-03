@@ -65,8 +65,9 @@ is what `<punctuation that is a token here>` stands for.
 
 The flag vocabulary is fixed, and the whole chain has to be flags: `/a/:upper`
 is not a regex with an unknown flag but the ordinary string `/A/`, since `:upper`
-is a transform. One non-flag link makes the literal a word again, so `/a/:i:g`
-is read as a string too — and then rejected, because `g` is no modifier at all.
+is a transform. A link that is a real modifier makes the literal a word again; a
+link that is *no* modifier either — `/a/:i:g` — is an error naming the flag
+vocabulary, since no reading is left for the word to fall back to.
 
 ## Lexical structure
 

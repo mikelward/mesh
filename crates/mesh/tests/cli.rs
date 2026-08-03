@@ -18342,6 +18342,40 @@ fn tilde_matches_regexes_and_globs() {
     );
 }
 
+/// A chain link that names no flag *and* no modifier gets the flag vocabulary,
+/// not the string path's "not a modifier" — whose quote-the-word advice would
+/// turn the pattern into text.
+///
+/// A link that is a real modifier (`:upper`) is not this error: the literal
+/// reading declines and the string one stands, whose own report
+/// (`modifier :upper is not valid for a regex`) is pinned elsewhere.
+#[test]
+fn an_unknown_regex_flag_names_the_flag_vocabulary() {
+    let out = run_with_input("x = abc ~ /a/:i:g\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`:g` is not a regex flag"), "{stderr}");
+    assert!(stderr.contains(":ignorecase"), "{stderr}");
+    assert!(!out.status.success());
+
+    // Detached, `:g` is not a chain link — the statement grammar reports the
+    // leftover token, not a flag slot nobody wrote.
+    let out = run_with_input("x = abc ~ /a/ :g\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("expected a statement separator"),
+        "{stderr}"
+    );
+    assert!(!out.status.success());
+
+    // A bare condition is not assignment-only territory: the value-vs-command
+    // probe keeps the flag error rather than handing the statement to a
+    // command reading that fails on the same token with the quoting advice.
+    let out = run_with_input("if abc ~ /a/:g { puts x }\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`:g` is not a regex flag"), "{stderr}");
+    assert!(!out.status.success());
+}
+
 /// A literal holds the characters a regex is **made of**, which are the same
 /// ones that used to end the word it was recognized from.
 ///
