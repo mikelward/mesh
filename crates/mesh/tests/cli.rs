@@ -1979,6 +1979,38 @@ fn glob_star_excludes_dotfiles() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_trailing_slash_glob_matches_directories_and_keeps_the_slash() {
+    // `*/` is "directories only" (`DESIGN.md` §"Globbing"). The walk reports its
+    // matches without the trailing slash, so the dotfile re-check compared `sub`
+    // against `*/`, filtered every match out, and `for d in */ { … }` ran zero
+    // times over a directory full of directories. The match keeps the slash the
+    // pattern asked for, as it would in other shells.
+    let dir = fresh_dir("glob_trailing_slash");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::fs::create_dir(dir.join("other")).unwrap();
+    std::fs::create_dir(dir.join(".git")).unwrap();
+    std::fs::write(dir.join("plain.txt"), "").unwrap();
+    // A qualifier still reads the *name*: statting the slashed spelling would
+    // traverse the link (`lstat("link/")` is the target), making `l` keep nothing
+    // and `d` keep the link. Raised in review.
+    std::os::unix::fs::symlink("sub", dir.join("link")).unwrap();
+    let out = run_with_input(&format!(
+        "cd {}\nfor d in */ {{ puts $d }}\nputs .*/\nputs **/\nputs glob(\"*/\")\nputs */(l)\nputs */(d)\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "link/\nother/\nsub/\n.git/\nlink/ other/ sub/\nlink/\nother/\nsub/\nlink/\nother/ sub/\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A directory with one file, one subdirectory, and one hidden entry of each —
 /// enough to tell the `files` / `dirs` split and the hidden rule apart.
 fn glob_family_dir(tag: &str) -> PathBuf {

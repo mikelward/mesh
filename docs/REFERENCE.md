@@ -1552,6 +1552,7 @@ Applied to each word before the command runs.
 | `*` | Any run of characters in a filename. |
 | `?` | Any single character. |
 | `[abc]` | Any one of the listed characters. |
+| trailing `/` | Directories only — `*/` is the subdirectories, each spelled with its trailing `/` (`sub/`). |
 
 A pattern that matches nothing contributes **no arguments**. A word with no
 pattern character is a literal and passes through unchanged. Quoting a pattern
