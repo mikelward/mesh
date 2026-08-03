@@ -250,6 +250,65 @@ fn non_interactive_shell_does_not_source_rc_config() {
     assert!(out.stderr.is_empty());
 }
 
+/// An interactive session is one shell level deeper than whatever started it,
+/// which is how a config can tell an explicitly started nested shell (`SHLVL`
+/// ≥ 2) from the terminal's or login's own first shell.
+#[test]
+fn interactive_session_deepens_shlvl() {
+    let out = mesh_command()
+        .args(["-i", "-c", "puts $env.SHLVL"])
+        .env("SHLVL", "3")
+        .output()
+        .expect("run mesh");
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4\n");
+    assert!(out.stderr.is_empty());
+}
+
+/// A script or `-c` run is not a deeper session — matching nu and fish — so the
+/// inherited value passes through to children untouched.
+#[test]
+fn non_interactive_run_keeps_shlvl() {
+    let out = mesh_command()
+        .args(["-c", "puts $env.SHLVL"])
+        .env("SHLVL", "3")
+        .output()
+        .expect("run mesh");
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n");
+    assert!(out.stderr.is_empty());
+}
+
+/// Inherited garbage restarts the count at 1 rather than propagating it.
+#[test]
+fn garbage_shlvl_restarts_at_one() {
+    let out = mesh_command()
+        .args(["-i", "-c", "puts $env.SHLVL"])
+        .env("SHLVL", "level-nine")
+        .output()
+        .expect("run mesh");
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+    assert!(out.stderr.is_empty());
+}
+
+/// The first interactive shell of a session — nothing inherited — is level 1.
+#[test]
+fn first_interactive_shell_is_level_one() {
+    let out = mesh_command()
+        .args(["-i", "-c", "puts $env.SHLVL"])
+        .env_remove("SHLVL")
+        .output()
+        .expect("run mesh");
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+    assert!(out.stderr.is_empty());
+}
+
 /// Script line that blocks until job `id` has finished, *without* consuming it.
 ///
 /// The tests using this assert on the shell's `[N] Done (…)` notice, or on a
