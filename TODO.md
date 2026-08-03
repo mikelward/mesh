@@ -1517,6 +1517,55 @@ the checkable list.
       sequence whose width the *terminal* disagrees about, where being right by
       the standard still leaves the cursor in the wrong column.
 
+## Beyond M3 — Line editing and history
+
+The reedline surface `DESIGN.md` promises beyond what is wired up today. The
+MVP bindings themselves are done — the emacs defaults, `Alt-.` / `Esc` `.`
+last-argument recall (`EscapePrefix`, `repl.rs`), `Ctrl-R`, Tab's menu, and
+up/down prefix search (reedline's default when a prefix is typed). Already
+tracked elsewhere and not repeated here: keybindings from `rc.mesh` plus the
+line-buffer/widget API, and the hint (autosuggestion) / highlighter hooks —
+all under "Beyond M3 — External tool integration".
+
+- [ ] **The `history` built-in.** `DESIGN.md` §"Interactive history" calls a
+      listing built-in *the MVP surface* — entries newest last, and
+      `history | grep foo` as the search — and it does not exist: nothing
+      lists the SQLite store today. The design's one subtlety: the current
+      session's own in-flight command is hidden so `history | grep foo` never
+      matches its own pipeline (moot until rows have an in-flight state — see
+      the rich-rows entry).
+- [ ] **Rich history rows** — `cwd`, `tty`, `session`, `start`, `duration`,
+      `status`, filled from `preexec` / `postexec` per the design's column
+      table. reedline's `HistoryItem` already has the fields; mesh fills only
+      `start_timestamp` (`TimestampedHistory`, `repl.rs`). `duration` /
+      `status` need the row id carried from `preexec` to `postexec` — the
+      same carry-a-value-across-the-command shape the atuin `_atuin_id` note
+      records under "Rough edges". This is also what gives a row an
+      *in-flight vs. finished* state, which the two entries around it need.
+- [ ] **The recall selection view** — `Up`, `Ctrl-R`, `Alt-.`, and `!`
+      expansion should draw from *this session plus finished history*: every
+      completed row, minus the in-flight rows of other currently-live
+      sessions. Today every saved row is visible to recall immediately,
+      whatever session it came from. Needs the design's liveness scheme —
+      per-session lock files under `$XDG_STATE_HOME/mesh/sessions/`, an
+      exclusive advisory lock held for the session's lifetime, startup
+      finalization of rows whose owning session's lock is unheld — and
+      depends on rows having an in-flight state at all (previous entry).
+      `ArgumentRecall::load` (`repl.rs`) already walks rows session-by-session
+      to reassemble multi-line commands, so the grouping half exists.
+- [ ] **Vi mode, layered under the emacs keys.** The requirement
+      (`DESIGN.md` §"Requirements") is *both keymaps active* with Esc/Alt
+      disambiguation, deferred in §"Line editing". reedline ships a `Vi` edit
+      mode, but modal INSERT/NORMAL, not layered — the shape needs deciding.
+      `EscapePrefix` is where the disambiguation bites: in vi mode `Esc`
+      must leave insert mode, so `Esc` `.` can't arm a meta prefix without a
+      rule for which reading wins (kitty keyboard protocol, which reedline
+      can enable, makes real `Alt` chords unambiguous and would shrink the
+      conflict to legacy terminals). Includes the `DESIGN.md` inline TODO: a
+      `$sh.keymap` value a prompt segment can read plus a redraw when the
+      keymap changes (zsh's `zle-keymap-select`), which "Cursor shape per
+      mode" under "Beyond M3 — Terminal integration" is blocked on.
+
 ## Beyond M3 — Navigation
 
 - [x] **`CDPATH` search in `cd`** — *landed*. A plain relative operand is looked
