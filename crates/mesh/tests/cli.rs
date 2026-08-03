@@ -11916,6 +11916,18 @@ fn type_t_and_the_sentence_agree_about_a_name_that_does_not_resolve() {
     assert!(!run("type ./plain.txt\n").status.success());
 }
 
+/// A built-in value call is not a command, but `-t` still names it: a config
+/// asking `type -t NAME` before binding a function to the name needs `keyword`,
+/// not silence — `func files()` is refused, unlike `func and()`. The sentence
+/// form already calls the name a shell keyword, and `-t` says the same word.
+#[test]
+fn type_t_names_a_value_call() {
+    let out = run_with_input("type -t files\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "keyword\n");
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+}
+
 /// `-P` answers only with a `PATH` hit, ignoring functions and builtins. This is
 /// what retires the hand-rolled `for d in $PATH` loop a portable `shrc` carries,
 /// since `type -P` is not available everywhere.
