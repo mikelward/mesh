@@ -197,6 +197,15 @@ pub(crate) fn type_of(args: &[String], funcs: &Funcs, vars: &Vars) -> u8 {
                     .chain(&found.separate)
                     .find(|finding| finding.usable())
                     .map(word)
+                    // A built-in value call (`files`, `re`, `glob`) is not
+                    // usable in command position, so the filter above drops
+                    // it — but mesh still owns the name, and a config asking
+                    // `type -t NAME` before binding a function to it needs an
+                    // answer, not silence. The sentence form already calls it
+                    // a shell keyword; `-t` says the same word. A contextual
+                    // word (`and`) stays silent: it reserves nothing, so a
+                    // function may take it.
+                    .or_else(|| builtins::is_value_call(name).then_some(&b"keyword"[..]))
             };
             match answer {
                 Some(answer) if !quiet => {
