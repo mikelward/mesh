@@ -12536,10 +12536,10 @@ fn a_composed_option_name_is_data_not_an_option() {
     for call in [
         "name = force\nf(--$name)",
         "f(--\"force\")",
-        // A postfix chain is a composition of the name in its own right. It applies
-        // to the **whole** word — there is no point in the text where the `=` stops
-        // it — so `--FORCE:lower` becomes `--force` and `--TAG=V9:lower` becomes
-        // `--tag=v9`, either of which would bind a flag the reader never wrote.
+        // A postfix chain on a word with no `=` is a composition of the name in
+        // its own right — `--FORCE:lower` becomes `--force`, which would bind a
+        // flag the reader never wrote. Only the attached form has a value part
+        // for a chain to anchor on; a switch spelling does not.
         "name = FORCE\nf(--$name:lower)",
         "f(--FORCE:lower)",
     ] {
@@ -12559,17 +12559,20 @@ fn a_composed_option_name_is_data_not_an_option() {
     let empty = run_with_input("func f(_a) { puts \"got=[$_a]\" }\nf(--\"\")\n");
     assert_eq!(String::from_utf8_lossy(&empty.stdout), "got=[--]\n");
 
-    // A chain over an *attached* form is data for the same reason, and this is the
-    // case that shows the `=` is no barrier: `--TAG=V9:lower` lowercases the name
-    // along with the value, so admitting it would bind a `--tag` nobody wrote.
+    // A chain over an *attached* form anchors on the value, so the name stays
+    // exactly as written: `--TAG=V9:lower` lowercases `V9`, never `--TAG`, and
+    // the undeclared name reports — the same `unknown flag --TAG` the command
+    // spelling answers — instead of a lowercased `--tag` binding a flag nobody
+    // wrote, or the whole word slipping through as data.
     let attached = run_with_input(
         "func f(target, --tag = none) { puts \"$target/$tag\" }\nf(--TAG=V9:lower)\n",
     );
-    assert_eq!(
-        String::from_utf8_lossy(&attached.stdout),
-        "--tag=v9/none\n",
-        "a chained attached form is data, not the `--tag` option"
+    assert!(
+        String::from_utf8_lossy(&attached.stderr).contains("unknown flag `--TAG`"),
+        "a chain must not rewrite which option binds: {:?}",
+        attached.stderr
     );
+    assert_eq!(String::from_utf8_lossy(&attached.stdout), "");
 
     // Written literally, both still mean what they always did — this narrows
     // what counts as an option, it does not stop options or the terminator.
@@ -12584,6 +12587,117 @@ fn a_composed_option_name_is_data_not_an_option() {
         String::from_utf8_lossy(&terminator.stdout),
         "force=false\n--force\n"
     );
+}
+
+/// A postfix chain on a `--name=value` word anchors on the value part, so a value
+/// call can finally say "this option, with a transformed value" — the spelling
+/// command position always had (`--tag=$w:upper` transforms `$w` there, riding
+/// the variable piece). Before this, the chain wrapped the whole word: the name
+/// was rewritten along with the value, the word stopped being an option, and
+/// `f(--tag=$w:upper)` silently passed `--TAG=V7` as data with `tag` unset.
+#[test]
+fn a_chain_on_an_attached_value_transforms_the_value_not_the_name() {
+    for (call, expected) in [
+        // The motivating case: a variable value, transformed at the call.
+        ("w = v7\nf(--tag=$w:upper)", "tag=V7\n"),
+        // Links nest left to right on the same anchor.
+        ("w = v7\nf(--tag=$w:upper:lower)", "tag=v7\n"),
+        // A bare literal value chains too — in a value call `:upper` is always
+        // a modifier, never text, so it anchors where the option rule points.
+        ("f(--tag=v9:upper)", "tag=V9\n"),
+        // A link that takes arguments anchors the same way.
+        ("f(--tag=abc:stripend(c))", "tag=ab\n"),
+        // A folded access chain is the value; the link lands on its result.
+        ("m = [key: v2]\nf(--tag=$m.key:upper)", "tag=V2\n"),
+        // A quoted or composed value part chains as one piece.
+        ("w = v7\nf(--tag=\"$w\":upper)", "tag=V7\n"),
+        // A chain that collapses a list to one scalar binds it: the anchor is
+        // the value itself, not its rendering, so the list reaches `:len`.
+        ("xs = [a b a]\nf(--tag=$xs:len)", "tag=3\n"),
+        // The anchor holds for the whole postfix run, not only `:` links — an
+        // index, a call, and a member after one all stay on the value.
+        ("xs = [a b a]\nf(--tag=$xs:dedup[0])", "tag=a\n"),
+        // An explicitly empty value anchors too: the plain `--tag=` binds the
+        // empty string, so its trailed spelling binds the trailed empty string
+        // rather than falling back to the whole-word reading.
+        ("f(--tag=:upper)", "tag=\n"),
+        ("func v() { return v9 }\nf(--tag=v())", "tag=v9\n"),
+        (
+            "func g() { return [key: v2] }\nf(--tag=g().key)",
+            "tag=v2\n",
+        ),
+    ] {
+        let out = run_with_input(&format!(
+            "func f(--tag = none) {{ puts \"tag=$tag\" }}\n{call}\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            expected,
+            "{call} should bind the transformed value"
+        );
+        assert!(out.stderr.is_empty(), "{call}: {:?}", out.stderr);
+    }
+
+    // The re-anchored parse is the word's, not the call's, so an assignment
+    // agrees with the call spelling: the name survives untransformed.
+    let bound = run_with_input("w = v7\nx = --tag=$w:upper\nputs $x\n");
+    assert_eq!(String::from_utf8_lossy(&bound.stdout), "--tag=V7\n");
+
+    // A chain that leaves the value a list is still refused — the chain changes
+    // where a modifier anchors, not what an option may hold.
+    let list = run_with_input(
+        "func f(--tag = none) { puts \"tag=$tag\" }\nxs = [a b a]\nf(--tag=$xs:dedup)\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&list.stderr).contains("list"),
+        "{:?}",
+        list.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&list.stdout), "");
+
+    // A glob-shaped *name* keeps the whole-word reading, even when its pattern
+    // could never expand (the class here never closes, so the written word is
+    // literal text). Rebuilding the word would turn its `--fo*=` head into a
+    // live glob — the value piece is a placeholder to expansion — and the
+    // argument would vanish against the filesystem; leaving the word whole
+    // keeps it deterministic data, like every other composed name.
+    let glob_name = run_with_input(
+        "func f(target = none, --tag = none) { puts \"$target/$tag\" }\nf(--fo*=bad[:upper)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&glob_name.stdout),
+        "--FO*=BAD[/none\n",
+        "a glob-shaped name must not be rebuilt around"
+    );
+}
+
+/// A qualified glob after the `=` anchors with its qualifiers: the `(f)` rides
+/// the pattern it narrows onto the extracted value, so `--tag=*.txt(f):len`
+/// counts the matching files rather than the whole word losing its option
+/// reading. In a scratch directory because the qualifier reads the filesystem.
+#[test]
+fn a_qualified_glob_value_keeps_its_qualifiers_when_chained() {
+    let dir = fresh_dir("qualified_glob_option_value");
+    std::fs::write(dir.join("a.txt"), "").unwrap();
+    std::fs::write(dir.join("b.txt"), "").unwrap();
+    std::fs::write(
+        dir.join("run.mesh"),
+        "func f(--tag = none) { puts \"tag=$tag\" }\nf(--tag=*.txt(f):len)\n",
+    )
+    .unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "tag=2\n",
+        "{:?}",
+        out.stderr
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A glob needs no punctuation to mark it as composed — it is spelled in the same

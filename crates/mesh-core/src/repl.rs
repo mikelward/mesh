@@ -9203,29 +9203,24 @@ fn scan_call_value<'p>(
 /// stop. So a first piece carrying no `=` has to be the *whole* word: `--force`
 /// and the bare `--` terminator qualify, a composed name does not.
 ///
-/// A **postfix chain** is a composition of the name in its own right, and the `=`
-/// is no barrier to it — see the comment in the body. All three halves raised in
-/// review.
+/// A **postfix chain** on a word with no `=` is a composition of the name in its
+/// own right — see the comment in the body. All three halves raised in review.
 fn starts_with_bare_dashes(expression: &parser::Expr) -> bool {
-    // A postfix chain disqualifies the word outright, `=` or not. In value mode a
-    // chain applies to the **whole** word rather than to the part after the `=`,
-    // so it can always rewrite the name: `--TAG=V9:lower` evaluates to
-    // `--tag=v9` and would bind a declared `--tag` that the reader never wrote.
-    // There is no position in the word where the `=` stops it.
+    // A chain on a `--name=value` word never reaches this test as a chain: the
+    // parser anchors the link on the value part (`parser::attach_chain_link`),
+    // so `f(--tag=$w:upper)` arrives as an ordinary attached word whose value
+    // piece happens to hold the chain, and the name can never be rewritten —
+    // `--TAG=V9:lower` keeps its `--TAG` and reports `unknown flag`, exactly as
+    // command position answers the same text.
     //
-    // That is a divergence from command position, which applies the chain to the
-    // value and answers `unknown flag --TAG` for the same text. Command position
-    // is the right one, and `TODO.md` carries it as its own entry — but it is a
-    // question about where a modifier attaches, not about what counts as an
-    // option, so it is not settled here. Until it is, this predicate cannot admit
-    // a chained word without letting a modifier pick the option, which is the one
-    // thing it exists to prevent. `f(--tag=$w:lower)` is therefore data; bind the
-    // transformed value first (`t = $w:lower`, then `f(--tag=$t)`) to pass it.
-    //
-    // Nothing to unwrap, then: a chained word is an `Expr::Modifier`, so requiring
-    // a bare `Expr::Scalar` refuses it already. `--tag=$m.key` and `--tag=$xs[0]`
-    // are *not* chains despite appearances — a member or index inside a word is an
-    // ordinary variable piece, so both stay attached values.
+    // What still arrives as an `Expr::Modifier` is the chain the parser left
+    // whole: a word with no `=` (`--force:upper` — a switch has no value part
+    // to anchor on), a globbing name, or an explicit `(--tag=$w):upper` group.
+    // Those disqualify outright, since admitting one would let a modifier pick
+    // which option binds — the one thing this predicate exists to prevent — so
+    // requiring a bare `Expr::Scalar` refuses them already. `--tag=$m.key` and
+    // `--tag=$xs[0]` are *not* chains despite appearances — a member or index
+    // inside a word is an ordinary variable piece, so both stay attached values.
     let parser::Expr::Scalar(word) = expression else {
         return false;
     };

@@ -3105,6 +3105,17 @@ greet world          # -> hi, world
     argument. Binding the last match there would make an option's value depend on
     which files happen to be on disk and drop the rest silently. Bind the value
     you mean first, or use the command spelling.
+  - **A modifier chain on an attached value transforms the value, never the
+    name.** `f(--tag=$w:upper)` binds `tag` to the uppercased `$w` — the same
+    reading as the command spelling — links nest left to right, and a link may
+    take arguments (`--tag=abc:stripend(c)`). The anchor holds for the whole
+    postfix run, so everything after the `=` reads as one value expression:
+    `--tag=$xs:dedup[0]` binds the first deduped element, and `--tag=g().key`
+    calls and projects. The name stays exactly as written, so
+    `f(--TAG=V9:lower)` reports `unknown flag --TAG` rather than binding a
+    name the chain rewrote. A chain on a switch spelling (`--force:upper` — no
+    `=`, so no value part to anchor on) leaves the whole word a chained value,
+    which is data like any other composed word.
   - **`--` ends flag parsing** — everything after a bare `--` is positional/rest,
     even if it begins with `--`.
   - **Defaults** are evaluated at call time, in the call's fresh scope, only when

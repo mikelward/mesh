@@ -62,6 +62,24 @@ Delete an entry once you have agreed with it or reversed it.
       `claude/regex-flag-error` cut from `origin/main`. *Reversible:* branches
       are cheap to rename or delete, and the designated-branch instruction can
       be reasserted for future sessions if the harness's reading was intended.
+- [ ] **The value-call chain on `--name=value` binds the whole value part,**
+      where command position binds the `$w` piece alone: `f(--tag=a$w:upper)`
+      uppercases the composed `a$w` (`AV7`) while `f prod --tag=a$w:upper`
+      uppercases only `$w` (`aV7`). A postfix link follows the complete word
+      and has no piece to single out, so the part after the `=` is the
+      narrowest scope the text offers. The alternative — reproducing command
+      position's piece-level attachment — would need the parser to re-split a
+      word it has already read. *Reversible:* narrowing the anchor later
+      changes only composed values, which nothing yet writes.
+- [ ] **A bare-text value chains in a value call** (`f(--tag=v9:upper)` binds
+      `V9`) **where command position keeps `:upper` literal** (`--tag=v9:upper`
+      passes through as text, protecting `--url=http://x` spellings). Not new
+      divergence so much as inherited: the value grammar reserves `:identifier`
+      as a chain everywhere, so the literal reading was never available to a
+      call — before this fix the same spelling was a chain on the *whole word*,
+      which was stranger. The alternative was refusing the bare-text case
+      outright. *Reversible:* a refusal narrows, and nothing shipped depends on
+      either reading.
 - [ ] **`:url` accepts a relative path and absolutizes it**, rather than refusing
       one and telling the writer to make it absolute first. The alternative was
       the safer default: refusing accepts strictly less, so widening later is a
@@ -3807,32 +3825,40 @@ thing a reader takes on trust.*
       place only where the two readings are genuinely both plausible. Not a
       licence to refuse anything merely unusual.
 
-- [ ] **A modifier on a dashed word applies to the whole word, so a value call
-      cannot use one on an option at all.** Found auditing 17. The underlying
-      behavior is **pre-existing** — a chain has always transformed the name
-      along with the value — but 17 changed what that costs, so the reproduction
-      below is the *current* one rather than the one that entry was opened with:
+- [x] **A modifier on a dashed word applies to the whole word, so a value call
+      cannot use one on an option at all.** *Fixed — the parser anchors the
+      chain on the value.* A postfix link after a bare literal `--name=` word
+      now attaches to the part after the `=` (`parser::attach_chain_link`), so
+      `f(--tag=$w:upper)` binds `tag=V7` exactly as the command spelling does,
+      links nest (`:upper:lower`), argument-taking links work
+      (`--tag=abc:stripend(c)`), the anchor holds for the whole postfix run —
+      an index, call, or member trailer after a link stays on the value
+      (`--tag=$xs:dedup[0]` binds the first deduped element; raised by review
+      on the first push) — and the name can never be rewritten —
+      `f(--TAG=V9:lower)` keeps `--TAG` and reports `unknown flag --TAG`, the
+      same answer command position gives the same text. 17's refusal now covers
+      only what still deserves it: a chain on a word with no `=`
+      (`--force:upper` — a switch has no value part to anchor on), a globbing
+      name, or an explicit `(--tag=$w):upper` group, all of which stay data.
+
+      Two seams accepted with the fix, recorded under *Decisions needing
+      review*: the link binds the whole value part where command position rides
+      the `$w` piece alone (`--tag=a$w:upper`), and a bare-text value chains
+      here (`--tag=v9:upper` binds `V9`) where command position keeps `:upper`
+      literal text — the value grammar reserves `:identifier` everywhere, so
+      the literal reading was never available to a call.
+
+      Found auditing 17; the original reproduction, kept for the record:
 
       ```
       w = v7
-      f(--tag=$w:upper)      # value:   --TAG=V7/none  — data, `tag` left at its default
-      f prod --tag=$w:upper  # command: prod/V7        — binds `--tag`
+      f(--tag=$w:upper)      # value:   was --TAG=V7/none — data, `tag` at its default
+      f prod --tag=$w:upper  # command: prod/V7           — binds `--tag`
       ```
 
-      Command position applies the chain to the **value** and binds the option.
-      A value call applies it to the **whole word**, which would rewrite the name
-      — `--tag=` becomes `--TAG=` — so 17 refuses a chained dashed word outright
-      rather than let a modifier choose which option binds. Correct as far as it
-      goes, but it leaves no value-call spelling for "this option, with a
-      transformed value": you have to bind first (`t = $w:upper`, then
-      `f(--tag=$t)`).
-
-      The command reading is the useful one — nobody writes a modifier meaning to
-      transform a flag's own name — so the fix is for a value call to attach the
-      chain to the part after the `=`, at which point 17's refusal can be relaxed
-      to match. Not folded into 17, which settles *whether* a token is an option
-      rather than what a modifier attaches to; that is the same question the
-      "Text glued to a bare value argument" loose end circles.
+      Not folded into 17, which settles *whether* a token is an option rather
+      than what a modifier attaches to; that is the same question the "Text
+      glued to a bare value argument" loose end circles.
 - [x] **A dashed word whose value globs stops being an option.** *Fixed — by
       reporting, not by binding.* An option's value must be one string, and a glob
       is a `Value::List` however many paths it matched, so the value call now says
