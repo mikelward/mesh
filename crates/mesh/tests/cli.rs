@@ -10191,6 +10191,459 @@ fn a_high_descriptor_reaches_every_kind_of_command() {
 }
 
 #[test]
+fn exec_replaces_the_shell_with_the_program() {
+    // Nothing after a successful `exec` runs: the shell *is* the program now,
+    // and the exit status is the program's.
+    let out = run_with_input("exec /bin/echo replaced\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "replaced\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn exec_arguments_belong_to_the_program() {
+    // Only the leading words are `exec`'s own, as with `command`: `--help` after
+    // the program is the program's question to answer, not this builtin's.
+    let help = run_with_input("exec /usr/bin/printf '%s\\n' --help\n");
+    assert_eq!(
+        String::from_utf8_lossy(&help.stdout),
+        "--help\n",
+        "{}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+
+    // `--` ends `exec`'s options, so the next word is the program however it reads.
+    let dashed = run_with_input("exec -- /bin/echo dashed\n");
+    assert_eq!(String::from_utf8_lossy(&dashed.stdout), "dashed\n");
+
+    // A flag-looking word in front of the program is a usage error rather than a
+    // program name — bash's `-l`/`-a`/`-c` are not built, and running one as a
+    // program today is what it would have to keep meaning tomorrow.
+    let flag = run_with_input("exec -l /bin/echo\n");
+    assert_eq!(flag.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&flag.stderr);
+    assert!(stderr.contains("not an option of `exec`"), "{stderr:?}");
+}
+
+#[test]
+fn a_bare_exec_is_a_usage_error() {
+    // With neither a program nor a redirection there is nothing to do; both
+    // spellings of nothing get the same answer.
+    for input in ["exec\n", "exec --\n"] {
+        let out = run_with_input(input);
+        assert_eq!(out.status.code(), Some(2), "{input:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("needs a program to run, or a redirection"),
+            "{input:?}: {stderr:?}"
+        );
+    }
+}
+
+#[test]
+fn exec_with_only_redirections_retargets_the_shell_for_good() {
+    // bash's `exec > log`: no command bounds the scope, so nothing restores —
+    // every later statement writes to the target.
+    let dir = fresh_dir("exec_redir_only");
+    let log = dir.join("log.txt");
+    let out = run_with_input(&format!("exec > {}\nputs one\nputs two\n", log.display()));
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "one\ntwo\n");
+
+    // A high descriptor opened this way stays open for later commands to name.
+    let three = dir.join("three.txt");
+    let out = run_with_input(&format!(
+        "exec 3> {}\nputs via-three >&3\n",
+        three.display()
+    ));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&three).unwrap(), "via-three\n");
+
+    // `--` only ends the options, so the terminator-only spelling is the same
+    // permanent form — not a "needs a program" error through the temporary
+    // bracket.
+    let dashed = dir.join("dashed.txt");
+    let out = run_with_input(&format!("exec -- > {}\nputs dashed\n", dashed.display()));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&dashed).unwrap(), "dashed\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn exec_with_a_command_applies_redirections_to_the_program() {
+    let dir = fresh_dir("exec_redirected");
+    let log = dir.join("out.txt");
+    let out = run_with_input(&format!("exec /bin/echo hi > {}\n", log.display()));
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "hi\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_permanent_retarget_refuses_to_carry_the_old_stdouts_bytes() {
+    // A failed flush leaves the buffered bytes *in* the buffer, where the next
+    // flush after the swap would write them into the new target as if they were
+    // its own — `print old` against an unwritable stdout must not leak `old`
+    // into the file a later `exec >` opens. The retarget is refused instead.
+    let dir = fresh_dir("exec_flush");
+    let target = dir.join("new.txt");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .stdin(Stdio::piped())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(format!("print old\nexec > {}\nputs new\n", target.display()).as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait for mesh");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("flushing stdout"), "{stderr:?}");
+    // The refused retarget opened nothing: the target either does not exist or
+    // at least never received the old sink's bytes.
+    let contents = std::fs::read_to_string(&target).unwrap_or_default();
+    assert!(!contents.contains("old"), "{contents:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_replacement_refuses_to_lose_the_old_stdouts_bytes() {
+    // The command-bearing form has the same duty as the retarget: `print old`
+    // buffered against an unwritable sink must not vanish behind a successful
+    // `exec /bin/true`, with the program's status hiding the loss.
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .stdin(Stdio::piped())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"print old\nexec /bin/true\n")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait for mesh");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("flushing stdout"), "{stderr:?}");
+    // The refusal is the statement's failure, not a silent success wearing
+    // /bin/true's status.
+    assert_eq!(out.status.code(), Some(1), "{stderr:?}");
+}
+
+#[test]
+fn exec_settles_stdout_after_its_targets_are_evaluated() {
+    // A redirect target can evaluate code that itself prints — `> "${pick()}"`
+    // — and those bytes belong to the old sink just as surely as ones written
+    // before the statement. A flush placed in front of the evaluation missed
+    // them: the picker refilled the buffer, the bracket swapped descriptors,
+    // and `side` was flushed into the exec target while the program exited 0.
+    // The flush runs after expansion now, so the refusal sees those bytes too.
+    let dir = fresh_dir("exec_target_eval");
+    let target = dir.join("picked.txt");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let script = format!(
+        "func pick() {{ print side\nreturn {} }}\nexec /bin/true > \"${{pick()}}\"\n",
+        target.display()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .stdin(Stdio::piped())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(script.as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait for mesh");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("flushing stdout"), "{stderr:?}");
+    assert_eq!(out.status.code(), Some(1), "{stderr:?}");
+    // Refused before anything was opened: the target never exists, let alone
+    // holding the picker's output.
+    assert!(!target.exists(), "the refused exec created its target");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn exec_resets_rusts_sigpipe_but_passes_inherited_dispositions_through() {
+    // Non-interactive mesh hands its caller's dispositions through the exec
+    // untouched — a batch runner that ignored SIGQUIT means it to stay ignored —
+    // while SIGPIPE, which Rust ignored on mesh's own behalf at startup, goes
+    // back to default so `exec yes | head -1` can die quietly instead of
+    // reporting a broken pipe.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mesh"));
+    command
+        .arg("-c")
+        .arg("exec cat /proc/self/status")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            // SAFETY: valid signal constant and disposition, in the child
+            // between fork and exec.
+            if libc::signal(libc::SIGQUIT, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = command.output().expect("run mesh");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mask = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .map(|hex| u64::from_str_radix(hex.trim(), 16).expect("hex mask"))
+        .unwrap_or_else(|| panic!("no SigIgn line in {stdout:?}"));
+    assert_ne!(
+        mask & (1u64 << (libc::SIGQUIT - 1)),
+        0,
+        "inherited SIGQUIT ignore was dropped across the exec: {stdout}"
+    );
+    assert_eq!(
+        mask & (1u64 << (libc::SIGPIPE - 1)),
+        0,
+        "Rust's SIGPIPE ignore crossed the exec: {stdout}"
+    );
+}
+
+#[test]
+fn a_failed_exec_ends_a_non_interactive_shell() {
+    // The shell asked to become the program; a script has nothing it was going
+    // to do as itself, so it exits with the failure — bash's split, where only
+    // an interactive session survives to keep its prompt.
+    let out = run_with_input("exec mesh_no_such_program\nputs after\n");
+    assert_eq!(out.status.code(), Some(127));
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("command not found: mesh_no_such_program"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn exec_refuses_a_name_with_no_process_image() {
+    // `CMD` resolves as an external executable only: a builtin or function has
+    // no process image with which to replace the shell, and the error says which
+    // kind of name declined rather than claiming nothing answers to it.
+    let builtin = run_with_input("exec prompt\n");
+    assert_eq!(builtin.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&builtin.stderr);
+    assert!(stderr.contains("prompt is a builtin"), "{stderr:?}");
+
+    let function = run_with_input("func mine() { puts x }\nexec mine\n");
+    assert_eq!(function.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&function.stderr);
+    assert!(stderr.contains("mine is a function"), "{stderr:?}");
+}
+
+#[test]
+fn exec_in_a_pipeline_stage_replaces_that_stage() {
+    // The stage runs in its own fork, so `exec` there is that process's to
+    // spend; the shell itself carries on to the next statement.
+    let out = run_with_input("puts hi | exec cat\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi\nafter\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_failed_exec_ends_the_forked_child_too() {
+    // The fork body wrote `exec` expecting to be replaced, so what follows it
+    // was written as unreachable — a failed replacement ends the child with
+    // the failure, as it does a script, rather than running those statements.
+    // The parent shell carries on either way.
+    let out = run_with_input("fork { exec mesh_no_such_program\nputs inner-after }\nputs outer\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("inner-after"), "{stdout:?}");
+    assert!(stdout.contains("outer"), "{stdout:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("command not found: mesh_no_such_program"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn exec_in_a_fork_block_replaces_only_the_subshell() {
+    let out = run_with_input("fork { exec /bin/echo forked }\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "forked\nafter\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_backgrounded_exec_replaces_the_background_child() {
+    let dir = fresh_dir("exec_background");
+    let target = dir.join("bg.txt");
+    let out = run_with_input(&format!(
+        "exec /bin/echo bg > {} &\nwait\nputs after\n",
+        target.display()
+    ));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("after"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "bg\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_backgrounded_redirection_only_exec_is_a_quiet_success() {
+    // The fork already installed the redirection on the child, which is all the
+    // form asks for: the job succeeds like bash's `exec > log &` subshell,
+    // rather than reporting it "needs a program" a redirection was supplied
+    // instead of.
+    let dir = fresh_dir("exec_redir_only_bg");
+    let log = dir.join("log.txt");
+    let out = run_with_input(&format!("exec > {} &\nwait\nputs after\n", log.display()));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("needs a program"), "{stderr:?}");
+    assert_eq!(out.status.code(), Some(0), "{stderr:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("after"),
+        "{:?}",
+        out.stdout
+    );
+    assert!(log.exists(), "the child never opened its target");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_stage_fork_refuses_to_carry_the_parents_unflushed_bytes() {
+    // `print old` buffered against an unwritable stdout, then a backgrounded
+    // redirected exec: the child's exit flush would write `old` into the
+    // stage's own target as if it were the stage's output. The fork is refused
+    // instead, with the flush named.
+    let dir = fresh_dir("exec_bg_flush");
+    let target = dir.join("new.txt");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .stdin(Stdio::piped())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(format!("print old\nexec /bin/true > {} &\nwait\n", target.display()).as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait for mesh");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("flushing stdout"), "{stderr:?}");
+    let contents = std::fs::read_to_string(&target).unwrap_or_default();
+    assert!(!contents.contains("old"), "{contents:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn exec_is_refused_inside_a_capture() {
+    // A capture's readers are threads of this very process, waiting on pipes
+    // from it; replacing the process would take them with it. bash's `$(exec
+    // ls)` works because its capture is a subshell — mesh's runs in-process.
+    let substitution = run_with_input("x = $(exec /bin/echo hi)\nputs alive\n");
+    let stderr = String::from_utf8_lossy(&substitution.stderr);
+    assert!(
+        stderr.contains("cannot replace the shell inside a capture"),
+        "{stderr:?}"
+    );
+    // The refusal is the capture's failure, not the shell's death.
+    assert!(
+        String::from_utf8_lossy(&substitution.stdout).contains("alive"),
+        "{:?}",
+        substitution.stdout
+    );
+
+    let record = run_with_input("func g() { exec /bin/echo x }\nr = g():capture\nputs alive\n");
+    let stderr = String::from_utf8_lossy(&record.stderr);
+    assert!(
+        stderr.contains("cannot replace the shell inside a capture"),
+        "{stderr:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&record.stdout).contains("alive"),
+        "{:?}",
+        record.stdout
+    );
+
+    // The redirection-only form is refused there too: the capture's restore
+    // would silently undo a retarget that promised to be permanent.
+    let redirected = run_with_input("x = $(exec > /dev/null)\nputs alive\n");
+    let stderr = String::from_utf8_lossy(&redirected.stderr);
+    assert!(
+        stderr.contains("cannot retarget the shell's descriptors inside a capture"),
+        "{stderr:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&redirected.stdout).contains("alive"),
+        "{:?}",
+        redirected.stdout
+    );
+}
+
+#[test]
+fn a_redirection_with_no_command_points_at_exec() {
+    // Still refused — the statement runs nothing — but the message now names
+    // the spelling that does retarget the shell, instead of "not supported yet".
+    let out = run_with_input("> /dev/null\n");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("a redirection needs a command"),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("`exec > f`"), "{stderr:?}");
+    assert!(!stderr.contains("not supported yet"), "{stderr:?}");
+}
+
+#[test]
 fn two_high_descriptors_keep_their_own_targets() {
     // An open takes the lowest free descriptor, so the file for fd 4 lands *on*
     // fd 3 — and installing fd 3 first overwrote it before anything copied it to
