@@ -693,6 +693,11 @@ fn expand_word(word: Word, vars: &Vars, out: &mut Vec<String>) -> Result<(), Exp
 /// symlink in the directory and `*(x)` would be useless. `*(l, x)` is then the
 /// readable spelling of "links to something runnable".
 fn qualifies(path: &str, qualifiers: &GlobQualifiers) -> bool {
+    // A `/`-ended match keeps the slash a directory pattern asked for, but statting
+    // that spelling would traverse a symlink (`lstat("link/")` reports the target),
+    // so `*/(l)` would keep nothing and `*/(d)` would keep the link. Ask about the
+    // name itself.
+    let path = untrailed(path);
     let Ok(named) = fs::symlink_metadata(path) else {
         return false;
     };
@@ -776,16 +781,29 @@ fn glob_matches(pattern: &str) -> Option<Vec<String>> {
     };
     // The walk reports a match in its own spelling, which is not always the one
     // the pattern was written in: a leading `./` is normalized away, so `./tool[0]`
-    // comes back as `tool0`. Re-checking has to compare like with like or every
-    // `./`-led pattern would filter its own matches out.
-    let compiled = glob::Pattern::new(undotted(pattern)).ok()?;
+    // comes back as `tool0`, and a trailing `/` — the "directories only" spelling —
+    // is dropped, so `*/` comes back as `target`, not `target/`. Re-checking has to
+    // compare like with like or every `./`-led or `/`-ended pattern would filter
+    // its own matches out.
+    let compiled = glob::Pattern::new(untrailed(undotted(pattern))).ok()?;
+    // A `/`-ended pattern promised directory spellings, so restore the slash the
+    // walk dropped — `for d in */` reads `target/`, as it would in other shells.
+    let dir_slash = untrailed(pattern) != pattern;
     let paths = glob::glob_with(pattern, walk).ok()?;
     Some(
         paths
             .flatten()
             .map(|path| path.to_string_lossy().into_owned())
             .filter(|path| {
-                !names_self_or_parent(path) && compiled.matches_with(undotted(path), literal_dot)
+                !names_self_or_parent(path)
+                    && compiled.matches_with(untrailed(undotted(path)), literal_dot)
+            })
+            .map(|path| {
+                if dir_slash {
+                    format!("{}/", untrailed(&path))
+                } else {
+                    path
+                }
             })
             .collect(),
     )
@@ -795,6 +813,18 @@ fn glob_matches(pattern: &str) -> Option<Vec<String>> {
 /// says and what the walk reports.
 fn undotted(path: &str) -> &str {
     path.strip_prefix("./").unwrap_or(path)
+}
+
+/// A path minus its trailing slashes — the other spelling difference: the walk
+/// drops the `/` a "directories only" pattern ends with. The root is all slash,
+/// so it keeps one rather than trimming to nothing.
+fn untrailed(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() && !path.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
 }
 
 /// Does this path name a directory's own `.` or `..` entry? Checked as text
