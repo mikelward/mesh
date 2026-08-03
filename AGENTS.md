@@ -68,11 +68,17 @@ apply throughout.
   next check with whatever the client offers (`send_later`, a scheduled task /
   cron, `/loop`), and arm it *without asking*. Scheduling your own follow-up is
   routine hygiene, not a decision that needs approval. Someone else's open PR is
-  not your polling job — adopt one only when asked. Keep polling until the PR
-  state is final: merged, with CI and Codex both reported on the final PR
-  head — or closed unmerged. Then run one last reply-or-resolve pass and
-  cancel the watch. Open a follow-up PR (with its own watch) for anything a
-  merged PR still needs.
+  not your polling job — adopt one only when asked. Once a PR is green,
+  reviewed, and has nothing left but the merge, drop to half-hourly — that's a
+  queue waiting on a human, not work in flight. Merged or closed unmerged is
+  terminal: wait for one more check to see CI and Codex report on the final
+  head, but don't block on a report that may never land — an early manual
+  merge, a docs-only push a path filter never runs CI on, a down review
+  service — settle for whatever's known by then and move on. Either way, run
+  one last reply-or-resolve pass, then cancel the watch in full:
+  `unsubscribe_pr_activity` *and* the pending scheduled trigger, not just one
+  of the two. Open a follow-up PR (with its own watch) for anything a merged
+  PR still needs.
 - **What the polling costs.** Twelve wake-ups an hour per PR, each a model turn
   plus a few GitHub API calls — roughly a dollar an hour on a large context.
   The scheduler is the single point of failure: one missed re-arm ends the
