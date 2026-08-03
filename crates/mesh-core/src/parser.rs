@@ -3455,6 +3455,11 @@ impl Parser<'_> {
                 &mut seen_rest,
             )?;
             parameters.push(param);
+            // A signature breaks across lines the way an argument list does:
+            // `arguments` takes `NL*` on both sides of the comma, and the
+            // continuation classifier (`parameters_prefix`) already reads on
+            // past a line break here, so the strict parse has to agree.
+            self.newlines();
             let comma = self.eat(&TokenKind::Comma).is_some();
             self.newlines();
             if comma && self.same(&TokenKind::RParen) {
@@ -6779,6 +6784,31 @@ mod tests {
             parse("func f(...xs) {}"),
             Ok(ParseOutcome::Complete(_))
         ));
+    }
+
+    #[test]
+    fn a_parameter_list_breaks_across_lines_like_an_argument_list() {
+        // The comma may sit on the next line, exactly as `g(1` ⏎ `, 2)` allows.
+        // (`y` takes a default too: a required positional after an optional one
+        // is refused on its own grounds, line break or no.)
+        let tree = complete("func f(x = 1\n, y = 2) {}");
+        let Executable::Function { parameters, .. } = &tree.statements[0].and_or.first else {
+            panic!()
+        };
+        let names: Vec<&str> = parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["x", "y"]);
+
+        // A whole signature laid out one parameter per line, comma-first.
+        assert!(matches!(
+            parse("func f(\n  a\n  , --region = us-west\n  , ...hosts\n) {}"),
+            Ok(ParseOutcome::Complete(_))
+        ));
+
+        // The line break does not smuggle in a trailing comma...
+        assert!(parse("func f(x\n,) {}").is_err());
+        assert!(parse("func f(x,\n) {}").is_err());
+        // ...and two names still need their comma, wherever the line breaks.
+        assert!(parse("func f(x\ny) {}").is_err());
     }
 
     #[test]

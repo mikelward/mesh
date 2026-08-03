@@ -5297,11 +5297,19 @@ a one-line edit. Every claim below was checked against the built shell.
       range — so every way of writing it answers alike. Group to say it
       (`(1 .. 2) .. 3` parses, and is the engine's problem from there).
 
-- [ ] **A parameter list refuses the newline an argument list accepts.**
-      `g(1` ⏎ `, 2)` parses; `func f(x = 1` ⏎ `, y)` is ``expected `,` or `)` ``.
+- [x] **A parameter list refuses the newline an argument list accepts.**
+      `g(1` ⏎ `, 2)` parses; `func f(x = 1` ⏎ `, y)` was ``expected `,` or `)` ``.
       `Parser::arguments` takes `NL*` before the comma and `Parser::parameters`
-      does not. Nothing seems to depend on the difference, and a signature is
-      exactly the thing long enough to want breaking across lines.
+      did not. Nothing depended on the difference — the lenient
+      `parameters_prefix` classifier already read past the line break, so the
+      interactive shell kept buffering for input the strict parse then refused.
+      Fixed by giving `parameters` the same `NL*` before the comma; the
+      trailing-comma refusal and the two-names-need-a-comma error are unchanged
+      and pinned across line breaks. `GRAMMAR.md`'s layout list and
+      `parameter-list` production updated to match. (The literal example above
+      now reports `required parameter `y` cannot follow an optional one` — the
+      signature rule the line break was hiding; `func f(x` ⏎ `, y = 2)` shows
+      the fix.)
 
 - [ ] **A repeated `;` is refused by a check that only looks one token ahead.**
       `Parser::source` tests `same(Semi) && tokens[position + 1] is Semi` once,

@@ -109,10 +109,9 @@ came before cannot end one. That covers, among others:
   and `x = true and` ⏎ `false` all parse — and after a trailing `|`, `|&`,
   `&&`, or `||`.
 - **In a bracketed or parenthesized list** — arguments, parameters, glob
-  qualifiers, an index — after the opener, after each `,`, and before the
-  closer. An argument list takes one *before* the comma as well; a parameter
-  list does not, so `func f(x = 1` ⏎ `, y)` is an error where `g(1` ⏎ `, 2)` is
-  not.
+  qualifiers, an index — after the opener, after each `,`, before each `,`,
+  and before the closer, so `func f(x = 1` ⏎ `, y)` parses just as
+  `g(1` ⏎ `, 2)` does.
 - **Around a block's braces**, after a `match`'s `{`, and around a `match`
   arm's `=>`.
 - **After a parameter default's `=`**, an `alias`'s `=`, and between a
@@ -497,7 +496,7 @@ definition      = "wrapper"? "func" definition-name parameter-list NL* block
                 | "alias" definition-name "=" NL* alias-command ;
 definition-name = bare-WORD ;                 # unjudged here; checked when it runs
 alias-command   = env-prefix* redirection* command-word command-item* ;  # no guard
-parameter-list  = "(" NL* ( parameter ( "," NL* parameter )* NL* )? ")" ;
+parameter-list  = "(" NL* ( parameter ( NL* "," NL* parameter )* NL* )? ")" ;
 parameter       = name                        # required positional
                 | name "=" NL* value-expression     # optional positional
                 | flag-name                   # switch flag
