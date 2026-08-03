@@ -13,6 +13,8 @@ workspace = true
 
 [dependencies]
 chrono = "0.4.44"
+# The version reedline itself builds against, so the key-event types unify.
+crossterm = "0.29.0"
 glob = "0.3.3"
 libc = "0.2.186"
 mesh-platform = { path = "../mesh-platform" }
