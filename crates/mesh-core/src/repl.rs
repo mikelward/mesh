@@ -16,17 +16,19 @@ use std::os::fd::FromRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crossterm::event::Event;
 use reedline::{
-    Color, ColumnarMenu, Completer, EditCommand, Emacs, Highlighter, History, HistoryItem,
-    HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, Keybindings, MenuBuilder,
+    Color, ColumnarMenu, Completer, EditCommand, EditMode, Emacs, Highlighter, History,
+    HistoryItem, HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, Keybindings, MenuBuilder,
     Osc133Markers, Osc633Markers, Prompt, PromptEditMode, PromptHistorySearch, PromptKind,
-    Reedline, ReedlineEvent, ReedlineMenu, SearchDirection, SearchQuery, SemanticPromptMarkers,
-    Signal, SimpleMatchHighlighter, Span, SqliteBackedHistory, StyledText, Suggestion,
-    default_emacs_keybindings,
+    Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, SearchDirection, SearchQuery,
+    SemanticPromptMarkers, Signal, SimpleMatchHighlighter, Span, SqliteBackedHistory, StyledText,
+    Suggestion, default_emacs_keybindings,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -10571,7 +10573,8 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         return ExitCode::from(1);
     }
     let completion = Arc::new(RwLock::new(CompletionState::default()));
-    let keybindings = interactive_keybindings();
+    let edit_mode = EscapePrefix::new(interactive_keybindings());
+    let search_state = edit_mode.search_state();
     let completion_menu = completion_menu();
     // Before the editor, so the highlighter can be handed the *same* settings the
     // shell writes to: `$sh.options.bold-input = false` has to reach a reedline
@@ -10594,7 +10597,7 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
         // defaults to off, so without this a paste's newlines each arrive as
         // Enter and every line but the last runs before it can be read.
         .use_bracketed_paste(true)
-        .with_edit_mode(Box::new(Emacs::new(keybindings)))
+        .with_edit_mode(Box::new(edit_mode))
         .with_quick_completions(true)
         .with_highlighter(Box::new(input_highlighter(Arc::clone(
             shell.vars.options(),
@@ -10699,7 +10702,17 @@ fn run_interactive(options: &StartupOptions) -> ExitCode {
             continuation: !pending.is_empty(),
             custom: shell.prompt.text.clone(),
         };
-        match editor.read_line(&prompt) {
+        let read = editor.read_line(&prompt);
+        // Every way out of `read_line` puts the engine back in regular input
+        // except a host command, which suspends a search and resumes it on the
+        // next read. Re-converge the meta prefix's search mirror here: the
+        // `Ctrl-D` exit produces a signal rather than an event, so the mirror
+        // cannot see it from inside `parse_event` — and on a continuation line
+        // that signal is ignored below and the loop reads again.
+        if !matches!(read, Ok(Signal::HostCommand(_))) {
+            search_state.store(false, Ordering::Relaxed);
+        }
+        match read {
             Ok(Signal::HostCommand(command)) if command == "mesh:recall-last-argument" => {
                 argument_recall.insert(&mut editor);
             }
@@ -10802,6 +10815,131 @@ fn interactive_keybindings() -> Keybindings {
         ]),
     );
     keybindings
+}
+
+/// readline's meta prefix: `Esc` and then a character behaves as `Alt` plus
+/// that character, so `Esc` `.` recalls the last argument even when the
+/// terminal delivers the two keys as separate events instead of an `Alt`
+/// chord. reedline's `Emacs` mode is stateless — on its own, `Esc` fires and
+/// the `.` that follows just inserts — so the prefix is remembered here, in
+/// front of it.
+///
+/// During reverse history search the engine consumes `Esc` to leave the
+/// search, readline-style, so that press is not a prefix. The engine doesn't
+/// share its input mode, so the search state is mirrored here from the events
+/// this mode hands back: `SearchHistory` enters it, and any event the engine's
+/// search handler answers by leaving — `Esc`, an accepting `Enter`, `Ctrl-C` —
+/// ends it. One exit produces no event to see — `Ctrl-D` on an empty search
+/// buffer returns a signal instead — so the mirror is shared with the read
+/// loop (see [`EscapePrefix::search_state`]), which clears it whenever
+/// `read_line` returns with the engine reset to regular input.
+struct EscapePrefix {
+    inner: Emacs,
+    /// The previous key was a bare `Esc`, so the next character is `Alt`-ed.
+    armed: bool,
+    /// The engine is in reverse history search, where `Esc` means "leave the
+    /// search" rather than the meta prefix.
+    searching: Arc<AtomicBool>,
+}
+
+/// Whether the engine's reverse-history-search handler answers `event` by
+/// leaving the search. `Ctrl-D` is deliberately absent: with text in the
+/// buffer it deletes a character and the search continues, and on an empty
+/// buffer it ends the whole session, after which the stale flag is moot.
+fn leaves_history_search(event: &ReedlineEvent) -> bool {
+    match event {
+        ReedlineEvent::Esc
+        | ReedlineEvent::CtrlC
+        | ReedlineEvent::Enter
+        | ReedlineEvent::Submit
+        | ReedlineEvent::SubmitOrNewline
+        | ReedlineEvent::HistoryHintComplete => true,
+        // Typing grows the search string and `Backspace` shrinks it; the
+        // search handler answers every other edit — a `Ctrl-W`, a motion —
+        // by bailing back to regular input.
+        ReedlineEvent::Edit(commands) => commands
+            .iter()
+            .any(|command| !matches!(command, EditCommand::InsertChar(_) | EditCommand::Backspace)),
+        // The search handler tries a compound's members in turn, so one
+        // leaving member (`Right` hides `HistoryHintComplete`) leaves.
+        ReedlineEvent::UntilFound(events) | ReedlineEvent::Multiple(events) => {
+            events.iter().any(leaves_history_search)
+        }
+        _ => false,
+    }
+}
+
+impl EscapePrefix {
+    fn new(keybindings: Keybindings) -> Self {
+        Self {
+            inner: Emacs::new(keybindings),
+            armed: false,
+            searching: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The search mirror, shared with the read loop. Every return from
+    /// `read_line` leaves the engine in regular input — `Ctrl-D` during a
+    /// search resets it before exiting, and mesh ignores that signal on a
+    /// continuation line and reads again — except a host command, which
+    /// suspends the search and resumes it on the next read. The loop clears
+    /// the flag on every other signal so the mirror re-converges even on the
+    /// exits that produce no event for `parse_event` to see.
+    fn search_state(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.searching)
+    }
+
+    fn forward(&mut self, event: Event) -> ReedlineEvent {
+        match ReedlineRawEvent::try_from(event) {
+            Ok(event) => self.inner.parse_event(event),
+            // Rewrapping only rejects key releases, and none survive the
+            // caller's own `ReedlineRawEvent` to get this far.
+            Err(()) => ReedlineEvent::None,
+        }
+    }
+}
+
+impl EditMode for EscapePrefix {
+    fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent {
+        let armed = self.armed;
+        self.armed = false;
+        let parsed = match Event::from(event) {
+            Event::Key(key) if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE => {
+                // `Esc` still does its own work on the way through — close
+                // the menu, drop the selection — and arms the prefix. In a
+                // search it instead pays for leaving it, so nothing is armed.
+                self.armed = !self.searching.load(Ordering::Relaxed);
+                self.forward(Event::Key(key))
+            }
+            // Only a plain or shifted character takes the prefix; control
+            // chords and navigation keys keep their unprefixed meaning.
+            Event::Key(mut key)
+                if armed
+                    && matches!(key.code, KeyCode::Char(_))
+                    && key.modifiers.difference(KeyModifiers::SHIFT).is_empty() =>
+            {
+                key.modifiers |= KeyModifiers::ALT;
+                self.forward(Event::Key(key))
+            }
+            // Resize and focus arrive on the terminal's schedule, not the
+            // typist's; they pass through without disturbing the prefix.
+            event @ (Event::Resize(..) | Event::FocusGained | Event::FocusLost) => {
+                self.armed = armed;
+                self.forward(event)
+            }
+            event => self.forward(event),
+        };
+        if parsed == ReedlineEvent::SearchHistory {
+            self.searching.store(true, Ordering::Relaxed);
+        } else if self.searching.load(Ordering::Relaxed) && leaves_history_search(&parsed) {
+            self.searching.store(false, Ordering::Relaxed);
+        }
+        parsed
+    }
+
+    fn edit_mode(&self) -> PromptEditMode {
+        self.inner.edit_mode()
+    }
 }
 
 /// Draws the line being typed, bold or plain per `$sh.options.bold-input`.
@@ -11977,9 +12115,9 @@ impl Prompt for MeshPrompt {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgumentRecall, CommandLine, CompletionState, HeredocGate, Hook, HookEvent, Integration,
-        Invocation, Lookup, MeshPrompt, NOTIFY_LIMIT, PromptMarkers, SemanticMark, Shell,
-        StartupOptions, Step, TITLE_LIMIT, TimestampedHistory, argument_completions,
+        ArgumentRecall, CommandLine, CompletionState, EscapePrefix, HeredocGate, Hook, HookEvent,
+        Integration, Invocation, Lookup, MeshPrompt, NOTIFY_LIMIT, PromptMarkers, SemanticMark,
+        Shell, StartupOptions, Step, TITLE_LIMIT, TimestampedHistory, argument_completions,
         body_awaits_close, command_line, command_notification, command_position,
         command_segment_words, command_words, completed_command, deferred_words, duration_words,
         escape_stripped_width, eval_binary, expand_history_designators, expansion_word,
@@ -11994,10 +12132,11 @@ mod tests {
     use crate::options::Options;
     use crate::parser;
     use crate::vars::Value;
+    use crossterm::event::{Event, KeyEvent};
     use reedline::{
-        EditCommand, Highlighter, History, HistoryItem, KeyModifiers, Prompt, PromptEditMode,
-        PromptKind, Reedline, ReedlineEvent, SearchDirection, SearchQuery, SemanticPromptMarkers,
-        Signal, SqliteBackedHistory,
+        EditCommand, EditMode, Highlighter, History, HistoryItem, KeyCode, KeyModifiers, Prompt,
+        PromptEditMode, PromptKind, Reedline, ReedlineEvent, ReedlineRawEvent, SearchDirection,
+        SearchQuery, SemanticPromptMarkers, Signal, SqliteBackedHistory,
     };
     use std::ffi::OsStr;
     use std::fs;
@@ -13496,6 +13635,198 @@ mod tests {
                 ReedlineEvent::Menu(super::COMPLETION_MENU.to_owned()),
                 ReedlineEvent::MenuNext,
             ]))
+        );
+    }
+
+    fn escape_prefix() -> EscapePrefix {
+        EscapePrefix::new(interactive_keybindings())
+    }
+
+    fn press(mode: &mut EscapePrefix, code: KeyCode, modifiers: KeyModifiers) -> ReedlineEvent {
+        let event = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(code, modifiers))).unwrap();
+        mode.parse_event(event)
+    }
+
+    fn recall_last_argument() -> ReedlineEvent {
+        ReedlineEvent::ExecuteHostCommand("mesh:recall-last-argument".to_owned())
+    }
+
+    #[test]
+    fn escape_then_dot_recalls_the_last_argument() {
+        let mut mode = escape_prefix();
+        assert_eq!(
+            press(&mut mode, KeyCode::Esc, KeyModifiers::NONE),
+            ReedlineEvent::Esc
+        );
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::NONE),
+            recall_last_argument()
+        );
+        // The prefix is spent: the next `.` inserts.
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::NONE),
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar('.')])
+        );
+    }
+
+    #[test]
+    fn alt_dot_still_recalls_without_the_prefix() {
+        let mut mode = escape_prefix();
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::ALT),
+            recall_last_argument()
+        );
+    }
+
+    #[test]
+    fn escape_prefix_reaches_every_alt_binding() {
+        let mut mode = escape_prefix();
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('b'), KeyModifiers::NONE),
+            ReedlineEvent::Edit(vec![EditCommand::MoveWordLeft { select: false }])
+        );
+    }
+
+    #[test]
+    fn escape_prefix_survives_a_repeated_escape() {
+        let mut mode = escape_prefix();
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::NONE),
+            recall_last_argument()
+        );
+    }
+
+    #[test]
+    fn escape_prefix_leaves_navigation_and_control_keys_alone() {
+        // `Esc` then `Up` still walks history rather than becoming a dead
+        // `Alt`+`Up`, and a control chord keeps its unprefixed meaning.
+        let mut mode = escape_prefix();
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut mode, KeyCode::Up, KeyModifiers::NONE),
+            ReedlineEvent::UntilFound(vec![ReedlineEvent::MenuUp, ReedlineEvent::Up])
+        );
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('w'), KeyModifiers::CONTROL),
+            ReedlineEvent::Edit(vec![EditCommand::CutWordLeft])
+        );
+    }
+
+    #[test]
+    fn escape_leaving_reverse_search_is_not_a_prefix() {
+        let mut mode = escape_prefix();
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('r'), KeyModifiers::CONTROL),
+            ReedlineEvent::SearchHistory
+        );
+        // This `Esc` pays for leaving the search; the character after it is
+        // itself again, not an `Alt` chord.
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('b'), KeyModifiers::NONE),
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar('b')])
+        );
+        // Out of the search, `Esc` is the meta prefix again.
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::NONE),
+            recall_last_argument()
+        );
+    }
+
+    #[test]
+    fn edit_chord_leaving_reverse_search_restores_the_prefix() {
+        // Typing edits the search string and the search continues, but any
+        // other edit — `Ctrl-W` here — makes the engine's search handler bail
+        // back to regular input, so the `Esc` after it arms as usual.
+        let mut mode = escape_prefix();
+        press(&mut mode, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('x'), KeyModifiers::NONE),
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar('x')])
+        );
+        // Still searching: this Esc leaves the search, not a prefix.
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::NONE),
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar('.')])
+        );
+        press(&mut mode, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('w'), KeyModifiers::CONTROL),
+            ReedlineEvent::Edit(vec![EditCommand::CutWordLeft])
+        );
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::NONE),
+            recall_last_argument()
+        );
+    }
+
+    #[test]
+    fn ctrl_d_exit_from_reverse_search_resets_the_shared_mirror() {
+        // `Ctrl-D` on an empty search buffer exits `read_line` with a signal
+        // and no event, and on a continuation line mesh ignores the signal
+        // and reads again. The read loop clears the shared mirror on that
+        // signal; after it does, `Esc` is the meta prefix again rather than
+        // being consumed by a search the engine already left.
+        let mut mode = escape_prefix();
+        let search_state = mode.search_state();
+        press(&mut mode, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('d'), KeyModifiers::CONTROL),
+            ReedlineEvent::CtrlD
+        );
+        // `CtrlD` alone must not clear the mirror: with text in the search
+        // buffer it deletes a character and the search continues.
+        assert!(search_state.load(std::sync::atomic::Ordering::Relaxed));
+        // The empty-buffer case exits `read_line` instead; this is the loop's
+        // reset on the returned signal.
+        search_state.store(false, std::sync::atomic::Ordering::Relaxed);
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::NONE),
+            recall_last_argument()
+        );
+    }
+
+    #[test]
+    fn accepting_reverse_search_restores_the_prefix() {
+        // `Enter` accepts the search into the buffer and leaves search mode,
+        // so the `Esc` after it arms as usual.
+        let mut mode = escape_prefix();
+        press(&mut mode, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(
+            press(&mut mode, KeyCode::Enter, KeyModifiers::NONE),
+            ReedlineEvent::Enter
+        );
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::NONE),
+            recall_last_argument()
+        );
+    }
+
+    #[test]
+    fn escape_prefix_survives_resize_but_not_typing() {
+        let mut mode = escape_prefix();
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        let resize = ReedlineRawEvent::try_from(Event::Resize(80, 24)).unwrap();
+        assert_eq!(mode.parse_event(resize), ReedlineEvent::Resize(80, 24));
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::NONE),
+            recall_last_argument()
+        );
+        // Any other keypress spends the prefix; the `.` after it inserts.
+        press(&mut mode, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut mode, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut mode, KeyCode::Char('.'), KeyModifiers::NONE),
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar('.')])
         );
     }
 
