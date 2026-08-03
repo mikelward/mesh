@@ -3601,6 +3601,16 @@ Rules:
   lenient (a `match` with no arm hit yields `""`, like a no-`else` `if`).
 - **It is an expression**: `x = match … { … }` binds the winning arm's value;
   in statement position the value is discarded and arms run for effect.
+- **A literal arm compares totally, even where `==` refuses.** An arm is
+  dispatch machinery, like `:dedup` and list `-`: under first-match traversal
+  it needs an answer for every pair, so it uses the total equality those
+  share rather than the `==` operator's refusals. Today the two agree
+  everywhere; the decided-but-unbuilt `Flag` type (`TODO.md`) is the first
+  divergence — `$x == "--help"` will refuse on a flag, while a `match` with
+  both a `--help` arm and a `"--help"` arm keeps working and takes the right
+  one, since naming both arms is someone deliberately telling them apart.
+  Stated here so the `(==)` in the table below is not read as importing the
+  refusal.
 - **Regex captures**: on the *value* side this is **settled** — `str:match(/re/)`
   returns the groups (positional → list, named → map); see
   [Destructuring](#destructuring). A `/re/` **arm** does **not** *auto*-bind its
@@ -3893,6 +3903,48 @@ hands you a silent empty that a destructure would refuse. That is the accepted c
 of the terse one-liner ([Conditionals](#conditionals-if-is-an-expression),
 "Decided: lenient"); the only lever to close it — requiring `else` in *binding*
 position — was weighed and declined for ergonomics.
+
+**An ambiguous spelling is an error.** Where one spelling has two genuinely
+plausible readings, mesh refuses rather than picking a winner. The standard the
+diagnostic aims for is to name the spelling that says each reading outright —
+`if $xs` errors naming `$xs:len > 0` — though not every shipped message meets
+it yet: the option-value report below states its requirement without suggesting
+the rewrites, which is diagnostic polish still owed, not a design change. The
+rule itself is the refusal. It keeps being reached independently
+rather than having been laid down up front — it is why a condition must be a
+bool or a command ([Conditionals](#conditionals-if-is-an-expression): `if $xs`
+on a list is an error naming `$xs:len > 0`, not a length test, alongside `if 0`
+and `if ""`); why an option value that evaluates to anything other than one
+string is reported rather than joined or dropped (`f(--tag=*.txt)` — raised on
+mikelward/mesh#361); and why comparing a flag to its own text form refuses
+rather than answering `false` *(decided, not yet built — the `Flag` type entry
+in `TODO.md`)*: the string was written *because* someone believed it was the
+flag, so a quiet `false` reads as "not that flag" when the truth is "wrong
+question."
+
+Two lookalikes are **not** instances, named so the rule is not overclaimed.
+`007` is not one: mesh *picks* — it is the string `007`, and it binds, travels,
+and runs as a command ([Arithmetic](#arithmetic)); the only error is `007 + 1`,
+which is the ordinary "a string is not a number" rule every string already
+follows. A glob that matches nothing is not one either: it is `[]`, a chosen
+answer rather than a refusal.
+
+The rule has a cost, and making it explicit is the point of writing the rule
+down: every refusal is a spelling somebody has to write differently, and the
+flag-equality decision shows the sharper version, where an operator that could
+not previously fail becomes fallible. So the rule earns its place only where
+the two readings are genuinely both plausible. It is not a license to refuse
+anything merely unusual — refusing the unusual is just a smaller language.
+
+One scoping note, so this principle and the flag decision are not read as
+contradicting. The rule decides *whether* a refusal exists; it does not fix
+where the line is drawn once one does. The flag decision refuses **every**
+flag-against-non-flag comparison — `$x == 7` as readily as the text-form
+pair — not because `7` is confusable with a flag but because "a flag compares
+to flags" needs no per-pair confusability judgment, where a narrower refusal
+would have to remake that judgment for every type added later. The genuinely
+ambiguous pair is what *earns* the refusal; the type boundary is where the
+line is cheapest to hold.
 
 **Recovery — the shell contains errors at interactive boundaries.** A channel-2
 error has to land somewhere; the rule is where:

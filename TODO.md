@@ -30,8 +30,10 @@ Delete an entry once you have agreed with it or reversed it.
       case the decision was about. The alternative is to make those operations
       fallible too, which is a much larger change and can still be made later.
       *Reversible:* it is a scope line in an unbuilt design entry — but note it
-      leaves `==` and `match` disagreeing on this one pair, so `DESIGN.md`:3602
-      needs amending either way.
+      leaves `==` and `match` disagreeing on this one pair. `DESIGN.md`'s
+      §Matching now states that seam (a literal arm compares totally, even
+      where `==` refuses), so reversing this decision means unwinding that
+      paragraph too.
 - [ ] **#357 closed as superseded rather than rebased.** Both of its fixes had
       landed on `main` by another route while it was open — the alias routing as
       `0c00091`, the invalid-pattern fix as `9acae60` — with equivalent tests
@@ -3411,8 +3413,9 @@ thing a reader takes on trust.*
         deliberately telling them apart, which must keep working. The cost,
         stated so it is not discovered later: `==` and `match` no longer agree
         on this one pair, which is a real seam in a language that otherwise
-        defines arms *by* `==`. `DESIGN.md`:3602 needs amending to say so
-        rather than being left to imply the opposite.
+        defines arms *by* `==`. `DESIGN.md` §Matching now says so — a literal
+        arm compares totally, even where `==` refuses — rather than being left
+        to imply the opposite.
 
         **The refusal is exactly the top-level operand pair of `==` / `!=`.**
         Everything else uses total equality: a nested pair
@@ -3773,7 +3776,14 @@ thing a reader takes on trust.*
         price of `--` appearing as a stray positional in functions that never
         forward.
 
-- [ ] **Write up "an ambiguous spelling is an error" in `DESIGN.md` as a rule.**
+- [x] **Write up "an ambiguous spelling is an error" in `DESIGN.md` as a rule.**
+      *Done — the rule lives in §Error handling, alongside the strict/soft
+      principle, with the instances, the two non-instances, and the cost stated
+      as specified below. The `match`-arms seam the flag decision left is
+      amended in the same commit: §Matching now says a literal arm compares
+      totally even where `==` refuses, so the arm table's `(==)` is not read as
+      importing the refusal.*
+
       It is already the answer mesh keeps reaching independently, and the repo
       owner named it as a trend worth keeping. Genuine instances to cite:
       `if $xs` on a list is an error rather than a length test
