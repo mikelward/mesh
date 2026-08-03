@@ -2535,6 +2535,138 @@ fn word_globs(word: &Word) -> bool {
     })
 }
 
+/// Attach one postfix trailer — a `:modifier` link, a `.member`, an `[index]`,
+/// or a call's `(…)` — where the written word says it belongs.
+///
+/// On a word written as a dashed option — a bare literal `--name=` head whose
+/// name does not glob — the trailer lands on the **value** after the `=` rather
+/// than the whole word. A trailer applied to the whole word can rewrite the
+/// name (`--tag=$w:upper` becoming `--TAG=…`), and nothing may pick which
+/// option binds but the written name — so the old parse left the call spelling
+/// with no way to say "this option, with a transformed value" at all.
+/// Anchoring on the value part is command position's reading of the same
+/// characters, where the chain rides the `$w` piece and the name stays as
+/// written. All four trailers anchor alike, so the postfix run after the `=`
+/// stays one value expression — `--tag=$xs:dedup[0]` indexes the deduped list,
+/// not the option word — rather than the first link continuing on the value
+/// and the next trailer seizing the whole word. Everywhere else — no `=`, a
+/// globbing name, an explicit `(--tag=$w):upper` group — the trailer wraps the
+/// expression it follows, whole, exactly as before.
+///
+/// A trailer binds the complete value part, so `--tag=a$w:upper` uppercases
+/// the composed `a$w`. Command position binds tighter — its chain rides the
+/// `$w` piece alone — but a postfix trailer here follows the whole word and
+/// the part after the `=` is the narrowest scope the text offers.
+fn attach_option_value_trailer(
+    mut value: Expr,
+    end: usize,
+    attach: impl FnOnce(Expr) -> Expr,
+) -> Expr {
+    if let Expr::Scalar(word) = &mut value
+        && let Some(WordPiece::Text {
+            text,
+            quote: QuoteMode::Bare,
+        }) = word.value.pieces.first()
+        && let Some((head, tail)) = text.split_once('=')
+        && head.strip_prefix("--").is_some_and(|name| !name.is_empty())
+        // A glob-*shaped* name — any metacharacter at all, the same set the
+        // parser's own `word_globs` reads — keeps the whole-word reading. This
+        // is deliberately *more* conservative than the option scanner's
+        // semantic test (`repl::starts_with_bare_dashes`, which asks whether
+        // the pattern is actually valid), and the reason is what restructuring
+        // does to the word: the value becomes an opaque piece, which stands in
+        // as a placeholder to expansion, so re-anchoring `--fo*=bad[:upper` —
+        // whose unclosed class makes the *written* word harmlessly literal —
+        // produces a word whose bare text `--fo*=` now globs on its own, and
+        // the argument expands against the filesystem and vanishes. The two
+        // predicates answer different questions: the scanner judges the word
+        // it sees, this guard decides whether rebuilding the word is safe, and
+        // only a name with no glob syntax at all is safe to rebuild around.
+        && !head.contains(['*', '?', '['])
+    {
+        let span = word.span.start..end;
+        let head = format!("{head}=");
+        let tail = tail.to_string();
+        // A glob qualifier list rides with the pattern it narrows, so it moves
+        // onto the extracted value (`--tag=*(f):len` counts files) rather than
+        // pinning the whole word to the old reading. Only the scalar-word arm
+        // below can carry it — qualifiers need a globbing bare text piece, and
+        // a globbing *name* never reaches this point.
+        let qualifiers = word.value.qualifiers.take();
+        let mut value_pieces = word.value.pieces.split_off(1);
+        // A `--tag=` with nothing after the `=` anchors on an **empty** value
+        // expression rather than falling back to the whole-word reading: the
+        // plain spelling binds the empty string, so its trailed spelling binds
+        // the trailed empty string — `f(--tag=:upper)` is `tag=""`, not the
+        // transformed word slipping through as data.
+        if !tail.is_empty() || value_pieces.is_empty() {
+            value_pieces.insert(
+                0,
+                WordPiece::Text {
+                    text: tail,
+                    quote: QuoteMode::Bare,
+                },
+            );
+        }
+        let inner = match value_pieces.as_slice() {
+            // A single spliced value — a folded access chain, or the trailer
+            // this one follows — chains directly, so a postfix run nests as
+            // trailer-over-trailer instead of re-wrapping words.
+            [
+                WordPiece::Value {
+                    quote: QuoteMode::Bare,
+                    ..
+                },
+            ] => {
+                let Some(WordPiece::Value { expression, .. }) = value_pieces.pop() else {
+                    unreachable!("just matched a single value piece")
+                };
+                expression.value
+            }
+            // A single bare variable chains as the variable itself, not its
+            // rendering, so a list-shaped value still reaches a list modifier
+            // and reports as the value it is.
+            [
+                WordPiece::Variable {
+                    quote: QuoteMode::Bare,
+                    ..
+                },
+            ] => {
+                let Some(WordPiece::Variable { name, .. }) = value_pieces.pop() else {
+                    unreachable!("just matched a single variable piece")
+                };
+                Expr::Variable(Spanned {
+                    value: name,
+                    span: span.clone(),
+                })
+            }
+            _ => Expr::Scalar(Spanned {
+                value: Word {
+                    pieces: value_pieces,
+                    qualifiers,
+                },
+                span: span.clone(),
+            }),
+        };
+        word.value.pieces = vec![
+            WordPiece::Text {
+                text: head,
+                quote: QuoteMode::Bare,
+            },
+            WordPiece::Value {
+                expression: Box::new(Spanned {
+                    value: attach(inner),
+                    span: span.clone(),
+                }),
+                quote: QuoteMode::Bare,
+            },
+        ];
+        word.span.end = end;
+        return value;
+    }
+    attach(value)
+}
+
 /// Does this word's text begin with `/`? The test that tells `../x` from a range,
 /// a leading `/` being a spelling no operand has.
 fn word_starts_with_slash(word: &Word) -> bool {
@@ -4607,22 +4739,26 @@ impl Parser<'_> {
             {
                 self.position += 1;
                 self.newlines();
-                value = Expr::Call {
-                    callee: Box::new(value),
-                    // Counted, for the same reason the `else if` arm is: `primary`
-                    // has already given its level back by the time the trailer loop
-                    // runs, so `f(f(f(…)))` would otherwise nest at a constant depth
-                    // of zero. Counted here rather than around the whole loop so
-                    // that a trailer which does *not* descend — `a.b`, or a chain of
-                    // indexes — stays free, and ordinary nesting keeps its full
-                    // budget.
-                    arguments: self.deeper(Self::arguments)?,
-                };
+                // Counted, for the same reason the `else if` arm is: `primary`
+                // has already given its level back by the time the trailer loop
+                // runs, so `f(f(f(…)))` would otherwise nest at a constant depth
+                // of zero. Counted here rather than around the whole loop so
+                // that a trailer which does *not* descend — `a.b`, or a chain of
+                // indexes — stays free, and ordinary nesting keeps its full
+                // budget.
+                let arguments = self.deeper(Self::arguments)?;
+                value =
+                    attach_option_value_trailer(value, self.previous_end(), |callee| Expr::Call {
+                        callee: Box::new(callee),
+                        arguments,
+                    });
             } else if self.eat(&TokenKind::Dot).is_some() {
-                value = Expr::Member {
-                    value: Box::new(value),
-                    name: self.name()?,
-                };
+                let name = self.name()?;
+                value =
+                    attach_option_value_trailer(value, self.previous_end(), |base| Expr::Member {
+                        value: Box::new(base),
+                        name,
+                    });
             } else if self.same(&TokenKind::LBracket)
                 && self
                     .peek()
@@ -4633,10 +4769,11 @@ impl Parser<'_> {
                 let index = self.deeper(Self::expression)?;
                 self.newlines();
                 self.expect(&TokenKind::RBracket, "`]`")?;
-                value = Expr::Index {
-                    value: Box::new(value),
-                    index: Box::new(index),
-                };
+                value =
+                    attach_option_value_trailer(value, self.previous_end(), |base| Expr::Index {
+                        value: Box::new(base),
+                        index: Box::new(index),
+                    });
             } else if self.same(&TokenKind::Colon)
                 && self.word_text_at(1).is_some()
                 // Both halves have to **abut**, which is what keeps a map literal's
@@ -4708,11 +4845,13 @@ impl Parser<'_> {
                 } else {
                     None
                 };
-                value = Expr::Modifier {
-                    value: Box::new(value),
-                    name,
-                    arguments,
-                };
+                value = attach_option_value_trailer(value, self.previous_end(), |base| {
+                    Expr::Modifier {
+                        value: Box::new(base),
+                        name,
+                        arguments,
+                    }
+                });
             } else {
                 break;
             }
