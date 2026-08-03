@@ -51,6 +51,15 @@ Delete an entry once you have agreed with it or reversed it.
       Pinned by a test instead, so it cannot go quiet. The alternative was to
       fold the fix in. *Reversible:* it is still an open entry with a failing-on-
       fix test attached.
+- [ ] **Post-merge, work continued on fresh topic branches rather than the
+      session's designated `claude/autopilot-bk8vre`.** The session harness
+      designates one branch and, for the merged case, prescribes resetting it
+      onto `origin/main`; this file says never reset a merged branch name and
+      take a fresh `claude/<short-topic>` instead, and its post-merge rule asks
+      before any reset. Followed this file: PR #380's follow-up went to
+      `claude/regex-flag-error` cut from `origin/main`. *Reversible:* branches
+      are cheap to rename or delete, and the designated-branch instruction can
+      be reasserted for future sessions if the harness's reading was intended.
 - [ ] **`:url` accepts a relative path and absolutizes it**, rather than refusing
       one and telling the writer to make it absolute first. The alternative was
       the safer default: refusing accepts strictly less, so widening later is a
@@ -5325,11 +5334,16 @@ a one-line edit. Every claim below was checked against the built shell.
       complaint that `member_target` already answers for `$sh` by *accepting* the
       parse and reporting at run time.
 
-- [ ] **`/a/:i:g` says ``:g` is not a modifier`.** `Parser::regex_literal`
+- [x] **`/a/:i:g` says ``:g` is not a modifier`.** `Parser::regex_literal`
       requires every link in the chain to be a regex flag and abandons the whole
-      regex reading on the first that is not — correct, but the message then comes
-      from the string path and never mentions flags. Naming the flag vocabulary
-      would say what is actually wrong.
+      regex reading on the first that is not — correct, but the message then came
+      from the string path and never mentioned flags. Fixed narrowly: a link that
+      is a real modifier still declines silently (`/a/:upper` stays the string
+      `/A/`, and the runtime "not valid for a regex" reports pinned in `cli.rs`
+      are untouched), but a link that is *no* modifier either — where the string
+      path was guaranteed to fail with the quote-the-word advice that would turn
+      the pattern into text — now reports `UnknownRegexFlag`, naming the four
+      flags and their long forms. `GRAMMAR.md`'s note updated to match.
 
 - [ ] **Newline layout inside a group covers binary operators but not postfix
       access.** `Parser::wraps` fires for a continuing binary or range operator,
