@@ -966,12 +966,37 @@ fn run_sourced_text(text: &str, path: &Path, last: u8, shell: &mut Shell) -> Ste
     step
 }
 
+/// Deepen `$env.SHLVL` for an interactive session, so a shell started from
+/// inside another shell can tell (`SHLVL` ≥ 2) that it was an explicit choice
+/// rather than the terminal's or login's own first shell. Interactive sessions
+/// only, matching nu and fish: a script does not deepen the nesting a user
+/// perceives. Inherited garbage — non-numeric, negative — restarts the count at
+/// 1 rather than propagating.
+fn bump_shlvl() {
+    let inherited = env::var("SHLVL")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let level = inherited.saturating_add(1).to_string();
+    // `write` refuses only a name or value the environment cannot hold, and
+    // "SHLVL" with an ASCII count is neither — but the impossible gets a line
+    // rather than a discard.
+    if let Err(message) = environ::write("SHLVL", Value::String(level), false) {
+        note!("mesh: could not set $env.SHLVL: {message}");
+    }
+}
+
 fn run_startup_files(
     options: &StartupOptions,
     interactive: bool,
     mut last: u8,
     shell: &mut Shell,
 ) -> Step {
+    // Before the first file, so `env.mesh` and `rc.mesh` read the session's own
+    // depth rather than the parent shell's.
+    if interactive {
+        bump_shlvl();
+    }
     // The first file that broke. Kept across the rest of the sequence for the same
     // reason a single file keeps it across its own statements: the startup set's
     // status would otherwise be the *last* file's, so a fine `rc.mesh` would report

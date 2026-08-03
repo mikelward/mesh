@@ -362,6 +362,12 @@ variables and functions remain available for the session.
 `--rcfile FILE` replaces `rc.mesh`, while `--norc` skips the interactive RC
 file. Neither option skips `env.mesh` or the login files.
 
+An interactive session sets `$env.SHLVL` to one more than it inherited before
+the startup files run, so a config can tell a shell started from inside another
+shell (`SHLVL` ≥ 2) from the terminal's or login's own first shell. Matching nu
+and fish, a script or `-c` run passes the inherited value through untouched. A
+non-numeric inherited value restarts the count at 1.
+
 Each startup file is a sourced file and reports itself the same way, so the
 [breakage rule](#source) applies to it. A file that fails does **not** stop the
 sequence — `rc.mesh` still runs after a typo in `env.mesh`, since one broken file
