@@ -136,28 +136,39 @@ esac
 `~` is the one-line boolean twin (`$f ~ *.txt`, `$s ~ /re/`) — one regex story, no
 separate `=~`, and it's unanchored like grep (anchor with `^…$`).
 
-## Loops keep their variables
+## Loops iterate a real list, in the current scope
 
-Piping into `while read` in bash runs the loop in a subshell, so your counter
-silently resets to zero. In mesh you iterate a captured **list** in the current
-scope:
+Every shell has loops. What differs is what you get to iterate, and bash makes
+you pick which breakage you can live with: pipe into `while read` and the body
+runs in a subshell, so whatever it set is gone by `done`; or reach for
+`for x in $(cmd)` and every line is re-split on `IFS` and glob-expanded, so one
+filename with a space becomes two iterations.
+
+mesh has one shape and neither problem. A capture is a **string** until you say
+how to split it — `:lines` says it — and the loop runs right where you wrote it.
+So a line is one value, spaces and all, nothing re-globs, and what the body sets
+is still set afterwards:
 
 <pre>
-# bash: prints 0 — the loop ran in a subshell
-n=0; seq 3 | while read x; do n=$((n+1)); done; echo "$n"
+# bash — pick your poison
+n=0; seq 3 | while read x; do n=$((n+1)); done; echo "$n"   # 0: the subshell ate it
+for f in $(ls); do echo "$f"; done                          # "My Photo.jpg" arrives as two
 
-# mesh: n survives
+# mesh
 <strong>n=0</strong>
-<strong>for line in $(seq 3) { n += 1 }</strong>
-<strong>puts $n</strong>
+<strong>for line in $(seq 3):lines { n += 1 }</strong>
+<strong>puts $n</strong>                                    # 3
 </pre>
+
+The split is never guessed for you, and never silently skipped either: looping
+over something that isn't a list is refused, and the error names `:lines`.
 
 Here's a real one — "list this machine's IPs" — from a hand-rolled config,
 in mesh:
 
 <pre>
 <strong>func ips() {
-  for line in $(ip -o a sh up primary scope global) {
+  for line in $(ip -o a sh up primary scope global):lines {
     [_ iface afam addr ...rest] = $line:words
     puts $iface $addr  if $afam ~ inet*
   }
