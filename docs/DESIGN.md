@@ -3476,6 +3476,98 @@ lambda: `$files:filter(:exec)` *is* `$files:filter(func(f) { $f:exec })`, and
 position denotes "the function that applies `:mod`"; the lambda form remains for
 anything a single modifier can't say.
 
+**Referencing a command or function by name — `&name`** *(decided)*. The two namespaces
+[coexist for free](#variables-and-assignment) — `f = 5` and `func f()` both bind, and
+`$f` and `f` tell them apart — but the split is one-directional: a variable can *hold*
+a function, while a named `func` has no value spelling at all. A bare word in value
+position is a [string literal](#bare-words-and-quoted-values--decided), so
+`$xs:map(up)` hands `:map` the string `"up"` and it reports `argument must be a
+function, got a string`. Only two things produce a function value otherwise — a lambda
+and a `:mod` reference — and neither can name a `func` you already wrote.
+
+`&name` is that spelling: a prefix `&` in value position denotes the **callable** of
+that name — a `func` you wrote, a builtin, or an external on `PATH`. The gap it fills
+is the named `func`, but the reference is over the **command namespace**, not a
+`func`-only lookup; that is what lets a hook slot hold `&reload-config` without the
+slot caring which of the three it is, and it falls out of late resolution rather than
+being a second rule.
+
+**Keywords are not referenceable.** Command position's full order is **keyword →
+builtin → func → external**; `&name` takes that path *minus the first step* — **builtin
+→ func → external** — so `&if` and `&return` are not references to control flow but
+**errors**, reported at *parse* time, since the reserved words are known statically.
+That is not a carve-out invented for `&`: a quoted or expanded name already skips the
+keyword step (`"if" x` resolves func → external), so the keyword step belongs to bare
+command position alone, and `&` is one more spelling that is not it.
+
+```
+$xs:map(&up)                    # the func `up`, as a value
+$sh.preprompt.git = &git-info   # the same reference, in a hook slot
+double = func(_x) { $_x * 2 }
+$double(5)                      # a lambda lives in the *variable* namespace: `$`, not `&`
+```
+
+`&name` and `$name` are therefore different callables — `&g` is whatever `g` names in
+the command namespace, `$g` is whatever the variable `g` holds — which falls out of `$` meaning "the value namespace"
+everywhere else, rather than being a rule of its own.
+
+**`&name` is a late-bound name reference, not a captured function object.** It resolves
+when it is *called*, against the command namespace as it stands then — the rule
+[command position already uses](#variables-and-assignment) — so redefining `up` changes
+what an already-registered `&up` runs. That is what lets the spelling be shared with
+[hooks](#hooks-and-the-prompt), whose re-source-safety *is* late binding: a handler
+registered as `&git-info` picks up a redefined `git-info` on the next prompt.
+
+**Whether the reference is legal and what the *call* yields are separate questions.**
+`&name` is well-formed for anything the callable path above resolves — any builtin,
+`func`, or external — but not everything it resolves *returns* something. **Externals
+have no return value** (above), and neither do the **effect-only builtins**: `r =
+puts(1 + 2)` already reports `a command has no return value`, so `&puts` is no more
+usable in a value slot than `&grep` is. What divides the callables is therefore not
+builtin-versus-external but **returns a value versus runs for effect**.
+
+A reference to an effect-only callable is fine in a slot that calls its handler for
+**effect** (a `$sh.preprompt` entry, a `$sh.signal.<NAME>` handler) and fails *when
+called* in a slot that needs a **value** (`:map`, a prompt segment that must return a
+piece). That failure is about the call producing nothing to use, not about the
+reference being ill-formed, and it lands at call time for the same reason the
+bare-`grep(foo)` error does.
+
+Late *dispatch* does not by itself decide whether a slot may hold a reference to a name
+that does not exist **yet**. Command position accepts one — `func f { g }` resolves `g`
+when `f` runs, so definition order is irrelevant there — while a hook slot validates
+eagerly at registration today, and whether it should keep doing so is its own question
+(`docs/HOOKS.md` D3). `&name` fixes when a reference *resolves*, not when it is
+*checked*; the two are easy to conflate and only the first is decided here.
+
+An early-bound capture (Perl's and Raku's `&foo` is a code object)
+would make `&` the one construct in mesh that snapshots the command namespace,
+reintroducing exactly the definition-order sensitivity call-time resolution exists to
+avoid. Elvish's `$f~` — the other two-namespace shell — is likewise a live lookup.
+
+**Why `&`.** In value position it is unclaimed, and it cannot collide with
+backgrounding, which is *postfix* in statement position (`make -j8 &`); a prefix `&`
+where a value is expected is unambiguous. The costs are named rather than dodged: `&`
+is the one glyph in a shell that already says "background", so `:map(&up)` misreads for
+a beat, and a future infix bitwise-and is spent — the worry [arithmetic](#arithmetic)
+already records for `^`. Both survivable, since prefix and infix are different
+positions, as `-` already demonstrates.
+
+*Rejected: `\name`.* Perl's `\&foo` is the shape people half-remember, and it works
+there because `\` is Perl's reference operator. Here `\` is the escape and the line
+continuation — `x = \up` already binds `"up"` — so it would silently change an existing
+spelling rather than add one.
+
+*Not taken (yet): widening `:name`.* `:upper` is already a one-argument function
+reference in value position, so extending it to user functions would need no new sigil
+at all. That is a real option, but it is the [user-defined modifier
+question](#open-questions), not a spelling choice: it merges the modifier vocabulary
+with the function namespace and gives up the parse-time unknown-modifier error. The
+line kept here is by **shape**, not by who wrote the name — `:name` is the
+argument-free, auto-mapping modifier form; `&name` is the general reference, any arity,
+any slot — so a reader can predict which applies without knowing whether a name shipped
+with the shell.
+
 ### Conditionals: `if` is an expression
 
 `if` **yields a value** — it is an expression, not just a statement (Rust,
@@ -4320,8 +4412,8 @@ with no new `trap` builtin:
 
 ```
 $sh.signal.INT.note  = func() { puts "interrupted" }
-$sh.signal.TERM.save = save-state                 # by name
-$sh.signal.USR1.reload = reload-config             # a command/function, late-bound
+$sh.signal.TERM.save = &save-state                 # by name
+$sh.signal.USR1.reload = &reload-config            # a command/function, late-bound
 unset $sh.signal.INT.note                          # remove one
 ```
 
@@ -4918,10 +5010,23 @@ solves the composition requirement and the worst hook footgun at once:
   (and segments render) in the order registered.
 - **Compose, never replace** — adding a key leaves every other handler intact.
 
-A handler value is a **command name or a callable**: a bareword is a string that
-names a command/function run late-bound (matching the [command
-namespace](#variables-and-assignment)), or a `func(){ … }` lambda for inline
-logic.
+A handler value is a **callable**: an
+[`&name` reference](#calling-for-a-value-and-lambdas) to a command or function —
+resolved late, so a redefinition is picked up on the next event — or a
+`func(){ … }` lambda for inline logic.
+
+**The `&` is required here** *(decided)*, rather than a hook slot accepting a bare
+word as a callable and reserving quotes for a literal string. Two reasons. A hook
+slot could only ever have that rule because `$sh.*` is a **fixed, shell-owned
+shape** that knows which slots are function-typed; a user's own `func` has no
+typed parameters, so `my-retry(&attempt)` would need the sigil regardless — and a
+reader would have to know which slots are magic. That is the same
+position-dependent bare-word meaning that
+[bare words and quoted values](#bare-words-and-quoted-values--decided) removed from
+block tails. Second, the hook slot was the one place in the language where quoting
+*changed* meaning; with `&` carrying the reference, quoting goes inert again
+everywhere. The cost is a sigil on lines you write once in an rc file, and it is
+worth it to keep higher-order user functions first-class.
 
 **Event hooks** run for effect at named events, in symmetric `pre`/`post` pairs
 plus the singletons — `preprompt` (before each prompt), the command pair
@@ -4932,7 +5037,7 @@ given the target) / **`postcd`** (after, now in the new dir, given the previous
 dir), and `exit`:
 
 ```
-$sh.preprompt.jobs   = publish-jobs                    # by name
+$sh.preprompt.jobs   = &publish-jobs                   # by name, late-bound
 $sh.postcd.fetch  = func() { vcs auto-fetch & }     # arrived in a new dir — the PWD-gate is now the event itself
 $sh.precd.save    = func(to) { save-dir-state }     # about to leave: act while still in the old dir
 $sh.preexec.timer = func(cmd) { timer-start }       # start the clock…
@@ -5092,8 +5197,8 @@ produce it — is one of:
 - a **renderable**: a plain string or a `style(…)` value (or `""` to contribute
   nothing → its line is skipped);
 - a **flat list of renderables**: the inline pieces of the line, **space-joined,
-  empties dropped** — the *same rule `puts` uses* for its arguments, so `[host-info
-  dir-info auth-info]` reads like `puts host dir auth` and an empty middle piece
+  empties dropped** — the *same rule `puts` uses* for its arguments, so `[&host-info
+  &dir-info &auth-info]` reads like `puts host dir auth` and an empty middle piece
   never leaves a double space. Each piece **keeps its own style** (the pieces stay
   separate *values*; fold them into a string — `"$a$b"` — and the attributes flatten,
   since a string has nowhere to store per-piece color). *Tight* joining (`user@host`,
@@ -5104,30 +5209,37 @@ produce it — is one of:
 - a **keyed sub-map** (`[host: …, dir: …]` — a map literal, `[ ]` not `{ }`): the
   *same* inline line, but each piece **named** so you can replace or `unset` it
   individually;
-- a **structural value**: `rule` (a full-width line) or `newline` (a blank line) —
+- a **structural piece**: `rule` (a full-width line) or `newline` (a blank line) —
   each a **whole** line; or **`fill`**, the *inline* structural piece, used *within*
-  a line's list (below).
+  a line's list (below). `rule` and `newline` are **zero-argument** callables;
+  `fill` takes **one optional argument**, the character to repeat (spaces by
+  default). All three are referenced `&rule` / `&newline` / `&fill` like any other
+  segment, and `fill("─")` is a *call* that produces the piece directly and needs
+  no `&`, being a value rather than a reference. What `fill` never takes as an
+  argument is the renderer's measured **slack** — that stays the renderer's job.
 
-A **bare word in a segment slot is the callable of that name** (late-bound, so
-re-sourcing rebinds it — the by-name rule the hooks use); **quote it for a literal
-string** (`host` calls the `host` segment, `"host"` renders the text). And
+A segment slot holds an [**`&name` reference**](#calling-for-a-value-and-lambdas) —
+late-bound, so re-sourcing rebinds it, the same rule the hooks use — or a
+`func(){ … }` lambda. A **bare word is an ordinary string**, exactly as it is in
+every other value position, so the slot no longer inverts the quoting rule
+(`&host` calls the `host` segment; `host` and `"host"` both render the text). And
 **multiple lines are multiple entries** — a list is always the pieces of *one*
 line, never several lines. So there are no separator entries to name:
 
 ```
-$sh.prompt.status = status-info                # a line — bare name = the status-info segment, by name
-$sh.prompt.rule   = rule                       # a full-width line on its own
-$sh.prompt.line1  = [host-info dir-info auth-info]   # ONE line: host (red) dir (blue) auth (yellow), each its own color
-$sh.prompt.jobs   = job-info                   # its own line — skipped when empty
+$sh.prompt.status = &status-info               # a line — the status-info segment, by name
+$sh.prompt.rule   = &rule                      # a full-width line on its own
+$sh.prompt.line1  = [&host-info &dir-info &auth-info]   # ONE line: host (red) dir (blue) auth (yellow), each its own color
+$sh.prompt.jobs   = &job-info                  # its own line — skipped when empty
 $sh.prompt.char   = func() { "> " }            # a func literal is fine too
 
 # `fill` is the inline right-align / trailing-bar piece, when you want it:
-$sh.prompt.line1  = [host-info dir-info fill clock-info]   # host dir on the left, clock flush-right
-$sh.prompt.line1  = [host-info dir-info fill("─")]         # …or a bar to the right edge (`rule` ≡ a whole-line [fill("─")])
+$sh.prompt.line1  = [&host-info &dir-info &fill &clock-info]   # host dir on the left, clock flush-right
+$sh.prompt.line1  = [&host-info &dir-info fill("─")]           # …or a bar to the right edge (`rule` ≡ a whole-line [fill("─")])
 
 # named variant — same line, pieces individually addressable:
-$sh.prompt.line1     = [host: host-info, dir: dir-info, auth: auth-info]
-$sh.prompt.line1.dir = my-dir-info             # swap ONE piece by name
+$sh.prompt.line1     = [host: &host-info, dir: &dir-info, auth: &auth-info]
+$sh.prompt.line1.dir = &my-dir-info            # swap ONE piece by name
 unset $sh.prompt.line1.auth                    # drop the auth warning
 
 func host-info() { style("$(hostname)", fg: red) }     # `style` (not styled); comma-separated args; parens on the func
@@ -5231,10 +5343,11 @@ completion, and resize stay correct; there is **no line-count knob**.
 **`fill` — right-align and trailing bars.** Within a line's list, **`fill`** is an
 inline piece that **expands to consume the remaining width of its line**, pushing
 whatever follows it to the right edge — the right-alignment primitive.
-`[left fill right]` puts `left` flush-left and `right` flush-right; **multiple
-`fill`s on a line split the slack evenly** (even columns). It fills with **spaces**
-by default; give it a character to repeat that instead — `fill("─")` draws a bar to
-the edge, so `[host-info dir-info fill("─")]` renders `host dir───────────────` out
+`[&left-info &fill &right-info]` puts `left-info` flush-left and `right-info`
+flush-right; **multiple `fill`s on a line split the slack evenly** (even columns). It
+fills with **spaces** by default; give it a character to repeat that instead —
+`fill("─")` draws a bar to
+the edge, so `[&host-info &dir-info fill("─")]` renders `host dir───────────────` out
 to the right margin. **`rule` is the whole-line case of `fill`** — a line whose only
 piece is `fill("─")` — so the two are one mechanism: `fill` fills the *rest of a
 line*, `rule` fills a *whole line*. `fill` measures against the same per-line width
@@ -5478,6 +5591,25 @@ to avoid" rather than promising the latter as done.
   a value call (independent channels); externals have no return value (runtime
   error → `$(…)`). Lambdas are `func(params) { … }` (anonymous, one param
   grammar), passed to `:map` / `:filter` / `:each`.
+- **Function references — decided: `&name`**
+  ([Calling for a value](#calling-for-a-value-and-lambdas)). A named `func` had no
+  value spelling, so `$xs:map(up)` passed the *string* `"up"`; `&name` is the
+  reference, and it is **late-bound** (resolved when called, matching call-time
+  command resolution) rather than a captured function object. The lookup is the
+  **command namespace**, so `&name` reaches a builtin or an external too — whether the
+  *call* then yields a usable value is a separate question, and an `&external` works in
+  an effect slot while failing in a value slot. It is **required in
+  hook and prompt slots**, which retires the bare-word-is-a-callable rule there —
+  the one place quoting changed meaning. Rejected: `\name` (`\` is the escape;
+  `x = \up` already binds `"up"`). **Remaining:** whether `:name` should widen to
+  user-defined functions, which is the *user-defined modifier* question below, not
+  a second spelling — the line held for now is by **shape** (`:name` argument-free
+  and auto-mapping, `&name` general) rather than by who wrote the name.
+- **User-defined modifiers — open.** `:ident` is reserved by the grammar, so the
+  ambiguity is already paid for and a user modifier is *possible*; the vocabulary
+  is otherwise closed forever. The cost is that `:name` moves from **parse**-time
+  to **run**-time resolution, so a typo'd modifier stops being a syntax error. That
+  trade is the whole decision.
 - **Bare environment references (`$PATH`) — decided for now, and reversible**
   ([Variables and assignment](#variables-and-assignment)). The environment becomes
   a third scope rung below local and session; reads fall outward to it on
@@ -5550,8 +5682,8 @@ to avoid" rather than promising the latter as done.
   piece (right-align / trailing bar, multiple `fill`s split slack evenly, optional
   repeat-char; `rule` ≡ a whole-line `[fill("─")]`). A list is one line's pieces —
   **multiple lines are multiple entries** — and line structure is the map, not
-  in-band `\n` (raw external output excepted, as dumb breaks). A bare word in a
-  segment slot is the callable of that name (late-bound); quote for a literal.
+  in-band `\n` (raw external output excepted, as dumb breaks). A segment slot holds
+  an `&name` reference (late-bound) or a lambda; a bare word is an ordinary string.
   Remaining: transient collapse.
 - **Structured prompt — direction decided** ([Hooks and the prompt](#hooks-and-the-prompt)):
   line structure is the **map**, not in-band newlines — **each top-level entry is a
