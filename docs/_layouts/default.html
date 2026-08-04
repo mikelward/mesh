@@ -72,7 +72,21 @@
       border-left: 3px solid var(--rule);
       opacity: .85;
     }
-    table { border-collapse: collapse; display: block; overflow-x: auto; }
+    /* The 46rem prose column is too narrow for the six-shell comparison tables,
+       which get squeezed and then scroll. Let a table size to its content and
+       break out of the column, centered on the same axis, capped so it stays
+       readable on a wide monitor. It still scrolls when even that is too narrow
+       — a phone, mostly. */
+    table {
+      border-collapse: collapse;
+      display: block;
+      width: max-content;
+      max-width: min(calc(100vw - 2.2rem), 72rem);
+      overflow-x: auto;
+      position: relative;
+      left: 50%;
+      transform: translateX(-50%);
+    }
     th, td { border: 1px solid var(--rule); padding: .4rem .7rem; }
     img { max-width: 100%; }
   </style>
