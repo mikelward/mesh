@@ -428,7 +428,7 @@ so when you want the lines you say so:
 
 <pre>
 mesh$ <strong>for line in $(git status --porcelain):lines { puts "[$line]" }</strong>
-[ M DESIGN.md]
+[ M docs/DESIGN.md]
 [?? notes.txt]
 </pre>
 

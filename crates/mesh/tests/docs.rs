@@ -53,12 +53,26 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// `DESIGN.md` is the one documentation file the sweep skips.
+///
+/// It argues the language mesh is *aiming at*, so it deliberately writes syntax
+/// the parser does not accept yet (glob qualifiers, `fork`, heredocs) and quotes
+/// diagnostics as examples of what must fail. Parsing it against today's parser
+/// would report the design's own open front as drift, and the only way to stay
+/// green would be to stop writing down unbuilt syntax — exactly what the file is
+/// for. Every other doc, including the forward-looking `INTRO.md` and
+/// `PROMPT.md`, is swept.
+fn is_design_document(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "DESIGN.md")
+}
+
 fn documentation_files(root: &Path) -> Vec<PathBuf> {
     let mut files = vec![root.join("README.md")];
     let mut from_docs: Vec<PathBuf> = std::fs::read_dir(root.join("docs"))
         .expect("read docs/")
         .map(|entry| entry.expect("docs/ entry").path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .filter(|path| !is_design_document(path))
         .collect();
     from_docs.sort();
     files.extend(from_docs);
@@ -392,5 +406,22 @@ mod extraction {
         let found = examples_in(text, Path::new("sample.md"));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].line, 4);
+    }
+
+    /// The design document is skipped and its neighbors in `docs/` are not, so
+    /// the exclusion stays one file wide rather than quietly swallowing the
+    /// directory.
+    #[test]
+    fn only_the_design_document_is_excluded() {
+        let files = documentation_files(&repo_root());
+        assert!(!files.iter().any(|path| is_design_document(path)));
+        for expected in ["README.md", "INTRO.md", "TOUR.md", "REFERENCE.md"] {
+            assert!(
+                files
+                    .iter()
+                    .any(|path| path.file_name().is_some_and(|name| name == expected)),
+                "{expected} should still be swept"
+            );
+        }
     }
 }

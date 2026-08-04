@@ -4,7 +4,7 @@ A personal, **interactive-first** Unix shell: byte-stream pipes with real
 arrays, a clean-break syntax (no POSIX-script baggage), and a prompt/session/
 completion setup built around how one person actually works at a terminal.
 
-The **language design** is still in progress — see [`DESIGN.md`](DESIGN.md) for
+The **language design** is still in progress — see [`docs/DESIGN.md`](docs/DESIGN.md) for
 the rationale and the language sketch so far. In parallel, a **build track** has
 started: [`ROADMAP.md`](ROADMAP.md) lays out the milestones and
 [`DEVELOPMENT.md`](DEVELOPMENT.md) covers how to build, test, and lay out the

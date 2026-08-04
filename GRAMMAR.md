@@ -9,7 +9,7 @@ accepted by the shell as it stands.
 
 Three neighboring documents, so the same thing is not written twice:
 
-- [`DESIGN.md`](DESIGN.md) — the language mesh is aiming at, and *why* each rule
+- [`docs/DESIGN.md`](docs/DESIGN.md) — the language mesh is aiming at, and *why* each rule
   reads the way it does. This file says what parses; `DESIGN.md` argues it.
 - [`docs/REFERENCE.md`](docs/REFERENCE.md) — what each construct *means* at run
   time: expansion, scope, statuses, builtins, modifiers, job control.
@@ -863,5 +863,5 @@ listed because a `mesh -n` parse check passing does not mean they work:
 - `global` on an environment removal (`global unset $env.KEY`), per
   [Scoped statements](#scoped-statements).
 
-See [`TODO.md`](TODO.md) for the working front and [`DESIGN.md`](DESIGN.md) for
+See [`TODO.md`](TODO.md) for the working front and [`docs/DESIGN.md`](docs/DESIGN.md) for
 the forms still under design.
