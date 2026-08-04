@@ -7,7 +7,13 @@ mesh` and type along.
 `mesh$` is mesh's default prompt. In the transcripts below, the **bold** text
 after it is what you type; the plain lines under it are what you see back.
 
-For a terse lookup of everything shown here, see [`REFERENCE.md`](REFERENCE.md).
+Three neighbors, depending on what you want:
+
+- [`INTRO.md`](INTRO.md) — the five-minute version, mesh set against the bash you
+  would otherwise write.
+- [`REFERENCE.md`](REFERENCE.md) — a terse lookup of everything shown here.
+- [`DESIGN.md`](DESIGN.md) — why each of these choices was made, and what is still
+  being decided.
 
 ---
 
@@ -296,7 +302,20 @@ mesh$ <strong>wait $j</strong>
 first three only ever mean a job, so a bare number is one there too (`fg 1` is
 `fg %1`) — but **`kill` is the exception**: `kill 1` signals *process* 1, as it
 does in every shell, so name the job (`kill %1`, `kill $j`) when that is what you
-mean. That distinction is why a handle has no text form.
+mean.
+
+Because `kill` reads a bare number as a pid, a handle is careful never to *become*
+one: `$j` has no text form at all. Printing or interpolating it is an error that
+tells you to ask for a member instead, so a handle reaches `kill` as a handle or
+not at all — it cannot collapse into a number on the way and signal some unrelated
+process:
+
+<pre>
+mesh$ <strong>puts $j</strong>
+mesh: puts: a job handle has no text form; ask it for a member
+mesh$ <strong>puts $j.id $j.pid $j.state</strong>
+1 4812 running
+</pre>
 
 The whole table is a value too — `$sh.jobs` — so a prompt can read the live jobs
 straight out of it instead of scraping `jobs` output.
@@ -393,7 +412,7 @@ keep the literal part in its own quotes, since pieces sitting next to each other
 join into one argument:
 
 <pre>
-mesh$ <strong>n=42</strong>
+mesh$ <strong>n = 42</strong>
 mesh$ <strong>puts "${n}nd"</strong>
 42nd
 mesh$ <strong>puts $n"nd"</strong>
@@ -889,14 +908,30 @@ web1
 Flags can appear in any order and never get swallowed as positionals; a bare `--`
 ends flag parsing so a later `--word` reaches `...hosts` as data.
 
-`return` leaves a function early; `return N` also sets its status, so a function
-reads as true/false in `&&` / `||`:
+A function's status is whatever its body did last, so a predicate needs no
+`return` at all — it reads as true/false in `&&` / `||` on its own:
 
 <pre>
-mesh$ <strong>func check(x) { test -e $x && return 0; return 1 }</strong>
-mesh$ <strong>check /etc && puts present</strong>
+mesh$ <strong>func check(x) { test -e $x }</strong>
+mesh$ <strong>check /etc &amp;&amp; puts present</strong>
 present
+mesh$ <strong>check /nope || puts missing</strong>
+missing
 </pre>
+
+`return` leaves early, and what it carries is a **value**, not a status — it is
+what a `check()` call hands back. The status that comes with a value is a view of
+it: only `false` fails, since every other value *is* a result and producing one is
+success. So `return 1` succeeds carrying the number `1`; it is not bash's
+`return 1`. When you mean the status, the word is **`fail`**:
+
+<pre>
+mesh$ <strong>func check(x) { test -e $x || fail; puts "$x is here" }</strong>
+mesh$ <strong>check /nope || puts missing</strong>
+missing
+</pre>
+
+`fail` takes a number too (`fail 3`), and stops the body the way `return` does.
 
 A function is also an ordinary pipeline stage or background job — `f | sort`,
 `echo x | f`, `f &` — each running in its own process, exactly as an external
@@ -918,10 +953,12 @@ asks `ls` for its help rather than printing mesh's.
 ## Calling a function for a value
 
 Attach the parentheses and you get the function's **value** rather than its
-status: the last expression of the body, or whatever `return` carries.
+status: the last expression of the body, or whatever `return` carries. The same
+default as the status side — the body's last thing is the answer — so `return` is
+for leaving early, not for handing a value back:
 
 <pre>
-mesh$ <strong>func double(n) { return $n * 2 }</strong>
+mesh$ <strong>func double(n) { $n * 2 }</strong>
 mesh$ <strong>x = double(21)</strong>
 mesh$ <strong>puts $x</strong>
 42
