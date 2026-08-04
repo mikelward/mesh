@@ -1990,6 +1990,39 @@ designed, and the cross-references say where the fuller note lives.
         questions it shares: first match or every match, and what a list
         argument means.
 
+- [ ] **Decide between `:extend` and `+=`'s type dispatch — they are two
+      answers to one question.** With the modifiers landed, `xs += $ys` and
+      `xs = $xs:extend($ys)` are the same operation, and `xs += $y` and
+      `xs = $xs:append($y)` are the same one. That is redundancy the design
+      elsewhere refuses, and it is *load-bearing* redundancy: the two
+      spellings disagree about what a **list** on the right means, so the
+      same line read under either rule does something different. Four ways
+      out, cheapest to most disruptive:
+  - **Keep both** (today). `+=` is the statement convenience and dispatches
+        on the right-hand type; the modifiers say which they mean by name.
+        Costs one exception to "no two spellings for one thing," and the
+        exception is exactly where a reader is most likely to guess wrong —
+        `xs += $ys` extends but `$xs:append($ys)` nests.
+  - **Drop `:extend`.** The modifier set stays `:prepend` / `:append`, and
+        flattening is `+=` or `[...$xs ...$ys]`. Cheapest to do — it is one
+        function and its tests — but it leaves no *pure* extend, so an
+        extend inside a chain has to become a statement.
+  - **Make `+=` append-only** — one element, always, whatever the type.
+        Removes type-directed flattening from the language outright, which
+        is the strongest version of the `DESIGN.md` rule it currently is the
+        sole exception to, and leaves `xs += one` (the common case) exactly
+        as it reads today. The cost is real and silent: `xs += $ys` stops
+        extending and starts nesting, with no error at the moment it
+        changes meaning.
+  - **Make `+=` extend-only.** Symmetric, and the worst of the four: the
+        overwhelmingly common `hosts += web3` would have to be written
+        `hosts += [web3]`, taxing every use to fix a case that is rare.
+      No decision here — `DESIGN.md` §"Arrays / lists" argues the dispatch is
+      safe *because* mesh has no coercion, and that argument has not been
+      answered, only complicated by a second spelling arriving. Whichever way
+      it goes, `DESIGN.md`'s `+=` table and the "one place the shell flattens
+      by type" claim are what change with it.
+
 - [x] **`postfix` consumes a *spaced* call suffix, so a following group is
       stolen** *(landed — narrowed to `Expr::Modifier`, so `f (1)` still calls
       `f` and the language decision this was blocked on was not needed)*. `y = $x:upper (1)` reports "modifier :upper does not take

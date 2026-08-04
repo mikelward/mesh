@@ -2404,6 +2404,13 @@ This is the **one place the shell flattens by type rather than by an explicit
 `...`** — confined to the `+=` right-hand side, type-directed not
 whitespace-directed, so it does not reintroduce word-splitting.
 
+*(TODO: with `:append` / `:extend` below saying by **name** what this says by
+type, `xs += $ys` and `$xs:extend($ys)` are one operation with two spellings —
+and they disagree about what a list on the right means. Open: drop `:extend`,
+make `+=` append-only so no type dispatch survives anywhere, make it extend-only,
+or keep both and accept the overlap. Whichever wins, the table above and this
+paragraph are what change with it.)*
+
 **`:prepend(e)` / `:append(e)` / `:extend(ys)`** are the **pure** counterparts of
 `+=` — the list builds above written as a chain. Each returns a *new* list rather
 than writing one, so they compose where a statement cannot:
