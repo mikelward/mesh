@@ -1,43 +1,53 @@
-# mesh compared with bash, fish, and nushell
+# mesh compared with bash, zsh, fish, and nushell
 
-Three shells worth measuring mesh against, because each one answers the same
+Four shells worth measuring mesh against, because each one answers the same
 question differently.
 
 - **bash** is the baseline — what nearly everyone arrives from, and the source
   of the specific problems mesh exists to fix.
-- **fish** is the friendly shell that kept the Unix shape: byte pipes, external
-  commands everywhere, no word splitting. It is the closest relative.
+- **zsh** is bash's machinery with better defaults. It is the interesting one:
+  it fixed the biggest footgun while keeping POSIX syntax and an emulation mode
+  that still runs old scripts — so the fix cost far less than a new language.
+  The safe default is itself a departure from POSIX expansion; the point is how
+  small a departure bought how much.
+- **fish** is the friendly shell that broke cleanly and kept the Unix shape:
+  byte pipes, external commands everywhere, no word splitting.
 - **nushell** is the structured-data shell: the pipeline carries tables and
   records rather than bytes, and much of coreutils is replaced by builtins that
   speak that format.
 
 mesh sits between fish and nushell, which is the order the tables below are
-written in. It takes fish's answer to expansion safety and pushes it further
-into a real type system — lists, maps, integers, booleans — while keeping
-nushell's ambition out of the pipe: **pipes carry bytes**, so `grep`, `jq`,
-`ffmpeg`, and everything else you already run works unchanged. See
-[`DESIGN.md`](DESIGN.md) for why each call went the way it did, and
-[`REFERENCE.md`](REFERENCE.md) for what is actually implemented today — this page
-compares designs, and mesh's is still being built.
+written in — roughly from most POSIX to least. It takes fish's answer to
+expansion safety and pushes it further into a real type system — lists, maps,
+integers, booleans — while keeping nushell's ambition out of the pipe: **pipes
+carry bytes**, so `grep`, `jq`, `ffmpeg`, and everything else you already run
+works unchanged. See [`DESIGN.md`](DESIGN.md) for why each call went the way it
+did, and [`REFERENCE.md`](REFERENCE.md) for what is actually implemented today —
+this page compares designs, and mesh's is still being built.
 
 ## At a glance
 
-| | bash | fish | mesh | nushell |
-| --- | --- | --- | --- | --- |
-| Unquoted `$x` with a space in it | **splits** | one argument | one argument | one value |
-| Unquoted `$x` holding `*` | **re-globs** | literal | literal | literal |
-| Lists | bolted-on arrays | native | native | native |
-| List → argv | `"${a[@]}"` | implicit | `...$a` | `...$a` |
-| Pipe payload | bytes | bytes | bytes | **structured** |
-| Coreutils | first-class | first-class | first-class | second-class |
-| Unset variable | empty string | empty string | **error** | error |
-| `pipefail` | opt-in | n/a (`$pipestatus`) | **always on** | n/a |
-| Truthiness | status + string tests | status | **no truthy values** | typed |
-| `'…'` | fully raw | nearly raw | **takes escapes** | fully raw |
-| `"…"` interpolates | yes | yes | yes | **no** (`$"…"` does) |
-| `"\n"` is a newline | no (`$'\n'`) | no | yes | yes |
-| Runs POSIX scripts | yes | no | no | no |
-| Config language | bash | fish | mesh | nu |
+| | bash | zsh | fish | mesh | nushell |
+| --- | --- | --- | --- | --- | --- |
+| Unquoted `$x` with a space in it | **splits** | one argument | one argument | one argument | one value |
+| Unquoted `$x` holding `*` | **re-globs** | literal | literal | literal | literal |
+| Unquoted command substitution | **splits on `IFS`** | **splits on `IFS`** | splits on newlines | one string | one value |
+| Unquoted empty `$x` | **vanishes** | **vanishes** | one empty argument | one empty argument | one empty value |
+| Lists | bolted-on arrays | native | native | native | native |
+| List → argv | `"${a[@]}"` | implicit | implicit | `...$a` | `...$a` |
+| Pipe payload | bytes | bytes | bytes | bytes | **structured** |
+| Coreutils | first-class | first-class | first-class | first-class | second-class |
+| Unset variable | empty string | empty string | empty string | **error** | error |
+| `pipefail` | opt-in | opt-in (`$pipestatus`) | n/a (`$pipestatus`) | **always on** | n/a |
+| Truthiness | status + string tests | status + string tests | status | **no truthy values** | typed |
+| `'…'` | fully raw | fully raw | nearly raw | **takes escapes** | fully raw |
+| `"…"` interpolates | yes | yes | yes | yes | **no** (`$"…"` does) |
+| `"\n"` is a newline | no (`$'\n'`) | no (`$'\n'`) | no | yes | yes |
+| Runs POSIX scripts | yes | mostly | no | no | no |
+| Config language | bash | zsh | fish | mesh | nu |
+
+Command substitution is spelled `$(…)` in bash, zsh, mesh, and fish; nushell
+writes a subexpression as `(…)`, and `$(…)` there is a parse error.
 
 ## Quoting and escaping
 
@@ -107,6 +117,73 @@ So in bash quoting is not about literalness. It is how you *turn off* an
 evaluation stage that is on by default. Arrays inherit the whole thing and add
 ceremony: `"${a[@]}"` is four pieces of punctuation that all have to be right.
 
+### zsh: the same machinery, better defaults
+
+zsh is the counter-argument to this whole page, and it deserves to be made
+properly: it kept bash's expansion pipeline and simply **turned the dangerous
+stages off by default**. A parameter expansion is not split and not re-globbed,
+with no options set and no preamble:
+
+```sh
+x='My Photo.jpg'
+printf '[%s]\n' $x         # [My Photo.jpg] — one argument, unquoted
+
+p='report[2024].txt'
+printf '[%s]\n' $p         # [report[2024].txt] — literal, not a pattern
+```
+
+That is the single biggest bug in shell programming, fixed, in a shell that
+still *looks* like `sh` and can still run old scripts under `sh` invocation or
+`emulate sh` — the exemption above is a deliberate non-POSIX default, and the
+compatibility lives in the emulation beside it. It is also why zsh sits second
+in these tables rather than beside bash — most of what the rest of this page
+argues for, zsh already has. Arrays are native, `$a` expands one word per
+element with the spaces intact, an unmatched glob is an **error** rather than
+silently passed through, and `$pipestatus` is a real array. One wrinkle to know
+if you move between them: zsh indexes arrays from **1**, where mesh's lists —
+like most languages, and unlike zsh — start at **0**, so `$xs[0]` is the first
+element.
+
+Three residuals remain, and they are what mesh is answering rather than
+repeating:
+
+- **Command substitution still splits.** The exemption is for *parameter*
+  expansion only, so `$(…)` goes through stage 4 as before, on `IFS`:
+
+  ```sh
+  printf '[%s]\n' $(echo 'a b c')     # [a] [b] [c] — three arguments
+  x=$(echo 'a b c'); printf '[%s]\n' $x   # [a b c] — one
+  ```
+
+  The same characters mean different arities depending on whether the value was
+  bound to a name first. In mesh a capture is one string in both spellings, and
+  splitting is written (`$(…):words`).
+
+- **An empty unquoted expansion still vanishes.** `e=''; printf '[%s]' a $e b`
+  prints `[a][b]` in both bash and zsh — two arguments, not three — so `"$e"`
+  stays load-bearing to pass an empty string. fish, mesh, and nushell all print
+  `[a][][b]`.
+
+  The distinction the other three can make and bash and zsh cannot is between a
+  value that is empty and no value at all. An empty *list* should contribute
+  nothing, and does — fish's `set e; printf '[%s]' a $e b` gives `[a][b]`,
+  correctly, because there are zero elements. A list holding one empty string is
+  a different thing, and survives. In bash and zsh both collapse to the same
+  disappearance, which is why the quotes are needed to tell them apart.
+
+- **The safety is a *default*, not a *rule*.** `setopt shwordsplit` brings
+  splitting back, `setopt globsubst` brings re-globbing back, and `emulate sh`
+  brings back both at once — verified, all three. Options are global dynamic
+  state, so this is the same objection as `IFS` and `set -f` one level up: what
+  a line of zsh does depends on what has been `setopt`-ed by the time it runs,
+  including by a sourced file or a function you did not write. It is a much
+  better default and it is still a default.
+
+That last point is the whole difference in one sentence. **zsh made the safe
+behavior the default; mesh makes it the grammar.** There is no mesh option that
+reintroduces word splitting, because there is no splitting stage to switch back
+on.
+
 ### mesh: the shape is fixed at parse time, and values are eager
 
 mesh has no stage 4 and no stage 5. A word's **arity and type are decided by how
@@ -141,8 +218,8 @@ every site, and is `IFS` what you think), where mesh's is a property of the
 
 ### What fish, mesh, and nushell make you quote
 
-All three make the safe case the default. A value is one value; nothing is
-inferred from its bytes:
+All three make the safe case the default — as does zsh for the parameter case
+above. A value is one value; nothing is inferred from its bytes:
 
 ```fish
 set photo 'My Photo.jpg'
@@ -215,14 +292,14 @@ it as text ("x:latest"), or brace the name when it comes from a variable
 The cost is real and lands on familiar lines — `docker run "ubuntu:latest"`,
 `git show "HEAD:file"`, `rsync "host:src" dst`, `curl -H "Accept:application/json"`.
 The quotes go around the **whole** token; `"ubuntu":latest` is not the same
-thing. bash, fish, and nushell all take those bare.
+thing. bash, zsh, fish, and nushell all take those bare.
 
-**`'…'` takes escapes, unlike every other shell.** In bash, fish, and nushell a
-single-quoted string is (near enough) raw, which is why every sed one-liner in
-existence is written in one. mesh follows Python instead: `'…'` is `"…"` minus
-interpolation, with the same `\n \t \e \u{…}` set, and an unknown escape is an
-error rather than a literal backslash. So this is a syntax error in mesh and
-fine in the other three:
+**`'…'` takes escapes, unlike every other shell.** In bash, zsh, fish, and
+nushell a single-quoted string is (near enough) raw, which is why every sed
+one-liner in existence is written in one. mesh follows Python instead: `'…'` is
+`"…"` minus interpolation, with the same `\n \t \e \u{…}` set, and an unknown
+escape is an error rather than a literal backslash. So this is a syntax error in
+mesh and fine in the other four:
 
 ```bash
 sed 's/\(a\)/[\1]/' file
@@ -245,12 +322,12 @@ spell a newline.
 
 ### The string forms, side by side
 
-| | bash | fish | mesh | nushell |
-| --- | --- | --- | --- | --- |
-| Interpolating + escapes | `$"…"` doesn't exist; `"…"` interpolates, `$'…'` escapes | `"…"` (few escapes) | `"…"` | `$"…"` |
-| Literal, with escapes | — | — | `'…'` | — |
-| Fully raw | `'…'` | `'…'` (bar `\'`, `\\`) | `r'…'` / `r"…"` | `'…'`, `r#'…'#` |
-| Both quote kinds, no escaping | heredoc | heredoc-ish | `<< 'END'` heredoc | `r#'…'#` |
+| | bash | zsh | fish | mesh | nushell |
+| --- | --- | --- | --- | --- | --- |
+| Interpolating + escapes | `"…"` interpolates, `$'…'` escapes | `"…"` interpolates, `$'…'` escapes | `"…"` (few escapes) | `"…"` | `$"…"` |
+| Literal, with escapes | — | — | — | `'…'` | — |
+| Fully raw | `'…'` | `'…'` | `'…'` (bar `\'`, `\\`) | `r'…'` / `r"…"` | `'…'`, `r#'…'#` |
+| Both quote kinds, no escaping | heredoc | heredoc | heredoc-ish | `<< 'END'` heredoc | `r#'…'#` |
 
 mesh's four forms answer four questions with no overlap: interpolate or not,
 escape or not. bash needs `$'…'` because `"…"` under-delivers; nushell needs
@@ -316,23 +393,24 @@ makes the arity readable from the line.
 
 ## Globbing
 
-| | bash | fish | mesh | nushell |
-| --- | --- | --- | --- | --- |
-| Bare `*.txt` | expands | expands | expands | expands |
-| `$x` where `x` is `"*"` | **re-globs** | literal | literal | literal |
-| No match | left as literal text | **error** | contributes no arguments | left as text |
-| Explicit call | — | — | `glob($p)` | `glob` / `into glob` |
+| | bash | zsh | fish | mesh | nushell |
+| --- | --- | --- | --- | --- | --- |
+| Bare `*.txt` | expands | expands | expands | expands | expands |
+| `$x` where `x` is `"*"` | **re-globs** | literal | literal | literal | literal |
+| No match | left as literal text | **error** | **error** | contributes no arguments | left as text |
+| Explicit opt-in | — | `${~x}` | — | `glob($p)` | `glob` / `into glob` |
 
 bash's "no match, so pass the pattern through as a filename" is a quiet
 correctness bug — `grep foo *.log` in a directory with no logs searches a file
-literally named `*.log`. fish errors, which is loud but stops the command. mesh
-drops the word, so a pattern that matches nothing contributes nothing, and
-`glob()` is there when you want the matches as a value.
+literally named `*.log`. zsh and fish error, which is loud but stops the
+command. mesh drops the word, so a pattern that matches nothing contributes
+nothing, and `glob()` is there when you want the matches as a value.
 
-The row that matters most is the second one. In bash a variable's contents are
-re-scanned for glob characters at use, so a filename containing `[` breaks a
-script that never mentioned globbing. In the other three, a glob is a glob
-because of how the *source* is written.
+The row that matters most is the second one, and bash is alone in getting it
+wrong: a variable's contents are re-scanned for glob characters at use, so a
+filename containing `[` breaks a script that never mentioned globbing. In the
+other four a glob is a glob because of how the *source* is written — zsh spells
+the opt-in `${~x}`, mesh spells it `glob($x)`.
 
 ## Errors and strictness
 
@@ -372,10 +450,13 @@ func greet(name) { puts "hi $name" }
 ```
 
 The shapes come from C-family languages rather than from `fi` / `esac` / `done`.
-fish keeps `end`; nushell uses braces and closures; bash keeps the Bourne
-keywords and the `[[ … ]]` grammar bolted beside them.
+fish keeps `end`; nushell uses braces and closures; bash and zsh keep the Bourne
+keywords and the `[[ … ]]` grammar bolted beside them — zsh adding a large
+second layer of its own on top (`${(@f)x}` parameter flags, `**/` recursive
+globs, glob qualifiers like `*(.om[1])`), which is powerful and is the other
+reason it is not a small language.
 
-Two mesh choices that have no counterpart in the other three:
+Two mesh choices that have no counterpart in the other four:
 
 - **`~` is the match operator**, with `/…/` regex literals in a match slot only,
   so absolute paths need no wrapper — `$p ~ /usr/bin` is a path, `$p ~ /error/`
@@ -387,15 +468,26 @@ Two mesh choices that have no counterpart in the other three:
 
 Honest costs, in the order they will bite:
 
-1. **Maturity.** bash is thirty-five years old, fish and nushell have real
-   ecosystems and package managers, and mesh's language design is still in
+1. **zsh already gets you most of the way**, and it is the honest objection
+   rather than a footnote. Unquoted `$x` is safe there too, arrays are real, you
+   keep POSIX *syntax* and thirty years of ecosystem, and old scripts still run
+   under `sh` invocation or `emulate sh`. (Native zsh mode is itself a departure
+   from POSIX expansion — that is exactly what the safe default *is* — so the
+   compatibility lives in the emulation, not alongside the default.) What is
+   left is
+   the last mile — `$(…)` splitting, empty elision, and safety-by-default rather
+   than safety-by-grammar — plus the parts of mesh that are not about safety at
+   all (typed values, modifiers, `match`). Whether that last mile is worth a new
+   shell is a real question, and for many people the answer is no.
+2. **Maturity.** bash is thirty-five years old, zsh, fish, and nushell all have
+   real ecosystems and package managers, and mesh's language design is still in
    draft. See [`ROADMAP.md`](../ROADMAP.md).
-2. **No POSIX compatibility.** Same as fish and nushell — your `.bashrc` does
-   not port, and neither does any script you wrote.
-3. **No structured pipeline.** `ls | where size > 10mb` is nushell's, and mesh
+3. **No POSIX compatibility.** Same as fish and nushell, and unlike zsh — your
+   `.bashrc` does not port, and neither does any script you wrote.
+4. **No structured pipeline.** `ls | where size > 10mb` is nushell's, and mesh
    does not offer it. Bytes on the wire is a deliberate ceiling.
-4. **The two extra quoting rules** above: `word:identifier` and `'…'` escapes.
-5. **Portability.** bash is on every machine you ssh into. mesh is a shell you
+5. **The two extra quoting rules** above: `word:identifier` and `'…'` escapes.
+6. **Portability.** bash is on every machine you ssh into. mesh is a shell you
    install, and — as with fish and nushell — the remote end still has `sh`.
 
 ## Others in the family
@@ -418,6 +510,10 @@ reimplemented coreutils, no structured pipeline to convert into and out of.
 
 - Use **bash** when the target machine is not yours, or the script has to run
   anywhere.
+- Use **zsh** when you want most of the safety while keeping POSIX syntax, the
+  ecosystem, and an emulation mode that still runs old scripts — the pragmatic
+  choice, and the one with the least to argue against it. If the case for a
+  clean break does not land for you, this is the shell that makes it.
 - Use **fish** for a safer interactive shell with a mature ecosystem, if you are
   happy writing scripts in a second language.
 - Use **nushell** when your work is mostly data wrangling and its builtins cover
