@@ -6,11 +6,12 @@
 //! nothing, so an example that stopped being valid mesh fails here instead of
 //! in a reader's terminal.
 //!
-//! This checks **syntax only**, deliberately. Running the examples would need a
-//! fixture for each one's assumed state, and several block on purpose (`wait`
-//! on a long sleep, `while test -e /tmp/lock`) or read the host's own
-//! filesystem. Parsing needs no such setup and is what catches the drift that
-//! actually happens.
+//! This checks **syntax only**, and has a sibling that goes further:
+//! `transcripts.rs` *runs* every `<pre>` transcript and compares the
+//! diagnostics mesh produces against the ones the doc shows. The two divide
+//! along what each can cover — every example here parses, including the fenced
+//! snippets that are fragments of a config and have no session to run in, while
+//! only a prompted transcript says what its own output should be.
 //!
 //! **A fenced block is checked unless it says it is not mesh.** Unlabeled
 //! counts as mesh, so the default is checked and a block that holds something

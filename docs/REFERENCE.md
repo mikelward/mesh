@@ -135,7 +135,11 @@ outcome *of* can be answered for. Each row below looks handled and is not:
 | `if true { $nope; false } \|\| puts handled` | the `\|\|` is answering for what `false` *returned* — a status, not the error |
 | `for x in [a] { $nope; break }` | leaving a construct is not handling what broke inside it |
 | `$nope`<br>`puts handled if false` | a skipped statement runs nothing, so it settles nothing; the failure is still standing |
-| `for x in [a] { $nope } \|\| fallback` | nothing ran between the failing pass and the loop's exit, so the failure is still the loop's own — where `while cond { … $nope } \|\| fallback` *is* recovered, the loop having tested again |
+| `while cond { … $nope } \|\| fallback` | the loop tested again after the failing pass, so the `\|\|` answers for that test rather than for the error |
+
+The mirror case *is* recovered: `for x in [a] { $nope } || fallback` runs nothing
+between the failing pass and the loop's exit, so the failure is still the loop's
+own outcome and the `||` answers for it.
 
 **`return` leaves a sourced file**, and `source` reports the returned value's
 status; a bare `return` carries the last status, as a bare `exit` does. `exit`
@@ -581,7 +585,7 @@ mesh$ read line
 mesh: command not found: read (mesh spells this `gets`)
 mesh$ local x = 5
 mesh: command not found: local (a plain `x = 5` inside a `func` is already local)
-mesh$ type ls
+mesh$ whence ls
 mesh: command not found: whence (mesh spells this `type`)
 ```
 
@@ -899,6 +903,7 @@ parsed:
 | `!$` | Its last argument |
 | `!*` | All of its arguments, separated by spaces |
 
+<!-- no-run: history expansion is interactive-only, so a script sees `!$` as text -->
 ```text
 mesh$ mkdir -p build/out
 mesh$ cd !$
@@ -1242,6 +1247,7 @@ in the table with a status to hand back, and `-r` leaves it there.
 **A job that is stopped when it is given up does not outlive the shell**, under
 either form, and `disown` says so:
 
+<!-- no-run: needs a job stopped from a terminal -->
 ```text
 mesh$ disown
 mesh: disown: [1] is stopped and will not survive the shell; `bg %1` first

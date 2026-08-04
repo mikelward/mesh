@@ -76,6 +76,7 @@ Where `help` explains what mesh has, **`type`** says what one name *is* — bash
 name, bash's flags, bash's words. `whence` is ksh's spelling and `where` zsh's;
 both point here:
 
+<!-- no-run: reports where `rg` is installed, which not every host has -->
 <pre>
 mesh$ <strong>type ll</strong>
 ll is a function
@@ -90,6 +91,7 @@ rg is /usr/local/bin/rg
 It reports what a bare word would **run** — the winner, and nothing about what it
 displaced. `-a` is where every match lives:
 
+<!-- no-run: reports where `git` is installed, which not every host has -->
 <pre>
 mesh$ <strong>type git</strong>
 git is a function
@@ -288,6 +290,7 @@ mesh$ <strong>puts $sh.status</strong>
 `&` runs a command in the background and hands you back the prompt. Bind it and
 you have a **job handle** — mesh's replacement for `$!`:
 
+<!-- no-run: waits on a 30-second background sleep -->
 <pre>
 mesh$ <strong>j = sleep 30 &amp;</strong>
 [1] 4812
@@ -310,6 +313,7 @@ tells you to ask for a member instead, so a handle reaches `kill` as a handle or
 not at all — it cannot collapse into a number on the way and signal some unrelated
 process:
 
+<!-- no-run: continues the background-job session above -->
 <pre>
 mesh$ <strong>puts $j</strong>
 mesh: puts: a job handle has no text form; ask it for a member
@@ -445,6 +449,7 @@ you@laptop
 Nothing splits on its own — that is the promise mesh keeps that bash does not —
 so when you want the lines you say so:
 
+<!-- no-run: runs `git`, which not every host has -->
 <pre>
 mesh$ <strong>for line in $(git status --porcelain):lines { puts "[$line]" }</strong>
 [ M docs/DESIGN.md]
@@ -757,7 +762,7 @@ value; it can currently be one string, a list or map literal, a whole variable
 value, or another `if`:
 
 <pre>
-mesh$ <strong>label = if test -d .git { "git tree" } else { directory }</strong>
+mesh$ <strong>label = if test -d .git { "git tree" } else { "directory" }</strong>
 mesh$ <strong>puts $label</strong>
 git tree
 mesh$ <strong>names = if true { [Ada "Grace Hopper"] } else { [] }</strong>
@@ -811,6 +816,7 @@ list element, for example `for [key value] in $pairs { ... }`.
 a value's truthiness or a command's exit status. `loop` repeats until something
 breaks out:
 
+<!-- no-run: loops until a deploy that never happens -->
 <pre>
 mesh$ <strong>i = 0</strong>
 mesh$ <strong>while $i &lt; 3 { puts $i; i = $i + 1 }</strong>
