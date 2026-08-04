@@ -4579,6 +4579,60 @@ two other shells' answers turned out to be strictly better than ours.
       Worth settling before the language is widely written, since it changes
       every existing single-quoted string.
 
+## Beyond M3 — Function references (`&name`)
+
+Decided in design discussion; see `docs/DESIGN.md` §"Calling for a value, and
+lambdas" and §"Hooks and the prompt". Nothing here is implemented.
+
+- [ ] **`&name` as a prefix function reference in value position.** A named `func`
+      has no value spelling today, so `$xs:map(up)` passes the string `"up"` and
+      `:map` reports `argument must be a function, got a string`. Add a prefix `&`
+      to the expression grammar at the same tier as prefix `-` and `...`, yielding
+      a **late-bound name reference** — resolved against the command namespace when
+      it is *called*, not captured at the point it is written, so redefining the
+      target changes what an already-registered reference runs. `&` is free in value
+      position (`&up` there is a syntax error today) and cannot collide with
+      backgrounding, which is postfix in statement position. **The lookup is the
+      command namespace, not a `func`-only table** — `&name` resolves to a builtin or
+      an external on `PATH` as readily as to a user `func`, which is what lets a hook
+      slot hold `&reload-config` without knowing which it is. **Skip the keyword
+      step**: resolution is `builtin → func → external`, not command position's full
+      `keyword → builtin → func → external`, so `&if` / `&return` are rejected by the
+      **parser** rather than resolving to control flow — the same skip a quoted or
+      expanded name already performs. Keep "is this name
+      resolvable" separate from "does calling it yield a value". The split is
+      **returns a value vs. runs for effect**, not builtin vs. external: externals
+      have no return value, and neither do the effect-only builtins (`r = puts(1 +
+      2)` already reports `a command has no return value`), so `&puts` is as
+      unusable in a value slot as `&grep`. Both must work in an effect slot
+      (`$sh.preprompt`, `$sh.signal.<NAME>`) and fail *at call time* in a value slot
+      (`:map`, a prompt segment) with an error about the call producing nothing, not
+      about a bad reference.
+- [ ] **Require `&` in hook and prompt slots.** A handler or segment is an `&name`
+      reference or a lambda; a bare word becomes an ordinary string, so the slot
+      stops being the one place where quoting changes meaning. This is a **breaking
+      change to a shipped spelling** — every `$sh.preprompt.x = handler` in a config
+      becomes `= &handler` — and a bare word in a slot must therefore report
+      something better than rendering the name as text; a handler slot that receives
+      a plain string should say so and name the `&` fix.
+- [ ] **Re-spell the design-target docs once `&` parses.** `docs/DESIGN.md` carries
+      the new spelling because `every_documented_example_parses`
+      (`crates/mesh/tests/docs.rs`) excludes it; every other document is held to
+      today's grammar, so `docs/PROMPT.md`'s `$sh.prompt.rule = rule` and the
+      handler examples in `docs/REFERENCE.md` still read bare and would fail that
+      test if changed now. `docs/HOOKS.md` is describing what is *built*, so its
+      bare examples stay correct until the implementation moves. Sweep all four
+      when the parser lands — the test will name anything missed.
+- [ ] **`rule` / `newline` / `fill` become callables** returning a piece, so a
+      segment list reads uniformly (`[&host-info &dir-info &fill]`). `rule` and
+      `newline` take **no** arguments; `fill` takes **one optional** repeat
+      character, and never the renderer's measured slack. The
+      parameterized `fill("─")` stays a *call* producing a piece and takes no `&`,
+      being a value rather than a reference — the distinction the sigil is there to
+      mark. Note the reading **not** taken: a callable that performs the fill would
+      need the renderer to pass the measured slack in, making `&fill("─")` a partial
+      application, which mesh has nothing else like.
+
 ## Loose ends
 
 Small items rescued from pull requests that were closed as superseded — the bulk

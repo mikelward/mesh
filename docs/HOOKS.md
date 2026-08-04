@@ -74,23 +74,34 @@ Two gaps left, each verified:
   a function's name; a callable value is not stored yet``. The stored handler is
   a `String`.
 - **No commands as handlers.** `on exit e echo` → ``mesh: on: `echo` is not a
-  function``, though `DESIGN.md` says "a command name or a callable".
+  function``, though `DESIGN.md` says a handler is a reference to "a command or
+  function."
 
 **Forward references are *not* on that list**, and an earlier revision wrongly
 put them there. `on exit e bye` before `func bye` is refused —
-``mesh: on: `bye` is not a function`` — but `DESIGN.md` says a bareword names a
-command/function "**run** late-bound", which is a claim about *dispatch*, and
-mesh's dispatch already is (see the table above). Eager registration-time
-validation and late-bound running coexist perfectly well, and the design
-document does not ask for the first to be dropped. Whether to accept a
-forward reference is a live ergonomic question — it is D3 below — but it is
-mesh's to decide, not a promise being broken.
+``mesh: on: `bye` is not a function`` — but `DESIGN.md` calls a handler reference
+"**resolved late**", which is a claim about *dispatch*, and mesh's dispatch
+already is (see the table above). Eager registration-time validation and
+late-bound running coexist perfectly well, and the design document does not ask
+for the first to be dropped. Whether to accept a forward reference is a live
+ergonomic question — it is D3 below — but it is mesh's to decide, not a promise
+being broken. The `&name` section says so directly: it fixes when a reference
+*resolves*, not when it is *checked*, and names D3 as the open half.
+
+**A newer gap, from the `&name` decision.** `DESIGN.md` now spells a handler
+reference `&handler` rather than a bare `handler`, and makes a bare word in a
+hook slot an ordinary string. Nothing here is built either way, so this document's
+questions are unchanged in substance — **D1's option (b) is written in the new
+spelling below**, rather than translated in passing here — and the eager-check
+question (D3) is untouched, since it is about *when* a reference is validated, not
+how it is spelled. See `TODO.md` §"Beyond M3
+— Function references (`&name`) and lambda capture".
 
 ---
 
 ## D1 — What is a handler's *value*?
 
-Today a `String`. `DESIGN.md` wants "a command name or a callable".
+Today a `String`. `DESIGN.md` wants an `&name` reference or a callable.
 
 **(a) Keep the string.** Cheapest. The cost is that `$sh.postcd.fetch = func()
 { … }` — the map form exactly as `DESIGN.md` writes it — has nowhere to go, so
@@ -98,8 +109,12 @@ the map ships accepting names only. That is a limit on what a hook *value* may
 be, and nothing more: it leaves D4 entirely open, since a string-only map can
 still be a view over the one hook list.
 
-**(b) A callable value type**, with a bareword still meaning "resolve this name
-at dispatch". Costs a value-type change, and buys the map form. It raises no
+**(b) A callable value type**, holding an `&name` reference — resolved at
+dispatch — or a lambda. A bare word is then an ordinary **string**, not a
+callable, which is `DESIGN.md`'s spelling; an earlier revision of this option
+read "with a bareword still meaning resolve-this-name-at-dispatch", and that
+spelling is retired, so `$sh.exit.k = f` becomes `$sh.exit.k = &f`. Costs a
+value-type change, and buys the map form. It raises no
 question about how a stored lambda *prints*: `docs/REFERENCE.md` already settles
 that a function value has **no text form** — "the one value that cannot be
 bytes" — so a lambda in a hook map simply keeps that behavior, and the existing
@@ -129,12 +144,25 @@ places, which is why "commands as handlers" is really its own question:
   the case before it can be tried.)*
 
 **Lean: (b), and preferably before D4** — but as a preference, not a constraint,
-and the distinction was got wrong here first. Adding callables to a shipped
-string-only map is **additive, not breaking**: `Value::Map` is
-`Vec<(String, Value)>` and already holds mixed types (a map can carry an
-integer, a string, and a list at once), `Value::Function` already exists, and an
-existing string entry keeps its read, write, and late-binding behavior when the
-accepted value set widens. Nothing a user wrote stops working.
+and the distinction was got wrong here first. Two changes ride together under
+(b), and they differ in compatibility:
+
+- **Widening the value type is additive.** `Value::Map` is
+  `Vec<(String, Value)>` and already holds mixed types (a map can carry an
+  integer, a string, and a list at once), and `Value::Function` already exists,
+  so accepting a callable where only a `String` was accepted breaks nothing by
+  itself.
+- **Adopting `&name`'s reading is breaking.** Once a bare word in a slot is an
+  ordinary string rather than a name to resolve, every `$sh.preprompt.x =
+  handler` already written becomes `= &handler`, and a stored plain string stops
+  being dispatched at all. `TODO.md` pairs that with a requirement that a handler
+  slot given a plain string *say so* and name the `&` fix, rather than silently
+  doing nothing.
+
+An earlier revision of this paragraph said an existing string entry "keeps its
+read, write, and late-binding behavior" and that "nothing a user wrote stops
+working." That is true of the first bullet alone and false of the pair, which is
+the whole reason the second one needs its own migration note.
 
 What doing D4 first actually costs is narrower, and worth naming honestly:
 
@@ -247,13 +275,21 @@ enables forward references on its own; D1 changes what a handler may *be*, not
 whether an unresolved name may be stored.
 
 What **command-handler support** would change is narrower still, and it is the
-*predicate* rather than the check: once a bareword may name a command, absence
-from `shell.funcs` stops being evidence of a typo. That argues for replacing the
-predicate — validate against the whole command namespace, functions and builtins
-and `PATH` — not for dropping eager validation, so (a) survives command handlers
-perfectly well by widening what it looks in. D1 alone does not even raise the
-question: a bareword stays a string, commands stay unusable, and an unknown name
-really is an invalid registration.
+*predicate* rather than the check: once a handler may hold a reference to a
+command — `&echo`, `&puts` — absence from `shell.funcs` stops being evidence of a
+typo. That argues for replacing the predicate — validate against the whole
+callable namespace, functions and builtins and `PATH` — not for dropping eager
+validation, so (a) survives command handlers perfectly well by widening what it
+looks in.
+
+**D1's option (b) is what raises that question**, which is a correction to an
+earlier revision of this paragraph. It read "D1 alone does not even raise the
+question: a bareword stays a string, commands stay unusable" — true of the
+retired bareword-is-a-callable reading, and false of `&name`, which resolves over
+the command namespace (`builtin → func → external`, per `DESIGN.md`). A callable
+value type is therefore precisely the form that can carry a command reference.
+Under **(a)** the point still holds: a name is a string, commands stay unusable,
+and an unknown name really is an invalid registration.
 
 So the honest statement of (a) versus (b) is about **forward references**, and
 nothing else: (a) cannot accept a handler defined later, whatever it validates
@@ -474,7 +510,8 @@ gate on the others, so they can be taken in whatever order suits.
 
 **D4 was taken first**, against the order below, and nothing about D1 got harder
 for it: widening what a handler value may be is additive to a shipped
-string-only map, exactly as D1 says.
+string-only map, exactly as D1 says. (Additive is the *value-type* half. The
+`&name` spelling that rides with it is the breaking half — see D1.)
 
 Ordered by what is cheapest to do early rather than by dependency:
 
