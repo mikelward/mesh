@@ -25,7 +25,10 @@ const TABLE: &[(&str, &str)] = &[
     ("pwd", "Print the working directory"),
     ("puts [ARG ...]", "Render the arguments, then a newline"),
     ("print [ARG ...]", "As `puts`, with no trailing newline"),
-    ("gets [VAR]", "Read one line from stdin"),
+    // Two spellings on one line — the only builtin with both, and `·` is what the
+    // `SYNTAX` rows already use to separate them. Neither is a token starting with
+    // `-`, so `reads_options` still reads this as a builtin with no options.
+    ("gets [VAR] · gets()", "Read one line from stdin"),
     ("clip [TEXT ...]", "Copy text to the terminal's clipboard"),
     ("notify [TEXT ...]", "Raise a desktop notification"),
     ("exit [N]", "Leave the shell"),
@@ -582,6 +585,24 @@ pub(crate) fn is_command_keyword(name: &str) -> bool {
 /// Is `name` a built-in value call? The parser refuses these as function names.
 pub(crate) fn is_value_call(name: &str) -> bool {
     claim_of(name) == Some(Claim::ValueCall)
+}
+
+/// Builtins that answer to the **call** spelling as well as the command one, so
+/// `name(…)` yields a value where a bare `name …` reports a status.
+///
+/// Deliberately not a [`Claim`]: a `Claim::ValueCall` name is *only* ever a call —
+/// `style …` in command position is a `command not found` — where these run both
+/// ways. `gets` is the first, and `DESIGN.md` §"Builtins" gives it both spellings
+/// in one sentence: read a line into `VAR`, *and* return that line as its value.
+///
+/// The list exists so nothing has to ask "is this a call?" twice and get two
+/// answers — `gets():capture` must record the *call*, not run the command form and
+/// discard the line it read.
+const CALLABLE_BUILTINS: &[&str] = &["gets"];
+
+/// Does `name` name a builtin with a value-call spelling? See [`CALLABLE_BUILTINS`].
+pub(crate) fn is_callable_builtin(name: &str) -> bool {
+    CALLABLE_BUILTINS.contains(&name)
 }
 
 /// Return the help text for a syntax entry — the keyword shape of what `help`

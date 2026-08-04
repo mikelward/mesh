@@ -1890,41 +1890,55 @@ designed, and the cross-references say where the fuller note lives.
       consumed by nothing — so routing the run through the expression parser
       would pass one list where the reader asked for its elements. Deliberately
       left loud rather than made silently wrong; bind it first for now.
-- [ ] **Should `gets` return the line, so `while line = gets()` works?**
-      *(mikelward)* The command form built here binds a variable and reports a
-      status, which is what `while gets line { … }` needs and nothing more.
-      `DESIGN.md` §"Builtins" also wants `gets` to **return** the line as its
-      value, which is the part that composes:
+- [x] **`gets` returns the line, so `while line = gets()` works** *(landed)* —
+      the value form `DESIGN.md` §"Builtins" specifies, which is the part that
+      composes:
 
       ```mesh
-      while line = gets() { puts $line }     # the spelling to consider
+      while line = gets() { puts $line }
       [k v] = gets():split("=")              # read and destructure in one
       if line = gets() { … }
       ```
 
-      The pieces are mostly already decided elsewhere, which is what makes this
-      worth doing rather than reopening:
-      - The **assignment-as-condition** rule is settled (`DESIGN.md` §"Tests and
-        comparisons"): `lhs = rhs` is true iff the RHS is truthy and its shape
-        fits, so `while line = gets()` needs no new grammar — it is the same rule
-        `if [one two] = $s:match(/…/)` already uses.
-      - The **EOF value** is pinned: `gets()` yields `false`, *not* `""`, so a
-        blank line (truthy `""`) cannot end a loop. That is already how the
-        command form's status behaves, so the two cannot disagree.
-      - What is missing is the **value-call route** — the one `style()` and
-        `link()` take, where parens attached to a name yield a value rather than a
-        status. `gets` would be the first builtin to have *both* spellings.
+      Nothing about the read changed: both spellings go through one
+      `read_gets_line`, which answers `Line` / `End` / `Interrupted` / `Failed`,
+      and each form says that in its own vocabulary — a status and a binding, or
+      a value. So the byte-at-a-time read, the non-UTF-8 refusal, the stdin line
+      counting and Ctrl-C cancelling are inherited rather than restated, and the
+      two cannot drift about where the input ends. **EOF yields `false`**, not
+      `""`, which is what stops the loops: the assignment-as-condition rule is
+      true iff the RHS is truthy and a blank line is a truthy `""`. A read
+      *failure* raises instead of yielding, since `false` is already spoken for.
 
-      Open sub-questions to settle first:
-      - Does bare `gets` (no parens, no variable) stay the "consume and discard a
-        line" form, or does the value form make it redundant?
-      - `gets line` and `line = gets()` would both bind `line`. Two spellings for
-        one act is the thing `DESIGN.md` usually declines — is the command form
-        still worth keeping once the value form exists, or does it retire?
-      - A value-returning `gets` in a **pipeline stage** runs in a forked process,
-        so the binding does not outlive it. Same as any builtin, but worth a line
-        in the reference, since `cmd | while gets line { … }` is the shape people
-        will reach for (`DESIGN.md`:3462 already flags that form as *planned*).
+      `gets` is the first builtin with **both** spellings, which needed one new
+      idea rather than a `Claim::ValueCall` — those names are *only* calls
+      (`style …` in command position is a `command not found`), where `gets` runs
+      both ways. `builtins::CALLABLE_BUILTINS` is that list, and `capture_call`
+      consults it so `gets():capture` records the **call**; without it that
+      spelling would have run the *command* form and handed back a record with no
+      `.value` holding the line it read.
+
+      Both forms stay — asked and answered, below. `gets line` reports a status
+      and is what a `while` condition wants when the line is all you need;
+      `DESIGN.md` writes the two in one sentence.
+  - [x] **Does the command form retire now that the value form exists?**
+        *(decided — mikelward: keep both spellings for now.)* `gets line` and
+        `line = gets()` both bind `line`, and two spellings for one act is what
+        `DESIGN.md` usually declines — but retiring is the direction that cannot
+        be undone, and `DESIGN.md` §"Builtins" gives `gets` both in one sentence,
+        so the pair is what it specifies rather than an accident of building the
+        second one. Bare `gets` (no parens, no variable) stays with it: it is the
+        "consume and discard a line" spelling, and `gets()` with the value thrown
+        away says the same thing one character longer. *Revisitable* — this is
+        "for now", and use will show whether the command form earns its keep.
+  - [ ] **A loop cannot be a pipeline stage**, so `cmd | while line = gets() { … }`
+        is a syntax error in both spellings — as is `cmd | if …`, so this is the
+        compound-statement gap rather than anything about `gets`
+        (`DESIGN.md`:3462 flags the literal form as *planned*). Worth naming here
+        because it is the shape people reach for, and the workaround
+        (`for x in $(cmd):split("\n")`) is not obvious. When
+        it does land, the binding a stage makes will not outlive the fork —
+        recorded in `docs/REFERENCE.md` already.
 - [x] **A regex pattern for the replace family** — the `/…/` slot `DESIGN.md`
       §"String" specifies. Split out of the modifier-arguments change because it
       is where the difficulty lives; each item below was a real bug caught in
