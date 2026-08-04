@@ -6,13 +6,13 @@
 ## What this is
 
 A personal, **interactive-first** Unix shell. The goal is a shell that is a
-pleasure to *use* at a terminal all day — not a general-purpose scripting
-language, and not a POSIX-compatible `sh`. Where nontrivial logic is needed
-(prompt rendering, VCS info), the shell leans on small external binaries (the
-`vcs`-style split) rather than growing a heavy scripting layer.
+pleasure to *use* at a terminal all day, and a language you are still happy to
+be in when the one-liner grows into a script — but not a POSIX-compatible `sh`.
 
-The emphasis is interactive use, but fixing the two things that make today's
-interactive shells worse than they need to be:
+Interactive use sets the priorities, and the same syntax has to hold up when it
+is saved to a file: the two are the same language, and neither is a
+second-class dialect of the other. That means fixing the two things that make
+today's shells worse than they need to be:
 
 - **Safer word expansion.** A bare `$x` never word-splits on whitespace or
   silently glob-expands. A capture is one string until a split is spelled, and lists stay
@@ -44,20 +44,15 @@ precedence among the three.
 - A **clean-break syntax**: keep the muscle memory that is worth keeping, fix
   the parts that are genuinely bad, and do not carry POSIX warts forward.
 - First-class prompt hooks, session management, and job control.
-- **Correctness and a simple, clear implementation over micro-performance.** When
-  a choice is between an obviously-correct, easy-to-read implementation and a
-  faster but subtler one, take the former; a shell's interactive latency is
-  dominated by the programs it launches and by I/O, not by shaving cycles off the
-  language runtime. Small performance differences never justify a design that is
-  harder to reason about or a behavior that is harder to specify. (Genuine
-  interactive responsiveness — startup time, prompt render, completion latency —
-  still matters and is an ergonomics concern; this goal is about not trading
-  clarity for *marginal* speed.)
+- **Good for scripting too.** What you type at the prompt is what you save to a
+  file: funcs, lists, maps, `match`, and the strict/soft error pairs are the
+  same language either way. A script gets no extra constructs and pays no
+  interactive tax — the features that make a line safe to type (no word
+  splitting, loud absence, real values) are exactly the ones that make a script
+  safe to leave running unattended.
 
 ### Non-goals
 
-- Being a scripting language. Interactive use comes first; big logic goes into
-  binaries.
 - Running existing `sh`/`bash` scripts verbatim. External *programs* run
   normally; the shell *language* is new.
 - A structured-data pipeline. Pipes carry bytes.
