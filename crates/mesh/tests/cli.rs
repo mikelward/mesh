@@ -5,13 +5,31 @@
 //! shell non-interactive, so no prompt is written), and we assert on stdout,
 //! stderr, and the exit code.
 
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{ChildStdin, Command, Output, Stdio};
 use std::sync::OnceLock;
+
+/// Write `bytes` to a child's stdin, tolerating a read end that is already
+/// closed.
+///
+/// The shell is entitled to exit without draining stdin — on a syntax error, an
+/// `exit`, or a stack limit it never returns from — and that closes the pipe
+/// under us. Whether the write lands first is a race the test does not control
+/// and does not care about: what the run produced is on stdout and stderr
+/// either way. Any other write error is still a failure.
+fn write_stdin(stdin: Option<ChildStdin>, bytes: &[u8]) {
+    let mut stdin = stdin.expect("stdin");
+    if let Err(error) = stdin.write_all(bytes) {
+        assert!(
+            error.kind() == ErrorKind::BrokenPipe,
+            "write stdin: {error}"
+        );
+    }
+}
 
 fn run_with_input(input: &str) -> Output {
     run_with_bytes(input.as_bytes())
@@ -28,12 +46,7 @@ fn run_script_with_stdin(script: &Path, config_home: &Path, bytes: &[u8]) -> Out
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(bytes)
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), bytes);
     child.wait_with_output().expect("wait for mesh")
 }
 
@@ -177,12 +190,7 @@ fn run_with_home(input: &str, home: &Path) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), input.as_bytes());
     child.wait_with_output().expect("wait for mesh")
 }
 
@@ -195,12 +203,7 @@ fn run_with_config(input: &str, config_home: &Path, args: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), input.as_bytes());
     child.wait_with_output().expect("wait for mesh")
 }
 
@@ -372,12 +375,7 @@ fn run_with_bytes(input: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input)
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), input);
     child.wait_with_output().expect("wait for mesh")
 }
 
@@ -410,12 +408,7 @@ fn run_with_input_and_stack_limit(input: &str, bytes: u64) -> Output {
         });
     }
     let mut child = command.spawn().expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), input.as_bytes());
     child.wait_with_output().expect("wait for mesh")
 }
 
@@ -442,12 +435,7 @@ fn run_without_a_terminal(input: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), input.as_bytes());
     child.wait_with_output().expect("wait for mesh")
 }
 
@@ -571,12 +559,7 @@ fn non_interactive_child_preserves_an_ignored_sigint() {
         });
     }
     let mut child = child.spawn().expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(b"sh -c 'kill -INT $$; echo survived'\n")
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), b"sh -c 'kill -INT $$; echo survived'\n");
     let out = child.wait_with_output().expect("wait for mesh");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "survived\n");
@@ -2591,12 +2574,7 @@ fn tilde_preserves_home_bytes_including_trailing_slash() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(b"puts ~/child\n")
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), b"puts ~/child\n");
     let out = child.wait_with_output().expect("wait for mesh");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -3893,12 +3871,7 @@ fn stdout_write_error_does_not_crash_the_shell() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(b"puts hi\nexit 7\n")
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), b"puts hi\nexit 7\n");
     let out = child.wait_with_output().expect("wait for mesh");
     assert_eq!(out.status.code(), Some(7));
     assert!(String::from_utf8_lossy(&out.stderr).contains("puts"));
@@ -10441,12 +10414,10 @@ fn a_permanent_retarget_refuses_to_carry_the_old_stdouts_bytes() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(format!("print old\nexec > {}\nputs new\n", target.display()).as_bytes())
-        .expect("write stdin");
+    write_stdin(
+        child.stdin.take(),
+        format!("print old\nexec > {}\nputs new\n", target.display()).as_bytes(),
+    );
     let out = child.wait_with_output().expect("wait for mesh");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("flushing stdout"), "{stderr:?}");
@@ -10472,12 +10443,7 @@ fn a_replacement_refuses_to_lose_the_old_stdouts_bytes() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(b"print old\nexec /bin/true\n")
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), b"print old\nexec /bin/true\n");
     let out = child.wait_with_output().expect("wait for mesh");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("flushing stdout"), "{stderr:?}");
@@ -10510,12 +10476,7 @@ fn exec_settles_stdout_after_its_targets_are_evaluated() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(script.as_bytes())
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), script.as_bytes());
     let out = child.wait_with_output().expect("wait for mesh");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("flushing stdout"), "{stderr:?}");
@@ -10697,12 +10658,10 @@ fn a_stage_fork_refuses_to_carry_the_parents_unflushed_bytes() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(format!("print old\nexec /bin/true > {} &\nwait\n", target.display()).as_bytes())
-        .expect("write stdin");
+    write_stdin(
+        child.stdin.take(),
+        format!("print old\nexec /bin/true > {} &\nwait\n", target.display()).as_bytes(),
+    );
     let out = child.wait_with_output().expect("wait for mesh");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("flushing stdout"), "{stderr:?}");
@@ -11309,12 +11268,7 @@ fn a_fifo_redirect_in_a_pipeline_does_not_deadlock() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(b"cat < f | echo hi > f\nputs done\n")
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), b"cat < f | echo hi > f\nputs done\n");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if child.try_wait().expect("try_wait").is_some() {
@@ -12228,12 +12182,7 @@ fn type_searches_the_default_path_when_path_is_unset() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(b"type sh\n")
-        .expect("write commands");
+    write_stdin(child.stdin.take(), b"type sh\n");
     let out = child.wait_with_output().expect("wait for mesh");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.starts_with("sh is /"), "{stdout}");
@@ -17047,12 +16996,10 @@ fn bool_after_get_reads_an_environment_flag_in_either_vocabulary() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn mesh");
-        child
-            .stdin
-            .take()
-            .expect("stdin")
-            .write_all(b"puts $env:get(MESH_TEST_FLAG, false):bool\n")
-            .expect("write stdin");
+        write_stdin(
+            child.stdin.take(),
+            b"puts $env:get(MESH_TEST_FLAG, false):bool\n",
+        );
         child.wait_with_output().expect("wait for mesh")
     };
 
@@ -22466,12 +22413,7 @@ fn a_heredoc_leaves_no_file_behind() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(b"cat << END\nbody\nEND\n")
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), b"cat << END\nbody\nEND\n");
     let out = child.wait_with_output().expect("wait for mesh");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -23500,7 +23442,7 @@ fn dash_n_checks_syntax_without_running_anything() {
             .stderr(Stdio::piped())
             .spawn()
             .and_then(|mut child| {
-                child.stdin.take().expect("stdin").write_all(&input)?;
+                write_stdin(child.stdin.take(), &input);
                 child.wait_with_output()
             })
             .expect("run mesh with piped stdin")
@@ -23602,11 +23544,7 @@ fn dash_i_makes_a_session_interactive_whatever_its_input_is() {
         .stderr(Stdio::piped())
         .spawn()
         .and_then(|mut child| {
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(b"puts \"$sh.origin $sh.interactive\"\n")?;
+            write_stdin(child.stdin.take(), b"puts \"$sh.origin $sh.interactive\"\n");
             child.wait_with_output()
         })
         .expect("run mesh with piped stdin");
@@ -26703,12 +26641,7 @@ fn gets_leaves_the_rest_of_stdin_for_the_next_command() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn mesh");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(b"one\ntwo\nthree\n")
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), b"one\ntwo\nthree\n");
     let out = child.wait_with_output().expect("wait for mesh");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -26733,12 +26666,7 @@ fn gets_reports_end_of_input_without_clobbering_its_variable() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn mesh");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(b"a\n\nb")
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), b"a\n\nb");
     let out = child.wait_with_output().expect("wait for mesh");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -26761,12 +26689,7 @@ fn gets_refuses_a_reserved_namespace_without_consuming_input() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn mesh");
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin")
-            .write_all(b"untouched\n")
-            .expect("write stdin");
+        write_stdin(child.stdin.take(), b"untouched\n");
         let out = child.wait_with_output().expect("wait for mesh");
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("reserved namespace"),
@@ -26792,12 +26715,7 @@ fn gets_refuses_a_non_utf8_line_and_leaves_its_variable_alone() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn mesh");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(b"a\xffb\n")
-        .expect("write stdin");
+    write_stdin(child.stdin.take(), b"a\xffb\n");
     let out = child.wait_with_output().expect("wait for mesh");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("not valid UTF-8"),
