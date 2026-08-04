@@ -1584,10 +1584,15 @@ rule: `-` is subtraction / exclusion *only* with surrounding spaces. So `a-b` is
 one name, `a - b` subtracts, and `$a-$b` interpolates the two with a literal
 hyphen between — the third payoff of that one spacing rule.
 
-- **Scope — two levels, lexical.** There are exactly two variable scopes: the
-  **session-global** scope (top-level rc and interactive bindings) and a fresh
-  **function-local** scope per `func` call. The environment (exported names) is
-  a separate axis. Scoping is **lexical**: a function sees its own locals, its
+- **Scope — two levels today, lexical.** There are two *kinds* of variable scope:
+  the **session-global** scope (top-level rc and interactive bindings) and a fresh
+  **function-local** scope per `func` call. Two is the current **depth**, not a
+  cap: the decided [lambda capture](#calling-for-a-value-and-lambdas) rule gives a
+  lambda a local scope whose parent is the scope that *defined* it, so a lambda
+  called from elsewhere — or outliving that frame — resolves through the captured
+  scope before reaching the session, and nested lambdas chain further. Build the
+  rung as a **parent link**, not a two-slot lookup. The environment (exported
+  names) is a separate axis. Scoping is **lexical**: a function sees its own locals, its
   parameters, and the globals — never its *caller's* locals (no dynamic scope,
   the classic shell footgun). Inside a function, `x = 5` binds a **local by
   default**, shadowing any global rather than clobbering it — the deliberate
@@ -1602,7 +1607,9 @@ hyphen between — the third payoff of that one spacing rule.
   }
   ```
 
-  Reading resolves **outward** (local → global); an **unbound** name is an
+  Reading resolves **outward** along that chain (local → any captured defining
+  scopes → global) — capture is lexical too, so it reaches the scope that *wrote*
+  the lambda, never the one that calls it; an **unbound** name is an
   **error**, not empty — the always-on `set -u` that the *no null* rule below
   already implies, so a **typo'd read fails loud** (`$staus` → error). The one
   place a typo is *not* caught is **assignment**, which always creates
@@ -1623,8 +1630,10 @@ hyphen between — the third payoff of that one spacing rule.
 - **No block scope; `unset` removes a scope's binding.** Control-flow blocks
   (`if` / `for` / `while` / `loop`) do **not** open a new scope, so
   `if c { x = 1 }` then `$x` works and a loop binder is an ordinary binding in
-  the enclosing scope (readable after the loop, holding the last value) — the
-  model stays two levels, no more. **`unset name`** removes the binding **in the
+  the enclosing scope (readable after the loop, holding the last value) — a block
+  adds **no rung**. Depth comes from `func` calls and, once
+  [lambdas capture](#calling-for-a-value-and-lambdas), from a captured defining
+  scope; never from a block. **`unset name`** removes the binding **in the
   current scope**: inside a function it drops the local, and if that local was
   shadowing a global the global becomes visible again (reads resolve outward as
   usual) — so plain `unset` never reaches through to mutate a global, matching
@@ -1838,7 +1847,9 @@ the pieces only hold together as one:
   [Shadowing, bounded](#variables-and-assignment) below, which is the statement to
   read this bullet by). A binding may not be *created* where the name is
   already visible further out — not local over session, not session over
-  environment. `PATH = /x` is refused, naming `export`, in the same teaching-error
+  environment, and (once [lambdas capture](#calling-for-a-value-and-lambdas)) not a
+  lambda parameter over a captured local. The list is the rungs that exist, not the
+  extent of the ban: a new rung inherits it rather than escaping it. `PATH = /x` is refused, naming `export`, in the same teaching-error
   style as the bare-`export` refusal (`parser.rs:5530`). The payoff is that
   `$NAME` has no precedence question at all: a collision cannot exist, so the
   fallthrough in `vars.rs:1198` can never actually choose. Worth noting Python
@@ -3567,6 +3578,49 @@ line kept here is by **shape**, not by who wrote the name — `:name` is the
 argument-free, auto-mapping modifier form; `&name` is the general reference, any arity,
 any slot — so a reader can predict which applies without knowing whether a name shipped
 with the shell.
+
+**A lambda closes over the scope that created it** *(decided — a change from what runs
+today)*. The body's scope parent is currently the *session*, so a lambda sees session
+and global bindings but not the function-locals beside it, even when it is called
+immediately, in the same scope:
+
+```
+func f() { _n = 41
+  _g = func() { puts $_n }
+  $_g() }                       # today: `_n: unbound variable`
+```
+
+That makes lambdas and [`_`-prefixed locals](#variables-and-assignment) mutually
+unusable in exactly the place a lambda earns its keep — `$xs:filter(func(_p) { $_p:ext
+== $_want })` cannot reach the `_want` bound on the line above it. So a lambda captures
+its defining scope.
+
+This is mesh's **first closure**, which is a commitment rather than a scope tweak: a
+lambda that outlives its defining frame needs that frame's locals to outlive the call
+too — as live bindings, or as a snapshot taken at capture, which is the sub-question
+below — so either way locals stop being a pure stack discipline. It also retires a justification used elsewhere — the
+decision that a flag's value is captured at assignment rejected the late alternative as
+"a closure in disguise, which mesh has nothing else like." mesh now has one, so that
+decision needs its own reasoning; it stands on the simpler ground that a *value* should
+not carry unevaluated work, but the supporting argument is gone and should not be cited
+again.
+
+*Open — capture by binding or by value.* Reading a **session** variable
+from a lambda is late today (`x = 1; g = func() { puts $x }; x = 2; $g()` prints `2`),
+and capturing the **binding** rather than a snapshot is what keeps a captured local
+consistent with that. One question follows and is not answered here: whether a
+captured local is *writable* through the lambda, which is the same answer under a
+different name.
+
+*Not open — shadowing a captured local.* An earlier revision listed this as a second
+sub-question, on the grounds that the [no-shadow rule](#variables-and-assignment) was
+stated over locals versus outer *session* bindings and said nothing about two nested
+locals. That misread it: the rule is *"no shadowing, **at any rung**"* — one name, one
+rung at a time — and its "not local over session, not session over environment" is an
+enumeration of the rungs that existed, not the extent of the ban. A captured defining
+scope is a rung, so a lambda parameter may not shadow a captured local, for exactly the
+reason a local may not shadow a session binding. Nothing here argues for a carve-out,
+and one would need its own justification.
 
 ### Conditionals: `if` is an expression
 
@@ -5632,7 +5686,11 @@ to avoid" rather than promising the latter as done.
   is visible only there; a **TODO — dynamic scope**: the "extract a chunk
   into a subfunction" goal that fixed cwd as *persist* would be served further by
   letting an extracted helper see the caller's locals — weigh dynamic (or opt-in
-  dynamic) scope against the lexical default; and an **open value-production
+  dynamic) scope against the lexical default. *(A named helper still cannot see its
+  caller's locals — that is this question and stays open. A **lambda** now can see
+  the locals of the scope that **defined** it, which is
+  [lexical capture](#calling-for-a-value-and-lambdas), decided separately and not an
+  answer to this one; the two are easily conflated.)* And an **open value-production
   question** *(from the match-syntax exploration — see [Matching](#matching-match))*:
   whether functions/blocks should require an **explicit value keyword** instead of the
   settled implicit **last-expression** rule. Language-wide — it
