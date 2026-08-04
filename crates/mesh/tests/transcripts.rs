@@ -106,14 +106,22 @@ enum Markup {
     Fenced,
 }
 
-/// The typed part of a transcript line: `mesh$ ` opens a unit and `...`
+/// The default prompt a transcript opens each command with.
+const PROMPT: &str = "mesh$ ";
+
+/// The continuation indicator drawn under it: one dot per printable column of
+/// the prompt, less its trailing space — what `mesh-core`'s
+/// `continuation_indicator` renders.
+const CONTINUATION: &str = ".....";
+
+/// The typed part of a transcript line: `mesh$ ` opens a unit and `.....`
 /// continues the one above it. A line with neither prefix is output.
 fn typed_line(line: &str, markup: Markup) -> Option<String> {
     let bare = plain(line, markup);
-    if let Some(rest) = bare.strip_prefix("mesh$ ") {
+    if let Some(rest) = bare.strip_prefix(PROMPT) {
         return Some(rest.to_string());
     }
-    let rest = bare.strip_prefix("...")?;
+    let rest = bare.strip_prefix(CONTINUATION)?;
     Some(rest.strip_prefix(' ').unwrap_or(rest).to_string())
 }
 
@@ -185,7 +193,7 @@ fn transcripts_in(text: &str) -> Vec<Transcript> {
         // no session of its own and belongs to the parse sweep instead.
         if !body
             .iter()
-            .any(|line| plain(line, markup).starts_with("mesh$ "))
+            .any(|line| plain(line, markup).starts_with(PROMPT))
         {
             continue;
         }

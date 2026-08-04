@@ -5,7 +5,15 @@ last, so read top to bottom the first time. Start the shell with `cargo run -p
 mesh` and type along.
 
 `mesh$` is mesh's default prompt. In the transcripts below, the **bold** text
-after it is what you type; the plain lines under it are what you see back.
+after it is what you type; the plain lines under it are what you see back. When a
+line is unfinished — an open brace, a heredoc still gathering — mesh asks for the
+rest with a continuation prompt of dots, one per printable character of the
+prompt above it, so the two line up:
+
+<pre>
+mesh$
+.....
+</pre>
 
 Three neighbors, depending on what you want:
 
@@ -243,8 +251,8 @@ for a single word:
 <pre>
 mesh$ <strong>name = world</strong>
 mesh$ <strong>cat &lt;&lt; END</strong>
-... <strong>hello $name</strong>
-... <strong>END</strong>
+..... <strong>hello $name</strong>
+..... <strong>END</strong>
 hello world
 mesh$ <strong>wc -l &lt;&lt;&lt; hi</strong>
 1
@@ -529,8 +537,8 @@ failing command, or through `return`, `break` or `continue`:
 
 <pre>
 mesh$ <strong>with TZ=UTC LANG=C {</strong>
-...   <strong>date</strong>
-... <strong>}</strong>
+.....   <strong>date</strong>
+..... <strong>}</strong>
 Sat Aug  1 05:00:00 UTC 2026
 </pre>
 
@@ -750,10 +758,10 @@ other status selects `else` when one is present:
 
 <pre>
 mesh$ <strong>if test -d .git {</strong>
-...   <strong>puts repository</strong>
-... <strong>} else {</strong>
-...   <strong>puts ordinary-directory</strong>
-... <strong>}</strong>
+.....   <strong>puts repository</strong>
+..... <strong>} else {</strong>
+.....   <strong>puts ordinary-directory</strong>
+..... <strong>}</strong>
 repository
 </pre>
 
@@ -853,9 +861,9 @@ wrapping one line in an `if`. `unless` is the inverse:
 
 <pre>
 mesh$ <strong>for n in 1..=4 {</strong>
-...   <strong>continue if $n == 2</strong>
-...   <strong>puts $n unless $n == 3</strong>
-... <strong>}</strong>
+.....   <strong>continue if $n == 2</strong>
+.....   <strong>puts $n unless $n == 3</strong>
+..... <strong>}</strong>
 1
 4
 </pre>
@@ -874,9 +882,9 @@ guards:
 <pre>
 mesh$ <strong>command = [start server verbose]</strong>
 mesh$ <strong>result = match $command {
-...   [verb ...args] if $verb == start =&gt; [$verb ...$args]
-...   _ =&gt; []
-... }</strong>
+.....   [verb ...args] if $verb == start =&gt; [$verb ...$args]
+.....   _ =&gt; []
+..... }</strong>
 mesh$ <strong>puts ...$result</strong>
 start server verbose
 </pre>
@@ -894,8 +902,8 @@ Give a sequence of commands a name with `func`. Parameters are named — you wri
 
 <pre>
 mesh$ <strong>func greet(name) {</strong>
-...   <strong>puts "hi, $name"</strong>
-... <strong>}</strong>
+.....   <strong>puts "hi, $name"</strong>
+..... <strong>}</strong>
 mesh$ <strong>greet world</strong>
 hi, world
 </pre>
@@ -917,8 +925,8 @@ optional, a `--name` parameter is a flag (a bare `--force` switch or a valued
 
 <pre>
 mesh$ <strong>func deploy(target, --tag = latest, --force, ...hosts) {</strong>
-...   <strong>puts "$target $tag $force"; puts ...$hosts</strong>
-... <strong>}</strong>
+.....   <strong>puts "$target $tag $force"; puts ...$hosts</strong>
+..... <strong>}</strong>
 mesh$ <strong>deploy prod --force web1 web2</strong>
 prod latest true
 web1 web2
