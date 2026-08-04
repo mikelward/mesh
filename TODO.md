@@ -4403,6 +4403,168 @@ thing a reader takes on trust.*
       as it always did, just as an interactive session. Nothing a prompt would
       decorate with leaks into a piped run, so output stays byte-exact.
 
+## Beyond M3 — Static checks
+
+Things a reader of the source could know before the shell runs a line, that mesh
+currently only finds at run time. Raised writing `docs/COMPARISON.md`, where
+two other shells' answers turned out to be strictly better than ours.
+
+- [ ] **Catch an unbound variable at parse time, not on the statement that
+      reads it.** elvish rejects `$nosuch` when it *compiles* the code, before
+      anything runs:
+
+      ```
+      $ elvish -c '/usr/bin/printf "[%s]" $nosuch'
+      Compilation error: variable $nosuch not found
+        code from -c:1:24-30: /usr/bin/printf "[%s]" $nosuch
+      ```
+
+      **nushell catches it too, while parsing** — so this is two shells ahead
+      of mesh, not one, and it is worth knowing that the shell with no static
+      pretensions at all still refuses before running anything:
+
+      ```
+      $ nu -c '^echo BEFORE; print $nosuch'
+      Error: nu::parser::variable_not_found
+      ```
+
+      `BEFORE` never prints. mesh reports the same mistake, but only once
+      execution reaches it — `puts BEFORE; puts $nosuch` prints `BEFORE` and
+      then `mesh: nosuch: unbound variable` — so a typo in a branch that runs
+      on the unhappy path survives every test that never takes it, and in a
+      script that has already deleted something it surfaces halfway through.
+      Being loud about absence is already the language's position; this is the
+      same claim moved earlier, where it costs nothing to obey.
+
+      **This cannot be done in mesh as the language currently stands, and the
+      reason is worth writing down, because it is not an implementation
+      problem.** Raised in review of the PR that added the comparison page.
+
+      A resolver pass over the parsed program would reject working code. A name
+      can be bound entirely outside the tree being checked: `env.mesh` runs on
+      every invocation and its variables stay for the session
+      (`docs/REFERENCE.md` §Configuration files), and `source lib.mesh`
+      persists what it assigns into the caller (§`source`) — that persistence
+      being the whole reason a config file works. Worse for the flag we would
+      most want it on, `mesh -n` **deliberately does not run startup files**
+      (§`-n`), since sourcing `env.mesh` to check an unrelated file would run
+      arbitrary commands. So the one caller that could most use the check is
+      also the one that cannot know what is in scope.
+
+      elvish gets this for free because it made a distinction mesh has not:
+      `var x = 1` declares, `set x = 1` assigns, and `set` on an undeclared
+      name is itself the compile error —
+
+      ```
+      $ elvish -c 'set x = 1'
+      Compilation error: cannot find variable $x
+      ```
+
+      Every name is therefore declared in the file or imported by a module, so
+      "not found here" really does mean not found. mesh spells both operations
+      `x = 1`, which is friendlier to type and gives a checker no way to tell a
+      typo from a name the environment supplied.
+
+      **There is no statically checkable subset to retreat to, either.** The
+      obvious narrowing — check only inside `func` bodies, where parameters and
+      locals are known — fails for the same reason, because a body's reads
+      deliberately fall through: "Reads see the innermost local scope, then the
+      global scope" (`docs/REFERENCE.md` §Functions), so a function reading a
+      global that `env.mesh` set is ordinary working code, and a checker that
+      cannot see `env.mesh` would reject it. Confirmed against the built shell:
+
+      ```
+      g = fromtop
+      func f() { puts $g }
+      f                      # prints: fromtop
+      ```
+
+      Moving the pass to **load time**, with the live global scope in hand,
+      survives both of those and still fails: a program can bind names *into
+      its own scope while running*, and `source` is the documented way to do
+      it. An upfront pass runs before the first statement, so it sees neither
+      the binding nor the file that will make it —
+
+      ```
+      source lib.mesh
+      puts $from_lib      # prints hello; lib.mesh bound it a statement ago
+      ```
+
+      **Four framings, four counter-examples. That is the finding, and it is
+      worth recording as such rather than proposing a fifth in the same
+      breath.** The constraint every version runs into is the same one: mesh
+      binds names by executing statements, and any check that runs earlier than
+      execution is guessing about what execution will bind. The accumulated
+      list of what a proposal has to survive:
+
+      - a global from `env.mesh`, which `mesh -n` cannot see by design;
+      - a global from a previous `source` in the session;
+      - a `func` body reading a global rather than a local;
+      - a `source` **inside the program being checked**, binding names for the
+        statements after it.
+
+      Two directions look viable, and both are language decisions rather than
+      passes to write:
+
+      1. **Conservative bail-out.** Check at load time against the live scope,
+         but treat any construct that can bind unknown names — `source` at
+         minimum — as poisoning everything after it, checking only the region
+         before the first one. Sound, and still catches a typo in a script that
+         does not `source`. The question is whether the covered subset is worth
+         a checker that silently stops covering things.
+      2. **A declaration or import form**, so a file can state what it expects
+         from outside and be checked whole. The elvish bargain, whose cost
+         lands on the language's most-typed line.
+
+      Nothing here should be built before someone picks between them — both
+      change the language rather than adding a pass, and (1) is only "cheap"
+      until you decide a checker that silently stops covering the rest of the
+      file is acceptable. The value of this item is the constraint list above,
+      not a plan.
+
+- [ ] **Reconsider what `'…'` should mean.** Writing the comparison put this in
+      an uncomfortable light: of the six shells on that page, mesh is the *only*
+      one whose single quotes are not raw. bash, zsh, fish, elvish, and nushell
+      all agree that `'…'` is text as typed, and mesh follows Python instead —
+      `'…'` is `"…"` minus interpolation, with the same `\n \t \e \u{…}` set and
+      an unknown escape as an error.
+
+      The page currently lists this as one of only two places mesh asks for
+      **more** quoting than everyone else, which is an awkward thing to be
+      defending. The concrete cost is that the single most common shell
+      one-liner shape does not survive the move:
+
+      ```
+      sed 's/\(a\)/[\1]/' file      # fine in the other five
+      sed r's/\(a\)/[\1]/' file     # what mesh needs
+      ```
+
+      Regexes, `awk` programs, and Windows paths all land on it, and the failure
+      is at least loud — the diagnostic names `r'…'` — so this is friction
+      rather than a correctness bug.
+
+      What the current design buys is real and should not be given up by
+      accident: `'\n'` and `"\n"` mean the same thing, which is why mesh needs
+      no `$'…'` at all, where bash's third string form exists precisely because
+      its `"…"` cannot spell a newline. Making `'…'` raw would restore that
+      asymmetry unless `"…"` keeps escapes, and would leave no short spelling
+      for "escapes but no interpolation" — currently `'…'`, and genuinely
+      useful for a string with a `$` in it.
+
+      Options, none costless:
+
+      1. **Leave it.** Defend it as the price of one string vocabulary, and keep
+         pointing at `r'…'` in the diagnostic.
+      2. **Make `'…'` raw** like everyone else, and let the escapes-only case be
+         served by `"…"` with `\$` for a literal dollar. Costs the exact
+         `'\n'` == `"\n"` symmetry that removes the need for `$'…'`.
+      3. **Keep both and change which is shorter** — raw on `'…'`, escapes on
+         some other short form. Buys familiarity at the cost of inventing a
+         spelling nobody knows either.
+
+      Worth settling before the language is widely written, since it changes
+      every existing single-quoted string.
+
 ## Loose ends
 
 Small items rescued from pull requests that were closed as superseded — the bulk

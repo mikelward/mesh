@@ -1,6 +1,6 @@
-# mesh compared with bash, zsh, fish, and nushell
+# mesh compared with bash, zsh, fish, elvish, and nushell
 
-Four shells worth measuring mesh against, because each one answers the same
+Five shells worth measuring mesh against, because each one answers the same
 question differently.
 
 - **bash** is the baseline — what nearly everyone arrives from, and the source
@@ -12,11 +12,14 @@ question differently.
   small a departure bought how much.
 - **fish** is the friendly shell that broke cleanly and kept the Unix shape:
   byte pipes, external commands everywhere, no word splitting.
+- **elvish** is the closest relative by design — real values, byte pipes, and a
+  strictness that in two places exceeds mesh's own. It is the one to read if you
+  want to know whether mesh's ideas needed a new shell to hold them.
 - **nushell** is the structured-data shell: the pipeline carries tables and
   records rather than bytes, and much of coreutils is replaced by builtins that
   speak that format.
 
-mesh sits between fish and nushell, which is the order the tables below are
+mesh sits between fish and elvish, which is the order the tables below are
 written in — roughly from most POSIX to least. It takes fish's answer to
 expansion safety and pushes it further into a real type system — lists, maps,
 integers, booleans — while keeping nushell's ambition out of the pipe: **pipes
@@ -27,27 +30,38 @@ this page compares designs, and mesh's is still being built.
 
 ## At a glance
 
-| | bash | zsh | fish | mesh | nushell |
-| --- | --- | --- | --- | --- | --- |
-| Unquoted `$x` with a space in it | **splits** | one argument | one argument | one argument | one value |
-| Unquoted `$x` holding `*` | **re-globs** | literal | literal | literal | literal |
-| Unquoted command substitution | **splits on `IFS`** | **splits on `IFS`** | splits on newlines | one string | one value |
-| Unquoted empty `$x` | **vanishes** | **vanishes** | one empty argument | one empty argument | one empty value |
-| Lists | bolted-on arrays | native | native | native | native |
-| List → argv | `"${a[@]}"` | implicit | implicit | `...$a` | `...$a` |
-| Pipe payload | bytes | bytes | bytes | bytes | **structured** |
-| Coreutils | first-class | first-class | first-class | first-class | second-class |
-| Unset variable | empty string | empty string | empty string | **error** | error |
-| `pipefail` | opt-in | opt-in (`$pipestatus`) | n/a (`$pipestatus`) | **always on** | n/a |
-| Truthiness | status + string tests | status + string tests | status | **no truthy values** | typed |
-| `'…'` | fully raw | fully raw | nearly raw | **takes escapes** | fully raw |
-| `"…"` interpolates | yes | yes | yes | yes | **no** (`$"…"` does) |
-| `"\n"` is a newline | no (`$'\n'`) | no (`$'\n'`) | no | yes | yes |
-| Runs POSIX scripts | yes | mostly | no | no | no |
-| Config language | bash | zsh | fish | mesh | nu |
+| | bash | zsh | fish | mesh | elvish | nushell |
+| --- | --- | --- | --- | --- | --- | --- |
+| Space in unquoted `$x` | **splits** | one arg | one arg | one arg | one arg | one value |
+| `*` in unquoted `$x` | **re-globs** | literal | literal | literal | literal | literal |
+| Unquoted command substitution | **splits on `IFS`** | **splits on `IFS`** | splits on newlines | one string | splits on newlines | one value |
+| Unquoted empty `$x` | **vanishes** | **vanishes** | one empty arg | one empty arg | one empty arg | one empty value |
+| Lists | bolted-on | native | native | native | native | native |
+| List → argv | `"${a[@]}"` | implicit | implicit | `...$a` | `$@a` | `...$a` |
+| Pipe payload | bytes | bytes | bytes | bytes | bytes + values | **structured** |
+| Coreutils | first-class | first-class | first-class | first-class | first-class | second-class |
+| Unset variable | `""` | `""` | `""` | error (at run time) | **compile error** | **parse error** |
+| A failed command | status | status | status | status | **aborts** | status |
+| `pipefail` | opt-in | opt-in | `$pipestatus` | **always on** | aborts, reports all | n/a |
+| Truthiness | status + tests | status + tests | status | **none** | value | typed |
+| `'…'` | raw | raw | nearly raw | **escapes** | raw | raw |
+| `"…"` interpolates | yes | yes | yes | yes | **no** | **no** (`$"…"`) |
+| `"\n"` is a newline | no (`$'\n'`) | no (`$'\n'`) | no | yes | yes | yes |
+| Runs POSIX scripts | yes | mostly | no | no | no | no |
+| Config language | bash | zsh | fish | mesh | elvish | nu |
 
-Command substitution is spelled `$(…)` in bash, zsh, mesh, and fish; nushell
-writes a subexpression as `(…)`, and `$(…)` there is a parse error.
+Command substitution is spelled `$(…)` in bash, zsh, mesh, and fish; elvish and
+nushell write a subexpression as `(…)`, and `$(…)` in nushell is a parse error.
+
+**Two rows go against mesh, and they are the two worth reading first.** On the
+unset-variable row mesh is the *weakest* of the three shells that refuse at all:
+elvish catches it when it compiles the code and nushell catches it while
+parsing, both before any of the program runs, where mesh only reports it once
+execution reaches the statement — so a typo down a branch your tests never take
+survives in mesh and does not in either of them. And a command that fails aborts
+an elvish script by default, where mesh leaves it in `$sh.status`. Both are
+stricter readings of the same instinct this page argues for, and the first is
+now on [`TODO.md`](../TODO.md).
 
 ## Quoting and escaping
 
@@ -161,8 +175,8 @@ repeating:
 
 - **An empty unquoted expansion still vanishes.** `e=''; printf '[%s]' a $e b`
   prints `[a][b]` in both bash and zsh — two arguments, not three — so `"$e"`
-  stays load-bearing to pass an empty string. fish, mesh, and nushell all print
-  `[a][][b]`.
+  stays load-bearing to pass an empty string. fish, mesh, elvish, and nushell
+  all print `[a][][b]`.
 
   The distinction the other three can make and bash and zsh cannot is between a
   value that is empty and no value at all. An empty *list* should contribute
@@ -183,6 +197,33 @@ That last point is the whole difference in one sentence. **zsh made the safe
 behavior the default; mesh makes it the grammar.** There is no mesh option that
 reintroduces word splitting, because there is no splitting stage to switch back
 on.
+
+#### How close can you tune zsh?
+
+Worth knowing if you are staying, and it is a sharper test of the claim above
+than any assertion: which of these gaps close by configuration? Every one of
+zsh's 185 options was tried.
+
+Two close outright, and both are worth setting:
+
+```sh
+setopt nounset          # $nosuch is an error, not ""      — as in mesh
+setopt pipefail         # a pipeline reports its failure   — as in mesh
+setopt warncreateglobal # catches an accidental global in a function
+```
+
+The two expansion residuals close at **no setting**. No option stops the empty
+elision — not one of the 185 — and none stops command substitution splitting;
+the only lever for that is `IFS=`, a variable rather than an option, and it
+takes the splitting you *wanted* with it: under `IFS=` a `for w in $(…)` loop
+runs once with the whole output, and `read -A parts` on `a:b:c` gives one field
+instead of three. The scoped form (`IFS=$'\n' read -r line`, or an explicit
+`${(f)"$(…)"}`) is the answer, per site.
+
+Which is the same shape as the argument itself. The gaps that close are the ones
+that were **policy** — what to do about an unset name, how a pipeline reports.
+The gaps that do not close are the ones built into **expansion**, and no amount
+of configuration reaches them, because they are not configured.
 
 ### mesh: the shape is fixed at parse time, and values are eager
 
@@ -292,14 +333,14 @@ it as text ("x:latest"), or brace the name when it comes from a variable
 The cost is real and lands on familiar lines — `docker run "ubuntu:latest"`,
 `git show "HEAD:file"`, `rsync "host:src" dst`, `curl -H "Accept:application/json"`.
 The quotes go around the **whole** token; `"ubuntu":latest` is not the same
-thing. bash, zsh, fish, and nushell all take those bare.
+thing. bash, zsh, fish, elvish, and nushell all take those bare.
 
-**`'…'` takes escapes, unlike every other shell.** In bash, zsh, fish, and
-nushell a single-quoted string is (near enough) raw, which is why every sed
+**`'…'` takes escapes, unlike every other shell.** In bash, zsh, fish, elvish,
+and nushell a single-quoted string is (near enough) raw, which is why every sed
 one-liner in existence is written in one. mesh follows Python instead: `'…'` is
 `"…"` minus interpolation, with the same `\n \t \e \u{…}` set, and an unknown
 escape is an error rather than a literal backslash. So this is a syntax error in
-mesh and fine in the other four:
+mesh and fine in the other five:
 
 ```bash
 sed 's/\(a\)/[\1]/' file
@@ -322,28 +363,55 @@ spell a newline.
 
 ### The string forms, side by side
 
-| | bash | zsh | fish | mesh | nushell |
-| --- | --- | --- | --- | --- | --- |
-| Interpolating + escapes | `"…"` interpolates, `$'…'` escapes | `"…"` interpolates, `$'…'` escapes | `"…"` (few escapes) | `"…"` | `$"…"` |
-| Literal, with escapes | — | — | — | `'…'` | — |
-| Fully raw | `'…'` | `'…'` | `'…'` (bar `\'`, `\\`) | `r'…'` / `r"…"` | `'…'`, `r#'…'#` |
-| Both quote kinds, no escaping | heredoc | heredoc | heredoc-ish | `<< 'END'` heredoc | `r#'…'#` |
+| | bash | zsh | fish | mesh | elvish | nushell |
+| --- | --- | --- | --- | --- | --- | --- |
+| Interpolating + escapes | `"…"`, `$'…'` | `"…"`, `$'…'` | `"…"` (few escapes) | `"…"` | — | `$"…"` |
+| Literal, with escapes | — | — | — | `'…'` | `"…"` | — |
+| Fully raw | `'…'` | `'…'` | `'…'` (bar `\'`, `\\`) | `r'…'` / `r"…"` | `'…'` | `'…'`, `r#'…'#` |
+| Both quote kinds, no escaping | heredoc | heredoc | heredoc-ish | `<< 'END'` heredoc | — | `r#'…'#` |
 
 mesh's four forms answer four questions with no overlap: interpolate or not,
 escape or not. bash needs `$'…'` because `"…"` under-delivers; nushell needs
 `$"…"` because `"…"` under-delivers the other way.
 
+elvish is the odd one: it has **no interpolating string at all**. `"hi $n"`
+prints `hi $n` literally, and you concatenate instead — `"hi "$n`, since
+adjacent words fuse there as they do in mesh. That is a real cost of its
+consistency, and the one place its quoting is less convenient than every other
+shell here.
+
 ## Values and the pipeline
 
-The deepest split among the four is what a pipe carries.
+The deepest split among the six is what a pipe carries, and there are three
+answers rather than two.
 
-bash, fish, and mesh all carry **bytes**, which is why every program ever written
-for a Unix shell works in them. nushell carries **structured data**, which buys a
-genuinely better `ls | where size > 10mb` and costs you the ecosystem: an
-external command's output arrives as text, and the way back to structure is a
-parse (`| lines`, `| split column`, `| from json`). nushell's answer is to
-reimplement the common tools as builtins that speak the format, which works well
-until you need one it has not reimplemented.
+bash, zsh, fish, and mesh all carry **bytes**, which is why every program ever
+written for a Unix shell works in them. nushell carries **structured data**,
+which buys a genuinely better `ls | where size > 10mb` and costs you the
+ecosystem: an external command's output arrives as text, and the way back to
+structure is a parse (`| lines`, `| split column`, `| from json`). nushell's
+answer is to reimplement the common tools as builtins that speak the format,
+which works well until you need one it has not reimplemented.
+
+**elvish takes the third answer: both, on separate channels.** A value channel
+runs alongside stdin and stdout, so elvish commands hand each other real values
+while bytes keep flowing to and from everything else. The seam is where a
+pipeline crosses to an external command, and it is worth knowing which way you
+are crossing:
+
+| | What arrives |
+| --- | --- |
+| elvish → elvish | the value itself — `put [1 2] \| each {\|x\| put (kind-of $x)}` says `list` |
+| elvish → external | **nothing** — `put [&a=1] \| cat` prints nothing at all |
+| external → elvish | bytes, split into one value per line |
+
+That last row is the pleasant one: `printf 'a\nb\n' | each {|x| put "["$x"]"}` gives
+`[a]` and `[b]` without a parse step. The second is the cost — a value piped at a
+program that cannot receive one is silently dropped rather than serialized.
+
+mesh does not have the second channel, and that is the deliberate part: one
+payload means one rule about what crosses a pipe, and nothing to lose when it
+crosses.
 
 mesh's position is that this is the one thing that rules out the nushell model
 here. Values are real *inside* the shell — lists, maps, integers, booleans, with
@@ -363,12 +431,17 @@ colon-joined string, so the `IFS=:` juggling disappears.
 
 ### Spread
 
-A list reaching argv is explicit in both mesh and nushell, implicit in fish, and
-punctuation in bash:
+A list reaching argv is **explicit** in mesh, elvish, and nushell, **implicit**
+in zsh and fish, and punctuation in bash:
 
 ```bash
 a=(one two)
 cmd "${a[@]}"
+```
+
+```sh
+a=(one two)      # zsh
+cmd $a
 ```
 
 ```fish
@@ -381,36 +454,54 @@ a = [one two]
 cmd ...$a
 ```
 
+```elvish
+var a = [one two]
+cmd $@a
+```
+
 ```nu
 let a = [one two]
 cmd ...$a
 ```
 
-fish's implicit expansion is the terse option, and the cost is that
-`$a` in argument position is a different arity depending on the variable — the
-same data-dependence mesh is trying to remove, in a milder form. mesh's `...`
-makes the arity readable from the line.
+The implicit shells are the terse option, and the cost is that `$a` in argument
+position is a different arity depending on what the variable holds — the same
+data-dependence mesh is trying to remove, in a milder form. It is milder because
+the arity tracks the *value's* structure rather than its bytes: `$a` is one word
+per element and stays that way whatever the elements contain, which is already
+far better than bash. mesh's `...` and elvish's `$@` make it readable from the
+line instead.
 
 ## Globbing
 
-| | bash | zsh | fish | mesh | nushell |
-| --- | --- | --- | --- | --- | --- |
-| Bare `*.txt` | expands | expands | expands | expands | expands |
-| `$x` where `x` is `"*"` | **re-globs** | literal | literal | literal | literal |
-| No match | left as literal text | **error** | **error** | contributes no arguments | left as text |
-| Explicit opt-in | — | `${~x}` | — | `glob($p)` | `glob` / `into glob` |
+| | bash | zsh | fish | mesh | elvish | nushell |
+| --- | --- | --- | --- | --- | --- | --- |
+| Bare `*.txt` | expands | expands | expands | expands | expands | expands |
+| `$x` where `x` is `"*"` | **re-globs** | literal | literal | literal | literal | literal |
+| No match | left as text | **error** | **error** | no arguments | **error** | left as text |
+| Tolerate no match | — | `*.txt(N)` | — | default | `*[nomatch-ok]` | — |
+| Glob a variable | (always) | `${~x}` | — | `glob($x)` | **impossible** | `into glob` |
 
 bash's "no match, so pass the pattern through as a filename" is a quiet
 correctness bug — `grep foo *.log` in a directory with no logs searches a file
-literally named `*.log`. zsh and fish error, which is loud but stops the
-command. mesh drops the word, so a pattern that matches nothing contributes
-nothing, and `glob()` is there when you want the matches as a value.
+literally named `*.log`. zsh, fish, and elvish error, which is loud but stops
+the command, and two of them let you say "empty is fine" per pattern: zsh with a
+glob qualifier (`*.log(N)`, or `setopt nullglob` for all of them) and elvish
+with `*[nomatch-ok]`. mesh drops the word, so a pattern that matches nothing
+contributes nothing and no exemption is needed — the trade being that a typo'd
+pattern is silently empty rather than loud.
 
 The row that matters most is the second one, and bash is alone in getting it
 wrong: a variable's contents are re-scanned for glob characters at use, so a
 filename containing `[` breaks a script that never mentioned globbing. In the
-other four a glob is a glob because of how the *source* is written — zsh spells
-the opt-in `${~x}`, mesh spells it `glob($x)`.
+other five a glob is a glob because of how the *source* is written.
+
+The last row is where they diverge on how much rope to leave. zsh keeps a
+sigil for it (`${~x}`), mesh a function (`glob($x)`), nushell a cast
+(`into glob`) — and **elvish offers nothing at all**: there is no way to turn a
+string's contents into a pattern, so the question cannot come up. That is the
+strictest position on this page, stricter than mesh's, and the cost is that a
+pattern genuinely computed at run time has nowhere to go.
 
 ## Errors and strictness
 
@@ -422,10 +513,24 @@ puts "a$undefined"
 mesh: undefined: unbound variable
 ```
 
-bash and fish both give you the empty string there — the failure mode behind
-every `rm -rf "$prefix/"` horror story. nushell and mesh both refuse.
+bash, zsh, and fish all give you the empty string there — the failure mode
+behind every `rm -rf "$prefix/"` horror story. The other three refuse, but not
+at the same moment, and the difference matters more than the agreement:
 
-mesh goes further in two places:
+| | When an unbound `$x` is caught |
+| --- | --- |
+| **mesh** | when execution reaches it — `puts BEFORE; puts $nosuch` prints `BEFORE` first |
+| **elvish** | at compile time, before any of the script runs |
+| **nushell** | at parse time — `^echo BEFORE; print $nosuch` prints nothing at all |
+
+So mesh is the *weakest* of the three here. A typo down a branch the tests never
+take survives in mesh and does not in elvish or nushell, and in a script that
+has already deleted something it surfaces halfway through. Closing that gap is
+on [`TODO.md`](../TODO.md), where it turns out to need a language decision
+rather than a pass: mesh binds names by executing statements, so any check
+earlier than execution is guessing at what execution will bind.
+
+mesh goes further than the POSIX shells in two places:
 
 - **`pipefail` is always on.** A pipeline's status is the **last** stage to
   fail, or `0` when none did, with no option to turn it off — and
@@ -433,6 +538,21 @@ mesh goes further in two places:
   than bash's magic `PIPESTATUS` array. An upstream stage killed by `SIGPIPE`
   because a later stage stopped reading is forgiven, which is the case
   `set -o pipefail` gets wrong.
+
+  **elvish goes further still, and unconditionally** — there is no option
+  because elvish has no options. Any stage failing anywhere raises, and rather
+  than electing one status it reports *every* failure at once:
+
+  ```text
+  $ elvish -c '/bin/sh -c "exit 3" | /bin/sh -c "exit 7"'
+  Exception: (/bin/sh exited with 3 | /bin/sh exited with 7)
+  ```
+
+  Where mesh answers `7` and files `[3 7]` in `$sh.pipestatus`, elvish declines
+  to pick and hands you both. Suppression is per site — `?(…)` around the
+  pipeline yields a structured `pipeline-error` value holding both exceptions,
+  which is more than a status list: each carries its command, exit status, and
+  stack trace.
 - **There are no truthy values.** A condition is a bool or a command, and
   nothing else. `if $xs:len` is refused, naming `if $xs:len > 0` as the fix —
   where bash's `[ $x ]` and fish's `test` both quietly answer a question you did
@@ -440,8 +560,8 @@ mesh goes further in two places:
 
 ## Syntax
 
-mesh is a clean break from POSIX, like fish and nushell — none of the three runs
-your old `sh` scripts, and all three run your old *programs* fine.
+mesh is a clean break from POSIX, like fish, elvish, and nushell — none of the
+four runs your old `sh` scripts, and all four run your old *programs* fine.
 
 ```mesh
 if $sh.status == 0 { puts ok }
@@ -456,13 +576,190 @@ second layer of its own on top (`${(@f)x}` parameter flags, `**/` recursive
 globs, glob qualifiers like `*(.om[1])`), which is powerful and is the other
 reason it is not a small language.
 
-Two mesh choices that have no counterpart in the other four:
+Two mesh choices that have no counterpart in the other five:
 
 - **`~` is the match operator**, with `/…/` regex literals in a match slot only,
   so absolute paths need no wrapper — `$p ~ /usr/bin` is a path, `$p ~ /error/`
   is a regex, decided by word shape.
 - **Modifiers chain**: `$m.rows[1].name:stem:upper` reads left to right, where
   bash has `${x%%…}` sigil soup and nushell reaches for a pipeline.
+
+## Implementation
+
+Two properties of a shell's implementation that a user feels only indirectly:
+what it is written in, and how many ways it can be told to behave differently.
+
+| | bash 5.2 | zsh 5.9 | fish 4.0 | mesh | elvish 0.21 | nushell 0.114 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Language | C | C | Rust | Rust | Go | Rust |
+| Options | 27 `set -o` + 57 `shopt` | **185** `set -o` | 7 feature flags | 5 | none | config record |
+| …that change what a line *means* | many | many | 7, transitional | **none** | none | none |
+
+**The last row is the one that compounds.** Every option that changes the
+meaning of a line multiplies the behavior a test suite has to cover, and the
+multiplication is combinatorial rather than additive — `SH_WORD_SPLIT` interacts
+with `GLOB_SUBST` interacts with `KSH_ARRAYS`, and each expansion path has to be
+right under every combination. Nobody can enumerate that space, so how much of
+it a suite reaches is bounded by the design and not by anyone's diligence.
+
+mesh's five options are `bold-input`, `command-notify`, `cwd-report`,
+`osc-title`, and `shell-integration` — every one of them terminal display. Not
+one changes what a line of code means, and that is a property to hold onto
+rather than a side effect of being early: an option that changes expansion is
+exactly the thing the grammar rules out three sections up.
+
+fish's seven are worth distinguishing from zsh's 185: each names the release
+that introduced it and the migration it eases, and one is already frozen
+(`stderr-nocaret`, "can no longer be changed"). That is a deprecation ratchet
+working itself out, not a permanent configuration matrix.
+
+**What this table does not tell you is how much simpler any of it is.** mesh is
+about 40k lines of Rust against zsh's 143k of C, and that comparison flatters
+mesh, because mesh is not finished. Job control, signals, and terminal handling
+are the same problem in any language and any era. Rust removes a class of memory
+bug; it does not make shell semantics simpler, and a confusing design is just as
+confusing in a safe language. The honest claim is narrower than "simpler": the
+expansion core is smaller and far more testable, because it has no stages to
+re-enter and no modes to cross-multiply — and that is where the long-lived bugs
+in this family of software actually live.
+
+## Interactive defaults
+
+The rest of this page is about the language. This section is about the shell you
+sit in, which for mesh is the point rather than a bonus — see
+[`INTRO.md`](INTRO.md).
+
+| | bash | zsh | fish | mesh | elvish | nushell |
+| --- | --- | --- | --- | --- | --- | --- |
+| History store | text file | text file | text file | **SQLite** | BoltDB | text (SQLite opt-in) |
+| Saved by default | yes | **no** | yes | yes | yes | yes |
+| Completion on by default | with a package | needs `compinit` | yes | yes | yes | yes |
+| Fuzzy matching | no | `zstyle` opt-in | subsequence | **default** | opt-in (`match-subseq`) | opt-in (`algorithm`) |
+| Named hook events | none | 7 | 5 kinds | 7 | 3 | 5 |
+| Registering a hook | reassign a var | `add-zsh-hook` (autoload) | `--on-…` flag | `on` / `$sh.<event>` | append to a list | `$env.config.hooks` |
+
+The comparison that flatters mesh is against a **bare** zsh, and it is stark.
+With no configuration at all:
+
+```sh
+HISTFILE=[]  HISTSIZE=[30]  SAVEHIST=[0]     # history is not saved. at all.
+sharehistory / extendedhistory / histignoredups   # every one off
+add-zsh-hook                                 # command not found — needs autoload
+completion                                   # needs compinit
+```
+
+Against that, mesh out of the box: history in **SQLite**
+(`$XDG_STATE_HOME/mesh/history.sqlite3`, owner-readable, a multi-line command
+stored and recalled as the one logical command it was typed as), **fuzzy
+smart-case completion** with a columnar menu, command specs layered from a
+curated file → the command's **man page** → a bounded **`--help` probe**, and
+hooks reachable as both `on <event>` and the `$sh.<event>` maps.
+
+But zsh is the outlier there, and the other four all arrive working. The rest of
+this section is the fairer comparison.
+
+### Hooks
+
+bash is the one with no hook *system* at all: you reassign `PROMPT_COMMAND`,
+set `PS0`, or `trap` on `DEBUG` / `ERR` / `EXIT`. Since 5.1 `PROMPT_COMMAND`
+may be an **array**, and bash runs each set element in turn —
+
+```bash
+PROMPT_COMMAND=("echo one" "echo two")   # both run, every prompt
+```
+
+— so two prompt integrations no longer have to collide or chain strings by
+hand, which they did for decades before it. What bash still has no equivalent
+of is a *named* registry: the entries are positional, nothing identifies whose
+is whose, and a `trap` is still single-valued, so two things wanting `EXIT`
+still overwrite each other.
+
+Everyone else has named events. What differs is how you attach to one:
+
+| Shell | Events | How you attach |
+| --- | --- | --- |
+| **zsh** | `precmd`, `preexec`, `chpwd`, `periodic`, `zshaddhistory`, `zshexit`, `zsh_directory_name` | define the function, or `add-zsh-hook` for more than one per event — after `autoload -Uz add-zsh-hook` |
+| **fish** | by *kind* rather than by name — `--on-event`, `--on-variable`, `--on-signal`, `--on-job-exit`, `--on-process-exit` | a flag on the function definition |
+| **elvish** | `before-readline`, `after-readline`, `after-command` | append a function to the `$edit:…` list |
+| **nushell** | `pre_prompt`, `pre_execution`, `env_change`, `display_output`, `command_not_found` | assign into `$env.config.hooks` |
+| **mesh** | `preprompt`, `preexec`, `postexec`, `precd`, `postcd`, `jobdone`, `exit` | `on <event> <name> <func>`, or `$sh.<event>.<name> = <func>` |
+
+fish's is the most general — an event *kind* system, so `--on-variable PATH` or
+`--on-process-exit` cover cases the others have no name for. elvish's three are
+the narrowest, and are about the line editor rather than the shell.
+
+mesh's distinguishing bit is small but real: a handler is **named**, so
+`on postcd fetch …` can be replaced or removed by that name later, and the same
+registry is readable and writable as a map. zsh's is a list you append to and
+must remove by function name; fish's is attached to the function definition
+itself, so replacing it means redefining the function. Which matters exactly
+when a config is assembled from pieces that do not know about each other, and
+not at all otherwise.
+
+Both of mesh's less usual events have counterparts; what differs is the payload
+and how you register. `postexec` lines up with elvish's `after-command`, and
+mesh's carries `command, status, elapsed` — the elapsed milliseconds being the
+part a prompt otherwise reconstructs with a `date` call on either side.
+`jobdone` lines up with fish's `--on-job-exit`, but fish's is registered
+**against a specific PID**, so you attach it to a job you already have in hand;
+mesh's fires for any background job the shell reaps, with its `id`, `command`,
+and `status`. Neither is a new idea, and the useful difference is that mesh's
+fire for work you did not arrange in advance.
+
+### Completion
+
+The gap here runs the other way, and it is worth being blunt about: **zsh has
+the best completions of any shell on this page**, by a distance that a decade of
+curated `_command` functions bought and nothing else can shortcut. fish is
+second and gets there partly by generation. mesh is not competing on coverage.
+
+| Shell | Where completions come from |
+| --- | --- |
+| **bash** | `complete` / `compgen`, plus the `bash-completion` package if installed |
+| **zsh** | a large curated `_command` set, `compinit`, `_gnu_generic` for `--help`-style commands, `zstyle` for matcher and menu behavior |
+| **fish** | shipped completions, plus `fish_update_completions` generating from man pages |
+| **elvish** | `$edit:completion:arg-completer` — a map from command name to a function you write |
+| **nushell** | `extern` signatures with types, plus custom completers |
+| **mesh** | four layers tried in order: curated file → man page → bounded `--help` probe → files |
+
+The shapes differ more than the table shows. elvish and nushell put the
+mechanism in your hands and ship little: nushell's `extern` is elegant — you
+declare a command's signature with types and get completion from it — but
+someone has to write the declaration. zsh and fish ship the answers. mesh tries
+to derive them, which is the cheapest thing to be right about *by default* and
+the most likely to be imprecise on any given command.
+
+So the honest statement is that mesh's completion is better than nothing without
+work, and worse than zsh's with it.
+
+The one row mesh does lead on is **fuzzy matching by default**, and it is a
+narrow lead: fish matches subsequences out of the box, while zsh, elvish, and
+nushell all ship prefix matching and put the better matcher behind a setting
+(`zstyle … matcher-list`, `$edit:completion:matcher`, and
+`$env.config.completions.algorithm` respectively). Being right by default rather
+than after configuration is the same argument this page makes about expansion,
+pointed at a much smaller target.
+
+Neither derived layer is a new idea, and it would be wrong to claim otherwise:
+fish ships `fish_update_completions`, which runs a Python script over your
+manpath and writes generated completion files, and zsh ships `_gnu_generic`,
+which parses a command's `--help` output. What mesh does differently is *when*
+and *how much*: those are a batch step you remember to re-run and a per-command
+`compdef` opt-in respectively, where mesh consults the four sources in order at
+the moment you press Tab, for any command, with nothing generated ahead of time
+and no Python in the picture. The layering is the feature, not either source.
+
+**But nobody runs a bare zsh, and that is the honest counter-case.**
+Distributions ship a starter `zshrc`, and the setup people actually have is zsh
+plus a framework — oh-my-zsh, prezto, zinit — plus `fzf`, plus
+`zsh-autosuggestions`. That combination is *excellent*, and it beats mesh
+comfortably on completion coverage, on breadth of plugins, and on every question
+that a decade of accumulated community effort answers.
+
+So the claim here is not "better than a configured zsh". It is that the
+configuration step is where people stall, that a shell arriving good is worth
+something on its own, and that when the defaults are the product they have to be
+defended rather than deferred to a plugin.
 
 ## What mesh gives up
 
@@ -479,27 +776,37 @@ Honest costs, in the order they will bite:
    than safety-by-grammar — plus the parts of mesh that are not about safety at
    all (typed values, modifiers, `match`). Whether that last mile is worth a new
    shell is a real question, and for many people the answer is no.
-2. **Maturity.** bash is thirty-five years old, zsh, fish, and nushell all have
-   real ecosystems and package managers, and mesh's language design is still in
-   draft. See [`ROADMAP.md`](../ROADMAP.md).
-3. **No POSIX compatibility.** Same as fish and nushell, and unlike zsh — your
-   `.bashrc` does not port, and neither does any script you wrote.
-4. **No structured pipeline.** `ls | where size > 10mb` is nushell's, and mesh
+2. **elvish already ships the value model**, has done for years, and is
+   *stricter* than mesh in the two places noted under the first table — an
+   unbound variable caught at compile time, and a failed command that aborts.
+   If those are what drew you here, that shell has them now. mesh's answer is
+   interpolation, modifiers, and the interactive defaults, not the core idea.
+3. **Maturity.** bash is thirty-five years old, zsh, fish, elvish, and nushell
+   all have real ecosystems and package managers, and mesh's language design is
+   still in draft. See [`ROADMAP.md`](../ROADMAP.md).
+4. **No POSIX compatibility.** Same as fish, elvish, and nushell, and unlike
+   zsh — your `.bashrc` does not port, and neither does any script you wrote.
+5. **No structured pipeline.** `ls | where size > 10mb` is nushell's, and mesh
    does not offer it. Bytes on the wire is a deliberate ceiling.
-5. **The two extra quoting rules** above: `word:identifier` and `'…'` escapes.
-6. **Portability.** bash is on every machine you ssh into. mesh is a shell you
+6. **The two extra quoting rules** above: `word:identifier` and `'…'` escapes.
+7. **Portability.** bash is on every machine you ssh into. mesh is a shell you
    install, and — as with fish and nushell — the remote end still has `sh`.
 
 ## Others in the family
 
-Beyond the three above, the same design space is worked by:
+Beyond the five above, the same design space is worked by:
 
 | Shell | The idea | Escaping stance |
 | --- | --- | --- |
-| **elvish** | Real values, byte pipes, and a functional core | Barewords take a restricted character set and there is **no backslash escape** outside quotes — you quote instead |
 | **PowerShell** | Objects on the pipe, .NET underneath | Backtick escapes; `'…'` is raw; globs are expanded by *cmdlets*, never for external programs, and native-argument passing needed a rewrite (`PSNativeCommandArgumentPassing`) to stop double-escaping |
-| **YSH** (Oils) | A new language that can still run your `sh` | Ends word splitting, adds `r'…'` / `u'…'` / `b'…'` string types |
 | **rc** (Plan 9) | The original clean break: real lists, no splitting | `'…'` only, doubled to escape itself; no backslash at all |
+
+**YSH** (Oils) belongs in the table above rather than this list — it is the
+other project attacking this problem from inside POSIX — and it is missing for
+a boring reason: everything on this page was measured against a shell built and
+run here, and YSH was the one that could not be. It is on
+[`TODO.md`](../TODO.md) to add once it can be, rather than described from
+recollection.
 
 mesh's closest relatives are elvish and rc on the value model, and fish on the
 day-to-day feel. The distinguishing bet is that a shell can have a real type
@@ -516,7 +823,48 @@ reimplemented coreutils, no structured pipeline to convert into and out of.
   clean break does not land for you, this is the shell that makes it.
 - Use **fish** for a safer interactive shell with a mature ecosystem, if you are
   happy writing scripts in a second language.
+- Use **elvish** if you want mesh's value model today, from a shell that has
+  been shipping for years, and you can live without string interpolation.
 - Use **nushell** when your work is mostly data wrangling and its builtins cover
   your tools.
 - **mesh** is for someone who wants fish's safety, real values in the language,
   and coreutils to stay first-class — and who is willing to be early.
+
+## TODO for this page
+
+Known gaps, kept here rather than in `TODO.md` because they are about the page
+rather than about the shell.
+
+- [ ] **Add YSH (Oils) to the tables.** It belongs here on merit — the other
+      project attacking this problem from inside POSIX — and is missing for a
+      boring reason: every cell on this page was measured against a shell built
+      and run locally, and YSH was the one that could not be. Neither
+      `oils.pub` nor `oilshell.org` was reachable from the sandbox this was
+      written in, and building from the repository needs the MyPy-translation
+      toolchain rather than a release tarball. zsh, fish, nushell, and elvish
+      were all built and run; YSH should get the same treatment rather than a
+      column of recollections. Worth checking when it lands: whether
+      `shopt --set ysh:all` ends word splitting as documented, how `r'…'` /
+      `u'…'` / `b'…'` line up against mesh's `r'…'`, whether unset variables
+      are an error, and what the pipeline carries.
+
+- [ ] **Decide whether the zsh case wants consolidating.** The argument for
+      preferring mesh over zsh is currently spread across three places — the
+      residuals under "zsh: the same machinery, better defaults", the tuning
+      subsection, and item 1 of "What mesh gives up". It reads fine in flow,
+      but a reader looking for "why not just use zsh" has to assemble it. The
+      deliberate omission is anything about zsh's maintenance — open bug
+      reports, test coverage, how patches are received — which is real, is part
+      of why mesh exists, and is not currently claimed anywhere on the page.
+      Whether to say it, and how neutrally, is a judgment call rather than a
+      fact to check.
+
+- [ ] **Reconsider the length.** The page is comfortably the longest in `docs/`.
+      "Implementation" is the most cuttable section if it starts to read as
+      padding — it supports the testability argument but is not load-bearing
+      for the quoting material that motivated the page.
+
+- [ ] **elvish's interactive surface is documented from source, not a session.**
+      Its hooks and completion API were read out of the module source, since a
+      non-interactive `elvish -c` does not load `$edit:`. Worth confirming
+      against a live session before anyone leans on those rows.
