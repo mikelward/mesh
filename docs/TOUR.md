@@ -1097,18 +1097,60 @@ mesh$ <strong>greet world</strong>
 hi, world
 </pre>
 
-The prompt is `prompt "text"`, and a `preprompt` hook makes it dynamic. Other
-hooks fire around each command and each finished job:
+## Hooks
+
+`on EVENT NAME FUNC` asks the shell to call a function of yours when something
+happens. `postcd` is the one to see it with — it runs after every directory
+change, in the new directory, and is handed the one you came from:
+
+<pre>
+mesh$ <strong>func arrived(previous) { puts "came from $previous" }</strong>
+mesh$ <strong>on postcd note arrived</strong>
+mesh$ <strong>cd src</strong>
+came from /home/you/project
+mesh$ <strong>cd ..</strong>
+came from /home/you/project/src
+</pre>
+
+`note` is the hook's **name**, not the function's, and that is what makes a
+config reloadable: registering `postcd note` again *replaces* that hook in place
+rather than adding a second one, so sourcing your `rc.mesh` twice does not give
+you two of everything. `on --remove postcd note` takes it off. Hooks are
+session-local and run in the order they were registered.
+
+<pre>
+mesh$ <strong>on --remove postcd note</strong>
+mesh$ <strong>cd src</strong>
+</pre>
+
+Seven events, each handed what it is about:
+
+| Event | Parameters | When |
+| --- | --- | --- |
+| `preprompt` | — | before each prompt is drawn |
+| `preexec` | `command` | just before an interactive command runs |
+| `postexec` | `command, status, elapsed` | after it, `elapsed` in milliseconds |
+| `precd` | `target` | before a directory change, still in the old one |
+| `postcd` | `previous` | after it, in the new one |
+| `jobdone` | `id, command, status` | when a background job is found finished |
+| `exit` | `status` | before the shell leaves, however the session ended |
+
+`preprompt` is the one a dynamic prompt hangs off, since `prompt "text"` on its
+own is fixed:
 
 ```mesh
 func refresh-prompt() { prompt "$(pwd)> " }
-on preprompt cwd refresh-prompt  # `cwd` names the hook, so it can be replaced
+on preprompt cwd refresh-prompt
 
 func command-finished(cmd, status, elapsed) {
   puts "$cmd exited $status after ${elapsed}ms"
 }
 on postexec log command-finished
 ```
+
+[`REFERENCE.md`](REFERENCE.md#custom-prompts-and-hooks) has the rest: what each
+event guarantees, and the `$sh.<event>` maps that hold the same registrations as
+values.
 
 Interactive decorations — bold input, the window title, the working-directory
 report, shell integration marks, the notification a slow command raises — are all
