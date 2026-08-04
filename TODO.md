@@ -4633,6 +4633,45 @@ lambdas" and §"Hooks and the prompt". Nothing here is implemented.
       need the renderer to pass the measured slack in, making `&fill("─")` a partial
       application, which mesh has nothing else like.
 
+## Beyond M3 — Lambda capture
+
+Decided in design discussion; see `docs/DESIGN.md` §"Calling for a value, and
+lambdas". Not implemented.
+
+- [ ] **A lambda captures the scope that defined it.** Today a lambda body's scope
+      parent is the *session*, so it sees session and global bindings but not the
+      function-locals beside it — `func f() { _n = 41; _g = func() { puts $_n }; $_g() }`
+      reports `_n: unbound variable` even called immediately in the same scope, which
+      makes lambdas and `_`-prefixed locals mutually unusable exactly where a lambda
+      earns its keep. This is mesh's **first closure**: a lambda outliving its
+      defining frame needs that frame's locals to outlive the call too — as live
+      bindings, or as a snapshot taken at capture, which is the open sub-question
+      below — so either way locals stop being a pure stack discipline. Do not pick
+      between the two here. Size the representation change before scheduling it. **The scope
+      invariant moves with it:** `docs/DESIGN.md` §"Variables and assignment" no
+      longer says there are exactly two scopes, because a captured lambda resolves
+      through its defining scope before the session and nested lambdas chain
+      further — build the rung as a parent link rather than a two-slot lookup.
+      Capture stays *lexical*: the scope that wrote the lambda, never the one that
+      calls it.
+  - [ ] **Sub-question — capture by binding or by value.** Reading a session
+        variable from a lambda is late today (`x = 1; g = func() { puts $x }; x = 2;
+        $g()` prints `2`), so capturing the *binding* keeps a captured local
+        consistent with that. Whether a captured local is **writable** through the
+        lambda follows from the same answer.
+  - **Not a sub-question — shadowing a captured local.** Listed as open in an
+        earlier revision; it is not. The no-shadow rule is *"no shadowing, at any
+        rung"*, and its "not local over session, not session over environment" is
+        an enumeration of the rungs that existed, not the extent of the ban. A
+        captured defining scope is a rung, so a lambda parameter may **not** shadow
+        a captured local — enforce it the same way, at the binding site.
+- [ ] **Restate the flag-value justification.** The decision that a flag's value is
+      captured at assignment rejected the late alternative as "a closure in
+      disguise, which mesh has nothing else like" (this file, under the typed-flag
+      thread). Lambda capture makes that false. The decision stands on the simpler
+      ground that a *value* should not carry unevaluated work — edit the entry to say
+      that instead, so the retired argument is not cited again.
+
 ## Loose ends
 
 Small items rescued from pull requests that were closed as superseded — the bulk
