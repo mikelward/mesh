@@ -18,6 +18,8 @@ This is a taste, not the spec. Where to go next:
   paste into a running shell.
 - [`REFERENCE.md`](REFERENCE.md) — what is *implemented* today, feature by
   feature, when you need the exact behavior rather than the shape of it.
+- [`COMPARISON.md`](COMPARISON.md) — mesh set against bash, fish, and nushell,
+  including what it gives up.
 
 In the examples, the mesh you'd type is in **bold**; the `# bash` lines are the
 old way, shown for contrast.
