@@ -184,12 +184,19 @@ isn't there. Asking for a missing element is a bug and says so; when absence is
 <pre>
 <strong>$xs[99]</strong>              # error — names the index; a missing element is a mistake
 <strong>$xs:get(99, "-")</strong>      # "-" — the total accessor, when absence is normal
+<strong>$config.timeout</strong>       # error — "no `timeout` in this map", not ""
+<strong>$env.EDITOR</strong>           # error — "$env.EDITOR: not set", not ""
+<strong>$env:get(EDITOR, vi)</strong>  # vi — the same opt-in, one shape for every lookup
 <strong>[a b] = $xs</strong>          # error if $xs isn't exactly two long
 <strong>if [a b] = $xs { }</strong>   # soft: a wrong shape just skips the block
 </pre>
 
-`gets()` returns `false` at end-of-input (not `""`), so `while gets line { … }`
-terminates cleanly, and a blank line is still a real `""`.
+An unset variable is the same: `$nope` is an error naming the name, never an
+empty word that quietly changes what a command sees.
+
+Reading input is the same story. `gets line` binds one whole line and reports
+**false** at end-of-input rather than `""`, so `while gets line { … }` ends
+cleanly and a blank line is still a real `""` you can act on.
 
 ## Jobs and the prompt are first-class
 

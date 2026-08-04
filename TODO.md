@@ -1873,6 +1873,17 @@ designed, and the cross-references say where the fuller note lives.
 - [x] `gets [var]`, reading descriptor 0 a byte at a time so it cannot swallow
       input belonging to the next command.
 
+- [ ] **`:match(/re/)` — capture groups as a list.** Not built:
+      `"one two":match(/(\w+) (\w+)/)` answers
+      `modifier :match arguments are not implemented yet`. It is the one headline
+      idiom `docs/INTRO.md` shows that does not run — `[one two] = $s:match(/…/)`
+      and `if [key val] = $line:match(/…/) { … }`, mesh's replacement for bash's
+      `[[ =~ ]]`-then-`$BASH_REMATCH` dance, which is exactly the shape the
+      strict/soft destructuring pair is built for. The `~` operator already tests
+      a regex and the replace family already takes a `/…/` **match slot**, so the
+      regex plumbing is in place; what is missing is returning the groups rather
+      than a boolean. Decide what a non-match yields (`false`, so `if [k v] =` is
+      the soft form) and whether group 0 leads the list.
 - [ ] **The spread of an argument-taking modifier at a command boundary.**
       `puts ...$x:split(":")` is still a syntax error. `CommandItem::Value` has
       no spread variant — `UnaryOp::Spread` is produced by the parser and
@@ -4340,6 +4351,44 @@ thing a reader takes on trust.*
 
 Small items rescued from pull requests that were closed as superseded — the bulk
 of each PR had landed by another route, but these pieces had not.
+
+- [ ] **A channel-2 error is loud on stderr and silent in the exit code.**
+      Found re-checking `docs/INTRO.md`'s "absence is loud" claims against the
+      built shell. Every strict/soft pair there holds — `$xs[99]` names the
+      index, `$config.k` says "no `k` in this map", `$env.K` says "not set", a
+      mismatched `[a b] = $xs` is refused, and each has its soft twin — but the
+      error does not carry past the statement it happened in:
+
+      ```
+      $ mesh -c 'xs = [a b]; puts $xs[99]; true'
+      mesh: $xs[99]: list index out of range
+      $ echo $?
+      0
+      ```
+
+      The statement's own status is `1`, and a script whose *last* statement is
+      the failure does exit `1`, so this is not invisible — but any later
+      successful command masks it, and the statements after the error all run.
+      `DESIGN.md` §"Recovery" gives the non-interactive case the opposite rule:
+      an uncaught error "exits nonzero (the batch contract), so automation still
+      fails hard", and the `source` bullet spells out that "subsequent
+      deploy/mutation commands do *not* run". Interactive containment (abort the
+      line, keep the session) is what is built; the batch half is not.
+
+      Not `errexit` — `DESIGN.md` rules that out explicitly, and a *failed
+      command* keeping the script alive is correct. What is missing is the
+      distinction between a command reporting failure and the shell refusing
+      invalid input: only the second should abort a non-interactive run. That
+      needs the error to propagate out of the statement, which the fork-crossing
+      item above needs as well, so the two want one channel between them.
+
+- [ ] **`docs/INTRO.md` writes `gets()` in the value-call form, which is not
+      built.** Also from the same sweep. The prose has been narrowed to the
+      command form (`gets line`, which is what exists and does report false at
+      end-of-input), so nothing in the docs is wrong today. It stays here as the
+      reason the sentence is phrased the way it is: `while line = gets() { … }`
+      is the shape that composes, and it waits on the value-call route in
+      *Beyond M3 — Modifier arguments and `gets`* above.
 
 - [ ] **Control flow raised inside a deferred stage never reaches the parent.**
       A stage carrying a value expands in its **own fork** — that is what keeps a
