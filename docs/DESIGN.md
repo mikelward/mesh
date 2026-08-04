@@ -175,7 +175,7 @@ There are four kinds of modifier, and the difference matters:
 - **Value modifiers** (path and string — `:stem`, `:dir`, `:stripend`, …) transform
   a value, and **map over a list** automatically (applied to each element).
 - **Collection modifiers** (`:len :first :last :rest :init :keys :values
-  :has :get :join :dedup`) consume a list or map **as a whole** — they do *not* map element-wise
+  :has :get :join :dedup :prepend :append :extend`) consume a list or map **as a whole** — they do *not* map element-wise
   — and return either a scalar (`:len` → int, `:join` → one byte-string) or a
   derived collection (`:rest`, `:keys`, `:dedup`). This is the category that answers "how
   long," "the last one," and "flatten to a string." `:join(SEP)` is the fold
@@ -2404,6 +2404,41 @@ This is the **one place the shell flattens by type rather than by an explicit
 `...`** — confined to the `+=` right-hand side, type-directed not
 whitespace-directed, so it does not reintroduce word-splitting.
 
+**`:prepend(e)` / `:append(e)` / `:extend(ys)`** are the **pure** counterparts of
+`+=` — the list builds above written as a chain. Each returns a *new* list rather
+than writing one, so they compose where a statement cannot:
+
+```
+$env.PATH = $env.PATH:prepend(/opt/bin):dedup
+xs = $xs:append($ys)      # [...$xs $ys]   — one element, $ys nested whole
+xs = $xs:extend($ys)      # [...$xs ...$ys] — $ys's own elements
+```
+
+**None of them reads its argument by type.** `:append` adds exactly one element
+whatever it is, and `:extend` adds a list's elements; which one you meant is in
+the **name**, decided at the call site rather than inferred from the value's
+shape. That is the point of having three: `+=` dispatches on the right-hand type
+because a statement has only one spelling to work with, and that dispatch is
+deliberately **the one place the shell flattens by type rather than by an
+explicit `...`** — a second one here would cost the rule its meaning. So
+`:extend` requires a list and says so, naming `:append` when it is handed
+something else.
+
+`:prepend` and `:append` are named for the end they add to rather than `:add`,
+since a list has two of them and a name that does not say which is a coin toss at
+the call site. `:extend` has no front-loading twin: `[...$ys ...$xs]` is the
+spelling for that, and a name for it would be worse than the spread it replaces.
+All three are **lists only** — a map has no front or back to add to (its `+=` is
+a *merge*, a different operation under a name that would not say so), and a
+string has `+=` and interpolation already. The element is **stored rather than
+read as text**, so a styled value keeps its attributes in the list, as it does in
+the `[...$xs $e]` build these are the chain spelling of.
+
+*(TODO: a **`:remove(e)`** to match, the pure counterpart of the proposed `-=` —
+`$env.PATH:remove(/usr/games):dedup` — waiting on the same open questions the
+`-=` note below raises: first match or every match, and what a list argument
+means.)*
+
 *(TODO: consider a symmetric **`-=`** that removes an element — `$hosts -= web3`
 deleting the matching element, mirroring how `+=` appends one. Open: remove the
 first match or every match; equality by value; whether the right-hand type
@@ -2411,14 +2446,6 @@ dispatches like `+=` (a list RHS removing each of its elements → set-differenc
 a scalar removing one), and what a map LHS means (`-= key` dropping that entry,
 overlapping with `unset $m.key`). Note this is a value-level remove-by-content,
 distinct from `unset $xs[i]`, which deletes by index.)*
-
-*(TODO: consider modifier-form **`:add`** / **`:remove`** (or similar names) as
-the **pure** counterparts to the mutating `+=` / `-=` — `$xs:add(e)` returning a
-new list with `e` appended and `$xs:remove(e)` returning one with the matching
-element gone, so they compose in a modifier chain (`$env.PATH:remove(/usr/games):dedup`)
-and read as expressions rather than statements. Open: the exact names, whether
-they mirror `+=`'s type-directed dispatch, and how they line up with the existing
-`:map` / `:filter` transforms.)*
 
 ### Maps (associative arrays)
 

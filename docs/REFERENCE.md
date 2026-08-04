@@ -2005,6 +2005,7 @@ out, which is what makes the guarded-PATH idioms work:
 ```mesh
 $env.PATH += /opt/bin         # append one entry
 $env.PATH = $env.PATH:dedup   # drop duplicates
+$env.PATH = $env.PATH:prepend(/opt/bin):dedup   # both, in one statement
 puts $env.PATH[0]
 puts $env.PATH:len
 ```
@@ -2216,6 +2217,8 @@ a different failure from an unknown name, which never parses.
 | `:join(SEP)` | list | Fold the list into a string, `SEP` between elements. |
 | `:get(KEY, DEFAULT)` | map or list | **Total** access — `DEFAULT` when the key or index is absent. |
 | `:has(VALUE)` | map or list | Membership, as a boolean — a map is asked about a **key**, a list about a value. |
+| `:prepend(VALUE)` / `:append(VALUE)` | list | A new list with `VALUE` added at the front / the back as **one element**, whatever it is. |
+| `:extend(LIST)` | list | A new list with `LIST`'s **elements** added at the back. Requires a list. |
 | `:stripstart(P)` / `:stripend(S)` | string or list | Drop the affix once if it is there; a no-op otherwise. |
 | `:trimstart` / `:trimend` | string or list | Peel whitespace from that end, repeatedly. |
 | `:trimstart(CHARS)` / `:trimend(CHARS)` | string or list | Peel any of `CHARS` from that end, repeatedly. |
@@ -2245,6 +2248,35 @@ no real path to report rather than a `false` to give.
 Note that a searchable directory carries the execute bit, so `:exec` alone keeps
 directories; `:f:x` is the executable-files idiom. List results retain their type: use `...$xs:rest` in command position,
 or bind them directly with `ys = $xs:rest`.
+
+`:prepend`, `:append`, and `:extend` are the **pure** counterparts of `+=`: they
+return a new list rather than writing one, so they compose in a chain where a
+statement cannot.
+
+```mesh
+xs = [b c]
+ys = [d e]
+puts $xs:prepend(a):join(" ")      # a b c
+puts $xs:append($ys):len           # 3        — one element; $ys nested whole
+puts $xs:extend($ys):join(" ")     # b c d e  — $ys's own elements
+puts $xs:join(" ")                 # b c      — the subject is untouched
+```
+
+**None of them reads its argument by type.** `:append` adds exactly one element
+whatever it is; `:extend` adds a list's elements and errors on anything else,
+naming `:append` when it does. Which you meant is in the name, decided where you
+write it rather than inferred from the value's shape — `+=` dispatches on the
+right-hand type instead, and that is the one place mesh flattens by type rather
+than by an explicit `...`.
+
+`:extend` has no front-loading twin; `[...$ys ...$xs]` is the spelling for that.
+All three are lists only: a map has no front or back to add to (its `+=` is a
+merge), and a string already has `+=` and interpolation. The payoff is the
+guarded PATH in one statement, where the mutating form needs two:
+
+```mesh
+$env.PATH = $env.PATH:prepend(/opt/bin):dedup
+```
 
 `:repr` is the odd one out: rather than transforming a value it **writes one
 down**, as the mesh source you would have typed to get it back.

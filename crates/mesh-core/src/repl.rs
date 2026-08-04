@@ -4876,6 +4876,21 @@ fn eval_modifier_with_arguments(
             };
             expand::has_value(value, needle).map_err(runtime_message)
         }
+        // The list builders. `:prepend` / `:append` add one element, `:extend` a
+        // list's own — the distinction `+=` makes by reading its right-hand type,
+        // made by name instead. Which subjects and arguments they take is
+        // `expand`'s to say, as above.
+        "prepend" | "append" | "extend" => {
+            let Some([item]) = value_arguments(name, arguments, last, in_function, shell)? else {
+                return Ok(control_placeholder());
+            };
+            let result = match name {
+                "prepend" => expand::prepend_value(value, item),
+                "append" => expand::append_value(value, item),
+                _ => expand::extend_value(value, item),
+            };
+            result.map_err(runtime_message)
+        }
         // The affix family. `:stripstart` / `:stripend` drop a literal affix once
         // if it is there and are a no-op otherwise, and the char-set spellings of
         // `:trimstart` / `:trimend` peel the given characters repeatedly — the

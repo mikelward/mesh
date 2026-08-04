@@ -484,6 +484,7 @@ mesh$ <strong>$env.PATH += /opt/bin</strong>
 mesh$ <strong>puts $env.PATH:last</strong>
 /opt/bin
 mesh$ <strong>$env.PATH = $env.PATH:dedup</strong>
+mesh$ <strong>$env.PATH = $env.PATH:prepend(/usr/local/bin):dedup</strong>
 </pre>
 
 Only strings cross into the environment, so a list or map has to be joined
@@ -611,6 +612,21 @@ mesh$ <strong>puts $xs:len $xs:first $xs:last</strong>
 mesh$ <strong>puts ...$xs:rest:init:dedup</strong>
 two
 </pre>
+
+`:prepend(e)` and `:append(e)` add one element at either end, and `:extend(ys)`
+adds a list's own elements. All three return a new list rather than writing one —
+the pure form of `+=`, which is what lets them chain:
+
+<pre>
+mesh$ <strong>puts $xs:append(four):last</strong>
+four
+mesh$ <strong>$env.PATH = $env.PATH:prepend(/opt/bin):dedup</strong>
+</pre>
+
+The name says which addition you meant, so neither reads its argument's type:
+`$xs:append($ys)` adds `$ys` as one element and `$xs:extend($ys)` adds its
+elements. (`+=` decides that from the right-hand type instead, which is the one
+place mesh flattens by type rather than by an explicit `...`.)
 
 A list-returning modifier remains a real list, so spread it with `...` in
 command arguments or assign it intact (`ys = $xs:rest`). Path and case

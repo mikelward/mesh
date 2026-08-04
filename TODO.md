@@ -1967,6 +1967,29 @@ designed, and the cross-references say where the fuller note lives.
       the modifier cannot disagree. A wrong-type needle or subject is a loud
       error rather than a quiet `false`, matching `:get`.
 
+- [x] **`:prepend(VALUE)` / `:append(VALUE)` / `:extend(LIST)`** *(landed)* — the
+      **pure** counterparts of `+=`, so the guarded PATH is one statement:
+      `$env.PATH = $env.PATH:prepend(/opt/bin):dedup`. **None reads its argument
+      by type**: `:append` adds one element whatever it is, `:extend` adds a
+      list's elements and errors on anything else (naming `:append` when it
+      does). Which was meant is in the name, decided at the call site — `+=`
+      dispatches on the right-hand type because a statement has one spelling to
+      work with, and `DESIGN.md` keeps that as the *only* place the shell
+      flattens by type rather than by an explicit `...`. A first draft did mirror
+      `+=`'s dispatch here and quietly made a second such place; the split names
+      are the fix (raised in review). Named for the end rather than `DESIGN.md`'s
+      provisional `:add`, since a list has two ends and a name that does not say
+      which is a coin toss at the call site. Lists only — a map's `+=` is a
+      *merge*, which no name here would say. The element is stored rather than
+      read as text, so a styled value keeps its attributes (pinned on the pty,
+      the one place that is visible).
+  - [ ] **No front-loading `:extend`.** `[...$ys ...$xs]` is the spelling, on
+        the view that a name for it would be worse than the spread it replaces.
+        Revisit if the build shows up often enough to want one.
+  - [ ] **`:remove(VALUE)`** to match, once `DESIGN.md` settles the `-=`
+        questions it shares: first match or every match, and what a list
+        argument means.
+
 - [x] **`postfix` consumes a *spaced* call suffix, so a following group is
       stolen** *(landed — narrowed to `Expr::Modifier`, so `f (1)` still calls
       `f` and the language decision this was blocked on was not needed)*. `y = $x:upper (1)` reports "modifier :upper does not take
