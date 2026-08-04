@@ -1,7 +1,7 @@
 # Roadmap
 
 The implementation plan, as milestones. This is the build track that runs **in
-parallel with** the language design in [`DESIGN.md`](DESIGN.md): the design
+parallel with** the language design in [`docs/DESIGN.md`](docs/DESIGN.md): the design
 settles *what* mesh should be; the milestones below get a working shell in front
 of the keyboard as early as possible and grow it toward that design.
 

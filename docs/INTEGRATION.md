@@ -84,7 +84,7 @@ is a fork in the road, and it should be taken deliberately.
 
 1. **Let generated code in.** Add `source -` (or a `run TEXT` builtin) so
    `atuin init mesh | source` works, exactly as
-   [`DESIGN.md`](../DESIGN.md#conditionals-if-is-an-expression) already sketches
+   [`DESIGN.md`](DESIGN.md#conditionals-if-is-an-expression) already sketches
    it. Cheapest to build, and it is the world's convention. The cost is that a
    mesh session's behavior is then defined by a string another program printed,
    which is the mechanism behind every "my prompt broke after an upgrade"
@@ -443,7 +443,7 @@ Two questions had to be answered to get there, and the second answers the first.
 
 **How a removal is spelled: `unset $env[$name]`.** It is the verb the language
 already has, so nothing new is invented. In particular there is no sentinel
-*value* meaning "remove" — mesh has [no null](../DESIGN.md), that rule is
+*value* meaning "remove" — mesh has [no null](DESIGN.md), that rule is
 load-bearing rather than incidental, and inventing a `none` to carry one tool's
 wire convention would pay a language-wide cost for an integration.
 

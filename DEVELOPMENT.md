@@ -1,7 +1,7 @@
 # Development
 
 How to build, test, and lay out the mesh implementation. For *what* mesh is and
-the language design, see [`DESIGN.md`](DESIGN.md); for the milestone plan, see
+the language design, see [`docs/DESIGN.md`](docs/DESIGN.md); for the milestone plan, see
 [`ROADMAP.md`](ROADMAP.md).
 
 [`GRAMMAR.md`](GRAMMAR.md) is the grammar the implementation accepts today —
@@ -231,12 +231,12 @@ mesh/
 │   └── mesh-platform/      # libc constants/types that differ across platforms
 │       ├── Cargo.toml
 │       └── src/lib.rs      # e.g. TIOCSCTTY, typed for libc::ioctl per platform
-├── DESIGN.md               # vision + language design (the "why/what")
 ├── DEVELOPMENT.md          # this file (the "how to build")
 ├── GRAMMAR.md              # the grammar the parser accepts today (EBNF + precedence)
 ├── ROADMAP.md              # milestones M0 → beyond
 ├── TODO.md                 # current-milestone checklist
-└── docs/                   # TOUR.md, REFERENCE.md (implemented), INTRO/PROMPT (design),
+└── docs/                   # DESIGN.md (vision + language design, the "why/what"),
+                            # TOUR.md, REFERENCE.md (implemented), INTRO/PROMPT (design),
                             # INTEGRATION.md (external tools)
 ```
 

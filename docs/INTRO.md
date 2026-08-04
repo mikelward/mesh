@@ -7,7 +7,7 @@ Pipes still carry **bytes** — every external program and coreutil works exactl
 elsewhere — but *inside* the shell you get **real values**: lists, maps, and
 type-directed operations, with no word-splitting footguns.
 
-This is a taste, not the spec — see [`DESIGN.md`](../DESIGN.md) for the full design
+This is a taste, not the spec — see [`DESIGN.md`](DESIGN.md) for the full design
 and the rationale behind each choice. In the examples, the mesh you'd type is in
 **bold**; the `# bash` lines are the old way, shown for contrast.
 

@@ -341,7 +341,7 @@ Delete an entry once you have agreed with it or reversed it.
         guards, statement position, and expression results.
   - [x] Add loop-control regression coverage for nested loops and for `break` /
         `continue` reached through nested `if` and function calls.
-  - [x] Audit the M3 acceptance examples in [`DESIGN.md`](DESIGN.md) and
+  - [x] Audit the M3 acceptance examples in [`docs/DESIGN.md`](docs/DESIGN.md) and
         [`docs/INTRO.md`](docs/INTRO.md): add end-to-end coverage for examples
         that are in scope, inventory dependencies that remain, and update the
         milestone documentation without silently weakening its acceptance bar.
@@ -5633,7 +5633,7 @@ a one-line edit. Every claim below was checked against the built shell.
       placeholder spelling with the bracket question above, since a `{}` hole in a
       format string and a `{…}` interpolation would want to agree.
 - [ ] **Regex literal + absolute-path rule** *(direction chosen — see the block in
-      [`DESIGN.md`](DESIGN.md) "Quoting and escaping")*. **Keep `/…/`** as the regex
+      [`docs/DESIGN.md`](docs/DESIGN.md) "Quoting and escaping")*. **Keep `/…/`** as the regex
       literal; in a match slot a leading-slash word is a regex only when it is a clean
       `/BODY/` (closing `/` final, no unescaped interior `/`), otherwise it is a
       path/glob — so absolute globs/paths go bare, no `glob("…")` wrapper. Known
@@ -5663,7 +5663,7 @@ a one-line edit. Every claim below was checked against the built shell.
         bytes to a command; an unquoted delimiter would expand). A raw,
         *value-producing* heredoc spelling still needs defining.
 - [ ] **Arithmetic operators** *(direction chosen — see the "Arithmetic" section in
-      [`DESIGN.md`](DESIGN.md))*. mesh has `Value::Integer` (i64, already checked —
+      [`docs/DESIGN.md`](docs/DESIGN.md))*. mesh has `Value::Integer` (i64, already checked —
       `+=` past `i64::MAX` is a loud `numeric overflow`) but no operator beyond
       `+=`, while `DESIGN.md` wrote infix arithmetic in three places before ever
       specifying it: `$m:int + 1` (`:replaceall` callback), `port: $base + 1`
