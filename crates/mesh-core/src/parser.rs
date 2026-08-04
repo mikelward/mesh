@@ -6669,6 +6669,9 @@ pub(crate) fn modifier_requires_arguments(name: &str) -> bool {
             | "each"
             | "get"
             | "has"
+            | "prepend"
+            | "append"
+            | "extend"
             | "stripstart"
             | "stripend"
             | "replaceall"
@@ -6687,6 +6690,7 @@ fn modifier_accepts_arguments(name: &str) -> bool {
 const MODIFIER_NAMES: &[&str] = &[
     "add",
     "ancestors",
+    "append",
     "atime",
     "bare",
     "base",
@@ -6703,6 +6707,7 @@ const MODIFIER_NAMES: &[&str] = &[
     "exec",
     "exists",
     "ext",
+    "extend",
     "extended",
     "exts",
     "f",
@@ -6741,6 +6746,7 @@ const MODIFIER_NAMES: &[&str] = &[
     "num",
     "old",
     "parents",
+    "prepend",
     "quotemeta",
     "raw",
     "read",

@@ -1793,6 +1793,63 @@ pub(crate) fn has_value(value: Value, needle: Value) -> Result<Value, ExpandErro
     }
 }
 
+/// `:prepend(VALUE)` — a new list with `VALUE` at the front, the modifier spelling
+/// of the `[e ...$xs]` build (`DESIGN.md` §"Arrays / lists").
+pub(crate) fn prepend_value(value: Value, item: Value) -> Result<Value, ExpandError> {
+    let mut elements = list_subject("prepend", value)?;
+    elements.insert(0, item);
+    Ok(Value::List(elements))
+}
+
+/// `:append(VALUE)` — the same at the back: `[...$xs e]`.
+pub(crate) fn append_value(value: Value, item: Value) -> Result<Value, ExpandError> {
+    let mut elements = list_subject("append", value)?;
+    elements.push(item);
+    Ok(Value::List(elements))
+}
+
+/// `:extend(LIST)` — `LIST`'s elements at the back, where [`append_value`] adds
+/// its argument as one.
+///
+/// Having both is what lets neither read its argument by type: which was meant is
+/// in the name, so a non-list here is a mistake to report rather than a shape to
+/// accommodate. `+=` dispatches instead, and `DESIGN.md` keeps that as the one
+/// place the shell flattens by type rather than by an explicit `...`.
+pub(crate) fn extend_value(value: Value, items: Value) -> Result<Value, ExpandError> {
+    let mut elements = list_subject("extend", value)?;
+    // Flattened before the test so the diagnostic says what the subject's does: a
+    // styled value is rendering-only, and naming the wrapper would leak how it is
+    // stored. Identity on the accepting path — `plain()` only unwraps a styled one.
+    let items = match items.plain() {
+        Value::List(items) => items,
+        other => {
+            return Err(ExpandError::Modifier {
+                name: "extend".into(),
+                message: format!(
+                    "requires a list argument, got {}; `:append` adds one element",
+                    value_kind(&other)
+                ),
+            });
+        }
+    };
+    elements.extend(items);
+    Ok(Value::List(elements))
+}
+
+/// The subject's elements, or the error naming what arrived.
+///
+/// Lists only: a map's `+=` is a *merge*, which no name here would say, and a
+/// string has `+=` and interpolation already.
+fn list_subject(name: &str, value: Value) -> Result<Vec<Value>, ExpandError> {
+    match value.plain() {
+        Value::List(elements) => Ok(elements),
+        other => Err(ExpandError::Modifier {
+            name: name.into(),
+            message: format!("requires a list, got {}", value_kind(&other)),
+        }),
+    }
+}
+
 /// The word a diagnostic uses for a value's type. Local to the modifiers here so
 /// they can name what they were handed without reaching into the runtime.
 pub(crate) fn value_kind(value: &Value) -> &'static str {

@@ -53,19 +53,23 @@ Use `$config.key` for identifier keys and `${config[$name]}` for a computed key.
 representation for the whole value.
 
 `$PATH` is a **list**, not a colon-string, so the `IFS=:` juggling disappears.
-To **prepend** (bash's `PATH="/opt/bin:$PATH"` — new dir wins), build the list with
-it first; `:dedup` drops any later duplicate, keeping the first:
+To **prepend** (bash's `PATH="/opt/bin:$PATH"` — new dir wins), say so; `:dedup`
+drops any later duplicate, keeping the first:
 
 <pre>
 # bash — prepend /opt/bin
 export PATH="/opt/bin:$PATH"
 
-# mesh — spread the old list after the new dir, then dedup (keep-first)
-<strong>$env.PATH = [/opt/bin ...$env.PATH]:dedup</strong>
+# mesh — add at the front, then dedup (keep-first)
+<strong>$env.PATH = $env.PATH:prepend(/opt/bin):dedup</strong>
 </pre>
 
-To **append** instead (existing entries win), that's exactly what `+=` is:
-`$env.PATH += /opt/bin`.
+`:prepend` and `:append` return a new list rather than writing one, which is why
+they chain like that — and why the result has to be assigned back;
+`[/opt/bin ...$env.PATH]:dedup` builds the same list the long way. To **append**
+instead (existing entries win), `$env.PATH = $env.PATH:append(/opt/bin)`, or the
+mutating `$env.PATH += /opt/bin`. Each adds one entry; `:extend` takes a list and
+adds its elements.
 
 ## Modifiers instead of subshell-and-sed gymnastics
 

@@ -3470,6 +3470,9 @@ fn both_spellings_of_a_modifier_chain_agree() {
         "first",
         "last",
         "dedup",
+        "prepend",
+        "append",
+        "extend",
     ];
     for (binding, name) in [
         ("r = re(a)", "r"),
@@ -6415,6 +6418,40 @@ fn style_harness(exec: &MeshExec) -> i32 {
     if status != 0 || occurrences(&seen, b"\x1b[31m") != 0 || occurrences(&seen, b"danger") == 0 {
         return 230;
     }
+    // `:append` **stores** its argument rather than reading it as text, so a styled
+    // element survives into the list and renders there — it is the modifier
+    // spelling of `[...$xs $r]`, which keeps the attributes too. `+=` is the
+    // deliberate contrast below: appending there is defined as a text operation.
+    for line in [
+        b"xs = [plain]\n".as_slice(),
+        b"ys = $xs:append($r)\n".as_slice(),
+    ] {
+        if !pty_write(shell.master, line) || pty_read_until_command_done(shell.master).is_none() {
+            return 231;
+        }
+    }
+    if !pty_write(shell.master, b"puts $ys\n") {
+        return 232;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 233;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b[31mdanger\x1b[0m") == 0 {
+        return 234;
+    }
+    if !pty_write(shell.master, b"xs += $r\n")
+        || pty_read_until_command_done(shell.master).is_none()
+        || !pty_write(shell.master, b"puts $xs\n")
+    {
+        return 235;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 236;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b[31m") != 0 || occurrences(&seen, b"danger") == 0 {
+        return 237;
+    }
+
     // A pipe means this stage's stdout is not the terminal, so the text goes
     // through plain even though the shell's own stdout is one.
     if !pty_write(shell.master, b"puts $r | cat\n") {
@@ -25439,6 +25476,151 @@ puts $m:has($k)
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// `:prepend(VALUE)` / `:append(VALUE)` — a new list with the value at that end.
+///
+/// Being **pure** is what they are for: the guarded PATH is one statement,
+/// `$env.PATH = $env.PATH:prepend(/opt/bin):dedup`, where the mutating `+=` needs a
+/// second one to dedup what it just wrote.
+#[test]
+fn prepend_and_append_add_one_element_at_either_end_of_a_new_list() {
+    let out = run_with_input(
+        r#"xs = [b c]
+puts $xs:prepend(a):join(" ")
+puts $xs:append(d):join(" ")
+puts $xs:join(" ")
+empty = []
+puts $empty:prepend(only):join(" ")
+n = [1]
+puts $n:append(2):join(",")
+$env.PATH = [/usr/bin /opt/bin]
+$env.PATH = $env.PATH:prepend(/opt/bin):dedup
+puts $env.PATH:join(":")
+"#,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The subject is untouched between the two calls — that is the "pure" claim.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a b c\nb c d\nb c\nonly\n1,2\n/opt/bin:/usr/bin\n"
+    );
+}
+
+/// The **name** says which of the two additions is meant, so neither has to read
+/// its argument's type: `:append` adds one element whatever it is, `:extend` adds a
+/// list's own. That is why they can be spelled without `+=`'s type-directed
+/// dispatch, which `DESIGN.md` keeps as the *one* place the shell flattens by type
+/// rather than by an explicit `...` — pinned here against `+=` itself, which still
+/// does dispatch.
+#[test]
+fn append_adds_one_element_where_extend_adds_a_lists_own() {
+    let out = run_with_input(
+        r#"xs = [b c]
+ys = [d e]
+puts $xs:append($ys):len
+puts $xs:append($ys):last:join("-")
+puts $xs:extend($ys):join(" ")
+puts $xs:extend($ys):len
+puts $xs:prepend($ys):first:join("-")
+puts $xs:join(" ")
+# `+=` still dispatches on the right-hand type, which is what the two names
+# replace: one statement extends where the other nests.
+grew = [b c]
+grew += $ys
+puts $grew:join(" ")
+nested = [b c]
+nested += [$ys]
+puts $nested:len
+"#,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3\nd-e\nb c d e\n4\nd-e\nb c\nb c d e\n3\n"
+    );
+}
+
+/// `:extend` takes a **list** and says so: the pair exists precisely so that
+/// neither modifier has to guess, which makes a scalar argument here a mistake to
+/// report rather than a shape to accommodate. The diagnostic names the modifier
+/// that does want one element.
+#[test]
+fn extend_refuses_an_argument_that_is_not_a_list() {
+    for (source, expected) in [
+        (
+            "xs = [a]\nputs $xs:extend(b)\n",
+            ":extend: requires a list argument, got a string; `:append` adds one element",
+        ),
+        (
+            "xs = [a]\nputs $xs:extend([k: v])\n",
+            ":extend: requires a list argument, got a map; `:append` adds one element",
+        ),
+        // A styled value is rendering-only, so it is named as the string it is —
+        // the subject path already answers that way, and one feature must not
+        // describe the same value two ways. Raised in review.
+        (
+            "xs = [a]\nputs $xs:extend(style(x, fg: red))\n",
+            ":extend: requires a list argument, got a string",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(stderr.contains(expected), "{source} said {stderr}");
+    }
+}
+
+/// Lists only, and the diagnostic names what arrived. A map has no front or back to
+/// add to — its `+=` is a merge, which is a different operation under a name that
+/// would not say so — and a string has `+=` and interpolation already.
+#[test]
+fn the_list_building_modifiers_refuse_a_subject_that_is_not_a_list() {
+    for (source, expected) in [
+        (
+            "m = [k: v]\nputs $m:append(x)\n",
+            ":append: requires a list, got a map",
+        ),
+        (
+            "s = abc\nputs $s:prepend(x)\n",
+            ":prepend: requires a list, got a string",
+        ),
+        (
+            "n = 1\nputs $n:append(2)\n",
+            ":append: requires a list, got an integer",
+        ),
+        (
+            "s = abc\nputs $s:extend([x])\n",
+            ":extend: requires a list, got a string",
+        ),
+        // The argument list is the modifier's own, so its arity is reported before
+        // any value reaches the list.
+        (
+            "xs = [a]\nputs $xs:append(a, b)\n",
+            "modifier :append takes exactly 1 argument, got 2",
+        ),
+        (
+            "xs = [a]\nputs $xs:prepend\n",
+            "modifier :prepend requires an argument",
+        ),
+        (
+            "xs = [a]\nputs $xs:extend\n",
+            "modifier :extend requires an argument",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(stderr.contains(expected), "{source} said {stderr}");
+    }
 }
 
 /// A bare `$env` is a map whose path-type entries are lists, so `puts $env` meets
