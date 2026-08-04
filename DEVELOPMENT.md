@@ -136,10 +136,25 @@ Two layers, both run by `cargo test --workspace`:
   assert on stdout, stderr, and the exit code.
 
 ```sh
-cargo test --workspace          # everything
-cargo test -p mesh --test cli   # just the end-to-end (integration) tests
-cargo test -p mesh --test docs  # just the documentation examples
+cargo test --workspace                 # everything
+cargo test -p mesh --test cli          # just the end-to-end (integration) tests
+cargo test -p mesh --test docs         # just the documentation examples
+cargo test -p mesh --test transcripts  # run the documentation transcripts
 ```
+
+The last two are how the docs are kept honest, and they divide the work.
+`docs` parses every example with `mesh -n`, so a construct that was renamed
+fails here rather than in a reader's terminal. `transcripts` **runs** every
+`<pre>` transcript — each block in the session its own file built ahead of it —
+and compares the `mesh:` lines the shell produces against the ones the block
+shows. Output itself is not compared: a transcript names the author's home
+directory, the programs on their `PATH`, and a pid, none of which a test host
+has. What is reproducible is whether mesh objects, and an example that quietly
+stopped working objects where the doc promises a result.
+
+A block that cannot run — one that waits on a background job, or asks about the
+host — says so in the prose above it, as `<!-- no-run: reason -->`. A test
+bounds how many may do that.
 
 Two suites sit outside `cargo`, both run by CI alongside the Rust tests and both
 by `make test`. `session_start_hook_test.sh` covers
