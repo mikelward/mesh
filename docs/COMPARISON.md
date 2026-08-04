@@ -365,14 +365,18 @@ spell a newline.
 
 | | bash | zsh | fish | mesh | elvish | nushell |
 | --- | --- | --- | --- | --- | --- | --- |
-| Interpolating + escapes | `"…"`, `$'…'` | `"…"`, `$'…'` | `"…"` (few escapes) | `"…"` | — | `$"…"` |
-| Literal, with escapes | — | — | — | `'…'` | `"…"` | — |
+| Interpolating + escapes | — | — | — | `"…"` | — | `$"…"` |
+| Interpolating only | `"…"` | `"…"` | `"…"` (few escapes) | — | — | — |
+| Escapes only | `$'…'` | `$'…'` | — | `'…'` | `"…"` | — |
 | Fully raw | `'…'` | `'…'` | `'…'` (bar `\'`, `\\`) | `r'…'` / `r"…"` | `'…'` | `'…'`, `r#'…'#` |
 | Both quote kinds, no escaping | heredoc | heredoc | heredoc-ish | `<< 'END'` heredoc | — | `r#'…'#` |
 
-mesh's four forms answer four questions with no overlap: interpolate or not,
-escape or not. bash needs `$'…'` because `"…"` under-delivers; nushell needs
-`$"…"` because `"…"` under-delivers the other way.
+The top row is the surprising one: **only mesh and nushell can spell
+interpolate-and-escape at all.** bash and zsh have the two halves in separate
+forms — `"…"` interpolates but leaves `\n` as backslash-n, and `$'…'` reads the
+escape but not the variable (`x=foo; echo $'$x'` prints `$x`) — so wanting both
+in one string means concatenating two of them. That is the gap `$"…"` fills in
+nushell, and the reason mesh's `'…'` and `"…"` differ on exactly one axis.
 
 elvish is the odd one: it has **no interpolating string at all**. `"hi $n"`
 prints `hi $n` literally, and you concatenate instead — `"hi "$n`, since
