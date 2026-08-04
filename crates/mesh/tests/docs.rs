@@ -122,16 +122,25 @@ fn strip_emphasis(text: &str) -> String {
     text.replace("<strong>", "").replace("</strong>", "")
 }
 
-/// The typed part of a transcript line: `mesh$ ` opens a unit and `...`
+/// The default prompt a transcript opens each command with.
+const PROMPT: &str = "mesh$ ";
+
+/// The continuation indicator drawn under it: one dot per printable column of
+/// the prompt, less its trailing space, then a space of its own — what
+/// `mesh-core`'s `continuation_indicator` renders, so the dots line up under the
+/// prompt and the docs show what the shell does.
+const CONTINUATION: &str = ".....";
+
+/// The typed part of a transcript line: `mesh$ ` opens a unit and `.....`
 /// continues the one above it. A line with neither prefix is output.
 fn transcript_line(line: &str) -> Option<(bool, String)> {
-    if let Some(rest) = line.strip_prefix("mesh$ ") {
+    if let Some(rest) = line.strip_prefix(PROMPT) {
         return Some((true, unescape(&strip_emphasis(rest))));
     }
-    // Only the prompt and its single separating space come off, so the
+    // Only the indicator and its single separating space come off, so the
     // continuation keeps the indentation it is written with and a failure shows
     // the construct as the doc has it.
-    let rest = line.strip_prefix("...")?;
+    let rest = line.strip_prefix(CONTINUATION)?;
     let rest = rest.strip_prefix(' ').unwrap_or(rest);
     Some((false, unescape(&strip_emphasis(rest))))
 }
@@ -202,7 +211,7 @@ fn examples_in(text: &str, path: &Path) -> Vec<Example> {
             }
             index += 1;
 
-            if body.iter().any(|line| line.starts_with("mesh$ ")) {
+            if body.iter().any(|line| line.starts_with(PROMPT)) {
                 let mut cursor = 0;
                 while cursor < body.len() {
                     match transcript_line(body[cursor]) {
@@ -347,11 +356,20 @@ mod extraction {
     /// line and closing after the last continuation.
     #[test]
     fn a_transcript_bolded_as_one_span_keeps_its_continuations() {
-        let text = "<pre>\nmesh$ <strong>result = match $x {\n...   _ =&gt; []\n... }</strong>\nmesh$ <strong>puts $result</strong>\n</pre>\n";
+        let text = "<pre>\nmesh$ <strong>result = match $x {\n.....   _ =&gt; []\n..... }</strong>\nmesh$ <strong>puts $result</strong>\n</pre>\n";
         assert_eq!(
             sources(text),
             vec!["result = match $x {\n  _ => []\n}", "puts $result"]
         );
+    }
+
+    /// The indicator the docs write has to be the one the shell draws, or every
+    /// transcript teaches a prompt nobody sees: one dot per printable column of
+    /// `mesh$ `, less its trailing space.
+    #[test]
+    fn the_continuation_indicator_matches_the_prompt_width() {
+        assert_eq!(CONTINUATION.len() + 1, PROMPT.len());
+        assert!(CONTINUATION.chars().all(|c| c == '.'));
     }
 
     /// A block with no prompt at all bolds only the mesh half of a bash/mesh
