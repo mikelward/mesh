@@ -7,9 +7,20 @@ Pipes still carry **bytes** — every external program and coreutil works exactl
 elsewhere — but *inside* the shell you get **real values**: lists, maps, and
 type-directed operations, with no word-splitting footguns.
 
-This is a taste, not the spec — see [`DESIGN.md`](DESIGN.md) for the full design
-and the rationale behind each choice. In the examples, the mesh you'd type is in
-**bold**; the `# bash` lines are the old way, shown for contrast.
+Interactive use sets the priorities, and the same language is what you save to a
+file: the features that make a line safe to type — nothing splits, absence is
+loud, values are real — are the ones that make a script safe to leave running.
+
+This is a taste, not the spec. Where to go next:
+
+- [`DESIGN.md`](DESIGN.md) — the full design and the rationale behind each choice.
+- [`TOUR.md`](TOUR.md) — the same ground at walking pace, in transcripts you can
+  paste into a running shell.
+- [`REFERENCE.md`](REFERENCE.md) — what is *implemented* today, feature by
+  feature, when you need the exact behavior rather than the shape of it.
+
+In the examples, the mesh you'd type is in **bold**; the `# bash` lines are the
+old way, shown for contrast.
 
 ---
 
