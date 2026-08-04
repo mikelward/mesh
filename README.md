@@ -93,6 +93,9 @@ surface and the work since; later design work remains tracked in
 [`docs/COMPARISON.md`](docs/COMPARISON.md) sets mesh against bash, zsh, fish,
 elvish, and nushell — where it is safer, where it asks for more quoting than
 they do, where they are stricter than it is, and what it gives up.
+[`docs/UPSTREAM.md`](docs/UPSTREAM.md) asks the follow-up question: which of
+these ideas another shell could simply adopt, and which are grammar and so
+cannot travel.
 [`docs/INTEGRATION.md`](docs/INTEGRATION.md) works through the external tools a
 bash or zsh user arrives with — starship, atuin, fzf, carapace, zoxide, direnv —
 saying which already work, which are blocked, and on what.
