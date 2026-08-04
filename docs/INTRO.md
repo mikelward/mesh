@@ -54,7 +54,8 @@ Use `$config.key` for identifier keys and `${config[$name]}` for a computed key.
 `:keys`, `:values`, and `:len` inspect a map without inventing a lossy string
 representation for the whole value.
 
-`$PATH` is a **list**, not a colon-string, so the `IFS=:` juggling disappears.
+`$env.PATH` is a **list**, not a colon-string, so the `IFS=:` juggling
+disappears.
 To **prepend** (bash's `PATH="/opt/bin:$PATH"` — new dir wins), say so; `:dedup`
 drops any later duplicate, keeping the first:
 
