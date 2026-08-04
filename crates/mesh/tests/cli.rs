@@ -16996,6 +16996,89 @@ fn tilde_expansion_ignores_adjacent_empty_quotes() {
     );
 }
 
+/// `:bool` reports a spelling it does not know; `:bool(DEFAULT)` does not.
+///
+/// The two forms differ in what they *say*, not only in what they answer. Naming
+/// a default is the statement that an unparsable value is expected, so mesh stops
+/// mentioning it — the bargain `:get(KEY, DEFAULT)` already makes for a missing
+/// key. Without that split the argument form would be a near-synonym of the bare
+/// one, since `:bool(false)` and `:bool` would then agree on every input.
+#[test]
+fn bool_warns_only_when_no_default_says_what_an_unknown_value_means() {
+    let bare = run_with_input("puts \"yes\":bool\n");
+    assert_eq!(String::from_utf8_lossy(&bare.stdout), "false\n");
+    assert!(
+        String::from_utf8_lossy(&bare.stderr).contains("is not 1/0/true/false"),
+        "stderr was {}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+
+    // The same input, with the caller's own answer for it: no diagnostic, and the
+    // default rather than the fallback.
+    let stated = run_with_input("puts \"yes\":bool(true)\n");
+    assert_eq!(String::from_utf8_lossy(&stated.stdout), "true\n");
+    assert_eq!(String::from_utf8_lossy(&stated.stderr), "");
+
+    // A value it *can* parse is never the default's business, in either form.
+    let known = run_with_input("puts \"1\":bool(false)\nputs \"0\":bool\n");
+    assert_eq!(String::from_utf8_lossy(&known.stdout), "true\nfalse\n");
+    assert_eq!(String::from_utf8_lossy(&known.stderr), "");
+}
+
+/// The shape `:bool` exists for: an environment flag read without quoting either
+/// side of the comparison it replaces.
+///
+/// `$env:get(FLAG, "0") == "1"` is what this spells `$env:get(FLAG, false):bool`.
+/// The old form had a trap in it — equality is type-strict, so `== 1` with the
+/// quotes dropped is *always* false and the flag silently never fires — and it
+/// could not see `FLAG=true` at all.
+#[test]
+fn bool_after_get_reads_an_environment_flag_in_either_vocabulary() {
+    let read = |value: Option<&str>| {
+        let mut command = mesh_command();
+        match value {
+            Some(value) => command.env("MESH_TEST_FLAG", value),
+            // Not merely empty: absent, which is what `:get`'s default answers for.
+            None => command.env_remove("MESH_TEST_FLAG"),
+        };
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mesh");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"puts $env:get(MESH_TEST_FLAG, false):bool\n")
+            .expect("write stdin");
+        child.wait_with_output().expect("wait for mesh")
+    };
+
+    for (value, answer) in [
+        (Some("1"), "true\n"),
+        (Some("true"), "true\n"),
+        (Some("0"), "false\n"),
+        (Some("false"), "false\n"),
+        (None, "false\n"),
+    ] {
+        let out = read(value);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), answer, "{value:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{value:?}");
+    }
+
+    // A spelling outside the four is the case the old string comparison swallowed:
+    // the flag stays off, but the person who typed it hears about it.
+    let out = read(Some("yes"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "false\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not 1/0/true/false"),
+        "stderr was {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn captures_command_output_as_an_expression_value() {
     let out = run_with_input("answer = \"$(printf 20)\":int + 22\nputs $answer\n");

@@ -1068,6 +1068,44 @@ in the design together as that note said they should: see **Floats** under
 own job — a string the program means as an integer should fail loud when it is
 `3.5`, not quietly widen.)*
 
+**String→boolean parse** *(decided — porting a shell config's `FAILSAFE=1` flag)*.
+**`:bool`** is `:int`'s twin and reads `1` / `true` / `0` / `false`, the only four
+spellings it accepts. Two vocabularies had to be in and a third had to stay out:
+`true` / `false` are what mesh writes for a boolean, so one round-trips, and
+`1` / `0` are what every shell flag already uses. `yes`, `on`, `y`, `enabled` are
+where a parse turns into a dialect — each synonym admitted forces a ruling on its
+opposite, and the ten-entry table that results still has to guess at `maybe`.
+
+**It warns rather than raising**, which is the one place it parts from `:int`, and
+the reason is the types rather than a preference: **a boolean has a safe stand-in
+and an integer does not**. "I could not read this flag, so it is off" is a real
+answer; "I could not read this number, so it is 0" is a fabrication. Raising was
+rejected because the motivating caller is a shell rc, where the flag is the escape
+hatch — `FAILSAFE=yes mesh` raising *inside* the rc is the failure the flag exists
+to escape. Answering `false` silently was rejected for the opposite reason: the
+person who typed `yes` meant *on* and would never find out they had not got it.
+
+**`:bool(DEFAULT)` is the quiet form**, and the split is what keeps the argument
+from being a synonym. Supplying a default is the statement that an unreadable
+value is expected, so mesh stops mentioning it — exactly the bargain
+[`:get(KEY, DEFAULT)`](#arrays-lists) makes, which never reports the key that was
+absent. If both forms warned, `:bool(false)` would agree with bare `:bool` on
+every input and the only useful argument left in the language would be `true`.
+
+This does **not** reopen [truthiness](#conditionals-if-is-an-expression), which
+stays settled at *there isn't any*. That rule governs values a condition accepts
+implicitly; `:bool` is an asked-for parse at the one boundary where strings arrive
+already stringly-typed from outside mesh, and it is refusable — `$sh.options.X =
+"false"` is still a type error rather than a coercion.
+
+A **boolean subject is the identity**, which exists to make the composition work:
+`$env:get(FLAG, false):bool` can then spell its default as the bare literal, where
+a string-only `:bool` would force `"false"` and put back the quotes the modifier
+was added to remove. The comparison it replaces —
+`$env:get(FLAG, "0") == "1"` — hides a trap those quotes are all that hold shut,
+since `1` is an integer literal and equality is type-strict across string and
+number, so dropping them makes the test *always* false.
+
 ### Globbing
 
 - `**` — recursive, **on by default** (no `globstar`-style opt-in).

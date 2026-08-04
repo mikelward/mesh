@@ -2195,6 +2195,7 @@ a different failure from an unknown name, which never parses.
 | `:real` | path or list | The path with every symlink, `.` and `..` resolved, absolute. Errors on a path it cannot resolve. |
 | `:upper` / `:lower` | string or list | Change case; maps over list elements. |
 | `:int` | string | Parse an integer, failing loudly on invalid input. |
+| `:bool` | string or boolean | Parse `1`/`true`/`0`/`false`; warn and read `false` for anything else. `:bool(DEFAULT)` answers `DEFAULT` there instead, and says nothing. |
 | `:len` | string, list, or map | Character, element, or entry count as an integer. |
 | `:first` / `:last` | list | First or last element; an empty list is an error. |
 | `:rest` / `:init` | list | All but the first or last element; empty and one-element lists yield `[]` where appropriate. |
@@ -2386,6 +2387,43 @@ value — the same two questions `in` asks of each subject, by the same equality
 `if $env:has(SSH_AUTH_SOCK) { … }` is the guard form, and the wrong-type
 refusal is `:get`'s: asking a map with anything but a string is a loud error
 rather than a quiet `false`.
+
+`:bool` parses a string as a boolean and is the twin of `:int`, with one
+deliberate difference: it does **not** raise on input it cannot read. It warns and
+answers `false`. The asymmetry is the types', not a preference — a boolean has a
+safe stand-in and an integer does not, so "I could not read this flag, so it is
+off" is a real answer where "I could not read this number, so it is 0" would be a
+fabrication.
+
+The spellings are `1` / `true` and `0` / `false`, and there are no others. `true`
+and `false` are what mesh itself writes, so a boolean round-trips; `1` and `0` are
+what every shell flag already uses. A third vocabulary — `yes`, `on`, `y` — is
+where a parse becomes a dialect, and each synonym admitted forces a ruling on its
+opposite, so anything outside the four is reported rather than guessed at.
+
+```mesh
+puts "1":bool                   # true
+puts "yes":bool                 # false, and a line on stderr saying so
+puts "yes":bool(true)           # true, and nothing on stderr
+```
+
+`:bool(DEFAULT)` is the quiet form. Naming a default *is* the statement that an
+unreadable value is expected, so mesh stops mentioning it — the same bargain
+`:get(KEY, DEFAULT)` makes, which says nothing about the key that was missing. A
+value the modifier *can* read is never the default's business in either form.
+
+A boolean subject is the identity, which is what lets `:bool` follow a `:get`
+whose default is the bare literal `false`:
+
+```mesh
+if $env:get(FAILSAFE, false):bool { puts "failsafe mode" }
+```
+
+That is the shape to reach for on an environment flag. Written as a comparison it
+needs quotes on both sides — `$env:get(FAILSAFE, "0") == "1"` — and the quotes are
+load-bearing rather than decorative: a bare `1` is an integer literal, equality is
+type-strict across string and number, so `== 1` is *always* false and the flag
+silently never fires.
 
 The **affix** family drops a known prefix or suffix **once** — the everyday
 "strip a known extension" reach, with no regex escaping and no interior-match
