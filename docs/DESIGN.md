@@ -2640,12 +2640,16 @@ whitespace, and `$file` (a string) stays one argv entry under every option
 below. "Does a **string** split?" is closed — no, permanently. "Does a **list**
 flatten?" is a separate question that the first one does not answer.
 
-**The live costs.** The `...` requirement is not free, because
-[command substitution](#command-substitution) newline-splits by default: `$(…)`
-already *is* a list, so the most common idiom in shell owes a spread —
-`wc -l ...$(ls)`, `grep foo ...$(find . -name '*.rs')`. Every capture used as an
-argument pays a token, which is a large surface for a rule whose stated
-justification (the separator guess) turns out not to apply at argv.
+**The live costs.** The `...` requirement is not free, though it costs less than
+it once did. When [command substitution](#command-substitution) newline-split by
+default, every capture reaching argv owed a spread — `wc -l ...$(ls)` — which was
+a large surface for a rule whose stated justification (the separator guess) turns
+out not to apply at argv. A capture is now **one string**, so the plain `cd $(…)`
+case pays nothing and the cost falls only on captures that are *deliberately*
+split: `wc -l ...$(ls):lines`, `grep foo ...$(find . -name '*.rs'):lines`. That is
+still the common list-producing idiom, and it still pays a token per use — but the
+line already says it wants a list, which is the part that makes the spread read as
+redundant.
 
 The options, cheapest-to-change first:
 
@@ -2654,14 +2658,16 @@ The options, cheapest-to-change first:
 | **A. Status quo** — always `...` | **error**, names the fix | error either way | Rule is **syntactic**: readable from the line, never data-dependent. Costs a token on every capture |
 | **B. Flatten flat, error on nested** | `cmd a b` | **error** | Terse where it matters; puts the loud failure exactly where the real ambiguity is. But whether a line works now depends on **run-time contents** — the regression that matters |
 | **C. Deep flatten** | `cmd a b` | `cmd a b c` | Never errors, never surprises with an error. Silently erases the distinction `+=` is built to preserve (`xs += [$ys]` appends whole vs `xs += $ys` extends), so a value's argv arity stops being predictable from its structure. This is **Perl's** auto-flattening list wart, which is why Perl needs `\@a` refs to nest at all |
-| **D. Flatten only a `$( )` capture** | `cmd a b` | n/a — captures are flat | Buys back the whole ergonomic cost above with no nesting question, since a split always yields a flat list of strings. But it makes the rule depend on a value's **provenance**, not its type — `xs = $(ls)` then `cmd $xs` would have to decide whether the property survives the binding, and "it does not" is a nasty wrinkle |
+| **D. Flatten only a split `$( )` capture** | `cmd a b` | n/a — split captures are flat | Buys back the whole ergonomic cost above with no nesting question, since a split always yields a flat list of strings. But it makes the rule depend on a value's **provenance**, not its type — `xs = $(ls):lines` then `cmd $xs` would have to decide whether the property survives the binding, and "it does not" is a nasty wrinkle |
 
 **Leaning A or D.** B's data-dependence is a real regression over a rule you can
 check by reading, and C is a known wart in the one language that shipped it. D is
 the interesting one precisely because it is *not* about lists at all — it is
-about whether `$(…)`-in-argument-position should keep bash's shape while keeping
-mesh's safety, and it needs the binding question answered before it is a real
-candidate.
+about whether a split `$(…)`-in-argument-position should keep bash's shape while
+keeping mesh's safety, and it needs the binding question answered before it is a
+real candidate. A capture becoming one string weakened D's case on its own: the
+ergonomic cost it buys back is now confined to captures the author already chose
+to split, so A costs less than it did when this was first weighed.
 
 *(TODO — **a `:flat` modifier**, which is wanted under **every** option above and
 is a gap today: [`:join`](#modifiers) already promises "there is no implicit deep
@@ -5202,10 +5208,13 @@ to avoid" rather than promising the latter as done.
 
 - **A pipeline's `while read` silently loses its variables.**
   `n=0; seq 3 | while read x; do n=$((n+1)); done; echo "$n"` prints `0` in bash —
-  the loop ran in a forked subshell, so `n` never escaped. mesh's **settled** answer is to not pipe into a loop at all: a
-  [command substitution](#command-substitution) is a real list you iterate *in the
-  current scope* — `for line in $(cmd) { n += 1 }` leaves `n` set, no subshell
-  involved. ***(planned)*** for the literal `cmd | while gets line { … }` form to
+  the loop ran in a forked subshell, so `n` never escaped. mesh's **settled** answer is to not pipe into a loop at all:
+  [split the capture](#command-substitution) and iterate the list *in the current
+  scope* — `for line in $(cmd):lines { n += 1 }` leaves `n` set, no subshell
+  involved. The split is spelled rather than implied, which is the other half of
+  the defense: bash's alternative to the pipe, `for x in $(cmd)`, re-splits each
+  line on `IFS` and globs it, so the escape from the subshell reintroduces the
+  word-splitting bug. ***(planned)*** for the literal `cmd | while gets line { … }` form to
   persist too, the **last stage of a `|` pipeline** would run in the current shell
   rather than a forked subshell — bash's opt-in `lastpipe`, intended as mesh's
   unconditional default; not yet written into [Redirection](#redirection).
