@@ -778,8 +778,8 @@ fn run_config_file(path: &Path, last: u8, shell: &mut Shell) -> Step {
 /// Exactly one operand. Extra arguments would be positional parameters for the
 /// sourced file, and mesh has no way to set those yet (`shift` / `set --` are
 /// deferred in `DESIGN.md`), so they are refused rather than silently ignored.
-/// `gets [VAR]` — read one line from stdin, strip its trailing newline, and bind
-/// it to `VAR` (`DESIGN.md` §"Builtins").
+/// `gets [VAR]` — the **command** form: read one line from stdin, strip its
+/// trailing newline, and bind it to `VAR` (`DESIGN.md` §"Builtins").
 ///
 /// **At end of input the status is `1` and `VAR` is left alone**, which is what
 /// terminates `while gets line { … }`. An empty line is a successful read of `""`,
@@ -792,8 +792,9 @@ fn run_config_file(path: &Path, last: u8, shell: &mut Shell) -> Step {
 /// sharing the same stdin.
 ///
 /// Reading with no `VAR` consumes the line and reports whether there was one,
-/// which is the "skip a line" spelling. The value form `gets()` — the one that
-/// yields the line into an expression — is not wired up yet.
+/// which is the "skip a line" spelling. The value form `gets()` is
+/// [`eval_gets`], and both spellings read through [`read_gets_line`] so they
+/// cannot disagree about what a line, an ending, or a failure is.
 fn gets(args: &[String], shell: &mut Shell) -> Step {
     let name = match args {
         [] => None,
@@ -818,6 +819,86 @@ fn gets(args: &[String], shell: &mut Shell) -> Step {
             return Step::Error(2);
         }
     }
+    match read_gets_line(shell) {
+        LineRead::Line(text) => {
+            if let Some(name) = name {
+                shell.vars.set_value(name, Value::String(text));
+            }
+            Step::Continue(0)
+        }
+        LineRead::End => Step::Continue(1),
+        LineRead::Interrupted => {
+            // The status any interrupted foreground command reports, and `var` keeps
+            // whatever it held — a cancelled read has read nothing. The newline is
+            // what the terminal's own `^C` echo lacks, so the next prompt starts on a
+            // line of its own.
+            note!("");
+            Step::Continue(130)
+        }
+        // Status 1 is reserved for end of input, so a failure reports 2 like the
+        // operand errors above. Sharing 1 would let a real read error end a
+        // `while gets line` as though the input had simply run out.
+        LineRead::Failed(message) => {
+            note!("mesh: gets: {message}");
+            Step::Error(2)
+        }
+    }
+}
+
+/// What one `gets` read produced. The four cases each spelling has to answer for,
+/// named once so the command form and the value form answer them the same way —
+/// they differ only in *how* they say it (a status and a binding, or a value).
+enum LineRead {
+    /// A line, with any trailing newline already stripped. An empty line is this
+    /// case, not [`LineRead::End`].
+    Line(String),
+    /// End of input: status `1` for `gets line`, `false` for `gets()`.
+    End,
+    /// Ctrl-C arrived during the read, which consumed nothing.
+    Interrupted,
+    /// The read failed, or the bytes were not UTF-8.
+    Failed(String),
+}
+
+/// `gets()` — the value form, which yields the line into an expression
+/// (`DESIGN.md` §"Builtins"), so a read composes: `line = gets()`,
+/// `[k v] = gets():split("=")`, `while line = gets() { … }`.
+///
+/// **At end of input it yields `false`**, not `""`. That is the whole reason the
+/// condition forms terminate: `DESIGN.md` §"Tests and comparisons" makes
+/// `lhs = rhs` true iff the right-hand side is truthy, and an empty line is a
+/// truthy `""`, so only the `false` ends a loop. It is the same distinction the
+/// command form draws with statuses `0` and `1`, said in the vocabulary a value
+/// has.
+///
+/// It takes **no arguments**: the value form binds through the assignment it sits
+/// in, where the command form takes the name as an operand. Both spellings stay —
+/// `gets line` reports a status and is what a `while` condition wants when the
+/// line is all you need, and neither is a rewrite of the other in the `if`/`while`
+/// position where mesh usually declines a second spelling.
+fn eval_gets(arguments: &[parser::Argument], shell: &mut Shell) -> Result<Value, Step> {
+    if !arguments.is_empty() {
+        return runtime_error(
+            "gets() takes no arguments; the value form yields the line, so bind it with \
+             `line = gets()`",
+        );
+    }
+    match read_gets_line(shell) {
+        LineRead::Line(text) => Ok(Value::String(text)),
+        LineRead::End => Ok(Value::Boolean(false)),
+        LineRead::Interrupted => {
+            // Not a runtime error: nothing was read and nothing went wrong. The
+            // statement abandons the way an interrupted command does, carrying the
+            // status any interrupted foreground command reports.
+            note!("");
+            Err(Step::Continue(130))
+        }
+        LineRead::Failed(message) => runtime_error(format!("gets(): {message}")),
+    }
+}
+
+/// Read one line from descriptor 0 for either `gets` spelling.
+fn read_gets_line(shell: &mut Shell) -> LineRead {
     let mut line = Vec::new();
     // Descriptor 0 directly, not `io::stdin()`: that handle buffers, so it would
     // read past the newline and the bytes it swallowed would never reach whatever
@@ -834,25 +915,16 @@ fn gets(args: &[String], shell: &mut Shell) -> Step {
         read_line(&mut *stdin, &mut line, false)
     });
     if interrupted {
-        // The status any interrupted foreground command reports, and `var` keeps
-        // whatever it held — a cancelled read has read nothing. The newline is
-        // what the terminal's own `^C` echo lacks, so the next prompt starts on a
-        // line of its own.
-        note!("");
-        return Step::Continue(130);
+        return LineRead::Interrupted;
     }
-    // Status 1 is reserved for end of input, so an I/O failure reports 2 like the
-    // operand errors above. Sharing 1 would let a real read error end a
-    // `while gets line` as though the input had simply run out.
     if let Err(err) = read {
-        note!("mesh: gets: {err}");
-        return Step::Error(2);
+        return LineRead::Failed(err.to_string());
     }
     // Only a zero-byte read is the end. A file's last line without a trailing
     // newline is still a line, and an empty line is a successful read of `""` —
     // a blank line in the middle of a file must not stop a `while gets line`.
     if line.is_empty() {
-        return Step::Continue(1);
+        return LineRead::End;
     }
     // The line came off the same descriptor a piped session reads its commands
     // from, so it is a line of that input even though the reader never saw it.
@@ -874,17 +946,10 @@ fn gets(args: &[String], shell: &mut Shell) -> Step {
     // read renders a table the shell was handed and cannot refuse. Replacing the
     // bad bytes with U+FFFD here would hand back corrupted text and call it
     // success, and the corruption would outlive any chance of noticing it.
-    let text = match String::from_utf8(line) {
-        Ok(text) => text,
-        Err(_) => {
-            note!("mesh: gets: line is not valid UTF-8");
-            return Step::Error(2);
-        }
-    };
-    if let Some(name) = name {
-        shell.vars.set_value(name, Value::String(text));
+    match String::from_utf8(line) {
+        Ok(text) => LineRead::Line(text),
+        Err(_) => LineRead::Failed("line is not valid UTF-8".to_owned()),
     }
-    Step::Continue(0)
 }
 
 fn source_file(args: &[String], last: u8, shell: &mut Shell) -> Step {
@@ -4434,6 +4499,9 @@ fn eval_call(
     if name == "glob" {
         return eval_glob(arguments, last, in_function, shell);
     }
+    if name == "gets" {
+        return eval_gets(arguments, shell);
+    }
     if let Some(filter) = entry_filter(&name) {
         return eval_directory_entries(&name, filter, arguments, last, in_function, shell);
     }
@@ -5635,7 +5703,13 @@ fn capture_call(
             // Every built-in value name, not just `re`: `glob("*"):capture` asks
             // what a *call* wrote and returned, and routing it to the command path
             // would report the command-not-found for a `glob` that isn't one.
-            (!parser::value_builtin(&name) && shell.funcs.get(&name).is_none()).then_some(name)
+            // `gets` is the case where both spellings exist, so the call form has to
+            // win here too — otherwise `gets():capture` would run the *command*,
+            // read a line, and hand back a record with no `.value` holding it.
+            (!parser::value_builtin(&name)
+                && !builtins::is_callable_builtin(&name)
+                && shell.funcs.get(&name).is_none())
+            .then_some(name)
         }
         _ => None,
     };

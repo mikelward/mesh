@@ -5479,7 +5479,8 @@ fn abandoned_line_harness(exec: &MeshExec) -> i32 {
     0
 }
 
-/// Ctrl-C cancels an interactive `gets`, leaving its variable alone.
+/// Ctrl-C cancels an interactive `gets`, leaving its variable alone — in **both**
+/// spellings, since they block in the same reader.
 ///
 /// An interactive shell ignores SIGINT while a foreground *job* holds the
 /// terminal, but `gets` blocks in the shell's own process, where there is no job
@@ -5502,46 +5503,61 @@ fn gets_interrupt_harness(exec: &MeshExec) -> i32 {
     let Some(shell) = start_pty_shell(exec, None) else {
         return 90;
     };
-    // Bind first, so the check below distinguishes "left alone" from "never set".
-    if !pty_write(shell.master, b"x = kept\n") {
-        return 91;
+    // One pty for both spellings: a cancelled read is a property of the reader they
+    // share, so the value form must answer exactly as the command form does — and a
+    // second forked shell would only pay for the same evidence twice.
+    for (spelling, base) in [("gets x", 90), ("x = gets()", 110)] {
+        let code = gets_interrupt_round(shell.master, spelling, base);
+        if code != 0 {
+            return code;
+        }
     }
-    if pty_read_until_command_done(shell.master).is_none() {
-        return 92;
+    if !stop_pty_shell(shell) {
+        return 100;
+    }
+    0
+}
+
+/// One Ctrl-C-during-a-read round. Failures report `base + n` so the two rounds
+/// stay tellable apart in the harness's exit code.
+fn gets_interrupt_round(master: RawFd, spelling: &str, base: i32) -> i32 {
+    // Bind first, so the check below distinguishes "left alone" from "never set".
+    if !pty_write(master, b"x = kept\n") {
+        return base + 1;
+    }
+    if pty_read_until_command_done(master).is_none() {
+        return base + 2;
     }
     // The marker is what keeps the keystroke from beating the command to the
     // terminal and cancelling the *line* instead, which would test nothing. It is
     // not evidence that the read has begun, though — only that the command before
     // it ended — so it is the near side of the gap described on
     // `pty_interrupt_until_command_done`, which is why the keystroke repeats.
-    if !pty_write(shell.master, b"puts BLOCKING; gets x\n") {
-        return 93;
+    if !pty_write(master, format!("puts BLOCKING; {spelling}\n").as_bytes()) {
+        return base + 3;
     }
-    if !pty_wait_for_marker(shell.master, b"BLOCKING\r\n") {
-        return 94;
+    if !pty_wait_for_marker(master, b"BLOCKING\r\n") {
+        return base + 4;
     }
     // Ctrl-C while the read blocks. The shell must come back to a prompt rather
     // than sit waiting for a line.
-    let Some((_, code)) = pty_interrupt_until_command_done(shell.master) else {
-        return 95;
+    let Some((_, code)) = pty_interrupt_until_command_done(master) else {
+        return base + 5;
     };
     // The status any interrupted foreground command reports.
     if code != 130 {
-        return 96;
+        return base + 6;
     }
     // The read was cancelled, so the binding is untouched — and this line is a
     // command, not the input `gets` was waiting for.
-    if !pty_write(shell.master, b"puts CHECK-$x\n") {
-        return 97;
+    if !pty_write(master, b"puts CHECK-$x\n") {
+        return base + 7;
     }
-    let Some((seen, _)) = pty_read_until_command_done(shell.master) else {
-        return 98;
+    let Some((seen, _)) = pty_read_until_command_done(master) else {
+        return base + 8;
     };
     if occurrences(&seen, b"CHECK-kept\r\n") == 0 {
-        return 99;
-    }
-    if !stop_pty_shell(shell) {
-        return 100;
+        return base + 9;
     }
     0
 }
@@ -26741,4 +26757,115 @@ fn gets_rejects_a_bad_operand() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+/// Run `source` as `-c` with `bytes` on stdin. The `gets` value-form tests need
+/// the two streams apart: the source cannot arrive on stdin, because stdin is
+/// what is being read.
+fn run_source_with_stdin(source: &str, bytes: &[u8]) -> Output {
+    let mut command = mesh_command();
+    command
+        .arg("-c")
+        .arg(source)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn mesh");
+    write_stdin(child.stdin.take(), bytes);
+    child.wait_with_output().expect("wait for mesh")
+}
+
+/// The **value** form: `gets()` yields the line into an expression, which is what
+/// makes a read compose (`DESIGN.md` §"Builtins").
+///
+/// The loop terminates on the `false` that end of input yields, *not* on an empty
+/// string: `lhs = rhs` is true iff the right-hand side is truthy, and a blank line
+/// is a truthy `""`. That is the same line the command form draws between statuses
+/// `0` and `1`, so the two spellings agree about where the input ends.
+#[test]
+fn the_gets_value_form_yields_the_line() {
+    let out = run_source_with_stdin(
+        "while line = gets() { puts \"[$line]\" }\nx = gets()\nputs $x:repr\n",
+        b"a\n\nb\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[a]\n[]\n[b]\nfalse\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The composing spellings the value form exists for: a read feeds a modifier
+/// chain, and a destructuring binding reads and splits in one statement.
+#[test]
+fn the_gets_value_form_composes_with_modifiers() {
+    let out = run_source_with_stdin(
+        "puts gets():upper\n[k v] = gets():split(\"=\")\nputs \"$k / $v\"\n",
+        b"shout\nkey=value\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "SHOUT\nkey / value\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Both spellings read through one reader, so the value form inherits the
+/// byte-at-a-time rule: the bytes after the line belong to whatever runs next.
+#[test]
+fn the_gets_value_form_leaves_the_rest_of_stdin_alone() {
+    let out = run_source_with_stdin(
+        "first = gets()\nputs \"first=$first\"\ncat\n",
+        b"one\ntwo\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first=one\ntwo\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The value form binds through the assignment it sits in, so the operand the
+/// command form takes is a usage error rather than a second way to bind.
+#[test]
+fn the_gets_value_form_takes_no_arguments() {
+    let out = run_source_with_stdin("x = gets(line)\n", b"a\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("gets() takes no arguments"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success());
+}
+
+/// `gets():capture` records the **call**. Routing it to the command path instead
+/// would run the other spelling — consuming a line and handing back a record with
+/// no `.value` holding it.
+#[test]
+fn the_gets_value_form_captures_as_a_call() {
+    let out = run_source_with_stdin("r = gets():capture\nputs \"[$r.value][$r.out]\"\n", b"hi\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[hi][]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A line that is not UTF-8 is refused in the value form too, and **raises**
+/// rather than yielding: `false` means end of input here, and a failure that
+/// yielded it would end a `while line = gets()` as though the input had run out.
+#[test]
+fn the_gets_value_form_refuses_a_non_utf8_line() {
+    let out = run_source_with_stdin("x = kept\nx = gets()\nputs \"x=$x\"\n", b"a\xffb\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not valid UTF-8"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The statement was abandoned, so the binding keeps what it held.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x=kept\n");
 }
