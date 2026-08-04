@@ -41,8 +41,8 @@ this page compares designs, and mesh's is still being built.
 | Pipe payload | bytes | bytes | bytes | bytes | bytes + values | **structured** |
 | Coreutils | first-class | first-class | first-class | first-class | first-class | second-class |
 | Unset variable | `""` | `""` | `""` | error (at run time) | **compile error** | **parse error** |
-| A failed command | status | status | status | status | **aborts** | status |
-| `pipefail` | opt-in | opt-in | `$pipestatus` | **always on** | aborts, reports all | n/a |
+| A failed command | status | status | status | status | **aborts** | **aborts** |
+| `pipefail` | opt-in | opt-in | `$pipestatus` | **always on** | aborts, reports all | any stage aborts |
 | Truthiness | status + tests | status + tests | status | **none** | value | typed |
 | `'…'` | raw | raw | nearly raw | **escapes** | raw | raw |
 | `"…"` interpolates | yes | yes | yes | yes | **no** | **no** (`$"…"`) |
@@ -59,9 +59,19 @@ elvish catches it when it compiles the code and nushell catches it while
 parsing, both before any of the program runs, where mesh only reports it once
 execution reaches the statement — so a typo down a branch your tests never take
 survives in mesh and does not in either of them. And a command that fails aborts
-an elvish script by default, where mesh leaves it in `$sh.status`. Both are
-stricter readings of the same instinct this page argues for, and the first is
-now on [`TODO.md`](../TODO.md).
+the script by default in *both* of them, where mesh leaves it in `$sh.status`:
+
+```
+$ elvish -c 'false; echo AFTER'        # AFTER never prints
+$ nu -c '^false; print AFTER'          # AFTER never prints, nu exits 1
+```
+
+nushell is the less obvious of the two — a failing external raises a catchable
+error rather than an exception, so `try`/`catch` and `complete` recover the
+status, but left alone it ends the script exactly as elvish does, and it does so
+for a failure in *any* pipeline stage, not only the last. Both are stricter
+readings of the same instinct this page argues for, and the first is now on
+[`TODO.md`](../TODO.md).
 
 ## Quoting and escaping
 
@@ -783,8 +793,10 @@ Honest costs, in the order they will bite:
 2. **elvish already ships the value model**, has done for years, and is
    *stricter* than mesh in the two places noted under the first table — an
    unbound variable caught at compile time, and a failed command that aborts.
-   If those are what drew you here, that shell has them now. mesh's answer is
-   interpolation, modifiers, and the interactive defaults, not the core idea.
+   nushell is stricter on both counts too, catching the unbound variable while
+   parsing and ending the script on a failed command. If those are what drew you
+   here, two shells have them now. mesh's answer is interpolation, modifiers,
+   and the interactive defaults, not the core idea.
 3. **Maturity.** bash is thirty-five years old, zsh, fish, elvish, and nushell
    all have real ecosystems and package managers, and mesh's language design is
    still in draft. See [`ROADMAP.md`](../ROADMAP.md).
