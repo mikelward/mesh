@@ -6657,8 +6657,9 @@ fn modifier_name(name: &str) -> bool {
 /// give a clearer error when such a modifier is written bare (`:split` with no
 /// arguments) rather than the generic "not implemented yet".
 ///
-/// `:trimstart` / `:trimend` are deliberately absent: their argument (a char set)
-/// is optional, so the bare spelling is the whitespace form rather than a mistake.
+/// `:trimstart` / `:trimend` / `:bool` are deliberately absent: their argument is
+/// optional, so the bare spelling is the whitespace form — or, for `:bool`, the
+/// warn-and-answer-`false` form — rather than a mistake.
 pub(crate) fn modifier_requires_arguments(name: &str) -> bool {
     matches!(
         name,
@@ -6680,11 +6681,12 @@ pub(crate) fn modifier_requires_arguments(name: &str) -> bool {
     )
 }
 
-/// Can `name` take an argument list at all? The superset that adds the two whose
-/// argument is *optional*, since an abutting `(` after either is still the argument
-/// form — `"$x:trimstart(abc)"` asks for the char set, not for literal parentheses.
+/// Can `name` take an argument list at all? The superset that adds the ones whose
+/// argument is *optional*, since an abutting `(` after any of them is still the
+/// argument form — `"$x:trimstart(abc)"` asks for the char set, not for literal
+/// parentheses.
 fn modifier_accepts_arguments(name: &str) -> bool {
-    modifier_requires_arguments(name) || matches!(name, "trimstart" | "trimend")
+    modifier_requires_arguments(name) || matches!(name, "trimstart" | "trimend" | "bool")
 }
 
 const MODIFIER_NAMES: &[&str] = &[
@@ -6694,6 +6696,7 @@ const MODIFIER_NAMES: &[&str] = &[
     "atime",
     "bare",
     "base",
+    "bool",
     "capture",
     "captures",
     "ctime",

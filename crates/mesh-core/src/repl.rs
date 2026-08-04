@@ -4867,6 +4867,21 @@ fn eval_modifier_with_arguments(
             };
             expand::get_value(value, key, default).map_err(runtime_message)
         }
+        // `:bool(DEFAULT)` — the quiet half of `:bool`, silent where the bare form
+        // warns, since naming a default already says unreadable input is expected.
+        // The default must be a boolean: `:bool` answers one or it is not a parse.
+        "bool" => {
+            let Some([default]) = value_arguments(name, arguments, last, in_function, shell)?
+            else {
+                return Ok(control_placeholder());
+            };
+            let Value::Boolean(default) = default.plain() else {
+                return runtime_error(format!(
+                    "modifier :{name} default must be `true` or `false`"
+                ));
+            };
+            expand::parse_bool_value(value, Some(default)).map_err(runtime_message)
+        }
         // `:has(VALUE)` — membership, the map/list question `in` also answers.
         // The needle is an ordinary value, so which subjects take which needles
         // is `expand::has_value`'s to say, as with `:get`.

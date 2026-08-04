@@ -48,6 +48,12 @@ pub enum Modifier {
     TrimStart,
     TrimEnd,
     Int,
+    /// `:bool` — parse a string as a boolean, the twin of [`Modifier::Int`]. It
+    /// **warns and answers `false`** where `:int` raises, because a boolean has a
+    /// safe stand-in and an integer does not (`DESIGN.md` §"String→boolean
+    /// parse"). `:bool(DEFAULT)` is the quiet form, taken with the
+    /// argument-carrying modifiers rather than here.
+    Bool,
     /// `:words` — split a string on runs of ASCII whitespace, the classic IFS
     /// word-split. A **split** modifier, so it consumes one string and yields a
     /// list; the argument-taking member of the family is `:split(SEP)`.
@@ -118,6 +124,7 @@ impl Modifier {
             "trimstart" => Self::TrimStart,
             "trimend" => Self::TrimEnd,
             "int" => Self::Int,
+            "bool" => Self::Bool,
             // The split family carries a two-letter alias each, since a split is
             // what a line loop or a `-print0` pipeline writes on every use. They
             // are *systematic* — initial plus `s` — rather than the `test`-derived
@@ -1300,6 +1307,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 message: "requires a string".into(),
             }),
         },
+        Modifier::Bool => parse_bool_value(value, None),
         // Resolving is a syscall, not string surgery: every component on the way
         // has to exist for the kernel to follow it, so a path that is not there has
         // no real path to report and this errors rather than inventing one. `:type`
@@ -1694,6 +1702,48 @@ pub(crate) fn map_strings(
     }
 }
 
+/// The spellings `:bool` accepts, and deliberately no others: what mesh writes
+/// for a boolean, plus what a shell flag is already set to. `yes` / `on` / `y`
+/// are where a parse turns into a dialect (`DESIGN.md` §"String→boolean parse").
+fn bool_spelling(text: &str) -> Option<bool> {
+    match text {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// `:bool` and `:bool(DEFAULT)` — parse a string as a boolean.
+///
+/// `default` is which spelling was written: `None` is the bare form, which warns
+/// on unreadable input, and `Some` is `:bool(DEFAULT)`, which stays quiet because
+/// naming a default already says such input is expected — [`get_value`]'s bargain
+/// for a missing key. A boolean subject is the identity, so the `:get` above it
+/// can spell its own default as the bare literal `false` rather than `"false"`.
+pub(crate) fn parse_bool_value(value: Value, default: Option<bool>) -> Result<Value, ExpandError> {
+    match value.plain() {
+        Value::Boolean(answer) => Ok(Value::Boolean(answer)),
+        Value::String(text) => Ok(Value::Boolean(bool_spelling(&text).unwrap_or_else(|| {
+            if default.is_none() {
+                // An exported-but-empty variable is the common way to reach here,
+                // and quoting nothing (`` `` ``) reads as a bug in the message
+                // rather than as the value it is describing.
+                let shown = if text.is_empty() {
+                    "an empty value".to_string()
+                } else {
+                    format!("`{text}`")
+                };
+                note!("mesh: :bool: {shown} is not 1/0/true/false, reading as false");
+            }
+            default.unwrap_or(false)
+        }))),
+        other => Err(ExpandError::Modifier {
+            name: "bool".into(),
+            message: format!("requires a string, got {}", value_kind(&other)),
+        }),
+    }
+}
+
 /// `:get(KEY, DEFAULT)` — the **total** accessor. Where `$m.key` and `$xs[i]`
 /// fail loudly on a miss, this answers `default`, which is what makes it the
 /// mesh spelling of `${VAR:-default}` (`DESIGN.md` §"Arrays / lists").
@@ -1891,6 +1941,7 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::TrimStart => "trimstart",
         Modifier::TrimEnd => "trimend",
         Modifier::Int => "int",
+        Modifier::Bool => "bool",
         Modifier::Words => "words",
         Modifier::Lines => "lines",
         Modifier::Nulls => "nulls",
@@ -2020,6 +2071,7 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         Modifier::Real
         | Modifier::Url
         | Modifier::Int
+        | Modifier::Bool
         | Modifier::Words
         | Modifier::Lines
         | Modifier::Nulls
@@ -2185,7 +2237,7 @@ mod tests {
     use super::{
         Access, ExpandError, Modifier, ModifierStep, VarRef, accessible_c, apply_modifier,
         apply_tilde, entries_pattern, get_value, has_glob_meta, has_value, join_value, map_strings,
-        resolve_value, split_value, words_value,
+        parse_bool_value, resolve_value, split_value, words_value,
     };
     use crate::vars::{Value, Vars};
 
@@ -2503,6 +2555,64 @@ mod tests {
             has_value(Value::String("ab".into()), Value::String("a".into())),
             Err(ExpandError::Modifier { name, .. }) if name == "has"
         ));
+    }
+
+    #[test]
+    fn bool_parses_the_four_spellings_and_is_the_identity_on_a_boolean() {
+        for (text, answer) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                apply_modifier(Value::String(text.into()), Modifier::Bool),
+                Ok(Value::Boolean(answer)),
+                "{text}"
+            );
+        }
+        // The identity is what lets `:bool` follow a `:get` whose default is the
+        // bare literal `false` — `$env:get(FLAG, false):bool`. Without it the
+        // default would have to be spelled `"false"`, putting back the quotes the
+        // modifier exists to remove.
+        for answer in [true, false] {
+            assert_eq!(
+                apply_modifier(Value::Boolean(answer), Modifier::Bool),
+                Ok(Value::Boolean(answer))
+            );
+        }
+    }
+
+    #[test]
+    fn bool_answers_the_stated_default_for_a_spelling_it_does_not_know() {
+        // Bare `:bool` has no default to consult, so it warns and reads `false`.
+        assert_eq!(
+            parse_bool_value(Value::String("yes".into()), None),
+            Ok(Value::Boolean(false))
+        );
+        // `:bool(DEFAULT)` — the caller has already said what an unknown value
+        // means, so the answer follows the caller rather than the fallback.
+        assert_eq!(
+            parse_bool_value(Value::String("yes".into()), Some(true)),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            parse_bool_value(Value::String("yes".into()), Some(false)),
+            Ok(Value::Boolean(false))
+        );
+        // A default does not override a value that *does* parse: it stands in for
+        // the unparsable one only, exactly as `:get`'s does for a missing key.
+        assert_eq!(
+            parse_bool_value(Value::String("1".into()), Some(false)),
+            Ok(Value::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn bool_refuses_a_subject_that_is_not_a_string() {
+        // String-only, like its twin `:int` — a list is a loud error rather than an
+        // element-wise map, so a collection cannot quietly answer for its elements.
+        for subject in [Value::Integer(1), list(&["1", "0"]), Value::Map(vec![])] {
+            assert!(matches!(
+                parse_bool_value(subject, None),
+                Err(ExpandError::Modifier { name, .. }) if name == "bool"
+            ));
+        }
     }
 
     #[test]
