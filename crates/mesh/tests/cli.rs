@@ -7859,6 +7859,66 @@ fn wait_reports_the_jobs_own_status() {
 }
 
 #[test]
+fn wait_timeout_gives_up_without_touching_the_job() {
+    // The deadline ends the *wait*, not the job: it keeps running, keeps its
+    // place in the table, and keeps an empty status, because it has not
+    // reported one. A number stood in for it here would be a lie about a job
+    // that is still there.
+    let out = run_with_input(
+        "sh -c 'sleep 30' &\nwait --timeout 200ms 1\nputs status=$sh.status\nputs jobs=$sh.jobs:len state=$sh.jobs[1].state own=[$sh.jobs[1].status]\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "status=124\njobs=1 state=running own=[]\n"
+    );
+}
+
+#[test]
+fn wait_timeout_still_reports_a_job_that_finishes_in_time() {
+    // The bound only changes what happens when it is *reached*. Inside it, the
+    // wait is the ordinary one and hands back the job's own status.
+    for spelling in ["--timeout 5s", "--timeout=5s", "--timeout 5"] {
+        let out = run_with_input(&format!(
+            "sh -c 'sleep 0.05; exit 7' &\nwait {spelling} 1\nputs status=$sh.status jobs=$sh.jobs:len\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "status=7 jobs=0\n",
+            "{spelling}"
+        );
+    }
+}
+
+#[test]
+fn wait_timeout_spends_one_budget_across_every_operand() {
+    // `wait --timeout 1s %1 %2` is one second for both, not one each -- so two
+    // jobs that outlast it are given up on together, at the deadline.
+    let started = std::time::Instant::now();
+    let out = run_with_input(
+        "sh -c 'sleep 30' &\nsh -c 'sleep 30' &\nwait --timeout 500ms 1 2\nputs status=$sh.status jobs=$sh.jobs:len\n",
+    );
+    let waited = started.elapsed();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=124 jobs=2\n");
+    assert!(
+        waited < std::time::Duration::from_secs(10),
+        "spent a budget per operand rather than one between them: {waited:?}"
+    );
+}
+
+#[test]
+fn wait_refuses_a_duration_it_cannot_read() {
+    // Rejected rather than saturated or ignored: `2x` is a typo, and a wait
+    // that quietly used some other limit is worse than one that says no.
+    let out = run_with_input("sh -c 'sleep 30' &\nwait --timeout 2x 1\nputs status=$sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=2\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not a duration"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn wait_answers_from_a_finished_jobs_record() {
     // Reading `$sh.jobs` polls the job and reaps its pid while keeping the
     // record, so by the time `wait` runs there is no child left to wait for.
@@ -11537,7 +11597,7 @@ fn help_lists_every_builtin_with_its_usage() {
         "fg [JOB]",
         "bg [JOB]",
         "jobs",
-        "wait [JOB …]",
+        "wait [--timeout DURATION] [JOB …]",
         "disown [-h] [-a | -r] [JOB …]",
         "kill [-SIGNAL] JOB|PID ...",
         "prompt [--reset | TEXT]",

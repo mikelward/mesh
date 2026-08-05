@@ -12,6 +12,7 @@ use std::io::IsTerminal;
 use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
+use crate::builtins;
 use crate::reaper;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +235,9 @@ impl JobTable {
                         job.state = JobState::Stopped(code);
                         newly_current.push((seq, job.id));
                     }
+                    // A poll has no deadline to run out, so it never answers
+                    // this way; only a bounded `wait` can.
+                    Some((WaitResult::TimedOut, _)) => {}
                     // A continue makes a job current wherever it is noticed —
                     // `bg` and a direct `kill -CONT` do it themselves, and a
                     // continue from a forked stage reaches the parent only here.
@@ -328,6 +332,9 @@ impl JobTable {
             // arrives here — the job is in the foreground and this call is what
             // resumed it.
             WaitResult::Continued => 0,
+            // Foreground waits are unbounded -- there is no `--timeout` to
+            // reach this call -- so the deadline answer cannot arrive here.
+            WaitResult::TimedOut => 0,
             WaitResult::Complete(status) => {
                 self.forget(job.id);
                 status
@@ -382,18 +389,33 @@ impl JobTable {
     /// inherited from a batch parent, which is that parent saying interrupts are
     /// not to take effect here.
     pub fn wait(&mut self, args: &[String], interactive: bool) -> u8 {
+        // One budget for the whole call, taken before the first operand: the
+        // point of `wait --timeout 5s %1 %2` is five seconds for both, not five
+        // each. Started here rather than per operand so a slow first job spends
+        // the budget the second one is also waiting on.
+        let (args, deadline) = match split_timeout(args) {
+            Ok(split) => split,
+            Err(bad) => {
+                note!("mesh: wait: not a duration: {bad}");
+                return 2;
+            }
+        };
         if args.is_empty() {
-            return self.wait_for_all(interactive);
+            return self.wait_for_all_until(interactive, deadline);
         }
         // Each operand is waited for in turn, and the same rule decides the
         // answer: the last failure wins.
         let mut status = 0;
         for arg in args {
-            match self.wait_one(std::slice::from_ref(arg), interactive) {
+            match self.wait_one(std::slice::from_ref(arg), interactive, deadline) {
                 // One Ctrl-C ends the wait, not just the operand it landed on.
                 // The jobs not reached keep running and keep their places, the
                 // same as the one that was being waited for.
                 Waited::Interrupted => return INTERRUPT_CODE,
+                // The budget is spent, so the operands not reached are not
+                // waited for either. Every job involved keeps running and keeps
+                // its place -- nothing here reports a status for one.
+                Waited::TimedOut => return builtins::TIMED_OUT_CODE,
                 Waited::Status(each) => {
                     if each != 0 {
                         status = each;
@@ -409,7 +431,12 @@ impl JobTable {
     /// A job may legitimately exit 130, so the two cannot travel back as the
     /// same number: a caller that has to tell "Ctrl-C" from "the job ended that
     /// way" — every loop over more than one job — would get it wrong.
-    fn wait_one(&mut self, args: &[String], interactive: bool) -> Waited {
+    fn wait_one(
+        &mut self,
+        args: &[String],
+        interactive: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Waited {
         let Some(index) = self.resolve(args, "wait") else {
             return Waited::Status(1);
         };
@@ -423,6 +450,9 @@ impl JobTable {
                 self.mark_current(id);
             }
             Some(WaitResult::Stopped(code)) => self.jobs[index].state = JobState::Stopped(code),
+            // A poll has no deadline to run out; only a bounded wait can answer
+            // this way.
+            Some(WaitResult::TimedOut) => {}
             // Finished. Whatever it was before, it is not *stopped* now, and
             // leaving the mark on would send this down the branch below and
             // report the stop it was killed out of rather than how it ended.
@@ -442,7 +472,7 @@ impl JobTable {
         } else {
             OnInterrupt::Resume
         };
-        let result = wait_outcomes_until(&mut self.jobs[index].outcomes, on_interrupt);
+        let result = wait_outcomes_until(&mut self.jobs[index].outcomes, on_interrupt, deadline);
         match result {
             Some(WaitResult::Complete(status)) => {
                 let job = self.jobs.remove(index);
@@ -459,6 +489,10 @@ impl JobTable {
             }
             // As in `foreground`: this wait does not ask for `WCONTINUED`.
             Some(WaitResult::Continued) => Waited::Status(0),
+            // The deadline gives up on the wait and not on the job, the same way
+            // Ctrl-C does -- the job is left running, listed, and with no status
+            // of its own, because it has not reported one.
+            Some(WaitResult::TimedOut) => Waited::TimedOut,
             // Ctrl-C gives up on the wait, not on the job: it keeps running and
             // keeps its place in the table.
             None => Waited::Interrupted,
@@ -473,7 +507,11 @@ impl JobTable {
     /// waiting on it would block for a continue that is not coming, and skipping
     /// it would make the bare form disagree with the named one about a table
     /// they can both see.
-    fn wait_for_all(&mut self, interactive: bool) -> u8 {
+    fn wait_for_all_until(
+        &mut self,
+        interactive: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> u8 {
         // A snapshot, oldest first. Waiting removes the jobs that finish and
         // leaves the ones that are stopped, so a fresh `min()` each time round
         // would either revisit a stopped job forever or have to skip it; taking
@@ -487,10 +525,13 @@ impl JobTable {
             if self.index_of(id).is_none() {
                 continue;
             }
-            match self.wait_one(&[id.to_string()], interactive) {
+            match self.wait_one(&[id.to_string()], interactive, deadline) {
                 // Ctrl-C gives up on the whole wait, not just this job — the
                 // remaining jobs keep running and keep their places.
                 Waited::Interrupted => return INTERRUPT_CODE,
+                // Same for the budget running out: the jobs not reached keep
+                // running, and none of them is given a status it did not report.
+                Waited::TimedOut => return builtins::TIMED_OUT_CODE,
                 Waited::Status(each) => {
                     if each != 0 {
                         status = each;
@@ -775,6 +816,8 @@ impl JobTable {
                     self.jobs[index].state = JobState::Running;
                     newly_current.push((seq, self.jobs[index].id));
                 }
+                // As above: a poll cannot run out of time.
+                Some((WaitResult::TimedOut, _)) => {}
                 None => {}
             }
             index += 1;
@@ -921,6 +964,8 @@ impl Drop for JobTable {
                 Some(WaitResult::Continued | WaitResult::Complete(_)) => {
                     self.jobs[index].state = JobState::Running;
                 }
+                // A poll cannot run out of time; only a bounded wait can.
+                Some(WaitResult::TimedOut) => {}
                 None => {}
             }
         }
@@ -968,9 +1013,45 @@ const INTERRUPT_CODE: u8 = 128 + 2;
 /// vocabulary for "interrupted". Inside the wait the two must stay apart, since
 /// a job is free to exit 130 on its own account and only one of the two means
 /// "stop waiting for the rest".
+/// Split a leading `--timeout <duration>` off a `wait` operand list, returning
+/// the rest and the deadline it names.
+///
+/// Both spellings, because a long flag that only takes one of them is the kind
+/// of thing a caller discovers by getting it wrong. `--` ends the flags, so a
+/// job reference that starts with a dash is still reachable.
+///
+/// The deadline is computed here, at the moment of the call, so every operand
+/// shares the one budget rather than each getting a fresh copy of it.
+fn split_timeout(args: &[String]) -> Result<(&[String], Option<std::time::Instant>), String> {
+    let mut rest = args;
+    let mut limit = None;
+    while let Some(first) = rest.first() {
+        let named = if let Some(value) = first.strip_prefix("--timeout=") {
+            rest = &rest[1..];
+            value.to_string()
+        } else if first == "--timeout" {
+            let Some(value) = rest.get(1) else {
+                return Err("--timeout needs a duration".to_string());
+            };
+            rest = &rest[2..];
+            value.clone()
+        } else if first == "--" {
+            rest = &rest[1..];
+            break;
+        } else {
+            break;
+        };
+        limit = Some(builtins::parse_duration(&named).ok_or(named)?);
+    }
+    Ok((rest, limit.map(|limit| std::time::Instant::now() + limit)))
+}
+
 enum Waited {
     Status(u8),
     Interrupted,
+    /// `--timeout` ran out. The job keeps running and keeps its place in the
+    /// table; only the wait ended.
+    TimedOut,
 }
 
 /// Run `words[0]` with `words[1..]` as arguments and return its exit status.
@@ -1690,8 +1771,9 @@ pub fn run_pipeline(
         }
     }
     let status = match result {
-        // As above: a foreground wait never sees a continue.
-        WaitResult::Continued => 0,
+        // As above: a foreground wait never sees a continue, and has no deadline
+        // to run out of either.
+        WaitResult::Continued | WaitResult::TimedOut => 0,
         WaitResult::Complete(status) => status,
         WaitResult::Stopped(status) => {
             if let Some(pgid) = foreground {
@@ -1756,6 +1838,10 @@ fn stage_seed(idx: usize, n: usize, background: bool, interactive: bool) -> Sour
 enum WaitResult {
     Complete(u8),
     Stopped(u8),
+    /// The deadline on a bounded wait passed with the job still running. Not a
+    /// status the job reported -- it has not reported one -- which is why this
+    /// is its own answer rather than a number stood in for it.
+    TimedOut,
     /// The job was continued by something other than this table's own `bg` —
     /// a `kill -CONT` from a pipeline stage, whose copy of the table dies with
     /// it, or anything outside the shell entirely.
@@ -1809,13 +1895,18 @@ enum OnInterrupt {
 }
 
 fn wait_outcomes(outcomes: &mut [Outcome]) -> WaitResult {
-    wait_outcomes_until(outcomes, OnInterrupt::Resume).expect("a resuming wait is never abandoned")
+    wait_outcomes_until(outcomes, OnInterrupt::Resume, None)
+        .expect("a resuming wait is never abandoned")
 }
 
 /// Wait for every process behind a job. `None` is a wait abandoned by SIGINT
 /// under [`OnInterrupt::Abandon`]; the processes it had not reached are still
 /// running, and their outcomes still say so.
-fn wait_outcomes_until(outcomes: &mut [Outcome], on_interrupt: OnInterrupt) -> Option<WaitResult> {
+fn wait_outcomes_until(
+    outcomes: &mut [Outcome],
+    on_interrupt: OnInterrupt,
+    deadline: Option<std::time::Instant>,
+) -> Option<WaitResult> {
     let _catcher = (on_interrupt == OnInterrupt::Abandon)
         .then(SigintCatcher::install)
         .flatten();
@@ -1824,9 +1915,15 @@ fn wait_outcomes_until(outcomes: &mut [Outcome], on_interrupt: OnInterrupt) -> O
     for outcome in &mut *outcomes {
         let (code, piped_out, did_stop, completed) = match outcome {
             Outcome::Running { pid, piped_out } => {
-                match wait_for_job(*pid, on_interrupt) {
+                match wait_for_job(*pid, on_interrupt, deadline) {
                     Ok((code, stopped)) => (code, *piped_out, stopped, !stopped),
                     Err(err) if err.kind() == ErrorKind::Interrupted => return None,
+                    // The deadline, not a status: leave the outcome untouched so
+                    // the job stays exactly as it was and a later wait can pick
+                    // it up where this one gave up.
+                    Err(err) if err.kind() == ErrorKind::TimedOut => {
+                        return Some(WaitResult::TimedOut);
+                    }
                     // Anything else is a wait that cannot be completed, which
                     // the caller has to be able to move past.
                     Err(_) => (1, *piped_out, false, true),
@@ -2091,7 +2188,7 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
         // `Resume`: the subshell holds the terminal, so a Ctrl-C goes to it and
         // this wait has nothing to give up on — the same reading a foreground
         // job's wait takes.
-        let (status, stopped) = match wait_for_job(pid, OnInterrupt::Resume) {
+        let (status, stopped) = match wait_for_job(pid, OnInterrupt::Resume, None) {
             Ok(waited) => waited,
             Err(error) => break Err(error),
         };
@@ -2123,7 +2220,11 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
 /// holds the terminal the signal went to the job, so the wait resumes, while a
 /// wait on a *background* job reports the interruption as `ErrorKind::Interrupted`
 /// for the caller to give up on.
-fn wait_for_job(pid: libc::pid_t, on_interrupt: OnInterrupt) -> std::io::Result<(u8, bool)> {
+fn wait_for_job(
+    pid: libc::pid_t,
+    on_interrupt: OnInterrupt,
+    deadline: Option<std::time::Instant>,
+) -> std::io::Result<(u8, bool)> {
     // Here rather than at the callers, because this is the only place that
     // blocks. Installed in `wait_outcomes_until` it covered pipelines and jobs
     // and missed `fork_and_wait`, which reaches this directly — so a `fork { … }`
@@ -2173,7 +2274,16 @@ fn wait_for_job(pid: libc::pid_t, on_interrupt: OnInterrupt) -> std::io::Result<
         // handled and forgotten — leaving this asleep with an undrained
         // transition behind it, so a long foreground wait collapses the arrival
         // order of everything that happened during it.
-        reaper::wait_for_change();
+        match deadline {
+            // `wait_for_change_until` reports whether a signal or the clock
+            // ended the sleep. Only the clock is terminal here: a spurious
+            // wake-up goes back round the loop and drains again.
+            Some(deadline) if !reaper::wait_for_change_until(deadline) => {
+                return Err(std::io::Error::from(ErrorKind::TimedOut));
+            }
+            Some(_) => {}
+            None => reaper::wait_for_change(),
+        }
     }
 }
 
