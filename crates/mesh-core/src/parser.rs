@@ -826,8 +826,32 @@ pub struct Guard {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pipeline {
-    pub stages: Vec<Command>,
+    pub stages: Vec<Stage>,
     pub pipe_stderr: Vec<bool>,
+}
+
+/// One stage of a `|` pipeline: an ordinary command, or a **compound statement**
+/// reading the pipe — `cmd | while line = gets() { … }`, `cmd | if … { … }`.
+///
+/// A compound is an [`Executable`] rather than a [`Command`] because that is what
+/// it already is everywhere else; making it a stage is about *where* one may
+/// appear, not a second spelling of it. Only the shapes that read or write a
+/// stream qualify — see [`Parser::compound_stage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stage {
+    Command(Command),
+    Compound(Box<Executable>),
+}
+
+impl Stage {
+    /// The command half, for the many callers that only have something to say
+    /// about words, redirections, or a guard.
+    pub fn as_command(&self) -> Option<&Command> {
+        match self {
+            Stage::Command(command) => Some(command),
+            Stage::Compound(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3057,7 +3081,13 @@ impl Parser<'_> {
     }
 
     fn pipeline(&mut self) -> Result<Pipeline, ParseError> {
-        let mut stages = vec![self.command()?];
+        // The first stage is a **command**, never a compound. Ordinarily the
+        // statement dispatcher settles that by taking `control-flow` before it
+        // ever looks for a pipeline — but `not` is consumed before this is
+        // called, so `not loop { … }` arrives here with the keyword still to
+        // read, and accepting it would build a lone compound stage that
+        // `run_single` has no way to run: the body silently never ran.
+        let mut stages = vec![Stage::Command(self.command()?)];
         let mut pipe_stderr = Vec::new();
         loop {
             let both = if self.eat(&TokenKind::PipeBoth).is_some() {
@@ -3072,12 +3102,61 @@ impl Parser<'_> {
                 return Err(self.eof(ParseErrorKind::UnexpectedEnd));
             }
             pipe_stderr.push(both);
-            stages.push(self.command()?);
+            stages.push(self.stage()?);
         }
         Ok(Pipeline {
             stages,
             pipe_stderr,
         })
+    }
+
+    /// One stage: a **compound statement** where one is spelled, an ordinary
+    /// command otherwise.
+    ///
+    /// The compound is read by the same parser that reads it at statement level,
+    /// so its body, `else` arms and continuation rules are the ones it always had
+    /// — a stage is a *position* it may now appear in, not a second grammar.
+    fn stage(&mut self) -> Result<Stage, ParseError> {
+        if let Some(compound) = self.compound_stage()? {
+            return Ok(Stage::Compound(Box::new(compound)));
+        }
+        self.command().map(Stage::Command)
+    }
+
+    /// The compound statement leading this stage, if one does.
+    ///
+    /// The same five shapes the statement dispatcher reads, and read by the same
+    /// functions — a stage is a new *position* for them, not a new grammar. A
+    /// keyword here is unambiguous for the reason it is at statement level: it
+    /// leads the stage, so there are no items in front of it for an `if` to be a
+    /// [guard](Guard) on.
+    ///
+    /// `fork` and `with` are left out deliberately. Both are already contextual —
+    /// a command of either name has to stay reachable — and `fork` is a subshell,
+    /// which is what a piped stage already was.
+    fn compound_stage(&mut self) -> Result<Option<Executable>, ParseError> {
+        // An attached `:modifier` outranks the keyword, the rule `command` already
+        // follows for a guard: `puts x | while:upper` names a command, and reading
+        // it as a loop turned a "command not found" into a syntax error.
+        if self.carries_attached_modifier() {
+            return Ok(None);
+        }
+        if self.word("if") {
+            return self.if_expr().map(|node| Some(Executable::If(node)));
+        }
+        if self.word("match") {
+            return self.match_expr().map(|node| Some(Executable::Match(node)));
+        }
+        if self.word("for") {
+            return self.for_expr().map(Some);
+        }
+        if self.word("while") {
+            return self.while_expr().map(Some);
+        }
+        if self.word("loop") {
+            return self.loop_expr().map(Some);
+        }
+        Ok(None)
     }
 
     fn command(&mut self) -> Result<Command, ParseError> {
@@ -3592,7 +3671,7 @@ impl Parser<'_> {
                 statements: vec![Statement {
                     and_or: AndOr {
                         first: Executable::Pipeline(Pipeline {
-                            stages: vec![command],
+                            stages: vec![Stage::Command(command)],
                             pipe_stderr: Vec::new(),
                         }),
                         rest: Vec::new(),
@@ -7077,6 +7156,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_compound_statement_as_a_pipeline_stage() {
+        let tree = complete("cmd | while line = gets() { puts $line }");
+        let Executable::Pipeline(pipeline) = &tree.statements[0].and_or.first else {
+            panic!("expected a pipeline")
+        };
+        assert_eq!(pipeline.stages.len(), 2);
+        assert!(matches!(pipeline.stages[0], Stage::Command(_)));
+        let Stage::Compound(body) = &pipeline.stages[1] else {
+            panic!("expected the last stage to be a compound statement")
+        };
+        assert!(matches!(**body, Executable::While { .. }));
+
+        // All five shapes the statement dispatcher reads, in stage position.
+        for source in [
+            "cmd | if true { puts x }",
+            "cmd | match 1 { 1 => { puts x } }",
+            "cmd | for i in [1] { puts $i }",
+            "cmd | while false { puts x }",
+            "cmd | loop { break }",
+        ] {
+            let tree = complete(source);
+            let Executable::Pipeline(pipeline) = &tree.statements[0].and_or.first else {
+                panic!("expected a pipeline for {source:?}")
+            };
+            assert!(
+                matches!(pipeline.stages[1], Stage::Compound(_)),
+                "{source:?} did not parse its last stage as a compound"
+            );
+        }
+
+        // `fork` and `with` stay out: both are contextual words, so a command of
+        // either name has to remain reachable in stage position.
+        let tree = complete("cmd | with x");
+        let Executable::Pipeline(pipeline) = &tree.statements[0].and_or.first else {
+            panic!("expected a pipeline")
+        };
+        assert!(matches!(pipeline.stages[1], Stage::Command(_)));
+    }
+
+    #[test]
     fn parses_the_wrapper_marker_only_before_func() {
         // Contextual, like `fork`: the word leads a definition only where `func`
         // follows it, so an ordinary command or assignment of that name is
@@ -7109,6 +7228,8 @@ mod tests {
             panic!("expected a pipeline")
         };
         pipeline.stages[0]
+            .as_command()
+            .expect("a command stage")
             .items
             .iter()
             .map(|item| match item {
@@ -7554,6 +7675,8 @@ mod tests {
             panic!()
         };
         let words: Vec<_> = pipeline.stages[0]
+            .as_command()
+            .expect("a command stage")
             .items
             .iter()
             .map(|item| match item {
@@ -7573,7 +7696,10 @@ mod tests {
         };
         let CommandItem::Redirect {
             body: Some(body), ..
-        } = &pipeline.stages[0].items[1]
+        } = &pipeline.stages[0]
+            .as_command()
+            .expect("a command stage")
+            .items[1]
         else {
             panic!()
         };
@@ -7746,7 +7872,14 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(pipeline.stages[0].items.len(), 2);
+        assert_eq!(
+            pipeline.stages[0]
+                .as_command()
+                .expect("a command stage")
+                .items
+                .len(),
+            2
+        );
         assert!(!tree.statements[0].background);
     }
 
@@ -7757,8 +7890,21 @@ mod tests {
             let Executable::Pipeline(pipeline) = statement.and_or.first else {
                 panic!()
             };
-            assert_eq!(pipeline.stages[0].items.len(), 2);
-            assert!(pipeline.stages[0].guard.is_none());
+            assert_eq!(
+                pipeline.stages[0]
+                    .as_command()
+                    .expect("a command stage")
+                    .items
+                    .len(),
+                2
+            );
+            assert!(
+                pipeline.stages[0]
+                    .as_command()
+                    .expect("a command stage")
+                    .guard
+                    .is_none()
+            );
         }
     }
 

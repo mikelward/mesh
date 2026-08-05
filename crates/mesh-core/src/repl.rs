@@ -3140,12 +3140,19 @@ fn commit_bindings(bindings: Vec<(String, Value)>, vars: &mut Vars) {
 struct Stage<'a> {
     /// The stage's words, still **parsed**: a value in one is evaluated by the
     /// code that expands that word, in word order — see [`expand_stage`].
+    ///
+    /// Empty for a [compound](Stage::compound) stage, which names no command.
     words: Vec<parser::Word>,
     redirs: Vec<Redir>,
     pipe_stderr: bool,
     /// The `NAME=value …` prefix in front of this stage, applied around it and
     /// restored after. Per stage, so `FOO=1 a | FOO=2 b` gives each its own.
     env: &'a [parser::EnvBinding],
+    /// A **compound statement** standing where a command would — the `while` of
+    /// `cmd | while line = gets() { … }`. It runs through the ordinary executor,
+    /// so its body, `break`/`continue`, and status are the ones it has anywhere
+    /// else; being a stage only says where its input comes from.
+    compound: Option<&'a parser::Executable>,
 }
 
 struct Redir {
@@ -3182,7 +3189,23 @@ fn run_ast_pipeline(
     shell: &mut Shell,
 ) -> Step {
     let mut stages = Vec::with_capacity(node.stages.len());
-    for (index, command) in node.stages.iter().enumerate() {
+    for (index, stage) in node.stages.iter().enumerate() {
+        // A compound stage names no command, so none of the word, prefix and
+        // redirection reading below applies to it: it carries its own body and is
+        // run by the ordinary executor once its stdin is wired up.
+        let command = match stage {
+            parser::Stage::Command(command) => command,
+            parser::Stage::Compound(body) => {
+                stages.push(Stage {
+                    words: Vec::new(),
+                    redirs: Vec::new(),
+                    pipe_stderr: node.pipe_stderr.get(index).copied().unwrap_or(false),
+                    env: &[],
+                    compound: Some(body),
+                });
+                continue;
+            }
+        };
         match guard_allows(command.guard.as_ref(), last, false, shell) {
             Ok(true) => {}
             // Skipped entirely, as for a guarded expression or control word: it
@@ -3311,6 +3334,7 @@ fn run_ast_pipeline(
             redirs,
             pipe_stderr: node.pipe_stderr.get(index).copied().unwrap_or(false),
             env: &command.env,
+            compound: None,
         });
     }
     run_pipeline(stages, background, last, in_function, shell)
@@ -6489,11 +6513,11 @@ fn eval_value_body(
         && let parser::Executable::Pipeline(parser::Pipeline { stages, .. }) =
             &statement.and_or.first
         && let [
-            parser::Command {
+            parser::Stage::Command(parser::Command {
                 items,
                 guard: None,
                 env,
-            },
+            }),
         ] = stages.as_slice()
         && env.is_empty()
         && let [parser::CommandItem::Word(word)] = items.as_slice()
@@ -6920,6 +6944,14 @@ fn run_single(
         redirs,
         pipe_stderr: _,
         env,
+        // A compound *can* reach here, by one route: a false postfix guard
+        // removing every command stage around it, as in
+        // `puts X if false | if true { … }`. Discarding it is right rather than
+        // accidental — that guard skips the whole pipeline, and a surviving
+        // **command** does not run either (`puts X if false | puts SURVIVOR`
+        // prints nothing). Running the compound here would make it the one kind
+        // of stage a guard could not switch off.
+        compound: _,
     } = stage;
     // A one-stage command may run in the shell itself — a builtin, a function, an
     // assignment — so its prefix is applied here and put back after, rather than
@@ -6940,6 +6972,7 @@ fn run_single(
                     redirs,
                     pipe_stderr: false,
                     env: &[],
+                    compound: None,
                 },
                 background,
                 last,
@@ -7199,7 +7232,25 @@ fn run_multi(
             redirs,
             pipe_stderr,
             env,
+            compound,
         } = stage;
+        if let Some(body) = compound {
+            cmds.push(exec::Cmd {
+                // Named for a job listing and for anything that reports the stage
+                // by name; a compound has no command word of its own.
+                words: vec![compound_stage_word(body).to_owned()],
+                redirs: Vec::new(),
+                pipe_stderr,
+                in_shell: true,
+                // Nothing to `exec` here — a compound is the shell's own syntax —
+                // so the last one runs in the shell and keeps what it binds, which
+                // is the whole reason for wanting a loop as a stage.
+                may_run_in_shell: true,
+                env: Vec::new(),
+            });
+            bodies.push(StageBody::Compound(Box::new(body.clone())));
+            continue;
+        }
         // A stage carrying a value expands in its **own** fork, not here: a call in
         // one of its arguments belongs to the stage, and this process is not it.
         // Every stage of a pipeline forks, so every one of them can defer.
@@ -7294,6 +7345,15 @@ fn run_multi(
 
 /// What an in-shell stage runs, kept beside the `exec::Cmd` describing it.
 enum StageBody {
+    /// A **compound statement** standing where a command would — the `while` of
+    /// `cmd | while line = gets() { … }`. Run by the ordinary executor, so its
+    /// body, `break`/`continue` and status are the ones it has anywhere else;
+    /// being a stage only decides where its stdin comes from.
+    ///
+    /// Owned rather than borrowed because the bodies outlive the borrow of the
+    /// parse tree that `run_multi` holds. A compound body is small beside the
+    /// work of running it.
+    Compound(Box<parser::Executable>),
     /// An external program: `exec` runs it, there is no in-shell body.
     External,
     /// A builtin, run from the stage's expanded words.
@@ -7338,6 +7398,21 @@ enum StageBody {
         /// the command, as they are for [`Self::Builtin`].
         call: Option<Vec<(Value, bool)>>,
     },
+}
+
+/// The word a compound stage is listed and reported under — its leading keyword,
+/// which is what someone reading `jobs` or a diagnostic would have written.
+fn compound_stage_word(node: &parser::Executable) -> &'static str {
+    match node {
+        parser::Executable::If(_) => "if",
+        parser::Executable::Match(_) => "match",
+        parser::Executable::For { .. } => "for",
+        parser::Executable::While { .. } => "while",
+        parser::Executable::Loop { .. } => "loop",
+        // `compound_stage` reads no other shape, so this is unreachable rather
+        // than a default worth inventing a name for.
+        _ => "compound",
+    }
 }
 
 /// Why a stage was deferred, which is also what it says when its words turn out to
@@ -7430,6 +7505,9 @@ fn run_stages(
             StageBody::Deferred { words, .. } => {
                 words.first().is_some_and(|word| word.is_bare_text("jobs"))
             }
+            // Conservatively, like a function: a compound body can reach `jobs`
+            // and is not statically knowable.
+            StageBody::Compound(_) => true,
             StageBody::External => false,
             // The bound changes nothing about *what* the stage runs, so it
             // answers exactly as the unbounded form does.
@@ -7487,6 +7565,58 @@ fn run_stage_in_shell(
     let outer_stage_here = shell.in_stage_here;
     shell.in_stage_here = !forked;
     let step = match body {
+        StageBody::Compound(node) => {
+            let step = run_executable(node, false, last, in_function, shell);
+            // A stage's result is its **status**, never the value its body
+            // happened to yield. Left as `Produced::Value`, an `if` arm ending in
+            // `42` made `func f() { cmd | if true { 42 } }` return 42 from the
+            // *last* stage while the same body behind a `| cat` returned the
+            // pipeline status — a typed value crossing a boundary that only a
+            // status can cross, and doing it only in the position that happens
+            // not to fork.
+            shell.produced = Produced::Status;
+            // A `return` inside the body would unwind the enclosing *function*,
+            // which a stage must not do. An earlier stage is a forked process
+            // where the unwind cannot cross at all, so letting the last one
+            // through would make the same loop mean different things depending on
+            // where it sits — and collapsing it to a status silently dropped it,
+            // leaving the function to run on past its own `return`. Refused in the
+            // same terms as a directly spelled `return` stage.
+            // `break` and `continue` escape by a different route than `return`:
+            // they are left on `shell.control` rather than carried in the step. A
+            // compound's *own* loop consumes its own, so anything still set here
+            // was aimed at a loop outside the stage — and that unwind is refused
+            // for the reason `return` is. `loop { puts x | if true { break } }`
+            // otherwise broke the caller's loop from inside a pipeline, while the
+            // same stage with `| cat` after it did not, since the fork swallowed
+            // it: the same code meaning different things by position.
+            let escaping = match shell.control {
+                Some(parser::ControlKind::Break) => Some("break"),
+                Some(parser::ControlKind::Continue) => Some("continue"),
+                _ => None,
+            };
+            if let Some(word) = escaping {
+                // Cleared either way: the marker must not cross the boundary.
+                shell.control = None;
+                // Only a *successful* step is an escape. A `break` with no
+                // enclosing loop has already been reported by `run_executable`
+                // — `break: not inside a loop`, `Step::Error(1)` — and adding
+                // the boundary refusal on top contradicted it, telling the user
+                // two different things about one statement and reporting 2 where
+                // the same `break` outside a pipeline reports 1.
+                if matches!(step, Step::Continue(_)) {
+                    note!("mesh: {word}: cannot be used in a pipeline");
+                    Step::Error(2)
+                } else {
+                    step
+                }
+            } else if matches!(step, Step::Return(..)) {
+                note!("mesh: {}", Deferred::Piped.returning());
+                Step::Error(2)
+            } else {
+                step
+            }
+        }
         StageBody::Function(args) => dispatch_function_call(&cmd.words[0], args.clone(), shell),
         // Not `builtins::dispatch`: `jobs`, `fg`, `bg`, and the prompt builtins
         // are dispatched by the shell, and would otherwise fall through to an
@@ -8398,6 +8528,10 @@ fn run_bounded_stage(
                     redirs,
                     pipe_stderr: false,
                     env: &[],
+                    // `timeout` wraps the *words* it was given, which are a
+                    // command by construction — a compound statement is never
+                    // one of its operands.
+                    compound: None,
                 },
                 false,
                 last,
@@ -11406,6 +11540,10 @@ fn command_words(line: &str) -> Option<Vec<String>> {
     let words: Vec<String> = pipeline
         .stages
         .last()?
+        // A compound stage names no command, so there is nothing to complete
+        // against — its body's own commands are completed when the cursor is in
+        // one of them, which is a different pipeline to this.
+        .as_command()?
         .items
         .iter()
         .filter_map(|item| match item {
@@ -16004,7 +16142,11 @@ mod tests {
         let parser::Executable::Pipeline(pipeline) = &source.statements[0].and_or.first else {
             panic!("source should contain a pipeline");
         };
-        let parser::CommandItem::Word(word) = &pipeline.stages[0].items[1] else {
+        let parser::CommandItem::Word(word) = &pipeline.stages[0]
+            .as_command()
+            .expect("a command stage")
+            .items[1]
+        else {
             panic!("second command item should be a word");
         };
         let mut shell = Shell::new();
