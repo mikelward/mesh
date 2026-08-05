@@ -9810,6 +9810,97 @@ fn a_last_stage_forks_again_under_job_control() {
     assert!(stderr.contains("line: unbound variable"), "{stderr:?}");
 }
 
+/// A write that fails at the **flush** is reported, and its bytes never reach the
+/// descriptor the redirection was hiding.
+///
+/// Buffered output is only handed to the target when the buffer is emptied, which
+/// for a short `print` is at the end of the command — after the failure would have
+/// been noticed, and just before the shell's own stdout is put back. Ignoring that
+/// flush lost both halves: the write error went unreported, and the bytes were
+/// still in the buffer to be flushed onto the terminal a moment later.
+#[test]
+fn a_failed_flush_is_reported_rather_than_leaking_to_the_shell() {
+    // `/dev/full` takes the open and fails every write, which is what a buffered
+    // `print` does not discover until the flush.
+    let out = run_with_input("print x > /dev/full\nputs \"status=$sh.status\"\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The bytes stay off the shell's own stdout — before, `x` was still in the
+    // buffer at the restore and arrived here, giving `xstatus=0`.
+    assert_eq!(stdout, "status=1\n", "{stdout:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("/dev/full"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Same again with the write coming from a stage running in the shell, which
+    // reaches the restore by the other path.
+    let out = run_with_input("puts hi | print x > /dev/full\nputs \"status=$sh.status\"\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout, "status=1\n", "{stdout:?}");
+
+    // A redirection that works is unchanged: the output still goes to the file,
+    // and nothing is reported.
+    let dir = fresh_dir("flush_ok");
+    let target = dir.join("out");
+    let out = run_with_input(&format!(
+        "print x > {}\nputs \"status=$sh.status\"\n",
+        target.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=0\n");
+    assert_eq!(std::fs::read_to_string(&target).expect("read target"), "x");
+}
+
+/// The shell's own undeliverable output never lands in a stage's redirection.
+///
+/// The flush *before* the swap is the other half of the one above. Buffered bytes
+/// belong to the stdout they were written for; if they cannot be delivered there,
+/// installing the stage's descriptors on top leaves them in the buffer for the
+/// restore-side flush to drain — into the stage's target, as though the shell's
+/// earlier output had been the stage's own. `fork_stage` already refused a fork
+/// on this, for the same reason.
+#[test]
+fn stale_shell_output_does_not_contaminate_a_stage_redirection() {
+    let dir = fresh_dir("stale_stdout");
+    let target = dir.join("out");
+    // `exec > /dev/full` leaves the shell's stdout undeliverable, and `print`
+    // writes without a newline, so `x` is still buffered when the pipeline runs.
+    let out = run_with_input(&format!(
+        "exec > /dev/full\nprint x\nputs hi | print y > {}\n",
+        target.display()
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("flushing stdout"), "{stderr:?}");
+    // Before, this held `xy` — the shell's stranded byte ahead of the stage's.
+    let written = std::fs::read_to_string(&target).unwrap_or_default();
+    assert_eq!(written, "", "stage target contaminated: {written:?}");
+}
+
+/// Draining a failed flush puts fd 1 back where it found it.
+///
+/// The drain covers stdout with `/dev/null` to empty a buffer that cannot be
+/// delivered. Undoing that cannot be left to the caller's restore, which only
+/// knows the targets it saved: a redirection that never touched stdout — here
+/// `2> err` — would leave the shell writing to `/dev/null` for the rest of the
+/// session, with every later write silently succeeding.
+#[test]
+fn draining_a_failed_flush_does_not_strand_the_shells_stdout() {
+    let dir = fresh_dir("drain_restore");
+    let err = dir.join("err");
+    let out = run_with_input(&format!(
+        "exec > /dev/full\nprint x 2> {}\nputs marker\n",
+        err.display()
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // `puts marker` comes *after* the drain. Before, stdout was left on
+    // `/dev/null`, so it wrote nowhere and reported success; now it still finds
+    // `/dev/full` underneath and says so.
+    assert!(
+        stderr.contains("puts:") && stderr.contains("No space left on device"),
+        "later write did not reach the real stdout: {stderr:?}"
+    );
+}
+
 /// The status and `$sh.pipestatus` are unchanged by where the stage ran.
 #[test]
 fn a_last_stage_in_the_shell_still_reports_its_status() {
