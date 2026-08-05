@@ -4830,10 +4830,15 @@ command's lifetime, `wait` only **observes** a job someone else started.
       entries answer the question differently rather than picking one convention
       for both.
 
-Neither needs **polling**. A bounded wait is the reap this shell already does
-with a deadline on it — `waitpid` with a timeout, or a timed wait on the job
-table's condvar. The polling in this area belongs to fish, which has no way to
-avoid it (see `docs/COMPARISON.md`).
+Neither needs **polling**, and neither wants a blocking `waitpid` — POSIX gives
+it no timeout parameter, and this shell deliberately stopped calling it that way:
+reaping lives behind one owner fed by `SIGCHLD`, precisely so a signal arriving
+between draining and sleeping cannot leave an undrained transition behind. A
+bounded wait is a **timed wait on that owner's state** — the same wait-for-change
+the job table already offers, given a deadline. Reintroducing a blocking
+`waitpid` here would walk back into the race the reaper was built to avoid. The
+polling in this area belongs to fish, which has no way to avoid it (see
+`docs/COMPARISON.md`).
 
 - [ ] **A way to background without the notice** — `$sh.options.job-notify`
       alongside `command-notify`, a quiet background operator, or backgrounding
