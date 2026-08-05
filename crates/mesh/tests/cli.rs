@@ -1487,7 +1487,7 @@ fn a_builtin_and_a_function_read_flags_the_same_way() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "[--help]\n['--', 'x']\n['a', 'b']\n[--help]\n"
+        "[--help]\n[--, 'x']\n['a', 'b']\n[--help]\n"
     );
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 
@@ -16682,7 +16682,7 @@ fn a_wrapper_func_forwards_the_terminator_too() {
     let out = run_with_input("wrapper func g(...xs) { puts $xs:repr }\ng -- --x\ng a -- b\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "['--', --x]\n['a', '--', 'b']\n"
+        "[--, --x]\n['a', --, 'b']\n"
     );
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 }
@@ -16735,7 +16735,7 @@ fn a_wrapper_func_forwards_flags_in_a_value_call_too() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "[--color='never', '--', --help]\n"
+        "[--color='never', --, --help]\n"
     );
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 }
@@ -29145,5 +29145,47 @@ fn a_flag_renders_as_bytes_but_is_not_a_string() {
         String::from_utf8_lossy(&appended.stderr).contains("cannot append"),
         "{:?}",
         appended.stderr
+    );
+}
+
+/// The flag terminator is a **value that travels**, not syntax consumed where it
+/// is written. That is what lets a wrapper forward one — `r -- -rf` has to reach
+/// `rm` as `["rm", "--", "-rf"]` — without mesh ever synthesizing a `--` of its
+/// own, which it must not do: it has one insertion point, not every command
+/// implements the convention, and guessing the callee's grammar is the overreach
+/// `wrapper func` already ruled out.
+#[test]
+fn the_flag_terminator_is_a_value_of_its_own() {
+    // `:repr` is where the type shows: `--` against the string's `'--'`, the same
+    // round-trip rule that keeps `42` and `'42'` apart. Read back through a
+    // binding because `puts --` would strip its own terminator.
+    let written = run_with_input("x = --\nr = $x:repr\nputs \"[$r]\"\n");
+    assert_eq!(String::from_utf8_lossy(&written.stdout), "[--]\n");
+
+    let quoted = run_with_input("y = \"--\"\nr = $y:repr\nputs \"[$r]\"\n");
+    assert_eq!(String::from_utf8_lossy(&quoted.stdout), "['--']\n");
+
+    // It ends flag parsing where the *string* no longer can — a computed `"--"`
+    // terminating would put back the data-decides-the-call reading the whole
+    // family removes.
+    let ends = run_with_input("func f(--force, ...rest) { puts \"force=$force\" }\nf -- --force\n");
+    assert_eq!(String::from_utf8_lossy(&ends.stdout), "force=false\n");
+
+    let computed = run_with_input(
+        "func f(--force, ...rest) { puts \"force=$force\" }\nw = \"--\"\nf $w --force\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&computed.stdout), "force=true\n");
+
+    // And it stops the `--help` search, so a function is handed the word as data
+    // rather than answering with its own generated help.
+    let help = run_with_input("func show(value) { puts \"<$value>\" }\nshow -- --help\n");
+    assert_eq!(String::from_utf8_lossy(&help.stdout), "<--help>\n");
+
+    // A terminator is not a flag, so the cast refuses it rather than building one.
+    let cast = run_with_input("puts \"--\":flag\n");
+    assert!(
+        String::from_utf8_lossy(&cast.stderr).contains("is the flag terminator, not a flag"),
+        "{:?}",
+        cast.stderr
     );
 }

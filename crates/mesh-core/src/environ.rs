@@ -210,6 +210,7 @@ fn serialize(key: &str, value: Value) -> Result<String, String> {
         // The environment carries bytes and a flag has them, so it crosses as
         // the word it was written with -- the argv rule, one boundary over.
         Value::Flag(flag) => flag.text(),
+        Value::FlagTerminator => "--".to_owned(),
         Value::List(entries) if is_path_var(key) => join_path(key, entries)?,
         Value::List(_) => {
             return Err(format!(

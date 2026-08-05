@@ -3502,6 +3502,8 @@ fn expansion_word(
 fn interpolated_value(value: Value) -> Result<Value, Step> {
     let kind = match value {
         Value::String(_) => return Ok(value),
+        // Its text, as at every other byte boundary.
+        Value::FlagTerminator => return Ok(Value::String("--".into())),
         // Its *text*, not itself. Returning the styled value unchanged let it stay
         // styled when it was the word's only piece, so `x = "${style(…)}"` kept
         // attributes that `x = "$styled"` and `x = "pre${…}"` both drop — the same
@@ -4330,7 +4332,8 @@ fn eval_expr(
                     | Value::Stream(_)
                     | Value::Job(_)
                     | Value::Function(_)
-                    | Value::Flag(_) => runtime_error("cannot slice a scalar value"),
+                    | Value::Flag(_)
+                    | Value::FlagTerminator => runtime_error("cannot slice a scalar value"),
                     Value::Map(_) => runtime_error("cannot slice a map value"),
                 };
             }
@@ -4363,7 +4366,8 @@ fn eval_expr(
                 | Value::Stream(_)
                 | Value::Job(_)
                 | Value::Function(_)
-                | Value::Flag(_) => runtime_error("cannot index a scalar value"),
+                | Value::Flag(_)
+                | Value::FlagTerminator => runtime_error("cannot index a scalar value"),
                 Value::Map(entries) => {
                     let key = match index_value {
                         Value::String(key) => key,
@@ -5456,6 +5460,7 @@ pub(crate) fn value_kind(value: &Value) -> &'static str {
     match value {
         Value::String(_) => "a string",
         Value::Flag(_) => "a flag",
+        Value::FlagTerminator => "the flag terminator",
         // Named as a string, because that is what it behaves as everywhere a
         // diagnostic is talking about: only a renderer sees the difference.
         Value::Styled(_) => "a string",
@@ -6120,6 +6125,9 @@ fn argv_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
         Value::String(text) => Ok(vec![text.clone()]),
         // A flag reaching an external is bytes -- mesh parses none of its flags.
         Value::Flag(flag) => Ok(vec![flag.text()]),
+        // And a terminator crosses as the word the caller wrote, which is what
+        // makes `r -- -rf` forward to `["rm", "--", "-rf"]`.
+        Value::FlagTerminator => Ok(vec!["--".to_owned()]),
         // An external takes bytes, so the text crosses and the attributes do not.
         Value::Styled(styled) => Ok(vec![styled.text.clone()]),
         Value::Integer(number) => Ok(vec![number.to_string()]),
@@ -6775,6 +6783,7 @@ fn type_phrase(value: &Value) -> &'static str {
     match value {
         Value::String(_) | Value::Styled(_) => "a string",
         Value::Flag(_) => "a flag",
+        Value::FlagTerminator => "the flag terminator",
         Value::Integer(_) => "an int",
         Value::Boolean(_) => "a bool",
         Value::List(_) => "a list",
@@ -6890,6 +6899,7 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
                 | Value::Regex(_)
                 | Value::Glob(_)
                 | Value::Flag(_)
+                | Value::FlagTerminator
                 | Value::Stream(_)
                 | Value::Job(_)
                 | Value::Function(_),
@@ -8964,7 +8974,13 @@ fn auto_help_requested(args: &[(Value, bool)]) -> bool {
     };
     args.iter()
         .map(|(arg, _)| arg)
-        .take_while(|arg| !matches!(arg, Value::String(value) if value == "--"))
+        // A written `--` is a terminator *value* now, so the search stops on one
+        // of those. The string still stops it too, for a computed `"--"` that
+        // reached here through the call-site scan.
+        .take_while(|arg| {
+            !matches!(arg, Value::FlagTerminator)
+                && !matches!(arg, Value::String(value) if value == "--")
+        })
         .any(is_help)
 }
 
@@ -10164,6 +10180,12 @@ fn bind_arguments(
         // than re-deriving the intent from its characters — the one source of
         // truth the type exists for. The string scan below still runs, for a
         // spread element and for a computed word.
+        // A terminator *value* ends flag parsing, where the string `"--"` no
+        // longer can — that is the whole point of it being a type.
+        if flags_enabled && !flags_ended && matches!(arg, Value::FlagTerminator) {
+            flags_ended = true;
+            continue;
+        }
         if flags_enabled
             && !flags_ended
             && let Value::Flag(flag) = &arg
@@ -10174,17 +10196,11 @@ fn bind_arguments(
         if flags_enabled
             && !flags_ended
             && let Value::String(text) = &arg
+            && let Some(body) = text.strip_prefix("--")
+            && !body.is_empty()
         {
-            if text == "--" {
-                flags_ended = true;
-                continue;
-            }
-            if let Some(body) = text.strip_prefix("--")
-                && !body.is_empty()
-            {
-                bind_dashed_option(name, params, body, bare, &mut switches_on, &mut flag_values)?;
-                continue;
-            }
+            bind_dashed_option(name, params, body, bare, &mut switches_on, &mut flag_values)?;
+            continue;
         }
         positional_values.push(arg);
     }
@@ -10378,7 +10394,10 @@ fn evaluate_value_arguments<'p>(
                 if flags_enabled
                     && !flags_ended
                     && written_dashed
-                    && !matches!(value, Value::String(_) | Value::Flag(_))
+                    && !matches!(
+                        value,
+                        Value::String(_) | Value::Flag(_) | Value::FlagTerminator
+                    )
                 {
                     // The flag itself is checked first. An undeclared name or a
                     // switch is a mistake in the line the reader wrote, where the
@@ -10491,6 +10510,10 @@ fn scan_call_value<'p>(
     switches_on: &mut std::collections::HashSet<&'p str>,
     flag_values: &mut std::collections::HashMap<&'p str, Value>,
 ) -> Result<(), Step> {
+    if flags_enabled && !*flags_ended && matches!(value, Value::FlagTerminator) {
+        *flags_ended = true;
+        return Ok(());
+    }
     if flags_enabled
         && !*flags_ended
         && let Value::Flag(flag) = &value
@@ -10502,16 +10525,10 @@ fn scan_call_value<'p>(
         && !*flags_ended
         && dashes_are_flags
         && let Value::String(text) = &value
+        && let Some(body) = text.strip_prefix("--")
+        && !body.is_empty()
     {
-        if text == "--" {
-            *flags_ended = true;
-            return Ok(());
-        }
-        if let Some(body) = text.strip_prefix("--")
-            && !body.is_empty()
-        {
-            return bind_dashed_option(name, params, body, bare, switches_on, flag_values);
-        }
+        return bind_dashed_option(name, params, body, bare, switches_on, flag_values);
     }
     positionals.push(value);
     Ok(())
