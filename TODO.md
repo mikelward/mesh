@@ -2141,6 +2141,35 @@ designed, and the cross-references say where the fuller note lives.
       per line makes the brackets pure framing — that is `:repr` pretty-printed,
       which is better pursued in `:repr` than by making `puts` a format.
 
+- [ ] **Pretty-print `:repr` — line breaks and indentation for a nested value.**
+      *(mikelward)* `:repr` writes the mesh source you would have typed and
+      recurses all the way down, but it writes it on **one line**:
+      `['a': ['b': [1, 2]]]`. That is exactly right for pasting back and for
+      comparing two values, and it stops being readable at the size where you most
+      want to read it — a whole `$env`, a config map, anything a few levels deep.
+
+      A broken-out form is the bracketed shape weighed against `puts` above, and it
+      belongs here rather than there: `:repr` already quotes and escapes, so unlike
+      `puts` it can add line breaks without the layout ever becoming load-bearing —
+      the brackets and commas still say where each value starts and ends, and the
+      result still round-trips. Roughly:
+
+      ```
+      ['a': ['b': [1, 2]],
+       'c': 3]
+      ```
+
+      or one element per line with a two-space indent, matching what `puts` now
+      does for nesting. Things to settle: whether it is the default for `:repr` or a
+      second modifier (`:pretty`, say) with `:repr` staying single-line and
+      paste-safe; whether a short value stays on one line and what "short" is; and
+      whether the indent unit matches `puts`'s two spaces, which it should unless
+      there is a reason not to.
+
+      Worth checking against the `puts` rendering when it lands: the two are the
+      **read it** and **read it back** halves of the same job, and they should not
+      disagree about indentation for no reason.
+
 - [x] **A modifier chain in `"…"` is dropped when punctuation abuts it**
       *(landed — the name now stops at the first character that cannot be in one;
       the command-word half was already fixed by the binding work, so
