@@ -54,6 +54,66 @@ pub enum Value {
     /// Boxed because it is the largest payload by some way and every `Value`
     /// would otherwise grow to hold it.
     Styled(Box<StyledValue>),
+    /// An **option**, decided where it is written: `x = --force` binds one where
+    /// `a = "--force"` binds the string. Before this, both bound `'--force'` and
+    /// every consumer had to re-derive intent from the characters, which is what
+    /// made `f $w` bind an option because `$w` happened to hold `--sleep=0`.
+    ///
+    /// Decidability moves rather than disappearing — you cannot tell from `f $x`
+    /// what `$x` is, you tell from the line that made it, exactly as `x = 7` and
+    /// `x = 007` already differ.
+    ///
+    /// It **renders** at the argv and interpolation boundaries without **being**
+    /// text, which puts it with `Integer` rather than with `Styled`: `as_text`
+    /// answers only for values that *are* text, so a flag falls through to the
+    /// variant arms and `$x == "--force"` lands where `1 == "1"` does.
+    Flag(FlagValue),
+}
+
+/// An option and, when it was written with one, its value.
+///
+/// `--force` and `--tag=v2` are one type in two states. The payload is captured
+/// at **construction**, so `w = alpha; x = --tag=$w; w = beta` leaves `$x`
+/// holding `alpha` — the same rule `g = *.md` already follows with its matches.
+///
+/// A bare flag has **no** payload rather than a boolean one: `--force` and
+/// `--force=true` are different flags and have to render as themselves.
+/// `--force` ≡ `force: true` is what the flag means once it *binds to a switch*,
+/// produced at the binding rather than stored here.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FlagValue {
+    /// The option name without its leading dashes — `force` for `--force`.
+    pub name: String,
+    /// The attached value, keeping the written word's own type, so `--n=2` holds
+    /// the integer `2` and `--n="2"` a string. One scalar: a list payload is
+    /// refused at construction, where the diagnostic can point at the line that
+    /// made the mistake.
+    pub value: Option<Box<Value>>,
+}
+
+impl FlagValue {
+    /// The text this flag was written with — `--force`, `--tag=v2`. What reaches
+    /// argv and what an interpolation renders.
+    ///
+    /// The payload renders as the same bytes it would have contributed on its
+    /// own, which is why the type this keeps is invisible here and visible in
+    /// [`Value::repr`]: `--n=2` and `--n="2"` send identical bytes and write
+    /// different literals.
+    pub fn text(&self) -> String {
+        let Some(value) = &self.value else {
+            return format!("--{}", self.name);
+        };
+        // A payload is a scalar — construction refuses anything else — so every
+        // arm here has a byte form and none can fail.
+        let rendered = match value.as_ref() {
+            Value::String(text) => text.clone(),
+            Value::Styled(styled) => styled.text.clone(),
+            Value::Integer(number) => number.to_string(),
+            Value::Boolean(boolean) => boolean.to_string(),
+            other => unreachable!("a flag payload is a scalar, not {other:?}"),
+        };
+        format!("--{}={rendered}", self.name)
+    }
 }
 
 /// Equality is **hand-written rather than derived** so that a styled value equals
@@ -75,6 +135,11 @@ impl PartialEq for Value {
             (Value::Stream(left), Value::Stream(right)) => left == right,
             (Value::Job(left), Value::Job(right)) => left == right,
             (Value::Function(left), Value::Function(right)) => left == right,
+            // A flag compares to flags. Against anything else this falls to the
+            // `_` arm — the same place `1 == "1"` lands — which is where the
+            // operator's type-mismatch refusal is raised. Total here so `:dedup`,
+            // list `-`, hashing and `match` dispatch keep a total answer.
+            (Value::Flag(left), Value::Flag(right)) => left == right,
             _ => false,
         }
     }
@@ -105,6 +170,7 @@ impl std::hash::Hash for Value {
             Value::Stream(value) => (7u8, value).hash(state),
             Value::Job(value) => (8u8, value).hash(state),
             Value::Function(value) => (9u8, value).hash(state),
+            Value::Flag(value) => (10u8, value).hash(state),
         }
     }
 }
@@ -571,6 +637,19 @@ impl Value {
             Value::Styled(styled) => quote_into(&styled.text, out),
             Value::Integer(number) => out.push_str(&number.to_string()),
             Value::Boolean(flag) => out.push_str(if *flag { "true" } else { "false" }),
+            // The literal, with the payload written by *its own* literal form
+            // rather than by the argv rendering: `s = "2"; x = --n=$s` has a
+            // string payload, so `--n='2'` is what reads back as an equal value.
+            // Writing the rendered `--n=2` would read back an integer payload,
+            // which is the round-trip contract broken.
+            Value::Flag(flag) => {
+                out.push_str("--");
+                out.push_str(&flag.name);
+                if let Some(value) = &flag.value {
+                    out.push('=');
+                    value.write_literal(out)?;
+                }
+            }
             Value::List(values) => {
                 out.push('[');
                 for (index, value) in values.iter().enumerate() {
@@ -1480,6 +1559,17 @@ pub fn append_into(current: &mut Value, value: Value, name: &str) -> Result<(), 
     }
     let value = value.plain();
     match (current, value) {
+        // `+=` on a flag is refused rather than given a meaning. Appending to
+        // the name (`--for` + `ce`) and appending to the payload are both
+        // plausible and neither is written down, and a flag built by accretion
+        // is exactly the data-decides-the-option reading the type removes.
+        // Revisit with the constructor, which is where deliberate building goes.
+        (Value::Flag(_), _) => {
+            return Err(format!("{name}: cannot append to a flag"));
+        }
+        (_, Value::Flag(_)) => {
+            return Err(format!("{name}: cannot append a flag"));
+        }
         (Value::String(left), Value::String(right)) => left.push_str(&right),
         (Value::Integer(left), Value::Integer(right)) => {
             *left = left

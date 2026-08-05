@@ -3468,6 +3468,8 @@ fn interpolated_value(value: Value) -> Result<Value, Step> {
         Value::Styled(styled) => return Ok(Value::String(styled.text)),
         Value::Integer(n) => return Ok(Value::String(n.to_string())),
         Value::Boolean(b) => return Ok(Value::String(b.to_string())),
+        // A flag renders: a string context asks for text, not for an option.
+        Value::Flag(flag) => return Ok(Value::String(flag.text())),
         Value::List(_) => "list",
         Value::Map(_) => "map",
         Value::Regex(_) => "pattern",
@@ -4286,7 +4288,8 @@ fn eval_expr(
                     | Value::Glob(_)
                     | Value::Stream(_)
                     | Value::Job(_)
-                    | Value::Function(_) => runtime_error("cannot slice a scalar value"),
+                    | Value::Function(_)
+                    | Value::Flag(_) => runtime_error("cannot slice a scalar value"),
                     Value::Map(_) => runtime_error("cannot slice a map value"),
                 };
             }
@@ -4318,7 +4321,8 @@ fn eval_expr(
                 | Value::Glob(_)
                 | Value::Stream(_)
                 | Value::Job(_)
-                | Value::Function(_) => runtime_error("cannot index a scalar value"),
+                | Value::Function(_)
+                | Value::Flag(_) => runtime_error("cannot index a scalar value"),
                 Value::Map(entries) => {
                     let key = match index_value {
                         Value::String(key) => key,
@@ -5410,6 +5414,7 @@ fn single_callable_argument(
 pub(crate) fn value_kind(value: &Value) -> &'static str {
     match value {
         Value::String(_) => "a string",
+        Value::Flag(_) => "a flag",
         // Named as a string, because that is what it behaves as everywhere a
         // diagnostic is talking about: only a renderer sees the difference.
         Value::Styled(_) => "a string",
@@ -6072,6 +6077,8 @@ fn capture_argument_words(value: &Value, name: &str) -> Result<Vec<String>, Step
 fn argv_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
     match value {
         Value::String(text) => Ok(vec![text.clone()]),
+        // A flag reaching an external is bytes -- mesh parses none of its flags.
+        Value::Flag(flag) => Ok(vec![flag.text()]),
         // An external takes bytes, so the text crosses and the attributes do not.
         Value::Styled(styled) => Ok(vec![styled.text.clone()]),
         Value::Integer(number) => Ok(vec![number.to_string()]),
@@ -6726,6 +6733,7 @@ fn condition_hint(value: &Value) -> &'static str {
 fn type_phrase(value: &Value) -> &'static str {
     match value {
         Value::String(_) | Value::Styled(_) => "a string",
+        Value::Flag(_) => "a flag",
         Value::Integer(_) => "an int",
         Value::Boolean(_) => "a bool",
         Value::List(_) => "a list",
@@ -6840,6 +6848,7 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
                 | Value::Boolean(_)
                 | Value::Regex(_)
                 | Value::Glob(_)
+                | Value::Flag(_)
                 | Value::Stream(_)
                 | Value::Job(_)
                 | Value::Function(_),
