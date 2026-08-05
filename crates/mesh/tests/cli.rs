@@ -25394,6 +25394,105 @@ fn repr_writes_a_value_as_the_literal_you_would_have_typed() {
     );
 }
 
+/// `:pretty` is `:repr` laid out over lines — same literal, two-space indent.
+#[test]
+fn pretty_writes_the_literal_over_lines() {
+    let out = run_with_input(
+        "m = [a: [b: [1, 2]], c: 3]\n\
+         puts $m:pretty\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[\n  'a': [\n    'b': [\n      1,\n      2\n    ]\n  ],\n  'c': 3\n]\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Every collection breaks, with no size threshold — a one-element list is
+    // laid out like any other, so the form does not depend on the contents.
+    let out = run_with_input("xs = [1]\nputs $xs:pretty\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[\n  1\n]\n");
+
+    // Nothing to break, nothing broken: scalars and the two empty spellings.
+    let out = run_with_input("e = [:]\nl = []\nputs $e:pretty $l:pretty 42:pretty\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[:] [] 42\n");
+}
+
+/// The layout is decoration over a spelling that already parses, which is the
+/// whole reason `:pretty` can exist where a `puts` layout could not. Pinned by
+/// feeding the output back through the parser and asking `:repr` whether it is
+/// the same value.
+#[test]
+fn pretty_output_reads_back_as_the_same_value() {
+    // `back` is spelled exactly as `$m:pretty` writes it, newlines and indent
+    // included, so this fails if the layout ever stops parsing. Through stdin,
+    // the line-at-a-time path, since pasting is what the layout is for.
+    let out = run_with_input(
+        r#"m = [a: [b: [1, 2]], c: 'x y', d: [:], e: []]
+back = [
+  'a': [
+    'b': [
+      1,
+      2
+    ]
+  ],
+  'c': 'x y',
+  'd': [:],
+  'e': []
+]
+puts ($m:pretty == $back:pretty)
+puts ($m == $back)
+"#,
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\ntrue\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `:repr` keeps meaning exactly one line. That is why the layout got its own
+/// name: `$a:repr == $b:repr` compares values, and its output is what you paste.
+#[test]
+fn repr_stays_on_one_line_now_that_pretty_exists() {
+    let out = run_with_input(
+        "m = [a: [b: [1, 2]], c: 3]\n\
+         puts $m:repr\n\
+         puts ($m:repr:lines:len)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "['a': ['b': [1, 2]], 'c': 3]\n1\n"
+    );
+}
+
+/// A value with no literal form has no pretty form either, and is refused by the
+/// same name — the layout never turns a refusal into an approximation.
+#[test]
+fn pretty_refuses_exactly_what_repr_refuses() {
+    for (src, needle) in [
+        (
+            "puts $sh.stdin:pretty\n",
+            "a stream handle has no literal form",
+        ),
+        // Nested, so the refusal has to survive the walk rather than only being
+        // checked at the top.
+        (
+            "j = sleep 0.2 &\nxs = [$j]\nputs $xs:pretty\n",
+            "a job handle has no literal form",
+        ),
+    ] {
+        let out = run_with_input(src);
+        assert!(!out.status.success(), "{src:?} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{src:?}: got {stderr}");
+    }
+}
+
 /// A value with no literal form is refused by name rather than approximated.
 ///
 /// An approximation is worse than an error here: whatever it printed would read

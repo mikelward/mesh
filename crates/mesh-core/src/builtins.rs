@@ -11,7 +11,7 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::vars::{Decoration, Value};
+use crate::vars::{Decoration, NEST_INDENT, Value};
 
 /// Every builtin as `(usage, summary)`: the usage line its `--help` prints, and
 /// the one-line description that sits beside it in `help`'s listing.
@@ -1067,10 +1067,6 @@ pub(crate) fn rendered_for_output(value: &Value, decoration: Decoration) -> Resu
         Value::Function(_) => Err("a function value has no text form; call it".into()),
     }
 }
-
-/// One level of nesting in rendered output. Two spaces, so a deep value stays on
-/// the line rather than walking off the terminal.
-const NEST_INDENT: &str = "  ";
 
 /// Shift a rendered block one level right, to sit under the map key that holds it.
 ///

@@ -2196,7 +2196,8 @@ a different failure from an unknown name, which never parses.
 | `:exec` / `:x` | list or path | Keep the executables (`test -x`). |
 | `:keys` | map | Keys as an insertion-ordered list. |
 | `:values` | map | Values as an insertion-ordered list. |
-| `:repr` | any value with a literal form | The value written as the mesh source you would have typed for it, as a string. |
+| `:repr` | any value with a literal form | The value written as the mesh source you would have typed for it, as a string. Always one line. |
+| `:pretty` | any value with a literal form | The same literal as `:repr`, laid out over lines with two-space indentation. Every collection breaks; a scalar and the empty `[]` / `[:]` stay as they are. |
 | `:tty` | stream handle | Is that stream a terminal? The `test -t N` replacement — see [`$sh.args` and `$sh.name`](#shargs-and-shname). |
 | `:words` | string | Split on runs of whitespace into a list — the IFS word-split. Never yields an empty element. Alias `:ws`. |
 | `:lines` / `:nulls` / `:tabs` | string | Split on newline / NUL / tab into a list. Each is `:split(SEP)` with the separator its name spells. Aliases `:ls` / `:ns` / `:ts`. |
@@ -2298,6 +2299,42 @@ puts $sh.stdin:repr           # mesh: :repr: a stream handle has no literal form
 
 The guarantee is worth stating plainly: **whatever `:repr` returns, reading it
 back gives the same value.** Anything that would not is an error instead.
+
+`:pretty` is that same literal laid out over lines, for the sizes where one line
+stops being readable — a whole `$env`, a config map, anything a few levels deep.
+
+```mesh
+m = [a: [b: [1, 2]], c: 3]
+puts $m:pretty
+# [
+#   'a': [
+#     'b': [
+#       1,
+#       2
+#     ]
+#   ],
+#   'c': 3
+# ]
+```
+
+**Every** collection breaks, with no size threshold: a rule like "short values
+stay inline" would mean you cannot tell which form you will get without counting
+characters, and the compact form already has a name — `:repr` *is* this value on
+one line. A scalar and the two empty spellings have nothing to put between the
+brackets, so they are written as they are. The indent is two spaces, the same
+width `puts` uses for nesting, so the read-it and read-it-back forms of a value
+line up.
+
+The round-trip guarantee is unchanged, which is what makes the layout safe here:
+the brackets and commas still say where each value starts and ends, so the
+indentation is decoration over a spelling that already parsed. `puts` could not do
+this — it quotes nothing, so there the layout would be the only thing carrying the
+structure. `:pretty` refuses exactly what `:repr` refuses, by the same name, so a
+value with no literal form never becomes an approximation.
+
+It is a separate modifier rather than a flag on `:repr` because `:repr` keeps
+meaning *one line*: `$a:repr == $b:repr` is a working way to compare two values,
+and a one-line literal is what makes its output something you can paste back.
 
 A modifier that takes an argument writes it in parentheses, comma-separated like a
 value call: `$path:split(":")`, `$dirs:join(":")`. `:split(SEP)` turns a string into

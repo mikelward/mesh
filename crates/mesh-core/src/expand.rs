@@ -71,6 +71,11 @@ pub enum Modifier {
     /// has no literal form is an error rather than an approximation — see
     /// [`Value::to_literal`](crate::vars::Value::to_literal).
     Repr,
+    /// The same literal as [`Modifier::Repr`], laid out over lines with two-space
+    /// indentation instead of written on one. A separate name rather than a flag
+    /// on `:repr`, so that `:repr` keeps meaning exactly one line — `$a:repr ==
+    /// $b:repr` compares values today, and its output is what you paste back.
+    Pretty,
     /// `:real` — the path with every symlink, `.` and `..` resolved, absolute.
     /// Grouped with the path components in `DESIGN.md` and maps over a list like
     /// them, but it is the one that **asks the filesystem** rather than slicing
@@ -135,6 +140,7 @@ impl Modifier {
             "nulls" | "ns" => Self::Nulls,
             "tabs" | "ts" => Self::Tabs,
             "repr" => Self::Repr,
+            "pretty" => Self::Pretty,
             "exists" => Self::Exists,
             "type" => Self::Type,
             "read" => Self::Read,
@@ -1175,6 +1181,14 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                     message: kind.to_string(),
                 })
         }
+        // Same writer, same refusals — only the layout differs.
+        Modifier::Pretty => value
+            .to_pretty_literal()
+            .map(Value::String)
+            .map_err(|kind| ExpandError::Modifier {
+                name: name.into(),
+                message: kind.to_string(),
+            }),
         Keys => match value {
             Value::Map(values) => Ok(Value::List(
                 values.into_iter().map(|(k, _)| Value::String(k)).collect(),
@@ -1947,6 +1961,7 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::Nulls => "nulls",
         Modifier::Tabs => "tabs",
         Modifier::Repr => "repr",
+        Modifier::Pretty => "pretty",
         Modifier::Exists => "exists",
         Modifier::Type => "type",
         Modifier::Read => "read",
@@ -2093,8 +2108,10 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         | Modifier::Links
         | Modifier::Exec
         // `:repr` answers for every type, so it is applied to the whole value
-        // rather than routed through the string path like `:upper`.
+        // rather than routed through the string path like `:upper`. `:pretty` is
+        // the same writer with line breaks, so it goes the same way.
         | Modifier::Repr
+        | Modifier::Pretty
         | Modifier::Tty => unreachable!("non-string modifier handled separately"),
     }
 }

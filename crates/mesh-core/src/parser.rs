@@ -6759,6 +6759,7 @@ const MODIFIER_NAMES: &[&str] = &[
     "old",
     "parents",
     "prepend",
+    "pretty",
     "quotemeta",
     "raw",
     "read",

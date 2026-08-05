@@ -502,6 +502,65 @@ impl Value {
         Ok(out)
     }
 
+    /// This value written as mesh source, laid out over lines instead of one.
+    ///
+    /// The round-trip contract is exactly [`to_literal`](Value::to_literal)'s, and
+    /// for the same reason it can afford the layout: the brackets and commas still
+    /// say where each value starts and ends, so the indentation is decoration over
+    /// a spelling that already parsed. `puts` cannot do this — it quotes nothing,
+    /// so there the layout would be the only thing carrying the structure.
+    ///
+    /// **Every** collection breaks, with no size threshold. A rule like "short
+    /// values stay inline" means you cannot tell which form you will get without
+    /// counting characters, and the compact form already has a name: `:repr` *is*
+    /// this value on one line.
+    pub fn to_pretty_literal(&self) -> Result<String, NoLiteral> {
+        let mut out = String::new();
+        self.write_pretty(&mut out, 0)?;
+        Ok(out)
+    }
+
+    /// `depth` is the nesting level of the value being written, not of its
+    /// contents: a value is written at the point its parent already indented to,
+    /// and is responsible for the lines *inside* it.
+    fn write_pretty(&self, out: &mut String, depth: usize) -> Result<(), NoLiteral> {
+        match self {
+            Value::List(values) if !values.is_empty() => {
+                out.push_str("[\n");
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(",\n");
+                    }
+                    indent_to(out, depth + 1);
+                    value.write_pretty(out, depth + 1)?;
+                }
+                out.push('\n');
+                indent_to(out, depth);
+                out.push(']');
+            }
+            Value::Map(entries) if !entries.is_empty() => {
+                out.push_str("[\n");
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(",\n");
+                    }
+                    indent_to(out, depth + 1);
+                    quote_into(key, out);
+                    out.push_str(": ");
+                    value.write_pretty(out, depth + 1)?;
+                }
+                out.push('\n');
+                indent_to(out, depth);
+                out.push(']');
+            }
+            // A scalar has no inside, and `[]` / `[:]` have nothing to put on the
+            // lines between — both write as themselves, which also keeps the
+            // no-literal-form refusals in one place.
+            flat => flat.write_literal(out)?,
+        }
+        Ok(())
+    }
+
     fn write_literal(&self, out: &mut String) -> Result<(), NoLiteral> {
         match self {
             Value::String(text) => quote_into(text, out),
@@ -558,6 +617,21 @@ impl Value {
             Value::Function(_) => return Err(NoLiteral::Function),
         }
         Ok(())
+    }
+}
+
+/// One level of nesting in rendered output — the shared knob.
+///
+/// Both readers are layout for a human: `puts` indenting a nested collection, and
+/// [`Value::to_pretty_literal`] breaking a literal over lines. They stay the same
+/// width deliberately, so the read-it and read-it-back forms of a value line up;
+/// changing this changes both, which is the point of there being one of it.
+pub(crate) const NEST_INDENT: &str = "  ";
+
+/// Push `depth` levels of [`NEST_INDENT`].
+fn indent_to(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str(NEST_INDENT);
     }
 }
 
@@ -1448,6 +1522,70 @@ mod tests {
             ("a b".into(), Value::List(vec![Value::String("x".into())])),
         ]);
         assert_eq!(map.to_literal().unwrap(), "['k': 1, 'a b': ['x']]");
+    }
+
+    #[test]
+    fn the_pretty_writer_breaks_every_collection() {
+        let nested = Value::Map(vec![
+            (
+                "a".into(),
+                Value::Map(vec![(
+                    "b".into(),
+                    Value::List(vec![Value::Integer(1), Value::Integer(2)]),
+                )]),
+            ),
+            ("c".into(), Value::Integer(3)),
+        ]);
+        assert_eq!(
+            nested.to_pretty_literal().unwrap(),
+            "[\n  'a': [\n    'b': [\n      1,\n      2\n    ]\n  ],\n  'c': 3\n]"
+        );
+
+        // No size threshold: a one-element collection breaks like any other, so
+        // the form is predictable without counting characters.
+        let small = Value::List(vec![Value::Integer(1)]);
+        assert_eq!(small.to_pretty_literal().unwrap(), "[\n  1\n]");
+    }
+
+    #[test]
+    fn the_pretty_writer_keeps_what_has_no_inside_on_one_line() {
+        // A scalar is written by the same code either way.
+        assert_eq!(Value::Integer(42).to_pretty_literal().unwrap(), "42");
+        assert_eq!(
+            Value::String("a b".into()).to_pretty_literal().unwrap(),
+            "'a b'"
+        );
+        // The two empty spellings stay apart and stay on their line — there is
+        // nothing to put between the brackets.
+        assert_eq!(Value::List(Vec::new()).to_pretty_literal().unwrap(), "[]");
+        assert_eq!(Value::Map(Vec::new()).to_pretty_literal().unwrap(), "[:]");
+        assert_eq!(
+            Value::Map(vec![("k".into(), Value::List(Vec::new()))])
+                .to_pretty_literal()
+                .unwrap(),
+            "[\n  'k': []\n]"
+        );
+    }
+
+    /// The layout is decoration over a spelling that already round-trips, so the
+    /// refusals have to be the same ones — a value with no literal form has no
+    /// pretty one either, and says so by the same name.
+    #[test]
+    fn the_pretty_writer_refuses_exactly_what_the_flat_one_does() {
+        for value in [
+            Value::Stream(1),
+            Value::Glob("*.txt".into()),
+            Value::Job(1),
+            Value::List(vec![Value::Integer(1), Value::Stream(1)]),
+            Value::Map(vec![("k".into(), Value::Job(1))]),
+        ] {
+            assert_eq!(
+                value.to_pretty_literal().err(),
+                value.to_literal().err(),
+                "{value:?}"
+            );
+            assert!(value.to_pretty_literal().is_err(), "{value:?}");
+        }
     }
 
     #[test]
