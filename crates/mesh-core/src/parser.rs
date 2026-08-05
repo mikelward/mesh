@@ -366,6 +366,16 @@ pub enum ParseErrorKind {
     /// own variant because the refusal is about *what the name is*, not about the
     /// shape of the reference: `&if` is spelled perfectly well.
     KeywordFuncRef(String),
+    /// The same name twice in one `with (…)` list. Its own variant because
+    /// [`DuplicateParameter`]'s wording names the wrong list — nothing is a
+    /// parameter here.
+    ///
+    /// [`DuplicateParameter`]: ParseErrorKind::DuplicateParameter
+    CaptureRepeated(String),
+    /// A name that is both a capture and a parameter. Also its own, because the
+    /// name appears exactly *once* in each list, so "duplicate" describes neither
+    /// one — what collides is the single scope they both bind into.
+    CaptureShadowsParameter(String),
     DuplicateParameter(String),
     RequiredAfterOptional(String),
     ParameterAfterRest(String),
@@ -480,6 +490,14 @@ impl std::fmt::Display for ParseError {
                 f,
                 "syntax error: `&{name}` is not a function reference; `{name}` is \
                  syntax, not a function"
+            ),
+            ParseErrorKind::CaptureRepeated(name) => {
+                write!(f, "syntax error: `${name}` is captured twice")
+            }
+            ParseErrorKind::CaptureShadowsParameter(name) => write!(
+                f,
+                "syntax error: `${name}` is both captured and a parameter; a lambda \
+                 binds each name once"
             ),
             ParseErrorKind::DuplicateParameter(name) => {
                 write!(f, "syntax error: duplicate parameter `{name}`")
@@ -958,6 +976,12 @@ pub enum Expr {
     },
     Lambda {
         parameters: Vec<Param>,
+        /// The `with (…)` capture list: the names whose **values** are copied into
+        /// the function value where the lambda is written. Empty when the list is
+        /// absent, which is every lambda that needs nothing from its frame — a
+        /// lambda reads the session without capturing, since the session outlives
+        /// it (`DESIGN.md` §"Calling for a value, and lambdas").
+        captures: Vec<Spanned<String>>,
         body: Source,
     },
     /// A bare modifier reference — `:stem` — denoting "the function that applies
@@ -5355,9 +5379,26 @@ impl Parser<'_> {
         {
             self.take_word("func");
             let parameters = self.parameters()?;
+            let captures = self.capture_list()?;
+            // Both bind into the same fresh scope, so a name in both is the
+            // duplicate a repeated parameter already is — caught here rather than
+            // at the call, since the two lists are in hand together.
+            if let Some(clash) = captures
+                .iter()
+                .find(|capture| parameters.iter().any(|param| param.name == capture.value))
+            {
+                return Err(ParseError {
+                    kind: ParseErrorKind::CaptureShadowsParameter(clash.value.clone()),
+                    span: clash.span.clone(),
+                });
+            }
             self.newlines();
             let body = self.block()?;
-            return Ok(Expr::Lambda { parameters, body });
+            return Ok(Expr::Lambda {
+                parameters,
+                captures,
+                body,
+            });
         }
         // A leading `:name` is a modifier *reference*. A postfix `:name` never
         // reaches here — it is consumed by the modifier loop after a value — so the
@@ -6708,6 +6749,93 @@ impl Parser<'_> {
         };
         let name = word.bare_word()?;
         modifier_name(name).then(|| name.to_string())
+    }
+
+    /// The `with (…)` capture list after a lambda's parameters, or an empty list
+    /// when there is none.
+    ///
+    /// Written `with ($_a, $_b)` — the `$` because these are **reads** of the
+    /// enclosing frame, spelled the way every other read is, rather than
+    /// declarations. That is the whole difference from the parameter list beside
+    /// it: parameters name what the caller supplies, a capture names what the
+    /// surrounding frame already holds.
+    ///
+    /// Only the shorthand is taken. `with (_w = $_want)` — capturing under another
+    /// name, or capturing a computed value — is the obvious extension and is left
+    /// unbuilt (`DESIGN.md` records it as open), so a `=` in here is refused rather
+    /// than half-read.
+    fn capture_list(&mut self) -> Result<Vec<Spanned<String>>, ParseError> {
+        if !self.word("with") {
+            return Ok(Vec::new());
+        }
+        self.take_word("with");
+        self.newlines();
+        self.expect(&TokenKind::LParen, "`(` after `with`")?;
+        let mut captures: Vec<Spanned<String>> = Vec::new();
+        loop {
+            self.newlines();
+            // Running out of input inside the list is **incomplete**, not wrong:
+            // that is what makes a wrapped list work over a line-at-a-time reader,
+            // which asks for more only when the parse says it is unfinished.
+            if self.at_end() {
+                return Err(self.eof(ParseErrorKind::UnexpectedEnd));
+            }
+            if self.eat(&TokenKind::RParen).is_some() {
+                break;
+            }
+            let start = self
+                .peek()
+                .map_or(self.source_len, |token| token.span.start);
+            let Some(name) = self.capture_name() else {
+                return Err(self.error(ParseErrorKind::Expected("a captured variable, as `$name`")));
+            };
+            let span = start..self.previous_end();
+            // The same name twice would bind it twice in one scope, which is the
+            // duplicate a repeated parameter already reports.
+            if captures.iter().any(|seen| seen.value == name) {
+                return Err(ParseError {
+                    kind: ParseErrorKind::CaptureRepeated(name),
+                    span,
+                });
+            }
+            captures.push(Spanned { value: name, span });
+            self.newlines();
+            if self.eat(&TokenKind::Comma).is_none() {
+                self.newlines();
+                self.expect(&TokenKind::RParen, "`,` or `)`")?;
+                break;
+            }
+        }
+        Ok(captures)
+    }
+
+    /// One `$name` inside a capture list, as the plain name it binds.
+    ///
+    /// A bare `$name` lexes to a single [`WordPiece::Variable`], the same piece an
+    /// operand-position read produces — so this accepts exactly what a read
+    /// accepts, and a quoted or composed word (`"$a"`, `$a$b`, `$m.key`) is not a
+    /// capture.
+    fn capture_name(&mut self) -> Option<String> {
+        let TokenKind::Word(word) = &self.peek()?.value else {
+            return None;
+        };
+        let [
+            WordPiece::Variable {
+                name,
+                quote: QuoteMode::Bare,
+                ..
+            },
+        ] = word.pieces.as_slice()
+        else {
+            return None;
+        };
+        let name = name.trim_start_matches('$');
+        if !valid_name(name) {
+            return None;
+        }
+        let name = name.to_string();
+        self.position += 1;
+        Some(name)
     }
 
     /// The name of an `&name` function reference starting at the current `&`, when
