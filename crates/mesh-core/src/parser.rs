@@ -7008,6 +7008,7 @@ const MODIFIER_NAMES: &[&str] = &[
     "files",
     "filter",
     "first",
+    "flag",
     "format",
     "get",
     "groups",

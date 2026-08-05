@@ -29011,3 +29011,123 @@ fn the_gets_value_form_refuses_a_non_utf8_line() {
     // The statement was abandoned, so the binding keeps what it held.
     assert_eq!(String::from_utf8_lossy(&out.stdout), "x=kept\n");
 }
+
+/// `:flag` is the deliberate cast from data to an option — the escape hatch the
+/// typed family needs, since `x = --force` is how you *write* one and a program
+/// sometimes has to build one from a name it computed.
+///
+/// Spelled as a modifier rather than a `flag()` value call so it costs no
+/// reserved function name; see `TODO.md` on unifying constructor spelling.
+#[test]
+fn the_flag_modifier_builds_an_option_from_a_string() {
+    // A bare flag carries no payload, so it renders as itself rather than
+    // collapsing to `--force=true`.
+    let bare = run_with_input("w = \"--force\"\nputs $w:flag:repr\n");
+    assert_eq!(String::from_utf8_lossy(&bare.stdout), "--force\n");
+    assert!(bare.stderr.is_empty(), "{:?}", bare.stderr);
+
+    // The payload types the way a *bare* word would, so this is the integer
+    // `2` and `:repr` writes it back as one.
+    let digits = run_with_input("puts \"--n=2\":flag:repr\n");
+    assert_eq!(String::from_utf8_lossy(&digits.stdout), "--n=2\n");
+
+    // Bare, and only bare: the cast is not a second parser, so quote marks in
+    // the text are payload characters rather than quoting. What that has to
+    // agree with is the *written* flag holding those same characters -- and it
+    // does. Raised in review against `--tag="v 2"`, which is a different
+    // payload (`v 2`, quoted in source) rather than the same one disagreeing.
+    let quoted = run_with_input(
+        "a = \"--tag=\\\"v 2\\\"\":flag\nb = --tag='\"v 2\"'\n\
+         puts $a:repr\nif $a == $b { puts same } else { puts different }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&quoted.stdout),
+        "--tag='\"v 2\"'\nsame\n"
+    );
+
+    let text = run_with_input("puts \"--tag=v2\":flag:repr\n");
+    assert_eq!(String::from_utf8_lossy(&text.stdout), "--tag='v2'\n");
+
+    // A payload's type shows in `:repr` and not in its bytes, which is what
+    // makes `flag<int>` and `flag<string>` different values that cross a byte
+    // boundary identically.
+    let bytes = run_with_input("x = \"--n=2\":flag\nputs \"[$x]\"\n");
+    assert_eq!(String::from_utf8_lossy(&bytes.stdout), "[--n=2]\n");
+
+    // And different values: unequal for the same reason `2 != \"2\"` is.
+    let typed = run_with_input(
+        "a = \"--n=2\":flag\nb = \"--n=v\":flag\n\
+         if $a == $b { puts same } else { puts different }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&typed.stdout), "different\n");
+
+    // Casting a flag to a flag is the identity, not an error.
+    let twice = run_with_input("puts \"--force\":flag:flag:repr\n");
+    assert_eq!(String::from_utf8_lossy(&twice.stdout), "--force\n");
+}
+
+/// Exact spelling only — the text you would have written, dashes included.
+/// Anything else reports rather than inventing a flag, which is `re()`'s rule and
+/// the typed family's.
+#[test]
+fn the_flag_modifier_refuses_anything_but_a_written_option() {
+    for (source, expected) in [
+        ("\"force\"", "it needs `--`"),
+        ("\"\"", "it needs `--`"),
+        // Short flags are unbuilt, so this reports rather than guessing at one.
+        ("\"-x\"", "short flags are not implemented"),
+        // A terminator is its own type, not a flag.
+        ("\"--\"", "is the flag terminator, not a flag"),
+        ("\"--=v\"", "it has no name"),
+        // Only a string can be cast; a list is not one option. Written as a
+        // binding because a bare `[a]` here is a glob character class, not a
+        // list literal, and expands away before any modifier is asked.
+        ("$xs", "requires a string"),
+    ] {
+        let out = run_with_input(&format!("xs = [a]\nputs {source}:flag\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(expected),
+            "{source} should report {expected:?}: {:?}",
+            out.stderr
+        );
+    }
+}
+
+/// A flag **renders** at every byte boundary without **being** text: argv,
+/// interpolation and `:join` all send the word it was written with, while
+/// equality keeps it a type of its own.
+#[test]
+fn a_flag_renders_as_bytes_but_is_not_a_string() {
+    // Interpolation asks for text, so it renders.
+    let interpolated = run_with_input("x = \"--tag=v2\":flag\nputs \"[$x]\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&interpolated.stdout),
+        "[--tag=v2]\n"
+    );
+
+    // Flag-to-flag equality is total, which is what keeps `:dedup` and `match`
+    // total. Against a string it is not equal — the same place `1 == \"1\"` lands.
+    let compared = run_with_input(
+        "a = \"--force\":flag\nb = \"--force\":flag\nc = \"--other\":flag\n\
+         if $a == $b { puts same }\nif $a != $c { puts differs }\n\
+         if $a == \"--force\" { puts texty } else { puts typed }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&compared.stdout),
+        "same\ndiffers\ntyped\n"
+    );
+
+    // Total equality means `:dedup` keeps a total answer.
+    let deduped =
+        run_with_input("xs = [\"--a\":flag, \"--a\":flag, \"--b\":flag]\nputs $xs:dedup:len\n");
+    assert_eq!(String::from_utf8_lossy(&deduped.stdout), "2\n");
+
+    // `+=` is refused rather than given a meaning: appending to the name and to
+    // the payload are both plausible and neither is written down.
+    let appended = run_with_input("x = \"--tag=v1\":flag\nx += \"2\"\n");
+    assert!(
+        String::from_utf8_lossy(&appended.stderr).contains("cannot append"),
+        "{:?}",
+        appended.stderr
+    );
+}

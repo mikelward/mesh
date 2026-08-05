@@ -48,6 +48,15 @@ pub enum Modifier {
     TrimStart,
     TrimEnd,
     Int,
+    /// `:flag` — build an **option** from a string, the deliberate cast from data
+    /// to a flag. The escape hatch the typed family needs: `x = --force` is how
+    /// you write one, and `$w:flag` is how a program turns a name it computed
+    /// into one on purpose.
+    ///
+    /// Spelled as a modifier rather than a `flag()` value call so it costs no
+    /// reserved function name, and so the list form falls out of `:map(:flag)`
+    /// with no second mechanism. See `TODO.md` on unifying constructor spelling.
+    Flag,
     /// `:bool` — parse a string as a boolean, the twin of [`Modifier::Int`]. It
     /// **warns and answers `false`** where `:int` raises, because a boolean has a
     /// safe stand-in and an integer does not (`DESIGN.md` §"String→boolean
@@ -129,6 +138,7 @@ impl Modifier {
             "trimstart" => Self::TrimStart,
             "trimend" => Self::TrimEnd,
             "int" => Self::Int,
+            "flag" => Self::Flag,
             "bool" => Self::Bool,
             // The split family carries a two-letter alias each, since a split is
             // what a line loop or a `-print0` pipeline writes on every use. They
@@ -522,6 +532,49 @@ fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError
 /// reaches [`whole_value`] first and stays typed, so `puts style(x, fg: red)` keeps
 /// its attributes. Rendering here is for the cases that genuinely need bytes — an
 /// external command, or a value argument glued to text (`ls dir$(suffix)`).
+/// Parse the text of a written option into a [`FlagValue`], or say why it is not
+/// one.
+///
+/// The payload types the way a **bare** word would, so `"--n=2":flag` holds the
+/// integer `2` — that is what leaves `flag<int>` constructible before the parser
+/// lands, and a cast that only ever produced `flag<string>` would not.
+///
+/// **Bare, and only bare.** Quoting is not re-read here: `"--tag=\"v 2\""` holds
+/// the five characters `"v 2"`, quote marks and all, exactly as the written
+/// `--tag='"v 2"'` does — the two are equal, which is the round trip that
+/// matters. The cast is not a second parser, and treating it as one would have
+/// to answer what `"--tag=v 2":flag` means, where the source it claims to be
+/// reading is two words.
+///
+/// The tension that leaves, recorded rather than resolved: `v = "2"; x = --n=$v`
+/// keeps a *string*, so interpolating and casting disagree about the same
+/// characters. They are different acts — one hands over a value, the other text
+/// to type — but a reader may reasonably expect them to agree. See `TODO.md`.
+fn flag_from_text(text: &str) -> Result<crate::vars::FlagValue, String> {
+    let Some(body) = text.strip_prefix("--") else {
+        let hint = if text.starts_with('-') {
+            " (short flags are not implemented)"
+        } else {
+            ""
+        };
+        return Err(format!("`{text}` is not an option: it needs `--`{hint}"));
+    };
+    if body.is_empty() {
+        return Err("`--` is the flag terminator, not a flag".into());
+    }
+    let (name, value) = match body.split_once('=') {
+        Some((name, value)) => (name, Some(Box::new(typed_scalar(value)))),
+        None => (body, None),
+    };
+    if name.is_empty() {
+        return Err(format!("`{text}` is not an option: it has no name"));
+    }
+    Ok(crate::vars::FlagValue {
+        name: name.to_owned(),
+        value,
+    })
+}
+
 fn value_argument_text(value: &Value) -> Result<String, ExpandError> {
     let refuse = |message: &str| Err(ExpandError::ArgumentValue(message.to_owned()));
     match value {
@@ -1335,6 +1388,26 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 message: "requires a string".into(),
             }),
         },
+        // Exact spelling only: the text you would have written, dashes included.
+        // Anything else reports rather than inventing a flag -- `re()`'s rule, and
+        // the family's. A short flag is refused because short flags are unbuilt,
+        // and `--` because a terminator is its own type, not a flag.
+        Modifier::Flag => {
+            match value {
+                Value::String(text) => flag_from_text(&text).map(Value::Flag).map_err(|message| {
+                    ExpandError::Modifier {
+                        name: name.into(),
+                        message,
+                    }
+                }),
+                // Already one: casting a flag to a flag is the identity, not an error.
+                Value::Flag(flag) => Ok(Value::Flag(flag)),
+                _ => Err(ExpandError::Modifier {
+                    name: name.into(),
+                    message: "requires a string".into(),
+                }),
+            }
+        }
         Modifier::Bool => parse_bool_value(value, None),
         // Resolving is a syscall, not string surgery: every component on the way
         // has to exist for the kernel to follow it, so a path that is not there has
@@ -1979,6 +2052,7 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::TrimStart => "trimstart",
         Modifier::TrimEnd => "trimend",
         Modifier::Int => "int",
+        Modifier::Flag => "flag",
         Modifier::Bool => "bool",
         Modifier::Words => "words",
         Modifier::Lines => "lines",
@@ -2110,6 +2184,7 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         Modifier::Real
         | Modifier::Url
         | Modifier::Int
+        | Modifier::Flag
         | Modifier::Bool
         | Modifier::Words
         | Modifier::Lines
