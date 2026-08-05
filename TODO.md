@@ -4716,9 +4716,13 @@ not.
 ## Beyond M3 — Lambda capture (`with (…)`) and the `for` binder
 
 Decided in design discussion; see `docs/DESIGN.md` §"Calling for a value, and
-lambdas". Not implemented.
+lambdas". Both landed.
 
-- [ ] **A lambda captures by an explicit list — `func(_p) with ($_want) { … }`.**
+- [x] **A lambda captures by an explicit list — `func(_p) with ($_want) { … }`.**
+      *(landed — `Expr::Lambda` carries a `captures` list, `Callable::Lambda` the
+      resolved `(name, value)` pairs, and `bind_captured` installs them in the
+      fresh call scope beside the parameters. An unclosed list reports
+      `UnexpectedEnd` so a line-at-a-time reader buffers a wrapped one.)*
       Today a lambda body's scope parent is the *session*, so it sees session and
       global bindings but not the function-locals beside it —
       `func f() { _n = 41; _g = func() { puts $_n }; $_g() }` reports
@@ -4726,14 +4730,16 @@ lambdas". Not implemented.
       same text that works at top level fails inside a function. The list is
       evaluated **where the lambda is written**, and the values are copied into the
       function value; an unbound name there is loud at the point of capture.
-  - [ ] Parser: `lambda = "func" parameter-list ("with" capture-list)? NL* block`,
+  - [x] Parser: `lambda = "func" parameter-list ("with" capture-list)? NL* block`,
         the list holding `$name` reads only. A parameter colliding with a captured
         name is a duplicate binding, the check a repeated parameter already gets.
-  - [ ] Evaluation: capture at `Expr::Lambda`, store on `Callable::Lambda`, and
+  - [x] Evaluation: capture at `Expr::Lambda`, store on `Callable::Lambda`, and
         insert the copies into the call's fresh scope alongside the parameters.
-  - [ ] `docs/REFERENCE.md` and `GRAMMAR.md` — the spelling, and why it is
+  - [x] `docs/REFERENCE.md` and `GRAMMAR.md` — the spelling, and why it is
         explicit.
-- [ ] **A `for` binding belongs to its loop.** Fresh each iteration, gone at the
+- [x] **A `for` binding belongs to its loop.** *(landed — `pattern_names` plus
+      `Vars::save_names` / `restore_names`, wrapped around the passes of both loop
+      runners so an early return cannot skip the restore.)* Fresh each iteration, gone at the
       end, and a name it shadows is restored rather than clobbered — so `$_i` after
       the loop is an unbound read where today it is the last value. Independent of
       the capture list and worth doing on its own: it is what stops a lambda in the

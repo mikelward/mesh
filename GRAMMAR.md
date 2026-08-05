@@ -678,7 +678,9 @@ wrapped-expression
                 = value-expression ;          # `NL*` *precedes* every binary and
                                               # range operator in here as well
 value-call      = name call-arguments ;
-lambda          = "func" parameter-list NL* block ;
+lambda          = "func" parameter-list capture-list? NL* block ;
+capture-list    = "with" NL* "(" NL* ( capture ( NL* "," NL* capture )* NL* ","? )? NL* ")" ;
+capture         = "$" name ;                  # a read, not a declaration
 modifier-ref    = ":" name ;
 capture         = "$(" statement-list ")" ;
 

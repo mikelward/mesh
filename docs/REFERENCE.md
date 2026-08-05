@@ -2998,7 +2998,9 @@ puts $x                      # "before" — the loop's binding is over
 
 That is what keeps a lambda written in the body from closing over one shared slot
 and seeing only its final value — the footgun Go fixed in 1.22 and JavaScript fixed
-with `let`, both in the loop rather than in the closure.
+with `let`, both in the loop rather than in the closure. A body that wants the
+value takes it explicitly, and gets that pass's:
+`func() with ($x) { … }` (see [Functions](#functions)).
 
 Globs, ranges, `$sh.args` and any bound list are already lists and are
 unaffected — a glob is a list however many paths it matched.
@@ -3464,10 +3466,40 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
   - **Any expression can be the callee** once it produces a function value:
     `$fs[0]()`, `$m.go()`. One that produces anything else is a loud
     `value is not callable`.
-  - **Scope is a function's scope** — fresh locals, the parameters, the globals.
-    A lambda does *not* close over the scope it was written in, so one inside a
-    function cannot read that function's locals; the read fails loud. (mesh has
-    exactly two variable scopes; see [Variables](#variables).)
+  - **Scope is a function's scope** — fresh locals, the parameters, the captured
+    values, the globals. A lambda does not read the scope it was written in unless
+    it says so: naming a local in a `with (…)` list is what brings it in, and a
+    local the list does not name fails loud. (mesh has exactly two variable
+    scopes; see [Variables](#variables).)
+  - **Capture is explicit — `with (…)`.** The list is evaluated where the lambda
+    is *written*, and the values are **copied** into the function value:
+
+    ```mesh
+    func pick(want) {
+      return $paths:filter(func(p) with ($want) { $p:ext == $want }) }
+    ```
+
+    Without it a lambda and a function-local are mutually unusable — the same text
+    works at top level and fails inside a function, because a lambda's scope
+    parent is the session.
+
+    - **Copied, so a later change is not seen.** `x = 1`, then
+      `g = func() with ($x) { … }`, then `x = 2` leaves the lambda holding `1`. An
+      *uncaptured* read of a session variable is still late and answers `2`,
+      because the session outlives every frame — you may read late only from a
+      scope that outlives you.
+    - **Evaluated at the point of capture**, so an unbound name is loud there,
+      while the frame that could explain it is still around — not at a later call.
+    - **Per iteration in a loop**, so a lambda built in a `for` body keeps that
+      pass's value rather than the last.
+    - **A read, not a declaration**, which is why it is spelled `$name`. Only a
+      bare variable is a capture: `$m.key` and a quoted word are not.
+    - **Each name binds once**, so a name that is both captured and a parameter is
+      a syntax error, as is the same capture written twice.
+    - A captured value keeps its type — a captured list arrives as a list.
+
+    Capturing under another name (`with (w = $want)`) is not built; `DESIGN.md`
+    records it as the open extension.
   - **A global binding is visible to the body**, which is what lets a lambda
     recurse: `fact = func(n) { if $n == 0 { return 1 }\n return $n * $fact($n - 1) }`.
   - **No text form.** A function value is the one value that cannot be bytes, so a

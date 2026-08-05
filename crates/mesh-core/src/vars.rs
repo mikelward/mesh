@@ -685,6 +685,11 @@ enum Callable {
     /// A written `func(params) { body }`.
     Lambda {
         params: Vec<crate::parser::Param>,
+        /// What the `with (…)` list copied in, as name/value pairs resolved where
+        /// the lambda was written. Values rather than a scope handle: that is what
+        /// keeps the frame from having to outlive the call, and what makes a cycle
+        /// impossible (`DESIGN.md` §"Calling for a value, and lambdas").
+        captured: Vec<(String, Value)>,
         body: crate::parser::Source,
     },
     /// A bare `:name` reference — the function that applies that modifier to its
@@ -698,9 +703,25 @@ enum Callable {
     Named(String),
 }
 
+/// What a written lambda is made of, as [`FuncValue::as_lambda`] hands it back:
+/// the signature, the values its `with (…)` list copied in, and the body.
+pub type LambdaParts<'a> = (
+    &'a [crate::parser::Param],
+    &'a [(String, Value)],
+    &'a crate::parser::Source,
+);
+
 impl FuncValue {
-    pub fn lambda(params: Vec<crate::parser::Param>, body: crate::parser::Source) -> Self {
-        Self(Arc::new(Callable::Lambda { params, body }))
+    pub fn lambda(
+        params: Vec<crate::parser::Param>,
+        captured: Vec<(String, Value)>,
+        body: crate::parser::Source,
+    ) -> Self {
+        Self(Arc::new(Callable::Lambda {
+            params,
+            captured,
+            body,
+        }))
     }
 
     pub fn modifier(name: String) -> Self {
@@ -711,10 +732,14 @@ impl FuncValue {
         Self(Arc::new(Callable::Named(name)))
     }
 
-    /// The signature and body, when this is a written lambda.
-    pub fn as_lambda(&self) -> Option<(&[crate::parser::Param], &crate::parser::Source)> {
+    /// The signature, captured values, and body, when this is a written lambda.
+    pub fn as_lambda(&self) -> Option<LambdaParts<'_>> {
         match &*self.0 {
-            Callable::Lambda { params, body } => Some((params, body)),
+            Callable::Lambda {
+                params,
+                captured,
+                body,
+            } => Some((params, captured, body)),
             Callable::Modifier(_) | Callable::Named(_) => None,
         }
     }

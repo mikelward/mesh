@@ -18185,6 +18185,136 @@ fn a_function_reference_captures_like_the_name_it_stands_for() {
     );
 }
 
+/// A lambda reads its enclosing frame through an explicit `with (…)` list, which
+/// is evaluated where the lambda is *written* and copies the values in
+/// (`DESIGN.md`). Before it, a local and a lambda were mutually unusable: the same
+/// text worked at top level and failed inside a function.
+#[test]
+fn a_lambda_captures_by_an_explicit_list() {
+    // The motivating case: a predicate that needs an argument of the function it
+    // is written in. This is the example `DESIGN.md` argues from.
+    let out = run_with_input(
+        "func pick(want) { xs = [\"a.txt\" \"b.md\" \"c.md\"]\n\
+         return $xs:filter(func(p) with ($want) { $p:ext == $want }):join(\",\") }\n\
+         puts pick(\"md\")\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "b.md,c.md\n");
+
+    // Called immediately in the frame that wrote it, and outliving that frame:
+    // both work, because the values were copied rather than the scope borrowed.
+    let escaping = run_with_input(
+        "func f() { n = 41\n\
+         g = func() with ($n) { puts $n }\n\
+         $g() }\n\
+         f\n\
+         func make(tag) { n = 7\n\
+         return func() with ($tag, $n) { \"$tag/$n\" } }\n\
+         g = make(\"hi\")\n\
+         puts $g()\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&escaping.stdout), "41\nhi/7\n");
+
+    // Types survive the copy — a captured list is still a list.
+    let typed = run_with_input("xs = [1 2]\ng = func() with ($xs) { $xs:len }\nputs $g()\n");
+    assert_eq!(String::from_utf8_lossy(&typed.stdout), "2\n");
+}
+
+/// Capture is **by value**, and only of what is named. The session is the one
+/// thing a body reads late, because the session outlives every frame — which is
+/// the principle the whole rule rests on.
+#[test]
+fn a_capture_copies_and_a_session_read_stays_late() {
+    // Captured: the value as it was when the lambda was written.
+    let copied = run_with_input("x = 1\ng = func() with ($x) { puts $x }\nx = 2\n$g()\n");
+    assert_eq!(String::from_utf8_lossy(&copied.stdout), "1\n");
+
+    // Not captured: an ordinary session read, still late, as it was before.
+    let late = run_with_input("x = 1\ng = func() { puts $x }\nx = 2\n$g()\n");
+    assert_eq!(String::from_utf8_lossy(&late.stdout), "2\n");
+
+    // A local the list does not name is still out of reach — capture is opt-in,
+    // so nothing became visible that was not asked for.
+    let unnamed = run_with_input("func f() { n = 1\ng = func() { puts $n }\n$g() }\nf\n");
+    assert!(!unnamed.status.success());
+    assert!(
+        String::from_utf8_lossy(&unnamed.stderr).contains("n: unbound variable"),
+        "{}",
+        String::from_utf8_lossy(&unnamed.stderr)
+    );
+}
+
+/// The list is evaluated per iteration, so a lambda written in a loop body keeps
+/// that pass's value — `1 2 3`, not `3 3 3`. This is the footgun Go fixed in 1.22
+/// and JavaScript fixed with `let`, and it needs *both* halves: the `for` binder
+/// being the loop's, and the capture being a copy.
+#[test]
+fn a_capture_in_a_loop_keeps_each_pass() {
+    let out = run_with_input(
+        "fs = []\n\
+         for i in [1 2 3] { fs += [func() with ($i) { puts $i }] }\n\
+         for f in $fs { $f() }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n3\n");
+}
+
+/// What the list refuses, and where it says so. All three are at *parse* time
+/// except the unbound read, which is at the point of capture — still before the
+/// call, which is the point of capturing eagerly.
+#[test]
+fn a_capture_list_refuses_what_it_cannot_bind() {
+    // Unbound where the list is written: the frame that could explain the name is
+    // still there, so the error names it rather than surfacing at some later call.
+    let unbound = run_with_input("func f() { g = func() with ($nope) { puts $nope } }\nf\n");
+    assert!(!unbound.status.success());
+    assert!(
+        String::from_utf8_lossy(&unbound.stderr).contains("nope: unbound variable"),
+        "{}",
+        String::from_utf8_lossy(&unbound.stderr)
+    );
+
+    for (source, message) in [
+        // Both lists bind into one scope, so a name in each is a collision — and
+        // the message says that rather than calling either one a duplicate.
+        (
+            "func f() { n = 1\ng = func(n) with ($n) { $n } }\n",
+            "`$n` is both captured and a parameter",
+        ),
+        (
+            "n = 1\ng = func() with ($n, $n) { $n }\n",
+            "`$n` is captured twice",
+        ),
+        // Only a bare `$name` is a capture: this is a read of the enclosing frame,
+        // spelled the way every other read is.
+        (
+            "g = func() with (n) { $n }\n",
+            "a captured variable, as `$name`",
+        ),
+        (
+            "m = [k: 1]\ng = func() with ($m.k) { $m }\n",
+            "a captured variable, as `$name`",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source} gave {stderr}");
+    }
+}
+
+/// `with` keeps its other meaning. The environment-prefix block is a statement and
+/// the capture list follows a parameter list, so the two never compete.
+#[test]
+fn a_capture_list_does_not_disturb_the_with_block() {
+    let out = run_with_input("with FOO=bar { env | grep \"^FOO=\" }\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "FOO=bar\n");
+
+    // And a capture list may span lines, like every other bracketed list.
+    let wrapped = run_with_input(
+        "a = 1\nb = 2\ng = func() with (\n  $a,\n  $b,\n) { puts \"$a$b\" }\n$g()\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&wrapped.stdout), "12\n");
+}
+
 /// A hook slot takes `&name` beside the bare word it already took: a reference
 /// *is* a name, and the late binding it means is the lookup a hook already did
 /// when the event fired. A lambda still has no name to register.

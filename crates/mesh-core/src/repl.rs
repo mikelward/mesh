@@ -4438,15 +4438,32 @@ fn eval_expr(
             Ok(Value::List((start..stop).map(Value::Integer).collect()))
         }
         E::Call { callee, arguments } => eval_call(callee, arguments, last, in_function, shell),
-        // A lambda evaluates to a function value, carrying its signature and body.
-        // Nothing else is captured: a call gets a fresh function-local scope and
-        // the globals, the same two levels a named `func` gets (`DESIGN.md`
-        // §"Variables and assignment"), so a lambda written inside a function
-        // cannot read that function's locals.
-        E::Lambda { parameters, body } => Ok(Value::Function(vars::FuncValue::lambda(
-            parameters.clone(),
-            body.clone(),
-        ))),
+        // A lambda evaluates to a function value carrying its signature, its body,
+        // and whatever its `with (…)` list names — read **here**, in the frame that
+        // wrote the lambda, and copied in. A call then gets a fresh scope holding
+        // its parameters and those copies, with the session as its parent: two
+        // levels still, because values were captured rather than a scope
+        // (`DESIGN.md` §"Calling for a value, and lambdas").
+        E::Lambda {
+            parameters,
+            captures,
+            body,
+        } => {
+            let mut captured = Vec::with_capacity(captures.len());
+            for name in captures {
+                // Loud where the list is written, not at the call: the frame that
+                // could have explained the name is still here.
+                let Some(value) = shell.vars.get(&name.value) else {
+                    return runtime_error(format!("{}: unbound variable", name.value));
+                };
+                captured.push((name.value.clone(), value.clone()));
+            }
+            Ok(Value::Function(vars::FuncValue::lambda(
+                parameters.clone(),
+                captured,
+                body.clone(),
+            )))
+        }
         // A bare `:name` is the function that applies that modifier — the value, not
         // an application, so nothing is applied here. Whether the name is one the
         // engine can actually apply is checked at the call, where the argument that
@@ -4573,13 +4590,14 @@ fn call_function_value(
         }
         return call_named_for_value(referenced, arguments, last, in_function, shell);
     }
-    let (params, body) = function
+    let (params, captured, body) = function
         .as_lambda()
         .expect("a callable is a lambda, a modifier reference, or an `&name`");
     // A lambda has no `wrapper` marker to carry, so it always parses flags.
     call_signature_for_value(
         description,
         params,
+        captured,
         body,
         arguments,
         true,
@@ -9103,9 +9121,12 @@ fn call_func_for_value(
     };
     // A `wrapper func` parses no flags of its own in either call form, so the
     // value spelling forwards `--flag` verbatim just as command position does.
+    // A declared `func` captures nothing: only a lambda has a `with (…)` list, and
+    // a named function's body reads its own locals and the session.
     call_signature_for_value(
         name,
         &params,
+        &[],
         &body,
         arguments,
         !wrapper,
@@ -9125,6 +9146,7 @@ fn call_func_for_value(
 fn call_signature_for_value(
     name: &str,
     params: &[parser::Param],
+    captured: &[(String, Value)],
     body: &parser::Source,
     arguments: &[parser::Argument],
     flags_enabled: bool,
@@ -9184,9 +9206,27 @@ fn call_signature_for_value(
         body,
         caller_result,
         caller_produced,
-        |shell| bind_scanned(name, params, positionals, switches_on, flag_values, shell),
+        |shell| {
+            bind_captured(captured, shell);
+            bind_scanned(name, params, positionals, switches_on, flag_values, shell)
+        },
         shell,
     )
+}
+
+/// Install a lambda's captured values in the fresh call scope.
+///
+/// They are ordinary current-scope bindings, indistinguishable once bound from a
+/// parameter or from anything the body assigns — which is the point of capturing
+/// *values*: the enclosing frame is not a rung, so there is no chain to resolve
+/// through and nothing outlives the frame that wrote the lambda.
+///
+/// A name in both the capture list and the parameter list is refused by the
+/// parser, so no collision can arrive here.
+fn bind_captured(captured: &[(String, Value)], shell: &mut Shell) {
+    for (name, value) in captured {
+        shell.vars.set_value(name, value.clone());
+    }
 }
 
 /// The **callee half** of a value-mode call: a fresh scope, the binding, the body,
@@ -9313,7 +9353,7 @@ fn call_callable_for_value(
             shell,
         );
     }
-    let (params, body) = function
+    let (params, captured, body) = function
         .as_lambda()
         .expect("a callable is a lambda, a modifier reference, or an `&name`");
     let caller_result = shell.result.clone();
@@ -9322,7 +9362,10 @@ fn call_callable_for_value(
         body,
         caller_result,
         caller_produced,
-        |shell| bind_arguments(name, params, vec![(argument, false)], false, shell),
+        |shell| {
+            bind_captured(captured, shell);
+            bind_arguments(name, params, vec![(argument, false)], false, shell)
+        },
         shell,
     )
 }
