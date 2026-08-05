@@ -68,6 +68,19 @@ pub enum Value {
     /// answers only for values that *are* text, so a flag falls through to the
     /// variant arms and `$x == "--force"` lands where `1 == "1"` does.
     Flag(FlagValue),
+    /// The **flag terminator**, `--`, as a value that travels rather than as
+    /// syntax consumed where it is written.
+    ///
+    /// A type of its own and not a `Flag`: a `--` is not an option, it *ends*
+    /// them, so `"--":flag` is refused rather than producing one. Distinct from
+    /// the string `"--"` because a string cannot end flag parsing — that would
+    /// put back the data-decides-the-call reading the flag type removes, since
+    /// `w = "--"; f $w` would terminate on what `$w` happened to hold.
+    ///
+    /// `:repr` writes `--` where the string writes `'--'`, which is the
+    /// round-trip contract keeping the two apart exactly as it keeps `42` and
+    /// `'42'` apart.
+    FlagTerminator,
 }
 
 /// An option and, when it was written with one, its value.
@@ -140,6 +153,7 @@ impl PartialEq for Value {
             // operator's type-mismatch refusal is raised. Total here so `:dedup`,
             // list `-`, hashing and `match` dispatch keep a total answer.
             (Value::Flag(left), Value::Flag(right)) => left == right,
+            (Value::FlagTerminator, Value::FlagTerminator) => true,
             _ => false,
         }
     }
@@ -171,6 +185,7 @@ impl std::hash::Hash for Value {
             Value::Job(value) => (8u8, value).hash(state),
             Value::Function(value) => (9u8, value).hash(state),
             Value::Flag(value) => (10u8, value).hash(state),
+            Value::FlagTerminator => 11u8.hash(state),
         }
     }
 }
@@ -650,6 +665,9 @@ impl Value {
                     value.write_literal(out)?;
                 }
             }
+            // Bare, where the string writes `'--'`. Both read back as what they
+            // are, which is the whole of `:repr`'s contract.
+            Value::FlagTerminator => out.push_str("--"),
             Value::List(values) => {
                 out.push('[');
                 for (index, value) in values.iter().enumerate() {
@@ -1569,6 +1587,13 @@ pub fn append_into(current: &mut Value, value: Value, name: &str) -> Result<(), 
         }
         (_, Value::Flag(_)) => {
             return Err(format!("{name}: cannot append a flag"));
+        }
+        // Same refusal, same reason: a terminator is one indivisible word.
+        (Value::FlagTerminator, _) => {
+            return Err(format!("{name}: cannot append to the flag terminator"));
+        }
+        (_, Value::FlagTerminator) => {
+            return Err(format!("{name}: cannot append the flag terminator"));
         }
         (Value::String(left), Value::String(right)) => left.push_str(&right),
         (Value::Integer(left), Value::Integer(right)) => {

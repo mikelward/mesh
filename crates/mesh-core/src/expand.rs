@@ -476,9 +476,9 @@ fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> 
         Value::List(values) => Ok(values),
         // A styled value is a string, so it is not a list for the same reason.
         // A flag is one option, not a list of them.
-        Value::String(_) | Value::Styled(_) | Value::Flag(_) => Err(ExpandError::Unsupported(
-            format!("...${}: value is not a list", vref.name),
-        )),
+        Value::String(_) | Value::Styled(_) | Value::Flag(_) | Value::FlagTerminator => Err(
+            ExpandError::Unsupported(format!("...${}: value is not a list", vref.name)),
+        ),
         Value::Map(_) => Err(ExpandError::Unsupported(
             "a map cannot be spread here".into(),
         )),
@@ -504,9 +504,9 @@ fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> 
 fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError> {
     match resolve_value(vref, vars)? {
         Value::List(values) => strings(values, &vref.name),
-        Value::String(_) | Value::Styled(_) | Value::Flag(_) => Err(ExpandError::Unsupported(
-            format!("...${}: value is not a list", vref.name),
-        )),
+        Value::String(_) | Value::Styled(_) | Value::Flag(_) | Value::FlagTerminator => Err(
+            ExpandError::Unsupported(format!("...${}: value is not a list", vref.name)),
+        ),
         Value::Map(_) => Err(ExpandError::Unsupported(
             "a map cannot be spread into argv".into(),
         )),
@@ -604,6 +604,7 @@ fn value_argument_text(value: &Value) -> Result<String, ExpandError> {
         // reaching argv is bytes. It is the `Integer` case, not the `Glob` one —
         // there genuinely is text to give.
         Value::Flag(flag) => Ok(flag.text()),
+        Value::FlagTerminator => Ok("--".to_owned()),
         Value::Stream(_) => refuse("a stream handle has no text form"),
         Value::Job(_) => refuse("a job handle has no text form"),
         Value::Function(_) => refuse("a function value has no text form"),
@@ -631,6 +632,7 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
             // A spread element that is a flag renders, like one reaching argv
             // directly: past this boundary it is bytes.
             Value::Flag(flag) => Ok(flag.text()),
+            Value::FlagTerminator => Ok("--".to_owned()),
             // A handle belongs with the function value, not the patterns: what
             // it lacks is a byte form, not a way to be matched against.
             Value::Stream(_) => Err(ExpandError::NoTextForm {
@@ -692,7 +694,13 @@ fn scalar_literal(word: &Word) -> Option<Result<Value, String>> {
     // needs no punctuation to mark it. And a globbing *payload* (`--tag=*.txt`)
     // has to reach expansion, which in command position turns the pattern into
     // words. Either way the word is not a literal, so it falls through.
-    if !word_globs(word) && text.starts_with("--") && text != "--" {
+    // The bare terminator is a value of its own, so it travels rather than being
+    // re-read as syntax by whatever command position it lands in next. That is
+    // what lets a wrapper forward one without mesh ever synthesizing it.
+    if !word_globs(word) && text == "--" {
+        return Some(Ok(Value::FlagTerminator));
+    }
+    if !word_globs(word) && text.starts_with("--") {
         // A `--` word here is meant as an option, so a name that is not a **name**
         // is a mistake in the line rather than data to pass on quietly. Reported
         // for the same reason a signature reports it: `func f(--fo*)` is
@@ -1060,6 +1068,7 @@ pub(crate) fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError>
         // A string context asks for text, not for an option, so a flag renders
         // the word it was written with — the same bytes it sends to argv.
         Value::Flag(flag) => Ok(flag.text()),
+        Value::FlagTerminator => Ok("--".to_owned()),
         Value::Integer(value) => Ok(value.to_string()),
         Value::Boolean(value) => Ok(value.to_string()),
         Value::List(_) | Value::Map(_) | Value::Regex(_) | Value::Glob(_) => {
@@ -1157,7 +1166,8 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                     | Value::Stream(_)
                     | Value::Job(_)
                     | Value::Function(_)
-                    | Value::Flag(_) => {
+                    | Value::Flag(_)
+                    | Value::FlagTerminator => {
                         return Err(ExpandError::NotAList(vref.name.clone()));
                     }
                 }
@@ -1265,7 +1275,8 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Stream(_)
             | Value::Job(_)
             | Value::Function(_)
-            | Value::Flag(_) => Err(ExpandError::Modifier {
+            | Value::Flag(_)
+            | Value::FlagTerminator => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a string or collection".into(),
             }),
@@ -1325,7 +1336,8 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Stream(_)
             | Value::Job(_)
             | Value::Function(_)
-            | Value::Flag(_) => Err(ExpandError::Modifier {
+            | Value::Flag(_)
+            | Value::FlagTerminator => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
             }),
@@ -1352,7 +1364,8 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Stream(_)
             | Value::Job(_)
             | Value::Function(_)
-            | Value::Flag(_) => Err(ExpandError::Modifier {
+            | Value::Flag(_)
+            | Value::FlagTerminator => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
             }),
@@ -1380,7 +1393,8 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Stream(_)
             | Value::Job(_)
             | Value::Function(_)
-            | Value::Flag(_) => Err(ExpandError::Modifier {
+            | Value::Flag(_)
+            | Value::FlagTerminator => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a list".into(),
             }),
@@ -1474,7 +1488,8 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Stream(_)
             | Value::Job(_)
             | Value::Function(_)
-            | Value::Flag(_) => Err(ExpandError::Modifier {
+            | Value::Flag(_)
+            | Value::FlagTerminator => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a path".into(),
             }),
@@ -1549,7 +1564,8 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Stream(_)
             | Value::Job(_)
             | Value::Function(_)
-            | Value::Flag(_) => Err(ExpandError::Modifier {
+            | Value::Flag(_)
+            | Value::FlagTerminator => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a path".into(),
             }),
@@ -1577,7 +1593,8 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Stream(_)
             | Value::Job(_)
             | Value::Function(_)
-            | Value::Flag(_) => Err(ExpandError::Modifier {
+            | Value::Flag(_)
+            | Value::FlagTerminator => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a path".into(),
             }),
@@ -1613,7 +1630,8 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Stream(_)
             | Value::Job(_)
             | Value::Function(_)
-            | Value::Flag(_) => Err(ExpandError::Modifier {
+            | Value::Flag(_)
+            | Value::FlagTerminator => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a path or a list of paths".into(),
             }),
@@ -1645,7 +1663,8 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Stream(_)
             | Value::Job(_)
             | Value::Function(_)
-            | Value::Flag(_) => Err(ExpandError::Modifier {
+            | Value::Flag(_)
+            | Value::FlagTerminator => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "cannot apply string modifier to this value".into(),
             }),
@@ -1768,6 +1787,7 @@ pub(crate) fn join_value(value: Value, separator: &str) -> Result<Value, ExpandE
         }
         match item {
             Value::String(s) => out.push_str(&s),
+            Value::FlagTerminator => out.push_str("--"),
             // `:join` builds a string, so a flag contributes the word it was
             // written with, as it does at every other byte boundary.
             Value::Flag(flag) => out.push_str(&flag.text()),
@@ -1845,7 +1865,8 @@ pub(crate) fn map_strings(
         | Value::Stream(_)
         | Value::Job(_)
         | Value::Function(_)
-        | Value::Flag(_) => Err(fail("cannot apply a string modifier to this value")),
+        | Value::Flag(_)
+        | Value::FlagTerminator => Err(fail("cannot apply a string modifier to this value")),
     }
 }
 
@@ -2053,6 +2074,7 @@ pub(crate) fn value_kind(value: &Value) -> &'static str {
     match value {
         Value::String(_) => "a string",
         Value::Flag(_) => "a flag",
+        Value::FlagTerminator => "the flag terminator",
         Value::Styled(_) => "a styled string",
         Value::Integer(_) => "an integer",
         Value::Boolean(_) => "a boolean",

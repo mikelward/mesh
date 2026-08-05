@@ -1035,6 +1035,7 @@ pub(crate) fn rendered_for_output(value: &Value, decoration: Decoration) -> Resu
         // and a flag in a call is an option. Inside a list it is data being
         // displayed, so it shows the text it was written with.
         Value::Flag(flag) => Ok(flag.text()),
+        Value::FlagTerminator => Ok("--".to_owned()),
         Value::List(items) => {
             let mut lines = Vec::with_capacity(items.len());
             for item in items {

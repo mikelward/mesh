@@ -3516,6 +3516,23 @@ thing a reader takes on trust.*
       `recent` — which read their one leading option off the front of `...args`
       by hand. Verbose, but explicit in the body where a reader sees it rather
       than inferred from a signature rule.
+- [x] **`Value::FlagTerminator`, built.** A bare `--` written in value position
+      binds a terminator value that *travels*, so a wrapper forwards one and mesh
+      never synthesizes it. `:repr` writes `--` where the string writes `'--'` --
+      settled by the repo owner, and forced by the round-trip contract, which is
+      the same rule keeping `42` and `'42'` apart.
+
+      **The string no longer terminates.** `w = "--"; f $w --force` binds the
+      switch now, where it used to end flag parsing on what `$w` happened to
+      hold. That was the data-decides-the-call reading this family exists to
+      remove, and it came out with no fan-out at all -- the whole suite stayed
+      green when the string check was deleted.
+
+      Still open, and the reason the entry above matters: a terminator reaching a
+      **builtin** goes through the same path a flag does, so `puts $x:repr` on one
+      prints nothing -- `puts` strips its own first `--`. Harmless today, and it
+      is the same plumbing the entry below describes.
+
 - [ ] **`puts $x` should report a flag, and cannot be done in `output_words`.**
       The design says a flag in a call is an *option*, `puts` declares none, so
       `puts $x` reports rather than printing -- `puts "$x"` and `puts $x:repr`
