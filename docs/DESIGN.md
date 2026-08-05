@@ -1600,15 +1600,15 @@ rule: `-` is subtraction / exclusion *only* with surrounding spaces. So `a-b` is
 one name, `a - b` subtracts, and `$a-$b` interpolates the two with a literal
 hyphen between — the third payoff of that one spacing rule.
 
-- **Scope — two levels today, lexical.** There are two *kinds* of variable scope:
+- **Scope — two levels, lexical.** There are two *kinds* of variable scope:
   the **session-global** scope (top-level rc and interactive bindings) and a fresh
-  **function-local** scope per `func` call. Two is the current **depth**, not a
-  cap: the decided [lambda capture](#calling-for-a-value-and-lambdas) rule gives a
-  lambda a local scope whose parent is the scope that *defined* it, so a lambda
-  called from elsewhere — or outliving that frame — resolves through the captured
-  scope before reaching the session, and nested lambdas chain further. Build the
-  rung as a **parent link**, not a two-slot lookup. The environment (exported
-  names) is a separate axis. Scoping is **lexical**: a function sees its own locals, its
+  **function-local** scope per `func` call. Two is the **depth**, and the decided
+  [lambda capture](#calling-for-a-value-and-lambdas) rule keeps it there: a lambda's
+  scope holds its parameters plus the values its `with (…)` list copied in, and its
+  parent is the session. There is no chain of defining scopes to walk, which is the
+  point of capturing values rather than scopes — a captured name is an ordinary
+  current-scope binding, so nothing outlives the frame that wrote it. The environment
+  (exported names) is a separate axis. Scoping is **lexical**: a function sees its own locals, its
   parameters, and the globals — never its *caller's* locals (no dynamic scope,
   the classic shell footgun). Inside a function, `x = 5` binds a **local by
   default**, shadowing any global rather than clobbering it — the deliberate
@@ -1623,9 +1623,9 @@ hyphen between — the third payoff of that one spacing rule.
   }
   ```
 
-  Reading resolves **outward** along that chain (local → any captured defining
-  scopes → global) — capture is lexical too, so it reaches the scope that *wrote*
-  the lambda, never the one that calls it; an **unbound** name is an
+  Reading resolves **outward** along that chain (local → global) — and a lambda's
+  captured names are in the *local* rung, having been copied there from the scope that
+  *wrote* the lambda, never the one that calls it; an **unbound** name is an
   **error**, not empty — the always-on `set -u` that the *no null* rule below
   already implies, so a **typo'd read fails loud** (`$staus` → error). The one
   place a typo is *not* caught is **assignment**, which always creates
@@ -1645,11 +1645,17 @@ hyphen between — the third payoff of that one spacing rule.
   the environment.
 - **No block scope; `unset` removes a scope's binding.** Control-flow blocks
   (`if` / `for` / `while` / `loop`) do **not** open a new scope, so
-  `if c { x = 1 }` then `$x` works and a loop binder is an ordinary binding in
-  the enclosing scope (readable after the loop, holding the last value) — a block
-  adds **no rung**. Depth comes from `func` calls and, once
-  [lambdas capture](#calling-for-a-value-and-lambdas), from a captured defining
-  scope; never from a block. **`unset name`** removes the binding **in the
+  `if c { x = 1 }` then `$x` works — a block adds **no rung**, and depth comes from
+  `func` calls alone.
+
+  The **`for` binder is the one exception**, and it is a binder rather than a
+  block rule: it belongs to its loop, fresh each iteration and gone at the end
+  (see [`for` binding](#calling-for-a-value-and-lambdas)), so `$_i` after the loop
+  is an unbound read. That is not a rung either — the binding lives in the
+  enclosing scope for the loop's duration and any name it shadows is put back
+  afterwards — it is a *lifetime*, chosen so that a lambda written in the body
+  cannot silently read one shared slot and see only its last value.
+  **`unset name`** removes the binding **in the
   current scope**: inside a function it drops the local, and if that local was
   shadowing a global the global becomes visible again (reads resolve outward as
   usual) — so plain `unset` never reaches through to mutate a global, matching
@@ -3595,10 +3601,11 @@ argument-free, auto-mapping modifier form; `&name` is the general reference, any
 any slot — so a reader can predict which applies without knowing whether a name shipped
 with the shell.
 
-**A lambda closes over the scope that created it** *(decided — a change from what runs
-today)*. The body's scope parent is currently the *session*, so a lambda sees session
-and global bindings but not the function-locals beside it, even when it is called
-immediately, in the same scope:
+**A lambda captures by an explicit list — `with (…)`** *(decided — a change from what
+runs today, and a reversal of what an earlier revision of this section decided)*. The
+body's scope parent is the *session*, so a lambda sees session and global bindings but
+not the function-locals beside it, even when it is called immediately, in the same
+scope:
 
 ```
 func f() { _n = 41
@@ -3608,35 +3615,117 @@ func f() { _n = 41
 
 That makes lambdas and [`_`-prefixed locals](#variables-and-assignment) mutually
 unusable in exactly the place a lambda earns its keep — `$xs:filter(func(_p) { $_p:ext
-== $_want })` cannot reach the `_want` bound on the line above it. So a lambda captures
-its defining scope.
+== $_want })` cannot reach the `_want` bound on the line above it. The same text works
+at top level and fails inside a function, which is the sharpest statement of the bug.
 
-This is mesh's **first closure**, which is a commitment rather than a scope tweak: a
-lambda that outlives its defining frame needs that frame's locals to outlive the call
-too — as live bindings, or as a snapshot taken at capture, which is the sub-question
-below — so either way locals stop being a pure stack discipline. It also retires a justification used elsewhere — the
-decision that a flag's value is captured at assignment rejected the late alternative as
-"a closure in disguise, which mesh has nothing else like." mesh now has one, so that
-decision needs its own reasoning; it stands on the simpler ground that a *value* should
-not carry unevaluated work, but the supporting argument is gone and should not be cited
-again.
+The fix is a **capture list**, written after the parameters:
 
-*Open — capture by binding or by value.* Reading a **session** variable
-from a lambda is late today (`x = 1; g = func() { puts $x }; x = 2; $g()` prints `2`),
-and capturing the **binding** rather than a snapshot is what keeps a captured local
-consistent with that. One question follows and is not answered here: whether a
-captured local is *writable* through the lambda, which is the same answer under a
-different name.
+```
+func pick(_want) {
+  return $_xs:filter(func(_p) with ($_want) { $_p:ext == $_want }) }
+```
 
-*Not open — shadowing a captured local.* An earlier revision listed this as a second
-sub-question, on the grounds that the [no-shadow rule](#variables-and-assignment) was
-stated over locals versus outer *session* bindings and said nothing about two nested
-locals. That misread it: the rule is *"no shadowing, **at any rung**"* — one name, one
-rung at a time — and its "not local over session, not session over environment" is an
-enumeration of the rungs that existed, not the extent of the ban. A captured defining
-scope is a rung, so a lambda parameter may not shadow a captured local, for exactly the
-reason a local may not shadow a session binding. Nothing here argues for a carve-out,
-and one would need its own justification.
+`with ($_want)` is evaluated **where the lambda is written**, in the frame that can see
+`_want`, and the value is copied into the function value. Reading an unbound name there
+is the usual loud error, at the point of capture rather than at the call.
+
+*Two decisions, not one.* They are usually run together and should not be, because
+different things decide them.
+
+- **By value, not by live binding — decided by the missing garbage collector.**
+  Capturing a *scope* means a frame outliving its call, which means a shared,
+  reference-counted scope; a lambda stored into the scope it captured is then a cycle
+  that is never freed. Capturing *values* has no such problem: they are copied into the
+  existing function value, nothing outlives its frame, and a self-referential
+  `_g = func() with ($_g) { … }` is an unbound-variable error at the point of capture,
+  because `_g` is not bound until the assignment completes. This is the axis where
+  having no GC actually forces the answer. Rust is the counterexample worth knowing:
+  the other GC-less language with closures, it requires no capture list and leans on
+  the borrow checker instead — so the absence of a collector does not dictate a *list*,
+  only that the lifetime question gets answered somewhere.
+- **Explicit, not implicit — decided by the `_` rule, and it is a readability call.**
+  A `_` name is [always current-scope](#variables-and-assignment), which is what makes
+  collision impossible by construction. Implicit capture works against exactly that: it
+  would make `$_want` in a body resolve to *some other frame's* scope, silently. A
+  capture list keeps the invariant, because the captured value arrives as a binding in
+  the lambda's **own** current scope — `with ($_want)` reads as "bind my `_want` from
+  the enclosing one", a copy in rather than a reach out. Note what this bullet does
+  *not* rest on: implicit capture **by value** would have been cycle-free too, so the
+  GC argument above does not reach this choice. PHP's arrow functions capture by value
+  implicitly, and immutable languages such as Erlang and Elixir get it for nothing.
+
+*Where the spelling comes from.* PHP is the near-exact precedent — `function ($p) use
+($want) { … }` — a garbage-collected scripting language that took an explicit list for
+readability rather than for memory, which is mesh's reason too. C++ (capture lists in
+C++11, init-capture in C++14) and Swift's `[weak self]` are the other explicit ones, and
+both are mainly about object lifetime. Everything else in common use captures
+implicitly. The keyword is `with` rather than `use` because mesh already spells
+"establish these bindings for the following block" that way in the
+[`with FOO=1` prefix](#the-environment).
+
+*What it costs, stated plainly.* A lambda cannot read a local it did not name, so
+adding a name to a body means adding it to the list — the compile-time-ish nuisance
+that is the price of the lifetime being visible. And a captured value is a **copy**, so
+a lambda can never accumulate into an enclosing local; `global` remains the way to
+mutate something a lambda can see. For a shell that is a fair trade — `:map` /
+`:filter` / `:len` cover most accumulation — but it is a real limit and not a temporary
+one.
+
+*What this reverses.* An earlier revision decided that a lambda captures its **defining
+scope**, with "by binding or by value" left open as a sub-question, and asked for the
+scope rung to be built as a parent link. That is withdrawn. Three things follow from
+the withdrawal, all of them simplifications:
+
+- **Scope depth stays two.** A lambda's scope is its parameters plus its captured
+  copies, and its parent is the session. There is no chain to walk and no parent link
+  to build, so [§Scope](#variables-and-assignment)'s "two is the current depth, not a
+  cap" is no longer under pressure from this decision.
+- **The by-binding / by-value sub-question is answered by removal.** Capture is always
+  by value, and only of what is named. Reading a *session* variable from a body stays
+  late, because the session outlives every frame — which is the principle the whole
+  rule rests on: **you may read late only from a scope that outlives you.** A frame
+  that is going away has to hand its values over, and handing over is a copy.
+- **The shadowing question dissolves.** The previous revision reasoned that a lambda
+  parameter may not shadow a captured local, since a captured scope is a rung. With an
+  explicit list the enclosing frame is *not* a rung — it is not in scope at all — so
+  there is nothing to shadow. What remains is an ordinary duplicate-binding error when
+  a parameter and a captured name collide, which is the same check a repeated parameter
+  already gets.
+
+It also retires a justification used elsewhere: the decision that a flag's value is
+captured at assignment rejected the late alternative as "a closure in disguise, which
+mesh has nothing else like." A capture list is not that closure — it captures values,
+not scopes — so the flag decision keeps its ground rather than losing it: a *value*
+should not carry unevaluated work, and that is now the only argument it needs.
+
+*Open — capturing under another name.* The list above captures a name as itself. The
+obvious extension is `with (_w = $_want)`, letting the body use a shorter name or
+capture a computed value, which would also make the list read like the `with FOO=1`
+[block prefix](#the-environment) it shares a keyword with. Nothing is blocked by
+leaving it out — the shorthand covers the motivating case — so it stays unbuilt until
+something wants it.
+
+**A `for` binding belongs to its loop** *(decided — a change from what runs today)*.
+The loop variable is currently an ordinary assignment into the surrounding scope, so it
+outlives the loop:
+
+```
+for _i in [1 2 3] { }
+puts $_i                        # today: 3
+```
+
+That is the classic capture footgun in the making: every lambda written in the body
+would read one shared binding and see only its final value, which is Go before 1.22 and
+JavaScript's `var`. Both fixed it in the *loop* rather than in the closure, and so does
+this: **the binding is fresh for each iteration and is gone when the loop ends**, so the
+`puts` above is an unbound-variable error and a body that wants the value must capture
+it — `func() with ($_i) { … }`, which then sees that iteration's value because the list
+is evaluated per iteration.
+
+A name the loop shadows is restored afterwards rather than clobbered, so a loop cannot
+quietly overwrite a binding around it. The two decisions are independent: fixing the
+loop is worth it on its own, and it is what keeps the capture list from being the only
+thing standing between a reader and a wrong answer.
 
 ### Conditionals: `if` is an expression
 

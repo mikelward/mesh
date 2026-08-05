@@ -4713,44 +4713,60 @@ not.
       a lambda already expresses every case — so this is sugar, to think about rather
       than schedule.
 
-## Beyond M3 — Lambda capture
+## Beyond M3 — Lambda capture (`with (…)`) and the `for` binder
 
 Decided in design discussion; see `docs/DESIGN.md` §"Calling for a value, and
 lambdas". Not implemented.
 
-- [ ] **A lambda captures the scope that defined it.** Today a lambda body's scope
-      parent is the *session*, so it sees session and global bindings but not the
-      function-locals beside it — `func f() { _n = 41; _g = func() { puts $_n }; $_g() }`
-      reports `_n: unbound variable` even called immediately in the same scope, which
-      makes lambdas and `_`-prefixed locals mutually unusable exactly where a lambda
-      earns its keep. This is mesh's **first closure**: a lambda outliving its
-      defining frame needs that frame's locals to outlive the call too — as live
-      bindings, or as a snapshot taken at capture, which is the open sub-question
-      below — so either way locals stop being a pure stack discipline. Do not pick
-      between the two here. Size the representation change before scheduling it. **The scope
-      invariant moves with it:** `docs/DESIGN.md` §"Variables and assignment" no
-      longer says there are exactly two scopes, because a captured lambda resolves
-      through its defining scope before the session and nested lambdas chain
-      further — build the rung as a parent link rather than a two-slot lookup.
-      Capture stays *lexical*: the scope that wrote the lambda, never the one that
-      calls it.
-  - [ ] **Sub-question — capture by binding or by value.** Reading a session
-        variable from a lambda is late today (`x = 1; g = func() { puts $x }; x = 2;
-        $g()` prints `2`), so capturing the *binding* keeps a captured local
-        consistent with that. Whether a captured local is **writable** through the
-        lambda follows from the same answer.
-  - **Not a sub-question — shadowing a captured local.** Listed as open in an
-        earlier revision; it is not. The no-shadow rule is *"no shadowing, at any
-        rung"*, and its "not local over session, not session over environment" is
-        an enumeration of the rungs that existed, not the extent of the ban. A
-        captured defining scope is a rung, so a lambda parameter may **not** shadow
-        a captured local — enforce it the same way, at the binding site.
-- [ ] **Restate the flag-value justification.** The decision that a flag's value is
-      captured at assignment rejected the late alternative as "a closure in
-      disguise, which mesh has nothing else like" (this file, under the typed-flag
-      thread). Lambda capture makes that false. The decision stands on the simpler
-      ground that a *value* should not carry unevaluated work — edit the entry to say
-      that instead, so the retired argument is not cited again.
+- [ ] **A lambda captures by an explicit list — `func(_p) with ($_want) { … }`.**
+      Today a lambda body's scope parent is the *session*, so it sees session and
+      global bindings but not the function-locals beside it —
+      `func f() { _n = 41; _g = func() { puts $_n }; $_g() }` reports
+      `_n: unbound variable` even called immediately in the same scope, and the
+      same text that works at top level fails inside a function. The list is
+      evaluated **where the lambda is written**, and the values are copied into the
+      function value; an unbound name there is loud at the point of capture.
+  - [ ] Parser: `lambda = "func" parameter-list ("with" capture-list)? NL* block`,
+        the list holding `$name` reads only. A parameter colliding with a captured
+        name is a duplicate binding, the check a repeated parameter already gets.
+  - [ ] Evaluation: capture at `Expr::Lambda`, store on `Callable::Lambda`, and
+        insert the copies into the call's fresh scope alongside the parameters.
+  - [ ] `docs/REFERENCE.md` and `GRAMMAR.md` — the spelling, and why it is
+        explicit.
+- [ ] **A `for` binding belongs to its loop.** Fresh each iteration, gone at the
+      end, and a name it shadows is restored rather than clobbered — so `$_i` after
+      the loop is an unbound read where today it is the last value. Independent of
+      the capture list and worth doing on its own: it is what stops a lambda in the
+      body reading one shared slot and seeing only its final value (Go before 1.22,
+      JavaScript's `var`). Both `run_ast_for` and `eval_for_expr` bind through
+      `bind_iteration`, so both need it. Undocumented today — `docs/REFERENCE.md`
+      §Loops says nothing about the binder's lifetime — so this changes no promise,
+      but it is a **breaking change to observable behavior** and needs saying.
+
+### Withdrawn: implicit capture of the defining scope
+
+An earlier revision decided a lambda captures its defining **scope**, with "by
+binding or by value" open beneath it and a parent-link rung to build. Withdrawn in
+favor of the list above, for two reasons. The `_` rule makes a `_` name *always
+current-scope*, and implicit capture would silently resolve one to another frame's
+scope, against the invariant that makes collisions impossible by construction. And
+mesh has no garbage collector: implicit capture of a live scope needs a shared,
+reference-counted scope, and a lambda stored into the scope it captured is then a
+cycle that is never freed. C++ made capture explicit for that same reason.
+
+Three things fell out, all simplifications: scope depth stays two (no chain to
+walk, so `Vars` is untouched); the by-binding/by-value sub-question is answered by
+removal (capture is always by value, of what you name); and the shadowing
+sub-question dissolves, since the enclosing frame is not a rung at all. The cost is
+real and permanent: a captured value is a copy, so a lambda can never accumulate
+into an enclosing local — `global` stays the way to mutate something a lambda sees.
+
+- [x] **Restate the flag-value justification.** *(no longer needed — resolved by the
+      reversal.)* The flag decision rejected the late alternative as "a closure in
+      disguise, which mesh has nothing else like". A capture list is not that
+      closure: it captures values, not scopes, so the argument was never falsified
+      and the entry needs no edit. `docs/DESIGN.md` says so where the reversal is
+      recorded.
 
 ## Loose ends
 
