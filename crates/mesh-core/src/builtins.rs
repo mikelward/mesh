@@ -1037,6 +1037,11 @@ pub(crate) fn rendered_for_output(value: &Value, decoration: Decoration) -> Resu
         Value::Styled(styled) => Ok(styled.style.render(&styled.text, decoration)),
         Value::Integer(number) => Ok(number.to_string()),
         Value::Boolean(flag) => Ok(flag.to_string()),
+        // Reached only for a flag nested in a collection (`puts [--force]`): a
+        // top-level one is refused before here, since `puts` declares no options
+        // and a flag in a call is an option. Inside a list it is data being
+        // displayed, so it shows the text it was written with.
+        Value::Flag(flag) => Ok(flag.text()),
         Value::List(items) => {
             let mut lines = Vec::with_capacity(items.len());
             for item in items {
