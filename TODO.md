@@ -9,6 +9,20 @@ file as tasks land.
 Calls autopilot made without asking, each one chosen for being cheap to undo.
 Delete an entry once you have agreed with it or reversed it.
 
+- [ ] **The nesting indent is two spaces, on trial.** `puts` and `:pretty` both
+      read `NEST_INDENT` in `crates/mesh-core/src/vars.rs`, deliberately one
+      constant so the read-it and read-it-back forms of a value line up. Two was
+      agreed as something to try — the standing preference is **four**.
+      *Reversible:* changing the constant moves both, so it is that one line plus
+      the test expectations that spell out indented output.
+- [ ] **`:pretty` breaks every collection, with no short-value exception.** A
+      one-element list lays out over three lines like any other. The alternative
+      is a size threshold below which a value stays inline, which was declined
+      because you cannot then tell which form you will get without counting
+      characters, and the compact form already has a name — `:repr` *is* the value
+      on one line. *Reversible:* adding a threshold later only ever collapses
+      output that currently breaks; nothing depends on the broken form, since the
+      round-trip contract holds either way.
 - [ ] **The flag-equality refusal was scoped to the top-level operands of
       `==` / `!=`.** Nested pairs (`[--help] == ["--help"]`) and `in`
       (`--help in ["--help"]`) use total equality and answer `false`. The
@@ -2141,34 +2155,27 @@ designed, and the cross-references say where the fuller note lives.
       per line makes the brackets pure framing — that is `:repr` pretty-printed,
       which is better pursued in `:repr` than by making `puts` a format.
 
-- [ ] **Pretty-print `:repr` — line breaks and indentation for a nested value.**
-      *(mikelward)* `:repr` writes the mesh source you would have typed and
-      recurses all the way down, but it writes it on **one line**:
-      `['a': ['b': [1, 2]]]`. That is exactly right for pasting back and for
-      comparing two values, and it stops being readable at the size where you most
-      want to read it — a whole `$env`, a config map, anything a few levels deep.
+- [x] **Pretty-print `:repr` — line breaks and indentation for a nested value**
+      *(landed as a separate `:pretty` modifier)*. `:repr` writes the mesh source
+      you would have typed and recurses all the way down, but on **one line**:
+      `['a': ['b': [1, 2]]]`. That is right for pasting back and for comparing two
+      values, and it stops being readable at the size where you most want to read
+      it — a whole `$env`, a config map, anything a few levels deep.
 
-      A broken-out form is the bracketed shape weighed against `puts` above, and it
-      belongs here rather than there: `:repr` already quotes and escapes, so unlike
-      `puts` it can add line breaks without the layout ever becoming load-bearing —
-      the brackets and commas still say where each value starts and ends, and the
-      result still round-trips. Roughly:
+      `$m:pretty` is the same literal laid out over lines, two-space indent per
+      level. The round-trip contract is unchanged, which is what makes the layout
+      safe here and not in `puts`: the brackets and commas still say where each
+      value starts and ends, so the indentation is decoration over a spelling that
+      already parsed, and the refusals are `:repr`'s refusals by the same name.
 
-      ```
-      ['a': ['b': [1, 2]],
-       'c': 3]
-      ```
-
-      or one element per line with a two-space indent, matching what `puts` now
-      does for nesting. Things to settle: whether it is the default for `:repr` or a
-      second modifier (`:pretty`, say) with `:repr` staying single-line and
-      paste-safe; whether a short value stays on one line and what "short" is; and
-      whether the indent unit matches `puts`'s two spaces, which it should unless
-      there is a reason not to.
-
-      Worth checking against the `puts` rendering when it lands: the two are the
-      **read it** and **read it back** halves of the same job, and they should not
-      disagree about indentation for no reason.
+      Settled along the way, all three by mikelward:
+  - A **separate modifier**, not a flag on `:repr`. `:repr` keeps meaning one
+        line — `$a:repr == $b:repr` is a working way to compare values, and a
+        one-line literal is what makes its output pasteable.
+  - **Every** collection breaks, no size threshold. See the note under
+        *Decisions needing review*.
+  - **Two-space** indent, matching `puts`. Also noted below — mikelward's
+        standing preference is four.
 
 - [x] **A modifier chain in `"…"` is dropped when punctuation abuts it**
       *(landed — the name now stops at the first character that cannot be in one;

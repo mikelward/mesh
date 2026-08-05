@@ -206,6 +206,22 @@ There are four kinds of modifier, and the difference matters:
   would re-glob it — and, until its flags round-trip, a regex); an approximation
   would read back as a different value, which is the one thing `:repr` must not
   do. It is the writer half of the [subshell value channel](#isolation-and-subshells).
+- **`:pretty`** is that same literal **laid out over lines**, two-space indent per
+  level, for the sizes where one line stops being readable — a whole `$env`, a
+  config map, anything a few levels deep. **Every** collection breaks, with no
+  size threshold: "short values stay inline" would mean you cannot tell which form
+  you get without counting characters, and the compact form already has a name.
+  A scalar and the empty `[]` / `[:]` have nothing to put between the brackets and
+  are written as they are. The round-trip contract is **unchanged**, and that is
+  what makes the layout safe here — the brackets and commas still say where each
+  value starts and ends, so the indentation is decoration over a spelling that
+  already parsed, and the refusals are `:repr`'s refusals by the same name.
+  [`puts`](#builtins) could not do this: it quotes nothing, so there the layout
+  would be the only thing carrying the structure. It is a **separate name** rather
+  than a flag on `:repr` because `:repr` keeps meaning *one line* — `$a:repr ==
+  $b:repr` compares two values, and a one-line literal is what you paste back. The
+  indent matches the one `puts` uses for nesting, so the read-it and read-it-back
+  forms of a value line up.
 - **Filter modifiers** (`:files`/`:f`, `:dirs`/`:d`, `:links`/`:l`,
   `:exec`/`:x`) keep the list elements matching a **file-type predicate** and
   drop the rest — a subset, not a transform. They **chain for AND** (`:f:x` =
