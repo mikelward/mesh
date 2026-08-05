@@ -4632,6 +4632,19 @@ lambdas" and §"Hooks and the prompt". Nothing here is implemented.
       mark. Note the reading **not** taken: a callable that performs the fill would
       need the renderer to pass the measured slack in, making `&fill("─")` a partial
       application, which mesh has nothing else like.
+- [ ] **Think about partial application — no implementation intended yet.** Recorded
+      as a named open question in `docs/DESIGN.md` §"Open questions" so the `fill`
+      aside above stops being the only place it is written down. `&name` names a
+      function but cannot pre-supply arguments, so a higher-order slot wanting an
+      existing function with one choice already made takes a lambda wrapper
+      (`$xs:map(func(_x) { pad($_x, width: 8) })`). Leading spelling if mesh ever grows
+      one: **`&f(key: value)`** — sigil kept so it stays a value, keyword-bound only.
+      Unweighed: `&pad(width: 8)` versus `pad(width: 8)` differing by the sigil
+      alone while meaning
+      "later" versus "now", and whether a bound argument is snapshotted or
+      re-evaluated per call (the lambda-capture question again). Nothing is blocked —
+      a lambda already expresses every case — so this is sugar, to think about rather
+      than schedule.
 
 ## Beyond M3 — Lambda capture
 
