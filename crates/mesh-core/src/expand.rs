@@ -452,6 +452,7 @@ pub fn expand_call_values(
         } else if let Some(value) = whole_value(&word, vars) {
             out.push((value?, false));
         } else if let Some(value) = scalar_literal(&word) {
+            let value = value.map_err(ExpandError::ArgumentValue)?;
             out.push((value, true));
         } else {
             // A single unquoted, un-interpolated word with no glob metacharacters
@@ -569,6 +570,19 @@ fn flag_from_text(text: &str) -> Result<crate::vars::FlagValue, String> {
     if name.is_empty() {
         return Err(format!("`{text}` is not an option: it has no name"));
     }
+    // A flag's name has to be a **name**, matching what a signature already
+    // demands — `func f(--fo*)` is `expected a name`, so a value spelled that way
+    // is not the option it looks like either. Everything else stays what it
+    // already was: a word, which expansion may turn into a glob or plain text,
+    // and which an external receives as bytes since mesh parses none of its
+    // flags. That keeps `curl --fo*` and `ls --*` working, where refusing at the
+    // parser would break both.
+    if !name
+        .chars()
+        .all(|ch| ch == '_' || ch == '-' || ch.is_alphanumeric())
+    {
+        return Err(format!("`{text}` is not an option: `{name}` is not a name"));
+    }
     Ok(crate::vars::FlagValue {
         name: name.to_owned(),
         value,
@@ -652,7 +666,11 @@ fn whole_value(word: &Word, vars: &Vars) -> Option<Result<Value, ExpandError>> {
     Some(resolve_value(vref, vars))
 }
 
-fn scalar_literal(word: &Word) -> Option<Value> {
+/// The typed value a single bare literal word denotes, when it denotes one.
+///
+/// `Some(Err(_))` is a word that was *meant* as an option and is malformed — kept
+/// distinct from `None`, which is "not a typed literal, expand it as text".
+fn scalar_literal(word: &Word) -> Option<Result<Value, String>> {
     let [
         Piece::Text {
             text,
@@ -674,16 +692,18 @@ fn scalar_literal(word: &Word) -> Option<Value> {
     // needs no punctuation to mark it. And a globbing *payload* (`--tag=*.txt`)
     // has to reach expansion, which in command position turns the pattern into
     // words. Either way the word is not a literal, so it falls through.
-    if !word_globs(word)
-        && let Ok(flag) = flag_from_text(text)
-    {
-        return Some(Value::Flag(flag));
+    if !word_globs(word) && text.starts_with("--") && text != "--" {
+        // A `--` word here is meant as an option, so a name that is not a **name**
+        // is a mistake in the line rather than data to pass on quietly. Reported
+        // for the same reason a signature reports it: `func f(--fo*)` is
+        // `expected a name`.
+        return Some(flag_from_text(text).map(Value::Flag));
     }
     // A bare word that is not a typed literal falls through to ordinary string
     // expansion, so only surface `true`/`false`/integers as typed values here.
     match typed_scalar(text) {
         Value::String(_) => None,
-        typed => Some(typed),
+        typed => Some(Ok(typed)),
     }
 }
 
