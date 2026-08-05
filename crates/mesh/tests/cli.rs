@@ -17756,6 +17756,429 @@ fn an_invalid_break_in_a_reference_argument_recovers_like_a_lambda() {
     assert!(in_loop.stderr.is_empty(), "{:?}", in_loop.stderr);
 }
 
+/// `&name` is the value spelling a named `func` did not have — the function
+/// command position would run, handed to anything that takes a callable
+/// (`DESIGN.md` §"Calling for a value, and lambdas"). Before it, `$xs:map(up)`
+/// passed the *string* `"up"` and the modifier reported a bad argument type.
+#[test]
+fn a_function_reference_is_a_callable() {
+    let out = run_with_input(
+        "func up(s) { $s:upper }\n\
+         func long(s) { $s:len >= 2 }\n\
+         xs = [a bb ccc]\n\
+         puts $xs:map(&up):join(\",\")\n\
+         puts $xs:filter(&long):join(\",\")\n\
+         f = &up\n\
+         puts $f(z)\n\
+         inlist = [&up]\n\
+         puts $inlist[0](q)\n\
+         puts $f(...[\"spread\"])\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "A,BB,CCC\nbb,ccc\nZ\nQ\nSPREAD\n"
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The whole signature travels with the reference, because it *is* the function's
+/// signature — a reference is a name, not a re-declaration. Diagnostics name the
+/// function referenced rather than the variable it arrived through, which is the
+/// name a reader can go look up.
+#[test]
+fn a_function_reference_calls_the_whole_signature() {
+    let out = run_with_input(
+        "func g(a, --loud = \"n\") { \"$a/$loud\" }\n\
+         wrapper func w(...rest) { $rest:join(\"|\") }\n\
+         f = &g\n\
+         puts $f(x, loud: \"y\")\n\
+         puts $f(x)\n\
+         v = &w\n\
+         puts $v(a, b)\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x/y\nx/n\na|b\n");
+
+    let arity = run_with_input("func up(s) { $s }\nf = &up\nputs $f()\n");
+    assert!(!arity.status.success());
+    assert!(
+        String::from_utf8_lossy(&arity.stderr).contains("up: expected 1 argument"),
+        "{}",
+        String::from_utf8_lossy(&arity.stderr)
+    );
+}
+
+/// **Late binding** is the difference from a captured lambda: the reference holds
+/// the name, so what it runs is whatever that name means when it is *called*.
+/// Redefining the target changes an already-stored reference.
+#[test]
+fn a_function_reference_resolves_when_it_is_called() {
+    let out = run_with_input(
+        "func up(s) { \"first-$s\" }\n\
+         f = &up\n\
+         func up(s) { \"second-$s\" }\n\
+         puts $f(x)\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "second-x\n");
+
+    // A reference to a name nothing defines yet is a perfectly good value — it is
+    // the *call* that has to resolve, so a reference may name a function declared
+    // further down the file.
+    let later = run_with_input(
+        "f = &defined-later\n\
+         func defined-later(s) { \"ran-$s\" }\n\
+         puts $f(x)\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&later.stdout), "ran-x\n");
+
+    // Binding one is late; *registering* one as a hook is not. The slot checks the
+    // name at the assignment, so the same order is refused there — late dispatch
+    // and eager registration are separate things, and only the first is what `&`
+    // changed. Whether the check should be relaxed is D3 in `docs/HOOKS.md`;
+    // pinned here so the asymmetry cannot drift unnoticed either way.
+    let hook_first = run_with_input(
+        "$sh.preprompt.x = &declared-below\n\
+         func declared-below() { puts hi }\n",
+    );
+    // Asserted on stderr rather than the status: the refused assignment is not the
+    // last statement, and a script's status is the last thing it ran.
+    assert!(
+        String::from_utf8_lossy(&hook_first.stderr).contains("`declared-below` is not a function"),
+        "{}",
+        String::from_utf8_lossy(&hook_first.stderr)
+    );
+}
+
+/// "Is this name resolvable" and "does calling it yield a value" are different
+/// questions, and the errors say which one failed. A builtin and an external are
+/// both perfectly good references that simply have nothing to return — the split
+/// is *returns a value* vs. *runs for effect*, not builtin vs. external.
+#[test]
+fn a_function_reference_in_a_value_slot_needs_something_that_returns() {
+    for (source, message) in [
+        // An effect-only builtin: the same wording a written `puts(1 + 2)` gives.
+        (
+            "xs = [a]\ny = $xs:map(&puts)\n",
+            "puts: a command has no return value",
+        ),
+        // An external, which has no return value at all. `sh` rather than a
+        // prettier name because this has to be a command that really is on `PATH`.
+        ("f = &sh\nputs $f(a)\n", "sh: a command has no return value"),
+        // Resolving to nothing is the separate failure, and names the reference.
+        (
+            "f = &no-such-name-here\nputs $f(a)\n",
+            "&no-such-name-here: no builtin, function, or command with that name",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source} gave {stderr}");
+    }
+}
+
+/// A reference skips command position's keyword step, so a keyword names nothing
+/// for one to denote. Refused by the **parser**, which is why the diagnostic
+/// survives instead of the text falling back to a command reading — where the
+/// leading `&` reads as a backgrounding operator with nothing in front of it and
+/// reports `empty command in a pipeline`.
+#[test]
+fn a_function_reference_refuses_a_keyword() {
+    for source in ["f = &if\n", "&return\n", "xs = [a]\ny = $xs:map(&if)\n"] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("is not a function reference") && stderr.contains("is syntax"),
+            "{source} gave {stderr}"
+        );
+    }
+}
+
+/// A reference is a function value like any other — no text form, identity rather
+/// than name for equality — and the spelling rule keeps every other `&` intact.
+#[test]
+fn a_function_reference_behaves_like_any_function_value() {
+    let out = run_with_input(
+        "func up(s) { $s }\n\
+         x = &up\n\
+         y = &up\n\
+         if $x == $x { puts self-same }\n\
+         if $x == $y { puts also-same } else { puts distinct }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "self-same\ndistinct\n"
+    );
+
+    let text = run_with_input("func up(s) { $s }\nx = &up\nputs $x\n");
+    assert!(!text.status.success());
+    assert!(
+        String::from_utf8_lossy(&text.stderr).contains("a function value has no text form"),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+
+    // Backgrounding is postfix and belongs to statement position, so it never
+    // starts an operand and the two readings of `&` cannot meet.
+    let background = run_with_input("sleep 0.01 &\nwait\nputs backgrounded\n");
+    assert!(
+        String::from_utf8_lossy(&background.stdout).contains("backgrounded"),
+        "{}",
+        String::from_utf8_lossy(&background.stderr)
+    );
+
+    // A bare `&` still has nothing to background, and says so.
+    let bare = run_with_input("&\n");
+    assert!(!bare.status.success());
+    assert!(
+        String::from_utf8_lossy(&bare.stderr).contains("a background operator needs a command"),
+        "{}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+
+    // The name has to be written tight against the `&`, the rule that keeps this
+    // reading from reaching for a `&` spent elsewhere.
+    let spaced = run_with_input("func up(s) { $s }\nf = & up\n");
+    assert!(!spaced.status.success());
+}
+
+/// A reference dispatches through the same path a written `name(…)` takes, so a
+/// **value call** reached through one behaves identically. Getting this wrong is
+/// easy in exactly one direction: rejecting every builtin as effect-only, which
+/// would refuse `&gets` — a builtin that does return a value — along with `&puts`,
+/// which does not.
+#[test]
+fn a_function_reference_reaches_a_value_call() {
+    let dir = fresh_dir("func_ref_value_call");
+    std::fs::write(dir.join("one.md"), "x").unwrap();
+    std::fs::write(dir.join("two.md"), "x").unwrap();
+    std::fs::write(dir.join("skip.txt"), "x").unwrap();
+    std::fs::create_dir(dir.join("sub")).unwrap();
+
+    let out = run_with_input(&format!(
+        "cd {}\n\
+         f = &glob\n\
+         puts $f(\"*.md\"):len\n\
+         d = &dirs\n\
+         puts $d(\".\"):len\n\
+         s = &style\n\
+         puts $s(\"hi\", fg: red)\n\
+         r = &re\n\
+         if \"ab\" ~ $r(\"^a\") {{ puts matched }}\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "2\n1\nhi\nmatched\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `gets` is the builtin that answers to both spellings, so a reference to it has
+/// to reach the **call** form. Its own test because it needs real stdin: the
+/// script arrives by `-c` so the pipe carries only the line to read.
+#[test]
+fn a_function_reference_to_gets_reads_a_line() {
+    let mut command = mesh_command();
+    command
+        .arg("-c")
+        .arg("f = &gets\nline = $f()\nputs \"got=$line\"\n")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn mesh");
+    write_stdin(child.stdin.take(), b"one\ntwo\n");
+    let out = child.wait_with_output().expect("wait for mesh");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "got=one\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The higher-order path has an element in hand rather than an argument list, and
+/// a value call reads its own arguments — so only a declared `func` can be applied
+/// per element. The three failures there are distinct, and each says which one it
+/// is rather than borrowing another's wording.
+#[test]
+fn a_function_reference_applied_per_element_needs_a_function() {
+    for (source, message) in [
+        // A value call: nothing to hand it, and the lambda wrapper that does work
+        // is named in the message.
+        (
+            "xs = [\"*.md\"]\ny = $xs:map(&glob)\n",
+            "&glob: a value call cannot be applied per element",
+        ),
+        // A command: no value to give at all, which is the other failure.
+        (
+            "xs = [a]\ny = $xs:map(&puts)\n",
+            "puts: a command has no return value",
+        ),
+        // And a name that resolves to nothing is the third.
+        (
+            "xs = [a]\ny = $xs:map(&no-such-name-here)\n",
+            "&no-such-name-here: no builtin, function, or command with that name",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source} gave {stderr}");
+    }
+
+    // The wrapper the message points at is the working spelling.
+    let dir = fresh_dir("func_ref_wrapped");
+    std::fs::write(dir.join("one.md"), "x").unwrap();
+    let wrapped = run_with_input(&format!(
+        "cd {}\n\
+         xs = [\"*.md\"]\n\
+         y = $xs:map(func(p) {{ glob($p) }})\n\
+         puts $y:len\n",
+        dir.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&wrapped.stdout),
+        "1\n",
+        "{}",
+        String::from_utf8_lossy(&wrapped.stderr)
+    );
+}
+
+/// `:capture` wraps an **invocation**, and a reference is how that invocation was
+/// named — so `$f(…):capture` records the same channels `name(…):capture` does,
+/// including the command case, where the record comes back without `.value`
+/// because there is none. That is the one place a command may be value-called at
+/// all, so a reference must not lose it.
+#[test]
+fn a_function_reference_captures_like_the_name_it_stands_for() {
+    let out = run_with_input(
+        "f = &puts\n\
+         r = $f(\"hi\"):capture\n\
+         puts \"cmd=[$r.out] status=$r.status\"\n\
+         func up(s) { puts noise\n\
+         return $s:upper }\n\
+         g = &up\n\
+         v = $g(\"x\"):capture\n\
+         puts \"fn=$v.value out=[$v.out] status=$v.status\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "cmd=[hi\n] status=0\nfn=X out=[noise\n] status=0\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // An external through a reference records both byte channels, as the written
+    // spelling does.
+    let external = run_with_input(
+        "f = &sh\n\
+         r = $f(\"-c\", \"echo out; echo err >&2\"):capture\n\
+         puts \"out=[$r.out] err=[$r.err] status=$r.status\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&external.stdout),
+        "out=[out\n] err=[err\n] status=0\n",
+        "{}",
+        String::from_utf8_lossy(&external.stderr)
+    );
+
+    // A command's record has no `.value` to read, through a reference as much as
+    // through the name.
+    let no_value = run_with_input("f = &puts\nr = $f(\"hi\"):capture\nputs $r.value\n");
+    assert!(!no_value.status.success());
+
+    // `:capture` is defined over the **whole** invocation, so a computed callee is
+    // evaluated inside it just as an argument is: what the callee printed on its
+    // way to producing the function belongs in the record, not on the terminal.
+    // Regressed once by evaluating the callee early to find out whether it was a
+    // command reference; pinned here because nothing else caught it.
+    let computed = run_with_input(
+        "func make() { puts maker\n\
+         return func() { puts body\n\
+         return ok } }\n\
+         r = (make())():capture\n\
+         puts \"value=$r.value out=[$r.out]\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&computed.stdout),
+        "value=ok out=[maker\nbody\n]\n",
+        "{}",
+        String::from_utf8_lossy(&computed.stderr)
+    );
+
+    // The same rule an argument already followed, asserted beside it so the two
+    // cannot drift back apart.
+    let printing_argument = run_with_input(
+        "func side() { puts arg\n\
+         return x }\n\
+         r = puts(side()):capture\n\
+         puts \"out=[$r.out]\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&printing_argument.stdout),
+        "out=[arg\nx\n]\n",
+        "{}",
+        String::from_utf8_lossy(&printing_argument.stderr)
+    );
+
+    // An unresolvable reference is a bad reference, not a command to go run.
+    let unknown = run_with_input("f = &no-such-name-here\nr = $f(\"x\"):capture\n");
+    assert!(!unknown.status.success());
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr)
+            .contains("&no-such-name-here: no builtin, function, or command with that name"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+}
+
+/// A hook slot takes `&name` beside the bare word it already took: a reference
+/// *is* a name, and the late binding it means is the lookup a hook already did
+/// when the event fired. A lambda still has no name to register.
+#[test]
+fn a_hook_slot_accepts_a_function_reference() {
+    let out = run_with_input(
+        "func h() { puts hooked }\n\
+         $sh.preprompt.x = &h\n\
+         puts $sh.preprompt.x\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "h\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The name is still checked at the assignment, exactly as the bare word is.
+    let unknown = run_with_input("$sh.preprompt.x = &nosuch\n");
+    assert!(!unknown.status.success());
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("`nosuch` is not a function"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+
+    // A lambda is still refused, and for the reason it always was.
+    let lambda = run_with_input("$sh.preprompt.x = func() { puts hi }\n");
+    assert!(!lambda.status.success());
+    assert!(
+        String::from_utf8_lossy(&lambda.stderr).contains("a callable value is not stored yet"),
+        "{}",
+        String::from_utf8_lossy(&lambda.stderr)
+    );
+}
+
 #[test]
 fn join_and_split_modifiers_take_a_separator_argument() {
     // `:join(SEP)` folds a list to a string; `:split(SEP)` is its inverse. Both

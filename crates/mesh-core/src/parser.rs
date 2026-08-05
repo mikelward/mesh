@@ -360,6 +360,12 @@ pub enum ParseErrorKind {
     /// so a second answer to the same question either contradicts the first or
     /// silently overwrites it, and neither is what the reader wrote.
     DuplicateGlobQualifier(&'static str),
+    /// `&if`, `&return` — a function reference naming a command keyword. A
+    /// reference resolves `builtin → func → external`, skipping the keyword step
+    /// command position starts with, so there is nothing for these to name. Its
+    /// own variant because the refusal is about *what the name is*, not about the
+    /// shape of the reference: `&if` is spelled perfectly well.
+    KeywordFuncRef(String),
     DuplicateParameter(String),
     RequiredAfterOptional(String),
     ParameterAfterRest(String),
@@ -469,6 +475,11 @@ impl std::fmt::Display for ParseError {
                 f,
                 "syntax error: a `wrapper func` parses no flags, so it cannot declare \
                  `--{name}`; drop the marker, or take the flag through `...rest`"
+            ),
+            ParseErrorKind::KeywordFuncRef(name) => write!(
+                f,
+                "syntax error: `&{name}` is not a function reference; `{name}` is \
+                 syntax, not a function"
             ),
             ParseErrorKind::DuplicateParameter(name) => {
                 write!(f, "syntax error: duplicate parameter `{name}`")
@@ -953,6 +964,12 @@ pub enum Expr {
     /// `:stem`". Written where a callable is wanted, so `$paths:map(:stem)` says
     /// what `$paths:map(func(p) { $p:stem })` says (`DESIGN.md`).
     ModifierRef(String),
+    /// A function reference — `&name` — denoting the function command position
+    /// would run for `name`. **Late bound**: the name is carried, not the
+    /// definition, so it is resolved when the reference is called and redefining
+    /// the target changes what an already-registered reference runs
+    /// (`DESIGN.md` §"Calling for a value, and lambdas").
+    FuncRef(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2768,7 +2785,11 @@ impl Parser<'_> {
         if self.same(&TokenKind::Semi) {
             return Err(self.error(ParseErrorKind::Expected("an empty command")));
         }
-        if self.same(&TokenKind::Amp) {
+        // A leading `&` has nothing to background — unless it opens a function
+        // reference, which is a value like any other and so starts a statement the
+        // way `42` does. Told apart by the same spelling rule the expression parser
+        // uses, so the two readings cannot disagree about which one a line is.
+        if self.same(&TokenKind::Amp) && self.func_ref_name().is_none() {
             return Err(self.error(ParseErrorKind::Expected(
                 "a background operator needs a command",
             )));
@@ -4671,6 +4692,30 @@ impl Parser<'_> {
                 expression: Box::new(self.deeper(Self::prefix)?),
             });
         }
+        // A leading `&` is a function **reference**. It takes a name rather than an
+        // expression, so unlike `-` and `...` it does not recurse — there is
+        // nothing to nest, and `&&x` is the syntax error it looks like.
+        //
+        // Only claimed when a bare name is written tight against the `&`, which is
+        // what keeps every other `&` reading intact: backgrounding is postfix and
+        // belongs to statement position, so it never starts an operand, and a `&`
+        // this declines falls through to the error it produced before.
+        if self.same(&TokenKind::Amp)
+            && let Some(name) = self.func_ref_name()
+        {
+            let start = self.peek().expect("the `&` just peeked").span.start;
+            self.position += 2;
+            // The lookup skips command position's keyword step, so a keyword names
+            // nothing here. Refused by the parser rather than left to resolution:
+            // `if` is not absent from the command namespace, it is not in it.
+            if crate::builtins::is_command_keyword(&name) {
+                return Err(ParseError {
+                    kind: ParseErrorKind::KeywordFuncRef(name),
+                    span: start..self.previous_end(),
+                });
+            }
+            return Ok(Expr::FuncRef(name));
+        }
         self.postfix()
     }
 
@@ -5929,6 +5974,14 @@ impl Parser<'_> {
             // line to hand back to, only a worse diagnostic for the same
             // fault.
             Err(error) if matches!(error.kind, ParseErrorKind::UnknownRegexFlag(_)) => true,
+            // A keyword function reference claims it for the same reason, and needs
+            // to: the command reading of `&if` is a backgrounding `&` with nothing
+            // in front of it, so handing the text back reports `empty command in a
+            // pipeline` — true of the tokens, and silent about the `&if` that is
+            // the actual fault. The error only fires on a `&` written tight against
+            // a bare keyword, which no command line spells: a backgrounding `&`
+            // follows a command rather than opening an operand.
+            Err(error) if matches!(error.kind, ParseErrorKind::KeywordFuncRef(_)) => true,
             Err(_) => false,
         };
         self.position = saved;
@@ -6646,6 +6699,28 @@ impl Parser<'_> {
         };
         let name = word.bare_word()?;
         modifier_name(name).then(|| name.to_string())
+    }
+
+    /// The name of an `&name` function reference starting at the current `&`, when
+    /// the next token really is a name written tight against it.
+    ///
+    /// Adjacency for the reason [`Parser::modifier_ref_name`] wants it: `&` is a
+    /// token the shell already spends elsewhere, and a spelling rule is what keeps
+    /// this reading from reaching for one of those. The name is not checked against
+    /// any table — the whole point of a reference is that it is resolved when it is
+    /// called — so anything `valid_name` accepts is a reference, including a name
+    /// nothing defines yet.
+    fn func_ref_name(&self) -> Option<String> {
+        let amp = self.peek()?;
+        let next = self.tokens.get(self.position + 1)?;
+        if amp.span.end != next.span.start {
+            return None;
+        }
+        let TokenKind::Word(word) = &next.value else {
+            return None;
+        };
+        let name = word.bare_word()?;
+        valid_name(name).then(|| name.to_string())
     }
 }
 

@@ -312,6 +312,12 @@ A `&` in separator position does two jobs: it backgrounds the `and-or` before it
 the complete preceding `and-or` — in `a | b && c & d` the background node holds
 `a | b && c`, and `d` is the next statement. A trailing `&` is valid.
 
+Separator position is what tells that `&` from the `func-ref` one: backgrounding
+*follows* a statement, while a reference **opens an operand** and is written tight
+against its name. So the two never compete for the same `&`, and a statement may
+begin with one only in the reference reading — a leading `&` is otherwise "a
+background operator needs a command".
+
 Newlines around a statement are layout — a leading or repeated newline is fine —
 but a leading `;` (`; puts x`) and a repeated one (`puts x;; puts y`) are
 errors, as is running two statements together with no separator at all. One
@@ -636,7 +642,7 @@ Assignment and command `&&` / `||` are statement grammar and do not appear here.
 | 5 | `..`, `..=` | none |
 | 6 | `+`, `-` | left |
 | 7 | `*`, `/`, `%` | left |
-| 8 | prefix `-`, spread `...` | prefix |
+| 8 | prefix `-`, spread `...`, function reference `&` | prefix |
 | 9 | call, member access, index, `:` modifier | left postfix |
 | 10 | primary values and adjacent word pieces | n/a |
 
@@ -652,7 +658,8 @@ range-expression
                 | ( ".." | "..=" ) additive? ;    # no NL after the operator here
 additive        = multiplicative ( ( "+" | "-" ) NL* multiplicative )* ;
 multiplicative  = prefix ( ( "*" | "/" | "%" ) NL* prefix )* ;
-prefix          = ( "-" | "..." ) prefix | postfix ;
+prefix          = ( "-" | "..." ) prefix | func-ref | postfix ;
+func-ref        = "&" name ;                  # `&` must abut the name; no operand
 postfix         = primary postfix-part* ;
 postfix-part    = call-arguments | member-access
                 | index-access                # `[` must abut what it indexes

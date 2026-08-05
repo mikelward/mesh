@@ -1437,8 +1437,16 @@ writing into that copy registers nothing.
 
 A handler is written as a function's **name**, the same thing `on` takes, and it
 is resolved when the event fires — redefining the function changes what the hook
-runs. `DESIGN.md` also writes the map form with a lambda
-(`$sh.postcd.fetch = func() { … }`); that is not accepted yet.
+runs. A [function reference](#functions) says the same thing with the sigil that
+marks it as one, and is accepted here beside the bare word:
+
+```mesh
+$sh.exit.tmp = &clean-up         # the same registration as the bare word above
+```
+
+`DESIGN.md` also writes the map form with a lambda
+(`$sh.postcd.fetch = func() { … }`); that is not accepted yet — a lambda has no
+name to register.
 
 The map is strict for the same reason the settings map is:
 
@@ -3353,6 +3361,59 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
     it rather than invent a rendering.
   - **Equality is identity.** A copied binding is the same function; a separately
     written lambda with the same text is a different one.
+
+- **Function references — `&name`.** A declared `func` has no value spelling of
+  its own: a bare word is a literal string everywhere else, so `$xs:map(up)`
+  passes the *string* `"up"`. A leading `&` names the function instead, so
+  anything taking a callable can take one directly:
+
+  ```mesh
+  func up(s) { $s:upper }
+  puts $xs:map(&up):join(",")         # the lambda `func(s) { up($s) }`, named
+  f = &up
+  puts $f(z)                          # Z — called through the variable
+  ```
+
+  - **Late bound.** The reference holds the *name*, not the definition, and
+    resolves when it is **called** — so redefining the target changes what an
+    already-stored reference runs, and `f = &later` may name a `func later` that
+    is declared further down the file. That is the difference from a lambda,
+    which is the body it was written with.
+
+    Binding one is late; *registering* one as a hook is not. A hook slot still
+    checks the name when it is assigned, so `$sh.preprompt.x = &later` before
+    `func later` is refused — whether that check should be relaxed is an open
+    question, D3 in [`HOOKS.md`](HOOKS.md). Late dispatch and eager registration
+    are separate things, and only the first of them is what `&` changed.
+  - **The command namespace, not a `func`-only table.** A reference resolves
+    `value call → builtin → func → external`, so `&reload-config` works without
+    the writer knowing which it is. Command position's *keyword* step is skipped,
+    so `&if` and `&return` are a syntax error rather than control flow. A call
+    through a reference dispatches exactly where a written `name(…)` does, so
+    `&glob`, `&dirs`, `&style`, `&re` and `&gets` all reach their value-call form.
+  - **Resolvable is not the same as returns a value.** An external has no return
+    value, and neither do the effect-only builtins, so `&grep` and `&puts` are
+    fine references that fail *at the call* in a value slot — with the same "a
+    command has no return value" a written `puts(1 + 2)` gives. A name that
+    resolves to nothing is the other failure, and says so.
+  - **Only a `func` can be applied per element.** `:map` / `:filter` / `:each`
+    hand their callable one already-evaluated element, and a value call reads its
+    own argument list, so `$xs:map(&glob)` is a loud error naming the lambda
+    wrapper that does work (`$xs:map(func(p) { glob($p) })`).
+  - **`:capture` works through one**, and records what the name it stands for
+    would: `$f("hi"):capture` through `f = &puts` is `puts("hi"):capture`, the
+    command record without `.value`. That is the one place a command may be
+    value-called at all, and a reference does not lose it.
+  - **The whole signature travels**, because a reference is a name: flags,
+    defaults, a rest parameter and the `wrapper` marker all behave as they do at
+    a written call, and diagnostics name the function referenced rather than the
+    variable it arrived through.
+  - **Written tight against the name.** `& up` is not a reference. Backgrounding
+    is postfix and belongs to statement position, so it never opens an operand
+    and the two readings of `&` cannot meet.
+  - A reference is a function value like any other: no text form, and identity
+    rather than name is what equality means, so `&up` written twice is two
+    values.
 
 - **Both channels at once — `:capture`.** `f(…):capture` runs the call and returns
   a **record of every channel**: `.value` (the return value), `.out` and `.err`

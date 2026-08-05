@@ -4628,9 +4628,23 @@ two other shells' answers turned out to be strictly better than ours.
 ## Beyond M3 — Function references (`&name`)
 
 Decided in design discussion; see `docs/DESIGN.md` §"Calling for a value, and
-lambdas" and §"Hooks and the prompt". Nothing here is implemented.
+lambdas" and §"Hooks and the prompt". The first item below is built; the rest are
+not.
 
-- [ ] **`&name` as a prefix function reference in value position.** A named `func`
+- [x] **`&name` as a prefix function reference in value position.** *(landed —
+      `Expr::FuncRef` in the parser at the `-` / `...` tier, `Callable::Named` in
+      `vars.rs`, resolved per call in `repl.rs`. A keyword is refused by the
+      parser, and that diagnostic has to claim the statement outright, or the text
+      falls back to a command reading where the leading `&` is a backgrounding
+      operator with nothing in front of it and reports `empty command in a
+      pipeline`. A hook slot accepts one beside the bare word, since a reference is
+      a name; a bare word is still a handler name, so nothing is broken yet.)*
+      **Found building it:** `on exit e &h` cannot work — `on` takes command
+      words, and a `&` there backgrounds `on exit e`. So the `&`-required rule
+      below cannot apply to `on` without changing what `&` means in command
+      position, which is a much larger question than the slot spelling.
+
+      The decision as it was written, kept for the record: a named `func`
       has no value spelling today, so `$xs:map(up)` passes the string `"up"` and
       `:map` reports `argument must be a function, got a string`. Add a prefix `&`
       to the expression grammar at the same tier as prefix `-` and `...`, yielding
