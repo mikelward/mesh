@@ -4774,6 +4774,56 @@ into an enclosing local — `global` stays the way to mutate something a lambda 
       and the entry needs no edit. `docs/DESIGN.md` says so where the reversal is
       recorded.
 
+## Beyond M3 — Bounding a wait
+
+Found writing the prompt's ssh-agent check in `mikelward/conf`. The prompt calls
+an *overridable* predicate hook, and the thing it usually ends up running —
+`ssh-add -L` against a stale `$SSH_AUTH_SOCK`, a forwarded agent whose connection
+has gone away — blocks forever. Bounding the hook from inside is wrong: an
+override would have to reimplement the guard. So the caller wants "run this
+predicate; if it has not answered in two seconds, treat it as failed."
+
+mesh has more of what that needs than most of the family. `&` backgrounds a
+**function**, not just an external — fish backgrounds only externals, and a
+`begin` block or a function under `&` there runs synchronously. `wait` reports
+the job's status in `$sh.status`, which elvish cannot do at all: it backgrounds
+happily but has no `wait`, no `jobs`, no `bg`, so a background command's status
+is unreachable. And `kill $j` signals the **process group**, so a hook that wraps
+its blocking command in more shell is still reached — bash's equivalent has to
+settle for signalling the job alone, because with monitor mode off the job shares
+the shell's own process group and the group signal would take the shell down.
+
+Two pieces are missing, and the prompt case needs **both** — a deadline whose
+job notices land on every prompt is not usable:
+
+- [ ] **A bounded wait.** `wait --timeout <duration> <job>` is the natural
+      spelling, and matches the `job recv --timeout` nushell already ships. Open
+      questions: what status it reports when the limit expires (`124` follows
+      `timeout(1)`, and is distinguishable from any 8-bit status a job can
+      exit with only because a real `124` is vanishingly rare — a distinct
+      sentinel would be cleaner and less familiar), and whether expiry leaves the
+      job running and listed (consistent with Ctrl-C abandoning a wait) or kills
+      it. Leaving it running is the smaller change and composes: the caller
+      already has the handle and can `kill $j` itself.
+- [ ] **A way to background without the notice.** `[1] 1234` on stderr when the
+      job starts and `[1] Done` at the next prompt are right for interactive work
+      and wrong for a job the prompt itself starts twice a second. `$sh.options`
+      has no monitor-mode equivalent today (`bold-input`, `command-notify`,
+      `cwd-report`, `osc-title`, `shell-integration`). Options: a
+      `$sh.options.job-notify` toggle to sit alongside `command-notify`; a quiet
+      background operator; or backgrounding and `disown`-ing in one step, which
+      already means "stop tracking this" and so already implies "stop announcing
+      it."
+
+An alternative that collapses both into one construct: a **`timeout` builtin** —
+`timeout 2s is-ssh-valid` — taking a function or an external, with no job ever
+registered and so nothing to announce. It reads better at the call site than the
+three-step background/wait/kill dance, at the cost of being a second way to
+express something `wait --timeout` would already cover.
+
+Until one of these lands, `mikelward/conf` leaves the mesh prompt's check
+unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
+
 ## Loose ends
 
 Small items rescued from pull requests that were closed as superseded — the bulk
