@@ -3622,6 +3622,35 @@ thing a reader takes on trust.*
       Until then `puts $x` prints the flag's text, which is wrong but harmless
       and does not block the rest of the type.
 
+- [ ] **A composed attached value does not build a flag, and the string scan is
+      propping it up.** Two P1s from review, and they are one bug. `scalar_literal`
+      accepts only a single bare text piece, so every composed payload --
+      `--tag="v2"`, `--tag=$w`, `--tag=*.txt` -- falls out of the flag path and
+      binds a plain string. What catches them today is the **runtime string scan**
+      in `bind_arguments`, which is itself wrong: `w = "--force"; f $w` still binds
+      the switch, which is the data-decides-the-call reading the type removes.
+
+      Deleting the scan makes eight tests fail, and all eight are composed
+      payloads -- so it is load-bearing until the literal handles them. One fix,
+      in order: build the flag from the multi-piece word first, then delete the
+      scan.
+
+      **`:repr` does not round-trip until this lands.** `"--tag=v2":flag:repr`
+      writes `--tag='v2'`, and reading that back gives a *string*, not an equal
+      `Flag`. The contract is advertised and unmet.
+
+      **The payload keeps the value's own type** -- the repo owner's call, and
+      better than the rule it replaces:
+
+          w = 2      ;  x = --n=$w    # integer payload
+          s = "2"    ;  x = --n=$s    # string payload
+
+      Stringifying both was an artifact of parsing the payload back out of a
+      word, which is what this fix removes: the payload *is* a `Value` and `$w`
+      *is* a `Value`, so it passes through. `an_interpolated_flag_value_keeps_its_string_type`
+      still holds -- it pins only that a string stays a string, which this does.
+      Only a payload written as a bare literal types from the word.
+
 - [ ] **Circle back: two flag rules the value type overwrote.** *(Both are
       implemented and green; both replaced a rule that had been argued through
       review, so they are recorded rather than treated as settled. Neither was
