@@ -3681,11 +3681,27 @@ thing a reader takes on trust.*
          because the word is still refused -- only the wording moved. And the new
          message follows from one rule (a flag's name must be a name) that the
          *signature* side already enforces, rather than from the
-         `word_globs && text_globs(name)` machinery. Same for `--fo*=bad[`.
+         `word_globs && text_globs(name)` machinery.
 
          Why to revisit anyway: the old rule distinguishes "this option does not
          exist" from "this word is not an option", and a reader hitting `--bad[`
          may want the first. Nobody has used either message in anger.
+
+         **Where the check runs moved once more, in review.** It was at
+         construction, which rejected `g --foo.bar=v` for a `wrapper func` --
+         and a wrapper is precisely the thing that cannot judge what it
+         forwards. A written word now becomes the flag it was written as, name
+         unjudged, and `bind_flag_value` reports a bad name where the flag
+         binds. Both spellings agree, which construction-time checking could not
+         manage: `g(--foo.bar=v)` goes through `eval_expr`, which has no way to
+         hear a call's flag policy.
+
+         One consequence fell out of it: `f(--fo*=bad[:upper)` now reports
+         ``cannot apply string modifier`` rather than ``` `fo*` is not a name ```.
+         The parser does not re-anchor the chain when the written name is not a
+         name, so `:upper` is asked of the whole word -- which is a flag, and no
+         string modifier applies to one. Refused either way; the wording is
+         worse, and a flag-specific message would say so plainly.
 
       2. **A wrapper's `...rest` holds `Flag` values, not strings.**
          `w --b c` gives `[--b, 'c']` where it gave `['--b', 'c']`. The bytes
@@ -3701,6 +3717,28 @@ thing a reader takes on trust.*
          flag today (`flag_from_text` refuses it), so a rest currently holds
          `['--', --x]` -- a string next to a flag. That reads as an
          inconsistency and is really just the terminator type being unbuilt.
+
+- [ ] **A composed payload's shape error masks the option error.** With
+      `func f(--force, ...rest)` and `xs = [a b]`, both `f --bogus=$xs` and
+      `f --force=$xs` report ``an option's value must be one string, not a
+      list``, where the more actionable answers are *unknown flag* and *a switch
+      takes no value*. The value-call binder deliberately resolves the written
+      flag first for exactly this reason (`repl.rs`, `evaluate_value_arguments`),
+      but a composed flag is refused at construction and never reaches it.
+      Raised by Codex on #415.
+
+      Not fixed there because both ways out cost something already argued for.
+      Letting the flag error win means constructing a `Flag` whose payload has
+      no text form -- the shape that produced the `unreachable!()` panic in
+      `FlagValue::text()` -- and moving the check to the bind would take the
+      `x = --tag=$xs` diagnostic off the assignment that made the mistake, which
+      is where the entry above says it belongs. Getting both needs the callee's
+      signature at construction time, and expansion deliberately does not have
+      it: that is the same coupling the wrapper fix in this file just removed.
+
+      The likely shape: carry the flag's name on the payload-shape error, and
+      have the two call paths resolve the written flag before reporting it, so
+      the assignment keeps its early diagnostic and a call gets the better one.
 
 - [ ] **Make a builtin work the way a function does, not its own way.**
       *Standing principle, from the repo owner: a builtin behaves the same as a

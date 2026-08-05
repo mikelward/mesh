@@ -10703,6 +10703,17 @@ fn bind_flag_value<'p>(
     flag_values: &mut std::collections::HashMap<&'p str, Value>,
 ) -> Result<(), Step> {
     use parser::ParamKind;
+    // Here, not where the flag was built: a word becomes a flag wherever it is
+    // written, but only a callee that *parses* mesh flags is entitled to judge
+    // the name. A `wrapper func` never reaches this, so `g --foo.bar=v` still
+    // forwards verbatim.
+    if let Some(problem) = expand::flag_name_problem(&flag.name) {
+        note!(
+            "mesh: {name}: `--{}` is not an option: {problem}",
+            flag.name
+        );
+        return Err(Step::Error(2));
+    }
     let declared = resolve_written_flag(name, params, &flag.name, flag.value.is_some())?;
     match &declared.kind {
         ParamKind::Switch => {

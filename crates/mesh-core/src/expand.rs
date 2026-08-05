@@ -452,7 +452,6 @@ pub fn expand_call_values(
         } else if let Some(value) = whole_value(&word, vars) {
             out.push((value?, false));
         } else if let Some(value) = scalar_literal(&word) {
-            let value = value.map_err(ExpandError::ArgumentValue)?;
             out.push((value, true));
         } else if let Some(name) = written_option_prefix(&word)
             && !word_globs(&word)
@@ -504,16 +503,6 @@ pub fn expand_call_values(
             // **string**: it came from the filesystem, not from a written word,
             // which is the same reason a positional glob is not typed from its
             // bytes.
-            // A name written *literally* in the first piece has to be a name,
-            // even when the rest of the word is composed: `--fo*=x$v[` writes
-            // `fo*`, and that is a mistake in the line rather than data. Only a
-            // word whose first piece is bare `--` composes its name (`--$name`,
-            // `--"force"`), and that stays data as it always did.
-            if !word_globs(&word)
-                && let Some(problem) = written_name_problem(&word)
-            {
-                return Err(ExpandError::ArgumentValue(problem));
-            }
             let dashed_prefix = expanded_option_prefix(&word);
             let mut strings = Vec::new();
             expand_word(word, vars, &mut strings)?;
@@ -630,17 +619,33 @@ fn flag_from_text(text: &str) -> Result<crate::vars::FlagValue, String> {
     if body.is_empty() {
         return Err("`--` is the flag terminator, not a flag".into());
     }
+    let flag = flag_parts(body);
+    if let Some(problem) = flag_name_problem(&flag.name) {
+        return Err(format!("`{text}` is not an option: {problem}"));
+    }
+    Ok(flag)
+}
+
+/// Split the body of a written `--…` into its name and attached value, taking
+/// the name as written.
+///
+/// **No name check here**, and none in the two `*_option_prefix` helpers that
+/// read a composed word either. Whether `foo.bar` is a legal *mesh* option name
+/// is a question only a callee that parses mesh flags asks: a `wrapper func`
+/// cannot validate what it forwards, because it does not know the callee's
+/// grammar (`docs/DESIGN.md` §"Functions"), and an external program has its own.
+/// So the word becomes the flag it was written as, and `bind_flag_value` reports
+/// a bad name where the flag actually binds. Checking here rejected
+/// `g --foo.bar=v` before the wrapper's policy could apply.
+fn flag_parts(body: &str) -> crate::vars::FlagValue {
     let (name, value) = match body.split_once('=') {
         Some((name, value)) => (name, Some(Box::new(typed_scalar(value)))),
         None => (body, None),
     };
-    if let Some(problem) = flag_name_problem(name) {
-        return Err(format!("`{text}` is not an option: {problem}"));
-    }
-    Ok(crate::vars::FlagValue {
+    crate::vars::FlagValue {
         name: name.to_owned(),
         value,
-    })
+    }
 }
 
 fn value_argument_text(value: &Value) -> Result<String, ExpandError> {
@@ -725,15 +730,16 @@ fn whole_value(word: &Word, vars: &Vars) -> Option<Result<Value, ExpandError>> {
 /// Why `name` cannot be a flag's name, if it cannot.
 ///
 /// A flag's name has to be a **name**, matching what a signature already demands
-/// — `func f(--fo*)` is `expected a name`, so a value spelled that way is not the
-/// option it looks like either. Shared by the `:flag` cast and by both literal
-/// paths, so a cast cannot build a flag no signature could declare.
+/// — `func f(--fo*)` is `expected a name`, so a value spelled that way is not an
+/// option any signature could declare.
 ///
-/// What fails this stays what it already was: a word, which expansion may turn
-/// into a glob or plain text, and which an external receives as bytes since mesh
-/// parses none of its flags. That keeps `curl --fo*` and `ls --*` working, where
-/// refusing at the parser would break both.
-fn flag_name_problem(name: &str) -> Option<String> {
+/// Asked at the two places that *decide* by the name: the `:flag` cast, which is
+/// an explicit request to build one, and binding a flag to a parameter. Not
+/// asked where a word merely **becomes** a flag — a `wrapper func` forwards
+/// names it cannot judge, since it does not know the callee's grammar, and an
+/// external receives bytes because mesh parses none of its flags. That is what
+/// keeps `g --foo.bar=v` and `curl --fo*` working.
+pub fn flag_name_problem(name: &str) -> Option<String> {
     if name.is_empty() {
         return Some("it has no name".to_owned());
     }
@@ -746,40 +752,14 @@ fn flag_name_problem(name: &str) -> Option<String> {
     None
 }
 
-/// Why the name a word wrote after `--` is not a name, if it wrote one.
-///
-/// Only sound for a word that does **not** glob. A globbing word is a pattern
-/// the filesystem answers, not a name someone wrote: `--*` must expand and pass
-/// its match as data rather than be judged for the `*` in it.
-///
-/// Answers `None` when the word composes its name rather than writing it —
-/// `--$name` and `--"force"` have a bare `--` and nothing more in the first
-/// piece, so there is no written name to judge and they stay data.
-fn written_name_problem(word: &Word) -> Option<String> {
-    let [
-        Piece::Text {
-            text,
-            expandable: true,
-        },
-        ..,
-    ] = word.pieces.as_slice()
-    else {
-        return None;
-    };
-    let body = text.strip_prefix("--")?;
-    let name = body.split_once('=').map_or(body, |(name, _)| name);
-    if name.is_empty() {
-        return None;
-    }
-    flag_name_problem(name).map(|problem| format!("`--{name}` is not an option: {problem}"))
-}
-
 /// The option name of a word written `--name=…` whose value still has to expand,
 /// so the flag is built from each expanded result rather than from the pattern.
 ///
 /// Distinct from [`written_option_prefix`], which handles a payload composed of
 /// *pieces*; this one is a single written word the expander will turn into one
 /// or more strings.
+///
+/// Only the `=` has to be there, not a valid name — see [`flag_parts`].
 fn expanded_option_prefix(word: &Word) -> Option<String> {
     // The **first** piece, not the only one: a payload can compose interpolation
     // with globbing (`--tag=$p*.txt`), which leaves several pieces *and* still
@@ -796,13 +776,15 @@ fn expanded_option_prefix(word: &Word) -> Option<String> {
         return None;
     };
     let (name, _) = text.strip_prefix("--")?.split_once('=')?;
-    flag_name_problem(name).is_none().then(|| name.to_owned())
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// The option name a word was **written** with, when its first piece is a bare
 /// `--name=` and something composed follows — so `--tag=$w` answers `tag` while
 /// `--tag=v2` (one piece, no remainder) and `--$name` (no `=`, so the name would
 /// run on into whatever follows) both answer `None`.
+///
+/// Only the `=` has to be there, not a valid name — see [`flag_parts`].
 fn written_option_prefix(word: &Word) -> Option<String> {
     let [
         Piece::Text {
@@ -822,7 +804,7 @@ fn written_option_prefix(word: &Word) -> Option<String> {
     // finished here, and letting the remainder finish it is the
     // data-decides-the-call reading (`--$name`) the type removes.
     let (name, _) = body.split_once('=')?;
-    flag_name_problem(name).is_none().then(|| name.to_owned())
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// The value the pieces after a written `--name=` denote.
@@ -862,10 +844,7 @@ fn composed_payload(word: &Word, vars: &Vars) -> Result<Value, ExpandError> {
 }
 
 /// The typed value a single bare literal word denotes, when it denotes one.
-///
-/// `Some(Err(_))` is a word that was *meant* as an option and is malformed — kept
-/// distinct from `None`, which is "not a typed literal, expand it as text".
-fn scalar_literal(word: &Word) -> Option<Result<Value, String>> {
+fn scalar_literal(word: &Word) -> Option<Value> {
     let [
         Piece::Text {
             text,
@@ -891,20 +870,21 @@ fn scalar_literal(word: &Word) -> Option<Result<Value, String>> {
     // re-read as syntax by whatever command position it lands in next. That is
     // what lets a wrapper forward one without mesh ever synthesizing it.
     if !word_globs(word) && text == "--" {
-        return Some(Ok(Value::FlagTerminator));
+        return Some(Value::FlagTerminator);
     }
-    if !word_globs(word) && text.starts_with("--") {
-        // A `--` word here is meant as an option, so a name that is not a **name**
-        // is a mistake in the line rather than data to pass on quietly. Reported
-        // for the same reason a signature reports it: `func f(--fo*)` is
-        // `expected a name`.
-        return Some(flag_from_text(text).map(Value::Flag));
+    if !word_globs(word)
+        && let Some(body) = text.strip_prefix("--")
+        && !body.is_empty()
+    {
+        // The name is taken as written; see [`flag_parts`] for why it is not
+        // judged here.
+        return Some(Value::Flag(flag_parts(body)));
     }
     // A bare word that is not a typed literal falls through to ordinary string
     // expansion, so only surface `true`/`false`/integers as typed values here.
     match typed_scalar(text) {
         Value::String(_) => None,
-        typed => Some(Ok(typed)),
+        typed => Some(typed),
     }
 }
 
