@@ -2180,6 +2180,7 @@ a different failure from an unknown name, which never parses.
 | `:stem` | string or list | Basename without the last extension. |
 | `:bare` | string or list | Basename without any extensions. |
 | `:real` | path or list | The path with every symlink, `.` and `..` resolved, absolute. Errors on a path it cannot resolve. |
+| `:url` | path or list | The path as a `file://host/path` URL, absolutized but not resolved. Errors on a path holding a `..`, and on the empty string. |
 | `:upper` / `:lower` | string or list | Change case; maps over list elements. |
 | `:int` | string | Parse an integer, failing loudly on invalid input. |
 | `:bool` | string or boolean | Parse `1`/`true`/`0`/`false`; warn and read `false` for anything else. `:bool(DEFAULT)` answers `DEFAULT` there instead, and says nothing. |
@@ -2234,9 +2235,45 @@ is not there — the others answer `false`, but a missing file has no type word.
 `:real` errors for the same reason: resolving is a syscall, and every component
 on the way has to exist for the kernel to follow it, so an unresolvable path has
 no real path to report rather than a `false` to give.
+
+All of that is about the modifiers that **look the path up**. `:url` never does —
+it is string work over the path, plus the working directory when the path is
+relative — so it neither dereferences a link nor errors on a path that is not
+there: `$link:url` names the link, and `$link:real:url` names what it points at.
+
 Note that a searchable directory carries the execute bit, so `:exec` alone keeps
 directories; `:f:x` is the executable-files idiom. List results retain their type: use `...$xs:rest` in command position,
 or bind them directly with `ys = $xs:rest`.
+
+`:url` names a path the way a URL reader wants it, which is what
+[`link`](#hyperlinks) and anything else taking a `file://` needs:
+
+```mesh
+puts /etc/hosts:url             # file://host/etc/hosts
+
+report = report.html            # a dotted literal takes no chain — bind it first
+puts $report:url                # file://host/home/user/report.html — this host, this directory
+puts link($report:base, $report:url)   # a clickable file, named by its basename
+```
+
+The **host** is in there because that is what lets a terminal tell a local file
+from one inside an `ssh` session, and everything RFC 3986 forbids raw is
+percent-encoded — a space would otherwise end the URL, a `#` start a fragment. It
+shares its encoder with the `OSC 7` sequence mesh writes on every `cd`, so the
+shell and the terminal name a file the same way.
+
+A relative path is absolutized against the working directory, and the **subject
+itself is never looked up** — which is the split with `:real`: `:url` names a
+file that does not exist yet, where a resolution has nothing to resolve. The one
+thing it does need is that working directory, so a *relative* subject fails,
+saying so, in a shell whose directory has been removed out from under it; an
+absolute subject asks for nothing at all. What it refuses outright
+is a `..`, because the two ends disagree about what one names — RFC 3986 §5.2.4
+has a reader remove dot segments *before* opening anything, while the kernel
+follows each symlink first and applies `..` to wherever it landed, so
+`a/link/../report` is two different files that can both exist. `:real:url` is the
+spelling that resolves it. A `.` needs no refusal; the empty string is refused
+rather than quietly meaning the current directory.
 
 `:prepend`, `:append`, and `:extend` are the **pure** counterparts of `+=`: they
 return a new list rather than writing one, so they compose in a chain where a
