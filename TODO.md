@@ -3528,10 +3528,26 @@ thing a reader takes on trust.*
       remove, and it came out with no fan-out at all -- the whole suite stayed
       green when the string check was deleted.
 
-      Still open, and the reason the entry above matters: a terminator reaching a
-      **builtin** goes through the same path a flag does, so `puts $x:repr` on one
-      prints nothing -- `puts` strips its own first `--`. Harmless today, and it
-      is the same plumbing the entry below describes.
+      Still open: **`puts` cannot print a leading `--`, and never could.**
+      `puts $x:repr` on a terminator prints nothing, which looks like a flag-type
+      problem and is not one:
+
+          puts "--"      # prints nothing
+          puts "--" x    # prints `x`
+
+      That is a plain string, and it predates all of this. A builtin reading no
+      options has its **first `--` stripped centrally** so `puts -- --help`
+      prints `--help`, and the strip works on argv text, so it eats a leading
+      `--` whatever produced it -- a written terminator, a string that merely
+      says `--`, or `:repr` output. The flag type did not cause it; it made it
+      visible, because `--` is now a value someone would want to print.
+
+      Two ways out, neither obviously right: teach the central strip to run
+      before values are rendered rather than after, so only a *terminator* is
+      eaten and a string saying `--` survives; or let a builtin that reads no
+      options keep the word, on the grounds that it has no options for a
+      terminator to end. The second is the smaller change and the bigger claim.
+      Same plumbing as the entry below, and worth doing with it.
 
 - [ ] **`puts $x` should report a flag, and cannot be done in `output_words`.**
       The design says a flag in a call is an *option*, `puts` declares none, so
