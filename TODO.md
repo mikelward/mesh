@@ -3544,6 +3544,44 @@ thing a reader takes on trust.*
       `recent` — which read their one leading option off the front of `...args`
       by hand. Verbose, but explicit in the body where a reader sees it rather
       than inferred from a signature rule.
+- [ ] **Circle back: two flag rules the value type overwrote.** *(Both are
+      implemented and green; both replaced a rule that had been argued through
+      review, so they are recorded rather than treated as settled. Neither was
+      chosen on its merits under time pressure -- the repo owner delegated the
+      call and asked for it to be written down.)*
+
+      1. **A malformed option name reports instead of degrading to text.**
+         `f(--bad[)` said ``unknown flag `--bad[` ``; it now says ``` `bad[` is
+         not a name ```. The rule it replaces held that an unglobbable word is
+         "exactly the characters written", so the *unknown flag* diagnostic was
+         the honest one, and that refusing on characters alone "turned that
+         diagnostic into a silent positional, which is a worse answer".
+
+         Why the change looks right: the silent-positional worry does not apply,
+         because the word is still refused -- only the wording moved. And the new
+         message follows from one rule (a flag's name must be a name) that the
+         *signature* side already enforces, rather than from the
+         `word_globs && text_globs(name)` machinery. Same for `--fo*=bad[`.
+
+         Why to revisit anyway: the old rule distinguishes "this option does not
+         exist" from "this word is not an option", and a reader hitting `--bad[`
+         may want the first. Nobody has used either message in anger.
+
+      2. **A wrapper's `...rest` holds `Flag` values, not strings.**
+         `w --b c` gives `[--b, 'c']` where it gave `['--b', 'c']`. The bytes
+         forwarded are identical, so every wrapper still behaves the same, but
+         what a wrapper *inspects* changed -- six tests asserted the old shape.
+
+         This follows from the type: a written `--b` is an option, and a wrapper
+         is the thing that forwards options. But it deserves a second look
+         because a wrapper's whole job is to be a passthrough, and a passthrough
+         that retypes what it carries is doing more than nothing.
+
+         The interaction to check when `FlagTerminator` lands: `--` is *not* a
+         flag today (`flag_from_text` refuses it), so a rest currently holds
+         `['--', --x]` -- a string next to a flag. That reads as an
+         inconsistency and is really just the terminator type being unbuilt.
+
 - [ ] **Make a builtin work the way a function does, not its own way.**
       *Standing principle, from the repo owner: a builtin behaves the same as a
       function and an external unless we have explicitly agreed otherwise.* A

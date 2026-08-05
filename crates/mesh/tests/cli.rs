@@ -1487,7 +1487,7 @@ fn a_builtin_and_a_function_read_flags_the_same_way() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "['--help']\n['--', 'x']\n['a', 'b']\n['--help']\n"
+        "[--help]\n['--', 'x']\n['a', 'b']\n[--help]\n"
     );
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 
@@ -14430,12 +14430,9 @@ fn a_composed_option_name_is_data_not_an_option() {
     for call in [
         "name = force\nf(--$name)",
         "f(--\"force\")",
-        // A postfix chain on a word with no `=` is a composition of the name in
-        // its own right — `--FORCE:lower` becomes `--force`, which would bind a
-        // flag the reader never wrote. Only the attached form has a value part
-        // for a chain to anchor on; a switch spelling does not.
+        // A chain over a *composed* name still yields data, since the word was
+        // never a flag literal to begin with — the interpolation makes it text.
         "name = FORCE\nf(--$name:lower)",
-        "f(--FORCE:lower)",
     ] {
         let out = run_with_input(&format!(
             "func f(target, --force) {{ puts \"$target/$force\" }}\n{call}\n"
@@ -14447,6 +14444,18 @@ fn a_composed_option_name_is_data_not_an_option() {
         );
         assert!(out.stderr.is_empty(), "{call}: {:?}", out.stderr);
     }
+
+    // A chain over a name written *bare* is different now: `--FORCE` is a flag,
+    // so `:lower` is a **type error** rather than producing data. A flag is not a
+    // string, and lowercasing one is the same mistake as lowercasing an integer.
+    // Settled by the repo owner: "it's not a string it's a flag".
+    let chained =
+        run_with_input("func f(target, --force) { puts \"$target/$force\" }\nf(--FORCE:lower)\n");
+    assert!(
+        String::from_utf8_lossy(&chained.stderr).contains("cannot apply string modifier"),
+        "{:?}",
+        chained.stderr
+    );
 
     // A composed empty name is data too, rather than collapsing onto the bare
     // `--` terminator that the same characters spell when written literally.
@@ -14555,13 +14564,17 @@ fn a_chain_on_an_attached_value_transforms_the_value_not_the_name() {
     // live glob — the value piece is a placeholder to expansion — and the
     // argument would vanish against the filesystem; leaving the word whole
     // keeps it deterministic data, like every other composed name.
+    // A glob-shaped *name* is now **reported** rather than kept as data: the word
+    // was written as an option and `fo*` is not a name. The old answer let it
+    // through as text, which is the same silent degradation as a non-matching
+    // glob vanishing. Recorded in `TODO.md` to circle back to.
     let glob_name = run_with_input(
         "func f(target = none, --tag = none) { puts \"$target/$tag\" }\nf(--fo*=bad[:upper)\n",
     );
-    assert_eq!(
-        String::from_utf8_lossy(&glob_name.stdout),
-        "--FO*=BAD[/none\n",
-        "a glob-shaped name must not be rebuilt around"
+    assert!(
+        String::from_utf8_lossy(&glob_name.stderr).contains("`fo*` is not a name"),
+        "a glob-shaped name is refused: {:?}",
+        glob_name.stderr
     );
 }
 
@@ -14742,16 +14755,21 @@ fn a_glob_after_the_option_separator_is_not_one_value() {
 
 #[test]
 fn glob_syntax_the_expander_refuses_is_still_a_literal_option_name() {
-    // The restriction is "could this name glob", not "does it contain a
-    // metacharacter". An unmatched `[` has the syntax but no pattern `glob` will
-    // accept, so expansion falls back to the literal text and `--bad[` is exactly
-    // the characters written — an unknown flag, as the command spelling reports.
-    // Refusing on the characters alone turned that diagnostic into a silent
-    // positional, which is a worse answer than the one the rule replaced.
+    // An unmatched `[` has glob syntax but no pattern `glob` will accept, so the
+    // word is exactly the characters written. It is still **refused**, which is
+    // what the rule this test guards was for — the earlier worry was that
+    // refusing on characters would turn the diagnostic into a *silent
+    // positional*, and it does not.
+    //
+    // What changed with the flag type is only *which* refusal: a flag's name has
+    // to be a name, so this reports that `bad[` is not one rather than that the
+    // option is unknown. More specific, and it matches what a signature already
+    // says about `func f(--bad[)`. Recorded in `TODO.md` to circle back to,
+    // since it overwrites a rule argued through several review rounds.
     let refused = run_with_input("func f(--force, ...rest) { puts \"force=$force\" }\nf(--bad[)\n");
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("unknown flag `--bad[`"),
-        "an unglobbable name is literal text: {:?} / {:?}",
+        String::from_utf8_lossy(&refused.stderr).contains("`bad[` is not a name"),
+        "an unglobbable name is still refused: {:?} / {:?}",
         refused.stdout,
         refused.stderr
     );
@@ -14777,17 +14795,15 @@ fn glob_syntax_the_expander_refuses_is_still_a_literal_option_name() {
         plain.stderr
     );
 
-    // An attached value can invalidate the pattern its own name is part of: `--fo*`
-    // globs on its own, but `--fo*=bad[` as a whole does not, so nothing reaches the
-    // filesystem and the word is the text written. Asking only the name refused it
-    // anyway and swallowed the diagnostic — the case that shows the name test alone
-    // is not enough, and that the whole word has to glob before the name matters.
-    // Raised in review.
+    // An attached value can invalidate the pattern its own name is part of:
+    // `--fo*` globs on its own, but `--fo*=bad[` as a whole does not, so nothing
+    // reaches the filesystem. It is still refused — now by the name rule, which
+    // says what is wrong with the word rather than that the option is unknown.
     let attached =
         run_with_input("func f(--force, ...rest) { puts \"force=$force\" }\nf(--fo*=bad[)\n");
     assert!(
-        String::from_utf8_lossy(&attached.stderr).contains("unknown flag `--fo*`"),
-        "an unglobbable whole word is literal text, name-side pattern or not: {:?} / {:?}",
+        String::from_utf8_lossy(&attached.stderr).contains("`fo*` is not a name"),
+        "an unglobbable whole word is still refused: {:?} / {:?}",
         attached.stdout,
         attached.stderr
     );
@@ -16639,7 +16655,7 @@ fn a_wrapper_func_forwards_an_undeclared_flag_instead_of_rejecting_it() {
     let out = run_with_input("wrapper func g(...xs) { puts $xs:repr }\ng --color=never -a x\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "['--color=never', '-a', 'x']\n"
+        "[--color='never', '-a', 'x']\n"
     );
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 }
@@ -16649,7 +16665,7 @@ fn a_wrapper_func_forwards_help_rather_than_answering_it() {
     // `g --help` has to reach whatever `g` wraps; answering with mesh's
     // generated help would hide the callee's own.
     let out = run_with_input("wrapper func g(...xs) { puts $xs:repr }\ng --help\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "['--help']\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[--help]\n");
     // A plain `func` still gets the canned help, so the marker is what changed.
     let plain = run_with_input("func g(...xs) { puts $xs:repr }\ng --help\n");
     assert!(
@@ -16666,7 +16682,7 @@ fn a_wrapper_func_forwards_the_terminator_too() {
     let out = run_with_input("wrapper func g(...xs) { puts $xs:repr }\ng -- --x\ng a -- b\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "['--', '--x']\n['a', '--', 'b']\n"
+        "['--', --x]\n['a', '--', 'b']\n"
     );
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 }
@@ -16678,7 +16694,7 @@ fn a_wrapper_func_still_binds_its_positionals() {
     let out = run_with_input(
         "wrapper func g(first, ...rest) { puts $first\nputs $rest:repr }\ng --a --b c\n",
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "--a\n['--b', 'c']\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "--a\n[--b, 'c']\n");
     let short = run_with_input("wrapper func g(a, b) { puts ok }\ng only\nputs after\n");
     assert!(
         String::from_utf8_lossy(&short.stderr).contains("expected 2 argument(s), got 1"),
@@ -16719,7 +16735,7 @@ fn a_wrapper_func_forwards_flags_in_a_value_call_too() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "['--color=never', '--', '--help']\n"
+        "[--color='never', '--', --help]\n"
     );
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 }
