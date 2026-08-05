@@ -4793,33 +4793,59 @@ its blocking command in more shell is still reached — bash's equivalent has to
 settle for signalling the job alone, because with monitor mode off the job shares
 the shell's own process group and the group signal would take the shell down.
 
-Two pieces are missing, and the prompt case needs **both** — a deadline whose
-job notices land on every prompt is not usable:
+**Both of these, and they are not redundant** — they bound different things. The
+split falls out of what each name already promises: `timeout` **owns** the
+command's lifetime, `wait` only **observes** a job someone else started.
 
-- [ ] **A bounded wait.** `wait --timeout <duration> <job>` is the natural
-      spelling, and matches the `job recv --timeout` nushell already ships. Open
-      questions: what status it reports when the limit expires (`124` follows
-      `timeout(1)`, and is distinguishable from any 8-bit status a job can
-      exit with only because a real `124` is vanishingly rare — a distinct
-      sentinel would be cleaner and less familiar), and whether expiry leaves the
-      job running and listed (consistent with Ctrl-C abandoning a wait) or kills
-      it. Leaving it running is the smaller change and composes: the caller
-      already has the handle and can `kill $j` itself.
-- [ ] **A way to background without the notice.** `[1] 1234` on stderr when the
-      job starts and `[1] Done` at the next prompt are right for interactive work
-      and wrong for a job the prompt itself starts twice a second. `$sh.options`
-      has no monitor-mode equivalent today (`bold-input`, `command-notify`,
-      `cwd-report`, `osc-title`, `shell-integration`). Options: a
-      `$sh.options.job-notify` toggle to sit alongside `command-notify`; a quiet
-      background operator; or backgrounding and `disown`-ing in one step, which
-      already means "stop tracking this" and so already implies "stop announcing
-      it."
+- [ ] **`timeout <duration> cmd [arg …]`** — the one-shot case, and the one the
+      prompt wants. Takes a function or an external, bounds it, hands back a
+      status. **Kills on expiry**, because that is what the name says and what
+      `timeout(1)` does. Reports **`124`**, same reason: every script already
+      written against `timeout(1)` keeps reading. The collision is real but
+      small — a command that genuinely exits 124 is indistinguishable from one
+      that ran out of time — and it is the price of a convention worth more than
+      the edge case.
 
-An alternative that collapses both into one construct: a **`timeout` builtin** —
-`timeout 2s is-ssh-valid` — taking a function or an external, with no job ever
-registered and so nothing to announce. It reads better at the call site than the
-three-step background/wait/kill dance, at the cost of being a second way to
-express something `wait --timeout` would already cover.
+      It registers **no job**, so there is nothing to announce, nothing in
+      `$sh.jobs`, and no handle to clean up. That is what makes it the answer for
+      a prompt rather than merely a tidier spelling.
+- [ ] **`wait --timeout <duration> <job>`** — for a job already backgrounded,
+      when the caller wants the handle anyway (to `kill` it, read `$j.state`, or
+      `fg` it later) or is collecting several with one budget. Matches the
+      `job recv --timeout` nushell ships.
+
+      **Does not kill, and does not fabricate a status.** mesh already says
+      "Ctrl-C abandons the wait, not the job"; a deadline is the same event with
+      a timer instead of a keystroke, and it should mean the same thing. So the
+      **builtin** reports the expiry — `wait` itself fails — while the job stays
+      running and listed with its status still empty, because it has not exited
+      and inventing a `124` for it would be a lie about a job that is still
+      there:
+
+      ```mesh
+      if wait --timeout 2s $j { … } else { kill $j }   # the caller decides
+      ```
+
+      This is where `124` would be the *worse* choice, and it is why the two
+      entries answer the question differently rather than picking one convention
+      for both.
+
+Neither needs **polling**. A bounded wait is the reap this shell already does
+with a deadline on it — `waitpid` with a timeout, or a timed wait on the job
+table's condvar. The polling in this area belongs to fish, which has no way to
+avoid it (see `docs/COMPARISON.md`).
+
+- [ ] **A way to background without the notice** — `$sh.options.job-notify`
+      alongside `command-notify`, a quiet background operator, or backgrounding
+      and `disown`-ing in one step, which already means "stop tracking this" and
+      so already implies "stop announcing it."
+
+      **Demoted by the `timeout` entry above, not blocked by it.** `[1] 1234` and
+      `[1] Done` on every prompt render was the reason this was a blocker; a
+      `timeout` builtin registers no job and so never prints them. What is left
+      is the general case — any config that wants to background something from
+      the prompt for its own reasons — which is worth having and is no longer in
+      anyone's way.
 
 Until one of these lands, `mikelward/conf` leaves the mesh prompt's check
 unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
