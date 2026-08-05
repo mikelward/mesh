@@ -8955,10 +8955,17 @@ fn run_cd_hooks(event: HookEvent, path: &Path, shell: &mut Shell) {
 }
 
 fn auto_help_requested(args: &[(Value, bool)]) -> bool {
+    // A written `--help` is a `Flag` now; a computed `"--help"` string still
+    // reaches here through the call-site scan, so both spellings are asked.
+    let is_help = |arg: &Value| match arg {
+        Value::Flag(flag) => flag.name == "help" && flag.value.is_none(),
+        Value::String(text) => text == "--help",
+        _ => false,
+    };
     args.iter()
         .map(|(arg, _)| arg)
         .take_while(|arg| !matches!(arg, Value::String(value) if value == "--"))
-        .any(|arg| matches!(arg, Value::String(value) if value == "--help"))
+        .any(is_help)
 }
 
 fn auto_help_requested_strings(args: &[String]) -> bool {
@@ -10153,6 +10160,17 @@ fn bind_arguments(
     let mut flag_values: std::collections::HashMap<&str, Value> = std::collections::HashMap::new();
     let mut flags_ended = false;
     for (arg, bare) in args {
+        // A written option now *is* a `Flag`, so binding reads the value rather
+        // than re-deriving the intent from its characters — the one source of
+        // truth the type exists for. The string scan below still runs, for a
+        // spread element and for a computed word.
+        if flags_enabled
+            && !flags_ended
+            && let Value::Flag(flag) = &arg
+        {
+            bind_flag_value(name, params, flag, &mut switches_on, &mut flag_values)?;
+            continue;
+        }
         if flags_enabled
             && !flags_ended
             && let Value::String(text) = &arg
@@ -10353,10 +10371,14 @@ fn evaluate_value_arguments<'p>(
                 // "a glob is a list however many paths it matched" (bf79900)
                 // removed — a value that depends on which files happen to be
                 // there, silently dropping the rest.
+                // A `Flag` is a written option that already parsed, payload and
+                // all, so this shape check does not apply to it — it exists for a
+                // word whose *attached value* evaluated to something that is not
+                // one string.
                 if flags_enabled
                     && !flags_ended
                     && written_dashed
-                    && !matches!(value, Value::String(_))
+                    && !matches!(value, Value::String(_) | Value::Flag(_))
                 {
                     // The flag itself is checked first. An undeclared name or a
                     // switch is a mistake in the line the reader wrote, where the
@@ -10469,6 +10491,13 @@ fn scan_call_value<'p>(
     switches_on: &mut std::collections::HashSet<&'p str>,
     flag_values: &mut std::collections::HashMap<&'p str, Value>,
 ) -> Result<(), Step> {
+    if flags_enabled
+        && !*flags_ended
+        && let Value::Flag(flag) = &value
+    {
+        bind_flag_value(name, params, flag, switches_on, flag_values)?;
+        return Ok(());
+    }
     if flags_enabled
         && !*flags_ended
         && dashes_are_flags
@@ -10659,6 +10688,41 @@ fn written_option_name(expression: &parser::Expr) -> Option<&str> {
     };
     let body = text.strip_prefix("--")?;
     Some(body.split_once('=').map_or(body, |(flag, _)| flag))
+}
+
+/// Bind a `Flag` **value** to the switch or valued flag it names.
+///
+/// The typed twin of [`bind_dashed_option`]: same rules, asked of a value that
+/// already knows it is an option instead of of a word being sniffed for one. A
+/// payload keeps whatever type it was constructed with, so `--n=2` binds the
+/// integer rather than re-parsing `"2"` here.
+fn bind_flag_value<'p>(
+    name: &str,
+    params: &'p [parser::Param],
+    flag: &crate::vars::FlagValue,
+    switches_on: &mut std::collections::HashSet<&'p str>,
+    flag_values: &mut std::collections::HashMap<&'p str, Value>,
+) -> Result<(), Step> {
+    use parser::ParamKind;
+    let declared = resolve_written_flag(name, params, &flag.name, flag.value.is_some())?;
+    match &declared.kind {
+        ParamKind::Switch => {
+            switches_on.insert(declared.name.as_str());
+        }
+        ParamKind::Flag(_) => {
+            let Some(value) = &flag.value else {
+                note!(
+                    "mesh: {name}: flag `--{}` requires a value (write `--{}=VALUE`)",
+                    flag.name,
+                    flag.name
+                );
+                return Err(Step::Error(2));
+            };
+            flag_values.insert(declared.name.as_str(), value.as_ref().clone());
+        }
+        _ => unreachable!("only flags are collected here"),
+    }
+    Ok(())
 }
 
 fn bind_dashed_option<'p>(
