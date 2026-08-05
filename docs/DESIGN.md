@@ -5271,6 +5271,9 @@ produce it — is one of:
   segment, and `fill("─")` is a *call* that produces the piece directly and needs
   no `&`, being a value rather than a reference. What `fill` never takes as an
   argument is the renderer's measured **slack** — that stays the renderer's job.
+  The reading *not* taken is exactly that one: a `fill` handed the slack would have
+  made `&fill("─")` a partial application, which mesh has no other instance of —
+  see [Open questions](#open-questions).
 
 A segment slot holds an [**`&name` reference**](#calling-for-a-value-and-lambdas) —
 late-bound, so re-sourcing rebinds it, the same rule the hooks use — or a
@@ -5659,6 +5662,26 @@ to avoid" rather than promising the latter as done.
   user-defined functions, which is the *user-defined modifier* question below, not
   a second spelling — the line held for now is by **shape** (`:name` argument-free
   and auto-mapping, `&name` general) rather than by who wrote the name.
+- **Partial application — open, and deliberately unanswered.** `&name` names a
+  function but cannot pre-supply any of its arguments, so every higher-order slot
+  that wants an existing function with one choice already made takes a lambda
+  wrapper instead (`$xs:map(func(_x) { pad($_x, width: 8) })`). The leading spelling
+  if mesh ever grows one is **`&f(key: value)`** — the reference sigil kept, so it
+  is still a *value* rather than a call, with arguments bound by **keyword** only,
+  which sidesteps "which positional did you mean" and matches how a flag parameter
+  already derives its call-site name. Two costs, neither weighed yet:
+  `&pad(width: 8)` and `pad(width: 8)` would differ only by the sigil while
+  meaning "later" versus "now" — a
+  distinction the prompt slots already carry (`&fill` vs `fill("─")`), but not yet
+  one where *both* forms are legal in the same slot — and it inherits the capture
+  question from lambdas, since a bound argument could be snapshotted when the
+  partial is written or re-evaluated on every call. **Nothing is blocked:** a
+  lambda expresses every case already, at the cost of naming the parameter, so
+  this is sugar and is recorded to be thought about rather than scheduled. It
+  surfaced from the prompt `fill` reading *not* taken — a `fill` that received the
+  renderer's measured slack would have made `&fill("─")` a partial application,
+  which is why the slack stays the renderer's job and `fill`'s only argument is the
+  optional repeat character ([Hooks and the prompt](#hooks-and-the-prompt)).
 - **User-defined modifiers — open.** `:ident` is reserved by the grammar, so the
   ambiguity is already paid for and a user modifier is *possible*; the vocabulary
   is otherwise closed forever. The cost is that `:name` moves from **parse**-time
