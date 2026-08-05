@@ -651,6 +651,9 @@ sit in, which for mesh is the point rather than a bonus — see
 | Fuzzy matching | no | `zstyle` opt-in | subsequence | **default** | opt-in (`match-subseq`) | opt-in (`algorithm`) |
 | Named hook events | none | 7 | 5 kinds | 7 | 3 | 5 |
 | Registering a hook | reassign a var | `add-zsh-hook` (autoload) | `--on-…` flag | `on` / `$sh.<event>` | append to a list | `$env.config.hooks` |
+| Backgrounds a *function* | yes | yes | **no** (externals only) | yes | yes | yes (`job spawn`) |
+| Reads a background job's status | `wait` | `wait` | **no** | `wait` | **no** | `job recv` |
+| Waiting with a deadline | no | no | no | **no** | no | `job recv --timeout` |
 
 The comparison that flatters mesh is against a **bare** zsh, and it is stark.
 With no configuration at all:
@@ -671,6 +674,58 @@ hooks reachable as both `on <event>` and the `$sh.<event>` maps.
 
 But zsh is the outlier there, and the other four all arrive working. The rest of
 this section is the fairer comparison.
+
+### Job control
+
+The three rows on job control above are the ones that decide whether a config can
+put a **time limit** on work it does not control — a prompt calling an
+overridable hook that might block, say. That needs three things in sequence:
+start the hook without blocking, get its exit status back, and give up after a
+deadline. Only the first is common to all six.
+
+**fish backgrounds externals and nothing else.** `command sleep 3 &` returns at
+once; `slow &` for a function, and `begin; …; end &` for a block, both run to
+completion first, and `$last_pid` is left holding whatever it held before:
+
+```fish
+function slow; command sleep 3; end
+slow &                      # returns after 3s. $last_pid unchanged
+command sleep 3 &           # returns immediately, $last_pid set
+```
+
+**elvish backgrounds anything and can tell you nothing about it.** A trailing `&`
+starts a function or an external concurrently, but `wait`, `jobs`, `bg` and
+`disown` are all unbound — `fg` exists and is not job control in the usual sense
+— so there is no way to reach a background command's status, and nothing to wait
+on. `run-parallel` and `peach` are the concurrency it does offer, and both block
+until *everything* finishes, which is the opposite of a deadline.
+
+**nushell is the only one with the deadline.** `job spawn` takes a closure,
+`job send` / `job recv` are a mailbox between jobs, and `job recv --timeout`
+gives up after a duration — so the whole pattern is four lines with no polling
+and no signal handling:
+
+```nu
+let parent = (job id)
+let j = (job spawn { (slow-predicate) | job send $parent })
+let answer = (try { job recv --timeout 2sec } catch { null })   # null = gave up
+job kill $j
+```
+
+**bash, zsh and mesh have the first two and not the third.** They background a
+function and `wait` for its status, then have to build the deadline by hand out
+of a second background job that sleeps and signals. mesh does that better than
+bash in one respect that matters: `kill $j` signals the job's whole **process
+group**, so a hook that wraps its blocking command in more shell is still
+reached. bash cannot copy that — with monitor mode off the job shares the
+shell's own process group, so the group signal takes the shell down with it, and
+`kill $!` reaches only the job itself while a grandchild runs on.
+
+Against that, mesh has no way to background quietly: `[1] 1234` on stderr at the
+start and `[1] Done` at the next prompt are right for interactive work and wrong
+for a job the prompt starts on every render, and `$sh.options` has no monitor-mode
+equivalent. bash's `set +m` covers exactly that. Both gaps — the bounded wait and
+the quiet background — are on [`TODO.md`](../TODO.md) under *Bounding a wait*.
 
 ### Hooks
 
