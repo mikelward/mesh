@@ -3544,6 +3544,34 @@ thing a reader takes on trust.*
       `recent` — which read their one leading option off the front of `...args`
       by hand. Verbose, but explicit in the body where a reader sees it rather
       than inferred from a signature rule.
+- [ ] **`puts $x` should report a flag, and cannot be done in `output_words`.**
+      The design says a flag in a call is an *option*, `puts` declares none, so
+      `puts $x` reports rather than printing -- `puts "$x"` and `puts $x:repr`
+      being the two ways to say which you meant. Attempted and **backed out**;
+      recording why, because the obvious implementation looks right and is not.
+
+      Intercepting a top-level `Value::Flag` in `output_words` (`repl.rs`) gives
+      the right answer for `puts $x` and the wrong one for two cases that already
+      work:
+
+      - **`puts -- --help` prints `--help`.** A builtin reading no options has
+        its first `--` stripped centrally, so the terminator is honored *outside*
+        `output_words`; a check inside it fires anyway and refuses a word the
+        caller explicitly protected.
+      - **`puts --help` prints puts's own help.** Now that a written `--help` is
+        a `Flag` rather than a string, a blanket flag refusal swallows the help
+        request before the builtin sees it.
+
+      Both say the same thing: a `Flag` has to reach the **builtin's own option
+      parsing** as the dashed token it is, so the terminator, `--help`, and
+      "this builtin takes no flags" are all decided in the one place that already
+      decides them for strings. That is the builtin principle again -- a builtin
+      behaving like a function -- and it is the work this needs, rather than a
+      guard bolted onto the output path.
+
+      Until then `puts $x` prints the flag's text, which is wrong but harmless
+      and does not block the rest of the type.
+
 - [ ] **Circle back: two flag rules the value type overwrote.** *(Both are
       implemented and green; both replaced a rule that had been argued through
       review, so they are recorded rather than treated as settled. Neither was
