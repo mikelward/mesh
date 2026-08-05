@@ -10483,6 +10483,319 @@ fn a_last_stage_in_the_shell_still_reports_its_status() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after=3\n");
 }
 
+/// A **loop is a pipeline stage**, and as the last one it keeps what it counts.
+///
+/// This is the shape people reach for, and the one bash loses: its `while read`
+/// runs in a forked subshell, so the count never escapes. Here the last stage runs
+/// in the shell, so both the loop variable and anything the body writes outlive
+/// the pipeline.
+#[test]
+fn a_loop_is_a_pipeline_stage() {
+    let out = run_with_input(
+        "n = 0\nputs \"a\\nb\\nc\" | while line = gets() { n += 1 }\nputs \"n=$n last=$line\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "n=3 last=c\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The other compound shapes are stages too — a stage is a new *position* for
+/// them, not a new grammar.
+#[test]
+fn the_other_compound_statements_are_stages_too() {
+    // `if`, reading from the pipe in its body.
+    let out = run_with_input("puts hi | if true { gets line }\nputs \"line=[$line]\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "line=[hi]\n");
+
+    // `for`, whose own loop variable is unrelated to the pipe.
+    let out = run_with_input("puts hi | for i in [1] { gets line }\nputs \"line=[$line]\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "line=[hi]\n");
+
+    // `match`.
+    let out = run_with_input("puts hi | match 1 { 1 => { gets line } }\nputs \"line=[$line]\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "line=[hi]\n");
+
+    // `loop`, which needs its own way out.
+    let out = run_with_input("n = 0\nputs hi | loop { n += 1; break }\nputs \"n=$n\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "n=1\n");
+}
+
+/// A compound stage in the *middle* writes to the next stage, like any other.
+#[test]
+fn a_compound_stage_feeds_the_stage_after_it() {
+    let out = run_with_input("puts \"a\\nb\" | while l = gets() { puts \"[$l]\" } | cat\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[a]\n[b]\n");
+}
+
+/// Its status is the body's, and takes its place in `$sh.pipestatus`.
+#[test]
+fn a_compound_stage_reports_its_status() {
+    let out = run_with_input(
+        "puts \"a\\nb\" | while l = gets() { false }\nputs \"status=$sh.status pipe=$sh.pipestatus:repr\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "status=1 pipe=[0, 1]\n"
+    );
+
+    let out = run_with_input(
+        "puts \"a\\nb\" | while l = gets() { true }\nputs \"status=$sh.status pipe=$sh.pipestatus:repr\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "status=0 pipe=[0, 0]\n"
+    );
+}
+
+/// A compound statement **cannot lead** a pipeline — only follow one.
+///
+/// `while … { } | cat` is a syntax error, because the statement dispatcher reads
+/// the `while` before `pipeline()` is ever reached, so the loop is taken as a
+/// whole statement and the `|` then has nothing to attach to. Pinned as the
+/// current answer rather than as a desirable one: the useful direction is
+/// piping *into* a loop, which works, and this is recorded in `TODO.md`.
+/// `not` does not smuggle a compound into the first stage.
+///
+/// The statement dispatcher normally settles this by taking `control-flow`
+/// before it looks for a pipeline — but `not` is consumed *before* `pipeline()`
+/// is called, so `not loop { … }` reaches it with the keyword still to read.
+/// Accepting a compound there built a lone stage that `run_single` had no way to
+/// run: the body silently never ran and the status was 1.
+#[test]
+fn a_negated_compound_is_not_a_lone_pipeline_stage() {
+    let out = run_with_input("not loop { puts RAN; break }\nputs \"status=$sh.status\"\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The body must not have run, and this must not be mistaken for a command
+    // that merely answered 1.
+    assert!(!stdout.contains("RAN"), "the body ran: {stdout:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A `return` reaching out of a compound stage is refused, not swallowed.
+///
+/// It would unwind the enclosing *function*, which a stage must not do — an
+/// earlier stage is a forked process the unwind cannot cross at all, so letting
+/// the last one through would make the same loop mean different things by
+/// position. Collapsing it to a status silently dropped it instead, leaving the
+/// function running past its own `return`.
+#[test]
+fn a_return_from_a_compound_stage_is_refused() {
+    let refusal = "return: cannot be used in a pipeline";
+
+    // The last stage, which runs in the shell — where the unwind would otherwise
+    // have been possible, and was silently lost.
+    let out = run_with_input(
+        "func f() { puts x | if true { return 7 }; puts AFTER }\nf\nputs \"status=$sh.status\"\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(refusal),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // An earlier, forked stage refuses identically, so position does not decide.
+    let out = run_with_input("func h() { puts x | if true { return 7 } | cat; puts AFTER }\nh\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(refusal),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `fail` is the same control flow and gets the same answer.
+    let out = run_with_input("func g() { puts x | if true { fail 3 }; puts AFTER }\ng\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(refusal),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Outside a pipeline the same compound still returns normally: the body's
+    // statements after it do not run.
+    let out = run_with_input("func k() { if true { return 7 }; puts AFTER }\nk\nputs DONE\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "DONE\n");
+}
+
+/// `break` and `continue` do not escape a compound stage.
+///
+/// They leave by a different route than `return` — left on the shell's control
+/// slot rather than carried in the step — so intercepting the step alone was not
+/// enough. A compound's *own* loop consumes its own; anything still set at the
+/// boundary was aimed at a loop outside the stage, which a stage must not unwind.
+#[test]
+fn loop_control_does_not_escape_a_compound_stage() {
+    // The last stage runs in the shell, so an escaping `break` reached the
+    // caller's loop and skipped the rest of its body.
+    let out = run_with_input(
+        "loop { puts x | if true { break }; puts AFTER; break }\nputs \"status=$sh.status\"\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("AFTER"),
+        "the caller's loop was broken: {stdout:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("break: cannot be used in a pipeline"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A forked middle stage gets the identical answer, so position does not
+    // decide — before, the fork swallowed the `break` and `AFTER` ran by luck.
+    let out = run_with_input("loop { puts x | if true { break } | cat; puts AFTER; break }\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("break: cannot be used in a pipeline"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A `break` with **no enclosing loop at all** is already an error of its
+    // own, reported by the body. The boundary must not add a second,
+    // contradictory diagnostic on top — it says the same thing, and reports the
+    // same status, as the identical `break` outside any pipeline.
+    let staged = run_with_input("puts x | if true { break }\nputs \"status=$sh.status\"\n");
+    let bare = run_with_input("break\nputs \"status=$sh.status\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&staged.stderr),
+        String::from_utf8_lossy(&bare.stderr),
+        "the stage boundary added a diagnostic the bare statement does not get"
+    );
+    assert_eq!(String::from_utf8_lossy(&staged.stdout), "status=1\n");
+
+    // A `break` belonging to the compound's **own** loop is untouched: it ends
+    // that loop and nothing is refused.
+    let out = run_with_input(
+        "n = 0\nputs \"a\\nb\\nc\" | while l = gets() { n += 1; break }\nputs \"n=$n\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "n=1\n");
+}
+
+/// A compound stage exposes its **status**, not the value its body yielded.
+///
+/// A typed value crossing the stage boundary would cross it only in the position
+/// that happens not to fork: an `if` arm ending in `42` made the function return
+/// `42` from the last stage, while the same body behind a `| cat` returned the
+/// pipeline status.
+#[test]
+fn a_compound_stage_yields_a_status_not_its_bodys_value() {
+    // The body reads its input, so the producer always finishes writing: left
+    // unread, `puts x` races into a SIGPIPE and pipefail would surface 141 here
+    // instead of the status under test.
+    let last = run_with_input("func f() { puts x | if true { gets l; 42 } }\nputs f()\n");
+    let forked = run_with_input("func f() { puts x | if true { gets l; 42 } | cat }\nputs f()\n");
+    assert_eq!(
+        String::from_utf8_lossy(&last.stdout),
+        String::from_utf8_lossy(&forked.stdout),
+        "the value crossed the boundary in one position only"
+    );
+    assert_eq!(String::from_utf8_lossy(&last.stdout), "0\n");
+
+    // Outside a pipeline the same body still yields its value, so the boundary is
+    // what changed and not the compound itself.
+    let out = run_with_input("func g() { if true { 42 } }\nputs g()\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+/// An `exit` in a compound stage behaves exactly as it does in a command stage.
+///
+/// It is the *stage's* exit, surfaced as a status, and the shell carries on to
+/// the next statement — the rule the last-stage change settled, for the reason
+/// that an earlier stage is a forked process whose `exit` can only ever be its
+/// own. A compound must not be the one stage that ends the session.
+#[test]
+fn an_exit_in_a_compound_stage_matches_a_command_stage() {
+    // Last stage, which runs in the shell.
+    let compound = run_with_input("puts x | if true { exit 7 }\nputs \"after=$sh.status\"\n");
+    let command = run_with_input("puts x | exit 7\nputs \"after=$sh.status\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&compound.stdout),
+        String::from_utf8_lossy(&command.stdout)
+    );
+    assert_eq!(String::from_utf8_lossy(&compound.stdout), "after=7\n");
+
+    // Forked middle stage, where the exit can only ever be the child's.
+    //
+    // The **producer's** status is deliberately left out. `puts x` races the
+    // middle stage exiting without reading, so it legitimately reports either 0
+    // or 141 (SIGPIPE) depending on scheduling — asserting the whole
+    // `pipestatus` fails under load while passing when the test runs alone.
+    let script = |stage: &str| {
+        format!("puts x | {stage} | cat\nputs \"mid=$sh.pipestatus[1] last=$sh.pipestatus[2]\"\n")
+    };
+    let compound = run_with_input(&script("if true { exit 7 }"));
+    let command = run_with_input(&script("exit 7"));
+    assert_eq!(
+        String::from_utf8_lossy(&compound.stdout),
+        String::from_utf8_lossy(&command.stdout)
+    );
+    assert_eq!(String::from_utf8_lossy(&compound.stdout), "mid=7 last=0\n");
+}
+
+/// An attached `:modifier` outranks the keyword in stage position too.
+///
+/// `command` already follows this rule for a guard, and claiming the word as a
+/// compound purely because its base token is a keyword turned a perfectly good
+/// command name into a syntax error.
+#[test]
+fn a_modified_keyword_is_a_command_stage_not_a_compound() {
+    for keyword in ["if", "match", "for", "while", "loop"] {
+        let out = run_with_input(&format!("puts x | {keyword}:upper\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // The word is a command name — unknown here, which is the point: it got
+        // as far as a lookup instead of being read as an incomplete compound.
+        assert!(
+            stderr.contains(&format!("command not found: {keyword}:upper")),
+            "{keyword}:upper was not treated as a command: {stderr:?}"
+        );
+    }
+}
+
+/// A false postfix guard skips the **whole** pipeline, a compound stage included.
+///
+/// A guard can collapse a pipeline to a single stage, and that stage may be the
+/// compound — the one route by which a lone compound reaches `run_single`. It is
+/// discarded there, which is the same answer a surviving *command* gets: the
+/// guard switches the pipeline off, and a compound must not be the one kind of
+/// stage it cannot reach.
+#[test]
+fn a_guard_skips_a_pipeline_with_a_compound_stage_too() {
+    // The established answer for commands, unchanged by compounds existing.
+    let out = run_with_input("puts X if false | puts SURVIVOR\nputs \"status=$sh.status\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=0\n");
+
+    // And the compound gets it too, rather than running on its own.
+    let out =
+        run_with_input("puts X if false | if true { puts RAN }\nputs \"status=$sh.status\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=0\n");
+
+    // A guard cannot be written on the compound's *own* side — a postfix guard
+    // belongs to a command. That is a syntax error at statement level too, so a
+    // stage is no more restrictive than anywhere else.
+    let out =
+        run_with_input("puts X | if true { puts RAN } if false\nputs \"status=$sh.status\"\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("syntax error"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_compound_statement_cannot_lead_a_pipeline() {
+    let out = run_with_input("while false { } | cat\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("syntax error"), "{stderr:?}");
+    // The rest of the script still runs, so this is a statement-level parse
+    // failure rather than something that takes the session down.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+}
+
 /// Earlier stages are forked and already running, so the last one reading in this
 /// process cannot deadlock against them — and a stage that stops reading early
 /// leaves the writer to a broken pipe rather than hanging the shell.

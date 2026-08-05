@@ -5606,19 +5606,26 @@ to avoid" rather than promising the latter as done.
 
 - **A pipeline's `while read` silently loses its variables.**
   `n=0; seq 3 | while read x; do n=$((n+1)); done; echo "$n"` prints `0` in bash —
-  the loop ran in a forked subshell, so `n` never escaped. mesh's **settled** answer is to not pipe into a loop at all:
-  [split the capture](#command-substitution) and iterate the list *in the current
-  scope* — `for line in $(cmd):lines { n += 1 }` leaves `n` set, no subshell
-  involved. The split is spelled rather than implied, which is the other half of
-  the defense: bash's alternative to the pipe, `for x in $(cmd)`, re-splits each
-  line on `IFS` and globs it, so the escape from the subshell reintroduces the
-  word-splitting bug. The **last stage of a `|` pipeline runs in the current shell**
-  rather than a forked subshell — bash's opt-in `lastpipe`, automatic here where
-  job control is not active — so `cmd | gets line` leaves `line` set, and a binding
-  a stage makes is the shell's.
-  See [Redirection](#redirection). ***(planned)*** is only the literal
-  `cmd | while gets line { … }` spelling, which needs a compound statement to be
-  usable as a stage at all.
+  the loop ran in a forked subshell, so `n` never escaped. mesh's **settled**
+  answer is that the pipe keeps them. The **last stage of a `|` pipeline runs in
+  the current shell** rather than a forked subshell — bash's opt-in `lastpipe`,
+  automatic here where job control is not active — and a **compound statement**
+  (`if`, `match`, `for`, `while`, `loop`) is a stage, so both `cmd | gets line`
+  and `cmd | while line = gets() { … }` leave their bindings behind. A binding a
+  stage makes is the shell's. A compound cannot *lead* a pipeline
+  (`while … { } | cat` is a syntax error, since the statement dispatcher takes the
+  `while` before a pipeline is read), but piping **into** a loop is the direction
+  that matters. See [Redirection](#redirection).
+
+  [Splitting a capture](#command-substitution) is the other spelling, and the
+  better one when the whole list is wanted at once rather than a line at a time:
+  `for line in $(cmd):lines { n += 1 }` iterates *in the current scope* with no
+  pipeline involved. Its split is spelled rather than implied, which is a defense
+  in its own right — bash's alternative to the pipe, `for x in $(cmd)`, re-splits
+  each line on `IFS` and globs it, so escaping the subshell reintroduces the
+  word-splitting bug. Before the last stage ran in the shell this was the *only*
+  spelling that kept what the loop counted; it is now a choice rather than a
+  workaround.
 - **Unquoted `$var` word-splits and globs.** `rm $file` breaks on a space; `[ $x =
   y ]` becomes a parse error when `$x` is empty. The single most common bash bug.
   mesh has **no word splitting and no implicit globbing of a value** — `$x` is

@@ -1960,16 +1960,27 @@ designed, and the cross-references say where the fuller note lives.
         "consume and discard a line" spelling, and `gets()` with the value thrown
         away says the same thing one character longer. *Revisitable* — this is
         "for now", and use will show whether the command form earns its keep.
-  - [ ] **A loop cannot be a pipeline stage**, so `cmd | while line = gets() { … }`
-        is a syntax error in both spellings — as is `cmd | if …`, so this is the
-        compound-statement gap rather than anything about `gets`. Worth naming
-        here because it is the shape people reach for, and the workaround
-        (`for x in $(cmd):split("\n")`) is not obvious.
+  - [x] **A loop can be a pipeline stage.** `cmd | while line = gets() { … }`
+        works in both spellings, as do `cmd | if …`, `| match`, `| for` and
+        `| loop` — this was the compound-statement gap rather than anything about
+        `gets`, and it is the shape people reach for.
 
-        The *semantic* half of this is now done: the last stage of a foreground
-        pipeline runs in the shell, so `cmd | gets line` leaves `line` set and a
-        loop landing here would keep what it counts. What is left is the parser
-        work to let a compound statement be a stage at all.
+        Both halves are now done. The *semantic* half came first: the last stage
+        of a foreground pipeline runs in the shell, so a loop landing there keeps
+        what it counts. The *parser* half is a `Stage` enum — a stage is either a
+        command or a compound statement — read by the same functions the statement
+        dispatcher uses, since a stage is a new **position** for those statements
+        rather than a new grammar.
+
+        Two limits, both deliberate. A compound cannot **lead** a pipeline
+        (`while … { } | cat` is a syntax error): `executable` tries `control-flow`
+        before `pipeline`, so the `while` is taken as the whole statement before a
+        pipeline is looked for. Piping *into* a loop is the direction that
+        matters, and undoing this would mean making the dispatcher look ahead for
+        a `|` past an arbitrary block. And `fork` / `with` are excluded from stage
+        position, both being contextual words a command of the same name has to
+        stay able to use — `fork` is a subshell besides, which is what a piped
+        stage already was.
 - [x] **A regex pattern for the replace family** — the `/…/` slot `DESIGN.md`
       §"String" specifies. Split out of the modifier-arguments change because it
       is where the difficulty lives; each item below was a real bug caught in

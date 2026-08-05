@@ -295,7 +295,17 @@ executable      = definition
                 | scoped
                 | "not"* ( binding | pipeline | expression-statement ) ;
 
-pipeline        = command ( ( "|" | "|&" ) NL* command )* ;
+# A compound reaches stage position only *after* a `|`. The first stage is a
+# command: `executable` tries `control-flow` before `pipeline`, so a leading
+# `while` is the whole statement and `while … { } | cat` is a syntax error — and
+# the first position is spelled `command` here rather than `stage` because `not`
+# is consumed before `pipeline` is entered, which would otherwise let
+# `not loop { … }` through as a lone compound stage.
+pipeline        = command ( ( "|" | "|&" ) NL* stage )* ;
+stage           = compound-stage | command ;
+# `fork` and `with` are excluded: both are contextual words, so a command of
+# either name stays reachable in stage position.
+compound-stage  = if-expr | match-expr | for-expr | while-expr | loop-expr ;
 command         = env-prefix* redirection* command-word command-item* guard? ;
 command-word    = qualified-glob | WORD ;     # names the command; must come first
 command-item    = command-word | redirection | value-argument ;
