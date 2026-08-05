@@ -1024,7 +1024,7 @@ a `PATH` hit, ignoring functions and builtins:
 type -t ll         # function
 type -t cd         # builtin
 type -t rg         # file
-type -t unless     # keyword
+type -t if         # keyword         — an always-claimed one; `unless` is contextual
 type -t xs         # variable        — the one word bash has no use for
 type -P rg         # /usr/local/bin/rg
 type -P ll         # (nothing, status 1) — a function has no path
@@ -1091,6 +1091,32 @@ failure rather than contradicting it. Two cases:
   here. The parser refuses them as *function* names, but a command-position
   `style …` is still a lookup that reports `command not found`, since they are
   value calls.
+
+**`-t` parts with the sentence form on one of those two**, and the split is
+whether mesh **owns** the name. A value call falls back to `keyword` and
+succeeds — the word the sentence form already uses — because `func files() { … }`
+is a *syntax* error, so a config asking `type -t` before it binds a function of
+that name needs to hear the name claimed rather than be passed over in silence. A
+contextual word answers nothing and fails: `and` reserves no name, so a function
+may take it.
+
+A **fallback** is all it is, and two things outrank it. A value call's name is
+not usable in command position, so a **program on `PATH`** of that name wins the
+resolution order first: `link` reports the coreutils program on a host that ships
+one. A function cannot be the winner here, unlike everywhere else in that order —
+`func link()` is refused for the very reason the fallback exists — so `PATH` is
+the whole of that tier. A **binding** answers next, since `-t` prints one word
+and the sentence form's both-of-them reading has no room here. So `keyword` is
+what is left when neither answers, and a guard copied out of this paragraph has
+to allow for a session that happens to bind `files`.
+
+```mesh
+type -t files      # keyword     — mesh owns it, and nothing else answers to it
+type -t link       # file        — /usr/bin/link wins; `keyword` where there is none
+files = 1
+type -t files      # variable    — a binding outranks the fallback too
+type -t and        # (nothing, status 1) — it reserves no name
+```
 
 The status is `0` when every name resolved, `1` when any did not, and `2` for a
 misuse. **`--quiet`** leaves only that status — no report, and no not-found note
