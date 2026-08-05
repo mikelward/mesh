@@ -3417,6 +3417,105 @@ thing a reader takes on trust.*
       standing in the same place. Deciding it needs an answer to "is command
       position argv-shaped or call-shaped for a func?", which is a design
       question rather than a bug fix.
+- [ ] **Why a real config writes `wrapper` 50-odd times, and every option
+      considered for reducing it.** *(Design record from a working session with
+      the repo owner. Nothing here is implemented; the entry exists so the field
+      does not have to be re-derived, and because two of the options were argued
+      for and rejected on grounds that are easy to lose.)*
+
+      **First, the distinction the session kept collapsing.** Two independent
+      rules make a config reach for `wrapper`, and conflating them wasted most
+      of the session:
+
+      1. **An undeclared `--flag` is refused rather than collected** into a
+         `...rest`. This is what `confirm --something`, `bak --weird-name` and
+         `setx curl --location URL` hit. It accounts for essentially all 50-odd
+         wrappers.
+      2. **A runtime value that looks like a flag was scanned as one** (the entry
+         above). This is a decidability bug — what `f $w` means depended on what
+         `$w` held — and fixing it changes *which words are flag syntax*, not
+         what happens to an undeclared one. It reduces the wrapper count by
+         approximately nothing.
+
+      Only rule 1 is what this entry is about.
+
+      **Options considered.**
+
+      - **Undeclared flags fall into `...rest` when the signature declares no
+        flags of its own.** Implemented and parked on
+        `claude/rc-mesh-flag-forwarding-bncyrk` rather than merged. Fixes every
+        motivating case; keeps the loud error where a function is in the
+        flag-parsing business (`func f(--force, ...rest)` still reports
+        `--forse`). **Its cost is action at a distance:** adding the *first*
+        `--flag` to a signature silently flips every other `--word` at every
+        existing call site from forwarded to refused. The failure is loud, which
+        is what makes it affordable, but it is a real edit hazard on a function
+        with callers.
+
+      - **Any signature with a `...rest` swallows undeclared flags** — the broad
+        version of the above. **Rejected.** It gives up typo detection
+        permanently for functions that declare flags *and* take a rest, and it
+        broke three existing tests that deliberately assert the loud error, one
+        of which carries the note that turning that diagnostic into a silent
+        positional is "a worse answer than the one the rule replaced."
+
+      - **Options before operands** — stop scanning after the first non-flag.
+        **Rejected.** It costs `f one --force` against `DESIGN.md`'s "flags may
+        appear in any order", a real interactive ergonomic; and it fixes only the
+        `cmd`-first forwarders, since `confirm --something` writes its dashed
+        data *first* and the scan meets it either way.
+
+      - **`func f(--, ...rest)`** — a signature-level marker, `--` meaning "my
+        options end here" as it means "options end here" at a call site. The
+        **only** candidate that also covers *declare flags and forward*
+        (`func f(--force, --, ...rest)`), which nothing covers today.
+        **Rejected on discoverability and safety, which agree:** a bare `--` in a
+        parameter list differs from a flag declaration only by the missing name,
+        so `func f(--, ...rest)` and `func f(--force, ...rest)` are one typo
+        apart and both compile with entirely different meanings. Punctuation that
+        cannot be grepped, said aloud, or told from a mistake — and a third
+        mechanism for one idea.
+
+      - **Relaxing `wrapper` to declare its own flags** — the other route to
+        *declare and forward*. **Rejected by the repo owner.** A wrapper forwards
+        `--help` rather than answering it, so a wrapper's declared `--force`
+        would be invisible in the help the caller actually sees; and the only fix
+        — answer `--help` itself, then ask the body for the callee's — means
+        **running the wrapped command to satisfy a query**. Keeping "a `wrapper
+        func` parses no flags" as a rule with no exceptions is worth more than
+        the capability.
+
+      - **A Python-style `*args` / `**kwargs` split** — a separate rest for
+        positionals and for flags. **Rejected: argv is not a call signature.**
+        `xr --output HDMI-1 --mode 1920x1080` splits to `flags = {output, mode}`,
+        `args = [HDMI-1, 1920x1080]` and cannot be reassembled, because mesh does
+        not know which of the callee's flags take a *separate* value — and has
+        already decided it never will ("a wrapper cannot validate what it
+        forwards, it does not know the callee's grammar"). `**kwargs` works in
+        Python precisely because Python owns the callee's signature. Two smaller
+        failures on the same idea: short flags (`-20`, `-v`, `-abc`) are not
+        `--flags` and would land in the positional bucket, so the split catches
+        half of flag syntax; and interleaving order is lost, which matters
+        wherever argument order does.
+
+      - **Inferring `wrapper` from "declares no flags"**, dropping the keyword.
+        **Rejected:** it collides with the merged decision that an ordinary
+        `func` consumes `--` *even when it declares no flags at all*, and with
+        `--help` interception. Both would change silently.
+
+      **What the session concluded.** `...rest` and `wrapper` are orthogonal and
+      should stay so: **`...rest` is arity** — how many positionals I take —
+      and **`wrapper` is flag policy** — whose job it is to validate
+      `--`-leading words. `wrapper` on `confirm` is therefore *correct*, not a
+      wart: explicit wins on discoverability and on footguns, and the failure
+      modes are asymmetric in its favor — forget to write `wrapper` and you get a
+      loud `unknown flag`; forget to *not* write it and a typo forwards silently.
+
+      **Job left uncovered on purpose: declare flags and forward.** Its real
+      constituency is three helpers in the reference config — `retry`, `body`,
+      `recent` — which read their one leading option off the front of `...args`
+      by hand. Verbose, but explicit in the body where a reader sees it rather
+      than inferred from a signature rule.
 - [ ] **Make a builtin work the way a function does, not its own way.**
       *Standing principle, from the repo owner: a builtin behaves the same as a
       function and an external unless we have explicitly agreed otherwise.* A
@@ -3721,13 +3820,51 @@ thing a reader takes on trust.*
         migration is renaming the function, since a reserved name has no
         alternate call spelling.
 
-        **Keep the name.** The set already reserves words at least as
-        ordinary — `glob`, `files`, `dirs`, `link` — so this is not a new kind
-        of imposition, and a constructor named anything but its type costs
-        every reader a lookup to spare a function that may not exist. Nothing
-        has shipped, so the break reaches only configs written against an
-        unreleased language. Reversible while the type is unbuilt: renaming a
-        constructor is one edit here and one in the reserved list.
+        ~~**Keep the name.**~~ **Reopened — do not reserve `flag` until the
+        value-call-versus-modifier question below is settled.** The argument for
+        keeping it still stands on its own terms and is preserved here: the set
+        already reserves words at least as ordinary — `glob`, `files`, `dirs`,
+        `link` — so this is not a new kind of imposition, and a constructor named
+        anything but its type costs every reader a lookup to spare a function
+        that may not exist. Nothing has shipped, so the break reaches only
+        configs written against an unreleased language. Reversible while the type
+        is unbuilt: renaming a constructor is one edit here and one in the
+        reserved list.
+
+        What reopens it is that the `:flag` alternative below does not pay the
+        cost at all rather than judging it acceptable, which is a different
+        answer to the same question. Taking the reservation before that is
+        settled would spend the name the objection is about. Raised in review.
+
+        **Alternative spelling: a `:flag` modifier rather than a `flag()` value
+        call.** Raised by the repo owner against the reserved-name cost above,
+        and it removes that cost outright — modifiers are a **closed, built-in
+        namespace** (user-defined modifiers are their own open question,
+        `DESIGN.md`:3609), so `:flag` takes nothing out of the function namespace
+        and `func flag(…)` keeps working.
+
+        - **`:int` and `:bool` are the closer precedent.** `re()` exists because
+          a regex has a *literal* syntax (`/…/`) and `re($x)` is the "from a
+          string instead" door. `:int` / `:bool` convert **a value in hand**,
+          which is what building a flag from `$w` is.
+        - **The list form falls out free.** `$xs:map(:upper)` already returns
+          `['A', 'B']`, so `...$xs:map(:flag)` needs no new mechanism — which
+          answers "should there also be a `flags()`?" with no, and without
+          burning a second, likelier name. (`re()` has no `res()`; `glob()` has
+          no `globs()`.)
+        - **It reads better where it is used.** The constructor exists for the
+          *computed* case; with a literal you would write `--force` bare.
+          `$w:flag` beats `flag($w)` there, and only `flag("--force")` beats
+          `"--force":flag`, which is the case nobody writes.
+
+        Against: it breaks the symmetry with `re()` the decision above leaned on,
+        and a modifier cannot be passed where a value call can — though
+        `:map(:flag)` shows the reference form covers the common case.
+
+        Not decided. Recorded because the entry above says the choice is
+        reversible only while the type is unbuilt, and it still is: `Value` has
+        no `Flag` variant, `flag("--force")` parses as a command, and `$w:flag`
+        reports that it is not a modifier.
 
         Open, and worth settling before it is built:
 
