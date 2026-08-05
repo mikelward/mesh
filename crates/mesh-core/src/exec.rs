@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::io::IsTerminal;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use crate::reaper;
@@ -1445,9 +1445,10 @@ fn with_stage_descriptors<T>(
     if published.is_some() {
         SHELL_STDIN.store(-1, Ordering::Relaxed);
     }
-    // Flush what the body wrote before restoring, or it would land on the restored
-    // descriptor instead of this stage's target.
-    let _ = std::io::stdout().flush();
+    if let Err(error) = flush_before_restore() {
+        restore(&mut swapped);
+        return Err(error);
+    }
     restore(&mut swapped);
     Ok(value)
 }
@@ -1504,6 +1505,13 @@ pub fn run_pipeline(
     // A background job must not consume commands from the shell's input.
     let mut next_stdin = initial_stdin(background, interactive);
     let mut process_group = None;
+    // Whether this process is going to be the one reading the end of the pipe —
+    // decided here because the stops of the *upstream* group have to be declined
+    // from the moment that group is created, well before the stage is reached.
+    let runs_last_stage_here = cmds
+        .last()
+        .is_some_and(|cmd| !background && cmd.in_shell && cmd.may_run_in_shell);
+    let mut unstoppable: Option<reaper::StopsDeclined> = None;
     let shell_modes = interactive.then(terminal_modes).flatten();
 
     // Resolve each stage's redirections concurrently — each stage still walks
@@ -1532,7 +1540,7 @@ pub fn run_pipeline(
     // because the child's descriptors die with it.
     let lastpipe_already_open: Vec<libc::c_int> = cmds
         .last()
-        .filter(|cmd| !background && !interactive && cmd.in_shell && cmd.may_run_in_shell)
+        .filter(|cmd| !background && cmd.in_shell && cmd.may_run_in_shell)
         .map(|cmd| {
             staged_redirs(cmd, true)
                 .iter()
@@ -1683,16 +1691,20 @@ pub fn run_pipeline(
         // is what keeps the pipeline concurrent: this process reads their output
         // through the pipe installed on its own stdin.
         //
-        // **Not under job control**, which is the condition bash puts on `lastpipe`
-        // too, and for a reason that bites hard: an interactive pipeline puts its
-        // forked stages in their own process group and hands that group the
-        // terminal. The shell is not in it. So a Ctrl-Z at `cat | gets line` stops
-        // `cat` and not mesh, and mesh is left blocked on a pipe that will never
-        // reach EOF — no prompt, no stopped-job record, and Ctrl-C going to the
-        // stopped group rather than recovering the session. Reading in a process
-        // outside the foreground group is the whole problem, so the answer is to
-        // keep this path away from job control rather than to unpick it here.
-        if is_last && !background && !interactive && cmd.in_shell && cmd.may_run_in_shell {
+        // **Under job control too**, which is where bash stops — it switches
+        // `lastpipe` off entirely rather than face the interaction. The problem is
+        // real: an interactive pipeline puts its forked stages in their own
+        // foreground group, and this process is not in it, so a Ctrl-Z stops the
+        // upstream and leaves the shell blocked on a pipe that will never reach
+        // EOF. What makes it unpickable is not the signal but the job table —
+        // there is no stopped state to record, because half the pipeline *is* the
+        // shell and `fg` cannot resume it.
+        //
+        // So the pipeline is made unstoppable instead, and says so: see
+        // [`reaper::decline_stops`], installed below for the length of the stage.
+        // Ctrl-C is unaffected and still ends it — the upstream dies, the pipe
+        // reaches EOF, and the read returns.
+        if is_last && !background && cmd.in_shell && cmd.may_run_in_shell {
             // stdin resolves exactly as it does for a fork: a `< file` in this
             // stage wins over the incoming pipe, and `Null` — the previous stage
             // sent its stdout elsewhere, so nothing is producing for this one —
@@ -1800,6 +1812,14 @@ pub fn run_pipeline(
                 if (interactive || background) && !forked {
                     let pgid = process_group.unwrap_or(pid);
                     process_group = Some(pgid);
+                    // Declined from the moment the group exists, not from the
+                    // moment the stage starts: the terminal is handed over here,
+                    // so a Ctrl-Z arriving before the shell reaches the last
+                    // stage would otherwise stop the upstream with nothing
+                    // watching, and strand the read that follows.
+                    if runs_last_stage_here && interactive && unstoppable.is_none() {
+                        unstoppable = Some(reaper::decline_stops(pgid));
+                    }
                     // Repeat setpgid in the parent to close the race with the
                     // child's own call: whichever runs first, the group is set
                     // before the stage can be signalled.
@@ -2904,11 +2924,37 @@ pub(crate) fn with_redirections<T>(
     if published.is_some() {
         SHELL_STDIN.store(-1, Ordering::Relaxed);
     }
-    // Flush what the body wrote before restoring, or it would land on the
-    // restored descriptor instead of the redirection target.
-    let _ = std::io::stdout().flush();
+    if let Err(error) = flush_before_restore() {
+        restore(&mut swapped);
+        return Err((path_for(libc::STDOUT_FILENO), error));
+    }
     restore(&mut swapped);
     Ok(result)
+}
+
+/// Empty the stdout buffer while the redirection is **still installed**, and
+/// keep the bytes of a failed write off the descriptor about to be restored.
+///
+/// Buffered output belongs to the descriptor that was in place when it was
+/// written, so it has to go out before the restore or it lands on the shell's
+/// own stdout. A *failed* flush is the same hazard carrying a write error:
+/// `print x > /dev/full` left `x` in the buffer, put it on the terminal on the
+/// way out, and reported success. Rust's `Stdout` has no way to drop what it is
+/// holding, so it is drained where the write was already going wrong — and the
+/// error is handed back, to become the failure of the command that wrote it.
+fn flush_before_restore() -> std::io::Result<()> {
+    use std::io::Write;
+
+    let flushed = std::io::stdout().flush();
+    if flushed.is_err()
+        && let Ok(sink) = OpenOptions::new().write(true).open("/dev/null")
+    {
+        // SAFETY: `sink` is this process's own descriptor, and stdout is restored
+        // from the saved copy immediately after, whatever lands here.
+        unsafe { libc::dup2(sink.as_raw_fd(), libc::STDOUT_FILENO) };
+        let _ = std::io::stdout().flush();
+    }
+    flushed
 }
 
 /// The shell's own stdin while an in-process redirection has fd 0 pointed at a

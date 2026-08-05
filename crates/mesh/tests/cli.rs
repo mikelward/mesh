@@ -9709,20 +9709,13 @@ fn job_control_is_refused_in_a_last_stage_too() {
     );
 }
 
-/// Under **job control**, the last stage forks as it always did.
-///
-/// An interactive pipeline puts its forked stages in a process group of their
-/// own and hands that group the terminal; the shell is not in it. Reading the
-/// pipe in the shell would then leave a Ctrl-Z at `cat | gets line` stopping
-/// `cat` and not mesh, with mesh blocked on a pipe that will never reach EOF —
-/// no prompt, no stopped-job record. So the in-shell path is taken exactly when
-/// the shell keeps the terminal, which is the same condition bash puts on
-/// `lastpipe`.
+/// The binding survives **under job control too**, which is where bash gives up.
 ///
 /// Driven with mesh's **stdin on a pty** — that is the flag the process-group
-/// handoff itself turns on, so the two cannot disagree.
+/// handoff itself turns on, so the test and the shell cannot disagree about
+/// whether job control is active.
 #[test]
-fn a_last_stage_forks_again_under_job_control() {
+fn a_last_stage_keeps_its_binding_under_job_control() {
     let (mut master, mut slave) = (-1, -1);
     assert_eq!(open_pty_pair(&mut master, &mut slave), 0, "openpty failed");
     let path = script(
@@ -9744,10 +9737,129 @@ fn a_last_stage_forks_again_under_job_control() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     // The premise: job control is on, because stdin is a terminal.
     assert!(stdout.contains("tty=true"), "{stdout:?}");
-    // So the stage forked, and its binding died with it — the pre-lastpipe
-    // behavior, kept exactly where running in the shell would strand it.
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("line: unbound variable"), "{stderr:?}");
+    // And the stage still ran here, so the binding outlived the pipeline.
+    assert!(stdout.contains("line=[hi]"), "{stdout:?}");
+}
+
+/// A pipeline whose last stage runs in the shell **cannot be stopped**, and says
+/// so rather than hanging.
+///
+/// This is the price of keeping `lastpipe` under job control. Ctrl-Z stops the
+/// upstream group — the shell is not in it — which would leave this process
+/// blocked on a pipe that never reaches EOF. There is no coherent stopped state
+/// to record instead, because half the pipeline *is* the shell and `fg` cannot
+/// resume it, so the stop is undone as it arrives.
+///
+/// Every stream is the terminal here, so the marker, the refusal and the result
+/// arrive at the master end in order. The child takes the pty as its
+/// **controlling terminal** (`setsid` + `TIOCSCTTY`), without which the line
+/// discipline has no foreground group to signal and Ctrl-Z would go nowhere.
+#[test]
+fn a_stop_of_a_pipeline_running_in_the_shell_is_declined() {
+    use std::os::unix::process::CommandExt;
+
+    let (mut master, mut slave) = (-1, -1);
+    assert_eq!(open_pty_pair(&mut master, &mut slave), 0, "openpty failed");
+    let path = script(
+        "lastpipe_decline_stop",
+        "sh -c 'echo ready >&2; cat' | gets line\nputs \"line=[$line]\"\n",
+    );
+    // SAFETY: `slave` came from `openpty`; each handle takes its own duplicate.
+    let (stdin, stdout, stderr) = unsafe {
+        (
+            Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave))),
+            Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave))),
+            Stdio::from(std::fs::File::from_raw_fd(slave)),
+        )
+    };
+    let mut command = mesh_command();
+    command
+        .arg(path.to_str().expect("utf-8 script path"))
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr);
+    // SAFETY: `setsid` and this `ioctl` are async-signal-safe, which is the bar
+    // for `pre_exec`, and both only affect the child.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("run mesh");
+
+    let mut seen = String::new();
+    // Bounded, so a failure reports what was on the terminal instead of hanging
+    // the run — the wait itself is on `poll`, not a sleep.
+    let read_until = |needle: &str, seen: &mut String| {
+        let mut buf = [0u8; 512];
+        while !seen.contains(needle) {
+            let mut fds = libc::pollfd {
+                fd: master,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `fds` is writable and `master` is this process's end.
+            if unsafe { libc::poll(&mut fds, 1, 10_000) } <= 0 {
+                return false;
+            }
+            // SAFETY: `master` is this process's end of the pair, `buf` writable.
+            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                return false;
+            }
+            seen.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+        }
+        true
+    };
+    let write = |bytes: &[u8]| {
+        // SAFETY: `master` is this process's end of the pair.
+        unsafe { libc::write(master, bytes.as_ptr().cast(), bytes.len() as _) };
+    };
+
+    // `cat` is running, so the stages are forked.
+    assert!(read_until("ready", &mut seen), "no marker: {seen:?}");
+    // But that is not yet the hazard. The hazard needs the *terminal* to belong
+    // to the upstream group, and until that handoff a Ctrl-Z goes to the shell's
+    // own group, which ignores it — harmless, and the source of a 1-in-5 flake
+    // when this waited on the marker alone. The handoff is observable from this
+    // end, so wait for the real precondition rather than for output that only
+    // correlates with it.
+    let shell = child.id() as libc::pid_t;
+    let mut handed_over = false;
+    for _ in 0..1_000_000 {
+        // SAFETY: `master` is this process's end of the pair.
+        let foreground = unsafe { libc::tcgetpgrp(master) };
+        if foreground > 0 && foreground != shell {
+            handed_over = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(handed_over, "terminal never handed over: {seen:?}");
+    // The stop goes to that group **directly** rather than as a `^Z` through the
+    // line discipline. Both arrive as the same SIGTSTP, but the keystroke is
+    // delivered to whatever the terminal's foreground group is at the instant it
+    // is processed, which no amount of waiting on this end pins down — it flaked
+    // 1-in-4 that way. Naming the group is the same event without the ambiguity.
+    // SAFETY: `master` is this process's end of the pair.
+    let upstream = unsafe { libc::tcgetpgrp(master) };
+    assert!(upstream > 0 && upstream != shell, "no upstream group: {seen:?}");
+    // SAFETY: signalling a process group this test just observed.
+    unsafe { libc::kill(-upstream, libc::SIGTSTP) };
+    assert!(
+        read_until("cannot stop", &mut seen),
+        "not declined: {seen:?} shell={shell} upstream={upstream}"
+    );
+    // Had the stop stood, neither of these would ever be read.
+    write(b"hello\n\x04");
+    assert!(read_until("line=[hello]", &mut seen), "no binding: {seen:?}");
+
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "{seen:?}");
+    // SAFETY: the master end is this process's, and the child is finished.
+    unsafe { libc::close(master) };
 }
 
 /// The status and `$sh.pipestatus` are unchanged by where the stage ran.

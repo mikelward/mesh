@@ -55,7 +55,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// A state change the kernel reported for one child, and where it sits in the
@@ -162,13 +162,115 @@ static WAITING_THREAD: AtomicUsize = AtomicUsize::new(0);
 /// Whether [`install`] has run.
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
+/// The process group whose stops this shell refuses, or zero for none.
+///
+/// Set while the **last stage of a pipeline runs in this process** and the
+/// stages feeding it are a foreground group of their own. That arrangement has
+/// no coherent stopped state: the terminal can stop the upstream group, but the
+/// half of the pipeline reading from it is this shell, which cannot be put in
+/// the job table and resumed. See [`decline_stops`].
+static UNSTOPPABLE_GROUP: AtomicI32 = AtomicI32::new(0);
+
+/// Refuse to let `pgid` stay stopped for as long as the guard lives.
+///
+/// A pipeline whose last stage runs in the shell cannot be stopped, and the
+/// honest answer is to say so rather than to half-do it. Stopping the upstream
+/// group leaves this process blocked on a pipe that will not reach EOF, and the
+/// two ways out are both worse than refusing: killing the in-shell stage loses
+/// a partly-done read *and* files a job that cannot be resumed — `fg` would
+/// wake the upstream into a pipe with no reader — while letting the stop stand
+/// is the hang itself.
+///
+/// So the stop is undone as it arrives, in [`note_child`]. bash sidesteps the
+/// same problem by switching `lastpipe` off under job control; this keeps the
+/// feature and gives up stopping instead, which is the smaller loss and the
+/// visible one.
+pub(crate) fn decline_stops(pgid: libc::pid_t) -> StopsDeclined {
+    UNSTOPPABLE_GROUP.store(pgid, Ordering::SeqCst);
+    // A stop that landed *before* this store — in the window between the group
+    // being handed the terminal and the shell reaching the stage — would
+    // otherwise stand, because the handler that saw it had no group to defend
+    // yet. Undo it here instead, where the same check is ordinary code.
+    decline_stop_of(pgid);
+    StopsDeclined
+}
+
+/// Restores stoppability on drop; see [`decline_stops`].
+pub(crate) struct StopsDeclined;
+
+impl Drop for StopsDeclined {
+    fn drop(&mut self) {
+        UNSTOPPABLE_GROUP.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Undo a stop of the group named by [`UNSTOPPABLE_GROUP`], and say so.
+///
+/// Async-signal-safe throughout, which is what dictates the shape. The peek is
+/// `waitid` with **`WNOWAIT`**: it answers "did something in that group stop"
+/// while *leaving* the transition waitable, so [`drain`] still collects it and
+/// the store's "nothing steals" property survives a handler running mid-wait.
+/// `WNOHANG` keeps the common case — a child that merely exited — to one call.
+/// The message goes out with a bare `write` for the same reason `println!` and a
+/// lock cannot be used here.
+fn decline_any_stop() {
+    let group = UNSTOPPABLE_GROUP.load(Ordering::SeqCst);
+    if group != 0 {
+        decline_stop_of(group);
+    }
+}
+
+/// Continue `group` if anything in it is stopped, and report the refusal.
+///
+/// Shared by the handler and [`decline_stops`], so a stop is undone the same way
+/// whether it arrives while the shell is reading or had already landed before
+/// the shell got there.
+fn decline_stop_of(group: libc::pid_t) {
+    // SAFETY: `kill` and `write` are both async-signal-safe, and `info` is
+    // writable and zeroed as documented.
+    unsafe {
+        // Peek *first*, because `SIGCONT` is what destroys the evidence: once the
+        // group is running again there is no stopped state left to report, and
+        // asking afterwards never says yes. `WNOWAIT` leaves the transition where
+        // it is, for [`drain`] to file as usual.
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let peeked = libc::waitid(
+            libc::P_PGID,
+            group as libc::id_t,
+            &mut info,
+            libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        let stopped = peeked == 0 && info.si_pid() != 0;
+        // Continue **unconditionally**, whatever the peek said. The peek is a
+        // race this cannot reliably win — `drain` owns `waitpid` and consumes the
+        // very transition it reads — and gating the continue on it left the stop
+        // standing and the shell hung on the pipe, 6 runs in 20. `SIGCONT` is a
+        // no-op for a group that is already running, so sending it on every
+        // `SIGCHLD` costs one syscall and cannot be wrong. Losing the race now
+        // costs the diagnostic only, never the continue.
+        libc::kill(-group, libc::SIGCONT);
+        if !stopped {
+            return;
+        }
+        const REFUSED: &[u8] =
+            b"\nmesh: cannot stop a pipeline whose last stage runs in the shell\n";
+        libc::write(
+            libc::STDERR_FILENO,
+            REFUSED.as_ptr().cast(),
+            REFUSED.len() as _,
+        );
+    }
+}
+
 /// Forward to the waiting thread, and otherwise do nothing at all.
 ///
 /// Async-signal-safe by being trivial: `pthread_self`, `pthread_equal` and
 /// `pthread_kill` are all on the list, and nothing here allocates, locks, or
 /// touches the table. Every decision about what a transition *means* happens in
-/// [`drain`], in ordinary code.
+/// [`drain`], in ordinary code — [`decline_any_stop`] is the one exception, and
+/// it only ever *undoes* a stop, never records one.
 extern "C" fn note_child(signal: libc::c_int) {
+    decline_any_stop();
     let waiting = WAITING_THREAD.load(Ordering::SeqCst);
     if waiting == 0 {
         return;
