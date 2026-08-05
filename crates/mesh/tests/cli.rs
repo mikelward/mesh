@@ -13043,6 +13043,159 @@ fn a_value_call_reads_options_from_the_call_site_not_from_the_data() {
     assert_eq!(String::from_utf8_lossy(&typed.stdout), "n=2\n");
 }
 
+/// Command position asked the same question of the *runtime value*, so `f $w` and
+/// `f "--sleep=0"` reported ``unknown flag `--sleep` `` and a plain `func` could
+/// not be handed flag-shaped data at all. `wrapper func` was the opt-in way round
+/// it on the callee's side — which is why a shell config ends up writing `wrapper`
+/// on every helper that forwards or merely prints a string — not a fix.
+///
+/// Now the call site decides here too: only a `--name` written where the call is
+/// written is an option. That is the rule the value-call scan already applies, so
+/// the two spellings agree, and it is the "quoting makes a value" rule every
+/// other position follows.
+#[test]
+fn command_position_reads_options_from_the_call_site_not_from_the_data() {
+    // The motivating pair. Identical text, both data — if the runtime value
+    // decided, both would still be flags.
+    let through_a_variable =
+        run_with_input("func f(_a) { puts \"got=[$_a]\" }\nw = \"--sleep=0\"\nf $w\n");
+    assert_eq!(
+        String::from_utf8_lossy(&through_a_variable.stdout),
+        "got=[--sleep=0]\n"
+    );
+    assert!(
+        through_a_variable.stderr.is_empty(),
+        "{:?}",
+        through_a_variable.stderr
+    );
+
+    let quoted = run_with_input("func f(_a) { puts \"got=[$_a]\" }\nf \"--sleep=0\"\n");
+    assert_eq!(String::from_utf8_lossy(&quoted.stdout), "got=[--sleep=0]\n");
+    assert!(quoted.stderr.is_empty(), "{:?}", quoted.stderr);
+
+    // A `...rest` holding data that looks like an option is the case `wrapper`
+    // exists for, and it no longer needs one when the data is not written bare.
+    let rest = run_with_input(
+        "func k(...rest) { puts $rest:len }\nname = \"--weird\"\nk $name \"--other\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&rest.stdout), "2\n");
+    assert!(rest.stderr.is_empty(), "{:?}", rest.stderr);
+
+    // This narrows what counts as an option; it does not stop options working.
+    let declared =
+        run_with_input("func f(target, --force) { puts \"$target/$force\" }\nf prod --force\n");
+    assert_eq!(String::from_utf8_lossy(&declared.stdout), "prod/true\n");
+
+    // A bare unknown flag is still refused, so a typo still fails loudly rather
+    // than vanishing into `...rest`.
+    let unknown = run_with_input("func f(_a) { puts \"got=[$_a]\" }\nf --sleep=0\n");
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("unknown flag `--sleep`"),
+        "{:?}",
+        unknown.stderr
+    );
+
+    // A composed name is data, for the reason the value-call rule gives: the name
+    // picks *which* option binds, so letting a runtime value form it is the
+    // data-decides-the-call reading this removes.
+    for call in [
+        "name = force\nf --$name",
+        "f --\"force\"",
+        "f --FORCE:lower",
+    ] {
+        let out = run_with_input(&format!(
+            "func f(target, --force) {{ puts \"$target/$force\" }}\n{call}\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "--force/false\n",
+            "{call} should pass `--force` as data, leaving the switch off"
+        );
+    }
+
+    // Only the `--name=` prefix has to be written; the value after the `=` is the
+    // option's value however it is formed.
+    for (call, expected) in [
+        ("f --tag=\"v2\"", "tag=v2\n"),
+        ("w = v9\nf --tag=$w", "tag=v9\n"),
+        ("f --tag=v2", "tag=v2\n"),
+    ] {
+        let out = run_with_input(&format!(
+            "func f(--tag = none) {{ puts \"tag=$tag\" }}\n{call}\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            expected,
+            "{call} should bind the flag"
+        );
+    }
+
+    // The typing question stays separate from the is-it-an-option question, the
+    // split that made the value-call rule work: `--n=2` binds the integer while
+    // `--n="2"` keeps its string type, and both are options.
+    let typed = run_with_input(
+        "func f(--n = 0) { if $n == 2 { puts int } else { puts str } }\nf --n=2\nf --n=\"2\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&typed.stdout), "int\nstr\n");
+
+    // A spread stays scanned, deliberately: writing `...` is the explicit "these
+    // are arguments, flags included" gesture — the channel a wrapper forwards
+    // through — where `f $w` says "this is one value".
+    let spread = run_with_input(
+        "func f(target, --force) { puts \"$target/$force\" }\nxs = [\"--force\"]\nf prod ...$xs\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&spread.stdout), "prod/true\n");
+}
+
+/// The `--` terminator is call-site syntax for the same reason a `--flag` is: a
+/// computed one ending option parsing is the data-decides-the-call reading in its
+/// most surprising form, since the caller wrote nothing that looks like a
+/// terminator. Written, it means exactly what it always did.
+#[test]
+fn only_a_written_terminator_ends_command_position_option_parsing() {
+    let written = run_with_input(
+        "func f(--force, ...rest) { puts \"force=$force\"\n puts ...$rest }\nf -- --force\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&written.stdout),
+        "force=false\n--force\n"
+    );
+
+    // Through a variable it is data — and, being data, it does not stop the
+    // `--force` behind it from binding. Read back by interpolation rather than
+    // `puts ...$rest`, since `puts` strips a leading `--` of its own and would
+    // swallow the very element under test.
+    let computed = run_with_input(
+        "func f(--force, ...rest) { text = $rest:join(\",\")\n puts \"force=$force rest=[$text]\" }\nw = \"--\"\nf $w --force\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&computed.stdout),
+        "force=true rest=[--]\n"
+    );
+}
+
+/// `--help` is intercepted before the call, so it needed the same narrowing: a
+/// function handed the *string* `--help` would print its own help over the top of
+/// whatever it was asked to do, with the argument never reaching it.
+#[test]
+fn only_a_written_help_flag_asks_for_the_generated_help() {
+    let quoted = run_with_input("func f(x) { puts \"got=$x\" }\nf \"--help\"\n");
+    assert_eq!(String::from_utf8_lossy(&quoted.stdout), "got=--help\n");
+
+    let through_a_variable =
+        run_with_input("func f(x) { puts \"got=$x\" }\nw = \"--help\"\nf $w\n");
+    assert_eq!(
+        String::from_utf8_lossy(&through_a_variable.stdout),
+        "got=--help\n"
+    );
+
+    // Written, it still answers with the generated help rather than calling.
+    let written = run_with_input("func f(x) { puts \"got=$x\" }\nf --help\n");
+    let help = String::from_utf8_lossy(&written.stdout);
+    assert!(help.contains("Usage"), "{help:?}");
+    assert!(!help.contains("got="), "{help:?}");
+}
+
 #[test]
 fn an_attached_option_value_may_be_quoted_or_expanded() {
     // Only the `--name=` prefix has to be written at the call site; the value
@@ -13292,6 +13445,17 @@ fn a_glob_cannot_choose_which_option_binds() {
     // Written literally the same name still binds, so the refusal is about
     // globbability and not about the characters `--force` happens to contain.
     assert_eq!(run("f(--force)"), "force=true n=0\n");
+
+    // Command position answers the same, now that it asks the call site too. It
+    // is the one composition that needs no punctuation to mark it, so scanning
+    // the expanded string let the working directory pick the option here as well.
+    assert_eq!(
+        run("f --*"),
+        "force=false n=1\n",
+        "a glob must not bind the switch it happens to match"
+    );
+    assert_eq!(run("f --?orce"), "force=false n=1\n");
+    assert_eq!(run("f --force"), "force=true n=0\n");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

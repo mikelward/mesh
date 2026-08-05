@@ -3272,14 +3272,24 @@ greet world          # -> hi, world
     may appear in any order and are not consumed as positionals; a repeated valued
     flag takes its **last** value. An argument that begins with `--` but names no
     declared flag is a loud error.
-  - **In a value call, a flag is read from the call site, not from the value.**
-    Only a `--name` written as a literal word there is an option, so `f($w)` and
-    `f("--sleep=0")` pass data even when the text begins with `--` — the same
-    rule as everywhere else that quoting makes a value, and it keeps what a call
-    means readable from the line rather than from what a variable happens to
-    hold. A **spread** is the exception, and the reason to write one:
-    `f(...$args)` does read a `--force` element as the option, which is how a
-    wrapper forwards flags it was handed.
+  - **A flag is read from the call site, not from the value.** Only a `--name`
+    written as a literal word where the call is written is an option, so `f $w`,
+    `f("--sleep=0")` and their command/value-call twins all pass data even when
+    the text begins with `--` — the same rule as everywhere else that quoting
+    makes a value, and it keeps what a call means readable from the line rather
+    than from what a variable happens to hold. The name is what has to be
+    literal: `--tag="v2"` and `--tag=$w` are options, since the `=` ends the name
+    and the value after it may be quoted or expanded. A name that is **composed**
+    (`--$name`, `--"force"`, `--FORCE:lower`) or that **globs** (`--*`, which
+    would take its option from whatever the working directory holds) is data.
+    A **spread** is the exception, and the reason to write one: `f ...$args` and
+    `f(...$args)` do read a `--force` element as the option, which is how a
+    wrapper forwards flags it was handed. `--` and `--help` follow the same rule
+    — only a written one ends flag parsing or asks for the generated help.
+
+    This applies to **in-shell** calls. An **external** command is argv, and mesh
+    parses none of its flags, so `curl $url` passes whatever `$url` holds
+    verbatim.
   - **An option's value must be one string.** `--tag=$xs` with a list reports
     rather than binding, and so does `--tag=*.txt`, since a glob is a list
     however many paths it matched — including none. The command spelling of a

@@ -938,6 +938,11 @@ web1
 Flags can appear in any order and never get swallowed as positionals; a bare `--`
 ends flag parsing so a later `--word` reaches `...hosts` as data.
 
+A flag is whatever you *wrote* as one, not whatever a value turned out to hold —
+so `deploy prod $host` passes `$host` along even when it holds `--force`, and
+quoting works here as it does everywhere else. Write `...$args` to forward flags
+you were handed, which is the one place a `--force` element still binds.
+
 A function's status is whatever its body did last, so a predicate needs no
 `return` at all — it reads as true/false in `&&` / `||` on its own:
 

@@ -2936,7 +2936,7 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Eighteen have since been fixed; two are tracked
+matched back to the discussion. Twenty-two have since been fixed; two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
 
@@ -3403,7 +3403,7 @@ thing a reader takes on trust.*
       ``$m("--x")`` was `unknown flag`. The bare spelling `$m(--x)` still is; the
       quoted one is data now, and is asserted as such.
       `repl.rs` `scan_call_value`.
-- [ ] **Command position scans a runtime value for flags too.** Found auditing
+- [x] **Command position scans a runtime value for flags too.** Found auditing
       17: `f $w` with `$w` holding `--sleep=0` reports ``unknown flag `--sleep` ``
       exactly as the value call did, so a plain `func` in command position still
       cannot be handed flag-shaped data. `wrapper func` is the opt-in workaround
@@ -3417,6 +3417,48 @@ thing a reader takes on trust.*
       standing in the same place. Deciding it needs an answer to "is command
       position argv-shaped or call-shaped for a func?", which is a design
       question rather than a bug fix.
+
+      **Answered: call-shaped, and the inconsistency was already there.** A
+      func's command-position arguments have never been argv — they take the
+      typed path (`expand_call_values`), so `f $xs` hands over a list where an
+      external gets flattened words, and `f 2` binds an integer. The boundary
+      between "in-shell callee" and "external" is where typing already changes;
+      flag-shape now changes at the same line rather than at a second one of its
+      own. `curl $url` is untouched, since mesh parses no external's flags.
+
+      Implemented as the command-position twin of 17's predicate:
+      `expand::written_dashed_word`, asking the same question of an
+      `expand::Word` that `starts_with_bare_dashes` asks of an `Expr` — the `=`
+      ends the name, the name must be literal and must not glob, and a composed
+      name is data. The bit rides on `expand::CallArgument`, which replaces the
+      `(Value, bool)` pair the binder took: `bare` (how the value *types*) and
+      `dashed` (whether this is option syntax) are the two questions 17 found
+      must stay apart, and command position had only been carrying the first.
+
+      Spread stays scanned, as in 17. `--` and `--help` follow the rule too — a
+      computed `--` no longer ends flag parsing, and a computed `--help` no
+      longer prints the generated help over the call.
+
+      **What this does *not* do:** it does not remove the need for `wrapper` on a
+      forwarder, because `setx curl --location URL` writes `--location` bare and
+      it is still scanned. That is the other half — see the entry below.
+- [ ] **A `...rest` still swallows nothing, so a forwarder still needs
+      `wrapper`.** With the call-site rule above in place, the remaining reason a
+      config writes `wrapper` 50-odd times is delegation: `setx curl --location
+      URL` and `quiet cmd --flag` write the callee's flags bare, so the scan
+      still meets them and still reports `unknown flag`.
+
+      The candidate is **options-before-operands for a signature with a
+      `...rest`**: stop scanning at the first non-flag, so trailing arguments —
+      which a rest parameter says belong to someone else — pass through. It is
+      decidable from the signature alone, and the grammar already refuses a flag
+      parameter *after* `...rest`, so the call site would simply agree with what
+      the signature already says. Fixed-arity functions keep full permutation.
+
+      The cost is that `f one --force` stops binding the switch when `f` also
+      takes a rest, against `DESIGN.md`'s "flags may appear in any order" — which
+      is a real interactive ergonomic, so this needs a decision rather than a
+      guess. **Waiting on the repo owner.**
 - [ ] **Make a builtin work the way a function does, not its own way.**
       *Standing principle, from the repo owner: a builtin behaves the same as a
       function and an external unless we have explicitly agreed otherwise.* A

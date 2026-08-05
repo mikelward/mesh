@@ -3107,6 +3107,14 @@ Rules:
   rather than hand-rolled `case $1` juggling. An argument that begins with `--`
   but names **no declared flag** is an **error**, not a silently-forwarded
   positional — a typo'd flag should fail loudly, not vanish into `...rest`.
+  What counts as "begins with `--`" is asked of the **call site**, not of the
+  runtime value: only a `--name` written literally where the call is written is
+  an option, in command position and value calls alike, so a string that merely
+  looks like a flag is data. A spread (`...$args`) is the deliberate exception —
+  the channel a wrapper forwards through. This is the same decidability rule as
+  everywhere else, and it is why `f $w` means one thing however `$w` is filled.
+  It stops at the argv boundary: an **external** gets the bytes, since mesh
+  parses none of its flags.
   When a flag is given **more than once** (directly or via a spread), the
   **last occurrence wins** for a valued flag (`--tag=v1 --tag=v2` binds `v2`, the
   universal CLI convention that makes a forwarded default overridable), and a
