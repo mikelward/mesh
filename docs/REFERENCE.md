@@ -678,6 +678,44 @@ It is usable wherever a value is — an assignment, a condition, a command argum
 The bash operators, and they mean what they do there: `>`, `>>`, `<`, `2>`,
 `2>>`, `2>&1`, `>&2`, `<&0`, and `&> file` / `>& file` for both streams.
 
+**The last stage of a pipeline runs in the shell**, not in a fork, whenever it is
+something the shell runs itself — a builtin or a function. So a binding it makes
+outlives the pipeline:
+
+```mesh
+cmd | gets line
+puts $line                             # set: the read happened here
+```
+
+This is bash's opt-in `lastpipe`, automatic in mesh. In bash without it,
+`seq 3 | while read x; do n=$((n+1)); done` leaves `n` at `0`, because the loop
+ran in a subshell.
+
+It applies where **job control is not active** — scripts and non-interactive
+shells — which is the condition bash puts on `lastpipe` too. Under job control an
+interactive pipeline hands its forked stages the terminal and the shell is not
+among them, so reading the pipe here would leave `cat | gets line` unstoppable:
+Ctrl-Z would stop `cat` and not mesh. There the last stage forks as it always
+did, and the binding does not outlive it.
+
+Every *earlier* stage still forks, which is what makes a pipeline concurrent, and
+so does the last stage in three cases: an **external** (it needs a process to
+`exec` into), a **backgrounded** pipeline (the shell is not waiting for it), and
+**`exec`** itself (`cmd | exec prog` is observably `cmd | prog`, so replacing the
+shell there would end the session for nothing). A function whose *body* reaches
+`exec` cannot be kept out that way, so `exec` refuses while the shell is standing
+in for a stage — the same refusal it makes inside a capture. A stage carrying a value still
+evaluates it in its own process, wherever it sits.
+
+The status and [`$sh.pipestatus`](#shstatus-and-shpipestatus) are the same either way,
+and an `exit` in the last stage is still that *stage's* exit, reported as a
+status — the shell carries on.
+
+Being a stage still means what it did: `fg`, `bg`, `wait` and `disown` are refused
+there, last stage or not, so a pipeline does not read differently depending on
+where the builtin sits. `jobs` and `kill` are unaffected — listing and signalling
+need no parenthood.
+
 **Any descriptor**, not just the standard three:
 
 ```mesh
@@ -926,7 +964,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `puts [arg …]` | Render each argument and print them separated by single spaces, then a newline. No arguments prints a blank line. Rendering is per value: a scalar as itself, a **list** as its elements joined by newlines, a **map** as `key: value` lines. A **nested** collection moves down a level — indented two spaces under its map key, or prefixed with a `- ` bullet as a list element, which is what keeps `[[1 2] [3 4]]` from printing exactly as the flat `[1 2 3 4]`. Depth is not capped. A value with no byte form — a job or stream handle, a function, a pattern — is a loud error rather than a guess, wherever it is nested. Unlike argv, `puts` sees the real value, so `puts $xs` needs no `...`; a *written* argument keeps its own text, so `puts 007` prints `007`. It takes no flags. |
 | `print [arg …]` | The same as `puts` with **no trailing newline**, for partial lines. No arguments prints nothing. |
 | `gets [var]` | Read one line from stdin, strip its trailing newline, and bind it to `var`. **At end of input the status is `1` and `var` is left unchanged**, which is what terminates `while gets line { … }`. An empty line is a successful read of `""` — a blank line mid-file must not end a loop — so only a zero-byte read ends it, and a final line with no trailing newline is still a line. A line that is not valid UTF-8 is **refused** rather than repaired — status `2`, and `var` is left alone — following the capture rather than `$env`'s lossy read; status `2` is also what an I/O error reports, so `1` means end of input and nothing else. Interactively, **Ctrl-C cancels a read** — status `130`, and `var` keeps whatever it held, since a cancelled read has read nothing. It reads a byte at a time, so the bytes after the line reach whatever runs next rather than being swallowed by a buffer. With no `var` it consumes the line and reports only whether there was one. |
-| `gets()` | The **value** form of the same read — parens attached, so it yields the line into an expression rather than reporting a status: `line = gets()`, `[k v] = gets():split("=")`, `while line = gets() { … }`. **At end of input it yields `false`**, which is what stops those loops: an [assignment as a condition](#conditionals) is true iff its right-hand side is truthy, and an empty line is a truthy `""`. It takes **no arguments** — the binding is the assignment it sits in, where the command form takes the name as an operand. Both spellings read through one reader, so everything above holds here: the byte-at-a-time read, the refusal of a non-UTF-8 line, and Ctrl-C cancelling. A failure **raises** rather than yielding, since `false` already means end of input. In a **pipeline stage** the read happens in a forked process, so a binding it makes does not outlive the stage — the same as any builtin. `cmd \| while line = gets() { … }` is not implemented in either spelling: a loop is not yet a pipeline stage. |
+| `gets()` | The **value** form of the same read — parens attached, so it yields the line into an expression rather than reporting a status: `line = gets()`, `[k v] = gets():split("=")`, `while line = gets() { … }`. **At end of input it yields `false`**, which is what stops those loops: an [assignment as a condition](#conditionals) is true iff its right-hand side is truthy, and an empty line is a truthy `""`. It takes **no arguments** — the binding is the assignment it sits in, where the command form takes the name as an operand. Both spellings read through one reader, so everything above holds here: the byte-at-a-time read, the refusal of a non-UTF-8 line, and Ctrl-C cancelling. A failure **raises** rather than yielding, since `false` already means end of input. As the **last stage of a foreground pipeline** the read happens in the shell itself, so `cmd \| gets line` leaves `line` set — see [the last stage](#redirection). In an *earlier* stage, or a backgrounded one, it happens in a forked process and the binding dies with the stage, the same as any builtin. `cmd \| while line = gets() { … }` is not implemented in either spelling: a loop is not yet a pipeline stage. |
 | `style(text, fg: …, bg: …, bold: …)` | A [styled value](#styled-values) — text plus display attributes. A **value call**, parens attached, because a command position yields a status. Colors are the sixteen ANSI names: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `grey` (or `gray`, or `bright-black`), and `bright-` forms of the rest. |
 | `link(text, url)` | A [styled value](#styled-values) carrying an `OSC 8` hyperlink, so `text` is clickable. The url needs a **scheme** (`https://…`, `file://host/path`) and anything RFC 3986 forbids raw is percent-encoded, a space included; over 2083 encoded bytes is refused, since past a terminal's own limit the whole sequence — link text included — is dropped. |
 | `glob(pattern)` · `files(dir = ".")` · `dirs(dir = ".")` | The paths a pattern matches, and a directory's immediate files or subdirectories — a **list**, since these are [value calls](#the-glob-family) rather than commands. |
@@ -945,7 +983,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `kill [-signal] job\|pid …` | Signal a job's process group, or a pid. Default `TERM`. |
 | `disown [-h] [-a \| -r] [job …]` | Stop tracking a job — see [Job control](#job-control). |
 | `command [--] name [arg …]` | Run the **program** `name`, past the builtin or function that name would otherwise reach — which is what makes `func ls() { command ls --color=auto }` safe to write, and what reaches `/usr/bin/env` when a function of that name is in the way. Only the words in front of the program are `command`'s own: `command ls --help` asks `ls` for its help, and `--` ends `command`'s options so the word after it is the program however it reads. `--help` is the only option it has, so any other flag-looking word in front of the program is a usage error (status `2`) rather than a program name — `command -v` / `-V` are held for the unbuilt half, and `command -- -v` runs a program called `-v`. The operand is the program with nothing peeled off it, so `command command x` looks for a program called `command`. A builtin's name finds no program, and says so; with no operand at all the status is `2`. |
-| `exec [--] cmd [arg …]` | Replace the shell process with the **program** `cmd` — the `exec(2)` hand-off, so on success no shell survives: `exec autotmux` in a dispatcher leaves only the session it started. `cmd` resolves as an external executable; a builtin or function has no process image with which to replace the shell, so a name only they answer to is an error saying which kind declined (`127`). Only the leading words are `exec`'s own, exactly as with `command`: `--` ends its options, `exec ls --help` is `ls`'s help, and a flag-looking word in front of the program is a usage error (status `2`) rather than a program name. With redirections and **no** program (`exec > log`, `exec 3< file`) the targets apply to the shell itself and *stay* applied — the one redirection nothing restores; a bare `> f` with no command stays an error whose message points here. A failed replacement reports and keeps an interactive session, while a script exits with the failure (`127` not found, `126` not executable) — it asked to become the program, and there is nothing it was going to do as itself. In a pipeline stage, a `fork` block, or a `&` background command, `exec` replaces that child process and the shell carries on. Inside a `$(…)` or `:capture` it is refused: mesh's captures run in-process, and their readers are the shell's own threads. |
+| `exec [--] cmd [arg …]` | Replace the shell process with the **program** `cmd` — the `exec(2)` hand-off, so on success no shell survives: `exec autotmux` in a dispatcher leaves only the session it started. `cmd` resolves as an external executable; a builtin or function has no process image with which to replace the shell, so a name only they answer to is an error saying which kind declined (`127`). Only the leading words are `exec`'s own, exactly as with `command`: `--` ends its options, `exec ls --help` is `ls`'s help, and a flag-looking word in front of the program is a usage error (status `2`) rather than a program name. With redirections and **no** program (`exec > log`, `exec 3< file`) the targets apply to the shell itself and *stay* applied — the one redirection nothing restores; a bare `> f` with no command stays an error whose message points here. A failed replacement reports and keeps an interactive session, while a script exits with the failure (`127` not found, `126` not executable) — it asked to become the program, and there is nothing it was going to do as itself. In a pipeline stage, a `fork` block, or a `&` background command, `exec` replaces that child process and the shell carries on — a directly spelled `exec` stage is kept in its own fork for exactly that reason. Inside a `$(…)` or `:capture` it is refused: mesh's captures run in-process, and their readers are the shell's own threads. It is refused for the same reason when reached from a **function running as a pipeline's last stage**, which runs in the shell rather than a fork: there is no separate process left to spend, and replacing this one would end the session. |
 | `source file` | Run a file's mesh code in this shell — see [`source`](#source). |
 | `type [-t\|-P\|-a\|--quiet] name …` | Say what each name is — see [`type`](#type). |
 

@@ -69,6 +69,16 @@ struct Shell {
     /// restore the diversion owes, would go down with it. A count rather than a
     /// flag because captures nest.
     captures: usize,
+    /// True while a pipeline's last stage is running **in the shell** rather than
+    /// in a fork. The process is not `exec`'s to replace for the same reason a
+    /// live capture makes it untouchable: the shell is standing in for a stage,
+    /// with its descriptors swapped and a restore owed, and replacing it would
+    /// spend the session on what was meant to spend one stage.
+    ///
+    /// A flag rather than a count, saved and put back around the stage, because
+    /// what matters is whether *this* body is standing in for a stage — a nested
+    /// pipeline inside one sets it again and hands the previous value back.
+    in_stage_here: bool,
     loop_depth: usize,
     prompt: PromptConfig,
     /// The **result so far** of the body being run: the value of the last
@@ -236,6 +246,7 @@ impl Shell {
             value_call_status: None,
             forked: false,
             captures: 0,
+            in_stage_here: false,
             loop_depth: 0,
             prompt: PromptConfig::default(),
             result: Value::String(String::new()),
@@ -2770,6 +2781,12 @@ fn run_forked_block(body: &parser::Source, in_function: bool, shell: &mut Shell)
         // its reader threads did not survive the fork, so this process holds no
         // live capture and `exec` is free to replace it.
         shell.captures = 0;
+        // And a stage this block was forked inside of is the parent's too. This
+        // child has a process of its own to spend, so `exec` here is ordinary —
+        // `fork { exec … }` inside a last-stage function means what it does
+        // anywhere else. Cleared for the same reason as the capture count: the
+        // thing the flag protects did not come across the fork.
+        shell.in_stage_here = false;
         // Seeded at 0, as every other compound body is. A subshell is a fresh
         // boundary: `false; fork { }` reporting 1 would carry a failure from
         // outside it across the very edge the construct exists to draw.
@@ -6746,6 +6763,8 @@ fn run_single(
                 redirs: opened,
                 pipe_stderr: false,
                 in_shell: true,
+                // Backgrounded, so there is no foreground last stage to be.
+                may_run_in_shell: false,
                 // Left empty on purpose: the body below applies the prefix in the
                 // fork, so evaluating it here would be the work this branch exists
                 // to move.
@@ -6783,6 +6802,8 @@ fn run_single(
                         redirs: opened,
                         pipe_stderr: false,
                         in_shell: true,
+                        // Backgrounded, so there is no foreground last stage to be.
+                        may_run_in_shell: false,
                         env: Vec::new(),
                     }],
                     vec![StageBody::Function(args)],
@@ -6838,6 +6859,13 @@ fn run_single(
         // would be silently undone when the capture puts them back.
         if terminator_only && shell.captures > 0 {
             note!("mesh: exec: cannot retarget the shell's descriptors inside a capture");
+            return Step::Error(2);
+        }
+        // And the same while standing in for a stage: this stage's targets are
+        // installed on the shell and owed a restore, so a permanent retarget
+        // underneath would be silently undone when the stage puts them back.
+        if terminator_only && shell.in_stage_here {
+            note!("mesh: exec: cannot retarget the shell's descriptors as a pipeline's last stage");
             return Step::Error(2);
         }
         let opened = match expand_redirs(redirs, last, in_function, shell) {
@@ -6904,6 +6932,9 @@ fn run_single(
             redirs: opened,
             pipe_stderr: false,
             in_shell: builtin,
+            // Reached only when backgrounding forced a child, so there is no
+            // foreground last stage to be.
+            may_run_in_shell: false,
             env: Vec::new(),
         }],
         vec![if builtin {
@@ -6975,6 +7006,10 @@ fn run_multi(
                 redirs: opened,
                 pipe_stderr,
                 in_shell: true,
+                // The words are not expanded yet, so this stage cannot be asked
+                // whether it is an `exec`. It keeps its fork; widening this is a
+                // follow-up rather than a guess made here.
+                may_run_in_shell: false,
                 // A deferred stage still ends in an `exec` inside its own fork, so
                 // it needs the prefix exactly as an eager one does. Dropping it
                 // here meant a value-bearing word anywhere in the stage silently
@@ -7001,11 +7036,17 @@ fn run_multi(
             Ok(stage) => stage,
             Err(step) => return step,
         };
+        // `exec` keeps its own process. Its meaning is "spend this stage on the
+        // replacement", and `puts hi | exec cat` is observably `puts hi | cat` — so
+        // letting it run in the shell would spend the *shell* to no end.
+        let may_run_in_shell = matches!(body, StageBody::Builtin | StageBody::Function(_))
+            && !cmds_is_exec(&stage_words);
         cmds.push(exec::Cmd {
             words: stage_words,
             redirs: opened,
             pipe_stderr,
             in_shell: !matches!(body, StageBody::External),
+            may_run_in_shell,
             env: stage_env,
         });
         bodies.push(body);
@@ -7140,12 +7181,17 @@ fn run_stages(
     {
         jobs.reap();
     }
-    let outcome = exec::run_pipeline(cmds, &mut jobs, background, &mut |index, cmd, jobs| {
-        std::mem::swap(&mut shell.jobs, jobs);
-        let status = run_stage_in_shell(&bodies[index], cmd, last, in_function, shell);
-        std::mem::swap(&mut shell.jobs, jobs);
-        status
-    });
+    let outcome = exec::run_pipeline(
+        cmds,
+        &mut jobs,
+        background,
+        &mut |index, cmd, jobs, forked| {
+            std::mem::swap(&mut shell.jobs, jobs);
+            let status = run_stage_in_shell(&bodies[index], cmd, last, in_function, forked, shell);
+            std::mem::swap(&mut shell.jobs, jobs);
+            status
+        },
+    );
     shell.jobs = jobs;
     // The only place that knows each stage's own status, so the only place that
     // can record `$sh.pipestatus`; `run_recorded` fills in a one-entry list for
@@ -7154,8 +7200,14 @@ fn run_stages(
     outcome.status
 }
 
-/// Run a builtin or function that is a pipeline stage. Called in the forked
-/// child, so an `exit` ends that child and any state it changes dies with it.
+/// Run a builtin or function that is a pipeline stage.
+///
+/// `forked` says which process this is. Every stage but one runs in a forked
+/// child, where an `exit` ends that child and any state it changes dies with it.
+/// The **last** stage of a foreground pipeline runs in the shell itself, so what
+/// it binds is the shell's and outlives the pipeline — which is the whole point of
+/// running it here (`DESIGN.md` §"bash / POSIX"), and also means an `exit` there
+/// exits the shell, as it does in bash under `lastpipe`.
 ///
 /// `last` is the status the pipeline started from, which a status-sensitive
 /// builtin — a bare `exit` — still reads.
@@ -7164,12 +7216,19 @@ fn run_stage_in_shell(
     cmd: &exec::Cmd,
     last: u8,
     in_function: bool,
+    forked: bool,
     shell: &mut Shell,
 ) -> u8 {
-    shell.forked = true;
-    // A capture live at the fork is the parent's: its reader threads are not in
-    // this process, so no capture holds this stage back from an `exec`.
-    shell.captures = 0;
+    if forked {
+        shell.forked = true;
+        // A capture live at the fork is the parent's: its reader threads are not in
+        // this process, so no capture holds this stage back from an `exec`.
+        shell.captures = 0;
+    }
+    // Standing in for a stage only when this *is* the shell. Saved and put back, so
+    // a nested pipeline's own last stage cannot clear the flag for this one.
+    let outer_stage_here = shell.in_stage_here;
+    shell.in_stage_here = !forked;
     let step = match body {
         StageBody::Function(args) => dispatch_function_call(&cmd.words[0], args.clone(), shell),
         // Not `builtins::dispatch`: `jobs`, `fg`, `bg`, and the prompt builtins
@@ -7244,6 +7303,7 @@ fn run_stage_in_shell(
             }
         }
     };
+    shell.in_stage_here = outer_stage_here;
     match step {
         Step::Continue(code) | Step::Error(code) | Step::Exit(code) | Step::Return(_, code) => code,
     }
@@ -7780,6 +7840,13 @@ fn unknown_command_option(flag: &str) -> Step {
 /// Is this argv `exec` with nothing after it but its own `--` terminator — the
 /// redirection-only form, whose targets are the interesting part? `--` only
 /// ends the options, so it must not change which form this is.
+/// Is this stage an `exec`? The one in-shell stage that keeps its own process even
+/// as a foreground pipeline's last one, since running it in the shell would spend
+/// the shell on the replacement — see [`exec::Cmd::may_run_in_shell`].
+fn cmds_is_exec(words: &[String]) -> bool {
+    words.first().is_some_and(|word| word == "exec")
+}
+
 fn redirection_only_exec(words: &[String]) -> bool {
     words.first().is_some_and(|word| word == "exec")
         && match &words[1..] {
@@ -7838,6 +7905,15 @@ fn run_exec(args: &[String], shell: &mut Shell) -> Step {
     // forked under are the parent's.)
     if shell.captures > 0 {
         note!("mesh: exec: cannot replace the shell inside a capture");
+        return Step::Error(2);
+    }
+    // The same refusal, for the same reason, when the shell is standing in for a
+    // pipeline's last stage: `exec` there is asking to spend one stage, and this
+    // process is the session. A *direct* `exec` stage never reaches here — it is
+    // kept in its own fork — but a function wrapping one does, and a body cannot
+    // be asked in advance whether it will `exec`.
+    if shell.in_stage_here {
+        note!("mesh: exec: cannot replace the shell as a pipeline's last stage");
         return Step::Error(2);
     }
     // The bytes Rust has buffered belong to the shell's stdout, and the program
@@ -7974,12 +8050,19 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     // the parent of those pids, so it can list what it inherited but cannot wait
     // on them or hand them the terminal — the same answer bash gives in a
     // subshell.
+    //
+    // The rule is about being a **stage**, not about forking, so it holds for the
+    // last stage too even though that one runs in the shell and *could* reach the
+    // table. Otherwise position would decide: `wait 1 | cat` refuses while
+    // `cmd | wait 1` reaps the job, and a pipeline reads differently depending on
+    // where the builtin sits. A stage taking its stdin from a pipe is not the
+    // place job control is asked for either way.
     let job_status = match words[0].as_str() {
         // `kill` is deliberately absent: it neither waits nor touches the
         // terminal, and signalling needs permission rather than parenthood, so a
         // forked stage can do it with the table it inherited — `kill %1 | cat`
         // works as bash's does.
-        "fg" | "bg" | "wait" | "disown" if shell.forked => {
+        "fg" | "bg" | "wait" | "disown" if shell.forked || shell.in_stage_here => {
             note!("mesh: {}: no job control in a pipeline stage", words[0]);
             Some(1)
         }

@@ -86,6 +86,14 @@ pub struct Cmd {
     /// It still gets its own forked process, so the stages of a pipeline run
     /// concurrently — see [`fork_in_shell`].
     pub in_shell: bool,
+    /// May this stage run in the shell itself when it is the **last** one of a
+    /// foreground pipeline, rather than in a fork? That is what lets a binding it
+    /// makes outlive the pipeline (`DESIGN.md` §"bash / POSIX").
+    ///
+    /// Only the caller knows: `exec` is the stage that must keep its own process,
+    /// since running it here would spend the *shell* on the replacement, and a
+    /// stage whose words are not expanded yet cannot be asked what it is.
+    pub may_run_in_shell: bool,
     /// This stage's `NAME=value` prefix, already evaluated to bytes. Applied in
     /// the parent immediately before the stage is forked and put back straight
     /// after, so the child inherits it and no other stage does — which is what
@@ -986,11 +994,12 @@ pub fn run(words: &[String], jobs: &mut JobTable) -> u8 {
             redirs: Vec::new(),
             pipe_stderr: false,
             in_shell: false,
+            may_run_in_shell: false,
             env: Vec::new(),
         }],
         jobs,
         false,
-        &mut |_, _, _| unreachable!("an external command is never an in-shell stage"),
+        &mut |_, _, _, _| unreachable!("an external command is never an in-shell stage"),
     )
     .status
 }
@@ -1021,7 +1030,7 @@ enum StageBody<'a> {
     InShell {
         index: usize,
         jobs: &'a mut JobTable,
-        run: &'a mut dyn FnMut(usize, &Cmd, &mut JobTable) -> u8,
+        run: &'a mut dyn FnMut(usize, &Cmd, &mut JobTable, bool) -> u8,
     },
 }
 
@@ -1304,7 +1313,7 @@ fn fork_stage(
                 // none of the shell's jobs and must not take the terminal for
                 // anything it runs.
                 mark_forked_stage();
-                run(index, cmd, jobs)
+                run(index, cmd, jobs, true)
             }
         };
         let _ = std::io::stdout().flush();
@@ -1338,6 +1347,109 @@ enum NextIn {
     /// The previous stage's stdout, piped in. Held as a `File` because every
     /// stage runs in a fork and installs the descriptor itself, with `dup2`.
     Pipe(File),
+}
+
+/// Install one stage's descriptors on **this** process, run `body`, and put every
+/// descriptor back — the in-process half of [`fork_stage`], for the last stage of a
+/// foreground pipeline.
+///
+/// Both halves are [`with_redirections`]'s, and for its reasons. The **save** puts
+/// each target's current descriptor clear of every target, so saving fd 4 cannot
+/// land on fd 3 and be overwritten by the next install; a target nothing held is
+/// marked `-1`, so the restore closes it rather than putting back something that
+/// was never there. The **install** is [`install_descriptors`], which orders the
+/// moves so an opened file that happens to sit on another redirection's target is
+/// copied before it is overwritten — a plain `dup2` in vector order gets both
+/// `3> out` (where the file commonly lands on fd 3 already, and `dup2(3, 3)` is a
+/// no-op that leaves `FD_CLOEXEC` set) and `4> a 3> b` wrong.
+///
+/// `already_open` is which of the targets the shell held **before the pipeline
+/// opened anything**. It cannot be asked here: an open takes the lowest free
+/// descriptor, so by now a target may be occupied by this stage's own file.
+fn with_stage_descriptors<T>(
+    files: Vec<(libc::c_int, File)>,
+    closed: &[libc::c_int],
+    already_open: &[libc::c_int],
+    body: impl FnOnce() -> T,
+) -> std::io::Result<T> {
+    use std::io::Write;
+
+    // Anything buffered belongs to the descriptor about to be replaced.
+    let _ = std::io::stdout().flush();
+
+    let mut swapped: Vec<(libc::c_int, libc::c_int)> = Vec::new();
+    let restore = |swapped: &mut Vec<(libc::c_int, libc::c_int)>| {
+        // Reverse, so a descriptor touched twice ends on the state it started in.
+        for (saved, target) in swapped.drain(..).rev() {
+            // SAFETY: `saved` is this function's own duplicate, `target` its slot.
+            unsafe {
+                if saved < 0 {
+                    libc::close(target);
+                } else {
+                    libc::dup2(saved, target);
+                    libc::close(saved);
+                }
+            }
+        }
+    };
+
+    let clear_of_targets = files
+        .iter()
+        .map(|(fd, _)| *fd)
+        .chain(closed.iter().copied())
+        .max()
+        .unwrap_or(libc::STDERR_FILENO)
+        .max(libc::STDERR_FILENO)
+        .saturating_add(1);
+    for target in files
+        .iter()
+        .map(|(fd, _)| *fd)
+        .chain(closed.iter().copied())
+    {
+        if !already_open.contains(&target) {
+            swapped.push((-1, target));
+            continue;
+        }
+        // SAFETY: duplicating a descriptor this process owns onto a free one above
+        // every target, so no later install can overwrite the copy.
+        let saved = unsafe { libc::fcntl(target, libc::F_DUPFD_CLOEXEC, clear_of_targets) };
+        if saved < 0 {
+            let error = std::io::Error::last_os_error();
+            restore(&mut swapped);
+            return Err(error);
+        }
+        swapped.push((saved, target));
+    }
+
+    if let Err(error) = install_descriptors(files, closed) {
+        restore(&mut swapped);
+        return Err(error);
+    }
+
+    // While stdin is swapped, fd 0 no longer says whether this is an interactive
+    // session, and it is no longer the session's input — so publish the saved
+    // descriptor exactly as `with_redirections` does. Without it a read of the
+    // pipe is counted as a line of the script, and job control reaches for fd 0
+    // where the terminal no longer is.
+    let stdin_saved = swapped
+        .iter()
+        .find(|(_, target)| *target == libc::STDIN_FILENO)
+        .map(|(saved, _)| *saved);
+    let published = stdin_saved.filter(|_| SHELL_STDIN.load(Ordering::Relaxed) < 0);
+    if let Some(saved) = published {
+        SHELL_STDIN.store(saved, Ordering::Relaxed);
+    }
+
+    let value = body();
+
+    if published.is_some() {
+        SHELL_STDIN.store(-1, Ordering::Relaxed);
+    }
+    // Flush what the body wrote before restoring, or it would land on the restored
+    // descriptor instead of this stage's target.
+    let _ = std::io::stdout().flush();
+    restore(&mut swapped);
+    Ok(value)
 }
 
 /// A spawned stage awaiting its status, or a stage that failed before running.
@@ -1375,7 +1487,7 @@ pub fn run_pipeline(
     cmds: Vec<Cmd>,
     jobs: &mut JobTable,
     background: bool,
-    run_in_shell: &mut dyn FnMut(usize, &Cmd, &mut JobTable) -> u8,
+    run_in_shell: &mut dyn FnMut(usize, &Cmd, &mut JobTable, bool) -> u8,
 ) -> PipelineStatus {
     let command_text = cmds
         .iter()
@@ -1411,6 +1523,27 @@ pub fn run_pipeline(
             .flat_map(|(idx, cmd)| staged_redirs(cmd, idx + 1 == n))
             .collect::<Vec<_>>(),
     );
+    // Which of the last stage's targets the shell already holds, asked **here**,
+    // before the resolve below opens anything. An open takes the lowest free
+    // descriptor, so asking later would find that stage's own freshly opened file
+    // sitting on fd 3, save it as if the shell had held it all along, and put it
+    // back on the way out — leaving fd 3 open on the shell for good. Only wanted
+    // when that stage is going to run in this process; `fork_stage` saves nothing,
+    // because the child's descriptors die with it.
+    let lastpipe_already_open: Vec<libc::c_int> = cmds
+        .last()
+        .filter(|cmd| !background && !interactive && cmd.in_shell && cmd.may_run_in_shell)
+        .map(|cmd| {
+            staged_redirs(cmd, true)
+                .iter()
+                .map(|redir| redir.fd)
+                .chain([libc::STDIN_FILENO])
+                // SAFETY: `F_GETFD` only reads a descriptor's flags, and answers
+                // whether it is open at all without disturbing it.
+                .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+                .collect()
+        })
+        .unwrap_or_default();
     let seeds: Vec<Sources> = (0..n)
         .map(|idx| stage_seed(idx, n, background, interactive))
         .collect();
@@ -1537,6 +1670,83 @@ pub fn run_pipeline(
                     }
                 }
             }
+        }
+
+        // The **last stage runs in this shell**, not in a fork, whenever it is
+        // something the shell runs itself. That is what makes a binding it makes
+        // outlive the pipeline — bash's `lastpipe` (see `DESIGN.md` §"bash /
+        // POSIX"). An external still forks: it needs a process to `exec` into. So
+        // does a background pipeline, which by definition is not this process's to
+        // run.
+        //
+        // Earlier stages are already forked and writing by the time this runs, which
+        // is what keeps the pipeline concurrent: this process reads their output
+        // through the pipe installed on its own stdin.
+        //
+        // **Not under job control**, which is the condition bash puts on `lastpipe`
+        // too, and for a reason that bites hard: an interactive pipeline puts its
+        // forked stages in their own process group and hands that group the
+        // terminal. The shell is not in it. So a Ctrl-Z at `cat | gets line` stops
+        // `cat` and not mesh, and mesh is left blocked on a pipe that will never
+        // reach EOF — no prompt, no stopped-job record, and Ctrl-C going to the
+        // stopped group rather than recovering the session. Reading in a process
+        // outside the foreground group is the whole problem, so the answer is to
+        // keep this path away from job control rather than to unpick it here.
+        if is_last && !background && !interactive && cmd.in_shell && cmd.may_run_in_shell {
+            // stdin resolves exactly as it does for a fork: a `< file` in this
+            // stage wins over the incoming pipe, and `Null` — the previous stage
+            // sent its stdout elsewhere, so nothing is producing for this one —
+            // is EOF rather than "leave fd 0 alone". Leaving it alone would point
+            // the stage at the shell's own input, where `puts hi > /dev/null |
+            // gets line` read the *next line of the script* as its data.
+            let stdin_file = match (in_file, incoming) {
+                (Some(file), _) => Some(file),
+                (None, NextIn::Pipe(file)) => Some(file),
+                (None, NextIn::Null) => match File::open("/dev/null") {
+                    Ok(file) => Some(file),
+                    Err(error) => {
+                        note!("mesh: /dev/null: {error}");
+                        outcomes.push(Outcome::Failed(1));
+                        continue;
+                    }
+                },
+                // Only reachable for a lone stage, where fd 0 already *is* the
+                // shell's stdin and there is nothing to install.
+                (None, NextIn::Inherit) => None,
+            };
+            let mut files = Vec::with_capacity(extra_files.len() + 3);
+            files.extend(stdin_file.map(|file| (libc::STDIN_FILENO, file)));
+            files.extend(out_file.map(|file| (libc::STDOUT_FILENO, file)));
+            files.extend(err_file.map(|file| (libc::STDERR_FILENO, file)));
+            files.extend(extra_files);
+            // The prefix is in place across the body exactly as it is across a
+            // fork, and put back straight after, so no other stage sees it.
+            let restore: Vec<(&str, Option<OsString>)> = cmd
+                .env
+                .iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var_os(key);
+                    // SAFETY: the shell runs its stages from a single-threaded loop,
+                    // the same reasoning `environ::write` relies on.
+                    unsafe { std::env::set_var(key, value) };
+                    (key.as_str(), previous)
+                })
+                .collect();
+            let ran = with_stage_descriptors(files, &closed, &lastpipe_already_open, || {
+                run_in_shell(idx, &cmd, jobs, false)
+            });
+            restore_stage_env(restore);
+            match ran {
+                Ok(code) => outcomes.push(Outcome::Completed {
+                    code,
+                    piped_out: false,
+                }),
+                Err(error) => {
+                    note!("mesh: {}: {error}", cmd.words.first().map_or("", |w| w));
+                    outcomes.push(Outcome::Failed(1));
+                }
+            }
+            continue;
         }
 
         let body = if cmd.in_shell {
