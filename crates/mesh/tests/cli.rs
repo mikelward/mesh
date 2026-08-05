@@ -13223,18 +13223,21 @@ fn a_chain_on_an_attached_value_transforms_the_value_not_the_name() {
     // live glob — the value piece is a placeholder to expansion — and the
     // argument would vanish against the filesystem; leaving the word whole
     // keeps it deterministic data, like every other composed name.
-    // A glob-shaped *name* is now **reported** rather than kept as data: the word
-    // was written as an option and `fo*` is not a name. The old answer let it
-    // through as text, which is the same silent degradation as a non-matching
-    // glob vanishing. Recorded in `TODO.md` to circle back to.
+    // A glob-shaped *name* does not re-anchor the chain — that is the parser's
+    // reading, and it asks whether the word wrote an option name. So `:upper` is
+    // asked of the whole word, and the whole word is now a **flag**, which no
+    // string modifier applies to. Refused either way, which is what this guards;
+    // the message no longer names `fo*` because the word never gets as far as
+    // binding, where the name is judged. Recorded in `TODO.md`.
     let glob_name = run_with_input(
         "func f(target = none, --tag = none) { puts \"$target/$tag\" }\nf(--fo*=bad[:upper)\n",
     );
     assert!(
-        String::from_utf8_lossy(&glob_name.stderr).contains("`fo*` is not a name"),
+        String::from_utf8_lossy(&glob_name.stderr).contains("cannot apply string modifier"),
         "a glob-shaped name is refused: {:?}",
         glob_name.stderr
     );
+    assert_eq!(String::from_utf8_lossy(&glob_name.stdout), "");
 }
 
 /// A qualified glob after the `=` anchors with its qualifiers: the `(f)` rides
@@ -15317,6 +15320,35 @@ fn a_wrapper_func_forwards_an_undeclared_flag_instead_of_rejecting_it() {
         "[--color='never', '-a', 'x']\n"
     );
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_wrapper_func_forwards_a_word_that_is_not_a_mesh_option_name() {
+    // A wrapper cannot validate the flags it forwards, and that has to include
+    // the *name*: `--foo.bar` is not a mesh option name, but it may well be the
+    // callee's. Typing flags moved name checking into expansion, and expansion
+    // has to hear the call's flag policy or it rejects the word before the
+    // wrapper's own policy applies.
+    let out = run_with_input("wrapper func g(...xs) { puts $xs:repr }\ng --foo.bar=v\ng --bad[\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[--foo.bar='v']\n[--bad[]\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    // The value spelling is the same call, so it forwards the same way.
+    let value = run_with_input("wrapper func g(...xs) { return $xs }\nputs g(--foo.bar=v):repr\n");
+    assert_eq!(String::from_utf8_lossy(&value.stdout), "[--foo.bar='v']\n");
+    // A plain `func` does read flags, so the same word is a mistake there — and
+    // it is reported at the bind, which is the first point that knows the callee
+    // parses mesh flags at all.
+    for call in ["g --foo.bar=v", "puts g(--foo.bar=v)"] {
+        let plain = run_with_input(&format!("func g(...xs) {{ puts $xs:repr }}\n{call}\n"));
+        assert!(
+            String::from_utf8_lossy(&plain.stderr).contains("`foo.bar` is not a name"),
+            "{call}: {:?}",
+            String::from_utf8_lossy(&plain.stderr)
+        );
+    }
 }
 
 #[test]
