@@ -3779,8 +3779,71 @@ thing a reader takes on trust.*
         whole cross-type family would be hostile if there were no way to get a
         flag out of data; there is.
 
-      - **`flag()` builds a flag from a string** *(decided — the escape hatch
-        the typed family needs).* `flag("--force")` is the flag `--force`, and
+      - **Built as `:flag`, a modifier, not as `flag()`.** *(Settled by the repo
+        owner to unblock the type; the entry below is the `flag()` reasoning it
+        supersedes, kept because the unification question is still open.)*
+
+        `$w:flag` builds an option from a string. Exact spelling only — the text
+        you would have written, dashes included — so `"force"`, `""`, `"-x"`
+        (short flags unbuilt) and `"--"` (a terminator is its own type) all
+        report rather than inventing a flag. Casting a flag is the identity.
+
+        **The payload types the way a *bare* word would**, so `"--n=2":flag`
+        holds the integer `2`. Bare, and only bare -- the claim that it "parses
+        the text the way the parser would" was too wide, and Codex found where
+        it broke: `"--tag=\"v 2\"":flag` keeps the quote marks as payload
+        characters rather than re-reading them as quoting. That is right, and
+        the round trip that matters holds -- it equals the written
+        `--tag='"v 2"'`, whose payload is the same characters. Treating the cast
+        as a second parser would have to answer what `"--tag=v 2":flag` means,
+        where the source it claims to read is two words.
+
+        *Open, recorded rather than resolved:* `v = "2"; x = --n=$v` keeps a
+        **string** (`an_interpolated_flag_value_keeps_its_string_type`), so the
+        interpolated form and the cast disagree about the same characters. They
+        are different acts -- one interpolates a value, the other hands over
+        source text -- but a reader may reasonably expect them to agree. Taking
+        the spec's reading for now, since a cast that only ever produced
+        `flag<string>` leaves `flag<int>` unconstructible until the parser lands.
+
+        **The payload is a full `Value`, so the type is a family** -- `flag<none>`
+        for `--force`, `flag<string>` for `--tag=v2`, `flag<int>` for `--n=2`.
+        Two projections, and confusing them is easy: the **text form** renders the
+        payload raw (`--n=2`) and is what crosses argv and interpolation, while
+        **`:repr`** writes the payload's own literal (`--n=2` against `--n='2'`)
+        and is where the parameter is visible. `--n=2` and `--n='2'` are therefore
+        *unequal*, for the same reason `2 != "2"` is. The **value-type answer
+        stays flat `flag`** per the decision below, not `flag<int>`: the parameter
+        is real in the value and not surfaced as a type name.
+
+        **Why the modifier won:** it spends no reserved function name, which was
+        the repo owner's objection to `flag()` and the thing that reopened the
+        spelling; and the list form falls out of `:map(:flag)` with no second
+        mechanism. It is also the cheaper mistake — adding `flag()` later is
+        purely additive, where un-spending a reserved name is not.
+
+        **Left open, and the reason this entry keeps both arguments:** mesh has
+        no rule for *when a conversion is a modifier and when it is a value
+        call*. `:int` and `:bool` convert a value in hand; `re()`, `glob()`,
+        `style()`, `files()`, `dirs()` and `link()` are value calls. `:flag` sits
+        with the first group by shape and with the second by having a literal
+        syntax of its own (`--force`, as `/…/` is for a regex), which is exactly
+        why the choice was arguable. **Worth deciding as one question and
+        aligning the family**, rather than settling it once per constructor —
+        including whether `re()` should have been `:re`. Until then `:flag` is
+        the spelling and `flag()` is unbuilt.
+
+        *(A correction while implementing: this entry cites
+        `RESERVED_FUNCTION_NAMES` at `parser.rs`:2560 and `definition_name_problem`
+        at `repl.rs`:1196. There is no `RESERVED_FUNCTION_NAMES` anywhere in the
+        crate — the mechanism is `RESERVED_WORDS` plus `claim_of` in
+        `builtins.rs`, where `Claim::ValueCall` marks `re` / `style` / `link` /
+        `glob` / `files` / `dirs`. An implementer following the old reference
+        would go looking for a constant that does not exist.)*
+
+      - **`flag()` builds a flag from a string** *(superseded by `:flag` above;
+        the reasoning is kept because the modifier-versus-value-call question it
+        argues is still open).* `flag("--force")` is the flag `--force`, and
         `flag($w)` is how a program turns data into an option deliberately.
 
         This is the piece that was missing. The type's whole point is that
