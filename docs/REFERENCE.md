@@ -941,7 +941,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `jobs` | List the jobs, one `[id] State command` per line. |
 | `fg [job]` | Resume a job in the foreground and wait for it. No argument takes the most recent job. |
 | `bg [job]` | Resume a stopped job in the background. No argument takes the most recent job. |
-| `wait job` | Wait for a job to finish and report its status — see [Job control](#job-control). |
+| `wait [--timeout duration] [job …]` | Wait for a job to finish and report its status. `--timeout` bounds the wait without touching the job — see [Job control](#job-control). |
 | `kill [-signal] job\|pid …` | Signal a job's process group, or a pid. Default `TERM`. |
 | `disown [-h] [-a \| -r] [job …]` | Stop tracking a job — see [Job control](#job-control). |
 | `command [--] name [arg …]` | Run the **program** `name`, past the builtin or function that name would otherwise reach — which is what makes `func ls() { command ls --color=auto }` safe to write, and what reaches `/usr/bin/env` when a function of that name is in the way. Only the words in front of the program are `command`'s own: `command ls --help` asks `ls` for its help, and `--` ends `command`'s options so the word after it is the program however it reads. `--help` is the only option it has, so any other flag-looking word in front of the program is a usage error (status `2`) rather than a program name — `command -v` / `-V` are held for the unbuilt half, and `command -- -v` runs a program called `-v`. The operand is the program with nothing peeled off it, so `command command x` looks for a program called `command`. A builtin's name finds no program, and says so; with no operand at all the status is `2`. |
@@ -977,7 +977,7 @@ kill -- -9 %1                 # looks for a job named `-9`, not signal 9
 
 Which command consumes it depends on which has options to end. `puts`, `print`, `gets`,
 `clip`, `notify`, `cd`, `source` and `help` have none of their own, so the terminator
-is simply removed. `kill`, `disown`, `prompt`, `on`, `command` and `type`
+is simply removed. `kill`, `disown`, `prompt`, `on`, `wait`, `command` and `type`
 do, so each ends its own options at `--` — only they know where those stop.
 
 `command` is also where the `--help` rule stops applying, because the arguments
@@ -1209,6 +1209,31 @@ matches; both say so. `%?string`, the *substring* match, is not implemented —
 name rather than reporting a job that does not exist. Note that `?` is a glob
 character first, so a `%?…` reference has to be quoted to reach a job builtin at
 all.
+
+**`wait --timeout duration`** bounds the wait. When the limit passes, `wait`
+reports `124` and the job is left **exactly as it was** — still running, still
+listed, and with `$j.status` still empty, because it has not exited. The `124` is
+the *builtin's* status, not a status invented for a job that has not reported
+one, and that distinction is the whole design: an empty `$j.status` next to a
+`124` from `wait` is how a caller tells "still going" from "exited 124".
+
+```mesh
+if wait --timeout 2s $j { … } else { kill $j }   # the caller decides
+```
+
+Giving up on the wait rather than on the job is the same answer Ctrl-C already
+gives, with a timer in place of a keystroke.
+
+The duration is `500ms`, `2s`, `1m`, `1h`, or a compound like `1m30s` — the
+spellings [`duration_words`](#the-prompt) prints. A bare number is seconds. One
+that cannot be read is refused (status `2`) rather than rounded into something
+nobody asked for.
+
+**One budget for the call, not per operand.** `wait --timeout 5s %1 %2` gives
+both jobs five seconds between them, starting when the call does; if it runs out,
+the operands not yet reached are not waited for either, and none of them is given
+a status. Both spellings work — `--timeout 2s` and `--timeout=2s` — and `--` ends
+the flags, so a job reference beginning with a dash is still reachable.
 
 **`wait`** reports a job's exit status without giving it the terminal, which is
 what lets a script hand work to the background and collect the result:

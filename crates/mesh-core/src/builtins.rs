@@ -35,7 +35,10 @@ const TABLE: &[(&str, &str)] = &[
     ("fg [JOB]", "Resume a job in the foreground"),
     ("bg [JOB]", "Resume a stopped job in the background"),
     ("jobs", "List the jobs"),
-    ("wait [JOB …]", "Wait for a job to finish"),
+    (
+        "wait [--timeout DURATION] [JOB …]",
+        "Wait for a job to finish",
+    ),
     ("disown [-h] [-a | -r] [JOB …]", "Stop tracking a job"),
     ("kill [-SIGNAL] JOB|PID ...", "Signal a job or a process"),
     (
@@ -1362,8 +1365,106 @@ fn exit(args: &[String], last: u8) -> Builtin {
     }
 }
 
+/// The status a bounded wait reports when its limit runs out.
+///
+/// `timeout(1)`'s number, so a script already written against that keeps
+/// reading. For `wait --timeout` this is the *builtin's* status and not the
+/// job's: the job has not exited, keeps its place in the table, and its own
+/// `status` stays empty -- which is what tells a caller "still running" apart
+/// from "exited 124".
+pub(crate) const TIMED_OUT_CODE: u8 = 124;
+
+/// Read a duration written the way a person writes one: `500ms`, `2s`, `1m`,
+/// `1h`, or the compound forms `1m30s` and `2h5m`. A bare number is seconds,
+/// which is the unit every caller means when they leave it off.
+///
+/// The compound forms are here because [`crate::repl::duration_words`] already
+/// *prints* them -- a shell that says `1m30s` and cannot read it back is one
+/// whose own output is not valid input.
+///
+/// A *string* rather than a value type: mesh has no duration in its type system
+/// today, and adding one to give `wait --timeout` an argument would be a
+/// language change made for a builtin's convenience. Parsing here leaves that
+/// open -- a real duration type can accept these same spellings later without
+/// invalidating anything already written.
+///
+/// Rejects rather than saturates. `2x` is a typo, not two of something, and a
+/// wait that silently used a limit the caller did not ask for is worse than one
+/// that refuses.
+pub(crate) fn parse_duration(text: &str) -> Option<std::time::Duration> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut millis = 0f64;
+    let mut rest = text;
+    let mut parts = 0;
+    while !rest.is_empty() {
+        let digits_end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        let (digits, tail) = rest.split_at(digits_end);
+        // Fractions are allowed because `0.5s` is the obvious way to ask for
+        // half a second and the alternative spelling, `500ms`, is not obvious.
+        let count: f64 = digits.parse().ok()?;
+        if !count.is_finite() || count < 0.0 {
+            return None;
+        }
+        // `ms` before `m`, or every millisecond is read as a minute.
+        let (scale_ms, tail) = if let Some(tail) = tail.strip_prefix("ms") {
+            (1f64, tail)
+        } else if let Some(tail) = tail.strip_prefix('s') {
+            (1_000f64, tail)
+        } else if let Some(tail) = tail.strip_prefix('m') {
+            (60_000f64, tail)
+        } else if let Some(tail) = tail.strip_prefix('h') {
+            (3_600_000f64, tail)
+        } else if tail.is_empty() && parts == 0 {
+            // The bare form, and only on its own: `1m30` would be asking this to
+            // guess whether the 30 is seconds or another minute.
+            (1_000f64, tail)
+        } else {
+            return None;
+        };
+        millis += count * scale_ms;
+        rest = tail;
+        parts += 1;
+    }
+    if millis > u64::MAX as f64 {
+        return None;
+    }
+    Some(std::time::Duration::from_millis(millis as u64))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::parse_duration;
+
+    #[test]
+    fn a_duration_reads_the_units_a_person_writes() {
+        use std::time::Duration;
+        assert_eq!(parse_duration("500ms"), Some(Duration::from_millis(500)));
+        assert_eq!(parse_duration("2s"), Some(Duration::from_secs(2)));
+        assert_eq!(parse_duration("1m"), Some(Duration::from_secs(60)));
+        assert_eq!(parse_duration("1h"), Some(Duration::from_secs(3600)));
+        // No suffix is seconds, which is what a caller who leaves it off means.
+        assert_eq!(parse_duration("3"), Some(Duration::from_secs(3)));
+        // Fractions, because `0.5s` is the obvious way to ask for half a second.
+        assert_eq!(parse_duration("0.5s"), Some(Duration::from_millis(500)));
+        // The compound forms duration_words prints, read back.
+        assert_eq!(parse_duration("1m30s"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_duration("2h5m"), Some(Duration::from_secs(7500)));
+    }
+
+    #[test]
+    fn a_duration_that_does_not_parse_is_refused_rather_than_guessed() {
+        // Each of these could be saturated or partially read into *something*.
+        // A wait silently using a limit nobody asked for is the worse failure.
+        for bad in [
+            "2x", "", "s", "ms", "-1s", "one", "1 s", "nan", "1m30", "1m2x", "..", "1..2s",
+        ] {
+            assert_eq!(parse_duration(bad), None, "accepted {bad:?}");
+        }
+    }
     use super::{
         Claim, Decoration, RESERVED_WORDS, SYNTAX, TABLE, Value, base64, help, is_builtin,
         is_command_keyword, is_value_call, name_of, names, overview, path_line, reads_options,

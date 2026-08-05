@@ -307,6 +307,51 @@ pub(crate) fn wait_for_change() {
     }
 }
 
+/// Sleep as [`wait_for_change`] does, but give up at `deadline`. Returns false
+/// if the deadline passed with nothing to report.
+///
+/// `pselect` with no descriptors is `sigsuspend` with a clock: it installs the
+/// mask and waits as one operation, so the same "no instant where the signal is
+/// deliverable and this thread is not yet waiting" property holds. `sigtimedwait`
+/// would be the more obvious name and is the wrong tool — it *consumes* the
+/// signal instead of letting the handler run, so a `SIGINT` arriving during a
+/// bounded wait would be swallowed rather than setting the flag that lets Ctrl-C
+/// out of it, and only signals named in its set would wake the sleep at all.
+///
+/// Returning on *any* handled signal, not just `SIGCHLD`, is deliberate and
+/// matches the untimed version: the caller loops, so a spurious wake costs one
+/// pass through the drain and a Ctrl-C still ends the wait.
+pub(crate) fn wait_for_change_until(deadline: std::time::Instant) -> bool {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    // SAFETY: reading the current mask and waiting on a copy of it; both affect
+    // only this thread, and the descriptor sets are empty so `pselect` is
+    // reduced to its mask-and-timeout behavior.
+    unsafe {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        if libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask) != 0 {
+            return false;
+        }
+        libc::sigdelset(&mut mask, libc::SIGCHLD);
+        let timeout = libc::timespec {
+            tv_sec: remaining.as_secs() as libc::time_t,
+            tv_nsec: libc::c_long::from(remaining.subsec_nanos() as i32),
+        };
+        // 0 means the clock ran out; -1/EINTR means a handler ran, which is what
+        // the caller wants to hear about.
+        libc::pselect(
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &timeout,
+            &mask,
+        ) != 0
+    }
+}
+
 /// Take note that a pid belongs to the shell, so the drain may reap it.
 pub(crate) fn own(pid: libc::pid_t) {
     if let Ok(mut reaper) = reaper().lock() {
@@ -472,6 +517,95 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// Held by every test that installs a [`WaitCatcher`].
+    ///
+    /// `WAITING_THREAD` names *one* thread, and the handler forwards `SIGCHLD`
+    /// to whichever is published. Two catchers alive at once on the harness's
+    /// parallel threads means the loser never hears about its own child and
+    /// sleeps to its deadline — which is exactly how this failed, about half the
+    /// time. The catcher is a process-global singleton, so tests that want one
+    /// take turns rather than pretending otherwise.
+    static ONE_WAITER: Mutex<()> = Mutex::new(());
+
+    /// The clock has to end the sleep on its own, or a bounded wait is not
+    /// bounded — with nothing of its own to report, only the deadline will end
+    /// it.
+    ///
+    /// Looped rather than asserted on a single call, because that is the
+    /// contract: any handled signal ends the sleep, and the suite runs tests in
+    /// parallel threads of one process, so another test's child can wake this
+    /// one. A real caller loops back to the drain; so does this.
+    #[test]
+    fn a_timed_wait_gives_up_when_the_deadline_passes() {
+        let _turn = ONE_WAITER.lock().unwrap_or_else(|held| held.into_inner());
+        let _catcher = WaitCatcher::install().expect("hold SIGCHLD");
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        while wait_for_change_until(deadline) {
+            // Another test's child, not ours. Round again, as a caller would.
+        }
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(150),
+            "gave up early, after {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(10),
+            "slept past its deadline, {waited:?}"
+        );
+    }
+
+    /// A deadline already in the past is not a reason to sleep at all.
+    #[test]
+    fn a_timed_wait_with_no_time_left_returns_at_once() {
+        let _turn = ONE_WAITER.lock().unwrap_or_else(|held| held.into_inner());
+        let _catcher = WaitCatcher::install().expect("hold SIGCHLD");
+        let started = Instant::now();
+        let woken = wait_for_change_until(started - Duration::from_secs(1));
+        assert!(!woken, "reported a wake-up for an expired deadline");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "slept on a deadline that had already passed"
+        );
+    }
+
+    /// A child changing state ends the sleep before the deadline, which is the
+    /// half that makes this a wait rather than a timer.
+    ///
+    /// Asserted by what the wait *delivers* — this child's transition — rather
+    /// than by which call returned true. In a process where other tests are
+    /// forking too, "something woke us" says nothing about whose child it was.
+    #[test]
+    fn a_timed_wait_wakes_on_a_child_before_its_deadline() {
+        let _turn = ONE_WAITER.lock().unwrap_or_else(|held| held.into_inner());
+        let _catcher = WaitCatcher::install().expect("hold SIGCHLD");
+        // SAFETY: the child does nothing but exit, so it touches none of the
+        // state the fork left it a copy of.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        own(pid);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(10);
+        loop {
+            drain();
+            if take(pid).is_some() {
+                break;
+            }
+            assert!(
+                wait_for_change_until(deadline),
+                "the deadline expired before the child was reported"
+            );
+        }
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(5),
+            "waited {waited:?} for a child that exited at once"
+        );
+    }
 
     /// A child forked while another thread holds the store must still be able to
     /// reach it.

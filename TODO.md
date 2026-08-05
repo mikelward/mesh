@@ -4946,7 +4946,7 @@ command's lifetime, `wait` only **observes** a job someone else started.
       It registers **no job**, so there is nothing to announce, nothing in
       `$sh.jobs`, and no handle to clean up. That is what makes it the answer for
       a prompt rather than merely a tidier spelling.
-- [ ] **`wait --timeout <duration> <job>`** — for a job already backgrounded,
+- [x] **`wait --timeout <duration> <job>`** — for a job already backgrounded,
       when the caller wants the handle anyway (to `kill` it, read `$j.state`, or
       `fg` it later) or is collecting several with one budget. Matches the
       `job recv --timeout` nushell ships.
@@ -4966,6 +4966,19 @@ command's lifetime, `wait` only **observes** a job someone else started.
       This is where `124` would be the *worse* choice, and it is why the two
       entries answer the question differently rather than picking one convention
       for both.
+
+      **Landed.** `124` turned out to be right for the *builtin's* status after
+      all — it is what a caller reads to mean "gave up" — while the job's own
+      `status` stays empty, which is the distinction that mattered. The bounded
+      sleep is `reaper::wait_for_change_until`, `pselect` with no descriptors:
+      `sigsuspend` with a clock, keeping the handler semantics the untimed one
+      has. `sigtimedwait` was the obvious name and the wrong tool, since it
+      consumes the signal rather than letting the handler run, so a Ctrl-C
+      during a bounded wait would have been swallowed.
+
+      Durations are parsed from a *string* rather than a new value type, and
+      accept the compound forms `duration_words` already prints — a shell whose
+      own output is not valid input is its own small wart.
 
 Neither needs **polling**, and neither wants a blocking `waitpid` — POSIX gives
 it no timeout parameter, and this shell deliberately stopped calling it that way:
