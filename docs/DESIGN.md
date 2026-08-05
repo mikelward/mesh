@@ -4455,6 +4455,46 @@ Two mesh notes, neither a behavior change:
   to be specified (see [`TODO.md`](TODO.md)); the interpolate-unless-quoted rule
   applies to both uses.
 
+**The last stage of a pipeline runs in the current shell** *(decided — bash's
+opt-in `lastpipe`, unconditional here)*. Every stage but the last runs in its own
+forked process, which is what makes a pipeline concurrent. The **last** one, when
+it is something the shell runs itself — a builtin, a function — runs in the shell
+instead, with the incoming pipe on its stdin for the length of the stage and the
+shell's own descriptors put back after. So a binding it makes **outlives the
+pipeline**:
+
+```mesh
+cmd | gets line     # `line` is set afterwards, not lost to a subshell
+```
+
+That is the fix for the bash defect in [What mesh avoids](#what-mesh-avoids):
+`seq 3 | while read x; do n=$((n+1)); done` leaves `n` at `0` in bash because the
+loop ran in a subshell. Automatic rather than an opt-in `shopt`, since a
+shell-visible binding is the behavior people expect and the subshell is the
+surprise.
+
+**Not under job control**, which is the condition bash puts on `lastpipe` too. An
+interactive pipeline puts its forked stages in a process group of their own and
+hands that group the terminal — the shell is not in it. Reading the pipe in the
+shell would then leave `cat | gets line` unstoppable: Ctrl-Z stops `cat` and not
+mesh, and mesh sits blocked on a pipe that will never reach EOF, with no prompt
+and no stopped-job record. So the last stage runs here exactly when the shell
+keeps the terminal, and forks as it always did when it does not. The two are the
+same condition, so they cannot drift apart.
+
+Two stages keep their own process. A **backgrounded** pipeline has no
+foreground last stage — the shell is not waiting for it, so there is nothing to
+run here — and **`exec`** is asking to spend a process on its replacement, which
+must not be the shell's: `cmd | exec prog` is observably `cmd | prog`, so
+replacing the shell there would end the session for nothing. A **function
+wrapping** `exec` cannot be spotted that way — a body cannot be asked in advance
+what it will do — so reaching `exec` while standing in for a stage is a **loud
+refusal**, the same answer `exec` gives inside a `$(…)` capture and for the same
+reason: the process is already committed to being something else. An **external** last
+stage forks as it always did; it needs a process to `exec` into. Status and
+[`$sh.pipestatus`](#variables-and-assignment) are unaffected either way, and an
+`exit` in the last stage is still that *stage's* exit, reported as a status.
+
 *(open: `noclobber` and the `>|` override; whether `&>>` append-both is worth a
 spelling.)*
 
@@ -5572,10 +5612,13 @@ to avoid" rather than promising the latter as done.
   involved. The split is spelled rather than implied, which is the other half of
   the defense: bash's alternative to the pipe, `for x in $(cmd)`, re-splits each
   line on `IFS` and globs it, so the escape from the subshell reintroduces the
-  word-splitting bug. ***(planned)*** for the literal `cmd | while gets line { … }` form to
-  persist too, the **last stage of a `|` pipeline** would run in the current shell
-  rather than a forked subshell — bash's opt-in `lastpipe`, intended as mesh's
-  unconditional default; not yet written into [Redirection](#redirection).
+  word-splitting bug. The **last stage of a `|` pipeline runs in the current shell**
+  rather than a forked subshell — bash's opt-in `lastpipe`, automatic here where
+  job control is not active — so `cmd | gets line` leaves `line` set, and a binding
+  a stage makes is the shell's.
+  See [Redirection](#redirection). ***(planned)*** is only the literal
+  `cmd | while gets line { … }` spelling, which needs a compound statement to be
+  usable as a stage at all.
 - **Unquoted `$var` word-splits and globs.** `rm $file` breaks on a space; `[ $x =
   y ]` becomes a parse error when `$x` is empty. The single most common bash bug.
   mesh has **no word splitting and no implicit globbing of a value** — `$x` is

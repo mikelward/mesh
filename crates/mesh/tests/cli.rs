@@ -9605,6 +9605,315 @@ fn a_quoted_pipe_is_a_literal_not_an_operator() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a|b\n");
 }
 
+/// The **last stage of a foreground pipeline runs in the shell**, not in a fork,
+/// so what it binds outlives the pipeline. `DESIGN.md` §"bash / POSIX" names the
+/// bash defect this closes: `seq 3 | while read x; do n=$((n+1)); done` leaves `n`
+/// at 0 there, because the loop ran in a subshell.
+#[test]
+fn the_last_stage_of_a_pipeline_binds_in_the_shell() {
+    let out = run_with_input("puts hi | gets line\nputs \"line=$line\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "line=hi\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Through more than one stage, and through a *function* stage, whose body is
+    // the shell's for the same reason.
+    let out = run_with_input("puts \"a\nb\" | cat | gets v\nputs \"v=$v\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v=a\n");
+
+    // A *function* stage is the shell's too. Written through `global` because a
+    // function's own scope is unchanged by any of this — the point is that the
+    // write survives the pipeline at all, which a forked stage's could not.
+    let out = run_with_input(
+        "n = 0\nfunc f() { gets got\n global n = $got }\nputs hi | f\nputs \"n=$n\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "n=hi\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Running the stage here must leave the shell's own descriptors exactly as it
+/// found them — the pipe goes on stdin for the stage and comes straight back off.
+#[test]
+fn a_last_stage_in_the_shell_puts_the_descriptors_back() {
+    // Two pipelines in a row: the second reads the *script*, so a stdin left on
+    // the first pipeline's read end would lose it.
+    let out = run_with_input(
+        "puts one | gets a\nputs two | gets b\nputs \"a=$a b=$b\"\nputs still-reading\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a=one b=two\nstill-reading\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A redirection on that stage is applied and undone around it, so the line
+    // after still reaches stdout.
+    let out = run_with_input("puts hi | gets l > /dev/null\nputs \"l=$l\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "l=hi\n");
+}
+
+/// A last stage with **no producer** reads EOF, not the shell's own input.
+///
+/// When the stage before it sends its stdout elsewhere, nothing is feeding this
+/// one. A fork gets `/dev/null` for that; running in the shell, leaving fd 0 alone
+/// would point the stage at the script being read — so `gets` consumed the *next
+/// line of the script* as its data and that line silently never ran.
+#[test]
+fn a_last_stage_with_no_producer_reads_eof() {
+    // `gets` reports 1 at end of input, and — the part that was broken — the line
+    // after the pipeline still runs, rather than being consumed as its data.
+    let out = run_with_input(
+        "puts hi > /dev/null | gets line\nputs \"status=$sh.status\"\nputs marker\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "status=1\nmarker\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // An explicit `<` on the stage still wins over the incoming pipe, as it does
+    // for a forked one.
+    let out = run_with_input("puts data | gets v < /dev/null\nputs \"status=$sh.status\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=1\n");
+
+    // The ordinary case is unaffected: a real producer still feeds the stage.
+    let out = run_with_input("puts hi | gets line\nputs \"status=$sh.status l=$line\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=0 l=hi\n");
+}
+
+/// A high-fd redirection on the in-shell last stage installs where it says.
+///
+/// The opened file commonly lands on the very descriptor it is bound for — `3>`
+/// opens onto fd 3, the lowest free one — so installing with a plain `dup2` in
+/// vector order is a no-op that leaves `FD_CLOEXEC` set, and a nested command sees
+/// a closed descriptor. With two of them the order can also overwrite one target
+/// before it is copied. Both are what `install_descriptors` exists to permute.
+#[test]
+fn a_last_stage_in_the_shell_installs_high_descriptors_safely() {
+    let dir = fresh_dir("lastpipe_fds");
+    let three = dir.join("three.txt");
+    let four = dir.join("four.txt");
+    let path = script(
+        "lastpipe_fds",
+        &format!(
+            "func f() {{ sh -c 'echo three >&3; echo four >&4' }}\n\
+             puts x | f 4> {} 3> {}\n\
+             puts \"status=$sh.status\"\n\
+             sh -c 'echo leaked >&3'\n",
+            four.display(),
+            three.display()
+        ),
+    );
+    let out = run_with_args(&[path.to_str().expect("utf-8 script path")]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("status=0"), "{stdout:?}");
+
+    // Each write reached its own target, rather than both landing on one.
+    assert_eq!(std::fs::read_to_string(&three).expect("three"), "three\n");
+    assert_eq!(std::fs::read_to_string(&four).expect("four"), "four\n");
+
+    // And the shell does not keep fd 3 afterwards — the save/restore puts back
+    // "not open", it does not leave the stage's file behind.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Bad file descriptor"), "{stderr:?}");
+}
+
+/// Job control stays refused in a stage, wherever the stage sits.
+///
+/// The rule is about being a **stage**, not about forking, so running the last
+/// one in the shell must not quietly grant it the job table: otherwise position
+/// decides, and `wait 1 | cat` refuses while `cmd | wait 1` reaps the job.
+#[test]
+fn job_control_is_refused_in_a_last_stage_too() {
+    for src in [
+        "sleep 5 &\nputs x | wait 1\nputs \"status=$sh.status\"\n",
+        "sleep 5 &\nwait 1 | cat\nputs \"status=$sh.status\"\n",
+    ] {
+        let out = run_with_input(src);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("wait: no job control in a pipeline stage"),
+            "{src:?}: {stderr:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("status=1"),
+            "{src:?}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    // Outside a pipeline it is the shell's own job to wait on, and does.
+    let out = run_with_input("sleep 0.2 &\nwait 1\nputs \"status=$sh.status\"\n");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("status=0"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `jobs` and `kill` are deliberately outside that list — listing and
+    // signalling need no parenthood — so they still work as a last stage.
+    let out = run_with_input("sleep 5 &\nputs x | kill %1\nputs \"status=$sh.status\"\n");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("status=0"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Under **job control**, the last stage forks as it always did.
+///
+/// An interactive pipeline puts its forked stages in a process group of their
+/// own and hands that group the terminal; the shell is not in it. Reading the
+/// pipe in the shell would then leave a Ctrl-Z at `cat | gets line` stopping
+/// `cat` and not mesh, with mesh blocked on a pipe that will never reach EOF —
+/// no prompt, no stopped-job record. So the in-shell path is taken exactly when
+/// the shell keeps the terminal, which is the same condition bash puts on
+/// `lastpipe`.
+///
+/// Driven with mesh's **stdin on a pty** — that is the flag the process-group
+/// handoff itself turns on, so the two cannot disagree.
+#[test]
+fn a_last_stage_forks_again_under_job_control() {
+    let (mut master, mut slave) = (-1, -1);
+    assert_eq!(open_pty_pair(&mut master, &mut slave), 0, "openpty failed");
+    let path = script(
+        "lastpipe_job_control",
+        "puts \"tty=$sh.stdin:tty\"\nputs hi | gets line\nputs \"line=[$line]\"\n",
+    );
+    // SAFETY: `slave` came from `openpty` and is handed to the child as its stdin.
+    let stdin = unsafe { Stdio::from(std::fs::File::from_raw_fd(slave)) };
+    let out = mesh_command()
+        .arg(path.to_str().expect("utf-8 script path"))
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run mesh");
+    // SAFETY: the master end is this process's, and the child is finished.
+    unsafe { libc::close(master) };
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The premise: job control is on, because stdin is a terminal.
+    assert!(stdout.contains("tty=true"), "{stdout:?}");
+    // So the stage forked, and its binding died with it — the pre-lastpipe
+    // behavior, kept exactly where running in the shell would strand it.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("line: unbound variable"), "{stderr:?}");
+}
+
+/// The status and `$sh.pipestatus` are unchanged by where the stage ran.
+#[test]
+fn a_last_stage_in_the_shell_still_reports_its_status() {
+    let out = run_with_input("puts hi | false\nputs \"status=$sh.status\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=1\n");
+
+    let out = run_with_input("false | true | false\nputs $sh.pipestatus:repr\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[1, 0, 1]\n");
+
+    // `exit` in that stage is still the *stage's* exit, reported as a status —
+    // the shell carries on to the next statement, as it did when the stage forked.
+    let out = run_with_input("puts hi | exit 3\nputs \"after=$sh.status\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after=3\n");
+}
+
+/// Earlier stages are forked and already running, so the last one reading in this
+/// process cannot deadlock against them — and a stage that stops reading early
+/// leaves the writer to a broken pipe rather than hanging the shell.
+#[test]
+fn a_last_stage_in_the_shell_does_not_deadlock_on_a_large_upstream() {
+    let out = run_with_input("seq 100000 | gets first\nputs \"first=$first\"\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first=1\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Two stages keep their own process. A **background** pipeline has no foreground
+/// last stage to be — the shell is not waiting for it — and `exec` is asking to
+/// spend a process on a replacement, which must not be the shell's.
+#[test]
+fn a_stage_that_must_keep_its_own_process_still_forks() {
+    // Backgrounded: the binding dies with the job, as every stage's did before.
+    let out = run_with_input("puts hi | gets line &\nwait\nputs \"line=[$line]\"\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("line: unbound variable"), "{stderr:?}");
+
+    // `exec` spends the stage, not the shell — `puts hi | exec cat` is observably
+    // `puts hi | cat`, so running it here would end the session for nothing.
+    let out = run_with_input("puts hi | exec cat\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi\nafter\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A **function wrapping** `exec` cannot slip past that carve-out.
+///
+/// The direct spelling is kept in its own fork by looking at the stage's words,
+/// but a function body cannot be asked in advance whether it will `exec` — and
+/// running one in the shell would replace the *session*, where the documented
+/// behavior is that `exec` in a stage spends only that stage. So it is refused
+/// where it would be irreversible, exactly as `exec` inside a capture is.
+#[test]
+fn exec_inside_a_last_stage_function_is_refused_rather_than_replacing_the_shell() {
+    let out = run_with_input("func f() { exec cat }\nputs hi | f\nputs after\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot replace the shell as a pipeline's last stage"),
+        "{stderr:?}"
+    );
+    // The session survived, which is the whole point.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("after"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // In an *earlier* stage the function runs in a fork, so `exec` there is that
+    // process's to spend and is unaffected.
+    let out = run_with_input("func f() { exec cat }\nputs hi | f | cat\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi\nafter\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And `exec` outside a pipeline still replaces the shell.
+    let out = run_with_input("exec /bin/echo replaced\nputs unreachable\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "replaced\n");
+
+    // A `fork` block *inside* that function has a process of its own to spend, so
+    // `exec` there is ordinary — the refusal is about the shell standing in for a
+    // stage, and a fork is no longer standing in for anything. Same output as the
+    // identical function run outside a pipeline, which is the point.
+    for src in [
+        "func f() { fork { exec /bin/echo child } }\nputs x | f\nputs after\n",
+        "func f() { fork { exec /bin/echo child } }\nf\nputs after\n",
+    ] {
+        let out = run_with_input(src);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "child\nafter\n",
+            "{src:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[test]
 fn a_builtin_runs_as_a_pipeline_stage() {
     let out = run_with_input("puts hi | cat\nputs after\n");

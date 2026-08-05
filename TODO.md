@@ -9,6 +9,21 @@ file as tasks land.
 Calls autopilot made without asking, each one chosen for being cheap to undo.
 Delete an entry once you have agreed with it or reversed it.
 
+- [ ] **`exec` keeps its own process as a pipeline's last stage.** Everything else
+      in-shell now runs in the shell there, but `exec` still forks. Running it in
+      the shell would spend the *shell* on the replacement, and it buys nothing:
+      `cmd | exec prog` is observably `cmd | prog`, so the only difference would be
+      ending the session. bash under `lastpipe` does replace the shell; this
+      deliberately does not. *Reversible:* one condition in `run_multi`, and the
+      behavior is pinned by a test either way.
+- [ ] **A pipeline stage carrying a value still forks, even as the last one.**
+      `puts $(pwd) | cat` was never affected, but `cmd | f $(g)` keeps its fork
+      rather than running in the shell, because a deferred stage's words are not
+      expanded yet — so it cannot be asked whether it is an `exec`, which is the
+      one thing that must not run here. Widening it means expanding far enough to
+      answer that. *Reversible:* it only ever adds cases; nothing depends on those
+      stages forking, beyond the value-isolation rule in `docs/REFERENCE.md`, which
+      would need rewording first.
 - [ ] **The nesting indent is two spaces, on trial.** `puts` and `:pretty` both
       read `NEST_INDENT` in `crates/mesh-core/src/vars.rs`, deliberately one
       constant so the read-it and read-it-back forms of a value line up. Two was
@@ -1947,12 +1962,14 @@ designed, and the cross-references say where the fuller note lives.
         "for now", and use will show whether the command form earns its keep.
   - [ ] **A loop cannot be a pipeline stage**, so `cmd | while line = gets() { … }`
         is a syntax error in both spellings — as is `cmd | if …`, so this is the
-        compound-statement gap rather than anything about `gets`
-        (`DESIGN.md`:3462 flags the literal form as *planned*). Worth naming here
-        because it is the shape people reach for, and the workaround
-        (`for x in $(cmd):split("\n")`) is not obvious. When
-        it does land, the binding a stage makes will not outlive the fork —
-        recorded in `docs/REFERENCE.md` already.
+        compound-statement gap rather than anything about `gets`. Worth naming
+        here because it is the shape people reach for, and the workaround
+        (`for x in $(cmd):split("\n")`) is not obvious.
+
+        The *semantic* half of this is now done: the last stage of a foreground
+        pipeline runs in the shell, so `cmd | gets line` leaves `line` set and a
+        loop landing here would keep what it counts. What is left is the parser
+        work to let a compound statement be a stage at all.
 - [x] **A regex pattern for the replace family** — the `/…/` slot `DESIGN.md`
       §"String" specifies. Split out of the modifier-arguments change because it
       is where the difficulty lives; each item below was a real bug caught in
