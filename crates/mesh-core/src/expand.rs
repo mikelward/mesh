@@ -454,6 +454,40 @@ pub fn expand_call_values(
         } else if let Some(value) = scalar_literal(&word) {
             let value = value.map_err(ExpandError::ArgumentValue)?;
             out.push((value, true));
+        } else if let Some(name) = written_option_prefix(&word)
+            && !word_globs(&word)
+        {
+            // `--tag=$w`, `--tag="v2"` — the *name* is written, the payload is
+            // composed. Only the name has to be literal: the `=` ends it, and
+            // what follows is the option's value however it was formed.
+            //
+            // The payload **keeps the value's own type** rather than being
+            // re-parsed out of text, so `w = 2; --n=$w` carries the integer and
+            // `s = "2"; --n=$s` the string. Stringifying both was an artifact of
+            // recovering the payload from a rendered word, which is exactly what
+            // this path removes: the payload is a `Value` and `$w` is a `Value`.
+            let payload = composed_payload(&word, vars)?;
+            // An option's value is **one scalar**, and this is where that is
+            // now checked: typed flags move the test from the call site to the
+            // construction site, and moving a validation must not weaken it.
+            // The diagnostic points at the line that made the mistake, which is
+            // the whole reason the payload is captured here.
+            if !matches!(
+                payload,
+                Value::String(_) | Value::Styled(_) | Value::Integer(_) | Value::Boolean(_)
+            ) {
+                return Err(ExpandError::ArgumentValue(format!(
+                    "an option's value must be one string, not {}",
+                    value_kind(&payload)
+                )));
+            }
+            out.push((
+                Value::Flag(crate::vars::FlagValue {
+                    name,
+                    value: Some(Box::new(payload)),
+                }),
+                false,
+            ));
         } else {
             // A single unquoted, un-interpolated word with no glob metacharacters
             // is a bare literal. A glob is not: even when it matches exactly one
@@ -463,9 +497,42 @@ pub fn expand_call_values(
                 word.pieces.as_slice(),
                 [Piece::Text { text, expandable: true }] if !has_glob_meta(text)
             );
+            // A word written as `--name=` whose value **globs** has to reach
+            // expansion first -- in command position a pattern becomes several
+            // words, and the last `--name=` wins -- so the flag is built from
+            // each result rather than before them. The payload stays a
+            // **string**: it came from the filesystem, not from a written word,
+            // which is the same reason a positional glob is not typed from its
+            // bytes.
+            // A name written *literally* in the first piece has to be a name,
+            // even when the rest of the word is composed: `--fo*=x$v[` writes
+            // `fo*`, and that is a mistake in the line rather than data. Only a
+            // word whose first piece is bare `--` composes its name (`--$name`,
+            // `--"force"`), and that stays data as it always did.
+            if !word_globs(&word)
+                && let Some(problem) = written_name_problem(&word)
+            {
+                return Err(ExpandError::ArgumentValue(problem));
+            }
+            let dashed_prefix = expanded_option_prefix(&word);
             let mut strings = Vec::new();
             expand_word(word, vars, &mut strings)?;
-            out.extend(strings.into_iter().map(|s| (Value::String(s), bare)));
+            out.extend(strings.into_iter().map(|text| match &dashed_prefix {
+                Some(name) => {
+                    let payload = text
+                        .strip_prefix("--")
+                        .and_then(|body| body.split_once('='))
+                        .map_or_else(String::new, |(_, value)| value.to_owned());
+                    (
+                        Value::Flag(crate::vars::FlagValue {
+                            name: name.clone(),
+                            value: Some(Box::new(Value::String(payload))),
+                        }),
+                        false,
+                    )
+                }
+                None => (Value::String(text), bare),
+            }));
         }
     }
     Ok(out)
@@ -567,21 +634,8 @@ fn flag_from_text(text: &str) -> Result<crate::vars::FlagValue, String> {
         Some((name, value)) => (name, Some(Box::new(typed_scalar(value)))),
         None => (body, None),
     };
-    if name.is_empty() {
-        return Err(format!("`{text}` is not an option: it has no name"));
-    }
-    // A flag's name has to be a **name**, matching what a signature already
-    // demands — `func f(--fo*)` is `expected a name`, so a value spelled that way
-    // is not the option it looks like either. Everything else stays what it
-    // already was: a word, which expansion may turn into a glob or plain text,
-    // and which an external receives as bytes since mesh parses none of its
-    // flags. That keeps `curl --fo*` and `ls --*` working, where refusing at the
-    // parser would break both.
-    if !name
-        .chars()
-        .all(|ch| ch == '_' || ch == '-' || ch.is_alphanumeric())
-    {
-        return Err(format!("`{text}` is not an option: `{name}` is not a name"));
+    if let Some(problem) = flag_name_problem(name) {
+        return Err(format!("`{text}` is not an option: {problem}"));
     }
     Ok(crate::vars::FlagValue {
         name: name.to_owned(),
@@ -666,6 +720,145 @@ fn whole_value(word: &Word, vars: &Vars) -> Option<Result<Value, ExpandError>> {
         return None;
     }
     Some(resolve_value(vref, vars))
+}
+
+/// Why `name` cannot be a flag's name, if it cannot.
+///
+/// A flag's name has to be a **name**, matching what a signature already demands
+/// — `func f(--fo*)` is `expected a name`, so a value spelled that way is not the
+/// option it looks like either. Shared by the `:flag` cast and by both literal
+/// paths, so a cast cannot build a flag no signature could declare.
+///
+/// What fails this stays what it already was: a word, which expansion may turn
+/// into a glob or plain text, and which an external receives as bytes since mesh
+/// parses none of its flags. That keeps `curl --fo*` and `ls --*` working, where
+/// refusing at the parser would break both.
+fn flag_name_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("it has no name".to_owned());
+    }
+    if !name
+        .chars()
+        .all(|ch| ch == '_' || ch == '-' || ch.is_alphanumeric())
+    {
+        return Some(format!("`{name}` is not a name"));
+    }
+    None
+}
+
+/// Why the name a word wrote after `--` is not a name, if it wrote one.
+///
+/// Only sound for a word that does **not** glob. A globbing word is a pattern
+/// the filesystem answers, not a name someone wrote: `--*` must expand and pass
+/// its match as data rather than be judged for the `*` in it.
+///
+/// Answers `None` when the word composes its name rather than writing it —
+/// `--$name` and `--"force"` have a bare `--` and nothing more in the first
+/// piece, so there is no written name to judge and they stay data.
+fn written_name_problem(word: &Word) -> Option<String> {
+    let [
+        Piece::Text {
+            text,
+            expandable: true,
+        },
+        ..,
+    ] = word.pieces.as_slice()
+    else {
+        return None;
+    };
+    let body = text.strip_prefix("--")?;
+    let name = body.split_once('=').map_or(body, |(name, _)| name);
+    if name.is_empty() {
+        return None;
+    }
+    flag_name_problem(name).map(|problem| format!("`--{name}` is not an option: {problem}"))
+}
+
+/// The option name of a word written `--name=…` whose value still has to expand,
+/// so the flag is built from each expanded result rather than from the pattern.
+///
+/// Distinct from [`written_option_prefix`], which handles a payload composed of
+/// *pieces*; this one is a single written word the expander will turn into one
+/// or more strings.
+fn expanded_option_prefix(word: &Word) -> Option<String> {
+    // The **first** piece, not the only one: a payload can compose interpolation
+    // with globbing (`--tag=$p*.txt`), which leaves several pieces *and* still
+    // has to reach the filesystem. Requiring a lone piece silently dropped the
+    // option on exactly those words -- the match bound as a positional instead.
+    let [
+        Piece::Text {
+            text,
+            expandable: true,
+        },
+        ..,
+    ] = word.pieces.as_slice()
+    else {
+        return None;
+    };
+    let (name, _) = text.strip_prefix("--")?.split_once('=')?;
+    flag_name_problem(name).is_none().then(|| name.to_owned())
+}
+
+/// The option name a word was **written** with, when its first piece is a bare
+/// `--name=` and something composed follows — so `--tag=$w` answers `tag` while
+/// `--tag=v2` (one piece, no remainder) and `--$name` (no `=`, so the name would
+/// run on into whatever follows) both answer `None`.
+fn written_option_prefix(word: &Word) -> Option<String> {
+    let [
+        Piece::Text {
+            text,
+            expandable: true,
+        },
+        rest @ ..,
+    ] = word.pieces.as_slice()
+    else {
+        return None;
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let body = text.strip_prefix("--")?;
+    // The `=` has to be in the *written* piece. Without one the name is not
+    // finished here, and letting the remainder finish it is the
+    // data-decides-the-call reading (`--$name`) the type removes.
+    let (name, _) = body.split_once('=')?;
+    flag_name_problem(name).is_none().then(|| name.to_owned())
+}
+
+/// The value the pieces after a written `--name=` denote.
+///
+/// A lone variable hands over its value untouched, which is what keeps
+/// `w = 2; --n=$w` an integer. Anything else -- quoted text, several pieces --
+/// renders, since what it denotes is the text it spells.
+fn composed_payload(word: &Word, vars: &Vars) -> Result<Value, ExpandError> {
+    // Whatever the written first piece put after the `=` is part of the value and
+    // has to lead it: `--tag=x$v[` spells `x`, then `$v`, then `[`.
+    let written = match word.pieces.first() {
+        Some(Piece::Text { text, .. }) => text
+            .strip_prefix("--")
+            .and_then(|body| body.split_once('='))
+            .map_or("", |(_, after)| after),
+        _ => "",
+    };
+    match &word.pieces[1..] {
+        // A lone variable with nothing written around it hands its value over
+        // untouched — the case that keeps `w = 2; --n=$w` an integer. Any written
+        // text beside it makes the payload the string those pieces spell.
+        [Piece::Var(vref)] if !vref.quoted && written.is_empty() => resolve_value(vref, vars),
+        [Piece::Value(value)] if written.is_empty() => Ok(value.clone()),
+        rest => {
+            let mut strings = Vec::new();
+            expand_word(
+                Word {
+                    pieces: rest.to_vec(),
+                    qualifiers: word.qualifiers.clone(),
+                },
+                vars,
+                &mut strings,
+            )?;
+            Ok(Value::String(format!("{written}{}", strings.concat())))
+        }
+    }
 }
 
 /// The typed value a single bare literal word denotes, when it denotes one.
