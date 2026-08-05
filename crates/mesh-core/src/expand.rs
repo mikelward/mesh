@@ -662,6 +662,23 @@ fn scalar_literal(word: &Word) -> Option<Value> {
     else {
         return None;
     };
+    // A written `--name` is an **option**, decided here where the spelling is the
+    // declaration — the same place `2` becomes an integer and `true` a boolean.
+    // Quoting opts out, as it does for those: `"--force"` is a bare-text piece
+    // only when unquoted, so it never reaches this.
+    //
+    // A word that **globs** is excluded, and both halves of it matter. A glob is
+    // spelled in the same bare characters a literal name is, so `--*` would take
+    // its option from whatever the working directory happens to hold — the
+    // data-decides-the-call reading, arriving through the one composition that
+    // needs no punctuation to mark it. And a globbing *payload* (`--tag=*.txt`)
+    // has to reach expansion, which in command position turns the pattern into
+    // words. Either way the word is not a literal, so it falls through.
+    if !word_globs(word)
+        && let Ok(flag) = flag_from_text(text)
+    {
+        return Some(Value::Flag(flag));
+    }
     // A bare word that is not a typed literal falls through to ordinary string
     // expansion, so only surface `true`/`false`/integers as typed values here.
     match typed_scalar(text) {
