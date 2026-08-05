@@ -1106,6 +1106,111 @@ was added to remove. The comparison it replaces —
 since `1` is an integer literal and equality is type-strict across string and
 number, so dropping them makes the test *always* false.
 
+**Declaring a modifier — `func _s:name()`** *(decided)*. The modifier vocabulary is no
+longer closed: a user may add to it, but only by **declaring** a modifier, not by
+having written a one-argument `func`. The declaration puts the subject where the call
+site puts it — left of the colon — so the two read the same:
+
+```
+func _s:shorten()          { … }                  # $x:shorten
+func _s:pad(_n)            { … }                  # $x:pad(8)
+func ..._xs:oxford(_conj)  { … }                  # $xs:oxford("and") — "a, b, and c"
+func ..._xs:longest()      { … }                  # $xs:longest
+```
+
+The subject is **not a positional parameter** — it sits outside the parens, which is
+what lets a list-taking modifier still take arguments; as a leading rest parameter it
+would collide with rest-must-be-last, and `$xs:oxford("and")` is not a corner case.
+This also describes the built-ins without strain: `:upper` is `func _s:upper()`,
+`:replaceall` is `func _s:replaceall(_old, _new)`, `:join` is
+`func ..._xs:join(_sep)`.
+
+**Element-wise is the default; `...` takes the collection.** A plain subject parameter
+receives *one element*, so a list subject means the modifier is called per element —
+the auto-mapping the built-ins already do, and most of what declaring one buys. A rest
+subject receives the whole list, once. That is not a second meaning for `...`: the
+subject is *spread into* the parameter the same way arguments are, and `...` gathers
+many either way — only the source differs.
+
+**Why a declaration rather than any `func`.** Letting every one-argument function be
+callable as `:name` would move `:name` from **parse**-time to **run**-time resolution
+for *every* modifier, the shipped ones included, because the parser could no longer
+tell which kind of name it was looking at. A declared set keeps the vocabulary closed
+at any given point in the program while still letting it grow.
+
+**The check is at load time, and that is the cost.** A unit — a script, a sourced file,
+a `-c` string, or one interactive line — has its modifier declarations collected first,
+then its modifier *uses* checked against the known set, before any of it runs. Two
+things follow on purpose: **forward references work within a unit** (`$x:shorten` above
+its own `func _s:shorten()`, matching how `func f { g }` resolves in command position),
+and an interactive line, being its own unit, still reports `:shortne` before executing
+anything. So the error does not arrive later than it used to. What is genuinely given
+up is that the **parser alone** can no longer tell `:foo` is invalid — it needs the
+loaded environment — so an editor or a single-file lint sees less than today.
+
+**Modifier declarations are hoisted**, which is what makes that forward reference real
+rather than a check that passes and then fails. An ordinary `func` binds when its
+statement *executes* — `shell.funcs.define` runs inside the executable step — so a call
+placed above it finds nothing. Collecting declarations only to validate them would
+therefore accept `$x:shorten` above `func _s:shorten()` and then have no body to call
+when execution arrived. So the same pre-pass that collects a unit's modifier
+declarations also **installs** them, before the unit's first statement runs. That is a
+real divergence from `func`, and it is the point: a modifier is vocabulary, and
+vocabulary that only exists once control has flowed past it cannot be checked in
+advance. The cost is that within a unit, textual order stops deciding which body is
+live — declare the same modifier twice and the later one wins even for a use written
+between them, where an ordinary `func` would give the earlier body to a call in that
+position.
+
+**A modifier declaration must be top-level in its unit**, and that follows from the
+same reasoning rather than being a separate rule. A `func` in mesh binds by
+*executing*, so a nested one binds only once its enclosing function is called —
+`func outer() { func inner() { … } }` leaves `inner` undefined until `outer` runs.
+A modifier declared that way is not knowable before the unit runs, which is the one
+property the whole decision rests on. Neither alternative survives: scanning
+recursively would accept `$x:slug` when the declaration sits in a function nobody
+calls or a branch nobody takes, and scanning only the top level while *allowing*
+nested declarations would reject uses that do work. So `func _s:name()` inside a
+function body or a conditional is an **error at the declaration**, reported where it
+is written. Ordinary nested `func`s are untouched — this restricts the modifier form
+only, because only the modifier form has to be known in advance.
+
+**What a `source` does to that check is not decided here.** A unit that sources a
+library and then uses one of its modifiers —
+
+```
+source lib.mesh        # declares func _s:slug()
+puts $x:slug
+```
+
+— cannot be checked by collecting declarations from the unit's own text, because
+`lib.mesh` binds `:slug` by *executing*, a statement later. That is not a new problem:
+it is the constraint `TODO.md`'s static-checker item already records, where four
+framings each died on a counter-example and the two surviving directions —
+poison-after-`source`, or an import form — are called out as **language decisions
+nobody has made**. This decision inherits that boundary rather than settling it, and
+must not be read as settling it: a library modifier has to remain usable in the script
+that sources it, which rules out simply rejecting the use. Whether the region after a
+`source` degrades to a call-time error, or `source` gets a declaration form, belongs to
+that item.
+
+**A built-in modifier name may not be redeclared**, on the principle that already
+governs this. `func _s:upper()` is a **loud error at the declaration**, for the reason
+mesh already refuses `func puts` and `func cd`: a name the shell resolves first makes
+the definition *unreachable*, and silently dead code is the failure mode that rule
+exists to prevent.
+
+What it does **not** do is widen the existing command-name reserved set. Modifiers are
+their own vocabulary, so the two declarations are independent: `func _s:upper()` is
+refused because `:upper` is a built-in **modifier**, while `func upper() { tr a-z A-Z }`
+stays perfectly legal — `upper` is not a builtin *command*, and a shipped modifier has
+no claim on the command namespace. One principle, applied per namespace; adding modifier
+names to the command-side check would break working code.
+
+A **map** subject has no element-wise meaning yet and **errors**, naming `:keys` /
+`:values` — see [Open questions](#open-questions), where it is parked rather than
+decided here.
+
 ### Globbing
 
 - `**` — recursive, **on by default** (no `globstar`-style opt-in).
@@ -3569,15 +3674,16 @@ there because `\` is Perl's reference operator. Here `\` is the escape and the l
 continuation — `x = \up` already binds `"up"` — so it would silently change an existing
 spelling rather than add one.
 
-*Not taken (yet): widening `:name`.* `:upper` is already a one-argument function
-reference in value position, so extending it to user functions would need no new sigil
-at all. That is a real option, but it is the [user-defined modifier
-question](#open-questions), not a spelling choice: it merges the modifier vocabulary
-with the function namespace and gives up the parse-time unknown-modifier error. The
-line kept here is by **shape**, not by who wrote the name — `:name` is the
-argument-free, auto-mapping modifier form; `&name` is the general reference, any arity,
-any slot — so a reader can predict which applies without knowing whether a name shipped
-with the shell.
+*Not a second spelling: `:name` for a user's own.* `:upper` is already a one-argument
+function reference in value position, and [it has since been decided](#modifiers) that
+a user may add to that vocabulary — by **declaring a modifier**, `func _s:name()`, and
+only that way. An ordinary `func shorten(_s)` is *not* callable as `$x:shorten`; the
+declaration is what makes a modifier, which is the whole of that decision. Either way,
+this does not make `&name` and `:name` alternatives for the same job. The line between them
+is by **shape**, not by who wrote the name: `:name` is the postfix, auto-mapping
+modifier form, applying to the subject on its left; `&name` is the general reference,
+any arity, any slot, usable wherever a value goes. A reader can still predict which
+applies without knowing whether a name shipped with the shell.
 
 **A lambda closes over the scope that created it** *(decided — a change from what runs
 today)*. The body's scope parent is currently the *session*, so a lambda sees session
@@ -5658,10 +5764,12 @@ to avoid" rather than promising the latter as done.
   an effect slot while failing in a value slot. It is **required in
   hook and prompt slots**, which retires the bare-word-is-a-callable rule there —
   the one place quoting changed meaning. Rejected: `\name` (`\` is the escape;
-  `x = \up` already binds `"up"`). **Remaining:** whether `:name` should widen to
-  user-defined functions, which is the *user-defined modifier* question below, not
-  a second spelling — the line held for now is by **shape** (`:name` argument-free
-  and auto-mapping, `&name` general) rather than by who wrote the name.
+  `x = \up` already binds `"up"`). The **`:name` question this left open is now
+  answered** — a user may add to the modifier vocabulary, but only by *declaring* a
+  modifier (`func _s:name()`), never by writing an ordinary `func`. That is not a
+  second spelling for `&name`: the line between them is by **shape** (`:name` postfix
+  on its subject and auto-mapping, `&name` general — any arity, any slot) rather than
+  by who wrote the name.
 - **Partial application — open, and deliberately unanswered.** `&name` names a
   function but cannot pre-supply any of its arguments, so every higher-order slot
   that wants an existing function with one choice already made takes a lambda
@@ -5682,11 +5790,25 @@ to avoid" rather than promising the latter as done.
   renderer's measured slack would have made `&fill("─")` a partial application,
   which is why the slack stays the renderer's job and `fill`'s only argument is the
   optional repeat character ([Hooks and the prompt](#hooks-and-the-prompt)).
-- **User-defined modifiers — open.** `:ident` is reserved by the grammar, so the
-  ambiguity is already paid for and a user modifier is *possible*; the vocabulary
-  is otherwise closed forever. The cost is that `:name` moves from **parse**-time
-  to **run**-time resolution, so a typo'd modifier stops being a syntax error. That
-  trade is the whole decision.
+- **User-defined modifiers — decided: a *declared* modifier, `func _s:name()`.**
+  `:ident` is reserved by the grammar, so the ambiguity was already paid for and a
+  user modifier was always *possible*; the vocabulary was otherwise closed forever.
+  What was open is whether to spend it, and on what terms. A modifier is a **postfix
+  function on its subject** that auto-maps over a list, so the naive widening — any
+  one-argument `func` is callable as `:name` — was rejected: it makes `:name`
+  resolution run-time for *every* modifier including the shipped ones, since the
+  parser can no longer tell which kind it is looking at. Requiring a declaration
+  keeps a closed set at any point in the program while letting users add to it. See
+  [Modifiers](#modifiers).
+- **Element-wise over a map — open.** `$m:name` where the subject is a **map** has no
+  answer here. Loop iteration is already settled and does *not* decide it: `for host,
+  addr in $known_hosts` binds key and value as two names, which is a **binding form**,
+  not a pair *value* — and a modifier receives one subject, so it has nothing to bind
+  two names to. Over-values and over-pairs are therefore both live, and over-pairs
+  would need a pair value the language does not have. `$m:name` **errors for now**,
+  naming `:keys` / `:values`, which decides nothing; the error can lift once the
+  question is answered, since nothing could have depended on it working. Related but
+  separate: [map destructuring](#destructuring) is deferred on its own terms.
 - **Bare environment references (`$PATH`) — decided for now, and reversible**
   ([Variables and assignment](#variables-and-assignment)). The environment becomes
   a third scope rung below local and session; reads fall outward to it on

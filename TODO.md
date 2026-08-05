@@ -4579,6 +4579,80 @@ two other shells' answers turned out to be strictly better than ours.
       Worth settling before the language is widely written, since it changes
       every existing single-quoted string.
 
+## Beyond M3 — User-defined modifiers (`func _s:name()`)
+
+Decided in design discussion; see `docs/DESIGN.md` §"Modifiers". Nothing here is
+implemented.
+
+- [ ] **A declaration form with the subject left of the colon.** `func _s:shorten()`,
+      `func _s:pad(_n)`, `func ..._xs:oxford(_conj)`. The subject is **not** a
+      positional parameter — it sits outside the parens, which is what lets a
+      list-taking modifier still take arguments without colliding with
+      rest-must-be-last (`$xs:oxford("and")`). Names in these examples are
+      deliberately unclaimed: `:join` is a shipped built-in and could not be
+      declared, per the reserved-name item below. `func` therefore grows a second declaration shape; that is
+      the accepted cost, and it buys a declaration readable straight off the call
+      site.
+- [ ] **Element-wise by default, `...` for the collection.** A plain subject parameter
+      receives one element, so a list subject calls the modifier per element — the
+      auto-mapping the built-ins already do. A rest subject receives the whole list
+      once. Implement the subject as *spread into* the parameter so this is one rule
+      rather than a special case.
+- [ ] **Resolve declared modifiers at load time, not parse time.** Per unit — a
+      script, a sourced file, a `-c` string, or one interactive line — collect the
+      modifier declarations, then check the unit's modifier *uses* against the known
+      set before running any of it. Forward references within a unit must work, which
+      falls out of collecting before checking rather than needing its own rule. An
+      unknown modifier is an error naming the name. **Do not** make `:name` resolution
+      run-time per call: that would weaken the shipped modifiers too, and it is the
+      reason a declaration is required at all rather than any one-argument `func`
+      qualifying.
+  - [ ] **Hoist modifier declarations — collect *and install* in the pre-pass.** An
+        ordinary `func` binds when its statement executes (`shell.funcs.define` inside
+        the `Function` step, `crates/mesh-core/src/repl.rs`), so validating without
+        installing would accept `$x:shorten` above its own declaration and then find
+        no body at execution. Install during the same pass that collects, before the
+        unit's first statement runs. Consequence to keep: within a unit the later
+        declaration of a name wins even for a use written above it, unlike `func`.
+  - [ ] **Modifier declarations are top-level only.** A `func` binds by executing, so
+        a nested one binds only when its enclosing function runs (`func outer() { func
+        inner() { … } }` — see the nested-definition test in
+        `crates/mesh/tests/cli.rs`). A modifier declared inside a function body or a
+        branch therefore is not knowable before the unit runs, which is the property
+        the whole decision rests on. Reject it **at the declaration**. Do not "fix"
+        this by scanning recursively: that accepts a use whose declaration sits in an
+        uncalled function. Ordinary nested `func`s keep working — this restricts the
+        modifier form only.
+  - [ ] **Blocked on the `source` boundary — do not implement the check until it is
+        settled.** `source lib.mesh` then `$x:slug` cannot be checked from the unit's
+        own text, because `lib.mesh` binds `:slug` by executing a statement later, and
+        a library modifier must stay usable in the script that sources it. This is the
+        same wall as the static-checker item above ("Four framings, four
+        counter-examples"), whose two surviving directions — poison after `source`, or
+        an import form — are recorded there as language decisions nobody has picked.
+        Pick one *there*, then implement here; do not invent a third answer inside the
+        modifier work. Everything else in this section is independent of it.
+- [ ] **Redeclaring a built-in modifier is refused, by the same principle as
+      `definition_name_problem` but on a separate name set.** `func _s:upper()` must be
+      rejected at the declaration, for the reason that helper already gives for
+      `func puts` / `func cd` (`crates/mesh-core/src/repl.rs`): a name resolved first
+      elsewhere makes the definition unreachable, and `docs/INTEGRATION.md` relies on
+      the `cd` case. **Do not add modifier names to the set that helper consults** — it
+      validates ordinary `func name()` declarations globally, and `func upper() { tr
+      a-z A-Z }` is a working, tested definition (`crates/mesh/tests/cli.rs`). Modifiers
+      are their own vocabulary: the built-in *modifier* names must be checked only
+      against *modifier* declarations, so the check needs declaration-kind context,
+      matching the diagnostic shape rather than the name set.
+- [ ] **A map subject errors**, naming `:keys` / `:values`. A placeholder, not a
+      decision — see the open question below.
+  - [ ] **What element-wise means over a map.** Loop iteration does *not* settle it:
+        `for host, addr in $known_hosts` is shipped, but two loop **binders** are a
+        binding form, not a pair *value*, and a modifier gets one subject with nothing
+        to bind a second name to. So over-values and over-pairs are both live, and
+        over-pairs needs a pair value mesh does not have. Decide this on its own
+        ground; `docs/DESIGN.md` §"Destructuring" defers **map destructuring**
+        separately and neither answers the other.
+
 ## Beyond M3 — Function references (`&name`)
 
 Decided in design discussion; see `docs/DESIGN.md` §"Calling for a value, and
