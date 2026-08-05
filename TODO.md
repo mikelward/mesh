@@ -3542,12 +3542,29 @@ thing a reader takes on trust.*
       says `--`, or `:repr` output. The flag type did not cause it; it made it
       visible, because `--` is now a value someone would want to print.
 
-      Two ways out, neither obviously right: teach the central strip to run
-      before values are rendered rather than after, so only a *terminator* is
-      eaten and a string saying `--` survives; or let a builtin that reads no
-      options keep the word, on the grounds that it has no options for a
-      terminator to end. The second is the smaller change and the bigger claim.
-      Same plumbing as the entry below, and worth doing with it.
+      **The fix is to strip the terminator *value*, not the text** -- the repo
+      owner's observation, and it is better than either option first written
+      here. Now that a written `--` binds `Value::FlagTerminator`, a builtin can
+      consume *that* and leave a string alone:
+
+      - `puts -- --help` keeps working: the written `--` is a terminator, eaten,
+        and `--help` follows it as data.
+      - `puts "--"` prints `--`, because a string is not a terminator and
+        nothing eats it.
+      - the central text-level strip goes away entirely, rather than being
+        taught to run at a different moment.
+
+      It is the same change as the entry below and should be done with it: both
+      say a builtin should read *values* the way a function does, instead of
+      re-deriving intent from argv text. Doing it resolves this entry and that
+      one together.
+
+      Worth recording what already works, since it is the case that would hurt:
+      an **external** never needs a quoted terminator. `rm -- -rf` reaches argv
+      as `["rm", "--", "-rf"]` written directly, forwarded through a wrapper's
+      `...args`, or held in a variable -- verified all four routes. The external
+      path parses no flags, so a written `--` is bytes, and a forwarded
+      terminator value renders back to `--`.
 
 - [ ] **`puts $x` should report a flag, and cannot be done in `output_words`.**
       The design says a flag in a call is an *option*, `puts` declares none, so
