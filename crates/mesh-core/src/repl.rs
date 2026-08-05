@@ -6829,6 +6829,36 @@ fn compile_regex(value: &RegexValue) -> Result<regex::Regex, String> {
 
 fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value, String> {
     use parser::BinaryOp::*;
+    // A flag compares to flags. Against anything else `==` and `!=` **refuse**
+    // rather than answering `false`, because a silent answer hides exactly the
+    // flag-versus-data confusion the type exists to surface: `x = --force;
+    // $x == "--force"` is a question whose two readings the writer has not told
+    // apart, and refusing beats guessing.
+    //
+    // The refusal is the **top-level operand pair only**. Everything else uses
+    // total equality — a nested pair (`[--help] == ["--help"]`) is unequal
+    // rather than an error, and `in` answers `false` — because drawing it
+    // deeper means a second, fallible comparator walking lists and map values
+    // beside `Value::eq`, to serve a case nobody writes.
+    if matches!(op, Equal | NotEqual) {
+        // The terminator is a type of its own, **not** a flag, so it has to be
+        // its own kind here: grouping the two made `--force == --` a silent
+        // `false`, which is the confusion this refusal exists to surface, one
+        // type over. Everything that is neither shares kind 0, so an ordinary
+        // pair like `1 == "1"` is untouched and answers `false` as before.
+        let kind = |value: &Value| match value {
+            Value::Flag(_) => 1,
+            Value::FlagTerminator => 2,
+            _ => 0,
+        };
+        if kind(&left) != kind(&right) {
+            return Err(format!(
+                "cannot compare {} with {}",
+                type_phrase(&left),
+                type_phrase(&right)
+            ));
+        }
+    }
     Ok(match op {
         Equal => bool_value(left == right),
         NotEqual => bool_value(left != right),

@@ -29122,16 +29122,59 @@ fn a_flag_renders_as_bytes_but_is_not_a_string() {
     );
 
     // Flag-to-flag equality is total, which is what keeps `:dedup` and `match`
-    // total. Against a string it is not equal — the same place `1 == \"1\"` lands.
+    // total.
     let compared = run_with_input(
         "a = \"--force\":flag\nb = \"--force\":flag\nc = \"--other\":flag\n\
-         if $a == $b { puts same }\nif $a != $c { puts differs }\n\
-         if $a == \"--force\" { puts texty } else { puts typed }\n",
+         if $a == $b { puts same }\nif $a != $c { puts differs }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&compared.stdout), "same\ndiffers\n");
+
+    // Against a non-flag, `==` and `!=` **refuse** rather than answering
+    // `false`. A silent answer hides the flag-versus-data confusion the type
+    // exists to surface, and this test previously pinned that silent `false` —
+    // the assertion was wrong, not the behavior it described. Raised in review.
+    for source in ["$a == \"--force\"", "$a != 7"] {
+        let out = run_with_input(&format!("a = \"--force\":flag\nif {source} {{ puts x }}\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("cannot compare a flag with"),
+            "{source} should refuse: {:?}",
+            out.stderr
+        );
+    }
+
+    // The terminator is its own type, not a flag, so the refusal separates them
+    // too — grouping the two made `--force == --` a silent `false`, which is the
+    // same confusion one type over. Raised in review.
+    let terminator = run_with_input("a = --force\nb = --\nif $a == $b { puts eq }\n");
+    assert!(
+        String::from_utf8_lossy(&terminator.stderr)
+            .contains("cannot compare a flag with the flag terminator"),
+        "{:?}",
+        terminator.stderr
+    );
+
+    // Each still compares to its own kind.
+    let same_kind = run_with_input(
+        "a = --\nb = --\nif $a == $b { puts terminators }\n\
+         c = --force\nd = --force\nif $c == $d { puts flags }\n",
     );
     assert_eq!(
-        String::from_utf8_lossy(&compared.stdout),
-        "same\ndiffers\ntyped\n"
+        String::from_utf8_lossy(&same_kind.stdout),
+        "terminators\nflags\n"
     );
+
+    // And an ordinary mismatched pair is untouched — both are kind 0, so this
+    // still answers `false` rather than reporting.
+    let ordinary = run_with_input("if 1 == \"1\" { puts eq } else { puts unequal }\n");
+    assert_eq!(String::from_utf8_lossy(&ordinary.stdout), "unequal\n");
+
+    // The refusal is the top-level pair only: nested, equality stays total, so
+    // a list holding a flag is merely unequal to one holding its text.
+    let nested = run_with_input(
+        "xs = [--help]\nys = [\"--help\"]\n\
+         if $xs == $ys { puts eq } else { puts unequal }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&nested.stdout), "unequal\n");
 
     // Total equality means `:dedup` keeps a total answer.
     let deduped =
