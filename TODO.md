@@ -3566,6 +3566,20 @@ thing a reader takes on trust.*
       path parses no flags, so a written `--` is bytes, and a forwarded
       terminator value renders back to `--`.
 
+- [ ] **A rendered flag re-enters builtin option parsing.** From review, and the
+      same root as the entry below. When `puts`/`print` render a non-scalar,
+      `output_words` turns the value back into argv *strings*, and `run_expanded`
+      then re-applies the builtin `--help` / `--` handling to those strings:
+
+          x = [--help] ;  puts $x    # prints puts's help, not the element
+          x = [--]     ;  puts $x    # element stripped, prints nothing
+
+      That contradicts this path's own intent -- `rendered_for_output` says a
+      flag inside a collection is data being displayed -- and it is the round
+      trip through text that does it. Fixed by the same change as the entry
+      below: a builtin should read the *values* it was handed rather than
+      re-deriving options from rendered bytes.
+
 - [ ] **`puts $x` should report a flag, and cannot be done in `output_words`.**
       The design says a flag in a call is an *option*, `puts` declares none, so
       `puts $x` reports rather than printing -- `puts "$x"` and `puts $x:repr`
