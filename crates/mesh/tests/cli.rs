@@ -1298,13 +1298,11 @@ fn puts_refuses_a_value_with_no_text_form_and_recovers() {
             "j = sleep 0.2 &\nputs $j\n",
             "a job handle has no text form",
         ),
+        // Nesting renders (see `puts_renders_a_nested_collection_indented`); a
+        // value with no text form is still refused wherever it is nested.
         (
-            "xs = [a [b c]]\nputs $xs\n",
-            "a list inside a list has no rendering",
-        ),
-        (
-            "m = [k: [a b]]\nputs $m\n",
-            "a list inside a map has no rendering",
+            "j = sleep 0.2 &\nxs = [a [$j]]\nputs $xs\n",
+            "a job handle has no text form",
         ),
     ] {
         let out = run_with_input(&format!("{src}puts recovered\n"));
@@ -1316,6 +1314,52 @@ fn puts_refuses_a_value_with_no_text_form_and_recovers() {
             out.stdout
         );
     }
+}
+
+/// A nested collection moves down a level rather than being refused: indented
+/// under a map key, bulleted as a list element. The bullet is what keeps
+/// `[[1 2] [3 4]]` distinguishable from the flat `[1 2 3 4]`.
+#[test]
+fn puts_renders_a_nested_collection_indented() {
+    for (src, want) in [
+        ("m = [a: [1 2], b: 3]\nputs $m\n", "a:\n  1\n  2\nb: 3\n"),
+        ("xs = [[1 2] [3 4]]\nputs $xs\n", "- 1\n  2\n- 3\n  4\n"),
+        ("xs = [1 2 3 4]\nputs $xs\n", "1\n2\n3\n4\n"),
+        // A scalar element keeps its bare line; the marker goes only where the
+        // ambiguity is.
+        ("xs = [a [b]]\nputs $xs\n", "a\n- b\n"),
+        // Depth is not capped.
+        ("m = [a: [b: [1 2]]]\nputs $m\n", "a:\n  b:\n    1\n    2\n"),
+        // An empty nested collection keeps its line without trailing space.
+        ("m = [a: [], b: 1]\nputs $m\n", "a:\nb: 1\n"),
+        // `print` renders identically, minus the trailing newline.
+        ("m = [a: [1 2]]\nprint $m\n", "a:\n  1\n  2"),
+    ] {
+        let out = run_with_input(src);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{src:?}");
+        assert!(
+            out.stderr.is_empty(),
+            "{src:?}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The rendering reads like YAML and is deliberately not YAML: nothing quotes or
+/// escapes, so a scalar that looks like structure is indistinguishable from it.
+/// `:repr` is the form that survives a round trip, and it stays unchanged.
+#[test]
+fn the_nested_rendering_is_not_a_round_trip_format() {
+    // A scalar holding a newline renders as two lines, exactly as two elements do.
+    let out = run_with_input("xs = [\"a\nb\"]\nys = [a b]\nputs $xs\nputs $ys\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\na\nb\n");
+
+    // `:repr` is where the difference survives.
+    let out = run_with_input("xs = [\"a\nb\"]\nys = [a b]\nputs $xs:repr\nputs $ys:repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "['a\\nb']\n['a', 'b']\n"
+    );
 }
 
 #[test]
@@ -25660,22 +25704,27 @@ fn the_list_building_modifiers_refuse_a_subject_that_is_not_a_list() {
     }
 }
 
-/// A bare `$env` is a map whose path-type entries are lists, so `puts $env` meets
-/// the ordinary "a collection inside a collection has no rendering" rule. Pinned
-/// alongside an ordinary nested map, because the point is that `$env` is **not** a
-/// special case — making it printable would mean changing what `puts` does for
-/// every map, which is a language decision rather than a fix here.
+/// A bare `$env` is a map whose path-type entries are lists, so it prints under
+/// the ordinary nested-collection rule — indented, with no rule of its own. Pinned
+/// because `$env` being *not* a special case is the point: it prints for the same
+/// reason any other nested map does.
 #[test]
-fn a_bare_env_reads_through_its_accessors_rather_than_printing_whole() {
+fn a_bare_env_prints_under_the_ordinary_nesting_rule() {
+    // `PATH` is the list entry, so it is the one that moves to an indented block.
     let out = run_with_input("puts $env\n");
-    let whole = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(whole.contains("has no rendering"), "{whole}");
+    let whole = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(whole.contains("\nPATH:\n  /"), "{whole}");
 
-    let out = run_with_input("m = [a: [1 2]]\nputs $m\n");
-    let ordinary = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(ordinary.contains("has no rendering"), "{ordinary}");
+    // The same shape an ordinary nested map gets — no `$env` special case.
+    let out = run_with_input("m = [a: [1 2], b: 3]\nputs $m\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a:\n  1\n  2\nb: 3\n");
 
-    // The accessors are what it is for, and they work.
+    // The accessors still work, and stay the way to read one name.
     let out = run_with_input(
         "puts $env:get(MESH_TEST_ABSENT, none)\nputs ($env:keys:len > 0)\nputs $env.PATH:len\n",
     );
@@ -25684,7 +25733,7 @@ fn a_bare_env_reads_through_its_accessors_rather_than_printing_whole() {
     let mut lines = lines.lines();
     assert_eq!(lines.next(), Some("none"));
     assert_eq!(lines.next(), Some("true"));
-    // `PATH` is a list, which is the reason the whole map does not print.
+    // `PATH` is a list, which is why it is the entry that nests.
     assert!(
         lines
             .next()

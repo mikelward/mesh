@@ -4597,7 +4597,18 @@ programs or user functions:
     newlines; a value with **no canonical byte form** — an `Instant`, a `regex`, a
     stream handle — is a **loud error** here, exactly as at the argv boundary above,
     never a guessed rendering — then **join the arguments with a single space** and append a trailing
-    newline. So `puts a b` → `a b`, `puts $(ls)` → one file per line, and a mixed
+    newline. A **nested** collection keeps that rule and moves down a level: under
+    a map key it goes on the lines below, indented two spaces, and as a list element
+    it takes a `- ` bullet. The bullet goes only where the ambiguity is — a scalar
+    element needs no marker because the line break already separates it, while a
+    nested collection's line breaks are *inside* it, so `[[1 2] [3 4]]` would
+    otherwise print exactly as the flat `[1 2 3 4]`. Depth is **not capped**;
+    indentation is what makes depth readable. So `puts $env` prints as an ordinary
+    map, its path-type entries as indented blocks, with no rule of its own. The
+    result reads like YAML and is deliberately **not** YAML: nothing here quotes or
+    escapes, so a scalar holding a newline — or one that starts with `- ` — renders
+    ambiguously. That is the standing trade for output meant to be *read*;
+    [`:repr`](#modifiers) is the form that survives a round trip. So `puts a b` → `a b`, `puts $(ls)` → one file per line, and a mixed
     `puts head $xs tail` is fully defined by that rule. `puts` can render rich values
     because it is a **built-in** on real values — an *external* command still needs
     bytes (spread or [`:join`](#spread--flattening)). It takes **no flags** — none of
