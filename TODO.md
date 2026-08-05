@@ -2098,31 +2098,48 @@ designed, and the cross-references say where the fuller note lives.
       limit. Four instances now argue for doing it properly; all four were
       raised by review on mikelward/mesh#318.
 
-- [ ] **How `puts` should render a nested structure.** *(mikelward)* A collection
-      inside a collection has no rendering today, so `puts $m` on
-      `[a: [1 2]]` is a loud error, and so is `puts $env` — the path-type names
-      are lists, which is what keeps `$env.PATH` and `$env:get(PATH, …)` the same
-      value. The error is honest (better than a guessed flattening), but it means
-      the one obvious way to *look at* a nested value is unavailable, and `$env`
-      made that reachable by accident rather than by choice.
+- [x] **How `puts` should render a nested structure** *(landed — the **indented**
+      shape, chosen by mikelward over deferring to `:repr` or printing the outer
+      level only)*. A collection inside a collection had no rendering, so `puts $m`
+      on `[a: [1 2]]` was a loud error, and so was `puts $env` — the path-type
+      names are lists, which is what keeps `$env.PATH` and `$env:get(PATH, …)` the
+      same value. The error was honest (better than a guessed flattening), but it
+      meant the one obvious way to *look at* a nested value was unavailable.
 
-      `puts` renders for **reading** — a scalar as itself, a list one element per
-      line, a map as `key: value` lines — so the question is what the nested case
-      reads as. Some shapes to weigh:
-  - [ ] An **indented** rendering, one level per depth, which is what a reader
-        drawing it by hand would do. Needs a rule for how deep before it stops
-        being readable, and whether a list of scalars stays on one line.
-  - [ ] Defer to **`:repr`**, which already writes any nested value down and is
-        defined round-trip. That answers "show me what I have" without inventing
-        a second format — but `:repr` quotes for round-tripping, which is exactly
-        what `puts` exists not to do.
-  - [ ] Render only the **outer** level, with a nested element shown by its shape
-        (`[3 elements]`, `[2 entries]`) rather than its contents. Keeps output one
-        line per entry, at the cost of not showing the value.
+      A nested collection now moves down a level: under a map key it goes on the
+      lines below, indented two spaces; as a list element it takes a `- ` bullet.
+      The bullet sits only where the ambiguity is — a scalar element needs no
+      marker because the line break already separates it, while a nested
+      collection's line breaks are *inside* it, so `[[1 2] [3 4]]` would otherwise
+      print exactly as the flat `[1 2 3 4]`. Depth is not capped: indentation is
+      what makes depth readable, and an elision rule would need explaining in
+      output that exists to be read. `$env` prints under the ordinary rule rather
+      than one of its own, which is the point of it being an ordinary map.
 
-      Whatever it becomes, `$env` should print under it rather than needing a
-      rule of its own — a listing whose entries are typed the way every other read
-      types them is the point of it being an ordinary map.
+      The result reads like YAML and is deliberately **not** YAML — nothing quotes
+      or escapes, so a scalar holding a newline, or one starting with `- `, renders
+      ambiguously. `:repr` is the form that survives a round trip, and the docs say
+      so at the rendering rule.
+
+- [ ] **Whether a map entry should be spelled `=` rather than `:`.** *(mikelward
+      prefers `=`)* `puts` renders a map as `key: value`, matching the map literal
+      `[a: 1]` and `:repr`'s `['a': 1]`. The standing preference is an equals, which
+      for `$env` is the universal spelling (`EDITOR=vim`) and is valid mesh
+      assignment besides — `FOO=bar` parses.
+
+      Two things argue against changing `puts` alone. A trailing `PATH=` above an
+      indented block reads as truncated, since a bare `FOO=` is a *syntax error* in
+      mesh, where `PATH:` has the established "block follows" reading. And `:` is
+      already the map spelling in the literal and in `:repr`, so an equals in
+      `puts` would make it the one place a map entry doesn't look like a map.
+
+      So this is a language-wide question — literal, `:repr`, and `puts` moving
+      together — not a `puts` rendering choice, and it is recorded here rather than
+      settled in the rendering work. A bracketed middle form (`PATH=[` … `]`) was
+      weighed and set aside: space-separating the elements inside reintroduces the
+      separator guess a path containing a space breaks silently, and one element
+      per line makes the brackets pure framing — that is `:repr` pretty-printed,
+      which is better pursued in `:repr` than by making `puts` a format.
 
 - [x] **A modifier chain in `"…"` is dropped when punctuation abuts it**
       *(landed — the name now stops at the first character that cannot be in one;
@@ -6160,8 +6177,9 @@ a one-line edit. Every claim below was checked against the built shell.
       A list element is a word, and a word containing a glob metacharacter
       expands to zero or more matches everywhere else, but `xs = [*.txt]` is a list of
       **one** element that is itself the match list — `$xs:len` is `1`, and
-      `puts $xs` reports `a list inside a list has no rendering`. `[z *.txt]`
-      measures `2` the same way. Either the element expansion should splice its
+      `puts $xs` now prints the matches as a single bulleted block rather than one
+      per line, which is the nesting made visible. `[z *.txt]` measures `2` the
+      same way. Either the element expansion should splice its
       matches, as it does in command arguments, or the nesting is deliberate and
       the doc sentence is wrong; decide which before writing the test.
 - [ ] **Two space-separated globs in a list literal do not parse.** `xs = [* *]`

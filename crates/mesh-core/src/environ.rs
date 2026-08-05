@@ -64,10 +64,10 @@ fn typed(key: &str, raw: &std::ffi::OsStr) -> Value {
 /// The whole environment as an ordered map, sorted by name so the order is stable
 /// rather than inherited from `environ`'s arbitrary one. Each entry is typed as
 /// [`read`] types it, so a path-type name is a **list** here too — which is what
-/// keeps `$env:get(PATH, …)` and `$env.PATH` the same value, and what makes the
-/// map one `puts` refuses, under the ordinary rule that a collection nested in a
-/// collection has no rendering. `$env:keys`, `$env:get(NAME, …)` and `$env.NAME`
-/// are the ways to read it; sorting is for those, not for a whole-map print.
+/// keeps `$env:get(PATH, …)` and `$env.PATH` the same value, and what makes those
+/// entries print as indented blocks under the ordinary nesting rule — `puts $env`
+/// needs no rule of its own. The sort is what makes that print stable, as well as
+/// ordering `$env:keys`, `$env:get(NAME, …)` and `$env.NAME`.
 ///
 /// This is what a bare `$env` denotes, which is what gives `$env:get(EDITOR,
 /// vim)` — the `${EDITOR:-vim}` of `DESIGN.md` §"Variables and assignment" — an

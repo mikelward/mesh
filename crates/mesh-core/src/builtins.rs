@@ -1002,6 +1002,18 @@ fn puts(args: &[String], newline: bool) -> u8 {
 /// a stream or job handle, a function, a pattern — is a **loud error** rather than
 /// a guessed rendering, exactly as at the argv boundary.
 ///
+/// A **nested** collection keeps that rule and moves down a level: under a map key
+/// it goes on the lines below, [indented](indented); as a list element it takes a
+/// [`- ` bullet](bulleted). The bullet is only where the ambiguity is — a scalar
+/// element needs no marker because the line break already separates it, while a
+/// nested collection's line breaks are *inside* it, so `[[1 2] [3 4]]` would
+/// otherwise print exactly as the flat `[1 2 3 4]`.
+///
+/// The result reads like YAML and is deliberately not YAML: nothing here quotes or
+/// escapes, so a scalar holding a newline — or one that itself starts with `- ` —
+/// renders ambiguously. That is the standing trade for output meant to be read.
+/// [`:repr`](crate::repl) is the form that survives a round trip.
+///
 /// This is why `puts` takes its arguments as values rather than as words: the
 /// argv boundary refuses a list outright, since an external command needs bytes
 /// and there is no canonical separator to pick. `puts` is a builtin looking at a
@@ -1022,11 +1034,9 @@ pub(crate) fn rendered_for_output(value: &Value, decoration: Decoration) -> Resu
             let mut lines = Vec::with_capacity(items.len());
             for item in items {
                 lines.push(match item {
-                    // A list of lines cannot nest: the rendering would have to
-                    // invent a second separator, and `DESIGN.md` refuses the guess
-                    // here as it does at every other boundary.
-                    Value::List(_) => return Err("a list inside a list has no rendering".into()),
-                    Value::Map(_) => return Err("a map inside a list has no rendering".into()),
+                    nested @ (Value::List(_) | Value::Map(_)) => {
+                        bulleted(&rendered_for_output(nested, decoration)?)
+                    }
                     scalar => rendered_for_output(scalar, decoration)?,
                 });
             }
@@ -1035,12 +1045,17 @@ pub(crate) fn rendered_for_output(value: &Value, decoration: Decoration) -> Resu
         Value::Map(entries) => {
             let mut lines = Vec::with_capacity(entries.len());
             for (key, entry) in entries {
-                let rendered = match entry {
-                    Value::List(_) => return Err("a list inside a map has no rendering".into()),
-                    Value::Map(_) => return Err("a map inside a map has no rendering".into()),
-                    scalar => rendered_for_output(scalar, decoration)?,
-                };
-                lines.push(format!("{key}: {rendered}"));
+                lines.push(match entry {
+                    nested @ (Value::List(_) | Value::Map(_)) => {
+                        match rendered_for_output(nested, decoration)? {
+                            // An empty collection has no block to hang below the
+                            // key, and a bare `key:` beats a line of trailing space.
+                            block if block.is_empty() => format!("{key}:"),
+                            block => format!("{key}:\n{}", indented(&block)),
+                        }
+                    }
+                    scalar => format!("{key}: {}", rendered_for_output(scalar, decoration)?),
+                });
             }
             Ok(lines.join("\n"))
         }
@@ -1051,6 +1066,57 @@ pub(crate) fn rendered_for_output(value: &Value, decoration: Decoration) -> Resu
         Value::Job(_) => Err("a job handle has no text form; ask it for a member".into()),
         Value::Function(_) => Err("a function value has no text form; call it".into()),
     }
+}
+
+/// One level of nesting in rendered output. Two spaces, so a deep value stays on
+/// the line rather than walking off the terminal.
+const NEST_INDENT: &str = "  ";
+
+/// Shift a rendered block one level right, to sit under the map key that holds it.
+///
+/// An empty line stays empty: indenting it would emit trailing whitespace that no
+/// reader can see and every diff can.
+fn indented(block: &str) -> String {
+    block
+        // `split` rather than `lines`: a scalar renders as itself, so a trailing
+        // newline is a blank line the block still has, and a `\r\n` is the text's
+        // own bytes. `lines` would eat both.
+        .split('\n')
+        .map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!("{NEST_INDENT}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Mark a rendered block as **one** element of the list holding it: `- ` on its
+/// first line, the same width of indent on the rest, so where an element begins
+/// stays visible however many lines it takes.
+fn bulleted(block: &str) -> String {
+    if block.is_empty() {
+        // A bare `-`, not `- ` — an empty element still needs its marker, and the
+        // trailing space would be invisible whitespace.
+        return "-".to_owned();
+    }
+    block
+        // See [`indented`](indented) on why this is not `lines`.
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                format!("- {line}")
+            } else if line.is_empty() {
+                String::new()
+            } else {
+                format!("{NEST_INDENT}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// How much base64 `clip` will send. Terminals bound the sequence they will
@@ -1497,6 +1563,89 @@ mod tests {
         );
     }
 
+    fn rendered(value: &Value) -> String {
+        rendered_for_output(value, Decoration::plain()).expect("renders")
+    }
+
+    #[test]
+    fn a_nested_collection_moves_down_a_level() {
+        // Under a key, the block sits below and indented — the `$env` shape.
+        let map = Value::Map(vec![
+            ("EDITOR".to_owned(), Value::String("vim".into())),
+            (
+                "PATH".to_owned(),
+                Value::List(vec![
+                    Value::String("/usr/bin".into()),
+                    Value::String("/bin".into()),
+                ]),
+            ),
+        ]);
+        assert_eq!(rendered(&map), "EDITOR: vim\nPATH:\n  /usr/bin\n  /bin");
+
+        // As a list element it takes a bullet, so where each element starts stays
+        // visible — without it this is indistinguishable from a flat `[1 2 3 4]`.
+        let nested = Value::List(vec![
+            Value::List(vec![Value::Integer(1), Value::Integer(2)]),
+            Value::List(vec![Value::Integer(3), Value::Integer(4)]),
+        ]);
+        assert_eq!(rendered(&nested), "- 1\n  2\n- 3\n  4");
+
+        // A scalar element keeps its bare line: the marker goes only where the
+        // ambiguity is.
+        let mixed = Value::List(vec![
+            Value::String("a".into()),
+            Value::List(vec![Value::String("b".into())]),
+        ]);
+        assert_eq!(rendered(&mixed), "a\n- b");
+
+        // Depth is not capped; each level shifts by one indent.
+        let deep = Value::Map(vec![(
+            "a".to_owned(),
+            Value::Map(vec![("b".to_owned(), Value::List(vec![Value::Integer(1)]))]),
+        )]);
+        assert_eq!(rendered(&deep), "a:\n  b:\n    1");
+
+        // A map inside a list bullets its first entry and aligns the rest.
+        let maps = Value::List(vec![Value::Map(vec![
+            ("a".to_owned(), Value::Integer(1)),
+            ("b".to_owned(), Value::Integer(2)),
+        ])]);
+        assert_eq!(rendered(&maps), "- a: 1\n  b: 2");
+    }
+
+    /// "A scalar renders as itself" has to keep holding once the scalar is nested:
+    /// indenting shifts the block sideways, it does not rewrite the text. A
+    /// line-splitter that ate the terminators would silently normalize both of
+    /// these, and only when nested — the top level would still be right.
+    #[test]
+    fn nesting_shifts_a_scalar_without_rewriting_it() {
+        // A trailing newline is a blank line the block still has.
+        let map = Value::Map(vec![(
+            "k".to_owned(),
+            Value::List(vec![Value::String("a\n".into())]),
+        )]);
+        assert_eq!(rendered(&map), "k:\n  a\n");
+
+        // `\r\n` is the text's own bytes, not a line ending to normalize.
+        let crlf = Value::Map(vec![(
+            "k".to_owned(),
+            Value::List(vec![Value::String("a\r\nb".into())]),
+        )]);
+        assert_eq!(rendered(&crlf), "k:\n  a\r\n  b");
+
+        // The same through a bullet.
+        let list = Value::List(vec![Value::List(vec![Value::String("a\n".into())])]);
+        assert_eq!(rendered(&list), "- a\n");
+    }
+
+    #[test]
+    fn an_empty_nested_collection_renders_without_trailing_space() {
+        let map = Value::Map(vec![("k".to_owned(), Value::List(vec![]))]);
+        assert_eq!(rendered(&map), "k:");
+        let list = Value::List(vec![Value::Map(vec![]), Value::Integer(1)]);
+        assert_eq!(rendered(&list), "-\n1");
+    }
+
     #[test]
     fn a_value_with_no_byte_form_is_a_loud_error() {
         // Naming the type beats guessing a rendering, the same answer the argv
@@ -1505,8 +1654,10 @@ mod tests {
             Value::Glob("*.rs".into()),
             Value::Stream(1),
             Value::Job(1),
-            Value::List(vec![Value::List(vec![])]),
-            Value::Map(vec![("k".to_owned(), Value::Map(vec![]))]),
+            // Nesting renders (see `a_nested_collection_moves_down_a_level`); a
+            // value with no byte form stays an error wherever it is found.
+            Value::List(vec![Value::List(vec![Value::Stream(1)])]),
+            Value::Map(vec![("k".to_owned(), Value::Job(1))]),
         ] {
             assert!(
                 rendered_for_output(&value, Decoration::plain()).is_err(),
