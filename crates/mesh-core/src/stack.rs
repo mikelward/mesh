@@ -23,6 +23,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::exec;
+
 /// The two ends of the stack the shell is running on, published for [`on_fault`]
 /// to compare a faulting address against. Zero means "not known", under which a
 /// fault reads as an ordinary bad address rather than an overflow — the cautious
@@ -184,6 +186,14 @@ extern "C" fn on_fault(
     info: *mut libc::siginfo_t,
     _context: *mut libc::c_void,
 ) {
+    // A bounded run supervised from this process has its command in a process
+    // group nothing else can name, so ending here without passing the fault on
+    // would leave that command running with no deadline behind it. Sent first,
+    // because everything below this leads to `_exit`.
+    //
+    // SAFETY: async-signal-safe (one atomic read and a `kill`), and this handler
+    // is only reached in a process that could be supervising one.
+    unsafe { exec::hand_off_timed_group(libc::SIGKILL) };
     // SAFETY: `SA_SIGINFO` guarantees a valid `siginfo_t` for the life of the
     // handler, and `si_addr` only reads it.
     let address = unsafe { info.as_ref().map_or(0, |info| info.si_addr() as usize) };

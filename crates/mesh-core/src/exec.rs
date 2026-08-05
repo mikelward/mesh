@@ -2323,7 +2323,11 @@ fn restore_terminal_modes(modes: &libc::termios) {
 /// `JobTable`'s, which signals jobs on drop and would otherwise reach the parent's
 /// jobs from a child that never owned them. Buffered output is flushed *before*
 /// forking, since a copy of the buffer would otherwise be printed twice.
-pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std::io::Result<u8> {
+pub(crate) fn fork_and_wait(
+    interactive: bool,
+    deadline: Option<std::time::Instant>,
+    body: impl FnOnce() -> u8,
+) -> std::io::Result<u8> {
     use std::io::Write;
 
     let _ = std::io::stdout().flush();
@@ -2337,7 +2341,22 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
     // reading. `in_forked_stage` is the existing answer to "am I the shell", so
     // it is asked here rather than trusted to every caller.
     let job_control = interactive && !in_forked_stage();
+    // A bounded run needs its own group whether or not this shell does job
+    // control: the limit is enforced by signalling, and the body may have
+    // started children of its own that signalling the leader alone would leave
+    // running. `timeout(1)` makes the same trade, which is why it has a
+    // `--foreground` for the cases that would rather keep the shell's group.
+    let own_group = job_control || deadline.is_some();
     let shell_modes = if job_control { terminal_modes() } else { None };
+    // That nested group is outside every table and every parent's reach, so
+    // whoever supervises it has to pass on the signal that ends them. See
+    // `TimedGroup`; installed before the fork so there is no instant where the
+    // group exists and nothing would hand a kill on to it.
+    let mut handoff = if deadline.is_some() {
+        TimedGroup::install()
+    } else {
+        None
+    };
 
     // SAFETY: fork has no arguments. The child runs `body` and leaves via
     // `_exit`, so it never unwinds back through the parent's stack or runs a
@@ -2353,6 +2372,11 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
         return Err(std::io::Error::last_os_error());
     }
     if pid == 0 {
+        // Before anything else: the handler and the blocked mask this child
+        // inherited belong to the supervisor, and the group they name is itself.
+        if let Some(handoff) = &handoff {
+            handoff.restore_in_child();
+        }
         // This process is no longer the interactive shell. It owns none of the
         // jobs in the `JobTable` it inherited — the pids in there are the
         // parent's children, not its own — so `jobs` must not `waitpid` on them
@@ -2364,9 +2388,11 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
         // caller's signal dispositions through untouched: a batch runner that
         // launches a script with `SIGINT` ignored means it to stay ignored, and
         // entering a `fork` block is not a reason to change the contract.
-        if job_control {
+        if own_group {
             // SAFETY: scalar arguments; this is the child, so 0 means itself.
             unsafe { libc::setpgid(0, 0) };
+        }
+        if job_control {
             // An interactive shell ignores the terminal signals so Ctrl-C reaches
             // the foreground job rather than the shell. A child that goes on to
             // `exec` has these restored for it; this one stays in mesh code, so
@@ -2395,9 +2421,14 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
     // does nothing rather than losing one.
     // Set from the parent as well as the child, so neither side races the other
     // into needing the group that is not there yet.
-    if job_control {
+    if own_group {
         // SAFETY: scalar arguments naming this process's own child.
         unsafe { libc::setpgid(pid, pid) };
+    }
+    // The group exists now, so the handoff has something to name; this also lets
+    // the signals it holds blocked through.
+    if let Some(handoff) = &mut handoff {
+        handoff.arm(pid);
     }
     // The wait's *outcome* rather than its status, because a failure has to leave
     // by the same door: the child took the terminal, so returning early on an error
@@ -2410,12 +2441,31 @@ pub(crate) fn fork_and_wait(interactive: bool, body: impl FnOnce() -> u8) -> std
         // `Resume`: the subshell holds the terminal, so a Ctrl-C goes to it and
         // this wait has nothing to give up on — the same reading a foreground
         // job's wait takes.
-        let (status, stopped) = match wait_for_job(pid, OnInterrupt::Resume, None) {
+        let (status, stopped) = match wait_for_job(pid, OnInterrupt::Resume, deadline) {
             Ok(waited) => waited,
+            Err(error) if error.kind() == ErrorKind::TimedOut => {
+                // The limit is this caller's to enforce, so the subshell is
+                // ended here rather than left for someone else to notice. The
+                // whole group where there is one: the body may have started
+                // children of its own, and signalling the leader alone would
+                // leave them running with nobody waiting for them.
+                //
+                end_timed_run(pid, own_group);
+                break Err(error);
+            }
             Err(error) => break Err(error),
         };
         if !stopped {
             break Ok(status);
+        }
+        // A bounded run's stop is one this process *asked* for: the handoff
+        // forwards a caught stop to the group and then stops here too, so by the
+        // time this wait resumes the matching `SIGCONT` has already been passed
+        // on. Continuing again would only add a note about a suspension that was
+        // deliberate — and the deadline still bounds a group stopped some other
+        // way, since it is wall clock either way.
+        if deadline.is_some() {
+            continue;
         }
         note!("mesh: fork: a subshell cannot be suspended yet");
         // The whole **group**, not just the leader. A stop from the keyboard
@@ -2651,6 +2701,469 @@ impl Drop for SigintCatcher {
             libc::sigaction(libc::SIGINT, &self.previous, std::ptr::null_mut());
         }
         SIGINT_SEEN.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The process group a bounded run must take down with it, or zero when there is
+/// none. Written by [`TimedGroup`], read only by its handler.
+static TIMED_GROUP: AtomicI32 = AtomicI32::new(0);
+
+/// Is this signal one the supervisor must **not** take over?
+///
+/// Stated as an exclusion on purpose. A list of the signals to *hand on* was
+/// wrong three times running — four names, then fourteen, then fourteen without
+/// the real-time range — because "every signal that would end this process"
+/// cannot be enumerated by hand: the set is platform-specific, partly unnamed,
+/// and grows. The complement is small, closed, and each entry has a reason.
+///
+/// The **synchronous faults** are not among them, though the first version of
+/// this excluded them. Whether a `SIGILL` is a fault is not a property of the
+/// number: `kill -ILL` sends the same signal and ends the supervisor just as a
+/// bad instruction would. The distinction is *how it was delivered*, which the
+/// handler reads from `si_code` — so faults are taken over here and sorted out
+/// there.
+fn never_handed_off(signal: libc::c_int) -> bool {
+    // Uncatchable. `sigaction` refuses these, so a handler would be a lie.
+    if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+        return true;
+    }
+    // Default action is to *ignore*, so this process is going nowhere and there
+    // is nothing to hand on. Taking one over would turn a harmless signal into a
+    // death — a terminal resize would end the shell.
+    if matches!(signal, libc::SIGCHLD | libc::SIGURG | libc::SIGWINCH) {
+        return true;
+    }
+    // Its own handler; see `continue_timed_group`.
+    if signal == libc::SIGCONT {
+        return true;
+    }
+    // BSD's `SIGINFO` is ignored by default too — Ctrl-T must not end a shell.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    if signal == libc::SIGINFO {
+        return true;
+    }
+    false
+}
+
+/// Did the kernel raise this signal **against** this process as a synchronous
+/// fault, rather than anybody sending it?
+///
+/// The one case where the group must not hear about it, and it takes both
+/// halves of the question. `si_code` alone is not enough: a positive code means
+/// "the kernel generated this", which covers `SI_KERNEL` on a terminal's Ctrl-C
+/// just as much as `SEGV_MAPERR` on a bad address — so testing the code by
+/// itself stopped Ctrl-C from reaching a timed group. The *signal* is what says
+/// a fault is even possible; the code then says whether this instance was one.
+///
+/// # Safety
+///
+/// `info` must be the `siginfo_t` the kernel passed to a `SA_SIGINFO` handler.
+/// Async-signal-safe: one read.
+unsafe fn raised_as_a_fault(signal: libc::c_int, info: *const libc::siginfo_t) -> bool {
+    let faultable = matches!(
+        signal,
+        libc::SIGILL | libc::SIGTRAP | libc::SIGBUS | libc::SIGFPE | libc::SIGSEGV | libc::SIGSYS
+    );
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    let faultable = faultable || signal == libc::SIGEMT;
+    // A null `info` cannot be judged, so it is treated as sent: forwarding a
+    // signal the group did not need is recoverable, and not forwarding one it
+    // did is the bug this whole path exists for.
+    faultable && !info.is_null() && unsafe { (*info).si_code } > 0
+}
+
+/// The highest signal number to consider, so the sweep covers the platform's
+/// whole range rather than the names this file happens to know.
+///
+/// FreeBSD's numbering runs past 31 into `SIGTHR` and `SIGLIBRT`, which belong
+/// to its threading library rather than to anyone sending a job a signal; the
+/// standard range stops short of them deliberately.
+fn highest_signal() -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    {
+        libc::SIGRTMAX()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        STANDARD_SIGNALS
+    }
+}
+
+/// The last of the standard signals, above which a platform's numbering is its
+/// own — Linux's real-time range, FreeBSD's `SIGTHR` and `SIGLIBRT`.
+const STANDARD_SIGNALS: libc::c_int = 31;
+
+/// The catchable **stops**, and the continue that undoes them.
+///
+/// A stopped job whose command keeps running is the same desynchronization one
+/// step sideways: `kill -TSTP %1` stopped the stage while the wrapped command
+/// carried on. `SIGSTOP` cannot be caught, so it is the one way in that no
+/// forwarding can cover — the same gap `SIGKILL` is for the list above.
+const JOB_STOPPING_SIGNALS: &[libc::c_int] = &[libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
+
+/// Delivered to the timed group in place of the stop that was caught, so a
+/// member that ignores `SIGTSTP` stops anyway — which is what the kernel would
+/// have done had the group been in the job's signal domain to begin with.
+const GROUP_STOP: libc::c_int = libc::SIGSTOP;
+
+/// Which of [`JOB_STOPPING_SIGNALS`] this supervisor took over, as a bitmask.
+/// Read by [`continue_timed_group`], which has to put back the one a stop just
+/// consumed — and can only do that for the ones that were this guard's to take.
+static STOPS_TAKEN: AtomicI32 = AtomicI32::new(0);
+
+/// Is this one of the real-time signals the C library keeps for itself?
+///
+/// The gap between the standard signals and the first *usable* real-time one:
+/// glibc takes the numbers just above 31 for its threading, and `SIGRTMIN()` is
+/// a function precisely so it can report where that ends.
+///
+/// Expressed as that gap rather than as a count below `SIGRTMIN()`, which is
+/// what the first version did — `SIGRTMIN() - 3` is 31 on glibc, so guessing at
+/// how many were reserved silently dropped `SIGSYS` out of the sweep. The two
+/// ends are both known; nothing here needs to be estimated.
+fn reserved_realtime(signal: libc::c_int) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        signal > STANDARD_SIGNALS && signal < libc::SIGRTMIN()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = signal;
+        false
+    }
+}
+
+extern "C" fn end_timed_group(
+    signal: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _context: *mut libc::c_void,
+) {
+    // SAFETY: `kill`, `sigemptyset`, `sigaction` and `raise` are all
+    // async-signal-safe. The negated form names a group `fork_and_wait` made
+    // with `setpgid`; zero means there is none, and the signal is simply passed
+    // on to this process.
+    unsafe {
+        // Everything except a fault the kernel raised against this process: that
+        // one says nothing about the timed group, and its handler is running on
+        // the state that produced it, so it does the one safe thing and gets out
+        // of the way. Anything else is passed on, however it was generated — a
+        // terminal's Ctrl-C is the kernel's doing too, and the group needs it.
+        if !raised_as_a_fault(signal, info) {
+            forward_to_timed_group(signal);
+        }
+        // Then end exactly as this process would have with no handler installed,
+        // so the stage's own status still reports the signal — and, for a stop,
+        // so the job really does stop rather than run on with its group halted.
+        // A fault reaches the same place by a different road: restoring the
+        // default and returning re-runs the faulting instruction, which faults
+        // again with nothing installed. The raise covers everything else, and is
+        // delivered when this returns since the handler runs with its own signal
+        // blocked.
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0;
+        libc::sigaction(signal, &action, std::ptr::null_mut());
+        libc::raise(signal);
+    }
+}
+
+/// `SIGCONT` resumes this process *before* the handler runs, so this one has
+/// nothing to re-raise — but it does have to put the stop handler back.
+///
+/// A caught stop ends through `SIG_DFL`, which *consumes* the disposition:
+/// without this, only a job's first suspension would reach the timed group and
+/// every one after it would stop the supervisor alone.
+extern "C" fn continue_timed_group(_signal: libc::c_int) {
+    // SAFETY: as above, and `sigaction`/`sigemptyset` are async-signal-safe too.
+    unsafe {
+        forward_to_timed_group(libc::SIGCONT);
+        let taken = STOPS_TAKEN.load(Ordering::SeqCst);
+        for (index, signal) in JOB_STOPPING_SIGNALS.iter().enumerate() {
+            // Only the ones this supervisor took over in the first place: a stop
+            // left ignored or handled by someone else stays theirs.
+            if taken & (1 << index) == 0 {
+                continue;
+            }
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = end_timed_group
+                as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+                as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = libc::SA_SIGINFO;
+            libc::sigaction(*signal, &action, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Pass `signal` to the group a bounded run is supervising from this process,
+/// for a handler outside this module that is about to end the process anyway.
+///
+/// `stack`'s fault handler is the one caller: mesh guards `SIGSEGV` itself, so
+/// the handoff leaves that disposition alone (it belongs to someone else, by the
+/// same rule that leaves an ignore alone) — and without this, a crash there
+/// would strand the timed command.
+///
+/// # Safety
+///
+/// Must be async-signal-safe: called from a signal handler. `kill` is.
+pub(crate) unsafe fn hand_off_timed_group(signal: libc::c_int) {
+    unsafe { forward_to_timed_group(signal) };
+}
+
+/// Pass `signal` to the group this process is supervising, if it has one.
+///
+/// A stop is translated to `SIGSTOP` so it cannot be refused; everything else
+/// goes on as sent, since the group should see what the supervisor saw.
+///
+/// # Safety
+///
+/// Must be async-signal-safe: called from a signal handler. `kill` is.
+unsafe fn forward_to_timed_group(signal: libc::c_int) {
+    let group = TIMED_GROUP.load(Ordering::SeqCst);
+    if group <= 0 {
+        return;
+    }
+    let sent = if JOB_STOPPING_SIGNALS.contains(&signal) {
+        GROUP_STOP
+    } else {
+        signal
+    };
+    unsafe { libc::kill(-group, sent) };
+}
+
+/// How long a timed group is given to leave on its own after the `SIGTERM`,
+/// before the limit is enforced with a signal it cannot refuse. Short, because
+/// the whole promise of the builtin at a prompt is that it comes back.
+const TIMED_GROUP_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// End the run the limit ran out on: ask the group to go, then insist.
+///
+/// The `SIGTERM` is a request, and a request has two ways of going unanswered.
+/// A command can trap it — [`drain_timed_group`] is the answer to that — and a
+/// command can be **stopped**, where the signal sits pending and nothing acts on
+/// it at all. `timeout 300ms sh -c 'kill -STOP 0'` is the second: a stopped
+/// subshell is not going to exit, so the wait that reaps it never returned and
+/// the escalation below was never reached. The `SIGCONT` is what lets a stopped
+/// group act on the request it was just sent, and `timeout(1)` sends one after
+/// its own signal for exactly this reason.
+///
+/// Every wait here is bounded by the same grace, so a group that stops itself
+/// *again* still ends: the escalation cannot be refused, and only the reap that
+/// follows it is unbounded.
+fn end_timed_run(pid: libc::pid_t, own_group: bool) {
+    let deadline = std::time::Instant::now() + TIMED_GROUP_GRACE;
+    // SAFETY: scalar arguments naming this process's own child, and the negated
+    // form only where `setpgid` made it a leader.
+    unsafe {
+        let target = if own_group { -pid } else { pid };
+        libc::kill(target, libc::SIGTERM);
+        libc::kill(target, libc::SIGCONT);
+    }
+    let _ = wait_for_job(pid, OnInterrupt::Resume, Some(deadline));
+    if own_group {
+        drain_timed_group(pid, deadline);
+    }
+    // Nothing left can refuse, so this one waits as long as it needs to and the
+    // child is reaped rather than left a zombie.
+    let _ = wait_for_job(pid, OnInterrupt::Resume, None);
+}
+
+/// Make sure a timed group is actually gone.
+///
+/// The `SIGTERM` on expiry is a *request*, and a command is free to trap or
+/// ignore it — `sh -c 'trap "" TERM; sleep 60'` does. The subshell leading the
+/// group is not free: it dies from that same signal, so the wait returns and
+/// `timeout` would report `124` while the command it was told to bound carried
+/// on with nobody left watching it. That is the failure the group exists to
+/// prevent, one level further down.
+///
+/// `timeout(1)` answers this by **staying** — it keeps waiting for its child,
+/// and its `--kill-after` escalation is opt-in. Mesh cannot take that answer
+/// here: the survivors are the subshell's children, not this process's, so there
+/// is no wait left to keep. Since a builtin whose point is to come back cannot
+/// block on a command that refused to stop, the limit is enforced instead of
+/// reported: the group gets [`TIMED_GROUP_GRACE`] to leave, and what remains is
+/// killed. `TODO.md` carries making that a caller's choice, as `--kill-after`
+/// and `-s` are for `timeout(1)`.
+///
+/// Not shared with [`TimedGroup`], deliberately. There the signal is the user's,
+/// forwarded as sent; escalating someone's `TERM` into a `KILL` on their behalf
+/// is a different decision, and a signal handler is no place to wait out a grace
+/// period.
+fn drain_timed_group(pgid: libc::pid_t, deadline: std::time::Instant) {
+    loop {
+        // SAFETY: signal 0 is the existence test and delivers nothing. The
+        // negated form names a group this process made, and a pid cannot be
+        // recycled while it is still a group id with members — so this is
+        // either that group or nothing at all.
+        if unsafe { libc::kill(-pgid, 0) } != 0 {
+            return;
+        }
+        // Nothing here is this process's child, so no `SIGCHLD` reports the
+        // group emptying; the sleep is the grace itself. A `false` return is
+        // either the deadline or a sleep this process cannot make, and both mean
+        // stop waiting — which also keeps a signal storm from looping.
+        if !reaper::wait_for_change_until(deadline) {
+            // SAFETY: as above, and nothing can refuse this one.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            return;
+        }
+    }
+}
+
+/// Hand a killing signal on to the group a bounded run made, then die from it.
+///
+/// A `timeout` inside a backgrounded stage is the case: `j = timeout 20s cmd &`
+/// registers the *stage's* pgid as the job, while the timed command sits in a
+/// nested group of its own — which is what lets the deadline reach the command's
+/// own children. Without this, `kill $j` ends the stage alone and leaves the
+/// timed command running with nothing left to enforce the limit, so it outlives
+/// both the job and its deadline.
+///
+/// Installed for **any** supervisor, not only a forked stage. The interactive
+/// shell's own dispositions are protected by the rule below rather than by
+/// skipping the install: it ignores INT/QUIT/TERM precisely so the keystroke
+/// reaches the foreground job, and an ignored signal is left ignored here — so
+/// the handler never takes over one that was the shell's to keep. A
+/// *noninteractive* top-level mesh has none of those ignores, and it is exactly
+/// the case a CI runner cancels by signalling the whole process group: without
+/// this the timed command outlives both the cancellation and its deadline.
+///
+/// It covers **stops** as well as ends: a job whose state reads `stopped` while
+/// the command it represents runs on is the same desynchronization, so a caught
+/// `SIGTSTP` stops the group too and the `SIGCONT` that follows resumes it.
+///
+/// `SIGKILL` and `SIGSTOP` cannot be caught, so those two still split the job
+/// from its group. That is the gap `timeout(1)` has, and for the same reason.
+struct TimedGroup {
+    previous: Vec<libc::sigaction>,
+    /// The mask from before the install, put back by [`Self::arm`].
+    mask: libc::sigset_t,
+    /// Which stops this guard took over, for [`STOPS_TAKEN`].
+    stops: i32,
+    /// What an enclosing bounded run was watching, restored on drop so a nested
+    /// `timeout` does not leave the outer one with nothing recorded.
+    outer: libc::pid_t,
+    outer_stops: i32,
+    armed: bool,
+}
+
+impl TimedGroup {
+    /// Installed *before* the fork, with these signals held blocked until
+    /// [`Self::arm`] names the group. A kill landing in between would otherwise
+    /// reach a handler with nothing recorded and end the stage on its own.
+    fn install() -> Option<Self> {
+        // SAFETY: a zeroed `sigaction`/`sigset_t` is the documented starting
+        // point, and every field is written before use. The handler only signals
+        // and re-raises, both async-signal-safe.
+        unsafe {
+            let mut blocked: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut blocked);
+            for signal in handoff_signals() {
+                libc::sigaddset(&mut blocked, signal);
+            }
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            if libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut mask) != 0 {
+                return None;
+            }
+            let mut stops = 0;
+            let mut previous = Vec::with_capacity(handoff_signals().count());
+            for signal in handoff_signals() {
+                let mut slot: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(signal, std::ptr::null(), &mut slot);
+                // Only a disposition still at its default is taken over. An
+                // ignored signal stays ignored — a noninteractive mesh must pass
+                // its caller's dispositions through, and catching one here would
+                // turn an ignore into a death — and a signal that already has a
+                // handler is somebody else's *and* cannot end this process
+                // unannounced, so there is nothing to hand on for it.
+                if slot.sa_sigaction == libc::SIG_DFL {
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    let continuing = signal == libc::SIGCONT;
+                    action.sa_sigaction = if continuing {
+                        continue_timed_group as extern "C" fn(libc::c_int) as libc::sighandler_t
+                    } else {
+                        end_timed_group
+                            as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+                            as libc::sighandler_t
+                    };
+                    libc::sigemptyset(&mut action.sa_mask);
+                    // `SA_SIGINFO` is what carries `si_code`, and `si_code` is
+                    // the only thing that tells a sent signal from a fault.
+                    action.sa_flags = if continuing { 0 } else { libc::SA_SIGINFO };
+                    libc::sigaction(signal, &action, std::ptr::null_mut());
+                    if let Some(index) = JOB_STOPPING_SIGNALS.iter().position(|&s| s == signal) {
+                        stops |= 1 << index;
+                    }
+                }
+                previous.push(slot);
+            }
+            Some(Self {
+                previous,
+                mask,
+                stops,
+                outer: 0,
+                outer_stops: 0,
+                armed: false,
+            })
+        }
+    }
+
+    /// Name the group, and let the held signals through.
+    fn arm(&mut self, group: libc::pid_t) {
+        self.outer = TIMED_GROUP.swap(group, Ordering::SeqCst);
+        self.outer_stops = STOPS_TAKEN.swap(self.stops, Ordering::SeqCst);
+        self.armed = true;
+        self.unblock();
+    }
+
+    /// The child inherits both the handler and the blocked mask, and neither is
+    /// its own: the group it would signal is itself.
+    ///
+    /// The group is cleared as well as the dispositions, because a *nested*
+    /// bounded run restores the enclosing supervisor's handler here — and that
+    /// one names a group this child is not supervising.
+    fn restore_in_child(&self) {
+        TIMED_GROUP.store(0, Ordering::SeqCst);
+        STOPS_TAKEN.store(0, Ordering::SeqCst);
+        self.restore_dispositions();
+        self.unblock();
+    }
+
+    fn unblock(&self) {
+        // SAFETY: `mask` was filled in by `pthread_sigmask` in `install`.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.mask, std::ptr::null_mut()) };
+    }
+
+    fn restore_dispositions(&self) {
+        for (previous, signal) in self.previous.iter().zip(handoff_signals()) {
+            // SAFETY: each entry was filled in by `sigaction` for that signal.
+            unsafe { libc::sigaction(signal, previous, std::ptr::null_mut()) };
+        }
+    }
+}
+
+/// Every signal [`TimedGroup`] takes over, in one fixed order so the saved
+/// dispositions line up with it on the way back.
+fn handoff_signals() -> impl Iterator<Item = libc::c_int> {
+    (1..=highest_signal())
+        .filter(|&signal| !never_handed_off(signal) && !reserved_realtime(signal))
+        .chain(std::iter::once(libc::SIGCONT))
+}
+
+impl Drop for TimedGroup {
+    fn drop(&mut self) {
+        if self.armed {
+            TIMED_GROUP.store(self.outer, Ordering::SeqCst);
+            STOPS_TAKEN.store(self.outer_stops, Ordering::SeqCst);
+        }
+        self.restore_dispositions();
+        // A guard dropped without ever being armed — the fork failed — still
+        // holds the signals blocked.
+        if !self.armed {
+            self.unblock();
+        }
     }
 }
 

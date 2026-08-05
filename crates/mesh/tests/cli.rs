@@ -6960,6 +6960,74 @@ fn sigcont_harness(exec: &MeshExec) -> i32 {
     0
 }
 
+/// Ctrl-C on a pipeline reaches the timed group, not just the stage supervising
+/// it.
+///
+/// A terminal generates its signals with a *positive* `si_code` — `SI_KERNEL` —
+/// exactly as a fault does, so a handoff that asked only "was this code
+/// positive?" classified a keystroke as a fault and kept it from the group. The
+/// wrapped command survived a Ctrl-C that had already reported `130`.
+///
+/// It has to be a pty: nothing else generates `SI_KERNEL`, so `kill -INT` proves
+/// the opposite case rather than this one.
+#[test]
+fn an_interrupt_reaches_a_timed_group_in_a_pipeline() {
+    let exec = MeshExec::new(isolated_config_home());
+    let dir = fresh_dir("timeout_interrupt");
+    let harness = unsafe { libc::fork() };
+    assert!(harness >= 0);
+    if harness == 0 {
+        unsafe { libc::_exit(timed_interrupt_harness(&exec, &dir)) };
+    }
+    await_pty_harness(harness);
+    // Past when the command would have written it, had the keystroke stopped at
+    // the supervisor.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        !dir.join("survived").exists(),
+        "the timed command outlived the Ctrl-C that ended its supervisor"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn timed_interrupt_harness(exec: &MeshExec, dir: &Path) -> i32 {
+    let Some(shell) = start_pty_shell(exec, None) else {
+        return 20;
+    };
+    let started = dir.join("started");
+    let survived = dir.join("survived");
+    // Piped, so the stage supervising the bounded run is a forked stage rather
+    // than the shell itself -- the shape the finding was reported in.
+    let command = format!(
+        "timeout 30s sh -c 'echo x > {}; sleep 0.7; echo x > {}' | cat\n",
+        started.display(),
+        survived.display()
+    );
+    if !pty_write(shell.master, command.as_bytes()) {
+        return 21;
+    }
+    // Held until the timed command is actually running, so the keystroke lands
+    // on a group that exists to be reached.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !started.exists() {
+        if std::time::Instant::now() >= deadline {
+            return 22;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let Some((_, code)) = pty_interrupt_until_command_done(shell.master) else {
+        return 23;
+    };
+    // What any interrupted foreground pipeline reports.
+    if code != 130 {
+        return 24;
+    }
+    if !stop_pty_shell(shell) {
+        return 25;
+    }
+    0
+}
+
 /// One Ctrl-C abandons the wait and nothing else, whether the wait named one job
 /// or several.
 ///
@@ -7855,6 +7923,505 @@ fn wait_reports_the_jobs_own_status() {
             "sh -c 'sleep 0.05; exit 7' &\nwait {reference}\nputs $sh.status\n"
         ));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n", "{reference}");
+    }
+}
+
+#[test]
+fn timeout_kills_the_command_and_reports_124() {
+    let out = run_with_input("timeout 200ms sleep 30\nputs status=$sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=124\n");
+}
+
+#[test]
+fn timeout_registers_no_job() {
+    // The point of it over background-and-wait: nothing to announce, nothing in
+    // `$sh.jobs`, no handle to clean up -- which is what makes it usable from a
+    // prompt.
+    let out = run_with_input("timeout 200ms sleep 30\nputs jobs=$sh.jobs:len\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "jobs=0\n");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains('['),
+        "announced a job: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn timeout_bounds_a_function_not_only_an_external() {
+    // Functions resolve in `expand_stage`, before `run_expanded`, so a bounded
+    // call has to dispatch one itself; going straight to `run_expanded` reported
+    // every function as not found.
+    let out = run_with_input(
+        "func slow() { sleep 30; return true }\ntimeout 200ms slow\nputs status=$sh.status\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=124\n");
+}
+
+#[test]
+fn timeout_reaches_a_command_the_body_started() {
+    // The child runs in its own process group, so the kill reaches what the body
+    // started rather than only the body. Without it the `sleep` outlives the
+    // shell -- and a wrapper whose blocking child was killed carries on to its
+    // own successful return, reporting a run that ran out of time as healthy.
+    let out = run_with_input(
+        "func wrapped() { sleep 30; return true }\ntimeout 200ms wrapped\nputs status=$sh.status\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=124\n");
+}
+
+#[test]
+fn timeout_hands_back_the_commands_own_status_inside_the_limit() {
+    for (command, expected) in [("sh -c 'exit 7'", "7"), ("puts hello", "0")] {
+        let out = run_with_input(&format!("timeout 5s {command}\nputs status=$sh.status\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).ends_with(&format!("status={expected}\n")),
+            "{command}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+#[test]
+fn timeout_refuses_what_it_cannot_read() {
+    for (line, expected) in [
+        ("timeout\n", 2),
+        ("timeout 2x sleep 1\n", 2),
+        ("timeout 5s\n", 2),
+    ] {
+        let out = run_with_input(&format!("{line}puts status=$sh.status\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("status={expected}\n"),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn timeout_keeps_the_wrapped_commands_own_expansion() {
+    // Resolved before expansion, so the wrapped command expands under its *own*
+    // name. Read from the argv `timeout` produced instead, `expand_stage` had
+    // already settled function-vs-argv as `timeout` and flattened the rest --
+    // so a list reached neither `puts` nor a function.
+    let out = run_with_input("xs = [a b]\ntimeout 5s puts $xs\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\n");
+
+    let out = run_with_input("func show(v) { puts $v:len }\nxs = [a b c]\ntimeout 5s show $xs\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n");
+}
+
+#[test]
+fn any_signal_that_ends_the_supervisor_reaches_the_timed_group() {
+    // The handoff was a list of signals to *forward*, and that list was wrong
+    // three times running -- four names, then fourteen, then fourteen without
+    // the real-time range, then still missing this platform's own. It is stated
+    // as an exclusion now, so "every signal that ends this process" needs no
+    // enumeration to be complete.
+    //
+    // By number, and Linux-only, because that is exactly the point: `SIGSTKFLT`
+    // and `SIGPWR` are this platform's own with no portable name, and the
+    // real-time range has no names at all.
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    for (signal, status) in [
+        (10, 138), // USR1, the one that showed four names were not a rule
+        (16, 144), // STKFLT, Linux's own
+        (30, 158), // PWR, likewise
+        // SIGSYS, the signal immediately below the reserved real-time gap. The
+        // first version of that filter guessed at how many glibc reserves —
+        // `SIGRTMIN() - 3` is 31 — and quietly took this one out of the sweep.
+        (31, 159), // SYS
+        (34, 162), // SIGRTMIN, where the names run out entirely
+        // A *fault* signal, sent rather than raised. Excluded by number at
+        // first, which classified by the wrong thing: `kill -ILL` ends the
+        // supervisor exactly as a bad instruction would, and only `si_code`
+        // tells the two apart.
+        (4, 132), // ILL
+        (8, 136), // FPE
+    ] {
+        let dir = fresh_dir(&format!("timeout_signal_{signal}"));
+        let started = dir.join("started");
+        let survived = dir.join("survived");
+        let out = run_with_input(&format!(
+            "s = '{started}'\n\
+             timeout 30s sh -c 'echo x > {started}; sleep 0.4; echo x > {survived}' &\n\
+             while $s:exists == false {{ sleep 0.02 }}\n\
+             kill -{signal} %1\n\
+             wait 1\n\
+             puts status=$sh.status\n",
+            started = started.display(),
+            survived = survived.display(),
+        ));
+        // The supervisor still dies from the signal it was sent, 128 + N.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("status={status}\n"),
+            "signal {signal}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        assert!(
+            !survived.exists(),
+            "the timed command outlived signal {signal}, which ended its supervisor"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn suspending_a_timed_job_suspends_the_command_it_represents() {
+    // A job reading `stopped` while its command runs on is the same split one
+    // step sideways: the stop reached the stage's group and the nested one never
+    // heard it.
+    //
+    // **Two** cycles, because a caught stop ends through `SIG_DFL` and so
+    // consumes its own disposition — with the handler not put back, the first
+    // suspension was forwarded and every one after it stopped the supervisor
+    // alone.
+    //
+    // Each cycle waits on a marker rather than a clock, and that is not
+    // decoration: a `sleep` keeps *expiring* while its process is stopped, so a
+    // timed command resumes and finishes at once, leaving nothing to suspend a
+    // second time. The command here can only make progress by running.
+    let dir = fresh_dir("timeout_suspended");
+    let started = dir.join("started");
+    let (release_one, done_one) = (dir.join("release-1"), dir.join("done-1"));
+    let (release_two, done_two) = (dir.join("release-2"), dir.join("done-2"));
+    let out = run_with_input(&format!(
+        "s = '{started}'\n\
+         d1 = '{done_one}'\n\
+         d2 = '{done_two}'\n\
+         timeout 30s sh -c 'echo x > {started}; \
+         while [ ! -e {release_one} ]; do sleep 0.02; done; echo x > {done_one}; \
+         while [ ! -e {release_two} ]; do sleep 0.02; done; echo x > {done_two}' &\n\
+         while $s:exists == false {{ sleep 0.02 }}\n\
+         kill -TSTP %1\n\
+         puts x > {release_one}\n\
+         sleep 0.3\n\
+         puts first=$sh.jobs[1].state during=$d1:exists\n\
+         kill -CONT %1\n\
+         while $d1:exists == false {{ sleep 0.02 }}\n\
+         kill -TSTP %1\n\
+         puts x > {release_two}\n\
+         sleep 0.3\n\
+         puts second=$sh.jobs[1].state during=$d2:exists\n\
+         kill -CONT %1\n\
+         wait 1\n\
+         puts after=$d2:exists\n",
+        started = started.display(),
+        release_one = release_one.display(),
+        done_one = done_one.display(),
+        release_two = release_two.display(),
+        done_two = done_two.display(),
+    ));
+    // Released while stopped and still not acted on, both times: the command
+    // really was suspended, not merely reported as such.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first=stopped during=false\nsecond=stopped during=false\nafter=true\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_killed_supervisor_takes_its_timed_command_with_it() {
+    // The timed command sits in a nested process group, which is what lets the
+    // deadline reach the command's own children -- and also what puts it outside
+    // every parent's reach. The deadline is enforced by the supervisor, so
+    // anything that kills the supervisor (a CI runner cancelling mesh, a
+    // `kill` from another terminal) orphaned the command: it outlived both the
+    // cancellation and its own limit.
+    //
+    // A top-level noninteractive shell, deliberately: the handoff used to be
+    // installed only inside a forked stage, and this is the case that showed
+    // that gate was drawn in the wrong place.
+    let dir = fresh_dir("timeout_killed_supervisor");
+    let started = dir.join("started");
+    let survived = dir.join("survived");
+    let script = dir.join("bounded.mesh");
+    std::fs::write(
+        &script,
+        format!(
+            "timeout 30s sh -c 'echo x > {}; sleep 1.5; echo x > {}'\n",
+            started.display(),
+            survived.display()
+        ),
+    )
+    .expect("write script");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mesh"))
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mesh");
+    // Held until the timed command is actually running, so the signal lands on a
+    // supervisor that has something to hand it on to.
+    while !started.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // SAFETY: scalar arguments naming a child this test spawned and has not yet
+    // reaped.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let _ = child.wait().expect("wait for mesh");
+    // Past the command's own write, which it only reaches if the signal stopped
+    // at the supervisor.
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    assert!(
+        !survived.exists(),
+        "the timed command outlived the supervisor that was enforcing its limit"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn timeout_reports_its_own_usage() {
+    // This builtin is reached ahead of the generic routing that turns `--help`
+    // into printed usage, so it has to answer the question itself -- and only in
+    // the limit's own position. Anywhere further along the line the word belongs
+    // to the wrapped command, as it does for `command ls --help`.
+    let out = run_with_input("timeout --help\nputs status=$sh.status\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Usage: timeout DURATION COMMAND"),
+        "{stdout}"
+    );
+    assert!(stdout.ends_with("status=0\n"), "{stdout}");
+}
+
+#[test]
+fn timeout_ends_a_command_that_stopped_itself() {
+    // The other way a request goes unanswered. A trapped `SIGTERM` is *declined*;
+    // a stopped group never hears it at all -- the signal sits pending, the
+    // subshell is not going to exit, and the wait that reaps it never returned.
+    // The limit stopped meaning anything and the shell hung.
+    //
+    // The `SIGCONT` after the request is what lets a stopped group act on it,
+    // which is what `timeout(1)` sends its own continue for.
+    let out = run_with_input("timeout 300ms sh -c 'kill -STOP 0'\nputs status=$sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=124\n");
+}
+
+#[test]
+fn timeout_ends_a_command_that_refuses_the_first_signal() {
+    // The `SIGTERM` on expiry is a request, and a command may trap it. The
+    // subshell leading the group cannot: it dies from the same signal, so the
+    // wait returns and `timeout` reported 124 while the command it was told to
+    // bound carried on with nobody watching it. The group is drained now, so the
+    // 124 means the run really is over.
+    let dir = fresh_dir("timeout_trapped");
+    let survived = dir.join("survived");
+    let out = run_with_input(&format!(
+        "timeout 100ms sh -c 'trap \"\" TERM; sleep 1.5; echo x > {}'\nputs status=$sh.status\n",
+        survived.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=124\n");
+    // Past the command's own write, which it only reaches if it was never
+    // escalated against.
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    assert!(
+        !survived.exists(),
+        "a command that ignored the TERM outlived its limit"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn redirecting_or_backgrounding_does_not_change_what_timeout_wraps() {
+    // The prefix is read before expansion on the plain path, which is what lets
+    // the wrapped command expand under its own name. A redirected or
+    // backgrounded one took a different route to the same construct and reached
+    // it from argv, where `expand_stage` had already settled function-vs-argv as
+    // `timeout` and flattened everything behind it -- so a function was reported
+    // as not found, and a list never reached the command it was given to.
+    let dir = fresh_dir("timeout_redirected");
+    let out = dir.join("out");
+    let show = "func show(v) { puts $v:len }\nxs = [a b c]\n";
+    for command in [
+        format!("timeout 5s show $xs > {}\n", out.display()),
+        format!(
+            "timeout 5s show $xs > {} &\n{}",
+            out.display(),
+            await_job(1)
+        ),
+    ] {
+        let _ = std::fs::remove_file(&out);
+        let result = run_with_input(&format!("{show}{command}"));
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap_or_default(),
+            "3\n",
+            "{command}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    // Deferring: a value in a word sends the whole stage to its own fork, where
+    // the prefix has to be read again. No redirection here — backgrounding a
+    // value-carrying command that also redirects is refused outright, since the
+    // shell resolves every stage's targets before it forks any of them.
+    let deferred = run_with_input(&format!(
+        "func echo_it(v) {{ puts got=$v }}\ntimeout 5s echo_it $(puts one) &\n{}",
+        await_job(1)
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&deferred.stdout),
+        "got=one\n",
+        "{}",
+        String::from_utf8_lossy(&deferred.stderr)
+    );
+    // The same for a builtin that reads typed arguments: one list, not three
+    // flattened words `timeout` had already taken for its own.
+    let _ = std::fs::remove_file(&out);
+    run_with_input(&format!(
+        "xs = [a b]\ntimeout 5s puts $xs > {}\n",
+        out.display()
+    ));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "a\nb\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_redirected_or_backgrounded_timeout_still_reaches_its_limit() {
+    // Resolving the wrapped command earlier must not cost the bound itself.
+    let dir = fresh_dir("timeout_redirected_limit");
+    let out = dir.join("out");
+    let redirected = run_with_input(&format!(
+        "timeout 200ms sleep 30 > {}\nputs status=$sh.status\n",
+        out.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&redirected.stdout), "status=124\n");
+    let backgrounded = run_with_input(&format!(
+        "timeout 200ms sleep 30 &\n{}puts status=$sh.jobs[1].status\n",
+        await_job(1)
+    ));
+    assert!(
+        String::from_utf8_lossy(&backgrounded.stdout).ends_with("status=124\n"),
+        "{}",
+        String::from_utf8_lossy(&backgrounded.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn killing_a_job_reaches_the_command_its_timeout_was_watching() {
+    // A backgrounded `timeout` registers the *stage* as the job, while the timed
+    // command sits in a nested process group the job table cannot name -- the
+    // group the deadline needs, so that expiry reaches the command's own
+    // children. Killing the job ends the stage and the deadline with it, so
+    // unless the stage hands the signal on, the command runs to completion with
+    // nothing left watching it.
+    //
+    // Waiting for `started` is what puts the kill on a stage that has actually
+    // reached the fork. Without it the stage can still be starting up, where a
+    // kill that leaves nothing behind proves nothing.
+    let dir = fresh_dir("timeout_killed_job");
+    let started = dir.join("started");
+    let survived = dir.join("survived");
+    let out = run_with_input(&format!(
+        "s = '{started}'\n\
+         timeout 30s sh -c 'echo x > {started}; sleep 0.4; echo x > {survived}' &\n\
+         while $s:exists == false {{ sleep 0.02 }}\n\
+         kill %1\n\
+         wait 1\n\
+         puts status=$sh.status\n",
+        started = started.display(),
+        survived = survived.display(),
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=143\n");
+    // Comfortably past when the command would have written it, had the kill
+    // stopped at the stage.
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    assert!(
+        !survived.exists(),
+        "the timed command outlived the job it belonged to"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn timeout_is_this_builtin_wherever_it_is_reached() {
+    // Without an argv-level entry point the name fell through to an external
+    // `timeout` wherever a command was resolved from argv -- the same line
+    // meaning coreutils in one position and this builtin in another. `300ms` is
+    // the tell: coreutils rejects it (125), this accepts it.
+    //
+    // Both ends of a pipeline, because they are not the same path: a foreground
+    // pipeline's *last* stage may run in the shell itself rather than a fork, so
+    // the bound is applied there with no stage fork under it to lean on.
+    for line in [
+        "timeout 300ms sleep 30 | cat",
+        "puts hi | timeout 300ms sleep 30",
+    ] {
+        let out = run_with_input(&format!("{line}\nputs status=$sh.status\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "status=124\n",
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn a_piped_timeout_starts_its_bound_before_expanding_anything() {
+    // A stage whose words carry a value is handed to its own fork to expand,
+    // which is where the deadline has to start -- ahead of that expansion rather
+    // than after it. Reading the prefix only once the words were argv put the
+    // capture *in front of* the limit, so a 100ms bound around a one-second
+    // capture took a second and reported success.
+    for line in [
+        "timeout 100ms puts $(sleep 1; print done) | cat",
+        "puts hi | timeout 100ms puts $(sleep 1; print done)",
+    ] {
+        let out = run_with_input(&format!("{line}\nputs status=$sh.status\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "status=124\n",
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn a_nested_timeout_keeps_the_wrapped_commands_own_expansion() {
+    // `timeout` wrapping `timeout` peeled one prefix and handed the rest to
+    // `expand_stage` under the name `timeout` -- the same flattening the whole
+    // token-level split exists to avoid, one level in. Every prefix is peeled
+    // now, and each becomes its own bound.
+    let show = "func show(v) { puts len=$v:len }\nxs = [a b c]\n";
+    for line in [
+        "timeout 5s timeout 5s show $xs",
+        "timeout 5s timeout 5s show $xs | cat",
+        "puts hi | timeout 5s timeout 5s show $xs",
+    ] {
+        let out = run_with_input(&format!("{show}{line}\n"));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "len=3\n", "{line}");
+    }
+    // Backgrounded, where the stage resolves in the parent rather than its fork.
+    let out = run_with_input(&format!(
+        "{show}timeout 5s timeout 5s show $xs &\n{}",
+        await_job(1)
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "len=3\n");
+}
+
+#[test]
+fn the_outer_bound_of_a_nested_timeout_still_holds() {
+    // Two bounds are not interchangeable: the outer one bounds the inner
+    // supervisor as well as the command, so it is the one that has to fire when
+    // the inner limit is the longer of the two.
+    let out = run_with_input("timeout 200ms timeout 30s sleep 30\nputs status=$sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=124\n");
+}
+
+#[test]
+fn a_piped_timeout_keeps_the_wrapped_commands_own_expansion() {
+    // The last position that still read the prefix from argv, where a list has
+    // already been flattened: `timeout 5s show $xs | cat` was an error while bare
+    // `show $xs` passed one list. Every stage form reads it from the tokens now,
+    // so the construct means the same thing wherever it is written.
+    let show = "func show(v) { puts $v:len }\nxs = [a b c]\n";
+    for line in ["timeout 5s show $xs | cat", "puts hi | timeout 5s show $xs"] {
+        let out = run_with_input(&format!("{show}{line}\n"));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n", "{line}");
     }
 }
 
@@ -11998,6 +12565,7 @@ fn help_lists_every_builtin_with_its_usage() {
         "bg [JOB]",
         "jobs",
         "wait [--timeout DURATION] [JOB …]",
+        "timeout DURATION COMMAND [ARG …]",
         "disown [-h] [-a | -r] [JOB …]",
         "kill [-SIGNAL] JOB|PID ...",
         "prompt [--reset | TEXT]",

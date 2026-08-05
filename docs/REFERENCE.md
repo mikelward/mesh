@@ -980,6 +980,7 @@ argument by hand, and repeating it walks back through earlier commands.
 | `fg [job]` | Resume a job in the foreground and wait for it. No argument takes the most recent job. |
 | `bg [job]` | Resume a stopped job in the background. No argument takes the most recent job. |
 | `wait [--timeout duration] [job …]` | Wait for a job to finish and report its status. `--timeout` bounds the wait without touching the job — see [Job control](#job-control). |
+| `timeout duration cmd [arg …]` | Run a command under a time limit, killing it and reporting `124` if it runs out — see [Job control](#job-control). |
 | `kill [-signal] job\|pid …` | Signal a job's process group, or a pid. Default `TERM`. |
 | `disown [-h] [-a \| -r] [job …]` | Stop tracking a job — see [Job control](#job-control). |
 | `command [--] name [arg …]` | Run the **program** `name`, past the builtin or function that name would otherwise reach — which is what makes `func ls() { command ls --color=auto }` safe to write, and what reaches `/usr/bin/env` when a function of that name is in the way. Only the words in front of the program are `command`'s own: `command ls --help` asks `ls` for its help, and `--` ends `command`'s options so the word after it is the program however it reads. `--help` is the only option it has, so any other flag-looking word in front of the program is a usage error (status `2`) rather than a program name — `command -v` / `-V` are held for the unbuilt half, and `command -- -v` runs a program called `-v`. The operand is the program with nothing peeled off it, so `command command x` looks for a program called `command`. A builtin's name finds no program, and says so; with no operand at all the status is `2`. |
@@ -1247,6 +1248,82 @@ matches; both say so. `%?string`, the *substring* match, is not implemented —
 name rather than reporting a job that does not exist. Note that `?` is a glob
 character first, so a `%?…` reference has to be quoted to reach a job builtin at
 all.
+
+**`timeout duration cmd [arg …]`** runs a command under a limit and **kills it**
+when the limit passes, reporting `124` — `timeout(1)`'s number, so a script
+already written against that keeps reading. A command that genuinely exits 124 is
+indistinguishable from one that ran out of time; that collision is the price of
+the convention.
+
+It is the counterpart to `wait --timeout`, and the difference is what each one
+owns. `timeout` owns the command's lifetime, so it ends it. `wait` only observes
+a job someone else started, so it does not.
+
+```mesh
+timeout 2s is-ssh-valid        # a hook that may block, bounded
+```
+
+`cmd` may be a **function, a builtin, or an external** — it runs through the same
+resolution a bare command does. It registers **no job**: nothing is announced,
+nothing appears in `$sh.jobs`, and there is no handle to clean up, which is what
+makes it usable from a prompt.
+
+Written with `&` it registers one like any other command, and that job is the
+bounded run itself — so `kill` on it ends the timed command too, rather than the
+supervisor alone. Redirections apply to the wrapped command:
+`timeout 5s cmd > out` sends `cmd`'s output to the file.
+
+Two consequences of running the command in a subshell, both shared with `&`:
+
+* **It cannot change this shell.** An assignment inside `timeout 2s some-func` is
+  lost with the subshell. A bounded run of something that has to be killable
+  cannot also be a run in this process.
+* **The command gets its own process group**, so the kill reaches whatever it
+  started rather than only the command itself — a function whose blocking child
+  was killed cannot carry on to its own successful `return` and report a run that
+  ran out of time as healthy. `timeout(1)` makes the same trade, and has a
+  `--foreground` for the cases that would rather keep the shell's group.
+
+Backgrounded, the job **is** the bounded run: any signal that would end or
+suspend it is passed to the timed command first, so `kill %1` ends it and
+`kill -TSTP %1` really suspends it rather than only reporting it as suspended.
+`SIGKILL` and `SIGSTOP` are the two that cannot be caught, so those two still
+leave the command behind — the same gap `timeout(1)` has. A `timeout` nested
+inside another has one more: the outer limit reaches the inner supervisor but
+not the group beneath it, so a wrapped command that refuses `SIGTERM` can outlive
+the outer bound. `TODO.md` carries why no arrangement of process groups fixes
+that one.
+
+The kill is a `SIGTERM`, which a command is free to trap. It gets a short grace
+to leave on its own and is then sent a `SIGKILL`, so a `124` means the run really
+is over. `timeout(1)` instead keeps waiting and escalates only when asked
+(`--kill-after`); mesh cannot, because the subshell it waits on dies to the same
+signal it forwards — and a builtin whose point is to come back cannot block on a
+command that refused to stop. Making the signal and the grace a caller's choice
+is in `TODO.md`.
+
+`timeout` takes exactly one word for itself — the duration — and everything after
+it belongs to the wrapped command, so there is no `--` to write. It is resolved
+*before* expansion, which is what lets the wrapped command expand under its own
+name: `timeout 5s show $xs` passes a list to a function exactly as `show $xs`
+does, with or without a redirection or an `&`. Only a bare `timeout` is the
+construct; a name that arrives through a variable or a quote is an ordinary
+command. `--help` in the duration's position asks *this* builtin; anywhere
+further along the line it belongs to the wrapped command, as it does after
+`command`.
+
+With a redirection the whole stage runs in the fork — words, targets and command
+alike — so a capture in the wrapped command is inside the limit too. Backgrounded
+it is the other way round, because the shell resolves every stage's targets
+before it forks any of them; a capture there is already refused outright.
+
+**It bounds the stage it prefixes, not a pipeline it starts** —
+`timeout 5s producer | consumer` limits `producer` alone. Whether that is the
+right reading is in `TODO.md`, together with `time`, which has to answer it the
+same way. Which *stage* it bounds is settled: a pipeline stage reads the prefix
+exactly as an unpiped command does, in either position.
+
+The duration is spelled as below.
 
 **`wait --timeout duration`** bounds the wait. When the limit passes, `wait`
 reports `124` and the job is left **exactly as it was** — still running, still
