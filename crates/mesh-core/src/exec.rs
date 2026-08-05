@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::io::IsTerminal;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use crate::reaper;
@@ -1374,8 +1374,19 @@ fn with_stage_descriptors<T>(
 ) -> std::io::Result<T> {
     use std::io::Write;
 
-    // Anything buffered belongs to the descriptor about to be replaced.
-    let _ = std::io::stdout().flush();
+    // Anything buffered belongs to the descriptor about to be replaced. A flush
+    // that *fails* refuses the stage, exactly as it refuses a fork in
+    // `fork_stage` and for the same reason: those bytes are undeliverable to the
+    // stdout they were written for, and going ahead would leave them in the
+    // buffer to be drained by the restore below — into *this stage's* target, as
+    // if the shell's earlier output had been the stage's own. `exec > /dev/full;
+    // print x` ahead of `cmd | print y > out` put `xy` in `out` that way.
+    if let Err(error) = std::io::stdout().flush() {
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("flushing stdout: {error}"),
+        ));
+    }
 
     let mut swapped: Vec<(libc::c_int, libc::c_int)> = Vec::new();
     let restore = |swapped: &mut Vec<(libc::c_int, libc::c_int)>| {
@@ -1445,9 +1456,10 @@ fn with_stage_descriptors<T>(
     if published.is_some() {
         SHELL_STDIN.store(-1, Ordering::Relaxed);
     }
-    // Flush what the body wrote before restoring, or it would land on the restored
-    // descriptor instead of this stage's target.
-    let _ = std::io::stdout().flush();
+    if let Err(error) = flush_before_restore() {
+        restore(&mut swapped);
+        return Err(error);
+    }
     restore(&mut swapped);
     Ok(value)
 }
@@ -2904,11 +2916,49 @@ pub(crate) fn with_redirections<T>(
     if published.is_some() {
         SHELL_STDIN.store(-1, Ordering::Relaxed);
     }
-    // Flush what the body wrote before restoring, or it would land on the
-    // restored descriptor instead of the redirection target.
-    let _ = std::io::stdout().flush();
+    if let Err(error) = flush_before_restore() {
+        restore(&mut swapped);
+        return Err((path_for(libc::STDOUT_FILENO), error));
+    }
     restore(&mut swapped);
     Ok(result)
+}
+
+/// Empty the stdout buffer while the redirection is **still installed**, and keep
+/// the bytes of a failed write off the descriptor about to be restored.
+///
+/// Buffered output belongs to the descriptor that was in place when it was
+/// written, so it has to go out before the restore or it lands on the shell's own
+/// stdout. A *failed* flush is the same hazard carrying a write error:
+/// `print x > /dev/full` left `x` in the buffer, put it on the terminal on the way
+/// out, and reported success. Rust's `Stdout` offers no way to drop what it is
+/// holding, so it is drained where the write was already going wrong — and the
+/// error is handed back, to become the failure of the command that wrote it.
+fn flush_before_restore() -> std::io::Result<()> {
+    use std::io::Write;
+
+    let flushed = std::io::stdout().flush();
+    if flushed.is_err()
+        && let Ok(sink) = OpenOptions::new().write(true).open("/dev/null")
+    {
+        // Put fd 1 back afterwards, rather than leaving that to the caller's
+        // restore: the restore only knows the targets *it* saved, so a
+        // redirection that never touched stdout — `print x 2> err` — would leave
+        // the shell writing to `/dev/null` for the rest of the session, every
+        // later write silently succeeding.
+        // SAFETY: all four calls act on this process's own descriptors; `sink`
+        // is owned here and `covered` is this function's private duplicate.
+        unsafe {
+            let covered = libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3);
+            libc::dup2(sink.as_raw_fd(), libc::STDOUT_FILENO);
+            let _ = std::io::stdout().flush();
+            if covered >= 0 {
+                libc::dup2(covered, libc::STDOUT_FILENO);
+                libc::close(covered);
+            }
+        }
+    }
+    flushed
 }
 
 /// The shell's own stdin while an in-process redirection has fd 0 pointed at a
