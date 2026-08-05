@@ -5488,6 +5488,15 @@ impl Parser<'_> {
                 break;
             }
             if is_map && !comma {
+                // Running out of input here is *unfinished*, not malformed: the
+                // comma may be on the next line the reader has not read yet. A
+                // list reaches the same conclusion by looping round and failing to
+                // parse another element, so only the map needed saying out loud —
+                // which is why `m = [` ⏎ `'a': 1` ⏎ `]` was rejected line-at-a-time
+                // while the list spelling was accepted.
+                if self.at_end() {
+                    return Err(self.error(ParseErrorKind::UnexpectedEnd));
+                }
                 return Err(self.error(ParseErrorKind::Expected("`,`")));
             }
         }
