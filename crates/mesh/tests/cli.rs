@@ -3151,6 +3151,48 @@ fn a_braced_interpolation_takes_an_expression_across_lines() {
 /// A `( … )` group holds **one expression**, so a newline in it separates nothing
 /// and is layout — the rule `docs/REFERENCE.md` already stated and the group
 /// already followed everywhere except mid-expression. Rough edge 9.
+/// A map literal wraps across lines like a list one.
+///
+/// The two spellings shared a loop but not this answer: running out of input
+/// after a pair reported ``expected `,` `` — a *hard* error, which a
+/// line-at-a-time reader takes as "dispatch it" rather than "read more" — while
+/// the list spelling reached end-of-input by looping round and so buffered. So
+/// the same shape parsed from a file and was rejected on stdin, which is where
+/// pasting a multi-line map lands.
+#[test]
+fn a_map_literal_takes_its_entries_across_lines() {
+    // Through stdin, which is the path that was broken; a file always worked.
+    for (name, text) in [
+        ("one_pair", "m = [\n  'a': 1\n]\nputs $m:repr\n"),
+        (
+            "two_pairs",
+            "m = [\n  'a': 1,\n  'b': 2\n]\nputs $m:keys:repr\n",
+        ),
+        (
+            "nested",
+            "m = [\n  'a': [\n    1\n  ],\n  'b': 2\n]\nputs $m:keys:repr\n",
+        ),
+    ] {
+        let out = run_with_input(text);
+        assert!(
+            out.status.success(),
+            "for {name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).is_empty(),
+            "for {name}: no output, stderr {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A genuinely missing comma is still a loud error — the fix distinguishes
+    // "not finished yet" from "malformed", it does not stop checking.
+    let out = run_with_input("m = ['a': 1 'b': 2]\nputs $m:repr\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("expected `,`"), "got {stderr}");
+}
+
 #[test]
 fn a_group_takes_an_expression_across_lines() {
     let dir = fresh_dir("group_multiline");
