@@ -652,7 +652,7 @@ sit in, which for mesh is the point rather than a bonus — see
 | Named hook events | none | 7 | 5 kinds | 7 | 3 | 5 |
 | Registering a hook | reassign a var | `add-zsh-hook` (autoload) | `--on-…` flag | `on` / `$sh.<event>` | append to a list | `$env.config.hooks` |
 | Backgrounds a *function* | yes | yes | **no** (externals only) | yes | yes | yes (`job spawn`) |
-| Reads a background job's status | `wait` | `wait` | **no** | `wait` | **no** | `job recv` |
+| Reads a background job's status | `wait` | `wait` | **no** | `wait` | **no** | **sent, not read** |
 | Waiting with a deadline | no | no | no | **no** | no | `job recv --timeout` |
 
 The comparison that flatters mesh is against a **bare** zsh, and it is stark.
@@ -700,16 +700,24 @@ starts a function or an external concurrently, but `wait`, `jobs`, `bg` and
 on. `run-parallel` and `peach` are the concurrency it does offer, and both block
 until *everything* finishes, which is the opposite of a deadline.
 
-**nushell is the only one with the deadline.** `job spawn` takes a closure,
-`job send` / `job recv` are a mailbox between jobs, and `job recv --timeout`
-gives up after a duration — so the whole pattern is four lines with no polling
-and no signal handling:
+**nushell is the only one with the deadline**, and it gets there by a different
+route than `wait`. `job recv` is a **mailbox receive**, not a status read: it
+returns a message some job chose to send, so a spawned job's exit status is not
+readable at all and the answer has to be sent explicitly. That is a real
+difference from `wait`, not a spelling — a job that fails or exits without
+sending leaves nothing to receive, so the caller has to treat "no message" as
+its own outcome rather than reading a status the shell kept for it. The tag
+matters for the same reason: an untagged receive takes any message in the
+mailbox in FIFO order, including one the caller never asked for.
+
+What nushell does have, and nothing else here does, is `--timeout` on that
+receive — so the deadline needs no polling and no signal handling:
 
 ```nu
 let parent = (job id)
-let j = (job spawn { (slow-predicate) | job send $parent })
-let answer = (try { job recv --timeout 2sec } catch { null })   # null = gave up
-job kill $j
+let j = (job spawn { (slow-predicate) | job send --tag 8737 $parent })
+let answer = (try { job recv --tag 8737 --timeout 2sec } catch { null })
+job kill $j     # null means it never answered: gave up, or died without sending
 ```
 
 **bash, zsh and mesh have the first two and not the third.** They background a
