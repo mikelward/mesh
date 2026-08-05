@@ -13476,8 +13476,8 @@ fn glob_syntax_the_expander_refuses_is_still_a_literal_option_name() {
         "v = x\nfunc f(--force, ...rest) { puts \"force=$force\" }\nf(--fo*=x$v[)\n",
     );
     assert!(
-        String::from_utf8_lossy(&interpolated.stderr).contains("unknown flag `--fo*`"),
-        "a later piece can invalidate the pattern too: {:?} / {:?}",
+        String::from_utf8_lossy(&interpolated.stderr).contains("`fo*` is not a name"),
+        "a written name is judged even when later pieces compose the value: {:?} / {:?}",
         interpolated.stdout,
         interpolated.stderr
     );
@@ -27890,4 +27890,143 @@ fn the_flag_terminator_is_a_value_of_its_own() {
         "{:?}",
         cast.stderr
     );
+}
+
+/// A composed attached value builds a flag like a written one — `--tag=$w` and
+/// `--tag="v2"` are options, not strings. Only the *name* has to be literal: the
+/// `=` ends it, and what follows is the option's value however it was formed.
+///
+/// Before this, `scalar_literal` took only a single bare text piece, so every
+/// composed payload fell out of the flag path and was caught by a runtime scan of
+/// the expanded string — which is what let a computed `"--force"` bind an option.
+/// Raised in review as two P1s; they were one bug.
+#[test]
+fn a_composed_attached_value_still_builds_a_flag() {
+    // The payload keeps **the value's own type**. Stringifying it would be the
+    // sniffing this type removes: the payload is a `Value` and so is `$w`.
+    let integer = run_with_input("w = 2\nx = --n=$w\nputs $x:repr\n");
+    assert_eq!(String::from_utf8_lossy(&integer.stdout), "--n=2\n");
+
+    let string = run_with_input("s = \"2\"\nx = --n=$s\nputs $x:repr\n");
+    assert_eq!(String::from_utf8_lossy(&string.stdout), "--n='2'\n");
+
+    // Which is what makes `:repr` round-trip for a composed payload — the claim
+    // the PR advertised and did not meet until this landed.
+    let round_trip = run_with_input(
+        "y = --tag='v2'\nif $y == --tag=\"v2\" { puts equal } else { puts differs }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&round_trip.stdout), "equal\n");
+
+    // Written text may lead the composed value; it is part of what the pieces
+    // spell, so the payload is the string they make.
+    let led = run_with_input("v = x\nx = --tag=x$v\nputs $x:repr\n");
+    assert_eq!(String::from_utf8_lossy(&led.stdout), "--tag='xx'\n");
+
+    // An option's value is **one scalar**, checked here at the construction site
+    // rather than at the call. Typed flags move where that test runs, and moving
+    // a validation must not weaken it — before this it was not run at all, and a
+    // list payload panicked in `FlagValue::text()`. Raised in review.
+    for source in [
+        "xs = [a b]\nx = --tag=$xs\nputs $x",
+        "m = [k: v]\nx = --tag=$m",
+    ] {
+        let out = run_with_input(&format!("{source}\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("an option's value must be one string"),
+            "{source} should report at construction: {:?}",
+            out.stderr
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("panicked"),
+            "{source} must not panic: {:?}",
+            out.stderr
+        );
+    }
+
+    // A path-list environment entry crosses as its written word, as it does at
+    // the top level of the same serializer — and as it did before it was a type,
+    // when `--foo` in a list was simply a string. Raised in review as a
+    // regression.
+    let path_list = run_with_input("xs = [--foo /bin]\n$env.PATH = $xs\nputs $env.PATH\n");
+    assert_eq!(
+        String::from_utf8_lossy(&path_list.stdout),
+        "--foo\n/bin\n",
+        "{:?}",
+        path_list.stderr
+    );
+
+    // The same at a call, since it is the same construction.
+    let called =
+        run_with_input("func f(--tag = none) { puts \"tag=$tag\" }\nxs = [a b]\nf --tag=$xs\n");
+    assert!(
+        String::from_utf8_lossy(&called.stderr).contains("an option's value must be one string"),
+        "{:?}",
+        called.stderr
+    );
+
+    // And it binds as the option it is, with the payload's type intact.
+    let bound = run_with_input("w = 2\nfunc add(--n = 1) { x = $n + 1\n puts $x }\nadd --n=$w\n");
+    assert_eq!(String::from_utf8_lossy(&bound.stdout), "3\n");
+}
+
+/// With every written option carrying its own intent, the runtime scan of
+/// expanded strings is gone — so a computed or quoted string is data, in both
+/// call spellings, for every flag rather than just the ones the type reached
+/// first.
+#[test]
+fn a_computed_string_is_never_an_option() {
+    for source in [
+        "w = \"--force\"\nf $w",
+        "w = \"--force\"\nf($w)",
+        "f \"--force\"",
+    ] {
+        let out = run_with_input(&format!(
+            "func f(--force, ...rest) {{ puts \"$force/$rest:len\" }}\n{source}\n"
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "false/1\n",
+            "{source} should pass data, not bind: {:?}",
+            out.stderr
+        );
+    }
+
+    // `--help` follows the same rule: only a written one asks for the generated
+    // help, so a function can be handed the string.
+    let help = run_with_input("func g(x) { puts \"got=$x\" }\nh = \"--help\"\ng $h\n");
+    assert_eq!(String::from_utf8_lossy(&help.stdout), "got=--help\n");
+
+    // The written spellings are untouched.
+    let written = run_with_input("func f(--force, ...rest) { puts \"force=$force\" }\nf --force\n");
+    assert_eq!(String::from_utf8_lossy(&written.stdout), "force=true\n");
+}
+
+/// A payload can combine interpolation *and* globbing — `--tag=$p*.txt` — which
+/// leaves several word pieces and still has to reach the filesystem. The
+/// composed-payload branch skips it (the word globs) and the expansion branch
+/// used to require a lone piece, so the match bound as a positional and the
+/// option silently kept its default. Silent, which is what makes it worse than
+/// an error. Raised in review.
+#[test]
+fn a_composed_payload_that_globs_still_binds_its_option() {
+    let dir = fresh_dir("composed_glob_flag_value");
+    std::fs::write(dir.join("--tag=a1.txt"), "").unwrap();
+    std::fs::write(
+        dir.join("run.mesh"),
+        "func f(--tag = none, ...rest) { puts \"tag=$tag n=$rest:len\" }\np = a\nf --tag=$p*.txt\n",
+    )
+    .unwrap();
+    let out = mesh_command()
+        .arg("run.mesh")
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "tag=a1.txt n=0\n",
+        "{:?}",
+        out.stderr
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

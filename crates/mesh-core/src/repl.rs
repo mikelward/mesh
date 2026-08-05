@@ -8326,20 +8326,15 @@ fn run_cd_hooks(event: HookEvent, path: &Path, shell: &mut Shell) {
 fn auto_help_requested(args: &[(Value, bool)]) -> bool {
     // A written `--help` is a `Flag` now; a computed `"--help"` string still
     // reaches here through the call-site scan, so both spellings are asked.
-    let is_help = |arg: &Value| match arg {
-        Value::Flag(flag) => flag.name == "help" && flag.value.is_none(),
-        Value::String(text) => text == "--help",
-        _ => false,
-    };
+    // Only a written `--help` -- a `Flag` -- asks for the generated help. A
+    // computed `"--help"` is data, as every other computed string now is.
+    let is_help = |arg: &Value| matches!(arg, Value::Flag(flag) if flag.name == "help" && flag.value.is_none());
     args.iter()
         .map(|(arg, _)| arg)
         // A written `--` is a terminator *value* now, so the search stops on one
         // of those. The string still stops it too, for a computed `"--"` that
         // reached here through the call-site scan.
-        .take_while(|arg| {
-            !matches!(arg, Value::FlagTerminator)
-                && !matches!(arg, Value::String(value) if value == "--")
-        })
+        .take_while(|arg| !matches!(arg, Value::FlagTerminator))
         .any(is_help)
 }
 
@@ -9534,7 +9529,7 @@ fn bind_arguments(
     let mut switches_on: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut flag_values: std::collections::HashMap<&str, Value> = std::collections::HashMap::new();
     let mut flags_ended = false;
-    for (arg, bare) in args {
+    for (arg, _bare) in args {
         // A written option now *is* a `Flag`, so binding reads the value rather
         // than re-deriving the intent from its characters — the one source of
         // truth the type exists for. The string scan below still runs, for a
@@ -9550,15 +9545,6 @@ fn bind_arguments(
             && let Value::Flag(flag) = &arg
         {
             bind_flag_value(name, params, flag, &mut switches_on, &mut flag_values)?;
-            continue;
-        }
-        if flags_enabled
-            && !flags_ended
-            && let Value::String(text) = &arg
-            && let Some(body) = text.strip_prefix("--")
-            && !body.is_empty()
-        {
-            bind_dashed_option(name, params, body, bare, &mut switches_on, &mut flag_values)?;
             continue;
         }
         positional_values.push(arg);
@@ -9704,7 +9690,6 @@ fn evaluate_value_arguments<'p>(
             | parser::Argument::Named(_, expression)
             | parser::Argument::Spread(expression) => expression,
         };
-        let bare = is_bare_literal_word(expression);
         let value = eval_expr(expression, last, in_function, shell)?;
         // A `break`/`continue` the argument raised belongs to the caller's loop.
         // Stop at once — before binding this argument or evaluating any later one —
@@ -9773,8 +9758,6 @@ fn evaluate_value_arguments<'p>(
                     name,
                     params,
                     value,
-                    bare,
-                    written_dashed,
                     flags_enabled,
                     &mut flags_ended,
                     &mut positionals,
@@ -9804,8 +9787,6 @@ fn evaluate_value_arguments<'p>(
                             name,
                             params,
                             item,
-                            false,
-                            true,
                             flags_enabled,
                             &mut flags_ended,
                             &mut positionals,
@@ -9861,8 +9842,6 @@ fn scan_call_value<'p>(
     name: &str,
     params: &'p [parser::Param],
     value: Value,
-    bare: bool,
-    dashes_are_flags: bool,
     flags_enabled: bool,
     flags_ended: &mut bool,
     positionals: &mut Vec<Value>,
@@ -9879,15 +9858,6 @@ fn scan_call_value<'p>(
     {
         bind_flag_value(name, params, flag, switches_on, flag_values)?;
         return Ok(());
-    }
-    if flags_enabled
-        && !*flags_ended
-        && dashes_are_flags
-        && let Value::String(text) = &value
-        && let Some(body) = text.strip_prefix("--")
-        && !body.is_empty()
-    {
-        return bind_dashed_option(name, params, body, bare, switches_on, flag_values);
     }
     positionals.push(value);
     Ok(())
@@ -9992,24 +9962,6 @@ fn starts_with_bare_dashes(expression: &parser::Expr) -> bool {
         && (text.contains('=') || word.value.pieces.len() == 1)
 }
 
-/// Is `expression` a single unquoted literal word? Such an argument types like the
-/// same token written in command position, so a dashed `--n=2` written inside a
-/// value call binds the integer `2` while `--n="2"` keeps its string type.
-fn is_bare_literal_word(expression: &parser::Expr) -> bool {
-    let parser::Expr::Scalar(word) = expression else {
-        return false;
-    };
-    word.value.pieces.iter().all(|piece| {
-        matches!(
-            piece,
-            parser::WordPiece::Text {
-                quote: parser::QuoteMode::Bare,
-                ..
-            }
-        )
-    })
-}
-
 /// Bind one **dashed** option token — `body` is the text after the leading `--`,
 /// so `force` or `tag=v2` — to the switch or valued flag it names. `bare` marks a
 /// value that came from an unquoted literal word, so `--n=2` types as the integer
@@ -10095,45 +10047,6 @@ fn bind_flag_value<'p>(
                 return Err(Step::Error(2));
             };
             flag_values.insert(declared.name.as_str(), value.as_ref().clone());
-        }
-        _ => unreachable!("only flags are collected here"),
-    }
-    Ok(())
-}
-
-fn bind_dashed_option<'p>(
-    name: &str,
-    params: &'p [parser::Param],
-    body: &str,
-    bare: bool,
-    switches_on: &mut std::collections::HashSet<&'p str>,
-    flag_values: &mut std::collections::HashMap<&'p str, Value>,
-) -> Result<(), Step> {
-    use parser::ParamKind;
-    let (flag, inline) = match body.split_once('=') {
-        Some((flag, value)) => (flag, Some(value.to_owned())),
-        None => (body, None),
-    };
-    let declared = resolve_written_flag(name, params, flag, inline.is_some())?;
-    match &declared.kind {
-        ParamKind::Switch => {
-            switches_on.insert(declared.name.as_str());
-        }
-        ParamKind::Flag(_) => {
-            let Some(value) = inline else {
-                note!("mesh: {name}: flag `--{flag}` requires a value (write `--{flag}=VALUE`)");
-                return Err(Step::Error(2));
-            };
-            // Last occurrence wins for a valued flag. A bare literal value is typed
-            // like the same token passed positionally, so `--n=2` binds the integer
-            // `2`; a quoted or interpolated value (`--n="2"`, `--n=$s`) keeps its
-            // expanded string type.
-            let value = if bare {
-                expand::typed_scalar(&value)
-            } else {
-                Value::String(value)
-            };
-            flag_values.insert(declared.name.as_str(), value);
         }
         _ => unreachable!("only flags are collected here"),
     }
@@ -15528,11 +15441,20 @@ mod tests {
                 "hook should bind {line:?} positionally"
             );
         }
-        // A command-position call (flags enabled) still reads `--foo` as a flag.
+        // A command-position call (flags enabled) still reads a **flag** as one.
+        // A `Value::String` no longer binds however it is spelled -- only a
+        // written option carries the intent -- so the flag value is what this
+        // has to hand over to be testing the gate rather than the old scan.
         assert_eq!(
             super::call_func(
                 "hook",
-                vec![(Value::String("--foo".into()), false)],
+                vec![(
+                    Value::Flag(crate::vars::FlagValue {
+                        name: "foo".into(),
+                        value: None,
+                    }),
+                    false,
+                )],
                 true,
                 &mut shell,
             ),

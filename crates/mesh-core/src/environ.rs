@@ -250,6 +250,11 @@ fn join_path(key: &str, entries: Vec<Value>) -> Result<String, String> {
             Value::String(text) => parts.push(text),
             Value::Integer(number) => parts.push(number.to_string()),
             Value::Boolean(flag) => parts.push(flag.to_string()),
+            // A flag crosses as the word it was written with, exactly as it does
+            // at the top level of this same function -- and as it did before it
+            // was a type, when `--foo` in a path list was simply a string.
+            Value::Flag(flag) => parts.push(flag.text()),
+            Value::FlagTerminator => parts.push("--".to_owned()),
             _ => {
                 return Err(format!(
                     "$env.{key}: a path entry must be a string, not a nested value"
