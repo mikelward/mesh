@@ -681,7 +681,8 @@ The three rows on job control above are the ones that decide whether a config ca
 put a **time limit** on work it does not control — a prompt calling an
 overridable hook that might block, say. That needs three things in sequence:
 start the hook without blocking, get its exit status back, and give up after a
-deadline. Only the first is common to all six.
+deadline. Not one of the three is common to all six — fish lacks even the
+first, for a function or a block.
 
 **fish backgrounds externals and nothing else.** `command sleep 3 &` returns at
 once; `slow &` for a function, and `begin; …; end &` for a block, both run to
