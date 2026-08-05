@@ -39,6 +39,10 @@ const TABLE: &[(&str, &str)] = &[
         "wait [--timeout DURATION] [JOB …]",
         "Wait for a job to finish",
     ),
+    (
+        "timeout DURATION COMMAND [ARG …]",
+        "Run a command under a time limit",
+    ),
     ("disown [-h] [-a | -r] [JOB …]", "Stop tracking a job"),
     ("kill [-SIGNAL] JOB|PID ...", "Signal a job or a process"),
     (

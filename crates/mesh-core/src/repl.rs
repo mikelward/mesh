@@ -2789,7 +2789,7 @@ fn run_forked_block(body: &parser::Source, in_function: bool, shell: &mut Shell)
     // group is only safe for a shell that took the terminal. A `mesh -i` batch
     // session never did, and a group of its own would be excluded from the
     // `SIGINT` sent to the invocation's — killing the shell and orphaning this.
-    let status = exec::fork_and_wait(shell.vars.owns_terminal(), || {
+    let status = exec::fork_and_wait(shell.vars.owns_terminal(), None, || {
         // Runs after the fork, so this marks the *child's* copy of the shell:
         // it is not the parent of the pids in the job table it inherited, so
         // `jobs` must not `waitpid` on them — that fails with `ECHILD` and
@@ -6998,6 +6998,21 @@ fn run_single(
             shell,
         ));
     }
+    // Read before expansion, exactly as the plain path does: what `timeout`
+    // wraps cannot depend on whether the command also redirects or backgrounds.
+    // See `split_bounded`. A stage that deferred was handled above and reads it
+    // in its own fork instead.
+    if split_bounded(&words).is_some() {
+        return run_bounded_stage(
+            words,
+            redirs,
+            decoration,
+            background,
+            last,
+            in_function,
+            shell,
+        );
+    }
     // The words expand *before* the targets are opened: `f * > summary` must not
     // see the `summary` the redirection is about to create.
     let argv = match expand_stage(&words, decoration, last, in_function, shell) {
@@ -7309,6 +7324,20 @@ enum StageBody {
         /// say different things about the same word.
         context: Deferred,
     },
+    /// A command run under a time limit that also redirects or backgrounds —
+    /// `timeout 5s cmd > out &`. The wrapped command is already resolved, since
+    /// a redirecting stage's words are the parent's to expand; the *bound* is
+    /// applied in this stage's own fork, which is what gives the limit something
+    /// to signal and makes the job the timed command's supervisor.
+    Bounded {
+        /// Outermost first — `timeout 5s timeout 3s cmd` is two bounds around
+        /// one command, each its own fork.
+        limits: Vec<std::time::Duration>,
+        /// The wrapped command's typed arguments when it is a function, whose
+        /// name is then the stage's only word. `None` when the stage's words are
+        /// the command, as they are for [`Self::Builtin`].
+        call: Option<Vec<(Value, bool)>>,
+    },
 }
 
 /// Why a stage was deferred, which is also what it says when its words turn out to
@@ -7338,6 +7367,15 @@ impl Deferred {
         match self {
             Self::Piped => "return: cannot be used in a pipeline",
             Self::Backgrounded => "return: cannot be redirected or backgrounded",
+        }
+    }
+
+    /// The same for `fail`, which is the other word that ends a call rather than
+    /// naming a command.
+    fn failing(self) -> &'static str {
+        match self {
+            Self::Piped => "fail: cannot be used in a pipeline",
+            Self::Backgrounded => "fail: cannot be redirected or backgrounded",
         }
     }
 }
@@ -7393,6 +7431,9 @@ fn run_stages(
                 words.first().is_some_and(|word| word.is_bare_text("jobs"))
             }
             StageBody::External => false,
+            // The bound changes nothing about *what* the stage runs, so it
+            // answers exactly as the unbounded form does.
+            StageBody::Bounded { call, .. } => call.is_some() || cmd.words == ["jobs"],
         })
     {
         jobs.reap();
@@ -7464,6 +7505,9 @@ fn run_stage_in_shell(
             }
         }
         StageBody::External => unreachable!("an external stage has no in-shell body"),
+        StageBody::Bounded { limits, call } => {
+            bounded_chain(limits, &cmd.words, call.clone(), last, shell)
+        }
         // The words are expanded **here**, in the stage's own process, which is the
         // whole point of deferring them: a `$(…)` or a call in one runs where its
         // effects belong. What they come to decides how the stage ends — as a
@@ -7487,6 +7531,15 @@ fn run_stage_in_shell(
             };
             if let Some(step) = prefix_failed {
                 step
+            } else if let Some((limit, command)) = split_bounded(words) {
+                // Read before expansion here too, for the reason `split_bounded`
+                // gives — and *first*, so the deadline starts before the capture
+                // that sent this stage to its own fork rather than after it. A
+                // stage reaches this branch precisely because one of its words
+                // runs code, so expanding ahead of the bound put that code
+                // outside the limit: `timeout 100ms puts $(sleep 1) | cat` took a
+                // second and reported success.
+                run_bounded(limit, command, last, in_function, shell)
             } else {
                 match expand_stage(words, *decoration, last, in_function, shell) {
                     Ok(Expanded::Function { name, args }) => {
@@ -7563,6 +7616,14 @@ fn expand_eager_stage(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<(Vec<String>, StageBody, Vec<exec::Redirection>), Step> {
+    // Read before expansion, as every other path reads it: what `timeout` wraps
+    // must not depend on the position it is written in. See `split_bounded`.
+    if split_bounded(words).is_some() {
+        let (stage_words, body) =
+            expand_bounded(words, decoration, Deferred::Piped, last, in_function, shell)?;
+        let opened = expand_redirs(redirs, last, in_function, shell)?;
+        return Ok((stage_words, body, opened));
+    }
     // Command words expand before the redirect targets, the order `run_single`
     // uses, so a stage reports the same first failure the unpiped command does —
     // and `f * > summary` cannot glob the file the redirection is about to create.
@@ -7839,12 +7900,64 @@ fn dispatch_function_call(name: &str, args: Vec<(Value, bool)>, shell: &mut Shel
     call_func(name, args, !wrapper, shell)
 }
 
+/// The bare word a token spells, when it spells one at all.
+///
+/// A single unquoted `Text` piece and nothing else. Anything built from a
+/// variable, a quote, or a splice is *not* this word even if it expands to the
+/// same letters, which is what keeps `cmd = timeout; $cmd 5s ls` an ordinary
+/// command rather than a construct in disguise.
+fn bare_word(token: &parser::Word) -> Option<&str> {
+    if token.qualifiers.is_some() {
+        return None;
+    }
+    match token.pieces.as_slice() {
+        [
+            parser::WordPiece::Text {
+                text,
+                quote: parser::QuoteMode::Bare,
+            },
+        ] => Some(text),
+        _ => None,
+    }
+}
+
+/// `timeout DURATION` in front of a command, resolved *before* expansion.
+///
+/// It has to be read here rather than from the expanded argv: `expand_stage`
+/// settles function-vs-argv from the first word, so reaching it as
+/// `timeout 5s puts $xs` decides "not a function, flatten the rest" under the
+/// name `timeout` and the list is gone before the wrapped command sees it.
+/// Splitting first lets the tail expand under its *own* name, so
+/// `timeout 5s show $xs` passes a list to a function exactly as `show $xs` does.
+///
+/// Returns the limit and the wrapped command's tokens, or `None` when this is
+/// not a bounded command at all.
+fn split_bounded(tokens: &[parser::Word]) -> Option<(&parser::Word, &[parser::Word])> {
+    let (first, rest) = tokens.split_first()?;
+    if bare_word(first)? != "timeout" {
+        return None;
+    }
+    let (limit, command) = rest.split_first()?;
+    // `--help` is this builtin's own question, so it is left to the generic
+    // path; a duration cannot be spelled that way.
+    if bare_word(limit) == Some("--help") {
+        return None;
+    }
+    Some((limit, command))
+}
+
 fn run_command(tokens: &[parser::Word], last: u8, in_function: bool, shell: &mut Shell) -> Step {
     // No redirection on this path, so the command's stdout is the shell's.
     //
     // Functions can never share a name with a builtin or the `return`/job control
     // words (definition rejects those), so resolving one in `expand_stage` does not
     // reorder the builtins → functions → external chain.
+    // Read before expansion; see `split_bounded`. The limit is the only word
+    // this construct takes for itself -- everything after it is the wrapped
+    // command's, and expands as if `timeout` were not there.
+    if let Some((limit, command)) = split_bounded(tokens) {
+        return run_bounded(limit, command, last, in_function, shell);
+    }
     match expand_stage(tokens, stdout_decoration(), last, in_function, shell) {
         Ok(Expanded::Function { name, args }) => dispatch_function_call(&name, args, shell),
         Ok(Expanded::Return(args)) => make_return(args, last, shell),
@@ -8183,6 +8296,344 @@ fn run_exec(args: &[String], shell: &mut Shell) -> Step {
 /// `cmd(args):capture`, which expands into argv before it knows the name. Command
 /// position resolves it as [`Expanded::Return`] instead and keeps the operand
 /// typed, so a `return $xs` there carries the list rather than its text.
+/// `timeout DURATION COMMAND [ARG …]` — run a command under a time limit.
+///
+/// The half of `TODO.md`'s *Bounding a wait* that **owns** the command's
+/// lifetime, where `wait --timeout` only observes a job someone else started.
+/// So this one kills on expiry and reports `124`, because that is what the name
+/// says and what `timeout(1)` does — a script already written against that keeps
+/// reading. The collision is real and small: a command that genuinely exits 124
+/// is indistinguishable from one that ran out of time.
+///
+/// It registers **no job**. Nothing to announce, nothing in `$sh.jobs`, no
+/// handle to clean up — which is what makes it the answer for a prompt rather
+/// than a tidier spelling of the background-and-wait dance.
+///
+/// The wrapped command runs through `run_command` again, so it resolves exactly
+/// as it would without the prefix: a function takes typed arguments, a builtin
+/// is a builtin, an external is looked up on `PATH`.
+///
+/// The command runs in a fork, which is what gives it something to signal. That
+/// costs it the ability to change this shell: an assignment inside
+/// `timeout 2s some-func` is lost with the subshell, the same way `&` loses one.
+/// A bounded run of something that has to be killable cannot also be a run in
+/// this process.
+///
+/// **It bounds the stage it prefixes, not a pipeline it starts** —
+/// `timeout 5s producer | consumer` limits `producer` alone. See `TODO.md`.
+fn run_bounded(
+    limit: &parser::Word,
+    command: &[parser::Word],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
+    if command.is_empty() {
+        note!("mesh: timeout: expected a command to run");
+        return Step::Error(2);
+    }
+    let limit = match limit_of(limit, last, in_function, shell) {
+        Ok(limit) => limit,
+        Err(step) => return step,
+    };
+    let command = command.to_vec();
+    bounded_run(limit, shell, move |shell| {
+        run_command(&command, last, in_function, shell).status()
+    })
+}
+
+/// `timeout DURATION cmd` with a redirection, in the background, or both.
+///
+/// The wrapped command is resolved **here**, from its own tokens, which is the
+/// same guarantee the plain path gives: a function still resolves under its own
+/// name, and a list still reaches the command it was given to. Redirecting or
+/// backgrounding must not change what `timeout` wraps.
+///
+/// Its words expand before the targets are opened — the order every other
+/// redirecting command uses — so `timeout 5s f * > summary` cannot glob the file
+/// its own redirection is about to create.
+///
+/// Expanding in this process rather than in the fork costs what it costs for
+/// every other redirecting stage: a capture in the wrapped command runs here,
+/// outside the limit. Backgrounding one is already refused for that reason (see
+/// `command_holds_a_value`), and with no redirection the stage defers instead
+/// and reads the prefix in its own fork.
+#[allow(clippy::too_many_arguments)]
+fn run_bounded_stage(
+    words: Vec<parser::Word>,
+    redirs: Vec<Redir>,
+    decoration: Decoration,
+    background: bool,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
+    if !background {
+        // One prefix here, not every one: the fork re-enters `run_single` on
+        // what is left, so a nested `timeout` is read there under its own bound.
+        let Some((limit_word, command)) = split_bounded(&words) else {
+            note!("mesh: timeout: expected a command to run");
+            return Step::Error(2);
+        };
+        if command.is_empty() {
+            note!("mesh: timeout: expected a command to run");
+            return Step::Error(2);
+        }
+        let command = command.to_vec();
+        let limit = match limit_of(limit_word, last, in_function, shell) {
+            Ok(limit) => limit,
+            Err(step) => return step,
+        };
+        // The whole stage runs in the fork — words, targets and command alike —
+        // so a capture in the wrapped command is *inside* the limit, and the
+        // documented order (words before targets) is the one `run_single`
+        // already applies. Resolving here instead put `$(…)` in front of the
+        // deadline: `timeout 100ms puts $(sleep 1) > out` took a second and
+        // reported success, while the same line without the redirection gave up
+        // at 100ms.
+        return bounded_run(limit, shell, move |shell| {
+            run_single(
+                Stage {
+                    words: command,
+                    redirs,
+                    pipe_stderr: false,
+                    env: &[],
+                },
+                false,
+                last,
+                in_function,
+                shell,
+            )
+            .status()
+        });
+    }
+    // Backgrounded, the stage's targets are this process's to open — the shell
+    // resolves every stage's before it forks any of them — so the words are
+    // expanded here too, in front of them, and a capture among them is already
+    // refused outright (see `command_holds_a_value`).
+    let (words, body) = match expand_bounded(
+        &words,
+        decoration,
+        Deferred::Backgrounded,
+        last,
+        in_function,
+        shell,
+    ) {
+        Ok(resolved) => resolved,
+        Err(step) => return step,
+    };
+    let opened = match expand_redirs(redirs, last, in_function, shell) {
+        Ok(redirs) => redirs,
+        Err(step) => return step,
+    };
+    // The stage's own fork is where the bound is applied, so the job is the
+    // supervisor: `kill` on it reaches the timed command through
+    // `exec::TimedGroup`. In-shell whatever the command turned out to be — an
+    // external still needs a mesh process around it to enforce the limit and
+    // report the 124.
+    Step::Continue(run_stages(
+        vec![exec::Cmd {
+            words,
+            redirs: opened,
+            pipe_stderr: false,
+            in_shell: true,
+            // Never: the bound is enforced by signalling, so it needs a process
+            // of its own to signal. Backgrounded here in any case, which is a
+            // fork whatever the stage turns out to be.
+            may_run_in_shell: false,
+            env: Vec::new(),
+        }],
+        vec![body],
+        background,
+        last,
+        in_function,
+        shell,
+    ))
+}
+
+/// The wrapped command of a bounded stage, resolved where the stage's words are
+/// this process's to expand — a pipeline stage, or a backgrounded command.
+///
+/// Reading the prefix from the *tokens* is what lets the wrapped command expand
+/// under its own name, so a function still resolves and a builtin still gets its
+/// typed arguments. Every stage form goes through here, which is the point:
+/// `timeout` must mean the same thing wherever it is written.
+///
+/// Safe to do in this process because a stage that reaches it has no word that
+/// runs code — one that does *defers*, and reads the prefix in its own fork
+/// where the capture is inside the limit rather than in front of it.
+fn expand_bounded(
+    words: &[parser::Word],
+    decoration: Decoration,
+    context: Deferred,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<(Vec<String>, StageBody), Step> {
+    // Every prefix, not just the first. `timeout 5s timeout 3s cmd` is two
+    // bounds around one command, and peeling only one left the rest to
+    // `expand_stage` under the name `timeout` — the very flattening this path
+    // exists to avoid, one level in.
+    let mut limits = Vec::new();
+    let mut command = words;
+    while let Some((limit, rest)) = split_bounded(command) {
+        limits.push(limit_of(limit, last, in_function, shell)?);
+        command = rest;
+    }
+    if command.is_empty() {
+        note!("mesh: timeout: expected a command to run");
+        return Err(Step::Error(2));
+    }
+    let (words, call) = match expand_stage(command, decoration, last, in_function, shell)? {
+        // Only the name goes into the words a job listing echoes back: the
+        // arguments are typed values, as they are for any other stage.
+        Expanded::Function { name, args } => (vec![name], Some(args)),
+        Expanded::Return(_) => {
+            note!("mesh: {}", context.returning());
+            return Err(Step::Error(2));
+        }
+        Expanded::Fail(_) => {
+            note!("mesh: {}", context.failing());
+            return Err(Step::Error(2));
+        }
+        Expanded::Argv(argv) => {
+            if argv.is_empty() {
+                note!("mesh: timeout: expected a command to run");
+                return Err(Step::Error(2));
+            }
+            (argv, None)
+        }
+    };
+    Ok((words, StageBody::Bounded { limits, call }))
+}
+
+/// Apply a stage's bounds from the outside in, one fork each, and run the
+/// command inside the innermost.
+///
+/// Nesting is rare but it is written down rather than flattened, because the two
+/// limits are not interchangeable: the outer one bounds the inner *supervisor*
+/// as well as the command, so it is the one that survives a wrapped command that
+/// refuses to stop.
+fn bounded_chain(
+    limits: &[std::time::Duration],
+    words: &[String],
+    call: Option<Vec<(Value, bool)>>,
+    last: u8,
+    shell: &mut Shell,
+) -> Step {
+    let Some((limit, rest)) = limits.split_first() else {
+        return Step::Continue(bounded_body(words, call, last, shell));
+    };
+    bounded_run(*limit, shell, |shell| {
+        bounded_chain(rest, words, call, last, shell).status()
+    })
+}
+
+/// The wrapped command once it is resolved: a function call keeps its typed
+/// arguments, and anything else runs from its words.
+fn bounded_body(
+    words: &[String],
+    call: Option<Vec<(Value, bool)>>,
+    last: u8,
+    shell: &mut Shell,
+) -> u8 {
+    match call {
+        Some(args) => dispatch_function_call(&words[0], args, shell),
+        None => run_expanded(words.to_vec(), last, shell),
+    }
+    .status()
+}
+
+/// `timeout` reached with its words already expanded — a nested one inside
+/// another bounded run, or any other path that resolves a command from argv.
+///
+/// Every path that has the *tokens* reads the prefix from them instead, so this
+/// is the floor rather than the pipeline's route: it exists because without it
+/// the name falls through to an **external** `timeout`, and the very same line
+/// would mean coreutils in one position and this builtin in another — `300ms`
+/// accepted by one and refused by the other with 125.
+///
+/// What it cannot do is keep *value fidelity*, since argv is where a list has
+/// already been flattened.
+fn run_bounded_argv(args: &[String], last: u8, shell: &mut Shell) -> Step {
+    let Some((limit, command)) = args.split_first() else {
+        note!("mesh: timeout: expected a duration and a command");
+        return Step::Error(2);
+    };
+    // Asked before the duration is read, and only in the limit's own position —
+    // the same cut `split_bounded` makes. This entry point is reached ahead of
+    // the generic builtin routing, so without it `timeout --help` answered "not
+    // a duration: --help" where every other builtin prints its usage. Anywhere
+    // further along the line the word is the wrapped command's, exactly as
+    // `command ls --help` is ls's question.
+    if limit == "--help" {
+        return Step::Continue(builtins::print_help("timeout"));
+    }
+    let Some(limit) = builtins::parse_duration(limit) else {
+        note!("mesh: timeout: not a duration: {limit}");
+        return Step::Error(2);
+    };
+    if command.is_empty() {
+        note!("mesh: timeout: expected a command to run");
+        return Step::Error(2);
+    }
+    let command = command.to_vec();
+    bounded_run(limit, shell, move |shell| {
+        run_expanded(command, last, shell).status()
+    })
+}
+
+/// Expand the one word this construct takes for itself, and read it as a limit.
+fn limit_of(
+    limit: &parser::Word,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<std::time::Duration, Step> {
+    let word = expansion_word(limit, last, in_function, shell)?;
+    let expanded = expand::expand(vec![word], &shell.vars).map_err(runtime_message)?;
+    let [limit] = expanded.as_slice() else {
+        note!("mesh: timeout: the limit is one word");
+        return Err(Step::Error(2));
+    };
+    builtins::parse_duration(limit).ok_or_else(|| {
+        note!("mesh: timeout: not a duration: {limit}");
+        Step::Error(2)
+    })
+}
+
+/// Run `body` in a fork, bounded by `limit`.
+///
+/// The fork is what gives the limit something to signal, and it is why a bounded
+/// run cannot change this shell: an assignment inside `timeout 2s some-func` is
+/// lost with the subshell, the same way `&` loses one.
+fn bounded_run(
+    limit: std::time::Duration,
+    shell: &mut Shell,
+    body: impl FnOnce(&mut Shell) -> u8,
+) -> Step {
+    // Started here rather than inside the fork: the clock is the caller's, and
+    // the child's own startup comes out of the limit it was given.
+    let deadline = std::time::Instant::now() + limit;
+    let outcome = exec::fork_and_wait(shell.vars.owns_terminal(), Some(deadline), || {
+        // As in `fork`: this is the child, and it is not the parent of the pids
+        // in the job table it inherited.
+        shell.forked = true;
+        shell.captures = 0;
+        body(shell)
+    });
+    match outcome {
+        Ok(status) => Step::Continue(status),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            Step::Continue(builtins::TIMED_OUT_CODE)
+        }
+        Err(error) => {
+            note!("mesh: timeout: {error}");
+            Step::Error(1)
+        }
+    }
+}
+
 fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     if words.is_empty() {
         // A command whose words all expanded away (e.g. a glob with no
@@ -8223,6 +8674,9 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     // a command that bypasses both.
     if words[0] == "exec" {
         return run_exec(&words[1..], shell);
+    }
+    if words[0] == "timeout" {
+        return run_bounded_argv(&words[1..], last, shell);
     }
     if builtins::is_builtin(&words[0]) {
         if auto_help_requested_strings(&words[1..]) {

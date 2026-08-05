@@ -4951,7 +4951,7 @@ the shell's own process group and the group signal would take the shell down.
 split falls out of what each name already promises: `timeout` **owns** the
 command's lifetime, `wait` only **observes** a job someone else started.
 
-- [ ] **`timeout <duration> cmd [arg …]`** — the one-shot case, and the one the
+- [x] **`timeout <duration> cmd [arg …]`** — the one-shot case, and the one the
       prompt wants. Takes a function or an external, bounds it, hands back a
       status. **Kills on expiry**, because that is what the name says and what
       `timeout(1)` does. Reports **`124`**, same reason: every script already
@@ -4963,6 +4963,22 @@ command's lifetime, `wait` only **observes** a job someone else started.
       It registers **no job**, so there is nothing to announce, nothing in
       `$sh.jobs`, and no handle to clean up. That is what makes it the answer for
       a prompt rather than merely a tidier spelling.
+
+      **Landed.** The command runs in a fork, which is what gives it something to
+      signal and lets it be a function, a builtin or an external alike — at the
+      cost, shared with `&`, of not being able to change this shell. Functions
+      resolve in `expand_stage` *before* `run_expanded`, so the bounded call
+      dispatches one itself; going straight to `run_expanded` reported every
+      function as not found. The child takes its own process group even when the
+      shell is not doing job control, so the kill reaches what the body started —
+      without that, a wrapper whose blocking child was killed carried on to its
+      own `return true` and reported a run that had run out of time as healthy.
+      That nested group is outside the job table's reach, so a backgrounded
+      `timeout` hands a killing signal on to it (`exec::TimedGroup`); otherwise
+      `kill` on the job ended the supervisor and left the timed command running
+      with nothing enforcing the limit. Redirecting or backgrounding one reads
+      the prefix on its own path rather than falling through to argv, so what
+      `timeout` wraps does not depend on what is written beside it.
 - [x] **`wait --timeout <duration> <job>`** — for a job already backgrounded,
       when the caller wants the handle anyway (to `kill` it, read `$j.state`, or
       `fg` it later) or is collecting several with one budget. Matches the
@@ -4996,6 +5012,81 @@ command's lifetime, `wait` only **observes** a job someone else started.
       Durations are parsed from a *string* rather than a new value type, and
       accept the compound forms `duration_words` already prints — a shell whose
       own output is not valid input is its own small wart.
+
+- [ ] **Does a prefix bound the stage or the pipeline?** `timeout` as landed
+      bounds the **stage** it prefixes, so `timeout 5s producer | consumer`
+      limits `producer` alone. That is the smaller reading and the one a
+      *prefix* suggests, but it is probably not what someone typing it expects —
+      the obvious reading of "give this pipeline five seconds" is the whole
+      thing. Deferred rather than decided: the pipeline reading needs the limit
+      to outlive a single stage's plan, and picking it later invalidates nothing
+      written against the current one, since a one-stage pipeline means the same
+      under both.
+
+      **`time` has the same question**, and the two should answer it together —
+      a shell where `timeout` prefixes a stage and `time` prefixes a pipeline
+      would be arbitrary. Whichever way this goes, both follow it.
+
+- [ ] **`timeout`'s signal and escalation should be the caller's choice.** On
+      expiry it sends `SIGTERM` to the timed group, gives it 200ms, and `SIGKILL`s
+      what is left. `timeout(1)` splits those into `-s` and `--kill-after`, and
+      escalates only when asked — it can afford to, because it waits on the
+      command itself and can simply keep waiting. Mesh runs the command under a
+      subshell, and that subshell dies to the same `SIGTERM` it forwards, so
+      there is no wait left to keep: a command that traps `TERM` would otherwise
+      outlive a `124` with nobody watching it. Enforcing the limit is the right
+      default for something whose point is to come back, but the 200ms and the
+      signal are both guesses that belong to the caller.
+
+- [ ] **A nested `timeout`'s group escapes the outer one's escalation, and no
+      arrangement of process groups fixes it.** `timeout 100ms timeout 30s
+      sh -c 'trap "" TERM; sleep 1; …'` reports `124` and the command runs on:
+      each bounded run makes its own group, so the outer expiry kills the inner
+      *supervisor*, whose handler forwards `TERM` and dies — and the trapping
+      command survives in a group the outer supervisor cannot name. Its drain
+      finds the outer group empty and stops there.
+
+      Both ways of rearranging the groups trade one leak for the other, which is
+      why this is written down rather than patched again:
+
+      - **Nested groups** (today) — the outer cannot reach the inner group, so
+        the *outer* limit leaks when the inner command refuses to stop.
+      - **One shared group** for every level — the outer reaches everything, but
+        the inner supervisor is then *inside* the group it must kill. It can
+        exclude itself from the broadcast by ignoring the signal, but not from
+        the emptiness test that decides whether to escalate, so the *inner*
+        limit leaks instead.
+
+      The real answer is to stop asking a process group to mean "the tree this
+      command started" and enumerate the tree: `/proc` on Linux, `sysctl`
+      `KERN_PROC_ALL` on macOS and FreeBSD. That also removes the whole signal
+      handoff — `exec::TimedGroup` exists only because the timed command sits
+      outside the job's signal domain — so it is a simplification rather than
+      another mechanism. It is a separate change: process enumeration is a new
+      platform surface, and every target has to grow it at once.
+
+- [x] **`timeout` in a pipeline stage loses value fidelity.** A pipeline stage
+      resolved its command from argv, where a list has already been flattened,
+      so `timeout 5s show $xs | cat` was an error while bare `show $xs` passed
+      one list.
+
+      **Closed.** Every stage form reads the prefix from the *tokens* now, so
+      there is one shape rather than a path per position: a stage whose words
+      carry a value reads it in its own fork, and every other reads it in the
+      parent from the wrapped tokens. Review found the seam twice before this —
+      once for redirected and backgrounded commands, once for pipeline stages —
+      which is what an argv fallback per position was always going to cost.
+
+      Fixing the fidelity fixed a *bound* that started too late with it: a
+      deferred stage expands in its fork, so reading the prefix after that put a
+      capture in front of the limit. `timeout 100ms puts $(sleep 1) | cat` took a
+      second and reported success. The deadline now starts before anything that
+      can run code, wherever the construct is written.
+
+      `run_bounded_argv` stays as the floor, for a nested `timeout` reached from
+      argv and anything else that resolves a command that way: without it the
+      name falls through to an **external** `timeout`, and the same line means
+      coreutils in one position and this builtin in another.
 
 Neither needs **polling**, and neither wants a blocking `waitpid` — POSIX gives
 it no timeout parameter, and this shell deliberately stopped calling it that way:
