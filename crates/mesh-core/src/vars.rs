@@ -691,6 +691,11 @@ enum Callable {
     /// one argument. Held as the name rather than a synthesized lambda body: there
     /// is nothing to parse, and applying a modifier is a direct call.
     Modifier(String),
+    /// An `&name` reference — the function command position would run for `name`.
+    /// The **name** is held rather than the definition it resolves to, which is
+    /// what makes the reference late bound: redefining `name` changes what an
+    /// already-stored reference runs.
+    Named(String),
 }
 
 impl FuncValue {
@@ -702,11 +707,15 @@ impl FuncValue {
         Self(Arc::new(Callable::Modifier(name)))
     }
 
+    pub fn named(name: String) -> Self {
+        Self(Arc::new(Callable::Named(name)))
+    }
+
     /// The signature and body, when this is a written lambda.
     pub fn as_lambda(&self) -> Option<(&[crate::parser::Param], &crate::parser::Source)> {
         match &*self.0 {
             Callable::Lambda { params, body } => Some((params, body)),
-            Callable::Modifier(_) => None,
+            Callable::Modifier(_) | Callable::Named(_) => None,
         }
     }
 
@@ -714,7 +723,16 @@ impl FuncValue {
     pub fn modifier_name(&self) -> Option<&str> {
         match &*self.0 {
             Callable::Modifier(name) => Some(name),
-            Callable::Lambda { .. } => None,
+            Callable::Lambda { .. } | Callable::Named(_) => None,
+        }
+    }
+
+    /// The referenced command name, when this is an `&name` reference. The caller
+    /// resolves it — this only says which name to resolve.
+    pub fn func_name(&self) -> Option<&str> {
+        match &*self.0 {
+            Callable::Named(name) => Some(name),
+            Callable::Lambda { .. } | Callable::Modifier(_) => None,
         }
     }
 }

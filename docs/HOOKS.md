@@ -72,7 +72,11 @@ Two gaps left, each verified:
 - **No callable values.** `on exit e func(s) { … }` → `mesh: a function value has
   no text form`, and `$sh.exit.e = func() { }` → ``mesh: $sh.exit.e: a handler is
   a function's name; a callable value is not stored yet``. The stored handler is
-  a `String`.
+  a `String`. An `&name` reference is the exception, and only because it is not a
+  new kind of stored value: the slot takes the name out of it and stores that.
+  Note that the exception is the **map** spelling only — `on exit e &h` is command
+  position, where a `&` still backgrounds `on exit e` and leaves `h` as the next
+  command.
 - **No commands as handlers.** `on exit e echo` → ``mesh: on: `echo` is not a
   function``, though `DESIGN.md` says a handler is a reference to "a command or
   function."
@@ -90,12 +94,17 @@ being broken. The `&name` section says so directly: it fixes when a reference
 
 **A newer gap, from the `&name` decision.** `DESIGN.md` now spells a handler
 reference `&handler` rather than a bare `handler`, and makes a bare word in a
-hook slot an ordinary string. Nothing here is built either way, so this document's
-questions are unchanged in substance — **D1's option (b) is written in the new
-spelling below**, rather than translated in passing here — and the eager-check
-question (D3) is untouched, since it is about *when* a reference is validated, not
-how it is spelled. See `TODO.md` §"Beyond M3
-— Function references (`&name`) and lambda capture".
+hook slot an ordinary string. **Half of that is built.** `&name` parses and is a
+function value, and a hook slot accepts one — `$sh.exit.e = &clean-up` registers
+exactly what the bare word registers, because a reference *is* a name. What is
+not built is the breaking half: a bare word in a slot is still a handler name
+rather than an ordinary string, so both spellings work and neither is required.
+The stored handler is still a `String`, so D1 below is untouched in substance —
+**its option (b) is written in the new spelling**, and accepting `&name` is not
+that option, since nothing new is stored. The eager-check question (D3) is
+untouched too: it is about *when* a reference is validated, not how it is
+spelled, and `&nosuch` is refused at the assignment exactly as `nosuch` is. See
+`TODO.md` §"Beyond M3 — Function references (`&name`)".
 
 ---
 

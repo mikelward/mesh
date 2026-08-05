@@ -430,7 +430,7 @@ fn signature(name: &str, def: &FuncDef) -> String {
 /// [system default](default_path). Reporting "not found" there would have been
 /// wrong about the one thing this exists to be right about — `env -u PATH mesh`
 /// still runs `sh`, so `whence sh` has to still find it.
-fn path_hits(name: &str) -> Vec<PathBuf> {
+pub(crate) fn path_hits(name: &str) -> Vec<PathBuf> {
     // Unset and empty are different: unset takes the default below, while a set
     // but empty `PATH` is one empty component — the current directory — which is
     // what `split_paths` already yields and what `execvp` searches.

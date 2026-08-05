@@ -3594,8 +3594,18 @@ fn assign_hook(
             if append {
                 return Err(format!("{target}: a handler is set with `=`, not `+=`"));
             }
-            let Value::String(function) = value else {
-                return Err(hook_value_error(target, value));
+            // A bare word is the shipped spelling and stays one. `&name` is
+            // accepted beside it because a reference *is* a name — it stores
+            // identically, and the late binding a hook already had (the handler is
+            // looked up when the event fires) is exactly what the sigil means.
+            // A lambda is still not storable; it has no name to register.
+            let function = match value {
+                Value::String(function) => function.as_str(),
+                Value::Function(reference) => match reference.func_name() {
+                    Some(name) => name,
+                    None => return Err(hook_value_error(target, value)),
+                },
+                _ => return Err(hook_value_error(target, value)),
             };
             // The check `on` makes, in the same words bar the prefix: absence
             // from `Funcs` is a typo, and reporting it at the assignment beats
@@ -4408,6 +4418,12 @@ fn eval_expr(
         // is nothing to call.
         E::ModifierRef(name) if name == "capture" => runtime_error(CAPTURE_NEEDS_A_CALL),
         E::ModifierRef(name) => Ok(Value::Function(vars::FuncValue::modifier(name.clone()))),
+        // `&name` is the name, not the thing it names: nothing is resolved here, so
+        // a reference to a function defined later — or redefined after — is the
+        // function it names at the moment it is *called*. That late binding is the
+        // whole difference from capturing a lambda, and it is what lets a hook slot
+        // hold `&reload-config` while the config that defines it is still loading.
+        E::FuncRef(name) => Ok(Value::Function(vars::FuncValue::named(name.clone()))),
     }
 }
 
@@ -4468,28 +4484,82 @@ fn eval_call(
                 callee_description(callee)
             ));
         };
-        // A modifier reference has no signature to match against: it takes exactly
-        // one thing and applies itself to it, so the argument list is checked here
-        // rather than by `bind_arguments`.
-        if let Some(modifier) = function.modifier_name() {
-            return call_modifier_ref(modifier, arguments, last, in_function, shell);
-        }
-        let (params, body) = function
-            .as_lambda()
-            .expect("a callable is a lambda or a modifier reference");
-        // A lambda has no `wrapper` marker to carry, so it always parses flags.
-        return call_signature_for_value(
+        return call_function_value(
+            &function,
             &callee_description(callee),
-            params,
-            body,
             arguments,
-            true,
             last,
             in_function,
             shell,
         );
     };
     let name = word.value.text();
+    call_named_for_value(&name, arguments, last, in_function, shell)
+}
+
+/// Call an **already-evaluated** function value.
+///
+/// Split from [`eval_call`] so [`capture_call`] can reach it with the callee it
+/// has already evaluated: a `:capture` has to know whether the callee is a command
+/// *before* diverting the channels, and evaluating the expression a second time to
+/// find out would run it twice.
+///
+/// `description` names the callee in diagnostics — the variable a lambda was read
+/// through. An `&name` is the exception and names *itself*, since the reference is
+/// the callee and the variable is only how it got here.
+fn call_function_value(
+    function: &vars::FuncValue,
+    description: &str,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    // A modifier reference has no signature to match against: it takes exactly
+    // one thing and applies itself to it, so the argument list is checked here
+    // rather than by `bind_arguments`.
+    if let Some(modifier) = function.modifier_name() {
+        return call_modifier_ref(modifier, arguments, last, in_function, shell);
+    }
+    // An `&name` reference resolves *here*, at the call, not where it was
+    // written — so this reads the namespace as it stands now, and through the
+    // same dispatch a written `name(…)` takes.
+    if let Some(referenced) = function.func_name() {
+        if !reference_resolves(referenced, shell) {
+            return runtime_error(format!(
+                "&{referenced}: no builtin, function, or command with that name"
+            ));
+        }
+        return call_named_for_value(referenced, arguments, last, in_function, shell);
+    }
+    let (params, body) = function
+        .as_lambda()
+        .expect("a callable is a lambda, a modifier reference, or an `&name`");
+    // A lambda has no `wrapper` marker to carry, so it always parses flags.
+    call_signature_for_value(
+        description,
+        params,
+        body,
+        arguments,
+        true,
+        last,
+        in_function,
+        shell,
+    )
+}
+
+/// Call the thing a **bare name** names, for its value — the tail of
+/// [`eval_call`], split out because an `&name` reference reaches exactly the same
+/// place. Sharing it is the point: a reference is a name, so `$f(x)` through
+/// `f = &g` must dispatch to whatever `g(x)` would, value-call builtins included,
+/// rather than to a second, narrower idea of what a name can be.
+fn call_named_for_value(
+    name: &str,
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
     if name == "style" {
         return eval_style(arguments, last, in_function, shell);
     }
@@ -4502,18 +4572,16 @@ fn eval_call(
     if name == "gets" {
         return eval_gets(arguments, shell);
     }
-    if let Some(filter) = entry_filter(&name) {
-        return eval_directory_entries(&name, filter, arguments, last, in_function, shell);
+    if let Some(filter) = entry_filter(name) {
+        return eval_directory_entries(name, filter, arguments, last, in_function, shell);
     }
     if name != "re" {
         // A user function called for its value; an external (or unknown) command
         // has no return value — point at `$(…)` for its output instead.
-        if shell.funcs.get(&name).is_some() {
-            return call_func_for_value(&name, arguments, last, in_function, shell);
+        if shell.funcs.get(name).is_some() {
+            return call_func_for_value(name, arguments, last, in_function, shell);
         }
-        return runtime_error(format!(
-            "{name}: a command has no return value; use `$({name} …)` to capture its output"
-        ));
+        return runtime_error(no_return_value(name));
     }
     let mut pattern = None;
     let mut literal = false;
@@ -5686,6 +5754,24 @@ mod capture {
 /// `.out`/`.err` are the bytes **as written** — no trailing-newline trim, unlike
 /// `$(…)` — because the record is meant to bake in no split policy: `:lines`,
 /// `:split`, and friends are how you divide them up.
+/// Does `name` capture as a **command** — the record without `.value` — rather
+/// than as a value call?
+///
+/// Every built-in value name, not just `re`: `glob("*"):capture` asks what a
+/// *call* wrote and returned, and routing it to the command path would report the
+/// command-not-found for a `glob` that isn't one. `gets` is the case where both
+/// spellings exist, so the call form has to win here too — otherwise
+/// `gets():capture` would run the *command*, read a line, and hand back a record
+/// with no `.value` holding it.
+///
+/// Shared by the bare name and the `&name` reference that reaches the same call,
+/// so the two cannot answer it differently.
+fn captures_as_a_command(name: &str, shell: &Shell) -> bool {
+    !parser::value_builtin(name)
+        && !builtins::is_callable_builtin(name)
+        && shell.funcs.get(name).is_none()
+}
+
 fn capture_call(
     callee: &parser::Expr,
     arguments: &[parser::Argument],
@@ -5697,29 +5783,66 @@ fn capture_call(
     // back without `.value`. This is the one case where a value call on a command
     // is allowed at all, since it asks for the channel record rather than a value
     // the command lacks.
-    let command = match callee {
-        parser::Expr::Scalar(word) => {
-            let name = word.value.text();
-            // Every built-in value name, not just `re`: `glob("*"):capture` asks
-            // what a *call* wrote and returned, and routing it to the command path
-            // would report the command-not-found for a `glob` that isn't one.
-            // `gets` is the case where both spellings exist, so the call form has to
-            // win here too — otherwise `gets():capture` would run the *command*,
-            // read a line, and hand back a record with no `.value` holding it.
-            (!parser::value_builtin(&name)
-                && !builtins::is_callable_builtin(&name)
-                && shell.funcs.get(&name).is_none())
-            .then_some(name)
-        }
-        _ => None,
-    };
-    if let Some(name) = command {
-        return capture_command(&name, arguments, last, in_function, shell);
-    }
-
     shell.value_call_status = None;
+    // *Everything* the invocation does happens inside the capture — including
+    // working out what the callee is. `:capture` is defined over the whole call,
+    // which is why [`run_command_in_capture`] evaluates arguments in here too: an
+    // argument that prints (`echo(side()):capture`) belongs in the record, and a
+    // computed callee that prints (`(make())():capture`) is the same case. Deciding
+    // command-vs-value first would have put that output on the terminal instead.
     let (outcome, out_text, err_text) = capture::with_channels_captured(shell, |shell| {
-        eval_call(callee, arguments, last, in_function, shell)
+        // A bare name answers from the token; anything else has to be evaluated,
+        // and is evaluated **once** — an `&name` reference to a command takes the
+        // command path below, and re-evaluating to discover that would run it twice.
+        let resolved = match callee {
+            parser::Expr::Scalar(word) => CapturedCallee::Name(word.value.text()),
+            _ => {
+                let target = eval_operand_of(callee, last, in_function, shell)?;
+                if shell.control.is_some() {
+                    return Ok(CapturedCall::Control);
+                }
+                let Value::Function(function) = target else {
+                    return runtime_error(format!(
+                        "{}: value is not callable",
+                        callee_description(callee)
+                    ));
+                };
+                CapturedCallee::Value(function)
+            }
+        };
+        // A reference is a name, so it answers the command question the same way
+        // the bare name does — `$f("hi"):capture` through `f = &puts` is
+        // `puts("hi"):capture`. An unresolvable one is not a command to go run: it
+        // is a bad reference, and `call_function_value` is what says so.
+        let command = match &resolved {
+            CapturedCallee::Name(name) => captures_as_a_command(name, shell).then(|| name.clone()),
+            CapturedCallee::Value(function) => function.func_name().and_then(|name| {
+                (reference_resolves(name, shell) && captures_as_a_command(name, shell))
+                    .then(|| name.to_string())
+            }),
+        };
+        if let Some(name) = command {
+            return Ok(
+                match run_command_in_capture(&name, arguments, last, in_function, shell)? {
+                    Some(status) => CapturedCall::Command(status),
+                    None => CapturedCall::Control,
+                },
+            );
+        }
+        match resolved {
+            CapturedCallee::Name(name) => {
+                call_named_for_value(&name, arguments, last, in_function, shell)
+            }
+            CapturedCallee::Value(function) => call_function_value(
+                &function,
+                &callee_description(callee),
+                arguments,
+                last,
+                in_function,
+                shell,
+            ),
+        }
+        .map(CapturedCall::Value)
     })?;
     // A `return`/`fail` carries its own status out; a body that fell off its end
     // reports the value's, which is the same rule an expression statement follows.
@@ -5728,8 +5851,8 @@ fn capture_call(
     // plain value call — `:capture` observes a call's channels, it does not turn a
     // failure into data. Its diagnostic went to the captured stderr, so it is
     // re-reported here or it would vanish with the record.
-    let value = match outcome {
-        Ok(value) => value,
+    let call = match outcome {
+        Ok(call) => call,
         Err(step) => {
             if !err_text.is_empty() {
                 note!("{}", err_text.trim_end_matches('\n'));
@@ -5737,13 +5860,42 @@ fn capture_call(
             return Err(step);
         }
     };
-    let status = unwound.unwrap_or_else(|| status_of(&value));
-    Ok(channel_record(
-        Some(value.clone()),
-        out_text,
-        err_text,
-        status,
-    ))
+    match call {
+        // Control flow is unwinding; the statement layer acts on `shell.control`.
+        CapturedCall::Control => Ok(control_placeholder()),
+        // A command's record has no `.value` — there is none — and a nonzero exit
+        // is the point of asking rather than a failure: `grep(x):capture` on no
+        // match reports status 1 in the record rather than failing the statement.
+        CapturedCall::Command(status) => Ok(channel_record(None, out_text, err_text, status)),
+        CapturedCall::Value(value) => {
+            let status = unwound.unwrap_or_else(|| status_of(&value));
+            Ok(channel_record(
+                Some(value.clone()),
+                out_text,
+                err_text,
+                status,
+            ))
+        }
+    }
+}
+
+/// What a captured call turned out to be, decided *inside* the capture because
+/// deciding it needs the callee evaluated. See [`capture_call`].
+enum CapturedCall {
+    /// A value call, and what it returned.
+    Value(Value),
+    /// A command — builtin or external — and its exit status. No `.value`.
+    Command(u8),
+    /// `break` / `continue` unwound out of the callee or an argument.
+    Control,
+}
+
+/// The callee of a captured call, once it is known.
+enum CapturedCallee {
+    /// Written as a bare name, which needs no evaluation to recognize.
+    Name(String),
+    /// Any other expression, already evaluated to the function value it produced.
+    Value(vars::FuncValue),
 }
 
 /// `cmd(args):capture` on a **command**: the same record minus `.value`, since
@@ -5760,20 +5912,21 @@ fn capture_call(
 /// Positional arguments only. A command has no signature and no canonical
 /// named-option encoding, so a `key: value` pair or a map spread has nothing to
 /// bind to; pass the intended argv token as a positional instead.
-fn capture_command(
+///
+/// Runs **inside** [`capture_call`]'s capture rather than opening one of its own:
+/// the arguments are evaluated in here, not before, because an argument can print
+/// — `echo(side()):capture` — and `:capture` is defined over the whole invocation,
+/// so everything written while evaluating the call belongs in the record. That is
+/// the same rule the callee is now held to. `None` means control flow unwound
+/// through an argument.
+fn run_command_in_capture(
     name: &str,
     arguments: &[parser::Argument],
     last: u8,
     in_function: bool,
     shell: &mut Shell,
-) -> Result<Value, Step> {
-    // The arguments are evaluated *inside* the capture, not before it. An argument
-    // can print — `echo(side()):capture` — and `:capture` is defined over the whole
-    // invocation, so everything written while evaluating the call belongs in the
-    // record. Doing it first would put that output on the terminal and leave the
-    // record holding only the command's own, which is not what the same argument
-    // does in a captured mesh call.
-    let (outcome, out_text, err_text) = capture::with_channels_captured(shell, |shell| {
+) -> Result<Option<u8>, Step> {
+    {
         let mut words = vec![name.to_string()];
         for argument in arguments {
             match argument {
@@ -5811,29 +5964,16 @@ fn capture_command(
         // `run_expanded` resolves builtins → functions → external exactly as command
         // position does. A function name cannot arrive here (the caller sent it to
         // the value-call path), so this is a builtin or an external.
+        //
+        // An argument that failed did so with its diagnostic on the captured stderr;
+        // re-reporting it is `capture_call`'s job, on the one path both kinds of
+        // failure now share.
         match run_expanded(words, last, shell) {
             Step::Continue(status) => Ok(Some(status)),
             // `exit` leaves the shell rather than reporting a status into a record.
             step => Err(step),
         }
-    })?;
-    // An argument that failed did so with its diagnostic on the captured stderr, so
-    // it is re-reported here rather than vanishing with the record — the same rule
-    // `capture_call` applies to a call that never ran.
-    let status = match outcome {
-        Ok(Some(status)) => status,
-        // Control flow is unwinding; the statement layer acts on `shell.control`.
-        Ok(None) => return Ok(control_placeholder()),
-        Err(step) => {
-            if !err_text.is_empty() {
-                note!("{}", err_text.trim_end_matches('\n'));
-            }
-            return Err(step);
-        }
-    };
-    // A nonzero exit is the point of asking, not a failure: `grep(x):capture` on no
-    // match reports status 1 in the record rather than failing the statement.
-    Ok(channel_record(None, out_text, err_text, status))
+    }
 }
 
 /// The record `:capture` returns. An ordered map, so `$r.value` / `$r.out` read it
@@ -8852,6 +8992,43 @@ fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &
 /// value carried by an explicit `return`. Stdout still streams: the value and
 /// byte channels are independent (`DESIGN.md` §"Calling for a value"). Loop state
 /// is isolated exactly as in [`call_func`].
+/// Why a name that runs cannot be called for a value. One wording, shared by the
+/// written call (`puts(1 + 2)`) and the `&name` reference that reaches the same
+/// place — the two are the same failure, and a reader who has met one should not
+/// have to recognize the other.
+fn no_return_value(name: &str) -> String {
+    format!("{name}: a command has no return value; use `$({name} …)` to capture its output")
+}
+
+/// Does `&name` name anything at all?
+///
+/// The command namespace, in the reference's own order — value call, builtin,
+/// function, external — which is command position's minus the keyword step the
+/// parser already refused. Asked *separately* from whether calling it yields a
+/// value, because those are different questions with different answers: `&grep`
+/// resolves and has nothing to return, and only a name that resolves to nothing
+/// gets the message about a bad reference.
+fn reference_resolves(name: &str, shell: &Shell) -> bool {
+    builtins::is_value_call(name)
+        || builtins::is_builtin(name)
+        || entry_filter(name).is_some()
+        || shell.funcs.get(name).is_some()
+        || !whence::path_hits(name).is_empty()
+}
+
+/// Why an `&name` reference cannot be applied one element at a time.
+///
+/// The higher-order path has an already-evaluated element rather than an argument
+/// list, and the value-call builtins read their own arguments — so there is
+/// nothing to hand them. A lambda wrapper expresses it exactly and works today,
+/// which is what the message points at rather than leaving the reader to find it.
+fn not_applicable_per_element(name: &str) -> String {
+    format!(
+        "&{name}: a value call cannot be applied per element; wrap it \
+         (`func(x) {{ {name}($x) }}`)"
+    )
+}
+
 fn call_func_for_value(
     name: &str,
     arguments: &[parser::Argument],
@@ -9038,9 +9215,49 @@ fn call_callable_for_value(
     if let Some(modifier) = function.modifier_name() {
         return apply_modifier_ref(modifier, argument);
     }
+    // Resolved per element rather than once for the whole `:map`, which is what
+    // late binding means: a handler that redefines its own target mid-traversal
+    // changes what the remaining elements run through. Cheap enough to be the
+    // honest reading — the store is a hash lookup.
+    if let Some(referenced) = function.func_name() {
+        if !reference_resolves(referenced, shell) {
+            return runtime_error(format!(
+                "&{referenced}: no builtin, function, or command with that name"
+            ));
+        }
+        // Only a declared `func` can be applied to an element in hand. A value call
+        // reads its own argument list and there is none here, and a command — an
+        // external or an effect-only builtin — has no value to give at all; the two
+        // are different failures and say so separately.
+        let Some((params, body)) = shell
+            .funcs
+            .get(referenced)
+            .map(|def| (def.params.clone(), def.body.clone()))
+        else {
+            return runtime_error(
+                if builtins::is_value_call(referenced)
+                    || builtins::is_callable_builtin(referenced)
+                    || entry_filter(referenced).is_some()
+                {
+                    not_applicable_per_element(referenced)
+                } else {
+                    no_return_value(referenced)
+                },
+            );
+        };
+        let caller_result = shell.result.clone();
+        let caller_produced = shell.produced;
+        return run_call_body_for_value(
+            &body,
+            caller_result,
+            caller_produced,
+            |shell| bind_arguments(referenced, &params, vec![(argument, false)], false, shell),
+            shell,
+        );
+    }
     let (params, body) = function
         .as_lambda()
-        .expect("a callable is a lambda or a modifier reference");
+        .expect("a callable is a lambda, a modifier reference, or an `&name`");
     let caller_result = shell.result.clone();
     let caller_produced = shell.produced;
     run_call_body_for_value(
