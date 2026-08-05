@@ -4097,10 +4097,14 @@ thing a reader takes on trust.*
         and a modifier cannot be passed where a value call can — though
         `:map(:flag)` shows the reference form covers the common case.
 
-        Not decided. Recorded because the entry above says the choice is
-        reversible only while the type is unbuilt, and it still is: `Value` has
-        no `Flag` variant, `flag("--force")` parses as a command, and `$w:flag`
-        reports that it is not a modifier.
+        **Decided and built as `:flag`** -- see the entry above, which records
+        the call and what it does not settle. This block is kept for the argument
+        rather than the verdict: it is why the modifier won, and the
+        modifier-versus-value-call question it raises for the *family* (`re()`,
+        `glob()`, `style()` against `:int`, `:bool`) is still open.
+
+        The "verified unbuilt" note that used to close this paragraph is spent:
+        `Value` has a `Flag` variant now and `$w:flag` builds one.
 
         Open, and worth settling before it is built:
 
