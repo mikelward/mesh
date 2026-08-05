@@ -465,10 +465,18 @@ pub fn expand_call_values(words: Vec<Word>, vars: &Vars) -> Result<Vec<CallArgum
     for word in words {
         if let Some(vref) = spread_var(&word) {
             // A spread's elements are values, not written words, so none is
-            // `bare` — but each is `dashed`, because writing `...` is the
-            // explicit "these are arguments, flags included" gesture, the
-            // forwarding channel a wrapper needs. `f $w` says "this is one
-            // value". Matches the value-call scan, which splits them the same way.
+            // `bare`. Each is nonetheless `dashed`, matching the value-call scan
+            // — and that is a **stopgap, not the rule this function applies
+            // everywhere else**. Promoting a runtime string to a flag is exactly
+            // the "the value decides" reading the call-site test removes: an
+            // element of `["--force"]` is text, and text cannot bind as an option
+            // (`TODO.md`, the `flag()` entry: "`a = \"--help\"` is text and
+            // cannot bind — decidable at the assignment").
+            //
+            // It stays only because the flag *type* is unbuilt, so there is no
+            // other way to forward an option a wrapper was handed. Once `flag()`
+            // / `:flag` exists, `...$xs:map(:flag)` is the spelling and this
+            // should stop scanning — tracked in `TODO.md` beside the constructor.
             out.extend(
                 spread_values(vref, vars)?
                     .into_iter()

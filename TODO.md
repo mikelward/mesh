@@ -3435,13 +3435,34 @@ thing a reader takes on trust.*
       `dashed` (whether this is option syntax) are the two questions 17 found
       must stay apart, and command position had only been carrying the first.
 
-      Spread stays scanned, as in 17. `--` and `--help` follow the rule too — a
-      computed `--` no longer ends flag parsing, and a computed `--help` no
-      longer prints the generated help over the call.
+      `--` and `--help` follow the rule too — a computed `--` no longer ends flag
+      parsing, and a computed `--help` no longer prints the generated help over
+      the call.
+
+      **Spread stays scanned, and that is now a known inconsistency rather than
+      a principled exception.** 17 justified it as "writing `...` is the explicit
+      *these are arguments, flags included* gesture", and this entry repeated it.
+      It does not survive the rule the rest of the entry establishes: a spread's
+      elements are **runtime strings**, so scanning them promotes text to an
+      option, which is the "the value decides" reading being removed. The
+      `flag()` entry says so in as many words — "`a = \"--help\"` is text and
+      cannot bind — decidable at the assignment rather than guessed from
+      characters" — and quoting has typed a word since long before either.
+
+      It stays because the flag **type is unbuilt**: remove the scan today and a
+      wrapper has no way at all to forward an option it was handed. Once
+      `flag()` / `:flag` lands, `...$xs:map(:flag)` is the spelling and the scan
+      should go. **Do not treat the current behavior as settled** — it is load
+      bearing only until the constructor exists, and the two cannot both be
+      right. Raised by the repo owner.
 
       **What this does *not* do:** it does not remove the need for `wrapper` on a
       forwarder, because `setx curl --location URL` writes `--location` bare and
-      it is still scanned. That is the other half — see the entry below.
+      it is still scanned. Nor is it purely permissive: a **globbing** option name
+      changes meaning — with a file named `--force` on disk, `f --*` used to bind
+      the switch and is now data. That is the intended fix (the working directory
+      must not choose which option binds), but it is a behavior change, not only
+      an error turning into a success.
 - [ ] **A `...rest` still swallows nothing, so a forwarder still needs
       `wrapper`.** With the call-site rule above in place, the remaining reason a
       config writes `wrapper` 50-odd times is delegation: `setx curl --location

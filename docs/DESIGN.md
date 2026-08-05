@@ -3110,11 +3110,18 @@ Rules:
   What counts as "begins with `--`" is asked of the **call site**, not of the
   runtime value: only a `--name` written literally where the call is written is
   an option, in command position and value calls alike, so a string that merely
-  looks like a flag is data. A spread (`...$args`) is the deliberate exception —
-  the channel a wrapper forwards through. This is the same decidability rule as
-  everywhere else, and it is why `f $w` means one thing however `$w` is filled.
-  It stops at the argv boundary: an **external** gets the bytes, since mesh
-  parses none of its flags.
+  looks like a flag is data. This is the same decidability rule as everywhere
+  else, and it is why `f $w` means one thing however `$w` is filled. It stops at
+  the argv boundary: an **external** gets the bytes, since mesh parses none of
+  its flags.
+  A spread (`...$args`) is a **standing exception, and an acknowledged
+  inconsistency**: its elements are runtime strings, so scanning them promotes
+  text to an option — the very reading the rule above removes, and one that
+  contradicts quoting having typed a word since the beginning. It survives only
+  because the [flag type](#) is unbuilt and a wrapper would otherwise have no way
+  to forward an option it was handed. When `flag()` / `:flag` lands,
+  `...$xs:map(:flag)` is the spelling and the scan goes; treat the current
+  behavior as temporary rather than as the design.
   When a flag is given **more than once** (directly or via a spread), the
   **last occurrence wins** for a valued flag (`--tag=v1 --tag=v2` binds `v2`, the
   universal CLI convention that makes a forwarded default overridable), and a

@@ -3282,10 +3282,15 @@ greet world          # -> hi, world
     and the value after it may be quoted or expanded. A name that is **composed**
     (`--$name`, `--"force"`, `--FORCE:lower`) or that **globs** (`--*`, which
     would take its option from whatever the working directory holds) is data.
-    A **spread** is the exception, and the reason to write one: `f ...$args` and
-    `f(...$args)` do read a `--force` element as the option, which is how a
-    wrapper forwards flags it was handed. `--` and `--help` follow the same rule
-    — only a written one ends flag parsing or asks for the generated help.
+    `--` and `--help` follow the same rule — only a written one ends flag parsing
+    or asks for the generated help.
+
+    A **spread** is the exception: `f ...$args` and `f(...$args)` do read a
+    `--force` element as the option, which is how a wrapper forwards flags it was
+    handed. This is **temporary and inconsistent with the rule above** — a
+    spread's elements are runtime strings, so scanning them promotes text to an
+    option. It survives only because the flag type is unbuilt; when `flag()` /
+    `:flag` lands, `...$xs:map(:flag)` becomes the spelling and the scan goes.
 
     This applies to **in-shell** calls. An **external** command is argv, and mesh
     parses none of its flags, so `curl $url` passes whatever `$url` holds
