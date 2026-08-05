@@ -2480,6 +2480,25 @@ fn run_ast_for(
         Ok(values) => values,
         Err(message) => return runtime_message(message),
     };
+    // The binder belongs to the loop: fresh each pass, gone at the end, and any
+    // name it shadows put back (`DESIGN.md`). Saved out here rather than per pass
+    // because what has to be restored is the state from *before* the loop — a pass
+    // that rebinds is exactly what the loop is for.
+    let saved = shell.vars.save_names(&pattern_names(bindings));
+    let outcome = run_ast_for_passes(bindings, values, body, in_function, shell);
+    shell.vars.restore_names(saved);
+    outcome
+}
+
+/// The passes themselves, split out so [`run_ast_for`] can restore the binder on
+/// every exit — including the ones that leave through `?`-shaped early returns.
+fn run_ast_for_passes(
+    bindings: &[parser::BindingPattern],
+    values: Vec<Vec<Value>>,
+    body: &parser::Source,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Step {
     let mut status = 0;
     // The loop collects a value per completed pass, exactly as `eval_for_expr`
     // does, because a `for` *is* the same construct in either position: its
@@ -3007,6 +3026,28 @@ fn validate_patterns(patterns: &[parser::BindingPattern]) -> Result<(), String> 
         names(pattern, &mut bindings);
     }
     validate_bindings(&bindings)
+}
+
+/// Every name a set of patterns can bind, without a value to match against.
+///
+/// [`pattern_bindings`] answers the same question but only for the value in hand,
+/// which is one iteration's worth. The `for` binder has to know the whole set
+/// *before* the first pass, so it can put the surroundings back afterwards — and a
+/// list pattern binds the same names whichever element it is destructuring.
+fn pattern_names(patterns: &[parser::BindingPattern]) -> Vec<String> {
+    fn walk(pattern: &parser::BindingPattern, into: &mut Vec<String>) {
+        use parser::BindingPattern::*;
+        match pattern {
+            Name(name) | Rest(name) => into.push(name.clone()),
+            Ignore => {}
+            List(patterns) => patterns.iter().for_each(|pattern| walk(pattern, into)),
+        }
+    }
+    let mut names = Vec::new();
+    patterns
+        .iter()
+        .for_each(|pattern| walk(pattern, &mut names));
+    names
 }
 
 fn pattern_bindings(
@@ -6462,6 +6503,23 @@ fn eval_for_expr(
         return Ok(control_placeholder());
     }
     let values = iteration_values(iterable, bindings.len()).map_err(runtime_message)?;
+    // As in `run_ast_for`: the binder is the loop's, so the surroundings are put
+    // back whichever way the loop ends.
+    let saved = shell.vars.save_names(&pattern_names(bindings));
+    let outcome = eval_for_passes(bindings, values, body, in_function, shell);
+    shell.vars.restore_names(saved);
+    outcome
+}
+
+/// The passes of an expression-position `for`, split out for the reason
+/// [`run_ast_for_passes`] is.
+fn eval_for_passes(
+    bindings: &[parser::BindingPattern],
+    values: Vec<Vec<Value>>,
+    body: &parser::Source,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
     let mut results = Vec::new();
     shell.loop_depth += 1;
     for values in values {

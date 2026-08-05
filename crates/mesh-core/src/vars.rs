@@ -1256,6 +1256,38 @@ impl Vars {
         }
     }
 
+    /// The active scope's binding for each name, for a construct that **owns** its
+    /// bindings for a bounded stretch and must put the surroundings back —
+    /// today the `for` binder, whose names belong to the loop
+    /// (`DESIGN.md` §"Calling for a value, and lambdas").
+    ///
+    /// Reads the *active* scope only, not the outward chain, because that is the
+    /// scope [`restore_names`](Vars::restore_names) writes back into: a name bound
+    /// globally while a function is running was never in the active scope, so it
+    /// must come back as absent — removing the local the loop created, which lets
+    /// the global show through again — rather than as a copy written into the local.
+    pub(crate) fn save_names(&self, names: &[String]) -> Vec<(String, Option<Value>)> {
+        let scope = self.locals.last().unwrap_or(&self.global);
+        names
+            .iter()
+            .map(|name| (name.clone(), scope.get(name).cloned()))
+            .collect()
+    }
+
+    /// Undo [`save_names`]: rebind what was there, and remove what was not.
+    pub(crate) fn restore_names(&mut self, saved: Vec<(String, Option<Value>)>) {
+        for (name, previous) in saved {
+            match previous {
+                Some(value) => {
+                    self.active_mut().insert(name, value);
+                }
+                None => {
+                    self.active_mut().remove(&name);
+                }
+            }
+        }
+    }
+
     /// Does the active scope already hold `name`? (Only the innermost local when
     /// one is active, else the global — never an outer scope.)
     fn active_has(&self, name: &str) -> bool {

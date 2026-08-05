@@ -20834,6 +20834,64 @@ fn loop_repeats_until_a_break() {
     );
 }
 
+/// A `for` binding belongs to its loop: fresh each pass, gone at the end, and any
+/// name it shadows put back rather than clobbered (`DESIGN.md`). The reason is the
+/// capture footgun — a body that closed over one shared, surviving slot would see
+/// only its final value, which is Go before 1.22 and JavaScript's `var`. Both
+/// fixed it in the loop rather than in the closure.
+#[test]
+fn a_for_binding_belongs_to_its_loop() {
+    // Gone afterwards, in statement position and in expression position alike.
+    for source in [
+        "for i in [1 2 3] { }\nputs $i\n",
+        "xs = for i in [1 2] { $i }\nputs $i\n",
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("i: unbound variable"),
+            "{source} gave {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Every binder the patterns name, not just a single one: two map binders, and
+    // a list pattern's names including its `...rest`.
+    for source in [
+        "for k, v in [a: 1] { }\nputs $k\n",
+        "for [a ...rest] in [[1 2 3]] { }\nputs $rest\n",
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("unbound variable"),
+            "{source} gave {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A name the loop shadows comes back, so a loop cannot quietly overwrite a
+    // binding around it — the half that makes this a lifetime rather than a leak.
+    let shadowed = run_with_input("i = \"before\"\nfor i in [1 2] { }\nputs $i\n");
+    assert_eq!(String::from_utf8_lossy(&shadowed.stdout), "before\n");
+
+    // The loop still runs, and the binding is readable *inside* the body — the
+    // scope is bounded, not removed.
+    let inside = run_with_input("for i in [1 2 3] { puts $i }\n");
+    assert_eq!(String::from_utf8_lossy(&inside.stdout), "1\n2\n3\n");
+
+    // Leaving early does not skip the restore.
+    let broken =
+        run_with_input("i = \"before\"\nfor i in [1 2 3] { if $i == 2 { break } }\nputs $i\n");
+    assert_eq!(String::from_utf8_lossy(&broken.stdout), "before\n");
+
+    // Nor does returning out of the loop from inside a function.
+    let returned = run_with_input(
+        "i = \"before\"\nfunc f() { for i in [1 2] { return done } }\nputs f()\nputs $i\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&returned.stdout), "done\nbefore\n");
+}
+
 #[test]
 fn break_and_continue_work_in_the_new_loops() {
     let out = run_with_input(

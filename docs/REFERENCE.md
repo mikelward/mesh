@@ -2986,6 +2986,20 @@ for x in [$s] { … }        # one value, iterated once
 for x in $s:lines { … }    # its lines
 ```
 
+**The binding belongs to the loop.** It is fresh for each pass and gone when the
+loop ends, so reading it afterwards is the usual unbound-variable error, and a name
+the loop shadows is put back rather than clobbered:
+
+```mesh
+x = "before"
+for x in [1 2] { puts $x }   # 1, then 2
+puts $x                      # "before" — the loop's binding is over
+```
+
+That is what keeps a lambda written in the body from closing over one shared slot
+and seeing only its final value — the footgun Go fixed in 1.22 and JavaScript fixed
+with `let`, both in the loop rather than in the closure.
+
 Globs, ranges, `$sh.args` and any bound list are already lists and are
 unaffected — a glob is a list however many paths it matched.
 Bounded integer ranges use the same half-open/inclusive spelling as slices, and
