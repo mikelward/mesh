@@ -15548,14 +15548,86 @@ fn a_wrapper_func_forwards_flags_in_a_value_call_too() {
 }
 
 #[test]
-fn a_plain_func_still_scans_flags_in_a_value_call() {
-    // The gate is the marker, not the call form: without `wrapper`, an undeclared
-    // flag is still the caller's mistake.
+fn a_plain_func_that_declares_no_flags_forwards_undeclared_ones() {
+    // A signature that declares no flags never had a reading of `--color` to
+    // lose, so with a `...rest` to hold it the word is data — the same answer
+    // `wrapper` gives. This used to be `unknown flag`, which is what forced a
+    // `wrapper` onto every helper that merely passes its arguments along.
     let out = run_with_input("func g(...xs) { return $xs }\nputs g(--color=never):repr\n");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("unknown flag `--color`"),
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "['--color=never']\n",
         "{:?}",
         out.stderr
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // Command position agrees, since the two spellings are the same call.
+    let command = run_with_input("func g(...xs) { return $xs }\nputs g(--color=never):repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&command.stdout),
+        "['--color=never']\n"
+    );
+}
+
+/// What `wrapper` still buys once a no-flag `...rest` forwards undeclared flags
+/// on its own: the two words an ordinary function reads *before* binding. This is
+/// the whole of the remaining difference, so it is worth pinning.
+#[test]
+fn a_wrapper_differs_from_a_plain_rest_func_only_in_the_two_words_it_does_not_eat() {
+    // `--`: an ordinary func consumes the terminator, a wrapper forwards it.
+    let plain = run_with_input("func g(...xs) { return $xs }\nputs g(a, --, b):repr\n");
+    assert_eq!(String::from_utf8_lossy(&plain.stdout), "['a', 'b']\n");
+
+    let wrapped = run_with_input("wrapper func w(...xs) { return $xs }\nputs w(a, --, b):repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&wrapped.stdout),
+        "['a', '--', 'b']\n"
+    );
+
+    // `--help`: an ordinary func answers with its generated help, a wrapper
+    // passes it to whatever it delegates to.
+    let plain_help = run_with_input("func g(...xs) { puts \"ran n=$xs:len\" }\ng --help\n");
+    assert!(
+        String::from_utf8_lossy(&plain_help.stdout).contains("Usage:"),
+        "{:?}",
+        plain_help.stdout
+    );
+
+    let wrapped_help =
+        run_with_input("wrapper func w(...xs) { puts \"ran n=$xs:len\" }\nw --help\n");
+    assert_eq!(String::from_utf8_lossy(&wrapped_help.stdout), "ran n=1\n");
+}
+
+/// The line is "does this signature declare flags", not "does it have a rest".
+/// A function that reads flags keeps its typo diagnostics, which is the case the
+/// loud-error rule was argued for on — `--forse` must not slip into `...rest`
+/// where `--force` was meant.
+#[test]
+fn a_signature_that_declares_flags_still_refuses_an_undeclared_one() {
+    let typo = run_with_input(
+        "func f(--force, ...rest) { puts \"force=$force n=$rest:len\" }\nf a --forse\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&typo.stderr).contains("unknown flag `--forse`"),
+        "{:?}",
+        typo.stderr
+    );
+
+    // Its own flag still binds, and the rest still collects the plain arguments.
+    let good = run_with_input(
+        "func f(--force, ...rest) { puts \"force=$force n=$rest:len\" }\nf a --force b\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&good.stdout), "force=true n=2\n");
+
+    // Without a rest there is nowhere for an undeclared flag to go, so it stays a
+    // loud error rather than an arity failure blamed on the wrong argument —
+    // whether or not the signature declares flags of its own.
+    let no_rest = run_with_input("func f(a) { puts $a }\nf x --bogus\n");
+    assert!(
+        String::from_utf8_lossy(&no_rest.stderr).contains("unknown flag `--bogus`"),
+        "{:?}",
+        no_rest.stderr
     );
 }
 

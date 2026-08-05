@@ -3105,8 +3105,13 @@ Rules:
   Flags may appear in any order at the call site and are *not* consumed as
   positionals — this is why a shell wants real flag parsing in the signature
   rather than hand-rolled `case $1` juggling. An argument that begins with `--`
-  but names **no declared flag** is an **error**, not a silently-forwarded
-  positional — a typo'd flag should fail loudly, not vanish into `...rest`.
+  but names **no declared flag** is an **error** wherever the function is in the
+  flag-parsing business — a typo'd flag should fail loudly, not vanish into
+  `...rest`. The exception is the signature that **declares no flags at all** and
+  has a `...rest`: it never had a reading of `--anything` to lose, so the word is
+  data (`confirm --something`, `setx curl --location URL`). One flag in the
+  signature turns the diagnostic back on, which is where it still discriminates;
+  with no rest it is an error either way, there being nowhere to put the word.
   What counts as "begins with `--`" is asked of the **call site**, not of the
   runtime value: only a `--name` written literally where the call is written is
   an option, in command position and value calls alike, so a string that merely

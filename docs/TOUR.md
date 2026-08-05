@@ -943,6 +943,37 @@ so `deploy prod $host` passes `$host` along even when it holds `--force`, and
 quoting works here as it does everywhere else. Write `...$args` to forward flags
 you were handed, which is the one place a `--force` element still binds.
 
+`deploy` declares `--force`, so it is in the flag-parsing business and a typo is
+caught — `deploy prod --forse web1` says `unknown flag --forse` rather than
+quietly deploying to a host of that name. A function that declares **no** flags
+is not in that business, and an undeclared `--word` is simply data:
+
+<pre>
+mesh$ <strong>func confirm(...question) { text = $question:join(" ") ; puts "$text?" }</strong>
+mesh$ <strong>confirm --force is set, continue</strong>
+--force is set, continue?
+</pre>
+
+That is the rule in one line: **if the signature declares no flags, none of the
+arguments are flags.** It is what lets a forwarder pass a delegated command's
+options straight through —
+
+<pre>
+mesh$ <strong>func setx(cmd, ...args) { puts "+ $cmd ${args:join(" ")}" >&amp;2 ; $cmd ...$args }</strong>
+mesh$ <strong>setx curl --location https://example.com</strong>
++ curl --location https://example.com
+</pre>
+
+— with two words left over. `--` and `--help` are still read by the *function*,
+not passed on, because an ordinary function answers its own help and ends its own
+flag parsing. When the callee should own those too, mark it a `wrapper func`:
+
+<pre>
+mesh$ <strong>wrapper func g(...args) { command grep ...$args }</strong>
+mesh$ <strong>g --help          # grep's help, not mesh's</strong>
+mesh$ <strong>g -- -x file      # the -- reaches grep</strong>
+</pre>
+
 A function's status is whatever its body did last, so a predicate needs no
 `return` at all — it reads as true/false in `&&` / `||` on its own:
 

@@ -3442,23 +3442,36 @@ thing a reader takes on trust.*
       **What this does *not* do:** it does not remove the need for `wrapper` on a
       forwarder, because `setx curl --location URL` writes `--location` bare and
       it is still scanned. That is the other half — see the entry below.
-- [ ] **A `...rest` still swallows nothing, so a forwarder still needs
-      `wrapper`.** With the call-site rule above in place, the remaining reason a
-      config writes `wrapper` 50-odd times is delegation: `setx curl --location
-      URL` and `quiet cmd --flag` write the callee's flags bare, so the scan
-      still meets them and still reports `unknown flag`.
+- [x] **A `...rest` swallowed nothing, so a forwarder needed `wrapper`.** With
+      the call-site rule above in place, the remaining reason a config wrote
+      `wrapper` 50-odd times was delegation and flag-shaped data written bare:
+      `setx curl --location URL`, `confirm --something`, `bak --weird-name`. All
+      reported `unknown flag`.
 
-      The candidate is **options-before-operands for a signature with a
-      `...rest`**: stop scanning at the first non-flag, so trailing arguments —
-      which a rest parameter says belong to someone else — pass through. It is
-      decidable from the signature alone, and the grammar already refuses a flag
-      parameter *after* `...rest`, so the call site would simply agree with what
-      the signature already says. Fixed-arity functions keep full permutation.
+      **Fixed by scoping the loud error to functions that read flags.** An
+      undeclared `--word` reaches a `...rest` as data when the signature declares
+      **no flags of its own** — such a function never had a reading of
+      `--anything` to lose. Declare one flag and the diagnostic comes back, which
+      is where a typo still discriminates (`func f(--force, ...rest)` still
+      reports `--forse`); with no rest it is an error either way, there being
+      nowhere to put the word.
 
-      The cost is that `f one --force` stops binding the switch when `f` also
-      takes a rest, against `DESIGN.md`'s "flags may appear in any order" — which
-      is a real interactive ergonomic, so this needs a decision rather than a
-      guess. **Waiting on the repo owner.**
+      Options-before-operands was the other candidate and was **rejected**: it
+      costs `f one --force` against "flags may appear in any order", a real
+      interactive ergonomic, and it fixes only the `cmd`-first forwarders —
+      `confirm --something` writes its dashed data *first*, so the scan meets it
+      either way. The rule that shipped is decidable from the signature alone
+      and needs no ordering restriction.
+
+      `repl.rs` `forwards_undeclared_flags`, `bind_dashed_option`.
+
+      **What `wrapper` is now**, since this narrows it to a two-line difference:
+      an ordinary `func` with a `...rest` and no declared flags already forwards
+      undeclared flags. `wrapper` adds only that the function does not read the
+      **two words an ordinary one reads before binding** — the `--` terminator
+      and `--help`. So it means "the callee owns `--` and `--help` too", which is
+      every delegation to an external program. Documented that way in
+      `REFERENCE.md` and `TOUR.md`, example-first.
 - [ ] **Make a builtin work the way a function does, not its own way.**
       *Standing principle, from the repo owner: a builtin behaves the same as a
       function and an external unless we have explicitly agreed otherwise.* A

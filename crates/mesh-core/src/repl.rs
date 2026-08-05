@@ -9522,7 +9522,7 @@ fn bind_arguments(
             if let Some(body) = text.strip_prefix("--")
                 && !body.is_empty()
             {
-                bind_dashed_option(
+                let bound = bind_dashed_option(
                     name,
                     params,
                     body,
@@ -9530,7 +9530,11 @@ fn bind_arguments(
                     &mut switches_on,
                     &mut flag_values,
                 )?;
-                continue;
+                // An undeclared name with a `...rest` to fall into is data, and
+                // it reaches the rest as the whole word the caller wrote.
+                if matches!(bound, DashedArgument::Bound) {
+                    continue;
+                }
             }
         }
         positional_values.push(arg.value);
@@ -9718,9 +9722,17 @@ fn evaluate_value_arguments<'p>(
                 // "a glob is a list however many paths it matched" (bf79900)
                 // removed — a value that depends on which files happen to be
                 // there, silently dropping the rest.
+                // An undeclared name with a `...rest` to fall into is not an
+                // option at all, so none of this applies to it: `f(--bogus=*.txt)`
+                // forwards the glob's list exactly as a positional `f(*.txt)`
+                // does, rather than being told what an option's value must be.
+                let is_an_option = written_option_name(expression).is_none_or(|flag| {
+                    declared_flag(params, flag).is_some() || !forwards_undeclared_flags(params)
+                });
                 if flags_enabled
                     && !flags_ended
                     && written_dashed
+                    && is_an_option
                     && !matches!(value, Value::String(_))
                 {
                     // The flag itself is checked first. An undeclared name or a
@@ -9846,7 +9858,12 @@ fn scan_call_value<'p>(
         if let Some(body) = text.strip_prefix("--")
             && !body.is_empty()
         {
-            return bind_dashed_option(name, params, body, bare, switches_on, flag_values);
+            let bound = bind_dashed_option(name, params, body, bare, switches_on, flag_values)?;
+            // As in command mode: an undeclared name with a `...rest` to fall
+            // into reaches it as the whole word, rather than being refused.
+            if matches!(bound, DashedArgument::Bound) {
+                return Ok(());
+            }
         }
     }
     positionals.push(value);
@@ -9991,10 +10008,7 @@ fn resolve_written_flag<'p>(
     has_value: bool,
 ) -> Result<&'p parser::Param, Step> {
     use parser::ParamKind;
-    let declared = params.iter().find(|param| {
-        param.name == flag && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
-    });
-    let Some(declared) = declared else {
+    let Some(declared) = declared_flag(params, flag) else {
         note!("mesh: {name}: unknown flag `--{flag}`");
         return Err(Step::Error(2));
     };
@@ -10003,6 +10017,62 @@ fn resolve_written_flag<'p>(
         return Err(Step::Error(2));
     }
     Ok(declared)
+}
+
+/// The switch or valued flag `flag` names, if the signature declares one.
+fn declared_flag<'p>(params: &'p [parser::Param], flag: &str) -> Option<&'p parser::Param> {
+    use parser::ParamKind;
+    params.iter().find(|param| {
+        param.name == flag && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
+    })
+}
+
+/// Does the signature end in a `...rest`, and so have somewhere to put an
+/// argument it does not otherwise account for?
+fn has_rest(params: &[parser::Param]) -> bool {
+    params
+        .iter()
+        .any(|param| matches!(param.kind, parser::ParamKind::Rest))
+}
+
+/// Does the signature declare any `--flag` of its own?
+///
+/// The line between "this function reads flags" and "flags here are someone
+/// else's": a signature that declares none never had a reading of `--anything`
+/// to lose, while one that declares even a single flag is in the flag-parsing
+/// business and keeps its typo diagnostics. See [`forwards_undeclared_flags`].
+fn declares_any_flag(params: &[parser::Param]) -> bool {
+    use parser::ParamKind;
+    params
+        .iter()
+        .any(|param| matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_)))
+}
+
+/// Does an undeclared `--flag` reach this signature's `...rest` as data, rather
+/// than being refused?
+///
+/// Both halves are needed. A **rest** is somewhere to put it — without one the
+/// word would land as a surplus positional and report an arity failure blamed on
+/// the wrong argument, so an undeclared flag stays a loud error there. Declaring
+/// **no flags** is what makes the word unambiguously someone else's: a function
+/// that never wrote a `--` in its signature cannot have meant one at the call
+/// site, which is what `confirm --something` and `setx curl --location URL` need.
+///
+/// The converse is the deliberate limit: `func f(--force, ...rest)` keeps
+/// reporting `--forse`, because a function that reads flags is the one place the
+/// typo is still worth catching — and it is the case the loud-error rule was
+/// argued for on.
+fn forwards_undeclared_flags(params: &[parser::Param]) -> bool {
+    has_rest(params) && !declares_any_flag(params)
+}
+
+/// What a written `--`-leading argument turned out to be.
+enum DashedArgument {
+    /// It named a declared flag, now bound.
+    Bound,
+    /// It named no declared flag, and the signature has a `...rest` to hold it,
+    /// so it is forwarded as a positional rather than refused.
+    Forwarded,
 }
 
 /// The option name a word was **written** with, when it was written as one.
@@ -10033,12 +10103,27 @@ fn bind_dashed_option<'p>(
     bare: bool,
     switches_on: &mut std::collections::HashSet<&'p str>,
     flag_values: &mut std::collections::HashMap<&'p str, Value>,
-) -> Result<(), Step> {
+) -> Result<DashedArgument, Step> {
     use parser::ParamKind;
     let (flag, inline) = match body.split_once('=') {
         Some((flag, value)) => (flag, Some(value.to_owned())),
         None => (body, None),
     };
+    // A name this signature does not declare is **data** when there is a
+    // `...rest` to hold it: a rest parameter is the writer saying "and whatever
+    // else the caller passes", and a delegated command's flags are exactly that.
+    // Refusing them is what made `confirm --something` and `setx curl --location
+    // URL` impossible without `wrapper func`, on functions that declare no flags
+    // at all and so could never have meant the word as one.
+    //
+    // Loud-on-typo is kept where it still discriminates: with **no** rest there
+    // is nowhere for the word to go, so an undeclared `--flag` is still an error
+    // rather than an arity failure blamed on the wrong argument. A signature that
+    // declares flags *and* a rest gives the typo up — `--forse` reaches the rest
+    // — which is the deliberate cost of letting the same signature forward.
+    if declared_flag(params, flag).is_none() && forwards_undeclared_flags(params) {
+        return Ok(DashedArgument::Forwarded);
+    }
     let declared = resolve_written_flag(name, params, flag, inline.is_some())?;
     match &declared.kind {
         ParamKind::Switch => {
@@ -10062,7 +10147,7 @@ fn bind_dashed_option<'p>(
         }
         _ => unreachable!("only flags are collected here"),
     }
-    Ok(())
+    Ok(DashedArgument::Bound)
 }
 
 /// Bind one value-mode `key: value` option to the switch or flag named `key`.

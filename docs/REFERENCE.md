@@ -3270,8 +3270,32 @@ greet world          # -> hi, world
     site a switch is `--force` and a valued flag is the **attached** `--tag=v9` (a
     bare `--tag` with no value is an error, never a consume-the-next-token). Flags
     may appear in any order and are not consumed as positionals; a repeated valued
-    flag takes its **last** value. An argument that begins with `--` but names no
-    declared flag is a loud error.
+    flag takes its **last** value.
+  - **A signature that declares no flags parses none.** An undeclared `--word`
+    reaches a `...rest` as data, because a function that never wrote a `--` in
+    its signature cannot have meant one at the call site:
+
+    ```mesh
+    func confirm(...question) { … }
+    confirm --force is set, continue    # four words, no flags
+
+    func setx(cmd, ...args) { … }
+    setx curl --location URL            # --location is curl's, and reaches it
+    ```
+
+    Declare even one flag and the function is in the flag-parsing business, so an
+    undeclared one is a **loud error** — that is where a typo is still worth
+    catching:
+
+    ```mesh
+    func deploy(target, --force, ...hosts) { … }
+    deploy prod --force web1            # binds the switch
+    deploy prod --forse web1            # error: unknown flag `--forse`
+    ```
+
+    With **no `...rest`** an undeclared flag is an error either way: there is
+    nowhere to put it, and an arity failure blamed on the wrong argument is a
+    worse diagnostic than naming the flag.
   - **A flag is read from the call site, not from the value.** Only a `--name`
     written as a literal word where the call is written is an option, so `f $w`,
     `f("--sleep=0")` and their command/value-call twins all pass data even when
@@ -3324,9 +3348,19 @@ greet world          # -> hi, world
   g --help                        # grep's help, not mesh's
   ```
 
-  This is what a forwarding wrapper needs and a plain `func` cannot give: an
-  undeclared long flag is otherwise rejected before `...args` can collect it, so
-  every wrapper would need an explicit `--`. A wrapper **cannot validate what it
+  Most of what a forwarder needs, a plain `func` now gives on its own: a
+  signature declaring no flags already passes an undeclared `--flag` to its
+  `...rest`. What is left is the **two words an ordinary function reads before
+  binding**, and that is the whole of the difference:
+
+  | | `func g(...args)` | `wrapper func g(...args)` |
+  |---|---|---|
+  | `g --color=never` | → `args` | → `args` |
+  | `g -- -x` | `--` consumed, `-x` → `args` | both → `args` |
+  | `g --help` | mesh prints `g`'s help | → `args` |
+
+  So reach for `wrapper` when the callee owns `--` and `--help` — which is every
+  delegation to an external program. A wrapper **cannot validate what it
   forwards** — it does not know the callee's grammar — so the check is
   *relocated* rather than dropped: the wrapped in-shell function's own signature
   rejects a bad flag, or the external program does.
