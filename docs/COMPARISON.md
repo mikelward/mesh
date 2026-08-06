@@ -578,7 +578,7 @@ mesh is a clean break from POSIX, like fish, elvish, and nushell — none of the
 four runs your old `sh` scripts, and all four run your old *programs* fine.
 
 ```mesh
-if $sh.status == 0 { puts ok }
+if $sh.status { puts ok }
 for f in *.md { puts $f }
 func greet(name) { puts "hi $name" }
 ```
