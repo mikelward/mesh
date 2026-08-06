@@ -3165,8 +3165,10 @@ thing a reader takes on trust.*
 
       **Still one access, deliberately.** `$env.PATH[0] = …`, `$env.PATH:dedup = …`
       and `$env[0..2] = …` stay syntax errors, for a write and an `unset` alike — a
-      slice or a modifier names a derived value, and an entry is bytes with nothing
-      inside it to reach into. `export`, `with`, and the `NAME=value` prefix keep
+      slice or a modifier names a derived value, and what a write replaces is the
+      whole entry whatever the read side makes of it. (The second access now says
+      so by name; whether it should instead *work* for a path-typed entry is the
+      open entry under "Parser asymmetries".) `export`, `with`, and the `NAME=value` prefix keep
       taking a spelled-out name only, since each is a header whose names are read at
       parse time; `$env[…]` in the body covers the computed case.
 
@@ -6688,12 +6690,63 @@ a one-line edit. Every claim below was checked against the built shell.
       the refusal. `GRAMMAR.md`'s separator production and its two paragraphs
       updated to match.
 
-- [ ] **`$env.PATH[0] = …` reports `expected a statement separator`.** Not a
-      target (an env entry is bytes, with nothing inside to reach into), so it
-      falls through to an ordinary expression and the error lands on the `=`,
-      naming neither the entry nor why it was refused. That is the same shape of
-      complaint that `member_target` already answers for `$sh` by *accepting* the
-      parse and reporting at run time.
+- [x] **`$env.PATH[0] = …` reported `expected a statement separator`.** Not a
+      target, so it fell through to an ordinary expression and the error landed on
+      the `=`, naming neither the entry nor why it was refused — the same shape of
+      complaint `member_target` already answers for `$sh`. Fixed by
+      `Parser::env_reach`, which recognizes a reference reaching *past* an entry
+      and, when an assignment follows, reports which entry a write would replace:
+
+      ```
+      $ mesh -c '$env.PATH[0] = "/x"'
+      mesh: command:1:1: syntax error: `$env.PATH[0]` is not somewhere to assign;
+      a write replaces the whole environment entry, so assign `$env.PATH` — read
+      it, change what you want, and write it back
+      ```
+
+      Scoped to an *access* after the entry and to an assignment: a trailing
+      modifier (`$env.PATH:upper = …`) is the wider "derived value is not a place"
+      complaint every `$xs:dedup = …` shares, a slice names a copy of a run of
+      entries rather than one entry to point at, and the read (`puts
+      $env.PATH[0]`) is untouched. `unset $env.PATH[0]` keeps the generic message
+      too — the same wording would fit, but `unset` reaches `env_target` by its own
+      route and widening it there is a second change.
+
+      This entry's original reason — "an env entry is bytes, with nothing inside to
+      reach into" — turned out to be wrong for the six path-typed names, which is
+      what the follow-up below is about.
+
+- [ ] **`$env.PATH[0] = "/x"` should write the entry back** *(mikelward: "I think
+      the write should work" — so this is a build task, not an open question).*
+      Found fixing the
+      message above. A path-typed entry (`PATH`, `MANPATH`, `CDPATH`, `INFOPATH`,
+      `LD_LIBRARY_PATH`, `PYTHONPATH` — `environ::PATH_VARS`) *reads* as a list, so
+      `puts $env.PATH[0]` prints the first directory and `$env.PATH = [/a /b]`
+      joins on the way out. Both halves of the round trip exist; only the indexed
+      write in the middle does not, and it is spelled the way `$xs[0] = …` already
+      is for an ordinary list. Today it takes a temporary:
+
+      ```mesh
+      p = $env.PATH; $p[0] = /z; $env.PATH = $p
+      ```
+
+      Left for its own change rather than folded into the message fix: it is a
+      capability, not a diagnostic, and it needs a read-modify-write of the entry
+      plus answers to two things the decision does not settle on its own —
+
+      - **the non-path names.** `$env.HOME[0] = …` has no list to write into, and
+        the read already reports `cannot index a string value`. The write should
+        presumably say the same, at run time, rather than keeping the syntax error
+        the entry above added — which would then apply only to a *member* reach
+        (`$env.HOME.x = …`) and to a slice.
+      - **whether `unset $env.PATH[0]` follows.** Removing one directory from the
+        list is the same shape and reads as the obvious companion, but `unset` on
+        an environment entry means "the name is gone", so it may want to stay
+        whole-entry only.
+
+      The message the entry above ships was written not to preclude any of this —
+      it says the whole entry is what a write replaces, which stays true if an
+      indexed write becomes sugar for exactly that.
 
 - [x] **`/a/:i:g` says ``:g` is not a modifier`.** `Parser::regex_literal`
       requires every link in the chain to be a regex flag and abandons the whole

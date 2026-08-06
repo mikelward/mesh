@@ -21847,6 +21847,64 @@ fn only_a_plain_env_member_is_an_assignment_target() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
+/// Refusing it is right; refusing it as `expected a statement separator` was not,
+/// since the complaint landed on the `=` and named neither the entry nor the rule.
+/// A write replaces a whole entry, so the entry is the place — and the message
+/// says which one, in the spelling the reference was written in.
+#[test]
+fn reaching_into_an_env_entry_to_assign_names_the_entry() {
+    for (source, entry) in [
+        ("$env.PATH[0] = x\n", "$env.PATH"),
+        ("$env.HOME.inner = x\n", "$env.HOME"),
+        ("$env.PATH[0] += x\n", "$env.PATH"),
+        ("$env[\"PATH\"][0] = x\n", "$env[\"PATH\"]"),
+        ("${env.PATH[0]} = x\n", "${env.PATH}"),
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(2), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("is not somewhere to assign"),
+            "{source}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("assign `{entry}`")),
+            "{source}: {stderr}"
+        );
+        assert!(out.stdout.is_empty(), "{source}");
+    }
+
+    // Only an *access* is claimed. A trailing modifier names a derived value, which
+    // is the complaint every `$xs:dedup = …` shares rather than an environment
+    // rule, and a slice names a copy of a run of entries rather than one entry to
+    // point at — both keep the wider message.
+    //
+    // The braced modifier spellings are the ones to keep an eye on: braces make the
+    // whole chain one word, so the `:` has to be found by walking the accesses. The
+    // unbraced spelling arrives as separate pieces and never reaches the walk, and
+    // the two spellings of one reference have to answer alike.
+    for source in [
+        "$env.PATH:upper = x\n",
+        "$env[1..2] = x\n",
+        "${env.PATH[0]:upper} = x\n",
+        "$env.PATH[0]:upper = x\n",
+        "${env.PATH[0].a:upper} = x\n",
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(2), "{source}");
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("is not somewhere to assign"),
+            "{source}"
+        );
+    }
+
+    // And only an assignment. The same reference is a working *read* — a
+    // path-typed entry is a list — which the refusal must not touch.
+    let out = run_with_input("$env.CDPATH = \"/a:/b\"\nputs $env.CDPATH[1]\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/b\n");
+    assert!(out.stderr.is_empty());
+}
+
 /// `$m.key = v` and `$xs[i] = v` write *into* a bound collection, generalizing the
 /// `$env.KEY` form that was until now the only member assignment there was. Nested
 /// paths mix members and indices, `+=` combines rather than replaces, and a
@@ -28082,8 +28140,11 @@ fn an_impossible_environment_name_is_reported_rather_than_hit() {
 }
 
 /// One access, and only one. A second access or a modifier describes a derived
-/// value rather than a place, and `$env` holds bytes with nothing inside them to
-/// reach into — so these stay the syntax errors they already were.
+/// value rather than a place: what a write replaces is the whole entry, whatever
+/// the read side makes of it — so these stay the syntax errors they already were.
+/// What the second access reports is
+/// `reaching_into_an_env_entry_to_assign_names_the_entry`; here it is only that it
+/// is still refused.
 #[test]
 fn only_a_single_env_access_is_a_place() {
     for source in [
