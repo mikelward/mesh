@@ -272,8 +272,10 @@ found
 </pre>
 
 `$sh.status` is the last command's exit status — the readable replacement for
-`$?`. A pipeline reports the **pipefail** status, always: the last stage to fail,
-or `0` when none did. `$sh.pipestatus` is the per-stage breakdown, as a real list:
+`$?`. It is a **status value**, so `if $sh.status { … }` asks whether the last
+command worked, and it prints as the bare number. A pipeline reports the
+**pipefail** status, always: the last stage to fail, or `0` when none did.
+`$sh.pipestatus` is the per-stage breakdown, as a real list of them:
 
 <pre>
 mesh$ <strong>sh -c 'exit 3' | sort</strong>
@@ -951,9 +953,10 @@ missing
 
 `return` leaves early, and what it carries is a **value**, not a status — it is
 what a `check()` call hands back. The status that comes with a value is a view of
-it: only `false` fails, since every other value *is* a result and producing one is
-success. So `return 1` succeeds carrying the number `1`; it is not bash's
-`return 1`. When you mean the status, the word is **`fail`**:
+it: only `false` and a nonzero status fail, since every other value *is* a result
+and producing one is success. So `return 1` succeeds carrying the number `1`; it is
+not bash's `return 1`. When you mean the status, say so — `return status 1`, or the
+verb that names one, **`fail`**:
 
 <pre>
 mesh$ <strong>func check(x) { test -e $x || fail; puts "$x is here" }</strong>
@@ -961,7 +964,16 @@ mesh$ <strong>check /nope || puts missing</strong>
 missing
 </pre>
 
-`fail` takes a number too (`fail 3`), and stops the body the way `return` does.
+`fail` takes a number too (`fail 3`), and stops the body the way `return` does. A
+status is an ordinary value: `status(3)` builds one, `$sh.status` is one, and a
+function whose body ends in a command hands back the status that command left — so
+`inside-project()` below answers a question without a `true` / `false` in sight:
+
+<pre>
+mesh$ <strong>func present(p) { test -e $p }</strong>
+mesh$ <strong>if present(/etc) { puts yes }</strong>
+yes
+</pre>
 
 A function is also an ordinary pipeline stage or background job — `f | sort`,
 `echo x | f`, `f &` — each running in its own process, exactly as an external

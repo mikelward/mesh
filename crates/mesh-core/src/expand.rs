@@ -116,6 +116,10 @@ pub enum Modifier {
     /// only value that carries a descriptor — a bare integer is refused so the
     /// question cannot be pointed at an unrelated one.
     Tty,
+    /// The integer inside a [`Value::Status`]. The spelling for arithmetic and
+    /// for a comparison against a number, since a status compares only with
+    /// another status: `$s:code > 1` where `$s > 1` is a type error.
+    Code,
 }
 
 impl Modifier {
@@ -130,6 +134,7 @@ impl Modifier {
             "real" => Self::Real,
             "url" => Self::Url,
             "len" => Self::Len,
+            "code" => Self::Code,
             "tty" => Self::Tty,
             "first" => Self::First,
             "last" => Self::Last,
@@ -602,7 +607,11 @@ pub fn expand_call_values(
             // [`ExpandError::OptionPayload`].
             if !matches!(
                 payload,
-                Value::String(_) | Value::Styled(_) | Value::Integer(_) | Value::Boolean(_)
+                Value::String(_)
+                    | Value::Styled(_)
+                    | Value::Integer(_)
+                    | Value::Boolean(_)
+                    | Value::Status(_)
             ) {
                 return Err(ExpandError::OptionPayload {
                     flag: name,
@@ -669,6 +678,7 @@ fn spread_values(vref: &VarRef, vars: &Vars) -> Result<Vec<Value>, ExpandError> 
         )),
         Value::Integer(_)
         | Value::Boolean(_)
+        | Value::Status(_)
         | Value::Regex(_)
         | Value::Glob(_)
         | Value::Stream(_)
@@ -697,6 +707,7 @@ fn spread_strings(vref: &VarRef, vars: &Vars) -> Result<Vec<String>, ExpandError
         )),
         Value::Integer(_)
         | Value::Boolean(_)
+        | Value::Status(_)
         | Value::Regex(_)
         | Value::Glob(_)
         | Value::Stream(_)
@@ -785,6 +796,9 @@ fn value_argument_text(value: &Value) -> Result<String, ExpandError> {
         Value::Styled(styled) => Ok(styled.text.clone()),
         Value::Integer(number) => Ok(number.to_string()),
         Value::Boolean(flag) => Ok(flag.to_string()),
+        // Decimal, beside `int` in the byte-boundary table: `cmd status(5)` passes
+        // `5`.
+        Value::Status(code) => Ok(code.to_string()),
         Value::List(_) => refuse("a list needs `...` to become command arguments"),
         Value::Map(_) => refuse("a map cannot be a command argument"),
         Value::Regex(_) | Value::Glob(_) => refuse("a pattern cannot be a command argument"),
@@ -808,6 +822,7 @@ fn strings(values: Vec<Value>, name: &str) -> Result<Vec<String>, ExpandError> {
             Value::Styled(styled) => Ok(styled.text),
             Value::Integer(value) => Ok(value.to_string()),
             Value::Boolean(value) => Ok(value.to_string()),
+            Value::Status(code) => Ok(code.to_string()),
             Value::List(_) => Err(ExpandError::Unsupported(format!(
                 "...${name}: nested list element cannot be a command argument"
             ))),
@@ -1373,6 +1388,8 @@ pub(crate) fn resolve(vref: &VarRef, vars: &Vars) -> Result<String, ExpandError>
         Value::FlagTerminator => Ok("--".to_owned()),
         Value::Integer(value) => Ok(value.to_string()),
         Value::Boolean(value) => Ok(value.to_string()),
+        // The bare number, as at argv: `"exited ${sh.status}"` interpolates `5`.
+        Value::Status(code) => Ok(code.to_string()),
         Value::List(_) | Value::Map(_) | Value::Regex(_) | Value::Glob(_) => {
             Err(ExpandError::ListNeedsSpread(vref.name.clone()))
         }
@@ -1484,6 +1501,7 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                     | Value::Styled(_)
                     | Value::Integer(_)
                     | Value::Boolean(_)
+                    | Value::Status(_)
                     | Value::Regex(_)
                     | Value::Glob(_)
                     | Value::Stream(_)
@@ -1653,6 +1671,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
+            | Value::Status(_)
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
@@ -1662,6 +1681,16 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::FlagTerminator => Err(ExpandError::Modifier {
                 name: name.into(),
                 message: "requires a string or collection".into(),
+            }),
+        },
+        // Only a status has a code, so this refuses everything else rather than
+        // reading a number out of whatever happens to hold one: `1:code` would be
+        // the int-is-a-status confusion the type exists to remove.
+        Modifier::Code => match value {
+            Value::Status(code) => Ok(Value::Integer(i64::from(code))),
+            other => Err(ExpandError::Modifier {
+                name: name.into(),
+                message: format!("requires a status, not {}", value_kind(&other)),
             }),
         },
         // Every value is welcome here — the ones without a literal form are
@@ -1714,6 +1743,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
+            | Value::Status(_)
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
@@ -1742,6 +1772,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
+            | Value::Status(_)
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
@@ -1771,6 +1802,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
+            | Value::Status(_)
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
@@ -1866,6 +1898,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
+            | Value::Status(_)
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
@@ -1942,6 +1975,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
+            | Value::Status(_)
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
@@ -1971,6 +2005,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
+            | Value::Status(_)
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
@@ -2008,6 +2043,7 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
             | Value::Styled(_)
             | Value::Integer(_)
             | Value::Boolean(_)
+            | Value::Status(_)
             | Value::Regex(_)
             | Value::Glob(_)
             | Value::Stream(_)
@@ -2051,10 +2087,12 @@ pub(crate) fn apply_modifier(value: Value, modifier: Modifier) -> Result<Value, 
                 name: name.into(),
                 message: "cannot apply string modifier to this value".into(),
             }),
-            Value::Integer(_) | Value::Boolean(_) => Err(ExpandError::Modifier {
-                name: name.into(),
-                message: "requires a string".into(),
-            }),
+            Value::Integer(_) | Value::Boolean(_) | Value::Status(_) => {
+                Err(ExpandError::Modifier {
+                    name: name.into(),
+                    message: "requires a string".into(),
+                })
+            }
         },
     }
 }
@@ -2179,6 +2217,7 @@ pub(crate) fn join_value(value: Value, separator: &str) -> Result<Value, ExpandE
             Value::Styled(styled) => out.push_str(&styled.text),
             Value::Integer(n) => out.push_str(&n.to_string()),
             Value::Boolean(b) => out.push_str(&b.to_string()),
+            Value::Status(code) => out.push_str(&code.to_string()),
             Value::List(_) => {
                 return Err(ExpandError::Modifier {
                     name: "join".into(),
@@ -2241,7 +2280,7 @@ pub(crate) fn map_strings(
             .collect::<Result<Vec<_>, _>>()
             .map(Value::List),
         Value::Map(_) => Err(fail("cannot map over a map")),
-        Value::Integer(_) | Value::Boolean(_) => Err(fail("requires a string")),
+        Value::Integer(_) | Value::Boolean(_) | Value::Status(_) => Err(fail("requires a string")),
         Value::Styled(_)
         | Value::Regex(_)
         | Value::Glob(_)
@@ -2461,6 +2500,7 @@ pub(crate) fn value_kind(value: &Value) -> &'static str {
         Value::Styled(_) => "a styled string",
         Value::Integer(_) => "an integer",
         Value::Boolean(_) => "a boolean",
+        Value::Status(_) => "a status",
         Value::List(_) => "a list",
         Value::Map(_) => "a map",
         Value::Regex(_) => "a regex",
@@ -2502,6 +2542,7 @@ fn modifier_name(modifier: Modifier) -> &'static str {
         Modifier::Tabs => "tabs",
         Modifier::Repr => "repr",
         Modifier::Pretty => "pretty",
+        Modifier::Code => "code",
         Modifier::Exists => "exists",
         Modifier::Type => "type",
         Modifier::Read => "read",
@@ -2625,6 +2666,7 @@ fn modify_string(value: String, modifier: Modifier) -> String {
         // can fail, so it is handled where a `Result` is available rather than here.
         Modifier::Real
         | Modifier::Url
+        | Modifier::Code
         | Modifier::Int
         | Modifier::Flag
         | Modifier::Bool

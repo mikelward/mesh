@@ -33,6 +33,14 @@ const TABLE: &[(&str, &str)] = &[
         "gets [--nulls] [VAR] · gets([--nulls])",
         "Read one line from stdin, or a NUL-terminated item",
     ),
+    // Two spellings, like `gets`: the call is the constructor, and the command
+    // form is what a `match` arm or a block tail writes. Both yield the value —
+    // the command form leaves it as the statement's result rather than printing
+    // it, which is what `x = match … { a => { status 5 } }` reads.
+    (
+        "status CODE · status(CODE)",
+        "A status value — how a command went",
+    ),
     ("clip [TEXT ...]", "Copy text to the terminal's clipboard"),
     ("notify [TEXT ...]", "Raise a desktop notification"),
     ("exit [N]", "Leave the shell"),
@@ -640,7 +648,7 @@ pub(crate) fn is_literal(name: &str) -> bool {
 /// The list exists so nothing has to ask "is this a call?" twice and get two
 /// answers — `gets():capture` must record the *call*, not run the command form and
 /// discard the line it read.
-const CALLABLE_BUILTINS: &[&str] = &["gets"];
+const CALLABLE_BUILTINS: &[&str] = &["gets", "status"];
 
 /// Does `name` name a builtin with a value-call spelling? See [`CALLABLE_BUILTINS`].
 pub(crate) fn is_callable_builtin(name: &str) -> bool {
@@ -1072,6 +1080,10 @@ pub(crate) fn rendered_for_output(value: &Value, decoration: Decoration) -> Resu
         Value::Styled(styled) => Ok(styled.style.render(&styled.text, decoration)),
         Value::Integer(number) => Ok(number.to_string()),
         Value::Boolean(flag) => Ok(flag.to_string()),
+        // The bare number, as at every other byte boundary: mesh already loses
+        // type there — the int `5` and the string `"5"` both write `5` — so a
+        // status needs no rendering of its own. `:repr` is the form that keeps it.
+        Value::Status(code) => Ok(code.to_string()),
         // Reached only for a flag nested in a collection (`puts [--force]`): a
         // top-level one is refused before here, since `puts` declares no options
         // and a flag in a call is an option. Inside a list it is data being

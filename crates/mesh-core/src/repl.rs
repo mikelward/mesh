@@ -201,12 +201,15 @@ impl Shell {
                             ("cmd".to_owned(), Value::String(job.command)),
                             ("state".to_owned(), Value::String(job.state.to_owned())),
                             // Empty while a job runs, filling in when it
-                            // finishes — the 8-bit view `$sh.status` gives.
+                            // finishes — a `Status` then, for the reason
+                            // `$sh.status` is one: `wait $j; return $j.status`
+                            // has to forward the job's failure rather than its
+                            // number. The `""` before that is the empty-value
+                            // rule, not a null.
                             (
                                 "status".to_owned(),
-                                Value::String(
-                                    job.status.map(|code| code.to_string()).unwrap_or_default(),
-                                ),
+                                job.status
+                                    .map_or_else(|| Value::String(String::new()), Value::Status),
                             ),
                         ]),
                     )
@@ -1118,7 +1121,7 @@ fn run_sourced_text(text: &str, path: &Path, last: u8, shell: &mut Shell) -> Ste
     // command yields its status. Set on both paths, since a startup file is run
     // outside `run_recorded` and would otherwise leave the value behind.
     if let Step::Continue(code) | Step::Error(code) = step {
-        shell.result = Value::Integer(i64::from(code));
+        shell.result = Value::Status(code);
         shell.produced = Produced::Status;
         // Published here rather than left to `run_recorded`, which a startup file
         // never passes through: a `return` in `env.mesh` is converted above, and
@@ -1232,11 +1235,10 @@ fn run_logout(options: &StartupOptions, last: u8, shell: &mut Shell) -> u8 {
     // `last` is the status the shell is leaving with, which is bash's `$?` in an
     // EXIT trap: the argument to `exit N`, or the last command's status for a
     // bare `exit` or an end of input.
-    run_hooks(
-        HookEvent::Exit,
-        vec![Value::Integer(i64::from(last))],
-        shell,
-    );
+    // A `Status`, as every status channel is: a handler is exactly where someone
+    // writes `if not $status { … }`, and an int there both mis-forwards and, under
+    // type-strict comparison, makes `$status != 0` always true.
+    run_hooks(HookEvent::Exit, vec![Value::Status(last)], shell);
     if options.login
         && let Some(path) = config_dir().map(|dir| dir.join("logout.mesh"))
     {
@@ -1322,14 +1324,24 @@ impl Step {
 
 /// The exit status a **returned value** leaves behind.
 ///
-/// Only `false` fails. `false` is mesh's "no result" — what `gets()` yields at
-/// EOF and what a failing predicate returns — so it is the one value whose
-/// absence of a result is worth reporting as a nonzero status. Every other value
-/// is a result, and producing a result is success, so `return 5` carries the
-/// integer five with status `0` rather than claiming exit code 5. Naming a
-/// specific code is [`fail`](make_fail)'s job.
+/// A `Status` reports its own code — that is what the type is *for*, and it is
+/// what lets `func w() { some-cmd; return $sh.status }` forward a failure instead
+/// of returning the number successfully. Otherwise only `false` fails: `false` is
+/// mesh's "no result" — what `gets()` yields at EOF and what a failing predicate
+/// returns — so it is the one other value whose absence of a result is worth
+/// reporting as a nonzero status. Every remaining value is a result, and producing
+/// a result is success, so `return 5` carries the integer five with status `0`
+/// rather than claiming exit code 5. There is deliberately **no `Integer` arm**:
+/// with one, `func g(_n) { $_n + 1 }` run bare would fail whenever its arithmetic
+/// came out nonzero (`DESIGN.md` §"Open questions", the status decision).
+///
+/// The bare `u8` is the point of the name: this is the code the OS is handed, so
+/// the *fields* that hold a status wrap it back up as `Value::Status`.
 fn status_of(value: &Value) -> u8 {
-    u8::from(matches!(value, Value::Boolean(false)))
+    match value {
+        Value::Status(code) => *code,
+        other => u8::from(matches!(other, Value::Boolean(false))),
+    }
 }
 
 /// Where a syntax error is, as the `file:line:column: ` prefix a diagnostic wears.
@@ -1579,7 +1591,7 @@ fn run_and_or(
         // statement's result, so the rejection is recorded here. Otherwise the
         // value some earlier statement produced would still stand, and a bare
         // `return` after it would carry that instead of the failure.
-        shell.result = Value::Integer(2);
+        shell.result = Value::Status(2);
         shell.produced = Produced::Status;
         return Step::Error(2);
     }
@@ -1656,10 +1668,15 @@ fn run_recorded(
     shell.produced = Produced::Status;
     let records = shell.status_records;
     let step = run_executable(executable, background, last, in_function, shell);
+    // A command's result is its status **as a value**: `func p() { /bin/false }`
+    // yields `Status(1)`, where a bare int let `$v + 1` do arithmetic on an exit
+    // code (`DESIGN.md` §"Open questions", the status decision). `Produced::Status`
+    // is precisely the "its status is its result" case, so this is the one place
+    // the wrapping has to happen.
     if let Step::Continue(code) | Step::Error(code) = step
         && shell.produced == Produced::Status
     {
-        shell.result = Value::Integer(i64::from(code));
+        shell.result = Value::Status(code);
     }
     // Keep a nested breakdown only when it really describes *this* executable's
     // status. Two ways it may not: nothing nested recorded at all (an assignment,
@@ -1702,6 +1719,12 @@ fn run_executable(
             Step::Continue(code)
                 if shell.control.is_none() && shell.produced != Produced::Nothing =>
             {
+                // The negation is the whole statement's answer, so a value the
+                // operand produced is no longer this statement's result — `not
+                // status 5` reports 0 and must not leave `Status(5)` behind for a
+                // value call to read. Handing it back to `run_recorded` as
+                // status-produced is what replaces it with the negated code.
+                shell.produced = Produced::Status;
                 Step::Continue(u8::from(code == 0))
             }
             step => step,
@@ -1953,7 +1976,12 @@ fn run_executable(
             }
             Step::Continue(status)
         }
-        Control { kind, value, guard } => {
+        Control {
+            kind,
+            value,
+            channel,
+            guard,
+        } => {
             match guard_allows(guard.as_ref(), last, in_function, shell) {
                 Ok(true) => {}
                 // Skipped entirely: it produced neither a value nor a status of
@@ -1984,7 +2012,21 @@ fn run_executable(
                         .map(|v| eval_expr(v, last, in_function, shell))
                         .transpose()
                     {
+                        // `return status N` is sugar for `return status(N)`, so
+                        // the operand is the code and the constructor's range
+                        // check is the same one.
                         Ok(Some(value)) => {
+                            let value = if *channel == Some(parser::Channel::Status) {
+                                match status_value(&value) {
+                                    Ok(status) => status,
+                                    Err(message) => {
+                                        note!("mesh: return {message}");
+                                        return Step::Error(2);
+                                    }
+                                }
+                            } else {
+                                value
+                            };
                             let code = status_of(&value);
                             Step::Return(value, code)
                         }
@@ -2570,6 +2612,21 @@ fn condition_status(
         if bound == Value::Boolean(false) {
             return Ok(Some(1));
         }
+        // A **status** is the other value-level failure (`DESIGN.md` §"Error
+        // handling"), so a failing one takes `else` here exactly as it does when
+        // it is the condition itself — otherwise `if s = sh("-c", "exit 5")`
+        // succeeds while `if sh("-c", "exit 5")` fails, on the same value.
+        //
+        // It still **binds**, unlike `false`: a status is a result rather than an
+        // absence, so the `else` branch can read the code it failed with — the
+        // same shape as the capture-tailed sibling above, where `if out = $(diff
+        // a b)` binds and branches on the diff's status.
+        if let Value::Status(code) = bound {
+            return match bind_pattern(pattern, &bound, &mut shell.vars, *global) {
+                Ok(()) => Ok(Some(code)),
+                Err(message) => Err(runtime_message(message)),
+            };
+        }
         // A list pattern never reaches here — the arm above claims every one of
         // them, capture-tailed or not — so the only failures left are real ones.
         return match bind_pattern(pattern, &bound, &mut shell.vars, *global) {
@@ -2977,7 +3034,7 @@ fn run_forked_block(body: &parser::Source, in_function: bool, shell: &mut Shell)
     });
     match status {
         Ok(code) => {
-            shell.result = Value::Integer(i64::from(code));
+            shell.result = Value::Status(code);
             shell.record_status(code, vec![code]);
             Step::Continue(code)
         }
@@ -3670,6 +3727,8 @@ fn interpolated_value(value: Value) -> Result<Value, Step> {
         Value::Styled(styled) => return Ok(Value::String(styled.text)),
         Value::Integer(n) => return Ok(Value::String(n.to_string())),
         Value::Boolean(b) => return Ok(Value::String(b.to_string())),
+        // The bare number: a status renders like the int it wraps.
+        Value::Status(code) => return Ok(Value::String(code.to_string())),
         // A flag renders: a string context asks for text, not for an option.
         Value::Flag(flag) => return Ok(Value::String(flag.text())),
         Value::List(_) => "list",
@@ -4425,9 +4484,12 @@ fn eval_expr(
                         let key = match eval_expr(key, last, in_function, shell)? {
                             Value::String(key) => key,
                             // Numeric-looking and boolean barewords in key position
-                            // are key bytes, not typed map keys.
+                            // are key bytes, not typed map keys. A status is the
+                            // same case: it renders as its decimal code wherever
+                            // bytes are wanted, so `[$s: found]` keys on `5`.
                             Value::Integer(key) => key.to_string(),
                             Value::Boolean(key) => key.to_string(),
+                            Value::Status(key) => key.to_string(),
                             _ => return runtime_error("map key must be a string"),
                         };
                         let value = eval_expr(value, last, in_function, shell)?;
@@ -4568,6 +4630,7 @@ fn eval_expr(
                     | Value::Styled(_)
                     | Value::Integer(_)
                     | Value::Boolean(_)
+                    | Value::Status(_)
                     | Value::Regex(_)
                     | Value::Glob(_)
                     | Value::Stream(_)
@@ -4602,6 +4665,7 @@ fn eval_expr(
                 | Value::Styled(_)
                 | Value::Integer(_)
                 | Value::Boolean(_)
+                | Value::Status(_)
                 | Value::Regex(_)
                 | Value::Glob(_)
                 | Value::Stream(_)
@@ -4614,6 +4678,9 @@ fn eval_expr(
                         Value::String(key) => key,
                         Value::Integer(key) => key.to_string(),
                         Value::Boolean(key) => key.to_string(),
+                        // Reached by the same byte form it was keyed under, so
+                        // `$m[$s]` finds what `$m[5]` finds.
+                        Value::Status(key) => key.to_string(),
                         _ => return runtime_error("map key must be a string"),
                     };
                     map_lookup(&entries, &key)
@@ -4699,7 +4766,11 @@ fn eval_expr(
                 Step::Continue(code) => Ok(if shell.jobs.holds(launched) {
                     Value::Job(launched)
                 } else {
-                    Value::Integer(i64::from(code))
+                    // A `Status`, like every other stand-in for "how it went":
+                    // as an int it read as data, so `if $j` was a type error
+                    // where the handle branch is a condition, and a failed
+                    // pre-registration launch bound a *successful* number.
+                    Value::Status(code)
                 }),
                 step => Err(step),
             }
@@ -4918,6 +4989,9 @@ fn call_named_for_value(
     if name == "glob" {
         return eval_glob(arguments, last, in_function, shell);
     }
+    if name == "status" {
+        return eval_status(arguments, last, in_function, shell);
+    }
     if name == "gets" {
         return eval_gets(arguments, last, in_function, shell);
     }
@@ -4925,12 +4999,40 @@ fn call_named_for_value(
         return eval_directory_entries(name, filter, arguments, last, in_function, shell);
     }
     if name != "re" {
-        // A user function called for its value; an external (or unknown) command
-        // has no return value — point at `$(…)` for its output instead.
         if shell.funcs.get(name).is_some() {
             return call_func_for_value(name, arguments, last, in_function, shell);
         }
-        return runtime_error(no_return_value(name));
+        // A control keyword has no call spelling, and must not reach the command
+        // dispatch below: `return(5)` there builds a `Step::Return` with none of
+        // the inside-a-function validation the control arm does, which at top
+        // level reaches an `unreachable!` and takes the shell down. The parser
+        // refuses `&return` in the same terms.
+        if builtins::is_command_keyword(name) {
+            return runtime_error(format!(
+                "{name}: not a call; `{name}` is syntax, not a command"
+            ));
+        }
+        // A builtin or an external, called for a value. **Every call yields one**
+        // — there is no null to hand back — and for anything command-shaped that
+        // value is how the command went, so `grep(zzz)` is `Status(1)` where it
+        // used to be *a command has no return value* (`DESIGN.md` §"Open
+        // questions", the status decision). The lost diagnostic is the accepted
+        // cost: `puts(1 + 2)` now binds `Status(0)` rather than saying that a
+        // value was wanted where none exists.
+        // The shell's own stdout, as command position gets: `puts(style(…))`
+        // writes to the terminal the written `puts style(…)` writes to, so it
+        // emits the same escapes.
+        return match run_command_call(
+            name,
+            arguments,
+            stdout_decoration(),
+            last,
+            in_function,
+            shell,
+        )? {
+            Some(status) => Ok(Value::Status(status)),
+            None => Ok(control_placeholder()),
+        };
     }
     let mut pattern = None;
     let mut literal = false;
@@ -5168,6 +5270,71 @@ fn entry_filter(name: &str) -> Option<expand::Modifier> {
 /// reason `ls $p` gets none: `~` is a *word* expansion that runs on what you
 /// typed, and a value never re-expands. A pattern under the home directory says
 /// so with `glob("$env.HOME/…")`, or lets the word form do it — `~/*.txt`.
+/// `status(N)` — the constructor for a [`Value::Status`].
+///
+/// The mechanism behind `return status N`, and the only spelling that reaches a
+/// `match` arm: `fail` and `return status` unwind the whole function, so an arm
+/// that must *yield* a status needs a call that merely evaluates
+/// (`DESIGN.md` §"Open questions", the status decision).
+///
+/// The range is `0`–`255` and out of range is **refused**, following `fail`'s
+/// existing check rather than normalizing: silent truncation would make
+/// `status(256)` and `status(0)` the same value, the very trap the decision
+/// declines elsewhere. `status(0)` is legal where `fail 0` is not — naming a zero
+/// status is reasonable, while a `fail` that succeeds is a mistake.
+fn eval_status(
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    let mut code: Option<Value> = None;
+    for argument in arguments {
+        match argument {
+            parser::Argument::Positional(expression) if code.is_none() => {
+                let Some(value) = eval_operand(expression, last, in_function, shell)? else {
+                    return Ok(control_placeholder());
+                };
+                code = Some(value);
+            }
+            parser::Argument::Positional(_) => {
+                return runtime_error("status() takes one code argument");
+            }
+            parser::Argument::Named(named, _) => {
+                return runtime_error(format!(
+                    "status(): no `{named}` argument; it takes the code positionally"
+                ));
+            }
+            parser::Argument::Spread(_) => {
+                return runtime_error("status() does not accept spread arguments");
+            }
+        }
+    }
+    let Some(code) = code else {
+        return runtime_error("status() requires a code between 0 and 255");
+    };
+    status_value(&code).map_err(runtime_message)
+}
+
+/// The `Status` a `status(N)` operand names, or why it names none.
+///
+/// Shared by the call and the command-position spelling so the two cannot
+/// disagree about the range or about the wording that reports it.
+fn status_value(code: &Value) -> Result<Value, String> {
+    match code.clone().plain() {
+        Value::Integer(number) => u8::try_from(number)
+            .map(Value::Status)
+            .map_err(|_| "status: status must be between 0 and 255".to_owned()),
+        // Already one: `status($sh.status)` is a reasonable thing to write on the
+        // way to a comparison, and re-wrapping it is the identity.
+        Value::Status(existing) => Ok(Value::Status(existing)),
+        other => Err(format!(
+            "status: the code must be an integer, not {}",
+            value_kind(&other)
+        )),
+    }
+}
+
 fn eval_glob(
     arguments: &[parser::Argument],
     last: u8,
@@ -5707,6 +5874,7 @@ pub(crate) fn value_kind(value: &Value) -> &'static str {
         Value::Styled(_) => "a string",
         Value::Integer(_) => "an integer",
         Value::Boolean(_) => "a boolean",
+        Value::Status(_) => "a status",
         Value::List(_) => "a list",
         Value::Map(_) => "a map",
         Value::Regex(_) => "a regex",
@@ -6140,7 +6308,7 @@ mod capture {
 
 /// `f(…):capture` — run the call and return a **record of every channel**:
 /// `.value` (the return value), `.out` and `.err` (its stdout / stderr), and
-/// `.status` (the exit int), per `DESIGN.md` §"Calling for a value".
+/// `.status` (a `Status`), per `DESIGN.md` §"Calling for a value".
 ///
 /// Both descriptors are diverted for the duration, and both are drained on
 /// threads: a body that fills the 64 KiB pipe buffer on one channel would
@@ -6149,21 +6317,28 @@ mod capture {
 /// `.out`/`.err` are the bytes **as written** — no trailing-newline trim, unlike
 /// `$(…)` — because the record is meant to bake in no split policy: `:lines`,
 /// `:split`, and friends are how you divide them up.
-/// Does `name` capture as a **command** — the record without `.value` — rather
-/// than as a value call?
+/// Does `name` capture as a **command** — its `.value` the `Status` it left —
+/// rather than as a value call?
 ///
 /// Every built-in value name, not just `re`: `glob("*"):capture` asks what a
 /// *call* wrote and returned, and routing it to the command path would report the
 /// command-not-found for a `glob` that isn't one. `gets` is the case where both
 /// spellings exist, so the call form has to win here too — otherwise
 /// `gets():capture` would run the *command*, read a line, and hand back a record
-/// with no `.value` holding it.
+/// holding a status where the line belongs.
+///
+/// A **control keyword** is not a command here either, so `return(5):capture`
+/// falls through to the value path and is refused there rather than being run:
+/// dispatched as a command it builds a `Step::Return` with none of the control
+/// arm's inside-a-function validation, which at top level reaches an
+/// `unreachable!`. One refusal, in `call_named_for_value`, for both spellings.
 ///
 /// Shared by the bare name and the `&name` reference that reaches the same call,
 /// so the two cannot answer it differently.
 fn captures_as_a_command(name: &str, shell: &Shell) -> bool {
     !parser::value_builtin(name)
         && !builtins::is_callable_builtin(name)
+        && !builtins::is_command_keyword(name)
         && shell.funcs.get(name).is_none()
 }
 
@@ -6174,14 +6349,12 @@ fn capture_call(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    // A *command* — builtin or external — has no return value, so its record comes
-    // back without `.value`. This is the one case where a value call on a command
-    // is allowed at all, since it asks for the channel record rather than a value
-    // the command lacks.
+    // A *command* — builtin or external — records the `Status` it left as its
+    // `.value`, so the record has the same shape whatever was called.
     shell.value_call_status = None;
     // *Everything* the invocation does happens inside the capture — including
     // working out what the callee is. `:capture` is defined over the whole call,
-    // which is why [`run_command_in_capture`] evaluates arguments in here too: an
+    // which is why [`run_command_call`] evaluates arguments in here too: an
     // argument that prints (`echo(side()):capture`) belongs in the record, and a
     // computed callee that prints (`(make())():capture`) is the same case. Deciding
     // command-vs-value first would have put that output on the terminal instead.
@@ -6218,7 +6391,16 @@ fn capture_call(
         };
         if let Some(name) = command {
             return Ok(
-                match run_command_in_capture(&name, arguments, last, in_function, shell)? {
+                // Plain: a capture's stdout is a pipe into the record, and escape
+                // bytes there would compare unequal to the text they decorate.
+                match run_command_call(
+                    &name,
+                    arguments,
+                    Decoration::plain(),
+                    last,
+                    in_function,
+                    shell,
+                )? {
                     Some(status) => CapturedCall::Command(status),
                     None => CapturedCall::Control,
                 },
@@ -6258,10 +6440,16 @@ fn capture_call(
     match call {
         // Control flow is unwinding; the statement layer acts on `shell.control`.
         CapturedCall::Control => Ok(control_placeholder()),
-        // A command's record has no `.value` — there is none — and a nonzero exit
+        // A command's `.value` is its `Status`, so the record has a **fixed
+        // shape** rather than one that depends on what was called. A nonzero exit
         // is the point of asking rather than a failure: `grep(x):capture` on no
         // match reports status 1 in the record rather than failing the statement.
-        CapturedCall::Command(status) => Ok(channel_record(None, out_text, err_text, status)),
+        CapturedCall::Command(status) => Ok(channel_record(
+            Some(Value::Status(status)),
+            out_text,
+            err_text,
+            status,
+        )),
         CapturedCall::Value(value) => {
             let status = unwound.unwrap_or_else(|| status_of(&value));
             Ok(channel_record(
@@ -6293,9 +6481,12 @@ enum CapturedCallee {
     Value(vars::FuncValue),
 }
 
-/// `cmd(args):capture` on a **command**: the same record minus `.value`, since
-/// there is none — reading it is then a loud no-such-field, exactly as
-/// `DESIGN.md` specifies.
+/// `cmd(args)` on a **command** — an external or a builtin — for its value.
+///
+/// The status it reports *is* that value, wrapped by the caller: a command's
+/// result is not missing, it is how the command went. Shared by the plain value
+/// call and by `:capture`, so the two cannot disagree about what running one
+/// means.
 ///
 /// "Command" covers a builtin as well as an external. Both are reached through
 /// `run_expanded`, the post-expansion half of `run_command`, so `puts(x):capture`
@@ -6308,15 +6499,55 @@ enum CapturedCallee {
 /// named-option encoding, so a `key: value` pair or a map spread has nothing to
 /// bind to; pass the intended argv token as a positional instead.
 ///
+/// The status each sibling in a list of words or arguments stands on.
+///
+/// Siblings are evaluated left to right, and one that runs a command **records**
+/// the status it left, so the next one stands on that rather than on the status
+/// the whole list began with: `puts(false(), source($f))` sources with `1`, the
+/// way the two lines written one after the other would. That is the status half
+/// of the rule the reference already states for values — "a call in one argument
+/// is seen by the words after it".
+///
+/// The record counter is what makes it answerable. `last` and `$sh.status`
+/// genuinely differ where a construct stands on the status in front of it while
+/// something inside has already published — a condition, most visibly — so
+/// reading the channel unconditionally would hand a later sibling a status
+/// nothing in the list produced. The counter tells "something recorded" from
+/// "unchanged because nothing ran", which the two values alone cannot.
+struct Standing {
+    status: u8,
+    records: u64,
+}
+
+impl Standing {
+    fn new(last: u8, shell: &Shell) -> Self {
+        Self {
+            status: last,
+            records: shell.status_records,
+        }
+    }
+
+    /// The status the next sibling stands on, adopting whatever the last one
+    /// recorded.
+    fn next(&mut self, shell: &Shell) -> u8 {
+        if self.records != shell.status_records {
+            self.records = shell.status_records;
+            self.status = shell.vars.status();
+        }
+        self.status
+    }
+}
+
 /// Runs **inside** [`capture_call`]'s capture rather than opening one of its own:
 /// the arguments are evaluated in here, not before, because an argument can print
 /// — `echo(side()):capture` — and `:capture` is defined over the whole invocation,
 /// so everything written while evaluating the call belongs in the record. That is
 /// the same rule the callee is now held to. `None` means control flow unwound
 /// through an argument.
-fn run_command_in_capture(
+fn run_command_call(
     name: &str,
     arguments: &[parser::Argument],
+    decoration: Decoration,
     last: u8,
     in_function: bool,
     shell: &mut Shell,
@@ -6333,14 +6564,16 @@ fn run_command_in_capture(
                 argv.push(text, written);
             }
         };
+        let mut standing = Standing::new(last, shell);
         for argument in arguments {
+            let last = standing.next(shell);
             match argument {
                 parser::Argument::Positional(expression) => {
                     let Some(value) = eval_operand(expression, last, in_function, shell)? else {
                         return Ok(None);
                     };
                     let written = expand::written_of_value(&value);
-                    push(capture_argument_words(&value, name)?, written);
+                    push(command_call_words(&value, name, decoration)?, written);
                 }
                 parser::Argument::Spread(expression) => {
                     let Some(value) = eval_operand(expression, last, in_function, shell)? else {
@@ -6352,7 +6585,7 @@ fn run_command_in_capture(
                         Value::List(values) => {
                             for value in &values {
                                 let written = expand::written_of_value(value);
-                                push(capture_argument_words(value, name)?, written);
+                                push(command_call_words(value, name, decoration)?, written);
                             }
                         }
                         _ => {
@@ -6378,7 +6611,15 @@ fn run_command_in_capture(
         // re-reporting it is `capture_call`'s job, on the one path both kinds of
         // failure now share.
         match run_expanded(argv, last, shell) {
-            Step::Continue(status) => Ok(Some(status)),
+            Step::Continue(status) => {
+                // Published, as running the command any other way publishes it:
+                // arguments evaluate left to right, so a later one reads
+                // `$sh.status` and has to see this call's — `show(false(),
+                // $sh.status:repr)` answers what the same call in command
+                // position, or a mesh function ending in `false`, answers.
+                shell.record_status(status, vec![status]);
+                Ok(Some(status))
+            }
             // `exit` leaves the shell rather than reporting a status into a record.
             step => Err(step),
         }
@@ -6395,24 +6636,46 @@ fn channel_record(value: Option<Value>, out: String, err: String, status: u8) ->
     }
     entries.push(("out".to_string(), Value::String(out)));
     entries.push(("err".to_string(), Value::String(err)));
-    entries.push(("status".to_string(), Value::Integer(status.into())));
+    // A `Status`, like every other status channel — and the invariant is that it
+    // is exactly the `Status` whose code is `status_of(.value)`, a derived view
+    // rather than an independent channel.
+    entries.push(("status".to_string(), Value::Status(status)));
     Value::Map(entries)
 }
 
-/// The words one captured argument contributes.
+/// The words one argument of a **command-shaped call** contributes — the value
+/// counterpart of [`stage_argument`], and the same two families it reads values
+/// for rather than argv text.
 ///
-/// `:capture` reaches a builtin as readily as an external — `run_expanded` resolves
-/// either — so `puts`/`print` render their values here exactly as they do in
-/// command position. Everything else takes the bytes-only argv rule.
-fn capture_argument_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
+/// `decoration` is the caller's, because that is the one thing the two callers
+/// differ on: a plain value call writes to the shell's stdout and may emit
+/// escapes, while a `:capture` writes into the record, where they would compare
+/// unequal to the text they decorate.
+fn command_call_words(
+    value: &Value,
+    name: &str,
+    decoration: Decoration,
+) -> Result<Vec<String>, Step> {
     if matches!(name, "puts" | "print") {
-        // A capture's stdout is a pipe into the record, so a styled value
-        // contributes its text: the record holds data, and escape bytes in it would
-        // compare unequal to the text they decorate.
-        return match builtins::rendered_for_output(value, Decoration::plain()) {
+        return match builtins::rendered_for_output(value, decoration) {
             Ok(text) => Ok(vec![text]),
             Err(message) => runtime_error(format!("{name}: {message}")),
         };
+    }
+    // The other family `stage_argument` reads values for: a job builtin takes the
+    // handle itself, so `kill($j)` has to name the job `kill $j` names rather than
+    // meet the argv rule's "a job handle has no text form".
+    if matches!(name, "fg" | "bg" | "wait" | "kill" | "disown") {
+        match value {
+            // `%id` rather than a bare id, for the reason the word path gives:
+            // `fg 2` and `fg %2` are one job, but a bare number is a *pid* to
+            // `kill`, and a handle must never arrive as one.
+            Value::Job(id) => return Ok(vec![format!("%{id}")]),
+            // The job builtin's own answer, where the generic argv message
+            // ("needs `...`") would advise a spread that does not help.
+            Value::Map(_) => return runtime_error(format!("{name}: a map is not a job")),
+            _ => {}
+        }
     }
     argv_words(value, name)
 }
@@ -6431,6 +6694,8 @@ fn argv_words(value: &Value, name: &str) -> Result<Vec<String>, Step> {
         Value::Styled(styled) => Ok(vec![styled.text.clone()]),
         Value::Integer(number) => Ok(vec![number.to_string()]),
         Value::Boolean(flag) => Ok(vec![flag.to_string()]),
+        // Decimal, beside `int`: `cmd status(5)` passes `5`.
+        Value::Status(code) => Ok(vec![code.to_string()]),
         Value::List(_) => runtime_error(format!(
             "{name}: a list needs `...` to become command arguments"
         )),
@@ -7059,6 +7324,12 @@ fn eval_body(
 fn condition_bool(value: &Value) -> Result<bool, String> {
     match value {
         Value::Boolean(value) => Ok(*value),
+        // A command is admitted in a condition *because* its result is a status,
+        // so once a status is a value the two are one question: `if grep -q x f`
+        // and `if grep(x)` ask the same thing (`DESIGN.md` §"Open questions", the
+        // status decision). Not a coercion — success and failure are the whole of
+        // what a status encodes, as for a bool.
+        Value::Status(code) => Ok(*code == 0),
         other => Err(format!(
             "{} is not a condition; {}",
             type_phrase(other),
@@ -7085,6 +7356,7 @@ fn type_phrase(value: &Value) -> &'static str {
         Value::FlagTerminator => "the flag terminator",
         Value::Integer(_) => "an int",
         Value::Boolean(_) => "a bool",
+        Value::Status(_) => "a status",
         Value::List(_) => "a list",
         Value::Map(_) => "a map",
         Value::Regex(_) => "a regex",
@@ -7225,6 +7497,7 @@ fn eval_binary(left: Value, op: parser::BinaryOp, right: Value) -> Result<Value,
                 Value::Styled(_)
                 | Value::Integer(_)
                 | Value::Boolean(_)
+                | Value::Status(_)
                 | Value::Regex(_)
                 | Value::Glob(_)
                 | Value::Flag(_)
@@ -7444,6 +7717,12 @@ fn run_single(
         }
         Ok(Expanded::Fail(_)) => {
             note!("mesh: fail: cannot be redirected or backgrounded");
+            return Step::Error(2);
+        }
+        // `status` writes nothing and answers with a **value**, so a redirection
+        // has nothing to carry and a background launch has nowhere to put it.
+        Ok(Expanded::Status(_)) => {
+            note!("mesh: status: cannot be redirected or backgrounded");
             return Step::Error(2);
         }
         Ok(Expanded::Argv(argv)) => argv,
@@ -8050,6 +8329,12 @@ fn run_stage_in_shell(
                         note!("mesh: {}", context.returning());
                         Step::Error(2)
                     }
+                    // Its value would die with the stage, so the spelling is a
+                    // mistake rather than a quiet no-op.
+                    Ok(Expanded::Status(_)) => {
+                        note!("mesh: status: cannot be used in a pipeline");
+                        Step::Error(2)
+                    }
                     Ok(Expanded::Argv(argv)) => {
                         if argv.is_empty() {
                             note!("mesh: {}", context.empty());
@@ -8139,6 +8424,10 @@ fn expand_eager_stage(
         }
         Expanded::Fail(_) => {
             note!("mesh: fail: cannot be used in a pipeline");
+            return Err(Step::Error(2));
+        }
+        Expanded::Status(_) => {
+            note!("mesh: status: cannot be used in a pipeline");
             return Err(Step::Error(2));
         }
         Expanded::Argv(argv) => {
@@ -8339,6 +8628,11 @@ enum Expanded {
     Return(Vec<(Value, bool)>),
     /// `fail`, whose operand is typed the same way `return`'s is.
     Fail(Vec<(Value, bool)>),
+    /// `status N`, likewise: the command form has to see the operand's **type**,
+    /// or `code = "5"; status $code` would build a status out of a string that
+    /// `status($code)` refuses — argv text re-typed after expansion, which is the
+    /// rule this path exists to keep.
+    Status(Vec<(Value, bool)>),
     /// argv for a builtin or an external program.
     Argv(Argv),
 }
@@ -8377,7 +8671,10 @@ fn expand_stage(
     let Some((first, rest)) = words.split_first() else {
         return Ok(Expanded::Argv(Argv::default()));
     };
-    let head = expansion_word(first, last, in_function, shell)?;
+    // Opened before the head runs, so a head that records — `$(pick) arg` — is
+    // already seen by the first word after it.
+    let mut standing = Standing::new(last, shell);
+    let head = expansion_word(first, standing.next(shell), in_function, shell)?;
     // The command's own word is never an option to itself, so the head is data
     // however it is spelled.
     let mut argv = Argv::data(expand::expand(vec![head], &shell.vars).map_err(runtime_message)?);
@@ -8388,7 +8685,7 @@ fn expand_stage(
     // become *values*, and argv is the boundary that would flatten a list or map on
     // the way. A function can never be named `return` — definition rejects the word
     // — so the two cannot both claim one stage.
-    let returning = matches!(name.as_deref(), Some("return" | "fail"));
+    let returning = matches!(name.as_deref(), Some("return" | "fail" | "status"));
     let calling = name
         .as_ref()
         .is_some_and(|name| shell.funcs.get(name).is_some());
@@ -8400,7 +8697,7 @@ fn expand_stage(
         // the binder, which does not run until every word has expanded.
         let mut flags_ended = false;
         for word in rest {
-            let word = expansion_word(word, last, in_function, shell)?;
+            let word = expansion_word(word, standing.next(shell), in_function, shell)?;
             let values = expand::expand_call_values(vec![word], &shell.vars).map_err(|error| {
                 let callee = name.as_deref().filter(|_| calling);
                 // Looked up **here**, not snapshotted before the loop. An earlier
@@ -8428,11 +8725,12 @@ fn expand_stage(
         return Ok(match name.as_str() {
             "return" => Expanded::Return(args),
             "fail" => Expanded::Fail(args),
+            "status" => Expanded::Status(args),
             _ => Expanded::Function { name, args },
         });
     }
     for word in rest {
-        let word = expansion_word(word, last, in_function, shell)?;
+        let word = expansion_word(word, standing.next(shell), in_function, shell)?;
         // Asked of the word before it is rendered, since that is the only moment
         // the distinction still exists.
         let written = expand::written_of(&word, &shell.vars);
@@ -8573,6 +8871,7 @@ fn run_command(tokens: &[parser::Word], last: u8, in_function: bool, shell: &mut
         Ok(Expanded::Function { name, args }) => dispatch_function_call(&name, args, shell),
         Ok(Expanded::Return(args)) => make_return(args, last, shell),
         Ok(Expanded::Fail(args)) => make_fail(args),
+        Ok(Expanded::Status(args)) => status_statement(args, shell),
         Ok(Expanded::Argv(words)) => run_expanded(words, last, shell),
         Err(step) => step,
     }
@@ -9111,6 +9410,10 @@ fn expand_bounded(
         }
         Expanded::Fail(_) => {
             note!("mesh: {}", context.failing());
+            return Err(Step::Error(2));
+        }
+        Expanded::Status(_) => {
+            note!("mesh: status: cannot be run under `timeout`");
             return Err(Step::Error(2));
         }
         Expanded::Argv(argv) => {
@@ -10120,7 +10423,8 @@ fn run_jobdone_hooks(shell: &mut Shell) {
                 vec![
                     Value::Integer(i64::try_from(job.id).unwrap_or(i64::MAX)),
                     Value::String(job.command),
-                    Value::Integer(i64::from(job.status)),
+                    // A `Status`: `if not $status { … }` is the handler's test.
+                    Value::Status(job.status),
                 ],
                 shell,
             );
@@ -10175,24 +10479,79 @@ fn make_return(args: Vec<(Value, bool)>, last: u8, shell: &Shell) -> Step {
     }
 }
 
+/// `status N` in **command position** — the same value the call builds, left as
+/// the statement's result.
+///
+/// It reports `N` as its own status too, through the ordinary projection: a bare
+/// `status 1` fails, so `status 1 || puts fallback` runs the fallback with no rule
+/// of its own (`DESIGN.md` §"Open questions", the status decision).
+fn status_statement(mut args: Vec<(Value, bool)>, shell: &mut Shell) -> Step {
+    // The typed path this reaches command position by skips the generic builtin
+    // option handling in [`run_expanded`], so the two words every builtin answers
+    // to are read here instead. `status` is a table builtin — `help status` lists
+    // `--help` — and a builtin that documents a flag it then treats as an operand
+    // is the table lying about its own surface.
+    if auto_help_requested(&args) {
+        return Step::Continue(builtins::print_help("status"));
+    }
+    // The **first** written `--` ends the options and is taken out of the way, as
+    // `call_func` does when binding a call's arguments; a later one is an operand
+    // like any other word past the terminator. Left in, `status -- 5` counted two
+    // arguments and reported a surplus.
+    if let Some(at) = args
+        .iter()
+        .position(|(value, _)| matches!(value, Value::FlagTerminator))
+    {
+        args.remove(at);
+    }
+    let value = match <[_; 1]>::try_from(args) {
+        Ok([(operand, _)]) => match status_value(&operand) {
+            Ok(value) => value,
+            Err(message) => {
+                note!("mesh: {message}");
+                return Step::Error(2);
+            }
+        },
+        Err(args) if args.is_empty() => {
+            note!("mesh: status: expected a code between 0 and 255");
+            return Step::Error(2);
+        }
+        Err(_) => {
+            note!("mesh: status: too many arguments");
+            return Step::Error(2);
+        }
+    };
+    let code = status_of(&value);
+    shell.result = value;
+    shell.produced = Produced::Value;
+    Step::Continue(code)
+}
+
 /// Build the [`Step::Return`] for `fail` — the status channel's counterpart to
 /// `return`.
 ///
-/// `fail` leaves the function with a **nonzero** status and no result. Bare it is
-/// `1`, the shell's ordinary "something went wrong"; `fail 3` names a specific
-/// code. The value it carries is `false`, which is mesh's "no result", so a caller
-/// reading the value sees the same absence whether the callee said `fail` or
-/// `return false`; the two are told apart by the status.
+/// `fail` leaves the function with a **nonzero** status, carrying that status as
+/// its value: it is a *validating wrapper* over `return status(N)` rather than
+/// exact sugar for it (`DESIGN.md` §"Open questions", the status decision). Bare
+/// it is `1`, the shell's ordinary "something went wrong"; `fail 3` names a
+/// specific code.
 ///
-/// `fail 0` is refused rather than silently succeeding: a `fail` that succeeds is
-/// always a mistake, and the spelling for "leave with success" is `return true`.
+/// The constraint is the whole difference from the constructor, and it is
+/// load-bearing: `status(0)` is legal, since naming a zero status is reasonable,
+/// while `fail 0` stays refused, since a `fail` that succeeds is always a mistake.
+/// Calling `fail` plain sugar would delete that diagnostic. The spelling for
+/// "leave with success" is `return true`.
 fn make_fail(args: Vec<(Value, bool)>) -> Step {
     let code = match <[_; 1]>::try_from(args) {
         Ok([(value, _)]) => match &value {
             Value::Integer(code) if (1..=255).contains(code) => {
                 u8::try_from(*code).expect("checked against the u8 range above")
             }
-            Value::Integer(_) => {
+            // A status already, which `fail $sh.status` and `fail $j.status` are
+            // the obvious spellings of now that those channels carry one. The
+            // range check is the same: a `fail` that succeeds is still a mistake.
+            Value::Status(code) if *code >= 1 => *code,
+            Value::Integer(_) | Value::Status(_) => {
                 note!("mesh: fail: status must be between 1 and 255");
                 return Step::Error(2);
             }
@@ -10207,7 +10566,9 @@ fn make_fail(args: Vec<(Value, bool)>) -> Step {
             return Step::Error(2);
         }
     };
-    Step::Return(Value::Boolean(false), code)
+    // `Status(code)`, not `false`: a caller reading the value of a failed call
+    // gets the code it failed with, and `return $r.value` forwards it.
+    Step::Return(Value::Status(code), code)
 }
 
 /// Call the function `name` with already-expanded typed `args`. Binds the
@@ -10286,28 +10647,14 @@ fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &
     result
 }
 
-/// Call a user function for its **value** (`x = f(arg, key: value)`): evaluate the
-/// value-mode arguments in the caller's scope, bind them in a fresh callee scope,
-/// run the body, and return its result — the last expression's value, or the
-/// value carried by an explicit `return`. Stdout still streams: the value and
-/// byte channels are independent (`DESIGN.md` §"Calling for a value"). Loop state
-/// is isolated exactly as in [`call_func`].
-/// Why a name that runs cannot be called for a value. One wording, shared by the
-/// written call (`puts(1 + 2)`) and the `&name` reference that reaches the same
-/// place — the two are the same failure, and a reader who has met one should not
-/// have to recognize the other.
-fn no_return_value(name: &str) -> String {
-    format!("{name}: a command has no return value; use `$({name} …)` to capture its output")
-}
-
 /// Does `&name` name anything at all?
 ///
 /// The command namespace, in the reference's own order — value call, builtin,
 /// function, external — which is command position's minus the keyword step the
-/// parser already refused. Asked *separately* from whether calling it yields a
-/// value, because those are different questions with different answers: `&grep`
-/// resolves and has nothing to return, and only a name that resolves to nothing
-/// gets the message about a bad reference.
+/// parser already refused. Asked *separately* from how it is then called, because
+/// those are different questions: `&grep` resolves and is run as a command for the
+/// `Status` it leaves, while only a name that resolves to nothing gets the message
+/// about a bad reference.
 fn reference_resolves(name: &str, shell: &Shell) -> bool {
     builtins::is_value_call(name)
         || builtins::is_builtin(name)
@@ -10329,6 +10676,12 @@ fn not_applicable_per_element(name: &str) -> String {
     )
 }
 
+/// Call a user function for its **value** (`x = f(arg, key: value)`): evaluate the
+/// value-mode arguments in the caller's scope, bind them in a fresh callee scope,
+/// run the body, and return its result — the last expression's value, or the
+/// value carried by an explicit `return`. Stdout still streams: the value and
+/// byte channels are independent (`DESIGN.md` §"Calling for a value"). Loop state
+/// is isolated exactly as in [`call_func`].
 fn call_func_for_value(
     name: &str,
     arguments: &[parser::Argument],
@@ -10550,25 +10903,44 @@ fn call_callable_for_value(
                 "&{referenced}: no builtin, function, or command with that name"
             ));
         }
-        // Only a declared `func` can be applied to an element in hand. A value call
-        // reads its own argument list and there is none here, and a command — an
-        // external or an effect-only builtin — has no value to give at all; the two
-        // are different failures and say so separately.
+        // A value call reads its own argument list and there is none here, so it
+        // is still refused. A **command** is not: every call yields a value now,
+        // so `$xs:map(&puts)` runs the builtin per element and collects the
+        // `Status(0)`s it leaves. Neither is *useful* — the list of statuses says
+        // nothing — but the value system no longer has a way to catch it, which is
+        // the lost diagnostic the status decision accepts rather than a new
+        // improvement (`DESIGN.md` §"Open questions").
         let Some((params, body, captured)) = shell
             .funcs
             .get(referenced)
             .map(|def| (def.params.clone(), def.body.clone(), def.captures.clone()))
         else {
-            return runtime_error(
-                if builtins::is_value_call(referenced)
-                    || builtins::is_callable_builtin(referenced)
-                    || entry_filter(referenced).is_some()
-                {
-                    not_applicable_per_element(referenced)
-                } else {
-                    no_return_value(referenced)
-                },
-            );
+            if builtins::is_value_call(referenced)
+                || builtins::is_callable_builtin(referenced)
+                || entry_filter(referenced).is_some()
+            {
+                return runtime_error(not_applicable_per_element(referenced));
+            }
+            let mut argv = Argv::data(vec![referenced.to_string()]);
+            // The same conversion a written call gets, so `&puts` renders a
+            // nested collection the way `puts([1 2])` does and `&kill` names a
+            // job the way `kill($j)` does.
+            for text in command_call_words(&argument, referenced, stdout_decoration())? {
+                argv.push(text, expand::written_of_value(&argument));
+            }
+            // The standing status, not a fresh `0`: a command that *reads* it —
+            // a `source` whose file ends in a bare `return` — must answer here
+            // the way it answers written out. And the code it leaves is
+            // published, as `run_command_call` publishes it, so a later element
+            // or a later stage of the same chain reads this call's status.
+            let standing = shell.vars.status();
+            return match run_expanded(argv, standing, shell) {
+                Step::Continue(status) => {
+                    shell.record_status(status, vec![status]);
+                    Ok(Value::Status(status))
+                }
+                step => Err(step),
+            };
         };
         let caller_result = shell.result.clone();
         let caller_produced = shell.produced;
@@ -10858,7 +11230,9 @@ fn evaluate_value_arguments<'p>(
     let mut flag_values: std::collections::HashMap<&'p str, Value> =
         std::collections::HashMap::new();
     let mut flags_ended = false;
+    let mut standing = Standing::new(last, shell);
     for argument in arguments {
+        let last = standing.next(shell);
         // Every argument form begins by evaluating one expression in the caller's
         // scope, so evaluate here and check for caller-owned loop control once.
         let expression = match argument {
@@ -13641,7 +14015,9 @@ fn handle_signal(
                 HookEvent::PostExec,
                 vec![
                     Value::String(command),
-                    Value::Integer(i64::from(status)),
+                    // A `Status`, for the same reason `jobdone`'s third argument
+                    // is one.
+                    Value::Status(status),
                     Value::Integer(elapsed),
                 ],
                 shell,

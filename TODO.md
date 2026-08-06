@@ -9,6 +9,35 @@ file as tasks land.
 Calls autopilot made without asking, each one chosen for being cheap to undo.
 Delete an entry once you have agreed with it or reversed it.
 
+- [ ] **`fail` accepts a `Status` operand as well as an integer.** `fail
+      $sh.status` and `fail $j.status` are the obvious spellings once those
+      channels carry a status, and the design's `fail N` wording predates the
+      type. The `N ≥ 1` check is unchanged, so `fail status(0)` is refused
+      exactly as `fail 0` is. *Reversible:* one arm in `make_fail`, and the
+      alternative — refusing it, and making the caller write `fail
+      $sh.status:code` — is a strictly smaller surface.
+- [ ] **`status` is a builtin with both spellings, like `gets`.** The design
+      calls `status(N)` a builtin returning a value and separately requires
+      `{ status 5 }` to work as a block arm's tail, which is command position.
+      Registering it in the builtin table plus `CALLABLE_BUILTINS` gives both
+      from one entry, and takes `help status` / `type status` with it, where a
+      `Claim::ValueCall` name would have needed a second mechanism for the
+      command form. *Reversible:* the entry is one table row; nothing outside
+      dispatch reads it.
+- [ ] **`exit` was left alone, which answers the design's open question by
+      omission.** `exit $sh.status` still works because a status renders as
+      decimal at the argv boundary, where `exit` reads its operand — so nothing
+      had to accept a `Status` for the obvious spelling to keep working.
+      *Reversible:* if `exit` ever reads values rather than words, it takes the
+      same arm `fail` just grew.
+- [ ] **A value call on a name that resolves to nothing now reports `command
+      not found`.** It used to say *a command has no return value*, which was
+      also the message for `double(5)` where `double` is a variable holding a
+      lambda — the `$double(5)` mistake. Command position already answers that
+      way for a bare `double`, so the two spellings now agree, at the cost of a
+      pointer that was only ever accidental. *Reversible:* a diagnostic that
+      notices a same-named function *value* would be an addition, not a
+      reversal.
 - [ ] **`exec` keeps its own process as a pipeline's last stage.** Everything else
       in-shell now runs in the shell there, but `exec` still forks. Running it in
       the shell would spend the *shell* on the replacement, and it buys nothing:
@@ -5735,6 +5764,62 @@ polling in this area belongs to fish, which has no way to avoid it (see
 
 Until one of these lands, `mikelward/conf` leaves the mesh prompt's check
 unguarded, alongside fish and elvish, and carries a `TODO:` naming this entry.
+
+## Beyond M3 — A status is a value ✅ (landed)
+
+- [x] **The `Status` type, the `status(N)` builtin, and the `return` channel
+      words.** `docs/DESIGN.md` §"Open questions" (the status decision) in full:
+      a status had no spelling, so `return`'s operand had to be read as one by
+      type and every status channel handed back a bare int — which a wrapper
+      forwarding it returned as the *number*, successfully.
+
+      What landed, against the design's own checklist:
+
+  - **`status(N)`** builds a `Status` from `0`–`255`, refusing outside it —
+        `status(0)` legal where `fail 0` is not. Both spellings ship: the call
+        is the constructor, and command-position `status 5` leaves the same
+        value as the statement's result, which is what a `match` arm needs
+        (`fail` and `return status` unwind the whole function).
+  - **`return status N`** is sugar for `return status(N)`, and `return value X`
+        the explicit spelling of the plain form. Channel words are recognized
+        only directly after `return`; an attached `(` is a call, never a channel
+        word, so `func value` stays legal.
+  - **`:code`** gives the integer; `:repr` writes `status(5)`; display, argv and
+        interpolation give the bare number.
+  - **A `Status` is a condition**, true iff its code is `0`, which `and` / `or` /
+        `not` inherit by the rule they already follow.
+  - **Every status channel carries one** — `$sh.status`, `$sh.pipestatus`, a
+        capture record's `.status`, a finished job's `$j.status`, and the
+        `jobdone` / `postexec` / `exit` hook arguments.
+  - **`fail N`** leaves `Status(N)` where it left `false`, as a validating
+        wrapper over `return status(N)`.
+  - **"No value" stopped existing.** Every call yields one: `grep(zzz)` is
+        `Status(1)` rather than *a command has no return value*, `puts(1 + 2)`
+        binds `Status(0)`, a command-tailed body yields `Status(n)` rather than a
+        bare int, and a capture record's `.value` is always present. That last
+        one also fixed the recorded defect where `p():capture` reported
+        `value=1 status=0` while bare `p` left `$sh.status` 1.
+
+- [ ] **Cross-type comparison wants one pass over all types.** Carried over from
+      the status decision, which deliberately took no exception for `Status`:
+      `status(0) == 0` is silently `false`, as `1 == "1"` is, while `$s > 1` is
+      an error, as `1 > "1"` is. The questions to settle together are whether
+      cross-type `==` stays silently false or becomes an error naming the fix
+      (`if 0` already sets the loud precedent), why ordering errors where
+      equality does not, whether numeric types compare across (`1 == 1.0`, where
+      the document and the implementation disagree), and where `Status` lands
+      once those are answered. Whatever equality ends up doing, `match` arms do.
+
+- [ ] **A word subscript takes only a string variable.** `$m[$key]` inside a word
+      goes through `expand::subscript_key`, which accepts `Value::String` and
+      nothing else, so `m = [5: found]; i = 5; puts $m[$i]` is *map key must be a
+      string* while the literal `puts $m[5]` and the expression `($m)[$i]` both
+      find it. It refuses an integer, a boolean and a status alike — the status
+      type inherited the gap rather than causing it — and the expression-level
+      index arm already admits all three. Widening the word path to match is the
+      fix; the reason it is filed rather than done is that `subscript_key` also
+      backs `$env` and the `in` operator, which have narrowness of their own to
+      settle in the same pass.
 
 ## Loose ends
 

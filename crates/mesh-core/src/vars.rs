@@ -21,6 +21,22 @@ pub enum Value {
     String(String),
     Integer(i64),
     Boolean(bool),
+    /// **How a command went**, as a value — `status(5)`, `$sh.status`, what a
+    /// command-tailed function body yields.
+    ///
+    /// A status had no spelling before this, so `return`'s operand had to be read
+    /// as one by type and every status channel handed back a bare int — which a
+    /// wrapper forwarding it (`func w() { some-cmd; return $sh.status }`) returned
+    /// as the *number*, successfully (`DESIGN.md` §"Open questions", the status
+    /// decision). It wraps the 8-bit code the OS deals in, so it renders as
+    /// decimal at the byte boundary exactly as an int does; what the type governs
+    /// is projection and dispatch, not the byte form.
+    ///
+    /// It is a **condition**, true iff the code is `0`. Not a truthiness
+    /// exception: success and failure are the whole of what it encodes, as for a
+    /// `bool`, and a command is already admitted in a condition precisely because
+    /// its result is a status.
+    Status(u8),
     List(Vec<Value>),
     Map(Vec<(String, Value)>),
     Regex(RegexValue),
@@ -123,6 +139,9 @@ impl FlagValue {
             Value::Styled(styled) => styled.text.clone(),
             Value::Integer(number) => number.to_string(),
             Value::Boolean(boolean) => boolean.to_string(),
+            // Decimal, as at every other byte boundary: a status has a canonical
+            // number, so `--code=$s` sends the same bytes `--code=5` does.
+            Value::Status(code) => code.to_string(),
             other => unreachable!("a flag payload is a scalar, not {other:?}"),
         };
         format!("--{}={rendered}", self.name)
@@ -141,6 +160,11 @@ impl PartialEq for Value {
         match (self, other) {
             (Value::Integer(left), Value::Integer(right)) => left == right,
             (Value::Boolean(left), Value::Boolean(right)) => left == right,
+            // Against an int this falls to the `_` arm, where `1 == "1"` already
+            // lands: `status(0) == 0` is false, and `$s == status(0)` is the
+            // spelling. No exception is carved for the type — cross-type
+            // comparison is one general question (`TODO.md`), not a per-type patch.
+            (Value::Status(left), Value::Status(right)) => left == right,
             (Value::List(left), Value::List(right)) => left == right,
             (Value::Map(left), Value::Map(right)) => left == right,
             (Value::Regex(left), Value::Regex(right)) => left == right,
@@ -186,6 +210,7 @@ impl std::hash::Hash for Value {
             Value::Function(value) => (9u8, value).hash(state),
             Value::Flag(value) => (10u8, value).hash(state),
             Value::FlagTerminator => 11u8.hash(state),
+            Value::Status(value) => (12u8, value).hash(state),
         }
     }
 }
@@ -652,6 +677,14 @@ impl Value {
             Value::Styled(styled) => quote_into(&styled.text, out),
             Value::Integer(number) => out.push_str(&number.to_string()),
             Value::Boolean(flag) => out.push_str(if *flag { "true" } else { "false" }),
+            // The call, not the bare number it displays as — forced by the
+            // round-trip contract rather than chosen, since `5` would read back as
+            // the integer. The same rule that writes a string as `'42'`.
+            Value::Status(code) => {
+                out.push_str("status(");
+                out.push_str(&code.to_string());
+                out.push(')');
+            }
             // The literal, with the payload written by *its own* literal form
             // rather than by the argv rendering: `s = "2"; x = --n=$s` has a
             // string payload, so `--n='2'` is what reads back as an equal value.
@@ -1266,15 +1299,16 @@ impl Vars {
     /// land in a copy that is discarded — and takes the [`Options`] path instead.
     pub(crate) fn shell_namespace(&self) -> Value {
         let mut entries = vec![
-            ("status".to_owned(), Value::Integer(i64::from(self.status))),
+            // A `Status`, not the bare int it used to be: `return $sh.status`
+            // forwards a failure this way, where an int returns the *number*,
+            // successfully (`DESIGN.md` §"Open questions", the status decision).
+            // It still renders as `5` in a prompt — the byte boundary is
+            // unchanged — and `if $sh.status { … }` is now the test that `==
+            // 0` used to be.
+            ("status".to_owned(), Value::Status(self.status)),
             (
                 "pipestatus".to_owned(),
-                Value::List(
-                    self.stages
-                        .iter()
-                        .map(|code| Value::Integer(i64::from(*code)))
-                        .collect(),
-                ),
+                Value::List(self.stages.iter().copied().map(Value::Status).collect()),
             ),
             ("pid".to_owned(), Value::Integer(i64::from(self.pid))),
             ("ppid".to_owned(), Value::Integer(i64::from(self.ppid))),
@@ -1622,6 +1656,7 @@ pub fn append_into(current: &mut Value, value: Value, name: &str) -> Result<(), 
             return Err(format!("{name}: can only add an integer to an integer"));
         }
         (Value::Boolean(_), _) => return Err(format!("{name}: cannot append to a boolean")),
+        (Value::Status(_), _) => return Err(format!("{name}: cannot append to a status")),
         (Value::Map(_), _) => return Err(format!("{name}: can only merge a map into a map")),
         (Value::Regex(_), _) => return Err(format!("{name}: cannot append to a regex")),
         (Value::Glob(_), _) => return Err(format!("{name}: cannot append to a glob")),
