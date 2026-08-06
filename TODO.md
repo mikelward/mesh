@@ -3630,14 +3630,25 @@ thing a reader takes on trust.*
       below: a builtin should read the *values* it was handed rather than
       re-deriving options from rendered bytes.
 
-- [ ] **`puts $x` should report a flag** -- the one symptom of the four still
-      open after the argv marks landed. The mark is now there and survives the
-      terminator strip, so the refusal is a small addition in `run_expanded`
-      rather than the redesign this entry describes. What backed the earlier
-      attempt out still has to hold: `puts --help` claims help *before* the
-      refusal sees the flag, and `puts -- --force` prints its operand because
-      the terminator was consumed first. Both are now decided in `run_expanded`
-      in that order, which is what makes the addition small.
+- [x] **`puts $x` should report a flag** -- *Fixed: a builtin with no options of
+      its own refuses a written flag in `run_expanded`, right after help is
+      claimed and before the terminator is consumed.* The last of the four
+      symptoms. What backed the earlier attempt out holds structurally now
+      rather than by care: `puts --help` claims help *before* the refusal sees
+      the flag, and the refusal reads only the words *ahead of* the terminator,
+      so `puts -- --force` prints the operand it protected.
+
+      The diagnostic mirrors the function one and names the escape --
+      ``puts: unknown flag `--force`; `puts -- --force` passes it as data`` --
+      with `puts "$x"` and `puts $x:repr` the other two ways to print one.
+
+      **What it cost, since it is wider than the entry implied.** Eight tests
+      printed a flag with a bare `puts $x` or `puts ...$rest` and now say which
+      they meant; the alias test forwards to an external, because forwarding a
+      flag to a *builtin* that declares none is now the error the design says it
+      is, and only an external takes it as bytes. That is the rule doing its job
+      rather than fallout to route around -- but it does mean "show me what I
+      was handed" is `$xs:repr` whenever the payload can hold a flag.
 
       *The original write-up follows, kept for its reasoning.* The design says
       a flag in a call is an *option*, `puts` declares none, so `puts $x`

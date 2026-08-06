@@ -462,7 +462,11 @@ pub fn written_of(word: &Word, vars: &Vars) -> Written {
 }
 
 /// The mark a value carries when it stands as a call argument of its own.
-fn written_of_value(value: &Value) -> Written {
+///
+/// For a caller that already holds the argument's **value** rather than the word
+/// it came from — a `:capture` call, where each argument is evaluated before argv
+/// exists. Same question, asked one step later.
+pub fn written_of_value(value: &Value) -> Written {
     match value {
         Value::Flag(_) => Written::Flag,
         Value::FlagTerminator => Written::Terminator,
