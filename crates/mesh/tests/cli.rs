@@ -16892,6 +16892,150 @@ fn an_alias_cannot_take_a_reserved_name() {
 }
 
 #[test]
+fn an_alias_takes_a_computed_name() {
+    // The point of the feature: one definition per name in a list, without
+    // writing a file and sourcing it. This is half of what a VCS-subcommand loop
+    // and an ssh-host loop want (`TODO.md`, rough edge 26) -- see the body test
+    // below for the half that is still missing.
+    let out = run_with_input(
+        "for name in [one two] { alias $name = puts ran }\none\ntwo\nt = $(type -t one)\nputs $t\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\nran\nfunction\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_computed_alias_name_does_not_bake_its_body() {
+    // The name is read at the definition; the **body** is syntax, evaluated when
+    // the alias runs, exactly as a `wrapper func` body is. So a loop variable
+    // named in the body is out of scope by the time anything calls it -- which
+    // is why this does not yet replace the generated file that rough edge 26 is
+    // about, where the value is baked into the body (`ssh-to <host>`).
+    //
+    // Asserted rather than left implicit: it is the surprise in the feature, and
+    // whichever way the body question is settled, this test is the record of
+    // what the name-only version did.
+    let out = run_with_input("for name in [one] { alias $name = puts $name }\none\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unbound variable"),
+        "{:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_computed_alias_name_may_be_built_out_of_parts() {
+    // A name assembled from a prefix and a value is the shape an ssh-host or a
+    // per-project alias wants, and it needs the quotes to hold the pieces
+    // together. Quoting only means "not a name" when there is nothing computed
+    // in the word — `alias "foo" = …` is still refused below.
+    let out = run_with_input("p = git\nalias \"${p}-st\" = puts ran\ngit-st\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    let literal = run_with_input("alias \"foo\" = puts x\n");
+    assert!(
+        String::from_utf8_lossy(&literal.stderr).contains("expected a name"),
+        "{:?}",
+        literal.stderr
+    );
+}
+
+#[test]
+fn a_computed_alias_name_takes_the_whole_glued_word() {
+    // A modifier is written attached, so reading one token left `:upper` sitting
+    // where the `=` was expected and the definition was a syntax error.
+    let out = run_with_input("n = foo\nalias $n:upper = puts ok\nFOO\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // The run still ends at the `=`, which is what tells a definition from a
+    // command: reading the word the way a redirect target is read would take the
+    // separator into the name and then look for one that is already behind it.
+    let glued = run_with_input("n = foo\nalias $n= puts x\nfoo\n");
+    assert_eq!(String::from_utf8_lossy(&glued.stdout), "x\n");
+    assert!(glued.stderr.is_empty(), "{:?}", glued.stderr);
+
+    // A modifier after a *closing quote* is a value expression everywhere else --
+    // `puts "$n":upper` prints `FOO` because that argument parses as one, not as
+    // a word -- and the name slot takes a word. So it stays text and is refused
+    // as a name rather than quietly naming something else. Asserted so the limit
+    // is recorded rather than discovered; `TODO.md` carries what accepting it
+    // would take.
+    let quoted = run_with_input("n = foo\nalias \"$n\":upper = puts ok\n");
+    assert!(
+        String::from_utf8_lossy(&quoted.stderr).contains("`foo:upper` is not a name"),
+        "{:?}",
+        quoted.stderr
+    );
+}
+
+#[test]
+fn a_computed_alias_name_is_judged_like_a_written_one() {
+    // A computed name is a way around writing the name down, not around the
+    // rules for one — same messages, same blast radius.
+    for (value, expect) in [
+        ("puts", "reserved name"),
+        ("re", "built-in value call"),
+        ("a.b", "member access"),
+        ("_", "discard name"),
+        ("2x", "is not a name"),
+        ("", "is not a name"),
+        ("a b", "is not a name"),
+    ] {
+        let out = run_with_input(&format!("n = \"{value}\"\nalias $n = puts wrapped\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(expect), "{value}: {stderr}");
+    }
+}
+
+#[test]
+fn a_computed_alias_naming_its_own_command_reaches_the_program() {
+    // The self-naming escape the parser applies to a written name has to reach a
+    // computed one too, and cannot be applied where the parser sits: the name is
+    // not known until the definition runs. Without it this recurses to the stack
+    // limit instead of running `true`.
+    let out = run_with_input("n = true\nalias $n = true\ntrue\nputs status=$sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=0\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_self_naming_alias_is_found_past_a_leading_redirect() {
+    // The head is the first item that is not a redirection. Looking at position
+    // zero instead missed a redirect written in front of the command, so the
+    // definition called itself until the stack ran out -- for a written name as
+    // much as a computed one, which is why both are here.
+    for source in [
+        "alias e = > /dev/null e hi\ne x\nputs status=$sh.status\n",
+        "n = e\nalias $n = > /dev/null e hi\ne x\nputs status=$sh.status\n",
+    ] {
+        let out = run_with_input(source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("out of stack"), "{source}: {stderr}");
+        // `e` is no program, so the escape reaching it is what the status says:
+        // not found (127), rather than a shell that never came back.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "status=127\n",
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn a_computed_alias_name_is_read_where_the_definition_runs() {
+    // Late binding is the whole difference from a written name: the same source
+    // defines a different alias each time round, and a later change to the
+    // variable does not reach back into what was already defined.
+    let out = run_with_input(
+        "n = first\nalias $n = puts one\nn = second\nalias $n = puts two\nfirst\nsecond\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one\ntwo\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
 fn alias_is_contextual_not_reserved() {
     // Like `wrapper` and `fork`, `alias` leads a definition only in the shape
     // that claims it, so the word stays free everywhere else.

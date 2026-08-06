@@ -3520,6 +3520,31 @@ greet world          # -> hi, world
   unquoted form. `alias` is contextual in the same way `wrapper` is: only the
   `alias NAME =` shape claims the word, so `alias = 1` and a function called
   `alias` still work.
+
+  **The name may be computed.** A word carrying an interpolation — `$name`,
+  `"${prefix}-st"`, `"${f()}"` — is evaluated where the definition runs, which is
+  what lets a list of names define a list of aliases:
+
+  ```mesh
+  for name in [status log diff] { alias $name = git }
+  ```
+
+  The result is judged by the naming rules above, and reported the same way, so a
+  computed name is a way around writing the name down rather than around what a
+  name may be. One word: a list is refused, not joined. The self-naming escape
+  applies here too, and has to be worked out at the definition for the same
+  reason the name is — `alias $n = grep` with `$n` holding `grep` reaches the
+  program.
+
+  Quoting is what tells a computed name from a written one when the word holds no
+  interpolation: `alias "foo" = …` is still `expected a name`, because a string
+  written as a string is not a name. Quotes *with* an interpolation are ordinary,
+  since that is how a name gets built out of parts.
+
+  **The body is not computed.** It is syntax, evaluated when the alias runs, as a
+  `wrapper func` body is — so `alias $name = puts $name` defines an alias whose
+  body reads `$name` at *call* time, where a loop's binding is long out of scope.
+  Baking a value into the body still needs the definition written out.
 - **Body.** May span multiple lines; the shell keeps reading until the `{ … }`
   braces balance. Interactively, the continuation prompt is `...`.
 - **Scope.** Each call gets a fresh **function-local** scope: `x = 5` in a body

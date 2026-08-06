@@ -666,6 +666,15 @@ pub enum Executable {
     },
     Function {
         name: String,
+        /// `alias $name = …` — the name is a **word evaluated where the
+        /// definition runs**, not text the parser read. `name` then holds the
+        /// word as written, which is what a diagnostic quotes when the word
+        /// itself is the problem.
+        ///
+        /// Only `alias` takes one. A `func` has a body that can refer to itself
+        /// by name, and a name nothing in the source spells is a worse deal
+        /// there than the generated file it replaces.
+        computed_name: Option<Word>,
         parameters: Vec<Param>,
         body: Source,
         /// `wrapper func name(…) { … }` — the function parses no flags of its
@@ -2302,6 +2311,52 @@ fn glued_name_text(kind: &TokenKind) -> Option<String> {
 /// whole-file parse error back.
 ///
 /// `+=` is a separator for neither, so it is always ordinary.
+/// Put `command` in front of an alias body that opens with the alias's own name,
+/// so `alias grep = grep --color=auto` reaches the program instead of recursing
+/// into the definition being made — the same escape `func ls() { command ls … }`
+/// uses, and bash's no-self-expansion rule.
+///
+/// Quoting is not part of the question: a quoted command head still resolves
+/// functions, so `alias true = "true"` would recurse to the stack limit without
+/// this.
+///
+/// Called from the parser for a written name and from the runtime for a computed
+/// one (`alias $name = …`), which is the only reason it is a free function: the
+/// two callers know the name at different times, and the rule must not differ
+/// between them.
+/// The head is the first item that is **not** a redirection, not the first item:
+/// a redirect may be written before the command it belongs to (`alias e = >
+/// /dev/null echo hi`), and looking only at position 0 missed exactly that,
+/// leaving the definition to call itself until the stack ran out.
+pub(crate) fn reach_past_self(command: &mut Command, name: &str, span: std::ops::Range<usize>) {
+    let Some(head) = command
+        .items
+        .iter()
+        .position(|item| !matches!(item, CommandItem::Redirect { .. }))
+    else {
+        return;
+    };
+    if let CommandItem::Word(word) = &command.items[head]
+        && single_text(&word.value).is_some_and(|(text, _)| text == name)
+    {
+        // In front of the head rather than of the line, so the redirections keep
+        // the place they were written in.
+        command.items.insert(
+            head,
+            CommandItem::Word(Spanned {
+                value: Word {
+                    pieces: vec![WordPiece::Text {
+                        text: "command".to_owned(),
+                        quote: QuoteMode::Bare,
+                    }],
+                    qualifiers: None,
+                },
+                span,
+            }),
+        );
+    }
+}
+
 fn name_piece(kind: &TokenKind, alias: bool) -> Option<String> {
     if alias && matches!(kind, TokenKind::Equal) {
         return None;
@@ -3469,6 +3524,18 @@ impl Parser<'_> {
     }
 
     fn command_word(&mut self) -> Result<Spanned<Word>, ParseError> {
+        self.glued_word_run(false)
+    }
+
+    /// One word: the token at the cursor plus every token glued to it.
+    ///
+    /// `stop_at_equal` is the [`name_piece`] rule in the other spelling. An `=`
+    /// contributes text to a word like any other punctuation, which is right for
+    /// a redirect target and wrong for an alias's name, where the `=` is the
+    /// separator that says a definition is being made — so `alias $n= puts x`
+    /// has to end the name at the `=` rather than read `$n=` and then look for a
+    /// separator that is already behind it.
+    fn glued_word_run(&mut self, stop_at_equal: bool) -> Result<Spanned<Word>, ParseError> {
         let first = self.next().ok_or_else(|| {
             self.eof(ParseErrorKind::Expected(
                 "a redirection needs a target file",
@@ -3481,6 +3548,13 @@ impl Parser<'_> {
             span: first.span.clone(),
         })?;
         while self.peek().is_some_and(|token| token.span.start == end) {
+            if stop_at_equal
+                && self
+                    .peek()
+                    .is_some_and(|token| matches!(token.value, TokenKind::Equal))
+            {
+                break;
+            }
             let Some(next_pieces) = self
                 .peek()
                 .and_then(|token| token_word_pieces(&token.value))
@@ -3589,7 +3663,7 @@ impl Parser<'_> {
         // An alias desugars to a `wrapper func`, so it is named by the same rules
         // and reports them the same way: read here, judged where the definition
         // runs.
-        let name = self.definition_name(true)?;
+        let (name, computed_name) = self.alias_name()?;
         self.expect(&TokenKind::Equal, "`=`")?;
         self.newlines();
         let mut command = self.command()?;
@@ -3616,25 +3690,11 @@ impl Parser<'_> {
         let span = start..end;
 
         // A first word naming the alias itself means the program, not a call
-        // back into this definition. Quoting is not part of the question: a
-        // quoted command head still resolves functions, so `alias true = "true"`
-        // would recurse to the stack limit without this.
-        if let Some(CommandItem::Word(first)) = command.items.first()
-            && single_text(&first.value).is_some_and(|(text, _)| text == name)
-        {
-            command.items.insert(
-                0,
-                CommandItem::Word(Spanned {
-                    value: Word {
-                        pieces: vec![WordPiece::Text {
-                            text: "command".to_owned(),
-                            quote: QuoteMode::Bare,
-                        }],
-                        qualifiers: None,
-                    },
-                    span: span.clone(),
-                }),
-            );
+        // back into this definition. A computed name is not known here, so that
+        // one is asked the same question where it *is* known — at the definition,
+        // through this same function.
+        if computed_name.is_none() {
+            reach_past_self(&mut command, &name, span.clone());
         }
 
         // `...$args`, the forwarded rest — built rather than parsed, since there
@@ -3663,6 +3723,7 @@ impl Parser<'_> {
 
         Ok(Executable::Function {
             name,
+            computed_name,
             parameters: vec![Param {
                 name: ALIAS_REST.to_owned(),
                 kind: ParamKind::Rest,
@@ -3703,6 +3764,7 @@ impl Parser<'_> {
         let body = self.block()?;
         Ok(Executable::Function {
             name,
+            computed_name: None,
             parameters,
             body,
             wrapper,
@@ -5812,6 +5874,41 @@ impl Parser<'_> {
     /// lexer split. `a.b` arrives as `a` `.` `b`, so adjacent word and dot tokens
     /// with nothing between them are one candidate; anything else ends it, and
     /// `func f()` still stops at the `(` because `(` is neither.
+    /// The name an `alias` is being given: text the parser read, or a word the
+    /// runtime will evaluate.
+    ///
+    /// A word carrying an interpolation — `$name`, `"$prefix-$host"`, `${f()}` —
+    /// is a **computed** name, which is what lets a list of names define a list
+    /// of aliases without writing a file and sourcing it. Anything else is read
+    /// as before and judged by the same rules.
+    ///
+    /// Quoting is what tells the two apart for a word that has no interpolation:
+    /// `alias "foo" = …` is still `expected a name`, because a string written as
+    /// a string is not a name and there is no call spelling for one. Quotes
+    /// *with* an interpolation are ordinary — `"$prefix-$host"` is how a name
+    /// gets built out of parts — so the rule is about where the name comes from,
+    /// not about the punctuation around it.
+    fn alias_name(&mut self) -> Result<(String, Option<Word>), ParseError> {
+        if let Some(Token {
+            value: TokenKind::Word(word),
+            ..
+        }) = self.peek()
+            && word
+                .pieces
+                .iter()
+                .any(|piece| !matches!(piece, WordPiece::Text { .. }))
+        {
+            // The whole glued run, not just the token that opened it: a modifier
+            // is written attached (`$n:upper`), and reading one token would leave
+            // it sitting where the `=` is expected.
+            let word = self.glued_word_run(true)?;
+            // The text is kept for diagnostics only: it is what the reader wrote,
+            // which is what a message about the word itself should quote.
+            return Ok((word.value.text(), Some(word.value)));
+        }
+        Ok((self.definition_name(true)?, None))
+    }
+
     fn definition_name(&mut self, alias: bool) -> Result<String, ParseError> {
         let token = self
             .next()
@@ -7248,6 +7345,7 @@ mod tests {
         let sugar = complete("alias co = vcs checkout");
         let Executable::Function {
             name,
+            computed_name,
             parameters,
             body,
             wrapper,
@@ -7260,6 +7358,9 @@ mod tests {
         assert_eq!(parameters.len(), 1);
         assert_eq!(parameters[0].name, ALIAS_REST);
         assert_eq!(parameters[0].kind, ParamKind::Rest);
+        // A written name is settled here; only `alias $name = …` leaves one for
+        // the definition to work out.
+        assert!(computed_name.is_none());
 
         let written = complete("wrapper func co(...args) { vcs checkout ...$args }");
         let Executable::Function { body: expected, .. } = &written.statements[0].and_or.first

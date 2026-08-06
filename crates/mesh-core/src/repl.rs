@@ -1744,21 +1744,53 @@ fn run_executable(
         }
         Function {
             name,
+            computed_name,
             parameters,
             body,
             wrapper,
         } => {
-            if let Some(reason) = definition_name_problem(name) {
+            // A written name is text the parser read; a computed one is a word
+            // evaluated here, which is the whole point of `alias $name = …` --
+            // the name can come from a list the shell built.
+            let (name, body) = match computed_name {
+                None => (name.clone(), body.clone()),
+                Some(word) => match computed_alias_name(word, last, in_function, shell) {
+                    Ok(name) => {
+                        let mut body = body.clone();
+                        // The self-naming escape, which the parser could not apply
+                        // without the name: `alias $n = grep` with `$n` holding
+                        // `grep` has to reach the program, or the definition calls
+                        // itself to the stack limit.
+                        if let Some(parser::Statement {
+                            and_or:
+                                parser::AndOr {
+                                    first: parser::Executable::Pipeline(pipeline),
+                                    ..
+                                },
+                            span,
+                            ..
+                        }) = body.statements.first_mut()
+                            && let Some(parser::Stage::Command(command)) =
+                                pipeline.stages.first_mut()
+                        {
+                            parser::reach_past_self(command, &name, span.clone());
+                        }
+                        (name, body)
+                    }
+                    Err(step) => return step,
+                },
+            };
+            if let Some(reason) = definition_name_problem(&name) {
                 note!("mesh: func: {reason}");
                 return Step::Error(2);
             }
             // Parameter names are already validated (distinct, not `env`) by the
             // parser's `parameters()`.
             shell.funcs.define(
-                name.clone(),
+                name,
                 FuncDef {
                     params: parameters.clone(),
-                    body: body.clone(),
+                    body,
                     wrapper: *wrapper,
                 },
             );
@@ -8860,6 +8892,29 @@ fn run_bounded_argv(args: &[String], last: u8, shell: &mut Shell) -> Step {
     bounded_run(limit, shell, move |shell| {
         run_expanded(command, last, shell).status()
     })
+}
+
+/// Expand the word an `alias $name = …` is named by, at the definition.
+///
+/// What comes back is judged by [`definition_name_problem`] exactly as a written
+/// name is — a computed name is not a way around the naming rules, only around
+/// having to write the name down. A list reaching here is refused by the
+/// expansion itself (`list value needs `...``), and the count check below holds
+/// the invariant the rest of the function is written against rather than
+/// covering a spelling a caller can reach today.
+fn computed_alias_name(
+    word: &parser::Word,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<String, Step> {
+    let expansion = expansion_word(word, last, in_function, shell)?;
+    let expanded = expand::expand(vec![expansion], &shell.vars).map_err(runtime_message)?;
+    let [name] = expanded.as_slice() else {
+        note!("mesh: alias: the name is one word, got {}", expanded.len());
+        return Err(Step::Error(2));
+    };
+    Ok(name.clone())
 }
 
 /// Expand the one word this construct takes for itself, and read it as a limit.
