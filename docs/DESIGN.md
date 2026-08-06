@@ -6006,6 +6006,48 @@ remain under-specified.
   **user-facing** `try` / `catch` or `?(…)` capture for channel-2 errors with no
   soft twin, or ship only the boundary-catch + soft twins for the MVP (leaning: no
   user catch in the MVP).
+- **A status-to-bool word — open; leaning `ok`.** A predicate whose condition is a
+  *value* collapses to `return $cond`, because
+  [value and status are separate channels](#functions) and `return expr` fails only
+  on `false`. A predicate whose condition is a **command** has no such spelling and
+  must write the branch out:
+
+  ```mesh
+  func is-ssh-valid() {
+      if quiet ssh-add -L { return true }
+      return false
+  }
+  ```
+
+  What is missing is a word that reads a command's status and answers with the
+  **bool**, so the body becomes one line. Three facts constrain the choice, each
+  checked against `main` rather than assumed:
+
+  - **`not` over a command yields an int, not a bool** — the inverted status.
+    `not command -- /bin/true` results in `1` and `not command -- /bin/false` in
+    `0`, so `not not CMD` hands back the original status, still an int, and the
+    predicate is unusable as a condition: `if f() { … }` answers *an int is not a
+    condition; compare it (`… > 0`), or use `fail` to report a status*. Double
+    negation is therefore not a workaround today, and `not`'s own behavior here is
+    a defect to fix whichever word wins (it is already flagged
+    [for a different reason](#modifiers) — modifiers are considered after
+    `not_expression` consumes it).
+  - **A bare prefix word does reach the position that matters.** `not CMD` parses
+    as a block tail, which is where all of a real config's session predicates end,
+    so the candidate needs no new bracket to be useful.
+  - **`return` is the exception.** `return not command -- /bin/true` is a syntax
+    error, because `return` takes a value expression and a command form is not one.
+    Any bare word inherits that limit and would need separate grammar work to reach
+    `return`. `ok`, `status` and `bool` are all free names today.
+
+  | Candidate | For | Against |
+  | --- | --- | --- |
+  | **`ok CMD`** | Inverse of `fail`, the status channel's verb — `fail` writes a failure, `ok` reads one back as a bool. Short, and reads cleanly ahead of a modifier: `ok quiet ssh-add -L`. | Says nothing about the *type* it produces. |
+  | `status CMD` | Names the channel it reads; the most literal of the three. | Says "status" while producing a bool, and the word is the obvious one for a future pipeline- or `$sh.status` accessor. |
+  | `bool CMD` | Names the result type, echoing the `:bool` cast. | mesh's casts are `:`-prefixed modifiers **on values**; a bare `bool` taking a *command* is a different shape wearing a cast's name. |
+  | `is CMD` | Shortest, reads as English. | `is quiet ssh-add -L` scans as "is quiet" — it collides with the modifier following it — and `is` is wanted for type tests and the if-binding. |
+  | `not not CMD` | No new name at all. | Does not work (above), and two negations to express a *conversion* reads worse than one word that names it. |
+  | `$?(CMD)` | Bracketed sibling of `$(…)` — bytes vs status — and works in `return` position with no grammar change. | Spends a sigil where a word will do, now that `not` shows a prefix word already reaches the block tail. |
 
 ## Name
 
