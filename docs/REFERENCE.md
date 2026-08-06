@@ -1066,6 +1066,8 @@ type cd            # cd is a shell builtin
                    #     cd [DIR]
 type unless        # unless is a shell keyword
                    #     cmd if COND
+type true          # true is a boolean literal
+                   #     true · false
 type rg            # rg is /usr/local/bin/rg
 type xs            # xs is a variable
                    #     a list of 3: ['a', 'b', 'c']
@@ -1080,6 +1082,7 @@ type -t ll         # function
 type -t cd         # builtin
 type -t rg         # file
 type -t if         # keyword         — an always-claimed one; `unless` is contextual
+type -t true       # keyword         — the literal; bash has no word of its own for one
 type -t xs         # variable        — the one word bash has no use for
 type -P rg         # /usr/local/bin/rg
 type -P ll         # (nothing, status 1) — a function has no path
@@ -1096,8 +1099,8 @@ Because bindings live in their own namespace, a name that is both a command and 
 variable is reported as **both** — neither shadows the other — and an `$env` entry
 is reported the same way (`type PATH`).
 
-What a name resolves to is reported in **resolution order**: a keyword, then a
-builtin, then a function, then the executables `PATH` holds. Bare, `type` reports
+What a name resolves to is reported in **resolution order**: a keyword or a
+literal, then a builtin, then a function, then the executables `PATH` holds. Bare, `type` reports
 the **winner** and says nothing about what it displaced — describing what a name
 could have matched but did not is not worth a line. `-a` is where every match
 lives, as in bash:
@@ -1126,6 +1129,12 @@ failure rather than contradicting it. Two cases:
   different things, and only one of them runs when typed bare:
   - **Always claimed** — `if`, `for`, `while`, `match`, `func`, `return`, `break`,
     `continue`, `not`, `global`, `export`, `unset`. These resolve.
+  - **The boolean literals** — `true` and `false`, which the parser reads as the
+    value in every position, so command position never reaches the program of
+    that name. `type true` reports `true is a boolean literal` and resolves; the
+    program is what `-a` shows under it, and what `type ./true` and `type -P true`
+    answer with, since `./true` and `command -- true` still reach it. Not a
+    keyword: the word is a value, not a construct.
   - **Contextual** — `fork` is the subshell keyword only before a block, `unless`
     is a postfix guard only *after* a statement, and `and` / `or` / `in` join
     values. A bare one is an ordinary command word, so `unless` on its own is

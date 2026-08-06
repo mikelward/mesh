@@ -178,11 +178,7 @@ impl Word {
                     text,
                     quote: QuoteMode::Bare,
                 },
-            ] => match text.as_str() {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            },
+            ] => boolean_literal(text),
             _ => None,
         }
     }
@@ -2900,6 +2896,22 @@ const ALIAS_REST: &str = "args";
 /// second list here, so adding one is a single edit.
 pub fn value_builtin(name: &str) -> bool {
     crate::builtins::is_value_call(name)
+}
+
+/// The boolean a bare `text` spells, if it spells one.
+///
+/// The two words this answers for are exactly the [`Claim::Literal`] rows of
+/// `builtins::RESERVED_WORDS`, which a test there holds against this — the table
+/// documents what a bare `true` does and refuses definitions of the name, so it
+/// cannot be allowed to disagree with the parser about which words those are.
+///
+/// [`Claim::Literal`]: crate::builtins::Claim::Literal
+pub(crate) fn boolean_literal(text: &str) -> Option<bool> {
+    match text {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 struct Parser<'a> {

@@ -13685,6 +13685,52 @@ fn type_t_names_a_value_call() {
     assert!(out.stderr.is_empty());
 }
 
+/// `true` and `false` are the booleans in every position, so command position never
+/// reaches the program of that name — and `type`, the command a reader asks when
+/// they do not know that, used to answer `/usr/bin/true`. It reports the literal.
+#[test]
+fn type_names_a_boolean_literal_rather_than_the_program_it_shadows() {
+    for name in ["true", "false"] {
+        let out = run_with_input(&format!("type {name}\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{name} is a boolean literal\n    true · false\n"),
+        );
+        assert!(out.status.success(), "{name}");
+        // `keyword` is the one bash word that says mesh owns the name: a script
+        // guarding on `type -t` has to hear the claim, and `file` was a lie about
+        // what a bare one does.
+        let kind = run_with_input(&format!("type -t {name}\n"));
+        assert_eq!(String::from_utf8_lossy(&kind.stdout), "keyword\n", "{name}");
+        // The program is still reachable by any spelling that is not a lone bare
+        // word, so the two answers that name the file stay right — and `-a` keeps
+        // reporting it, under the literal that shadows it.
+        let path = run_with_input(&format!("type -P {name}\n"));
+        let path = String::from_utf8_lossy(&path.stdout);
+        assert!(path.starts_with('/'), "{name}: {path}");
+        let all = run_with_input(&format!("type -a {name}\n"));
+        let all = String::from_utf8_lossy(&all.stdout);
+        assert!(
+            all.starts_with(&format!("{name} is a boolean literal\n")),
+            "{all}"
+        );
+        assert!(all.contains(&format!("\n{name} is /")), "{all}");
+    }
+}
+
+/// The other half of the same fact: `help true` used to answer "not a builtin or a
+/// keyword" about a word the parser reads as a value — the falsehood `fail` was
+/// told before the reserved-word table was the one place words are listed.
+#[test]
+fn help_explains_the_boolean_literals() {
+    for name in ["true", "false"] {
+        let out = run_with_input(&format!("help {name}\n"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("true · false"), "{name}: {stdout}");
+        assert!(out.stderr.is_empty(), "{name}: {:?}", out.stderr);
+    }
+}
+
 /// `-P` answers only with a `PATH` hit, ignoring functions and builtins. This is
 /// what retires the hand-rolled `for d in $PATH` loop a portable `shrc` carries,
 /// since `type -P` is not available everywhere.
