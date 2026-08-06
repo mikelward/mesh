@@ -4762,12 +4762,23 @@ programs or user functions:
   - **`print [args…]`** — identical, but with **no trailing newline** — for partial
     lines and hand-built prompts. The `puts` / `print` pair replaces `echo -n`,
     keeping both flag-free.
-  - **`gets [var]`** — read one line from stdin into `var` (trailing newline
+  - **`gets [--nulls] [var]`** — read one line from stdin into `var` (trailing newline
     stripped) and return that line as its value. **At EOF it returns `false`**
     (whose [status](#variables-and-assignment) is `1`) and leaves `var` unchanged,
     so `while gets line { … }` terminates. An empty line still reads as a truthy
     `""` — only EOF is `false` — so blank lines don't end the loop. With no `var`
-    it just yields the line (or `false`).
+    it just yields the line (or `false`). **`--nulls` reads a NUL-terminated item
+    instead** — the read a `find -print0` stream needs, where a newline inside a name
+    is data and a line read would tear the name in half. The separator is *named*
+    rather than passed as a character because `\0` is deliberately not one of the
+    [escapes](#quoting-and-escaping) — a NUL crosses neither `execve` nor the
+    environment — so a general `--delimiter=CHAR` could not spell the one delimiter
+    this is for; `--nulls` is what the [`:nulls`](#modifiers) split modifier already
+    calls it, and the two stay one vocabulary. The delimiter is a *terminator* either
+    way, so a final item without one is still an item. Both spellings take the flag —
+    `gets --nulls name` and `name = gets(--nulls)` — since the value form is the
+    composable one, and withholding it there would make the spelling you reach for
+    the one that cannot read the stream the flag exists for.
 - **Formatting** — **`style(text, fg: name, bg: name, bold: bool)`** produces a
   [styled value](#hooks-and-the-prompt) — for the prompt, and for `puts`/`print`,
   the other renderers. It must be a built-in because a structured return value

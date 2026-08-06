@@ -2976,7 +2976,7 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Eighteen have since been fixed; two are tracked
+matched back to the discussion. Nineteen have since been fixed; two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
 
@@ -4922,11 +4922,38 @@ thing a reader takes on trust.*
       the buffer is still in hand — so it now declines to answer for it.
       `repl.rs` `handle_signal`; `docs/REFERENCE.md` key table + paragraph;
       `DESIGN.md` signals.
-- [ ] **24. No NUL-delimited read.** `gets` takes no delimiter and `"\0"` is
+- [x] **24. No NUL-delimited read.** `gets` takes no delimiter and `"\0"` is
       `invalid escape`, so `find -print0 | while read -d ''` has no translation.
       `each0` delegates to `xargs -0` instead, which means it can only run
       **programs** where its sibling `each` can call a mesh function — the one
       capability gap between the pair.
+
+      **Fixed: `gets --nulls`, and `gets(--nulls)`.** The separator is *named*
+      rather than passed as a character, because the escape that would spell it
+      is deliberately absent — `\0` is not in the set, since a NUL crosses
+      neither `execve` nor the environment — and `--nulls` is what the
+      `:lines`/`:nulls`/`:tabs` family already calls it. Both spellings take it,
+      so the composable `while name = gets(--nulls)` is not the one that cannot
+      read a `-print0` stream.
+
+      Two things the reader had to learn beyond the byte it stops at. The
+      session's line counter advances by the newlines the item actually
+      swallowed, which is neither one nor none: a NUL item may hold any number
+      of them, and a line read holds exactly the one it stops at. And the
+      terminator rule is the family's — a final item with no trailing NUL is
+      still an item, as a file's last line without a newline is.
+
+      The flag is read off the **written** marks rather than the rendered text,
+      which is what tells `gets --nulls` from a `gets $flag` whose value happens
+      to spell one — the second is data, and reading it as an option blocked on
+      a NUL stream instead of reporting an unusable variable name. Declaring an
+      option also moved `gets` into the set of builtins that keep their own
+      terminator, so it consumes one itself; the generic layer removes it only
+      for builtins that read no options.
+
+      A general `--delimiter=CHAR` was not built. It would still not spell NUL,
+      so it is additional surface rather than a replacement; `:tabs` and friends
+      already cover the characters a string *can* hold, on a captured stream.
 - [x] **25. A value function's exit status cannot be reached, and `$(f)` around
       one captures nothing.** `y = $(v)` on a value function binds the empty
       string, so bash's `find_up x && …` has no mesh spelling; a falsy return
