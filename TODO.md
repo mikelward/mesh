@@ -7172,6 +7172,64 @@ a one-line edit. Every claim below was checked against the built shell.
       all current/planned deps are permissive (`reedline`/`nix`/`crossterm` MIT)
       except `nucleo` **MPL-2.0** (weak, file-level copyleft — compatible with a
       permissive project). `LICENSE-APACHE`/`LICENSE-MIT` are at the repo root.
+- [ ] **Is refusing a flag-valued argument the right ergonomics for `puts`?**
+      Shipped in #425: `puts` declares no options, so `x = --force; puts $x`
+      reports `unknown flag` rather than printing, the same answer a `func` with
+      no such parameter already gives. The rule itself is not in question — a
+      builtin is not a third kind of command, and `puts $x` is genuinely
+      ambiguous between *print this* and *pass this option*. What needs a call is
+      the cost it puts on **forwarding**.
+
+      **A hand-written wrapper already has its answer, and it is the
+      terminator.** `puts -- ...$rest` forwards a rest list that may hold flags:
+      the terminator makes every mark behind it data, and the spread rides
+      through it.
+
+      ```mesh
+      func show(...rest) { puts -- ...$rest }
+      show -- a --force b            # a --force b
+      func bare(...rest) { puts ...$rest }
+      bare -- a --force b            # mesh: puts: unknown flag `--force`
+      ```
+
+      So the standing cost is one `--` in the body, not `:repr` and not an
+      external. Two corrections to what #425's description implied: there is no
+      spread-repr spelling at all — `puts ...$r:repr` is
+      `value is not a list: not supported yet`, and `puts $r:repr` prints
+      `['a', --force, 'b']`, which is the list written out rather than the
+      arguments forwarded. And `an_alias_is_a_wrapper_func_that_forwards` echoes
+      through `/bin/echo` to show a flag reaching an *external* as bytes, which
+      is that test's subject; it is not evidence that a builtin had no route.
+
+      **An alias says it in the definition**, which is the same answer one
+      step earlier: desugaring appends `...$args` after the definition words,
+      so a trailing `--` lands exactly where a hand-written body would put it.
+
+      ```mesh
+      alias co = puts checkout --
+      co --force x                   # checkout --force x
+      co x y                         # checkout x y
+      co                             # checkout
+      ```
+
+      No caller-side `--` and no change to desugaring: the terminator is
+      removed before dispatch, so it costs nothing in the calls that carry no
+      flag. `alias grep = grep --color=auto` is untouched, since an alias
+      passing a flag *to* its target puts it ahead of the `--`.
+
+      So the whole question reduces to one thing: **is a single `--` in a
+      forwarding definition an acceptable standing cost**, or does the common
+      case deserve to work unannotated? Every route out is that same character
+      in a different position.
+
+      Either way, `docs/REFERENCE.md`'s alias bullet should show the
+      definition-side spelling — it follows from the desugaring it already
+      documents, but a user meets it as an `unknown flag` report rather than
+      as a deduction.
+
+      *Reversible:* accepting more later is safe — nothing depends on the
+      refusal firing — but each escape added is a spelling that has to keep
+      working, so widening is easier to do than to undo.
 
 ## Icebox / decide later
 
