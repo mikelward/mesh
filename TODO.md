@@ -3275,11 +3275,35 @@ thing a reader takes on trust.*
       identical bare list was a syntax error. A group written *inside* one of them
       turns wrapping back on, so `[1, (2` / `+ 3)]` is two elements with the second
       wrapped.
-- [ ] **10. `"$var.suffix"` in a string is member access, not text.**
-      `"$file.bak"` looks up `bak` in `$file` and fails with `value is not a map`
+- [x] **10. `"$var.suffix"` in a string is member access, not text.**
+      `"$file.bak"` looks up `bak` in `$file` and failed with `value is not a map`
       — at **runtime**, so a rarely-taken branch carries it silently until it is
       taken. `"${file}.bak"` is the fix, and the brace is easy to forget precisely
       because every other shell makes it optional here.
+
+      **The reading stays; the diagnostic now names the fix.** A member access is
+      what `$m.key` has to mean, so this cannot be told from a typo by the parser
+      — what it can do is stop reporting an unimplemented feature for a permanent
+      error and say what was almost certainly meant:
+
+      ```
+      $ file = report; puts "$file.bak"
+      mesh: $file.bak: a string has no members; write `${file}.bak` if the rest is
+      literal text
+      ```
+
+      `ExpandError::NoMembers` replaces the `Unsupported` message, for the reason
+      `NoSuchKey` was split out before it — `Unsupported` renders "… not supported
+      yet", which reads as something still to be built.
+
+      Found while writing it: the message named the *root* rather than what the
+      walk had reached, so `"$m.a.b"` reported `$m.b` and advised `${m}.b`, both
+      about a different reference. The access loop now carries the reference as
+      written, which fixes the out-of-range index message the same way
+      (`$m.rows[9]`, where it used to say `$m`).
+
+      `docs/REFERENCE.md` states the rule where it documents the brace, since
+      this is the one place mesh requires what other shells let you leave out.
 - [x] **11. An argument-taking modifier cannot be interpolated.**
       `"$env:get(HOME, none)"` does not call the modifier. Walked into four
       separate times in one port, which is the usual sign that the diagnostic
