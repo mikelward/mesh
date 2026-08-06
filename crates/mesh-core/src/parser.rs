@@ -2854,18 +2854,10 @@ impl Parser<'_> {
                 span: statement_start..end,
             });
             if background {
-                self.terminators();
+                self.separator()?;
                 continue;
             }
-            if self.same(&TokenKind::Semi)
-                && self
-                    .tokens
-                    .get(self.position + 1)
-                    .is_some_and(|token| matches!(token.value, TokenKind::Semi))
-            {
-                return Err(self.error(ParseErrorKind::Expected("an empty command")));
-            }
-            if self.terminators() == 0
+            if self.separator()? == 0
                 && !self.at_end()
                 && !closer.as_ref().is_some_and(|c| self.same(c))
             {
@@ -6324,6 +6316,32 @@ impl Parser<'_> {
             self.position += 1;
         }
         self.position - start
+    }
+    /// [`Parser::terminators`] over the run that separates one statement from
+    /// the next, refusing a second `;` in it.
+    ///
+    /// The run separates two statements and one `;` does that, so the newlines
+    /// around it are layout; a second `;` has nothing between the two to
+    /// separate, and commands nothing — the same complaint a leading `;` draws.
+    /// Reading the whole run is what makes that answer the same wherever the run
+    /// is written: the old check looked one token past the statement's own `;`,
+    /// so it saw `puts x;; puts y` but not `puts x;` ⏎ `;; puts y`.
+    fn separator(&mut self) -> Result<usize, ParseError> {
+        let start = self.position;
+        let mut semis = 0;
+        while matches!(
+            self.peek().map(|t| &t.value),
+            Some(TokenKind::Newline | TokenKind::Semi)
+        ) {
+            if self.same(&TokenKind::Semi) {
+                semis += 1;
+                if semis > 1 {
+                    return Err(self.error(ParseErrorKind::Expected("an empty command")));
+                }
+            }
+            self.position += 1;
+        }
+        Ok(self.position - start)
     }
     fn newlines(&mut self) {
         while self.eat(&TokenKind::Newline).is_some() {}
