@@ -69,6 +69,81 @@ fn fresh_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// Whether a command that a limit should have ended outlived it.
+///
+/// Waits for one of two *observations*, never for a length of time. Either the
+/// marker appears — the command ran on past its limit and wrote — or the process
+/// goes away without it, which is the escalation having reached it.
+///
+/// Sleeping a fixed margin after the run and looking once cannot tell those
+/// apart: a survivor that has not been scheduled to write yet looks exactly like
+/// one that was killed, so the test passes precisely when the runner is slow
+/// enough to hide the bug. This asks the kernel instead, and the answer arrives
+/// when it arrives.
+fn outlived_the_limit(pid_file: &Path, marker: &Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let pid = loop {
+        if let Some(pid) = std::fs::read_to_string(pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the command never recorded its pid, so nothing here can be concluded"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    loop {
+        if marker.exists() {
+            return true;
+        }
+        if !still_running(pid) {
+            // Writing and leaving are not one step, so a marker created in
+            // between must not be missed on the way out.
+            return marker.exists();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the command neither wrote its marker nor went away"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Whether a pid still names a process that could yet do something.
+///
+/// A zombie cannot. It has already been killed and is only waiting to be
+/// reaped, and whether that ever happens is somebody else's init's business —
+/// but it answers `kill(pid, 0)` exactly as a live process does. Waiting on
+/// signalability alone therefore waits on a reaper: about 1.7s in this
+/// sandbox, and forever in a container whose PID 1 does not collect adopted
+/// children, which would fail the test precisely when the escalation *worked*.
+#[cfg(target_os = "linux")]
+fn still_running(pid: libc::pid_t) -> bool {
+    let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // `comm` is parenthesized and unescaped, so the state that follows it is
+    // counted from the last `)` rather than by splitting the whole line.
+    let Some(close) = stat.iter().rposition(|byte| *byte == b')') else {
+        return false;
+    };
+    !matches!(stat.get(close + 2), Some(b'Z') | None)
+}
+
+/// The same question where there is no `/proc` to ask.
+///
+/// Signalability alone, which cannot see a zombie — adequate where init reaps
+/// adopted children, and that is the case on the macOS the tests are otherwise
+/// run on. The Linux answer above is the one CI gates on.
+#[cfg(not(target_os = "linux"))]
+fn still_running(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 performs the existence check and delivers nothing.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
 fn isolated_config_home() -> &'static Path {
     static CONFIG_HOME: OnceLock<PathBuf> = OnceLock::new();
     CONFIG_HOME.get_or_init(|| fresh_dir("default_config"))
@@ -8264,6 +8339,172 @@ fn timeout_ends_a_command_that_stopped_itself() {
     // which is what `timeout(1)` sends its own continue for.
     let out = run_with_input("timeout 300ms sh -c 'kill -STOP 0'\nputs status=$sh.status\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "status=124\n");
+}
+
+/// A killed process that nobody has reaped is not still running.
+///
+/// The distinction the observation above turns on, and it is not academic: the
+/// survivors these tests watch are orphans, so who reaps them — and whether
+/// anybody does — is a property of the container rather than of mesh. A zombie
+/// answers `kill(pid, 0)` like a live process, so reading termination from
+/// signalability makes a working escalation look like a hung one.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_killed_process_awaiting_reaping_is_not_still_running() {
+    // SAFETY: the child leaves immediately through `_exit`, running no
+    // destructor this process still owns.
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        // SAFETY: leaving without unwinding.
+        unsafe { libc::_exit(0) };
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while still_running(child) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never became a zombie"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // Deliberately still unreaped at this point, which is the whole claim: the
+    // pid is signalable and the process is finished.
+    // SAFETY: signal 0 performs the existence check and delivers nothing.
+    let signalable = unsafe { libc::kill(child, 0) } == 0;
+    // SAFETY: waiting on this process's own child; the status is not read.
+    unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+    assert!(
+        signalable,
+        "a zombie stopped being signalable, so this no longer tests anything"
+    );
+}
+
+#[test]
+fn a_nested_timeouts_own_group_does_not_outlive_the_outer_limit() {
+    // Each bounded run puts its command in a process group of its own, and a
+    // *nested* one is therefore in a group the outer supervisor never made and
+    // cannot name. Killing the outer group ends the inner supervisor, whose
+    // handler forwards the request and dies -- and a command that refuses the
+    // request carried on in a group the outer drain could not see.
+    //
+    // Both nesting orders, because they fail differently: the outer limit is the
+    // one that has to reach *through* a supervisor, and the inner is the one
+    // that has to end without help from above.
+    for (label, line) in [
+        ("outer", "timeout 1s timeout 30s"),
+        ("inner", "timeout 30s timeout 1s"),
+    ] {
+        let dir = fresh_dir(&format!("timeout_nested_{label}"));
+        let survived = dir.join("survived");
+        let ready = dir.join("ready");
+        let pid = dir.join("pid");
+        let out = run_with_input(&format!(
+            "{line} sh -c 'trap \"\" TERM; echo $$ > {}; echo r > {}; sleep 2; echo x > {}'\nputs status=$sh.status\n",
+            pid.display(),
+            ready.display(),
+            survived.display()
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "status=124\n",
+            "{label}"
+        );
+        // Checked separately, and it is what stops this passing for the wrong
+        // reason: a command killed by the default `SIGTERM` before its trap was
+        // installed never refuses anything and never writes, so the absence of
+        // `survived` would prove nothing. The limits are a second rather than
+        // the 100ms they were, for the same reason — long enough that a loaded
+        // runner still gets the trap in.
+        let armed = ready.exists();
+        let escaped = outlived_the_limit(&pid, &survived);
+        assert!(
+            armed,
+            "{label}: the command never got as far as installing its trap"
+        );
+        assert!(
+            !escaped,
+            "{label}: a nested timeout's command outlived the limit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn a_nested_timeouts_command_is_asked_to_stop_exactly_once() {
+    // The inner supervisor forwards the outer's `SIGTERM` to its own group on
+    // its way out, so the command has already been asked by the time the outer
+    // limit looks for anything the group kill could not name. Asking again from
+    // there delivered the same request twice: standard signals coalesce only
+    // while pending, so a handler that already ran sees the second as fresh and
+    // may run cleanup twice or take it for a force-shutdown.
+    //
+    // The trap counts rather than exits, so a second delivery has somewhere to
+    // show up; the escalation ends the run either way.
+    //
+    // The command records that its trap is installed, and that is asserted
+    // separately. Otherwise "the runner was slow enough that the limit expired
+    // during startup" and "the request was never forwarded" are the same
+    // observation -- a count of zero -- and the second is the one this test
+    // exists to catch.
+    let dir = fresh_dir("timeout_nested_once");
+    let asked = dir.join("asked");
+    let ready = dir.join("ready");
+    let out = run_with_input(&format!(
+        "timeout 3s timeout 30s sh -c 'trap \"echo x >> {}\" TERM; echo r > {}; while true; do sleep 0.05; done'\nputs status=$sh.status\n",
+        asked.display(),
+        ready.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=124\n");
+    let armed = ready.exists();
+    let count = std::fs::read_to_string(&asked)
+        .map(|body| body.lines().count())
+        .unwrap_or(0);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(armed, "the command never got as far as installing its trap");
+    assert_eq!(count, 1, "the command was asked to stop {count} times");
+}
+
+#[test]
+fn a_nested_timeout_ends_a_command_that_double_forks_away() {
+    // A `SIGTERM` handler is free to fork twice and let the middle process go,
+    // which reparents the survivor to init. That is the one maneuver a walk over
+    // remembered parents cannot follow -- the link is gone before any rescan can
+    // see it -- and in a nested run there is no outer group holding it either.
+    // The process group is what survives both: `fork` does not change it, and
+    // neither does reparenting.
+    let dir = fresh_dir("timeout_double_fork");
+    let survived = dir.join("survived");
+    let body = dir.join("body.sh");
+    let ready = dir.join("ready");
+    let pid = dir.join("pid");
+    // The survivor is its own `sh -c` rather than a subshell, so `$$` is its own
+    // pid and not the shell it was forked from — a subshell reports its parent's,
+    // which would leave the observation below watching the wrong process.
+    // Backgrounding it and exiting is the maneuver under test: the survivor is
+    // orphaned to init the moment the handler returns.
+    std::fs::write(
+        &body,
+        format!(
+            "trap 'sh -c \"echo \\$$ > {}; sleep 1; echo x > {}\" & exit 0' TERM\necho r > {}\nwhile true; do sleep 0.05; done\n",
+            pid.display(),
+            survived.display(),
+            ready.display()
+        ),
+    )
+    .expect("test script written");
+    let out = run_with_input(&format!(
+        "timeout 3s timeout 30s sh {}\nputs status=$sh.status\n",
+        body.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=124\n");
+    let armed = ready.exists();
+    let escaped = outlived_the_limit(&pid, &survived);
+    let _ = std::fs::remove_dir_all(&dir);
+    // Without this the test passes for the wrong reason on a slow runner: a
+    // command killed before its handler was installed forks nothing, so there
+    // is no survivor and the escape goes unnoticed.
+    assert!(armed, "the command never got as far as installing its trap");
+    assert!(!escaped, "a double-forked survivor outlived the limit");
 }
 
 #[test]

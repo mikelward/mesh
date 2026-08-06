@@ -1305,10 +1305,15 @@ suspend it is passed to the timed command first, so `kill %1` ends it and
 `kill -TSTP %1` really suspends it rather than only reporting it as suspended.
 `SIGKILL` and `SIGSTOP` are the two that cannot be caught, so those two still
 leave the command behind — the same gap `timeout(1)` has. A `timeout` nested
-inside another has one more: the outer limit reaches the inner supervisor but
-not the group beneath it, so a wrapped command that refuses `SIGTERM` can outlive
-the outer bound. `TODO.md` carries why no arrangement of process groups fixes
-that one.
+inside another is reached too: the outer limit takes a snapshot of the process
+tree before it signals anything, so it finds the command in the inner one's
+group even though it never made that group and cannot name it.
+
+A command that **daemonizes** — a handler that forks a child which calls
+`setsid()` — still gets away, because the session and group it detaches into are
+made after that snapshot and belong to nothing the limit can name. This is the
+same gap `timeout(1)` has, and closing it needs a mechanism that outlives the
+process table; `TODO.md` carries it.
 
 The kill is a `SIGTERM`, which a command is free to trap. It gets a short grace
 to leave on its own and is then sent a `SIGKILL`, so a `124` means the run really
