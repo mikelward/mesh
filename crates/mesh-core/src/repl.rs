@@ -4116,6 +4116,54 @@ fn control_placeholder() -> Value {
     Value::String(String::new())
 }
 
+/// The value a scalar word expression denotes, with the expansion error handed
+/// back **unreported**.
+///
+/// Two errors, deliberately not collapsed: the outer `Step` is control flow
+/// raised while evaluating the word's own sub-expressions (`f($(pick))`), which
+/// has already been reported and is not this word's to describe. The inner
+/// `ExpandError` is the word's, and a caller that knows more than expansion does
+/// can answer it better — see [`option_error`], which turns a payload complaint
+/// into the unknown-flag one a signature can give. Everyone else calls
+/// `runtime_message` on it, which is what `eval_expr` does.
+fn eval_scalar(
+    word: &parser::Spanned<parser::Word>,
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Result<Value, expand::ExpandError>, Step> {
+    let word = expansion_word(&word.value, last, in_function, shell)?;
+    // A glob is a **list** however many paths it matched; only a word that did
+    // not touch the filesystem collapses to the one value it expanded to. Asked
+    // after the fact — "did this produce exactly one?" — the two are
+    // indistinguishable, and a pattern's type came to depend on the directory's
+    // contents.
+    let globs = expand::word_globs(&word);
+    Ok(expand::expand_values(vec![word], &shell.vars).map(|mut v| {
+        if v.len() == 1 && !globs {
+            v.pop().unwrap()
+        } else {
+            Value::List(v)
+        }
+    }))
+}
+
+/// The scalar word an argument denotes, seen through any grouping.
+///
+/// Parentheses are transparent to a call's option reading — `f((--force))` binds
+/// the switch, because the group evaluates to the `Flag` the word wrote — so a
+/// grouped payload has to reach the same answer an ungrouped one does. Peeled
+/// recursively for the same reason `eval_expr` treats `Expr::Group` as
+/// transparent: `((--force))` is the one word too. Raised in review, where a
+/// group changed which call-site mistake won.
+fn grouped_scalar(expression: &parser::Expr) -> Option<&parser::Spanned<parser::Word>> {
+    match expression {
+        parser::Expr::Scalar(word) => Some(word),
+        parser::Expr::Group(inner) => grouped_scalar(inner),
+        _ => None,
+    }
+}
+
 fn eval_expr(
     expr: &parser::Expr,
     last: u8,
@@ -4132,27 +4180,7 @@ fn eval_expr(
         return Ok(control_placeholder());
     }
     match expr {
-        E::Scalar(word) => {
-            let word = expansion_word(&word.value, last, in_function, shell)?;
-            // A glob is a **list** however many paths it matched; only a word that
-            // did not touch the filesystem collapses to the one value it expanded
-            // to. Asked after the fact — "did this produce exactly one?" — the two
-            // are indistinguishable, and a pattern's type came to depend on the
-            // directory's contents.
-            let globs = expand::word_globs(&word);
-            expand::expand_values(vec![word], &shell.vars)
-                .map_err(|e| {
-                    note!("mesh: {e}");
-                    Step::Error(1)
-                })
-                .map(|mut v| {
-                    if v.len() == 1 && !globs {
-                        v.pop().unwrap()
-                    } else {
-                        Value::List(v)
-                    }
-                })
-        }
+        E::Scalar(word) => eval_scalar(word, last, in_function, shell)?.map_err(runtime_message),
         E::Regex(pattern) => {
             let value = RegexValue::new(pattern.clone());
             compile_regex(&value).map_err(runtime_message)?;
@@ -5523,6 +5551,50 @@ fn runtime_message(message: impl std::fmt::Display) -> Step {
 
 fn runtime_error<T>(message: impl std::fmt::Display) -> Result<T, Step> {
     Err(runtime_message(message))
+}
+
+/// Report an expansion error from a **call's** arguments, preferring the
+/// signature's answer where it has one.
+///
+/// `f --bogus=$xs` has two mistakes in it, and the payload's is the one
+/// expansion happens to reach first. The flag's is more actionable: fixing the
+/// payload only uncovers it, whereas an unknown flag or a switch given a value
+/// is wrong however the payload turns out. The value-call binder already
+/// resolves the written flag first for this reason; a *composed* payload is
+/// refused before it ever reaches the bind, so the same question is asked here
+/// with the name the error carries.
+///
+/// `signature` is `None` where there is none to ask: a `wrapper func`, which
+/// declares no flags, or a word past a `--`, which is an operand rather than an
+/// option. The callee still *names* the option error in both — an option is
+/// offered to a callee, so its complaint is the callee's — which is why the two
+/// are separate arguments rather than one pair.
+///
+/// **Only the option error is named that way.** Every other expansion failure is
+/// the caller's: `f $missing` is an unbound variable on the caller's line, and
+/// `f` has not been reached, let alone objected. Prefixing those made the two
+/// call spellings disagree, since a value call's `$missing` never comes through
+/// here at all. Raised in review.
+fn option_error(
+    error: expand::ExpandError,
+    callee: Option<&str>,
+    signature: Option<&[parser::Param]>,
+) -> Step {
+    let expand::ExpandError::OptionPayload { flag, .. } = &error else {
+        return runtime_message(error);
+    };
+    if let Some(name) = callee
+        && let Some(params) = signature
+        && let Err(step) = resolve_written_flag(name, params, flag, true)
+    {
+        return step;
+    }
+    // The callee leads it, matching every other binding diagnostic — `f --tag=$xs`
+    // reads as `f`'s complaint, as the glob-payload path already spells it.
+    match callee {
+        Some(name) => runtime_message(format!("{name}: {error}")),
+        None => runtime_message(error),
+    }
 }
 
 /// Capturing the shell's own output descriptors.
@@ -8008,11 +8080,35 @@ fn expand_stage(
         .is_some_and(|name| shell.funcs.get(name).is_some());
     if returning || calling {
         let mut args = Vec::new();
+        // Past a written `--` the words are operands, so the signature has nothing
+        // to say about one that looks like an option — `f -- --bogus=$xs` is a bad
+        // payload, not an unknown flag. Tracked here rather than read back from
+        // the binder, which does not run until every word has expanded.
+        let mut flags_ended = false;
         for word in rest {
             let word = expansion_word(word, last, in_function, shell)?;
-            args.extend(
-                expand::expand_call_values(vec![word], &shell.vars).map_err(runtime_message)?,
-            );
+            let values = expand::expand_call_values(vec![word], &shell.vars).map_err(|error| {
+                let callee = name.as_deref().filter(|_| calling);
+                // Looked up **here**, not snapshotted before the loop. An earlier
+                // argument can redefine the callee — `f change() --x=$xs` — and
+                // `call_func` dispatches whatever is defined once every word has
+                // expanded, so a snapshot would answer for a function that will
+                // not run. The value path has no such gap: it is handed the very
+                // parameters it binds against.
+                //
+                // A `wrapper func` declares no flags to resolve against, and
+                // `return` is not a call at all, so neither offers a signature.
+                let signature = callee
+                    .filter(|_| !flags_ended)
+                    .and_then(|name| shell.funcs.get(name))
+                    .filter(|def| !def.wrapper)
+                    .map(|def| def.params.as_slice());
+                option_error(error, callee, signature)
+            })?;
+            flags_ended |= values
+                .iter()
+                .any(|(value, _)| matches!(value, Value::FlagTerminator));
+            args.extend(values);
         }
         let name = name.expect("a named stage, since one of the two branches claimed it");
         return Ok(match name.as_str() {
@@ -10361,7 +10457,28 @@ fn evaluate_value_arguments<'p>(
             | parser::Argument::Named(_, expression)
             | parser::Argument::Spread(expression) => expression,
         };
-        let value = eval_expr(expression, last, in_function, shell)?;
+        // A scalar word goes through `eval_scalar` so its expansion error arrives
+        // unreported: a written `--name=` whose payload is not one scalar is
+        // refused during expansion, and this is the only place that knows the
+        // signature which can answer it better. Every other expression form has
+        // no flag in it, so it takes the ordinary path.
+        let value = match grouped_scalar(expression) {
+            Some(word) => match eval_scalar(word, last, in_function, shell)? {
+                Ok(value) => value,
+                Err(error) => {
+                    // Only a **positional** offers its word to the callee as an
+                    // option. In `f(tag: --bogus=v)` the flag is `tag`'s *value*
+                    // and binds fine, so `f(tag: --bogus=$xs)` has one mistake in
+                    // it — the payload — and asking the signature about `--bogus`
+                    // would answer a question the call never posed. A spread is
+                    // the same: its expression is the list, not an option.
+                    let offered = matches!(argument, parser::Argument::Positional(_));
+                    let signature = (offered && flags_enabled && !flags_ended).then_some(params);
+                    return Err(option_error(error, Some(name), signature));
+                }
+            },
+            None => eval_expr(expression, last, in_function, shell)?,
+        };
         // A `break`/`continue` the argument raised belongs to the caller's loop.
         // Stop at once — before binding this argument or evaluating any later one —
         // so `f(if c { break }, 1 / 0)` reports no division error and a switch whose
@@ -10653,6 +10770,15 @@ fn resolve_written_flag<'p>(
     flag: &str,
     has_value: bool,
 ) -> Result<&'p parser::Param, Step> {
+    // A name that is not a **name** is not an unknown option, it is not an option
+    // at all, and saying so is the more accurate of the two. Asked first and here
+    // rather than at each caller, so the answer cannot depend on which one asked:
+    // `f --foo.bar=v` and `f --foo.bar=$xs` describe the same mistake and differ
+    // only in their payloads. Raised in review, where they did not.
+    if let Some(problem) = expand::flag_name_problem(flag) {
+        note!("mesh: {name}: `--{flag}` is not an option: {problem}");
+        return Err(Step::Error(2));
+    }
     use parser::ParamKind;
     let declared = params.iter().find(|param| {
         param.name == flag && matches!(param.kind, ParamKind::Switch | ParamKind::Flag(_))
@@ -10703,17 +10829,10 @@ fn bind_flag_value<'p>(
     flag_values: &mut std::collections::HashMap<&'p str, Value>,
 ) -> Result<(), Step> {
     use parser::ParamKind;
-    // Here, not where the flag was built: a word becomes a flag wherever it is
-    // written, but only a callee that *parses* mesh flags is entitled to judge
-    // the name. A `wrapper func` never reaches this, so `g --foo.bar=v` still
-    // forwards verbatim.
-    if let Some(problem) = expand::flag_name_problem(&flag.name) {
-        note!(
-            "mesh: {name}: `--{}` is not an option: {problem}",
-            flag.name
-        );
-        return Err(Step::Error(2));
-    }
+    // The name is judged here, not where the flag was built: a word becomes a
+    // flag wherever it is written, but only a callee that *parses* mesh flags is
+    // entitled to judge it. A `wrapper func` never reaches this, so
+    // `g --foo.bar=v` still forwards verbatim. `resolve_written_flag` asks.
     let declared = resolve_written_flag(name, params, &flag.name, flag.value.is_some())?;
     match &declared.kind {
         ParamKind::Switch => {

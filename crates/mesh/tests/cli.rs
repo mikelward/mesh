@@ -29342,6 +29342,181 @@ fn a_composed_attached_value_still_builds_a_flag() {
     assert_eq!(String::from_utf8_lossy(&bound.stdout), "3\n");
 }
 
+/// The payload's shape is checked at construction, so it lands *before* the
+/// signature has said anything — and for a call the signature has the better
+/// answer. `f --bogus=$xs` is an unknown flag before it is a bad payload:
+/// fixing the payload only uncovers that, while the flag is wrong however the
+/// payload turns out. Raised in review, where the value-call binder was already
+/// resolving the written flag first for exactly this reason and composed flags
+/// were the case that never reached it.
+#[test]
+fn a_call_prefers_the_signatures_answer_to_the_payloads() {
+    let head =
+        "func f(--force, --tag = none, ...rest) { puts \"force=$force tag=$tag\" }\nxs = [a b]\n";
+    // Both spellings of the call, since they are the same call.
+    for call in ["f --bogus=$xs", "f(--bogus=$xs)"] {
+        let out = run_with_input(&format!("{head}{call}\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("unknown flag `--bogus`"),
+            "{call}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    for call in ["f --force=$xs", "f(--force=$xs)"] {
+        let out = run_with_input(&format!("{head}{call}\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("is a switch and takes no value"),
+            "{call}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A *declared* valued flag has nothing wrong with it, so the payload is the
+    // only mistake and it is what gets reported — now named by the callee, the
+    // way every other binding diagnostic reads.
+    for call in ["f --tag=$xs", "f(--tag=$xs)"] {
+        let out = run_with_input(&format!("{head}{call}\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("f: an option's value must be one string, not a list"),
+            "{call}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Past a `--` the word is an operand, so the signature has nothing to say
+    // about a name that merely looks like an option — asking anyway would report
+    // `--bogus` as unknown when the call never offered it as a flag.
+    for call in ["f -- --bogus=$xs", "f(--, --bogus=$xs)"] {
+        let out = run_with_input(&format!("{head}{call}\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("an option's value must be one string"),
+            "{call}: {stderr:?}"
+        );
+        assert!(!stderr.contains("unknown flag"), "{call}: {stderr:?}");
+    }
+
+    // A `wrapper func` declares no flags at all, so there is no signature to
+    // consult and the payload keeps the whole diagnostic.
+    let wrapped =
+        run_with_input("wrapper func g(...args) { puts ok }\nxs = [a b]\ng --bogus=$xs\n");
+    let stderr = String::from_utf8_lossy(&wrapped.stderr);
+    assert!(
+        stderr.contains("an option's value must be one string") && !stderr.contains("unknown flag"),
+        "{stderr:?}"
+    );
+
+    // Parentheses are transparent to option reading — `f((--force))` binds the
+    // switch — so a grouped payload has to reach the same answer an ungrouped one
+    // does, however many parentheses are around it. Raised in review, where a
+    // group changed which call-site mistake won.
+    let grouped_switch = run_with_input(&format!("{head}f((--force=$xs))\n"));
+    assert!(
+        String::from_utf8_lossy(&grouped_switch.stderr).contains("is a switch and takes no value"),
+        "{:?}",
+        String::from_utf8_lossy(&grouped_switch.stderr)
+    );
+    let grouped_unknown = run_with_input(&format!("{head}f(((--bogus=$xs)))\n"));
+    assert!(
+        String::from_utf8_lossy(&grouped_unknown.stderr).contains("unknown flag `--bogus`"),
+        "{:?}",
+        String::from_utf8_lossy(&grouped_unknown.stderr)
+    );
+    // Grouping does not turn an ordinary expansion failure into the callee's.
+    let grouped_plain = run_with_input("func f(x) { puts ok }\nf(($missing))\n");
+    assert_eq!(
+        String::from_utf8_lossy(&grouped_plain.stderr).trim(),
+        "mesh: missing: unbound variable"
+    );
+
+    // Only the *option* error is named by the callee. Every other expansion
+    // failure is the caller's — `f $missing` is an unbound variable on the
+    // caller's line, and `f` has not been reached, let alone objected. Naming
+    // those made the two spellings disagree, since a value call's `$missing`
+    // never comes through this path at all. Raised in review.
+    for call in ["f $missing", "f($missing)"] {
+        let out = run_with_input(&format!("func f(x) {{ puts ok }}\n{call}\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).trim(),
+            "mesh: missing: unbound variable",
+            "{call}"
+        );
+    }
+
+    // Only a **positional** offers its word to the callee as an option. A named
+    // argument's flag is that parameter's *value* and binds fine, so the payload
+    // is the only mistake in it — asking the signature about `--bogus` there
+    // would answer a question the call never posed. A spread is the same: its
+    // expression is the list. Raised in review.
+    let named_ok =
+        run_with_input("func f(--tag = none) { puts \"tag=$tag\" }\nf(tag: --bogus=v)\n");
+    assert_eq!(
+        String::from_utf8_lossy(&named_ok.stdout),
+        "tag=--bogus=v\n",
+        "{:?}",
+        String::from_utf8_lossy(&named_ok.stderr)
+    );
+    for call in ["f(tag: --bogus=$xs)", "f(...--bogus=$xs)"] {
+        let out = run_with_input(&format!(
+            "func f(--tag = none, ...rest) {{ puts ok }}\nxs = [a b]\n{call}\n"
+        ));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("an option's value must be one string")
+                && !stderr.contains("unknown flag"),
+            "{call}: {stderr:?}"
+        );
+    }
+
+    // A name that is not a *name* is not an unknown option, it is not an option
+    // at all — and which of those two a call says must not depend on whether the
+    // payload happens to be scalar. Resolving against the signature asks the name
+    // question first, so all four spellings of the same mistake agree. Raised in
+    // review, where a composed payload answered `unknown flag` and a written one
+    // answered `is not a name`.
+    for call in [
+        "f --foo.bar=$xs",
+        "f(--foo.bar=$xs)",
+        "f --foo.bar=v",
+        "puts f(--foo.bar=v)",
+    ] {
+        let out = run_with_input(&format!("{head}{call}\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("`foo.bar` is not a name"),
+            "{call}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The signature is read where the error happens, not snapshotted before the
+    // arguments run: an earlier argument can redefine the callee, and `call_func`
+    // dispatches whatever is defined by the time every word has expanded. Here
+    // `--x` starts as a switch and is a *valued* flag by the time `f` runs, so
+    // "takes no value" would be a complaint about a function that never ran —
+    // only the list payload is left to report. Raised in review.
+    let redefined = run_with_input(
+        "func f(--x, ...rest) { puts switch }\n\
+         func change() { func f(--x = none, ...rest) { puts valued }\nreturn arg }\n\
+         xs = [a b]\nf change() --x=$xs\n",
+    );
+    let stderr = String::from_utf8_lossy(&redefined.stderr);
+    assert!(
+        stderr.contains("an option's value must be one string") && !stderr.contains("switch"),
+        "{stderr:?}"
+    );
+
+    // And an assignment is not a call, so it keeps the diagnostic on the line
+    // that made the mistake — the property the construction-site check is for.
+    let assigned = run_with_input("xs = [a b]\nx = --tag=$xs\n");
+    assert!(
+        String::from_utf8_lossy(&assigned.stderr)
+            .contains("an option's value must be one string, not a list"),
+        "{:?}",
+        String::from_utf8_lossy(&assigned.stderr)
+    );
+}
+
 /// With every written option carrying its own intent, the runtime scan of
 /// expanded strings is gone — so a computed or quoted string is data, in both
 /// call spellings, for every flag rather than just the ones the type reached
