@@ -3636,6 +3636,108 @@ thing a reader takes on trust.*
       Until then `puts $x` prints the flag's text, which is wrong but harmless
       and does not block the rest of the type.
 
+- [ ] **Sizing the terminator-value fix: two options, needs a decision.**
+      *Scoped but deliberately not built — the three entries above are one fix,
+      and it is bigger than they imply. Recorded for the repo owner to read
+      before anything is written.*
+
+      **The four symptoms**, all one root:
+
+          puts "--"                    # prints nothing
+          x = [--help] ;  puts $x      # prints puts's help, not the element
+          x = "--help" ;  puts $x      # same
+          x = --force  ;  puts $x      # prints the flag, should report it
+
+      **The root** is `run_expanded` (`repl.rs`), which decides two things by
+      reading argv **text**: `auto_help_requested_strings` sniffs `--help`, and a
+      builtin that `!reads_options` has its first `--` removed. Both act on
+      characters, so anything that *renders* to those characters is re-read as
+      syntax -- a string, a list element, `:repr` output. Written intent and
+      rendered data are indistinguishable by the time argv exists.
+
+      **The obstacle, as first written here, was wrong, and correcting it moved
+      the recommendation.** The claim was that `timeout 5s puts -- --help` nests
+      so `expand_stage` sees `timeout` as the head and cannot know the `--`
+      belongs to `puts`. Codex checked it and it does not hold: `run_command`
+      calls `split_bounded` *before* expanding, and `run_bounded` re-enters
+      `run_command` with the wrapped command's **unexpanded tokens**, so
+      `expand_stage` sees `puts`. Verified three ways -- `timeout 5s g --help`
+      prints `g`'s *generated* help, which only a token-level resolution
+      produces; `timeout 5s timeout 3s puts -- --help` works, so even nesting
+      re-enters tokens; and `run_bounded_argv`'s own doc comment says it plainly:
+      *"Every path that has the tokens reads the prefix from them instead, so
+      this is the floor rather than the pipeline's route."*
+
+      So the real position is much better than the entry first said:
+      **`expand_stage` sees the true command head on every route that has
+      tokens**, including under `timeout` and for each pipeline stage (a stage's
+      `cmd.words` is `expand_stage`'s own argv). The genuine floor is
+      `run_bounded_argv` -- argv arriving with the tokens already lost, which
+      exists only so a bare `timeout` name does not fall through to coreutils.
+
+      ---
+
+      **Option A -- widen the argv type.** `Expanded::Argv` carries a per-word
+      mark (`Data` / `Flag` / `Terminator`) beside the text. `run_expanded` then
+      asks *was this written as an option* rather than *does this read like one*,
+      and the central text strip is deleted rather than relocated.
+
+      - Fixes the `--help` and terminator symptoms on every route, the argv
+        floor included.
+      - **Not the list symptom on the floor**, which was claimed here and is
+        wrong. `cmd = "timeout"; x = [--help]; $cmd 5s puts $x` reports
+        ``$x: list value needs `...` `` -- `split_bounded` cannot see a computed
+        head, so `expand_stage` expands under the name `timeout`, and
+        `stage_argument` takes ordinary expansion rather than `output_words`.
+        The list is refused before `Expanded::Argv` exists, so no mark on it can
+        help. Fixing that needs typed arguments preserved through the floor,
+        which is a different piece of work -- and `run_bounded_argv` already
+        says it cannot keep value fidelity, since argv is where a list has been
+        flattened. Raised in review.
+      - A small `Argv` struct with `Deref<Target = [String]>` keeps most read
+        sites compiling untouched (`cmd.words == ["jobs"]`, `&cmd.words[0]`,
+        `redirection_only_exec(&cmd.words)`), and **builtins keep their
+        `&[String]` signatures** -- the marks stop at `run_expanded`.
+      - Cost: ~20 `words:` construction sites across the pipeline planner, plus
+        `run_bounded_argv`, `bounded_chain`, and the stage structs. Wide but
+        shallow -- mechanical, and the compiler finds every site.
+
+      **Option B -- decide it once, in `expand_stage`.** It has the words and it
+      has the true head, so it can consume the terminator *value*, claim
+      `--help` from a written `Flag`, and hand `run_expanded` an argv that is
+      already settled. What has to travel is not per-word marks but the
+      *decision*: the stripped argv (free) plus one "help was requested" bit.
+
+      - Fixes all four symptoms everywhere a command is reached from tokens,
+        which is everywhere a user writes one.
+      - Residue is the argv floor alone: a `timeout` resolved from argv rather
+        than tokens keeps the old text reading for its wrapped command. Narrow,
+        already documented as a floor, and it can take Option A later without
+        the rest being redone.
+      - Much smaller diff, and no rewrite of the stage planner.
+
+      **`puts $x` reporting a flag** fits either. It needs the refusal to happen
+      where the terminator is consumed and `--help` is claimed -- one place
+      under B, `run_expanded` under A -- not in `output_words`, which is the
+      thing already tried and backed out.
+
+      *Recommendation: B, changed from A once the timeout claim was checked, and
+      unchanged by the second correction.* The case for A rested almost entirely
+      on the broken example; with `expand_stage` seeing the true head on every
+      token route, A's extra machinery buys the argv floor and pays ~20 planner
+      sites for it -- and the floor turns out to be **partly unreachable
+      anyway**, since the list symptom there dies before argv exists. What A
+      still buys is the *invariant* rather than the behavior: it makes "written,
+      not rendered" a property of the argv type itself, which no later reader
+      can undo by accident, where B leaves a rule that holds because of where it
+      is called. That is the argument to weigh, and it is a smaller one than
+      this entry first made.
+
+      *Both corrections came from review, and both were load-bearing.* Worth
+      noting for whoever acts on this: a design note is read once and built
+      from, so a wrong fact in it is more expensive than a wrong line of code,
+      which at least has a test to argue with.
+
 - [x] **A composed attached value builds a flag, and the string scan is gone.**
       Two P1s from review that were one bug. `scalar_literal` took only a single
       bare text piece, so `--tag="v2"`, `--tag=$w` and `--tag=*.txt` never became
