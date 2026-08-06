@@ -1170,21 +1170,77 @@ fn curated_hint(text: &str) -> ValueHint {
 /// Where a hand-written spec goes: data rather than cache, since nothing
 /// regenerates it and losing it loses the user's work.
 fn curated_directory() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("XDG_DATA_HOME").filter(|path| !path.is_empty()) {
-        return Some(PathBuf::from(path).join("mesh/completions"));
+    #[cfg(test)]
+    {
+        Some(test_home().join(".local/share/mesh/completions"))
     }
-    env::var_os("HOME")
-        .filter(|path| !path.is_empty())
-        .map(|path| PathBuf::from(path).join(".local/share/mesh/completions"))
+    #[cfg(not(test))]
+    {
+        if let Some(path) = env::var_os("XDG_DATA_HOME").filter(|path| !path.is_empty()) {
+            return Some(PathBuf::from(path).join("mesh/completions"));
+        }
+        env::var_os("HOME")
+            .filter(|path| !path.is_empty())
+            .map(|path| PathBuf::from(path).join(".local/share/mesh/completions"))
+    }
 }
 
 fn cache_directory() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|path| !path.is_empty()) {
-        return Some(PathBuf::from(path).join("mesh/completions"));
+    #[cfg(test)]
+    {
+        Some(test_home().join(".cache/mesh/completions"))
     }
-    env::var_os("HOME")
-        .filter(|path| !path.is_empty())
-        .map(|path| PathBuf::from(path).join(".cache/mesh/completions"))
+    #[cfg(not(test))]
+    {
+        if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|path| !path.is_empty()) {
+            return Some(PathBuf::from(path).join("mesh/completions"));
+        }
+        env::var_os("HOME")
+            .filter(|path| !path.is_empty())
+            .map(|path| PathBuf::from(path).join(".cache/mesh/completions"))
+    }
+}
+
+/// A home of this test process's own, so the two directories above never resolve
+/// to the developer's real ones.
+///
+/// `CompletionCache::default()` reads the environment, and a unit test that builds
+/// a `CompletionState` builds one of those — so probing left `.spec` files in
+/// `~/.cache/mesh/completions` and read whatever `~/.local/share` happened to
+/// hold. The cached entries are keyed by a hash of the executable's path, which
+/// for these tests contains the process id, so a reused pid could match a stale
+/// entry; the stored fingerprint saved it in practice, which was luck rather than
+/// isolation.
+///
+/// Redirected here rather than by setting `XDG_CACHE_HOME` for the run: tests
+/// share one process and run in parallel, so `set_var` races with every other
+/// thread reading the environment, and a harness wrapper would not cover
+/// `cargo test` run directly. `cfg(test)` reaches exactly the builds that need
+/// it, and the constructors that take a directory outright are untouched.
+///
+/// Names a path and creates nothing, exactly as the two functions above do
+/// outside a test: [`CompletionCache::write`] creates what it writes into, and a
+/// read of a directory that is not there is the miss it should be.
+#[cfg(test)]
+fn test_home() -> PathBuf {
+    test_temp_root().join(format!("mesh-test-home-{}", std::process::id()))
+}
+
+/// The temp directory, when the environment names one a path can be built on.
+///
+/// `env::temp_dir` hands back an **empty** path for `TMPDIR=`, and the setting
+/// verbatim for a relative one. Joining onto either gives a relative path, so the
+/// cache would land in Cargo's working directory and leave `.cache` and
+/// `.local` under the checkout — the same class of mess this redirection exists
+/// to prevent, one directory over. An empty or relative setting means here what no
+/// setting means: the platform default, which is the answer
+/// `crates/mesh/tests/transcripts.rs` already takes for the empty case.
+#[cfg(test)]
+fn test_temp_root() -> PathBuf {
+    match env::temp_dir() {
+        root if root.is_absolute() => root,
+        _ => PathBuf::from("/tmp"),
+    }
 }
 
 fn cache_name(executable: &Path, args: &[String]) -> String {
@@ -1459,14 +1515,67 @@ fn join_reader(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionCache, CompletionSpec, ValueHint, associated_page, cache_name, command_help,
-        nothing_named_in, pages_in, rank_candidates, rendered_page_with, resolve_command,
+        CompletionCache, CompletionSpec, ValueHint, associated_page, cache_directory, cache_name,
+        command_help, curated_directory, nothing_named_in, pages_in, rank_candidates,
+        rendered_page_with, resolve_command,
     };
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// A test run leaves the developer's own cache and data directories alone.
+    ///
+    /// `CompletionCache::default()` reads the environment, and a unit test that
+    /// builds a `CompletionState` builds one of those — so a probe wrote its
+    /// `.spec` into `~/.cache/mesh/completions` and a curated lookup read whatever
+    /// `~/.local/share` happened to hold. Both now resolve under the process's own
+    /// temporary home.
+    #[test]
+    fn the_default_completion_directories_stay_out_of_the_real_home() {
+        // The resolved root, not `env::temp_dir()`: that answers with an *empty*
+        // path under `TMPDIR=`, and every path starts with an empty one, so the
+        // assertion below would hold for a directory sitting in the checkout.
+        let temporary = super::test_temp_root();
+        assert!(temporary.is_absolute(), "{}", temporary.display());
+        // A `$HOME` that already lives under the temp directory has nothing to
+        // protect, and the second assertion would contradict the first.
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| !temporary.starts_with(home));
+        for directory in [cache_directory(), curated_directory()] {
+            let directory = directory.expect("a directory under test");
+            assert!(
+                directory.starts_with(&temporary),
+                "{} is not under {}",
+                directory.display(),
+                temporary.display()
+            );
+            if let Some(home) = &home {
+                assert!(
+                    !directory.starts_with(home),
+                    "{} is under the real home",
+                    directory.display()
+                );
+            }
+            // Writable, not merely elsewhere — and writable rather than creatable,
+            // because `create_dir_all` answers `Ok` for a directory that already
+            // exists, whoever owns it. `CompletionCache::write` gives up quietly
+            // when it cannot write — deliberately, since a cache write failing
+            // must not break completion — so anything short of an actual write
+            // leaves the cache silently disabled with this test still passing.
+            fs::create_dir_all(&directory).unwrap_or_else(|error| {
+                panic!("{} cannot be created: {error}", directory.display())
+            });
+            let probe = directory.join(format!(".writable-{}", std::process::id()));
+            fs::write(&probe, b"")
+                .unwrap_or_else(|error| panic!("{} is not writable: {error}", directory.display()));
+            fs::remove_file(&probe).unwrap_or_else(|error| {
+                panic!("{} could not be cleaned up: {error}", probe.display())
+            });
+        }
+    }
 
     fn helper(path: &Path, body: &str) {
         write_program(path, &format!("#!/bin/sh\n{body}"));
@@ -1519,7 +1628,11 @@ mod tests {
     }
 
     fn fresh_temp_dir(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        // `test_temp_root` rather than `env::temp_dir`, for the reason given there:
+        // under `TMPDIR=` the latter is empty, and this joined onto it — putting
+        // the helpers these tests write in the checkout, where
+        // `a_man_that_renders_nothing_useful_yields_no_spec` then failed outright.
+        let root = super::test_temp_root().join(format!("{name}-{}", std::process::id()));
         if let Err(error) = fs::remove_dir_all(&root)
             && error.kind() != std::io::ErrorKind::NotFound
         {
