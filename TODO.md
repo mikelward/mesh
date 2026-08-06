@@ -3556,7 +3556,11 @@ thing a reader takes on trust.*
       remove, and it came out with no fan-out at all -- the whole suite stayed
       green when the string check was deleted.
 
-      Still open: **`puts` cannot print a leading `--`, and never could.**
+      **Fixed** by the argv marks -- `puts "--"` prints `--`, because the
+      strip now consumes a terminator *value* rather than the characters. The
+      write-up of the problem follows.
+
+      Was open: **`puts` cannot print a leading `--`, and never could.**
       `puts $x:repr` on a terminator prints nothing, which looks like a flag-type
       problem and is not one:
 
@@ -3594,7 +3598,10 @@ thing a reader takes on trust.*
       path parses no flags, so a written `--` is bytes, and a forwarded
       terminator value renders back to `--`.
 
-- [ ] **A rendered flag re-enters builtin option parsing.** From review, and the
+- [x] **A rendered flag re-enters builtin option parsing.** *Fixed: argv now
+      carries what each entry was, and the mark is taken from the word's own
+      value, so a flag one element down is data being displayed exactly as this
+      entry said it should be.* From review, and the
       same root as the entry below. When `puts`/`print` render a non-scalar,
       `output_words` turns the value back into argv *strings*, and `run_expanded`
       then re-applies the builtin `--help` / `--` handling to those strings:
@@ -3608,9 +3615,26 @@ thing a reader takes on trust.*
       below: a builtin should read the *values* it was handed rather than
       re-deriving options from rendered bytes.
 
-- [ ] **`puts $x` should report a flag, and cannot be done in `output_words`.**
-      The design says a flag in a call is an *option*, `puts` declares none, so
-      `puts $x` reports rather than printing -- `puts "$x"` and `puts $x:repr`
+- [ ] **`puts $x` should report a flag** -- the one symptom of the four still
+      open after the argv marks landed. The mark is now there and survives the
+      terminator strip, so the refusal is a small addition in `run_expanded`
+      rather than the redesign this entry describes. What backed the earlier
+      attempt out still has to hold: `puts --help` claims help *before* the
+      refusal sees the flag, and `puts -- --force` prints its operand because
+      the terminator was consumed first. Both are now decided in `run_expanded`
+      in that order, which is what makes the addition small.
+
+- [ ] **A pipeline stage loses its argv marks.** `exec::Cmd.words` is a plain
+      `Vec<String>`, so a stored stage goes through `Argv::data` and falls back
+      to the old text reading -- a *backgrounded* or *piped* builtin, where
+      everything written directly is covered. Marked in the code at the
+      `run_expanded(Argv::data(cmd.words.clone()))` call. Fixing it means
+      widening `exec::Cmd`, which is a second module and was left out to keep
+      the first change reviewable.
+
+      *The original write-up follows, kept for its reasoning.* The design says
+      a flag in a call is an *option*, `puts` declares none, so `puts $x`
+      reports rather than printing -- `puts "$x"` and `puts $x:repr`
       being the two ways to say which you meant. Attempted and **backed out**;
       recording why, because the obvious implementation looks right and is not.
 
@@ -3636,7 +3660,10 @@ thing a reader takes on trust.*
       Until then `puts $x` prints the flag's text, which is wrong but harmless
       and does not block the rest of the type.
 
-- [ ] **Sizing the terminator-value fix: two options, needs a decision.**
+- [x] **Sizing the terminator-value fix: two options, needs a decision.**
+      *Decided by the repo owner: widen the argv type, "that sounds more
+      structurally correct". Built -- `expand::Written` and `Argv`. Two gaps
+      recorded below.*
       *Scoped but deliberately not built — the three entries above are one fix,
       and it is bigger than they imply. Recorded for the repo owner to read
       before anything is written.*
