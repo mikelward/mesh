@@ -6587,9 +6587,9 @@ of each PR had landed by another route, but these pieces had not.
       stage's words rather than to special-case `return`, since any command word
       that carries a value has the same effect on what follows it.
 
-- [ ] **An invalid place runs its right-hand side before refusing.** A slice is not
-      a place, but the refusal comes from `resolve_path` at *run* time, after
-      `eval_operand_of` has already evaluated what was being assigned:
+- [x] **An invalid place ran its right-hand side before refusing.** A slice is not
+      a place, but the refusal came from `resolve_path` at *run* time, after
+      `eval_operand_of` had already evaluated what was being assigned:
 
       ```
       $ mesh -c 'xs = [1 2 3]; $xs[0..1] = $(touch side)'
@@ -6606,14 +6606,27 @@ of each PR had landed by another route, but these pieces had not.
       right-hand side runs, which is the kind of split the last two entries above
       were about closing.
 
-      Worth doing for both together: `member_target` and the element walk in
-      `env_reach` would refuse a range subscript, and `GRAMMAR.md`'s `access`
-      would take a `subscript` without `range` on the assignment side. The
-      run-time check stays regardless — a computed subscript is not a range until
-      it is evaluated — so this shortens the window rather than closing it. Note
-      the same ordering applies to every other run-time refusal a place can draw
-      (a read-only `$sh` entry, an out-of-range index), so the fix is narrower
-      than the pattern.
+      **Done for both together**, as `Parser::slice_place`: a probe ahead of both
+      place parsers and ahead of the value, so a range subscript anywhere in the
+      accesses is a syntax error naming the reference. It covers `unset` too, from
+      review — there is no right-hand side to protect there, but a rule about
+      places answering in the grammar for a write and at run time for a removal is
+      the same split this was about. The error carries the verb, as `resolve_path`
+      already did. One rule covers `$xs[0..1]`,
+      `$m.rows[1..]`, `$env.CDPATH[0..2]`, the braced spellings, and `global`,
+      which changes which binding is written rather than what counts as a place.
+      A slice is told from a key by the same `..` in the subscript text
+      `expansion_variable` uses, so one classification serves the read and the
+      refusal — including its edge, a quoted key containing `..`, which the read
+      side cannot spell either.
+
+      The run-time check stays, as expected: a computed subscript (`$xs[$i] = …`)
+      is not a range until it is evaluated, so that one still reports after the
+      value has been produced. This shortens the window rather than closing it,
+      and the same ordering still applies to every other run-time refusal a place
+      can draw — a read-only `$sh` entry, an out-of-range index, a member on a
+      string. Those are answers only the *value* has, where a slice is answerable
+      from the text, which is what made this one worth moving.
 
 ## Redirection: one source-ordered pass ✅ (done)
 
