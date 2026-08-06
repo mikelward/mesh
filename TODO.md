@@ -3624,14 +3624,6 @@ thing a reader takes on trust.*
       the terminator was consumed first. Both are now decided in `run_expanded`
       in that order, which is what makes the addition small.
 
-- [ ] **A pipeline stage loses its argv marks.** `exec::Cmd.words` is a plain
-      `Vec<String>`, so a stored stage goes through `Argv::data` and falls back
-      to the old text reading -- a *backgrounded* or *piped* builtin, where
-      everything written directly is covered. Marked in the code at the
-      `run_expanded(Argv::data(cmd.words.clone()))` call. Fixing it means
-      widening `exec::Cmd`, which is a second module and was left out to keep
-      the first change reviewable.
-
       *The original write-up follows, kept for its reasoning.* The design says
       a flag in a call is an *option*, `puts` declares none, so `puts $x`
       reports rather than printing -- `puts "$x"` and `puts $x:repr`
@@ -3659,6 +3651,21 @@ thing a reader takes on trust.*
 
       Until then `puts $x` prints the flag's text, which is wrong but harmless
       and does not block the rest of the type.
+
+- [x] **A pipeline stage loses its argv marks.** *Fixed: `StageBody::Builtin`
+      carries the stage's `Argv`, so a piped or backgrounded builtin reads the
+      same written options an unpiped one does.* A stored stage went through
+      `Argv::data` and got no marks at all -- and since the text reading it
+      replaced was gone, `puts --help | cat` printed `--help` and
+      `puts -- --help | cat` wrote its terminator out. Raised in review as a P1.
+
+      **Not** by widening `exec::Cmd`, which this entry predicted: the marks are
+      how the *shell* runs an in-shell body, not part of the process description
+      `exec` needs -- `execvp` has no way to carry them -- and `StageBody`
+      already holds each body's run form beside a display-only `Cmd.words`
+      (`Function` its typed arguments, `Deferred` its unexpanded words). The
+      deferred path never lost them: it re-expands in its own fork and hands
+      `run_expanded` the real `Argv`.
 
 - [x] **Sizing the terminator-value fix: two options, needs a decision.**
       *Decided by the repo owner: widen the argv type, "that sounds more

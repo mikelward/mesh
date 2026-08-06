@@ -7313,7 +7313,7 @@ fn run_single(
     // resolved above, where its arguments keep their types.)
     Step::Continue(run_stages(
         vec![exec::Cmd {
-            words: argv.words,
+            words: argv.words.clone(),
             redirs: opened,
             pipe_stderr: false,
             in_shell: builtin,
@@ -7323,7 +7323,7 @@ fn run_single(
             env: Vec::new(),
         }],
         vec![if builtin {
-            StageBody::Builtin
+            StageBody::Builtin(argv)
         } else {
             StageBody::External
         }],
@@ -7442,7 +7442,7 @@ fn run_multi(
         // `exec` keeps its own process. Its meaning is "spend this stage on the
         // replacement", and `puts hi | exec cat` is observably `puts hi | cat` — so
         // letting it run in the shell would spend the *shell* to no end.
-        let may_run_in_shell = matches!(body, StageBody::Builtin | StageBody::Function(_))
+        let may_run_in_shell = matches!(body, StageBody::Builtin(_) | StageBody::Function(_))
             && !cmds_is_exec(&stage_words);
         cmds.push(exec::Cmd {
             words: stage_words,
@@ -7477,8 +7477,15 @@ enum StageBody {
     Compound(Box<parser::Executable>),
     /// An external program: `exec` runs it, there is no in-shell body.
     External,
-    /// A builtin, run from the stage's expanded words.
-    Builtin,
+    /// A builtin, run from the stage's expanded argv.
+    ///
+    /// The argv rather than `exec::Cmd.words`, because the marks are how the
+    /// *shell* runs an in-shell body and not part of the process description
+    /// `exec` needs — `execvp` has no way to carry them. Kept here, a piped or
+    /// backgrounded builtin reads the same written options the unpiped one
+    /// does; taken from `cmd.words`, `puts --help | cat` printed `--help` and
+    /// `puts -- --help | cat` wrote its terminator out.
+    Builtin(Argv),
     /// A function, with its arguments already expanded as **typed values** — the
     /// same guarantee a plain call gives, so `f $xs` still passes one list.
     Function(Vec<(Value, bool)>),
@@ -7613,7 +7620,7 @@ fn run_stages(
     // that stage never started.
     if !shell.forked
         && cmds.iter().zip(&bodies).any(|(cmd, body)| match body {
-            StageBody::Builtin => cmd.words == ["jobs"],
+            StageBody::Builtin(_) => cmd.words == ["jobs"],
             StageBody::Function(_) => true,
             // A deferred stage is *not* treated like a function, for all that what
             // it runs is equally unknowable: almost every one of them is an ordinary
@@ -7748,13 +7755,13 @@ fn run_stage_in_shell(
         // the form asks for — they hold for the rest of the child's life,
         // bash's `exec > log &` subshell. Only with redirections to its name; a
         // truly bare `exec` still reports what it was missing.
-        StageBody::Builtin => {
+        StageBody::Builtin(argv) => {
             if redirection_only_exec(&cmd.words) && !cmd.redirs.is_empty() {
                 Step::Continue(0)
             } else {
-                // A stored stage lost its marks at the `exec::Cmd` boundary; see
-                // `Argv::data`.
-                run_expanded(Argv::data(cmd.words.clone()), last, shell)
+                // The stage's own argv, marks and all — not `cmd.words`, which is
+                // the bytes a job listing shows.
+                run_expanded(argv.clone(), last, shell)
             }
         }
         StageBody::External => unreachable!("an external stage has no in-shell body"),
@@ -7904,7 +7911,9 @@ fn expand_eager_stage(
             // rather than a forked shell that runs it.
             match external_stage(&argv) {
                 Some(program) => (program, StageBody::External),
-                None => (argv.words, StageBody::Builtin),
+                // The words a job listing shows and the argv the body runs are
+                // the same bytes; only the body needs the marks beside them.
+                None => (argv.words.clone(), StageBody::Builtin(argv)),
             }
         }
     };
