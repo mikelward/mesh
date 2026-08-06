@@ -4110,12 +4110,14 @@ fn expansion_variable(source: &str, quote: parser::QuoteMode) -> VarRef {
                     start: parse_bound(start),
                     end: parse_bound(end),
                     inclusive: true,
+                    text: index.to_string(),
                 }
             } else if let Some((start, end)) = index.split_once("..") {
                 expand::Access::Slice {
                     start: parse_bound(start),
                     end: parse_bound(end),
                     inclusive: false,
+                    text: index.to_string(),
                 }
             } else {
                 expand::Access::Subscript(index.to_string())

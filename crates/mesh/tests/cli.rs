@@ -21102,6 +21102,137 @@ fn maps_reject_missing_keys_and_non_string_keys() {
     assert!(String::from_utf8_lossy(&bad_key.stderr).contains("map key must be a string"));
 }
 
+/// `"$file.bak"` is a member access, not text — every other shell reads the `.`
+/// as literal there, so the mistake is easy to make and lands at *run* time,
+/// where a rarely-taken branch carries it silently until it is taken.
+///
+/// It used to render through `Unsupported` as `value is not a map: not supported
+/// yet`, which named an unimplemented feature rather than a permanent error and
+/// said nothing about the brace that spells what was meant.
+#[test]
+fn a_member_access_on_a_value_without_members_names_the_brace() {
+    for (source, message) in [
+        (
+            "file = report\nputs \"$file.bak\"\n",
+            "$file.bak: a string has no members; write `${file}.bak`",
+        ),
+        // Outside a string too: the reading is the same, so the advice is.
+        (
+            "file = report\nputs $file.bak\n",
+            "$file.bak: a string has no members; write `${file}.bak`",
+        ),
+        // The value it *reached*, not the root it started from. Naming `$m` here
+        // would advise `${m}.b`, which is a different reference.
+        (
+            "m = [a: x]\nputs \"$m.a.b\"\n",
+            "$m.a.b: a string has no members; write `${m.a}.b`",
+        ),
+        // A subscript in the reference the walk *reached* is fine — it sits
+        // inside the braces, where it stays an access.
+        (
+            "m = [rows: [x]]\nputs \"$m.rows[0].b\"\n",
+            "$m.rows[0].b: a string has no members; write `${m.rows[0]}.b`",
+        ),
+        // `$env.KEY` names its entry by *consuming* that member before the walk
+        // starts, so the reference has to count what was taken before it — and
+        // the two spellings of one entry have to answer alike.
+        (
+            "$env.MESH_TEST_M = x\nputs \"$env.MESH_TEST_M.inner\"\n",
+            "$env.MESH_TEST_M.inner: a string has no members; \
+             write `${env.MESH_TEST_M}.inner`",
+        ),
+        (
+            "$env.MESH_TEST_M = x\nputs \"$env[MESH_TEST_M].inner\"\n",
+            "$env[MESH_TEST_M].inner: a string has no members; \
+             write `${env[MESH_TEST_M]}.inner`",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(1), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source}: {stderr}");
+        assert!(!stderr.contains("not supported yet"), "{source}: {stderr}");
+    }
+
+    // Anything *after* the failing access withholds the advice, because what the
+    // remainder means depends on where it is pasted — and it took five review
+    // rounds, one guard at a time, to establish that the list is not enumerable:
+    // a bracketed remainder is a glob when bare, a quoted subscript loses its
+    // quotes, a dynamic one becomes its own interpolation, a slice canonicalizes.
+    // An empty remainder has none of them to carry.
+    //
+    // The `!contains` is the assertion that matters here: advice that runs and
+    // answers differently is worse than none, and a `contains` check on the fact
+    // would pass with a wrong hint appended.
+    for (source, message) in [
+        // Bracing a list trades this error for ``list value needs `...` ``.
+        (
+            "xs = [[1]]\nputs \"$xs[0].k\"\n",
+            "$xs[0].k: a list has no members",
+        ),
+        // A trailing modifier has two rewrites that both run and disagree:
+        // `"${file:upper}.tar"` is `REPORT.tar`, `"${file}.tar":upper` is
+        // `REPORT.TAR`. Which was meant is not in the text.
+        (
+            "file = report\nputs \"$file.tar:upper\"\n",
+            "$file.tar: a string has no members",
+        ),
+        // A second literal component.
+        (
+            "file = report\nputs \"$file.tar.gz\"\n",
+            "$file.tar.gz: a string has no members",
+        ),
+        // A quoted subscript, whose `"` is syntax in both positions.
+        (
+            "file = report\nputs \"$file.tar[\\\"a b\\\"]\"\n",
+            "$file.tar[\"a b\"]: a string has no members",
+        ),
+        // A bracketed remainder, which globs once the braces make it text.
+        (
+            "file = report\nputs $file.tar[01..02]\n",
+            "$file.tar[01..02]: a string has no members",
+        ),
+        // A dynamic subscript, which becomes an interpolation of its own.
+        (
+            "file = report\nxs = [a b]\nputs \"$file.tar[$xs]\"\n",
+            "$file.tar[$xs]: a string has no members",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(1), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source}: {stderr}");
+        assert!(!stderr.contains("write `"), "{source}: {stderr}");
+    }
+
+    // The brace is the fix, and it works — including for the multi-component
+    // suffix, which is the case where advice that truncated would have printed
+    // something the writer did not ask for.
+    let out = run_with_input(
+        "file = report\nm = [rows: [x]]\nputs \"${file}.bak\"\nputs \"${m.rows[0]}.b\"\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "report.bak\nx.b\n");
+    assert!(out.stderr.is_empty());
+
+    // A member that *is* there is untouched, and so is a missing key on a real
+    // map — that stays `no \`k\` in this map` rather than becoming this.
+    let out = run_with_input("m = [a: 1]\nputs \"$m.a\"\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+}
+
+/// An index failing names the value it indexed, for the same reason: `$m.rows[9]`
+/// is not a `$m` problem.
+#[test]
+fn an_out_of_range_index_names_the_list_it_reached() {
+    let out = run_with_input("m = [rows: [1 2]]\nputs $m.rows[9]\n");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("$m.rows[9]: list index out of range"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn command_interpolation_dispatches_map_subscripts_by_value_type() {
     let out = run_with_input(

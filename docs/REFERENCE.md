@@ -2262,6 +2262,16 @@ omitted
 bounds and negative bounds are supported. Use braces to delimit a reference
 before literal text: `${x}.txt`.
 
+The brace is **required** there, which is the one place mesh asks for something
+every other shell lets you leave out. `"$file.bak"` reads `.bak` as a member of
+`$file`, so on a string it is an error rather than the text you meant — and the
+error says so by name, since the mistake is easy to make and lands at run time:
+
+```
+$ file = report; puts "$file.bak"
+mesh: $file.bak: a string has no members; write `${file}.bak` if the rest is literal text
+```
+
 **`${…}` also takes an expression**, not only a reference — a call, or arithmetic:
 
 ```mesh

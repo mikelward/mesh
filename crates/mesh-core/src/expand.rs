@@ -21,6 +21,11 @@ pub enum Access {
         start: Option<i64>,
         end: Option<i64>,
         inclusive: bool,
+        /// The subscript exactly as written, which `Subscript` above keeps by
+        /// being raw text. The bounds alone cannot reproduce it — `[01..02]`
+        /// parses to `1` and `2` — and a diagnostic that rebuilds a reference
+        /// has to quote what the writer typed, not a canonical spelling of it.
+        text: String,
     },
 }
 
@@ -353,6 +358,27 @@ pub enum ExpandError {
         name: String,
         key: String,
     },
+    /// A `.member` on a value that has no members — `"$file.bak"` where `$file` is
+    /// a string. Its own variant for `NoSuchKey`'s reason and one more: nothing is
+    /// unimplemented here, and the writer almost never wanted a member at all. In
+    /// every other shell the `.` after a reference is literal text, so the message
+    /// names the brace that spells that.
+    NoMembers {
+        name: String,
+        key: String,
+        /// Whatever the reference carried *after* the access that failed. The walk
+        /// stops at the first one, but the advice has to name the whole thing:
+        /// `"$file.tar.gz"` braced as `${file}.tar` would print `report.tar`, so
+        /// dropping it would be advice that changes the answer.
+        rest: String,
+        kind: &'static str,
+        /// Would bracing the reference actually work? Only a value with a text
+        /// form renders on its own, so advising `${xs[0]}.k` for a list would
+        /// trade this error for `list value needs `...``. Advice that does not
+        /// run is worse than none, so the kinds that cannot are told the fact
+        /// and left there.
+        braceable: bool,
+    },
     /// A function value reached a place that needs bytes — a command argument, an
     /// interpolation, the environment. It is the one value with no text form.
     NoTextForm {
@@ -401,6 +427,22 @@ impl std::fmt::Display for ExpandError {
             }
             ExpandError::NoSuchKey { name, key } => {
                 write!(f, "${name}: no `{key}` in this map")
+            }
+            ExpandError::NoMembers {
+                name,
+                key,
+                rest,
+                kind,
+                braceable,
+            } => {
+                write!(f, "${name}.{key}{rest}: {kind} has no members")?;
+                if *braceable {
+                    write!(
+                        f,
+                        "; write `${{{name}}}.{key}{rest}` if the rest is literal text"
+                    )?;
+                }
+                Ok(())
             }
             ExpandError::NoTextForm { name, kind } => {
                 write!(f, "${name}: a {kind} has no text form")
@@ -1377,7 +1419,20 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
             vref.accesses.as_slice(),
         )
     };
-    for access in accesses {
+    // The reference as written *up to* the access being taken, so a failure names
+    // the value it actually reached rather than the root it started from:
+    // `$m.a.b` is a `$m.a` problem, and advice about `${m}.b` would be advice
+    // about a different reference.
+    //
+    // Seeded with whatever the branches above already consumed — `$env.HOME` names
+    // an entry by taking its member, so a failure under it is a `$env.HOME`
+    // problem. Counted from what is left rather than written out per branch, so a
+    // namespace that consumes an access later cannot forget to say so.
+    let mut reached = vref.name.clone();
+    for consumed in &vref.accesses[..vref.accesses.len() - accesses.len()] {
+        reached.push_str(&access_text(consumed));
+    }
+    for (position, access) in accesses.iter().enumerate() {
         // A handle is a live *reference*, not a snapshot taken when it was
         // bound: reading through one looks the job up in the table as it stands
         // now, so `$j.state` cannot go stale the way a captured record would.
@@ -1392,7 +1447,13 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
             value = vars.job_record(id).ok_or(ExpandError::GoneJob { id })?;
         }
         value = match access {
-            Access::Member(key) => map_value_access(value, key, &vref.name)?,
+            Access::Member(key) => map_value_access(
+                value,
+                key,
+                &reached,
+                &accesses[position + 1..],
+                vref.modifiers.is_empty(),
+            )?,
             Access::Subscript(subscript) => {
                 let key = subscript_key(subscript, vars)?;
                 match value {
@@ -1410,11 +1471,13 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                             .and_then(|offset| values.get(offset))
                             .cloned()
                             .ok_or_else(|| ExpandError::IndexOutOfRange {
-                                name: vref.name.clone(),
+                                name: reached.clone(),
                                 index,
                             })?
                     }
-                    Value::Map(_) => map_value_access(value, &key, &vref.name)?,
+                    // A map, so the failing branch cannot be reached and the
+                    // remaining accesses are never rendered.
+                    Value::Map(_) => map_value_access(value, &key, &reached, &[], true)?,
                     // A styled value indexes exactly as its text does — which is
                     // to say it does not, since mesh has no string subscript.
                     Value::String(_)
@@ -1436,6 +1499,7 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                 start,
                 end,
                 inclusive,
+                ..
             } => match value {
                 Value::List(values) => {
                     Value::List(slice(&values, *start, *end, *inclusive).to_vec())
@@ -1443,6 +1507,7 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
                 _ => return Err(ExpandError::NotAList(vref.name.clone())),
             },
         };
+        reached.push_str(&access_text(access));
     }
     for step in &vref.modifiers {
         value = apply_modifier_step(value, step)?;
@@ -1450,7 +1515,35 @@ pub(crate) fn resolve_value(vref: &VarRef, vars: &Vars) -> Result<Value, ExpandE
     Ok(value)
 }
 
-fn map_value_access(value: Value, key: &str, name: &str) -> Result<Value, ExpandError> {
+/// An access as it was written, for rebuilding the reference a walk has reached.
+///
+/// A subscript keeps its raw text — the key a `$name` subscript resolves to is a
+/// value, and the reference in a message is what the writer typed. A slice is
+/// rebuilt from its bounds, since those are all that survives the parse.
+fn access_text(access: &Access) -> String {
+    match access {
+        Access::Member(key) => format!(".{key}"),
+        Access::Subscript(subscript) => format!("[{subscript}]"),
+        Access::Slice { text, .. } => format!("[{text}]"),
+    }
+}
+
+/// `rest` is the accesses still to come, rendered only if this one fails on a
+/// value with no members — the advice has to name the whole reference, and the
+/// walk would otherwise stop at the first access and drop the remainder.
+///
+/// `plain` says the reference carries no modifiers, which is one of the two
+/// conditions on advising a rewrite at all: `"$file.tar:upper"` has two rewrites
+/// that run and disagree (`"${file:upper}.tar"` is `REPORT.tar`,
+/// `"${file}.tar":upper` is `REPORT.TAR`), and which was meant is not something
+/// the message can know.
+fn map_value_access(
+    value: Value,
+    key: &str,
+    name: &str,
+    rest: &[Access],
+    plain: bool,
+) -> Result<Value, ExpandError> {
     match value {
         Value::Map(entries) => entries
             .into_iter()
@@ -1460,9 +1553,39 @@ fn map_value_access(value: Value, key: &str, name: &str) -> Result<Value, Expand
                 name: name.to_string(),
                 key: key.to_string(),
             }),
-        _ => Err(ExpandError::Unsupported(format!(
-            "${name}: value is not a map"
-        ))),
+        other => {
+            let rest: String = rest.iter().map(access_text).collect();
+            Err(ExpandError::NoMembers {
+                name: name.to_string(),
+                key: key.to_string(),
+                kind: value_kind(&other),
+                // Advised only for the shape whose rewrite is provably the
+                // same text in any position: nothing after the failing access,
+                // no modifier on the reference, and a value that renders on its
+                // own. Everything else states the fact and stops.
+                //
+                // The guards started one at a time — a list receiver, a trailing
+                // modifier, a quoted subscript, a bracketed remainder that globs
+                // when bare, a dynamic subscript that becomes its own
+                // interpolation — and each was a case where the advice *ran* and
+                // answered differently from what was written. An empty remainder
+                // has none of those to carry: what is left is `${name}.key`,
+                // where `key` is an identifier and the braces make the rest of
+                // the reference syntax rather than text.
+                braceable: rest.is_empty()
+                    && plain
+                    && matches!(
+                        other,
+                        Value::String(_)
+                            | Value::Styled(_)
+                            | Value::Integer(_)
+                            | Value::Boolean(_)
+                            | Value::Flag(_)
+                            | Value::FlagTerminator
+                    ),
+                rest,
+            })
+        }
     }
 }
 
