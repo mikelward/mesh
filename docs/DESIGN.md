@@ -1798,14 +1798,14 @@ top-level is **yours**; the built-ins hang off two reserved roots:
   component is meaningful (`PATH=/usr/bin:` means "…and the cwd") and a
   split→join round-trip must be byte-faithful.
 - **`$sh`** — everything else the shell owns, **flat**: runtime values —
-  **`$sh.status`** (last exit, the readable replacement for `$?` — an int `0`–`255`
-  today, becoming a **`Status`** value under the
-  [status decision](#open-questions). Note that under that decision's
-  type-strict comparison ruling `$sh.status == 0` is **`false`** — write
-  `$sh.status == status(0)` or `$sh.status:code == 0`, and see the cross-type
-  comparison TODO, which this is the sharpest instance of),
-  **`$sh.pipestatus`** (a **list** of the last pipeline's stage statuses — of
-  `Status` under that same decision — where real lists beat bash's `PIPESTATUS`), `$sh.pid` / `$sh.ppid` (own and parent PID,
+  **`$sh.status`** (last exit, the readable replacement for `$?` — a **`Status`**
+  value per the [status decision](#open-questions), whose code is `0`–`255`. Note
+  that under that decision's type-strict comparison ruling `$sh.status == 0` is
+  **`false`** — write `if $sh.status { … }`, or `== status(0)` / `:code == 0`
+  where a comparison is really wanted, and see the cross-type comparison TODO,
+  which this is the sharpest instance of),
+  **`$sh.pipestatus`** (a **list** of the last pipeline's stage statuses, each a
+  `Status`, where real lists beat bash's `PIPESTATUS`), `$sh.pid` / `$sh.ppid` (own and parent PID,
   bash's `$$` / `$PPID`), `$sh.uid` (effective user id), `$sh.version`, `$sh.options`,
   `$sh.interactive`, the **stream handles** `$sh.stdin` / `$sh.stdout` / `$sh.stderr`
   (each with a `:tty` test — the `test -t N` replacement), **`$sh.jobs`** (the live
@@ -3214,11 +3214,12 @@ Rules:
 
   | Form | Value | Status |
   | --- | --- | --- |
-  | body ends in a command | `Status(n)` — that command's status *as a value*, under the [status decision](#open-questions); today a value call sees a bare int here, which is a defect | the command's own |
-  | `return $v` | `$v` | `0` — or `1` when `$v` is `false`; or `n` when `$v` is a `Status(n)`, under the [status decision](#open-questions) |
+  | body ends in a command | `Status(n)` — that command's status *as a value*, per the [status decision](#open-questions) | the command's own |
+  | `return $v` | `$v` | `0` — or `1` when `$v` is `false`; or `n` when `$v` is a `Status(n)` |
+  | `return status N` | `Status(N)` | `N` |
   | `return true` / `return false` | the bool | `0` / `1` |
   | bare `return` | the result so far | the **last** status |
-  | `fail` / `fail 123` | `false` *(→ `Status(1)` / `Status(123)` once the [status decision](#open-questions) lands)* | `1` / `123` |
+  | `fail` / `fail 123` | `Status(1)` / `Status(123)` | `1` / `123` |
 
   **Only `false` fails** *(and, under the [status decision](#open-questions), a
   `Status(n)` — which projects to its own `n`, so `fail 123` and
@@ -4179,7 +4180,11 @@ than by every integer. Two live scraps this left, both pointed at their canonica
   than truth — and there the answer follows from `false` being mesh's "no result":
   only `false` is absent, so `""`, `[]` and `0` all bind and take the branch. That
   also keeps `gets()`'s pinned contract, where a blank line must not end a read
-  loop.
+  loop. A **`Status`** is the one addition the [status
+  decision](#open-questions) makes here, and it is not an exception to the
+  presence reading: a nonzero status is a *value-level failure* like `false`, so
+  it takes `else` — but unlike `false` it still binds, being a result rather than
+  an absence, so the `else` branch can read the code.
 - **An explicit coded-failure spelling** *(deferred)* — any such value must stay a
   **channel-1** failure (a testable value) and so **cannot** reuse the name "error"
   (channel-2: fail-loud, no value, aborts); defining it touches the two-channel
@@ -6124,8 +6129,12 @@ remain under-specified.
   soft twin, or ship only the boundary-catch + soft twins for the MVP (leaning: no
   user catch in the MVP).
 - **Status as a projection of the value — reopened, then decided: `status` becomes
-  a *value*.** *(Resolution at the end of this entry; the exploration that led
-  there is kept because it is what rules the alternatives out.)*
+  a *value*. Implemented.** *(Resolution at the end of this entry; the exploration
+  that led there is kept because it is what rules the alternatives out. The
+  checklist at the end of the entry has landed in full — the type, the builtin,
+  the channel words, the typed channels, and the end of "no value" — so the
+  present-tense claims about the implementation below are describing it as it now
+  is, except where one says otherwise.)*
   [Value and status are separate channels](#functions) is marked
   *decided; shipped*, and the objection it records is that deriving one from the
   other "makes every integer-returning function a landmine." Reopened on the
@@ -6518,7 +6527,11 @@ remain under-specified.
 
   One consequence this entry does *not* decide: whether **`exit`** accepts a
   `Status` beside the int it takes today, since `exit $sh.status` becomes the
-  obvious way to leave with the last status.
+  obvious way to leave with the last status. *(In the implementation the question
+  did not arise: `exit` reads its operand as a **word**, and a `Status` renders as
+  decimal there, so `exit $sh.status` keeps working without `exit` knowing the
+  type. `fail` does read a value, and takes a `Status` beside the int — recorded
+  in `TODO.md` under decisions needing review.)*
 
   #### "No value" stops existing, which is what unifies the rest
 
@@ -6632,11 +6645,13 @@ remain under-specified.
   either way. What the decision adds is the **type**: once fixed, the value is
   `Status(1)`, not the int `1`.
 
-  Checked against `main` (`199d4ef`): `status` is a free name — `func status(_n)
-  { $_n }` defines and calls cleanly — so the builtin needs no keyword and the
-  channel word needs no reservation. `return status 5` is a syntax error today
-  and `return status` binds the **string** `"status"`, which is exactly why the
-  channel word needs parser support rather than falling out of existing rules.
+  Checked against `main` (`199d4ef`) before the work: `status` was a free name —
+  `func status(_n) { $_n }` defined and called cleanly — so the builtin needed no
+  keyword and the channel word needed no reservation. `return status 5` was a
+  syntax error and `return status` bound the **string** `"status"`, which is
+  exactly why the channel word needed parser support rather than falling out of
+  existing rules. It has it now, and `func status` is refused by the existing
+  builtin rule.
 
   **It does not do the motivating example, and that is intended.** `func g()
   { return 1 }; if g` takes the *true* branch, because `1` is data; the failing
@@ -6707,11 +6722,13 @@ remain under-specified.
     reservation or gains an escape (a namespace, a shadowing rule, an explicit
     `builtin` prefix) is its own pass.
 
-  Two **defects** were found while checking this entry. Neither is created by the
-  decision and both are fixable independently: `1 == 1.0` is `false` on `main`
-  while the [`:repr`](#modifiers) rationale asserts it is true, and `p():capture`
-  reports `value=1 status=0` for a function whose command tail failed while bare
-  `p` leaves `$sh.status` 1.
+  Two **defects** were found while checking this entry, neither created by the
+  decision. `1 == 1.0` is `false` on `main` while the [`:repr`](#modifiers)
+  rationale asserts it is true — still open, and now part of the cross-type
+  comparison pass above. The second one is **fixed**: `p():capture` reported
+  `value=1 status=0` for a function whose command tail failed while bare `p` left
+  `$sh.status` 1, and typing the command tail made the two agree
+  (`value=Status(1) status=Status(1)`).
 
   #### Settled along the way
 

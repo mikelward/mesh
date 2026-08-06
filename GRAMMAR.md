@@ -652,7 +652,9 @@ match-pattern   = "_" | "*" | list-pattern | pattern-value ;
 pattern-value   = value-expression ;          # may not *begin* with `[`
 
 control-statement
-                = ( "return" | "fail" | "break" | "continue" ) control-value? guard? ;
+                = "return" channel-word? control-value? guard?
+                | ( "fail" | "break" | "continue" ) control-value? guard? ;
+channel-word    = "status" | "value" ;        # only with no `(` abutting it
 control-value   = value-expression ;          # may not *begin* with `if` / `unless`
 ```
 
@@ -685,6 +687,14 @@ an exact list by binding and comparing in the guard.
 A guard attaches to **one** simple command, control statement, or value
 expression — before any `;`, newline, `&`, pipeline, or conditional operator. It
 is not a suffix on a whole pipeline. `unless` negates its condition.
+
+A **channel word** is recognized only directly after `return`, and says which
+channel the operand fills: `return status 5` is the status `5` (sugar for
+`return status(5)`), `return value 5` is the value `5`, which is what a bare
+`return 5` already means. An **attached `(` is a call, never a channel word** — the
+same discrimination `f arg` and `f(arg)` already draw — so `return value(5)` calls
+whatever `value` names and `func value` stays legal. The words reserve nothing, but
+a channel word with no operand is an error rather than the string it used to bind.
 
 Because a control statement's guard is claimed first, its value may not *begin*
 with `if` or `unless`: `return if true { 1 }` reads the `if` as the guard and

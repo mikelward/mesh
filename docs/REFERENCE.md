@@ -528,6 +528,13 @@ func g() { global n = second
 puts $n g() $n                # first x second
 ```
 
+The **status** a sibling that *runs something* leaves is seen the same way, in a
+call's argument list as in a command's words: `puts(false(), source($f))` and
+`/bin/echo false() source($f)` both source with `1` standing, exactly as the two
+lines written one after the other would. Only running changes it — `status(5)`
+builds a status without leaving one, as `re("x")` builds a regex, so
+`puts(false(), status(0), source($f))` still sources with `1`.
+
 Redirect targets come after all of them, which is why `f * > summary` cannot match
 the `summary` its own redirection is about to create.
 
@@ -573,8 +580,8 @@ comparison you actually want gets its own parens (`puts (1 < 2)` prints `true`),
 
 `[` and `..` are **not** value syntax here: in an argument they are already a glob
 character class (`ls src/[ab]*`) and the literal word `1..3`. Spacing decides an
-attached call from an argument — `puts(1 + 2)` calls `puts` for a value (and a command
-has none), while `puts (1 + 2)` passes it one.
+attached call from an argument — `puts(1 + 2)` calls `puts` for a value (a command's
+is the [status](#exit-status) it leaves), while `puts (1 + 2)` passes it one.
 
 An unknown command prints `command not found` and sets a failing status. When
 another shell spells the same thing differently, the message names mesh's
@@ -988,8 +995,9 @@ argument by hand, and repeating it walks back through earlier commands.
 | `pwd` | Print the working directory. |
 | `clip [text …]` | Copy to the terminal's clipboard with `OSC 52`, so it works over `ssh`. Arguments join with a space; with none, stdin is read (`puts hi \| clip`). The bytes are copied as given, a trailing newline included. Goes to the terminal, not stdout, so a redirect cannot swallow it. Whether the copy lands is up to the terminal — xterm needs `allowWindowOps`, tmux `set-clipboard on` — and there is no reply, so success means "asked". |
 | `notify [text …]` | Raise a desktop notification through the terminal with `OSC 9`. Arguments or stdin, like `clip`. A command that runs for more than ten seconds notifies on its own, with its outcome and duration — `$sh.options.command-notify = false` turns that off. Inside tmux the sequence is wrapped for passthrough, which tmux forwards only with `allow-passthrough` set. Support is uneven and unreportable — iTerm2, WezTerm, Ghostty, kitty and ConEmu raise these; xterm and Alacritty discard them; tmux needs `allow-passthrough` — so success means "asked". |
+| `status code` · `status(code)` | A [**status value**](#exit-status) — how a command went — from a code between `0` and `255`. Out of range is refused rather than truncated, and so is a code that is not an integer: both spellings read the operand as a *value*, so `code = "5"; status $code` is refused exactly as `status($code)` is. The call is the constructor (`file-not-found = status(5)`), and the command form leaves the same value as the statement's result, which is what a `match` arm writes: `x = match $kind { missing => { status 5 } }`. `status(0)` is legal where `fail 0` is not: naming a zero status is reasonable, while a `fail` that succeeds is a mistake. It writes nothing and answers with a value, so — like `return` — it is refused in a pipeline, under a redirection, and in the background, where that value would be discarded. |
 | `exit [n]` | Leave the shell with status `n` (default: the last command's status; masked to 0–255). Leaves the **whole shell**; to leave only the current function with a status, use `fail`. |
-| `fail [n]` | Leave the current function (or sourced file) with a nonzero status — `1` by default, `n` when given — and `false` as its value. The status channel's counterpart to `return`. `fail 0` is refused; `return true` is how a function leaves with success. |
+| `fail [n]` | Leave the current function (or sourced file) with a nonzero status — `1` by default, `n` when given — carrying that status as its value. A **validating wrapper** over `return status(n)`, not exact sugar for it: `fail 0` is refused, where `status(0)` is legal. `return true` is how a function leaves with success. |
 | `prompt [text]` | Set the interactive prompt to `text`. With no arguments, print the current prompt; `--reset` restores the status-sensitive default, and `prompt -- --reset` sets that literal text. |
 | `on event name function` | Register a named function for a prompt lifecycle event. Reusing `name` within an event replaces that hook without changing its order. |
 | `jobs` | List the jobs, one `[id] State command` per line. |
@@ -1237,7 +1245,13 @@ j = make -j8 &
 puts $j.pid                     # the process group leader
 puts $j.state                   # running … and later, done
 wait $j                         # the handle is a job reference
+puts $j.status                  # "" while it runs, its status once it has ended
 ```
+
+`$j.status` is a [status value](#exit-status) once the job has finished, for the
+reason `$sh.status` is one: `wait $j; return $j.status` has to forward the job's
+failure rather than its number. It is `""` until then — the empty-value rule, not a
+null.
 
 Reading a member resolves the handle against the **live** table, so `$j.state`
 moves on with the job instead of freezing as it was when bound. `$sh.jobs[2]` is
@@ -1538,11 +1552,15 @@ multiline continuation prompts.
 | --- | --- | --- |
 | `preprompt` | none | Before each primary prompt is rendered. |
 | `preexec` | `command` | Immediately before an interactive command runs. |
-| `postexec` | `command, status, elapsed` | After an interactive command; `elapsed` is integer milliseconds. |
+| `postexec` | `command, status, elapsed` | After an interactive command; `status` is a [status value](#exit-status) and `elapsed` is integer milliseconds. |
 | `precd` | `target` | Before the working directory changes, still in the old one. `target` is where it is about to go. |
 | `postcd` | `previous` | After it has changed, in the new directory. `previous` is where it came from. |
-| `jobdone` | `id, command, status` | Once per background job the shell finds finished, alongside its `[N] Done` notice. |
-| `exit` | `status` | Before the shell exits, however the session ended. `status` is the status it is leaving with. |
+| `jobdone` | `id, command, status` | Once per background job the shell finds finished, alongside its `[N] Done` notice. `status` is a [status value](#exit-status). |
+| `exit` | `status` | Before the shell exits, however the session ended. `status` is the [status value](#exit-status) it is leaving with. |
+
+Every `status` argument above is a **status value**, not an integer, so a handler
+forwarding one reports the failure it was told about. Test it directly — `if not
+$status { … }` — since `$status != 0` compares across types and is always true.
 
 ```mesh
 func command-started(cmd) { puts "running $cmd" }
@@ -1679,24 +1697,61 @@ own exit code at end of input.
 | `128 + n` | Killed by signal `n`. |
 | `2` | Syntax error (the shell recovers and continues). |
 
-A **condition** — the subject of `if` / `while`, a `stmt if cond` guard, a `match`
-arm guard, or an operand of `and` / `or` / `not` — is a **bool or a command**, and
-nothing else. A command branches on its exit status (`0` is true); a bool branches
-on itself. Any other type is a loud error naming the comparison to write instead,
-so `if $xs:len` is refused and `if $xs:len > 0` is what you write. There are no
-truthy values.
+A status is also a **value**, of its own type. `status(5)` builds one, `$sh.status`
+and its siblings hold one, and anything command-shaped yields one: a function whose
+body ends in a command, a value call on a command (`grep(zzz)` is `status(1)`), and
+a capture record's `.value` and `.status`. It exists so that forwarding a status
+forwards the *failure* — `func w() { some-cmd; return $sh.status }` reports what
+`some-cmd` reported, where a bare integer there returns the number, successfully.
 
-A **value** used as a statement reports the status *view* of that value, and only
-`false` fails — `false` is mesh's "no result", while every other value *is* a
-result and producing one is success. So `1 == 2 || puts nope` prints, a function
-whose body ends in a boolean fails when that boolean is false, and a body ending
-in an integer, string or list succeeds. Naming a status is [`fail`](#fail)'s job,
-not `return`'s.
+```mesh
+missing = status(5)
+puts $missing                         # 5      — the bare number, at every byte boundary
+puts $missing:repr                     # status(5)
+puts $missing:code                     # 5      — the integer, for arithmetic and comparison
+```
+
+A status **renders as its number** wherever bytes are wanted — argv, interpolation,
+`puts`, a valued option's payload, a path-type `$env` list, and a map key — since
+mesh already loses type there (the int `5` and the string `"5"` both write `5`, and
+`[5: found]` and `[status(5): found]` key the same entry). `:repr` writes
+`status(5)`, which is forced by its round-trip contract, and
+[`:code`](#modifiers) is how you reach the integer.
+
+It compares like every other type, which is to say **strictly**: `status(0) == 0` is
+`false` (as `1 == "1"` is), `$s > 1` is an error, and a `0` arm never matches a
+status. `$s == status(0)` and `$s:code == 0` are the spellings that work. So a
+`$sh.status == 0` written out of shell reflex says nothing — write the condition
+instead.
+
+A **condition** — the subject of `if` / `while`, a `stmt if cond` guard, a `match`
+arm guard, or an operand of `and` / `or` / `not` — is a **bool, a status, or a
+command**, and nothing else. A command branches on its exit status (`0` is true); a
+status is true iff its code is `0`; a bool branches on itself. Any other type is a
+loud error naming the comparison to write instead, so `if $xs:len` is refused and
+`if $xs:len > 0` is what you write. There are no truthy values: a status is admitted
+because success and failure are the whole of what it encodes, which is what a
+command in a condition was already being read for.
+
+```mesh
+if $sh.status { puts "that worked" }
+puts warn unless $sh.status
+bad = $sh.pipestatus:filter(func(c) { not $c })
+```
+
+A **value** used as a statement reports the status *view* of that value: a status is
+its own code, `false` fails, and every other value *is* a result, so producing one is
+success. So `1 == 2 || puts nope` prints, a function whose body ends in a boolean
+fails when that boolean is false, a body ending in an integer, string or list
+succeeds, and `status(1) || puts fallback` runs the fallback. Naming a status is
+[`fail`](#fail)'s and `status`'s job, not a bare `return`'s.
 
 ### `$sh.status` and `$sh.pipestatus`
 
-`$sh.status` is the last command's status — the readable replacement for `$?`.
-`$sh.pipestatus` breaks the same run down by stage, as a **real list**:
+`$sh.status` is the last command's status — the readable replacement for `$?` — and
+a [status value](#exit-status) rather than an integer, so `return $sh.status`
+forwards a failure and `if $sh.status { … }` is how you ask whether it worked.
+`$sh.pipestatus` breaks the same run down by stage, as a **real list** of statuses:
 
 ```mesh
 sh -c 'exit 3' | sh -c 'exit 0' | sh -c 'exit 7'
@@ -2417,6 +2472,7 @@ a different failure from an unknown name, which never parses.
 | `:int` | string | Parse an integer, failing loudly on invalid input. |
 | `:bool` | string or boolean | Parse `1`/`true`/`0`/`false`; warn and read `false` for anything else. `:bool(DEFAULT)` answers `DEFAULT` there instead, and says nothing. |
 | `:len` | string, list, or map | Character, element, or entry count as an integer. |
+| `:code` | status | The integer inside a [status](#exit-status) — the spelling for arithmetic on one, and for a comparison against a number (`$s:code > 1`, where `$s > 1` is a type error). |
 | `:first` / `:last` | list | First or last element; an empty list is an error. |
 | `:rest` / `:init` | list | All but the first or last element; empty and one-element lists yield `[]` where appropriate. |
 | `:dedup` | list | Remove later duplicates, preserving first occurrence order. |
@@ -3107,6 +3163,16 @@ if path = find-up(Makefile) {
 while line = next-line() { puts $line }   # ends when `next-line` answers false
 ```
 
+A **status** is the other value-level failure, so a failing one takes `else`
+here exactly as it does when it is the condition itself — otherwise `if s =
+f()` would succeed where `if f()` fails, on the same value. Unlike `false` it
+still **binds**, since a status is a result rather than an absence, so the
+`else` branch can read the code:
+
+```mesh
+if s = build() { puts done } else { puts "build failed: $s" }
+```
+
 An absent value binds nothing, so the `else` reads whatever the name held
 before — the same rule a list-pattern mismatch and a `gets` at end of input
 already follow. A **capture** right-hand side is unaffected: `if out = $(cmd)`
@@ -3606,14 +3672,35 @@ greet world          # -> hi, world
   spread (`...$xs`) or joined. A spread contributes one argument per element.
 - **Result.** A function's status is its last statement's status, or `0` for an
   empty body — and when that last statement is an expression, its status is the
-  view of the resulting value, so a body ending in `1 == 2` fails.
+  view of the resulting value, so a body ending in `1 == 2` fails. A body ending in
+  a **command** yields that command's [status as a value](#exit-status), so
+  `func p() { /bin/false }` has the value `status(1)` and `p()` reads it.
 
-  **Value and status are separate channels.** `return expr` exits early carrying a
-  **value**, and succeeds (status `0`) unless that value is `false` — so
-  `return 3` is the integer three with status `0`, not exit code 3. `fail` is the
-  status channel's verb: bare `fail` is status `1`, `fail 123` names a code, and
-  the value it leaves behind is `false`. `fail 0` is refused — the spelling for
-  leaving with success is `return true`.
+  **`return expr` carries a value**, and succeeds (status `0`) unless that value is
+  `false` or a nonzero status — so `return 3` is the integer three with status `0`,
+  not exit code 3. Naming a status takes the **channel word**: `return status 3`,
+  which is sugar for `return status(3)`, leaves `status(3)` with status 3.
+  `return value 3` is the explicit spelling of the plain form and means exactly
+  what `return 3` means.
+
+  ```mesh
+  func port() { return 8080 }         # value 8080, status 0
+  func check() { return status 2 }    # value status(2), status 2
+  func forward() { some-cmd
+    return $sh.status }               # whatever `some-cmd` reported
+  ```
+
+  The channel words are recognized **only directly after `return`** and reserve
+  nothing: an attached `(` is a call, never a channel word, so `return value(5)`
+  calls whatever `value` names and `func value` stays legal. (`status` is taken
+  anyway, as every builtin's name is.) Either channel word written without an
+  operand is an error naming what is missing, not the string it used to bind.
+
+  `fail` is the other spelling of a named status: bare `fail` is status `1`,
+  `fail 123` names a code, and the value it leaves is that same status. It is
+  `return status(n)` plus the constraint `n ≥ 1`, so `fail 0` is refused where
+  `status(0)` is legal — the spelling for leaving with success is `return true`.
+  It takes a status as readily as an integer, so `fail $sh.status` forwards one.
 
   A bare `return` carries the **result so far** — the last value the body produced,
   or the empty string if nothing ran — with the **last status**, so it means "stop
@@ -3657,9 +3744,18 @@ greet world          # -> hi, world
     option parsing; `...$list` spreads positionals and `...$map` spreads options.
   - **Channels stay independent.** The value returns through the call while the
     body's stdout streams as usual (`DESIGN.md`).
-  - **Status** is the usual view of the resulting value: an integer is its own
-    status, a boolean inverts (`true` is `0`), anything else is `0`. A runtime
-    error in the call fails the enclosing statement instead of yielding a value.
+  - **Status** is the usual view of the resulting value: a status is its own code,
+    a boolean inverts (`true` is `0`), anything else — an integer included — is
+    `0`. A runtime error in the call fails the enclosing statement instead of
+    yielding a value.
+  - **Every call yields a value**, so a **command** may be value-called too, and
+    what it yields is its status: `grep(zzz)` is `status(1)` and `puts(1 + 2)`
+    prints and yields `status(0)`. `f`, `$(f)` and `f()` therefore mean the same
+    three things for an external as for a mesh function, arguments included — a
+    job builtin takes a handle (`wait($j)`) and `puts` renders a collection and
+    styles it for the terminal, the same two value-reading families the written
+    command has. Neither of those two examples is *useful*: the cost of every call
+    having a value is the diagnostic that used to catch them.
   - **Not backgroundable.** `f() &` — the *value* spelling — is refused, and so
     is `&` on any statement that is not a command or pipeline: an expression, an
     assignment, an `if`/`match`, a loop, a definition. The value is produced in
@@ -3779,19 +3875,18 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
     so `&if` and `&return` are a syntax error rather than control flow. A call
     through a reference dispatches exactly where a written `name(…)` does, so
     `&glob`, `&dirs`, `&style`, `&re` and `&gets` all reach their value-call form.
-  - **Resolvable is not the same as returns a value.** An external has no return
-    value, and neither do the effect-only builtins, so `&grep` and `&puts` are
-    fine references that fail *at the call* in a value slot — with the same "a
-    command has no return value" a written `puts(1 + 2)` gives. A name that
-    resolves to nothing is the other failure, and says so.
+  - **A reference to a command calls like one.** `&grep` and `&puts` are fine
+    references, and calling one in a value slot runs the command and yields the
+    [status](#exit-status) it left, exactly as the written `puts(1 + 2)` does — with
+    the same argument handling, so `&puts` renders a collection and `&kill` names a
+    job. A name that resolves to nothing is the failure that remains, and says so.
   - **Only a `func` can be applied per element.** `:map` / `:filter` / `:each`
     hand their callable one already-evaluated element, and a value call reads its
     own argument list, so `$xs:map(&glob)` is a loud error naming the lambda
     wrapper that does work (`$xs:map(func(p) { glob($p) })`).
   - **`:capture` works through one**, and records what the name it stands for
-    would: `$f("hi"):capture` through `f = &puts` is `puts("hi"):capture`, the
-    command record without `.value`. That is the one place a command may be
-    value-called at all, and a reference does not lose it.
+    would: `$f("hi"):capture` through `f = &puts` is `puts("hi"):capture`, whose
+    `.value` is the status the command left.
   - **The whole signature travels**, because a reference is a name: flags,
     defaults, a rest parameter and the `wrapper` marker all behave as they do at
     a written call, and diagnostics name the function referenced rather than the
@@ -3805,8 +3900,10 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
 
 - **Both channels at once — `:capture`.** `f(…):capture` runs the call and returns
   a **record of every channel**: `.value` (the return value), `.out` and `.err`
-  (its stdout and stderr), and `.status` (the exit int). Read them with ordinary
-  field access.
+  (its stdout and stderr), and `.status` (a [status](#exit-status)). Read them with
+  ordinary field access. The record has a **fixed shape** — every field is always
+  present — and `.status` is exactly the status whose code is the view of `.value`:
+  the two are one channel with two views, not two answers.
 
   ```mesh
   func build() { puts compiling
@@ -3824,12 +3921,12 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
   - **`.out` and `.err` are the bytes as written**, with no trailing-newline trim
     (unlike `$(…)`), so the record fixes no split policy: divide them with
     `:split` and friends as you need.
-  - **Commands capture too**, and this is the one exception to "a command has no
-    return value": `grep(foo):capture` asks for the record, not a value. It comes
-    back **without `.value`** — reading it is a loud missing-key error — and takes
-    **positional arguments only**, since a command has no signature for a
-    `key: value` option or a map spread to bind to. A nonzero exit is data:
-    `false():capture` reports `.status` 1 rather than failing.
+  - **Commands capture too**: `grep(foo):capture` asks for the record. Its
+    `.value` is the status the command left, so the record's shape does not depend
+    on what was called, and it takes **positional arguments only**, since a command
+    has no signature for a `key: value` option or a map spread to bind to. A
+    nonzero exit is data: `false():capture` reports `.status` 1 rather than
+    failing.
 
     Builtins are commands here as well: `puts(x):capture` runs the builtin, not a
     program named `puts`, and `pwd():capture` does not reach `/bin/pwd`. `exit`

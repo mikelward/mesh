@@ -5473,9 +5473,11 @@ fn jobdone_hook_harness(exec: &MeshExec, gates: &Path) -> i32 {
     for line in [
         // Only for the *first* job. The handler runs for both, and by the
         // second there is no writer left on that fifo — a `cat` there would
-        // wait for one that has already been and gone.
+        // wait for one that has already been and gone. The argument is a
+        // `Status`, so the comparison is against `status(3)`; `== 3` is
+        // cross-type and silently false.
         format!(
-            "func chain(id, cmd, status) {{ puts JOBDONE=$id/$status; if $status == 3 {{ sh -c 'cat \"$1\" > /dev/null; {}' _ {} {two_pid} }}; jobs }}\n",
+            "func chain(id, cmd, status) {{ puts JOBDONE=$id/$status; if $status == status(3) {{ sh -c 'cat \"$1\" > /dev/null; {}' _ {} {two_pid} }}; jobs }}\n",
             REAPABLE, two_word
         ),
         "on jobdone j1 chain\n".to_owned(),
@@ -6664,6 +6666,39 @@ fn style_harness(exec: &MeshExec) -> i32 {
     };
     if status != 0 || occurrences(&seen, b"\x1b[31m") != 0 || occurrences(&seen, b"danger") == 0 {
         return 237;
+    }
+
+    // The **value-call** spelling writes to the same stdout the written command
+    // does, so it emits the same escapes: `puts($r)` runs the builtin now rather
+    // than reporting that a command has no return value, and the decoration is
+    // the caller's rather than always plain.
+    if !pty_write(shell.master, b"puts($r)\n") {
+        return 238;
+    }
+    let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+        return 239;
+    };
+    if status != 0 || occurrences(&seen, b"\x1b[31mdanger\x1b[0m") == 0 {
+        return 240;
+    }
+    // And a capture is the other side of the same rule: its stdout is a pipe into
+    // the record, so the text lands there plain.
+    for line in [
+        b"c = puts($r):capture\n".as_slice(),
+        b"puts $c.out:repr\n".as_slice(),
+    ] {
+        if !pty_write(shell.master, line) {
+            return 241;
+        }
+        let Some((seen, status)) = pty_read_until_command_done(shell.master) else {
+            return 242;
+        };
+        if status != 0 {
+            return 243;
+        }
+        if occurrences(&seen, b"\x1b[31m") != 0 {
+            return 244;
+        }
     }
 
     // A pipe means this stage's stdout is not the terminal, so the text goes
@@ -10821,8 +10856,13 @@ fn a_last_stage_in_the_shell_still_reports_its_status() {
     let out = run_with_input("puts hi | false\nputs \"status=$sh.status\"\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "status=1\n");
 
+    // Each entry is a `Status`, not the bare int it used to be, so a handler
+    // forwarding one reports the stage's failure rather than its number.
     let out = run_with_input("false | true | false\nputs $sh.pipestatus:repr\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "[1, 0, 1]\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[status(1), status(0), status(1)]\n"
+    );
 
     // `exit` in that stage is still the *stage's* exit, reported as a status —
     // the shell carries on to the next statement, as it did when the stage forked.
@@ -10885,7 +10925,7 @@ fn a_compound_stage_reports_its_status() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "status=1 pipe=[0, 1]\n"
+        "status=1 pipe=[status(0), status(1)]\n"
     );
 
     let out = run_with_input(
@@ -10893,7 +10933,7 @@ fn a_compound_stage_reports_its_status() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "status=0 pipe=[0, 0]\n"
+        "status=0 pipe=[status(0), status(0)]\n"
     );
 }
 
@@ -14344,20 +14384,653 @@ fn and_or_and_not_refuse_the_same_values_a_condition_does() {
 
 #[test]
 fn fail_names_a_status_and_return_names_a_value() {
-    // The two channels, spelled apart. `return` fills the value channel and leaves
-    // the status at 0 — a result is success, whatever its type. `fail` fills the
-    // status channel and leaves `false`, mesh's "no result", in the value channel.
+    // The two spellings, told apart by what they leave. `return` fills the value
+    // channel and leaves the status at 0 — a result is success, whatever its type.
+    // `fail` names a status and leaves that status *as the value*, since it is a
+    // validating wrapper over `return status(N)`; both render as the bare number.
     let out = run_with_input(
         "func v() { return 5 }\nfunc f() { fail 5 }\n\
          v\nputs \"return $sh.status\"\n\
          f\nputs \"fail $sh.status\"\n\
-         x = v()\ny = f()\nputs \"[$x][$y]\"\n",
+         x = v()\ny = f()\nputs \"[$x:repr][$y:repr]\"\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "return 0\nfail 5\n[5][false]\n"
+        "return 0\nfail 5\n[5][status(5)]\n"
     );
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
+#[test]
+fn a_status_is_a_value_with_a_code_of_its_own() {
+    // `status(N)` is an ordinary value: bindable, passable, returnable. It
+    // renders as the bare number at every byte boundary — argv included, where
+    // the int `5` and the string `"5"` already render alike — and `:repr` writes
+    // the call, forced by its round-trip contract.
+    let out = run_with_input(
+        "missing = status(5)\n\
+         puts $missing\n\
+         puts $missing:repr\n\
+         puts $missing:code\n\
+         puts ($missing:code + 1)\n\
+         /bin/echo $missing\n\
+         puts \"exited $missing\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "5\nstatus(5)\n5\n6\n5\nexited 5\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // `:code` is the only way to the integer, so nothing else can be mistaken
+    // for a status on the way in.
+    let int = run_with_input("puts 5:code\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&int.stderr).contains("requires a status"),
+        "{:?}",
+        int.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&int.stdout), "after\n");
+}
+
+#[test]
+fn a_status_is_built_from_zero_to_255_and_refuses_the_rest() {
+    // Construction rejects rather than truncating: silent wrapping would make
+    // `status(256)` and `status(0)` the same value.
+    for source in ["x = status(256)\n", "x = status(-1)\n"] {
+        let out = run_with_input(&format!("{source}puts after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("status must be between 0 and 255"),
+            "{source}: {stderr}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    }
+
+    // `status(0)` is legal where `fail 0` is not: naming a zero status is
+    // reasonable, while a `fail` that succeeds is a mistake.
+    let zero = run_with_input("x = status(0)\nputs $x:repr\n");
+    assert_eq!(String::from_utf8_lossy(&zero.stdout), "status(0)\n");
+    assert!(zero.stderr.is_empty(), "{:?}", zero.stderr);
+
+    // And the code must be a number rather than whatever happens to be to hand.
+    let word = run_with_input("x = status(\"5\")\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&word.stderr).contains("the code must be an integer"),
+        "{:?}",
+        word.stderr
+    );
+}
+
+#[test]
+fn a_status_is_a_condition_and_the_boolean_words_take_one() {
+    // A command is admitted in a condition *because* its result is a status, so
+    // the two are one question: true iff the code is `0`.
+    let out = run_with_input(
+        "if status(0) { puts zero-true }\n\
+         if status(1) { puts nonzero-true } else { puts nonzero-false }\n\
+         puts guarded if status(0)\n\
+         puts unless-fired unless status(3)\n\
+         puts (not status(1))\n\
+         puts (status(0) and true)\n\
+         puts (status(1) or true)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "zero-true\nnonzero-false\nguarded\nunless-fired\ntrue\ntrue\ntrue\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // Which is what gives "did that work" a short spelling, now that `== 0` is
+    // cross-type and says nothing.
+    let last = run_with_input("false\nif $sh.status { puts ok } else { puts failed }\n");
+    assert_eq!(String::from_utf8_lossy(&last.stdout), "failed\n");
+}
+
+#[test]
+fn a_status_compares_only_with_another_status() {
+    // No exception is carved for the type: it follows the cross-type rules
+    // already in force, which are asymmetric — `==` is silently false where `>`
+    // is an error, exactly as for `1 == "1"` and `1 > "1"`.
+    let out = run_with_input(
+        "s = status(0)\n\
+         puts ($s == 0)\n\
+         puts ($s == status(0))\n\
+         puts ($s != status(1))\n\
+         puts ($s:code == 0)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "false\ntrue\ntrue\ntrue\n"
+    );
+
+    let ordered = run_with_input("s = status(3)\nputs ($s > 1)\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&ordered.stderr).contains("comparison requires"),
+        "{:?}",
+        ordered.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&ordered.stdout), "after\n");
+
+    // So a `0` arm never matches a status, and `status(0)` is the arm that does.
+    let arms = run_with_input(
+        "func f() { return status 0 }\n\
+         x = match f() { 0 => int-arm\n\
+           status(0) => status-arm\n\
+           _ => neither }\n\
+         puts $x\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&arms.stdout), "status-arm\n");
+}
+
+#[test]
+fn the_channel_word_says_which_channel_a_return_fills() {
+    // `return status N` is sugar for `return status(N)`: the value is the status
+    // and the function leaves with that code. `return value N` and a bare
+    // `return N` are the same thing as each other — the load-bearing rule, since
+    // `func f() { 5 }` and `func f() { return 5 }` must agree.
+    let out = run_with_input(
+        "func s() { return status 5 }\n\
+         func c() { return status(5) }\n\
+         func v() { return value 5 }\n\
+         func b() { return 5 }\n\
+         puts s():repr c():repr v():repr b():repr\n\
+         s\nputs \"status=$sh.status\"\n\
+         b\nputs \"status=$sh.status\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "status(5) status(5) 5 5\nstatus=5\nstatus=0\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // The channel words are positional and reserve nothing, so a function named
+    // `value` is still callable — an attached `(` is a call, never a channel
+    // word.
+    let call =
+        run_with_input("func value(n) { $n * 2 }\nfunc f() { return value(21) }\nputs f()\n");
+    assert_eq!(String::from_utf8_lossy(&call.stdout), "42\n");
+    assert!(call.stderr.is_empty(), "{:?}", call.stderr);
+
+    // A channel word still owes an operand: with none it names what is missing
+    // rather than binding the string `"status"`. Either word — a written `return
+    // value` that fell back to bare-`return` behavior would silently hand back
+    // whatever the body produced last.
+    for (source, message) in [
+        (
+            "func f() { return status }\n",
+            "expected a status code after `status`",
+        ),
+        (
+            "func f() { 7\n return value }\n",
+            "expected a value after `value`",
+        ),
+    ] {
+        let bare = run_with_input(&format!("{source}puts after\n"));
+        assert!(
+            String::from_utf8_lossy(&bare.stderr).contains(message),
+            "{source}: {:?}",
+            bare.stderr
+        );
+    }
+
+    // And the constructor's range check is the same one.
+    let range = run_with_input("func f() { return status 300 }\nf\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&range.stderr).contains("status must be between 0 and 255"),
+        "{:?}",
+        range.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&range.stdout), "after\n");
+}
+
+#[test]
+fn forwarding_a_status_forwards_the_failure() {
+    // The case the type exists for: as an int this returned the *number*,
+    // successfully, at the likeliest place to meet it.
+    let out = run_with_input(
+        "func wrapper() { /bin/false\n return $sh.status }\n\
+         wrapper\nputs \"forwarded=$sh.status\"\n\
+         v = wrapper()\nputs $v:repr\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "forwarded=1\nstatus(1)\n"
+    );
+
+    // A status can be bound and passed like any other value, which is what makes
+    // it a type rather than syntax.
+    let bound = run_with_input(
+        "file-not-found = status(5)\n\
+         func f(s) { return $s }\n\
+         x = f($file-not-found)\n\
+         puts $x:repr\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&bound.stdout), "status(5)\n");
+}
+
+#[test]
+fn a_status_builtin_call_yields_rather_than_unwinding() {
+    // `fail` and `return status` are function-level verbs, so only the builtin
+    // lets a `match` arm *yield* a status while the function carries on. Both arm
+    // forms reach it: the value arm through the call, the block arm through
+    // command position.
+    let out = run_with_input(
+        "func pick(kind) {\n\
+           x = match $kind { missing => { status 5 }\n\
+             _ => status(0) }\n\
+           puts after-the-match\n\
+           return $x }\n\
+         puts pick(missing):repr pick(other):repr\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "after-the-match\nafter-the-match\nstatus(5) status(0)\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // In command position it reports its own code through the ordinary
+    // projection, so it chains like any other statement.
+    let chained = run_with_input("status 1 || puts fallback\nstatus 0 && puts ran\n");
+    assert_eq!(String::from_utf8_lossy(&chained.stdout), "fallback\nran\n");
+
+    // And `not` answers for the whole statement, so the value it leaves is the
+    // negated status rather than the one the operand produced: a body's value
+    // and its status have to agree, whichever spelling reads them.
+    let negated =
+        run_with_input("func f() { not status 5 }\nf\nputs \"bare=$sh.status\"\nputs f():repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&negated.stdout),
+        "bare=0\nstatus(0)\n",
+        "{}",
+        String::from_utf8_lossy(&negated.stderr)
+    );
+
+    // `status` is a builtin, so the existing rule refuses it as a function name.
+    let named = run_with_input("func status(n) { $n }\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&named.stderr).contains("reserved name"),
+        "{:?}",
+        named.stderr
+    );
+}
+
+#[test]
+fn every_status_channel_carries_a_status_value() {
+    // The list is the point: one channel left an int is one more place a handler
+    // forwarding it reports success.
+    // Both entries in one statement: reading either is itself a command, so a
+    // first read would replace what the second reports.
+    let out = run_with_input(
+        "sh -c 'exit 3' | sh -c 'exit 0'\n\
+         puts $sh.status:repr $sh.pipestatus:repr\n\
+         r = false():capture\n\
+         puts $r.status:repr $r.value:repr\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "status(3) [status(3), status(0)]\nstatus(1) status(1)\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // `fail` takes one back, since `fail $sh.status` is the obvious spelling once
+    // that channel holds a status.
+    let refail =
+        run_with_input("func f() { sh -c 'exit 6'\n fail $sh.status }\nf\nputs $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&refail.stdout), "6\n");
+}
+
+#[test]
+fn a_command_shaped_call_yields_the_status_it_left() {
+    // "No value" stops existing: every call yields one, and for anything
+    // command-shaped that value is how the command went. So `f`, `$(f)` and `f()`
+    // mean the same three things for an external as for a mesh function.
+    // `false()` rather than a `grep` that would eat the script off stdin — the
+    // point is the value a command-shaped call yields, not which command it was.
+    let out = run_with_input(
+        "x = false()\n\
+         puts $x:repr\n\
+         y = puts(1 + 2)\n\
+         puts $y:repr\n\
+         func p() { /bin/false }\n\
+         puts p():repr\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "status(1)\n3\nstatus(0)\nstatus(1)\n"
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // And it publishes its status where running the command any other way
+    // publishes it: arguments evaluate left to right, so a later one reads this
+    // call's `$sh.status` rather than whatever preceded the line.
+    let published = run_with_input(
+        "func show(a, b) { puts $b }\n\
+         show(false(), $sh.status:repr)\n\
+         func p() { /bin/false }\n\
+         show(p(), $sh.status:repr)\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&published.stdout),
+        "status(1)\nstatus(1)\n",
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+
+    // Which also settles the record: a command's `.value` and `.status` agree,
+    // where the value used to hold the failure while the status claimed success.
+    let record = run_with_input(
+        "func p() { /bin/false }\n\
+         r = p():capture\n\
+         puts \"$r.value:repr $r.status:repr\"\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&record.stdout),
+        "status(1) status(1)\n"
+    );
+}
+
+#[test]
+fn a_command_shaped_call_reads_values_where_the_written_command_does() {
+    // A value call on a command runs the same command, so it has to convert its
+    // arguments the same way. The two families that read *values* rather than
+    // argv text are the job builtins, which take the handle itself, and
+    // `puts`/`print`, which render a collection.
+    let job = run_with_input(
+        "j = sh -c 'exit 4' &\n\
+         s = wait($j)\n\
+         puts $s:repr\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&job.stdout)
+            .lines()
+            .last()
+            .unwrap_or_default(),
+        "status(4)"
+    );
+
+    // And a map is still not a job, in the job builtin's own words rather than
+    // the argv rule's advice to spread it.
+    let map = run_with_input("m = [id: 1]\nkill($m)\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&map.stderr).contains("kill: a map is not a job"),
+        "{:?}",
+        map.stderr
+    );
+    assert_eq!(String::from_utf8_lossy(&map.stdout), "after\n");
+
+    // `puts` renders a nested collection through a reference exactly as the
+    // written call does — the reference is a name, not a second rule.
+    let rendered = run_with_input("xs = [[1 2]]\nys = $xs:map(&puts)\nputs $ys:repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&rendered.stdout),
+        "1\n2\n[status(0)]\n",
+        "{}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+}
+
+#[test]
+fn a_status_crosses_the_byte_boundary_wherever_an_int_does() {
+    // The byte-boundary table puts a status beside `int`, so every place an
+    // integer has a canonical decimal form, a status has the same one: a valued
+    // option's payload, a path-type environment list, and argv itself.
+    let out = run_with_input(
+        "func f(--code = 0) { return $code }\n\
+         s = status(5)\n\
+         puts f(--code=$s):repr\n\
+         /bin/echo --code=$s\n\
+         $env.PATH = [status(0), \"/bin\"]\n\
+         puts $env.PATH:repr\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "status(5)\n--code=5\n['0', '/bin']\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+
+    // A map key is the same boundary: a key is bytes, so a status keys and is
+    // looked up under its decimal code, exactly where an integer does.
+    let keys = run_with_input(
+        "s = status(5)\n\
+         m = [$s: found]\n\
+         puts $m:repr\n\
+         n = [5: found]\n\
+         puts ($n)[$s]\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&keys.stdout),
+        "['5': 'found']\nfound\n",
+        "{}",
+        String::from_utf8_lossy(&keys.stderr)
+    );
+}
+
+#[test]
+fn a_later_sibling_stands_on_what_an_earlier_one_left() {
+    // Words and arguments run left to right, and a command-shaped one publishes
+    // the status it left, so the next sibling stands on that rather than on the
+    // status the list began with — the answer the two written on separate lines
+    // give. A sourced file's bare `return` is what reads it.
+    let dir = fresh_dir("bare_return_argument");
+    let sourced = dir.join("bare.mesh");
+    std::fs::write(&sourced, "return\n").expect("write the sourced file");
+    let path = sourced.display();
+
+    // The written form, for the answer the call forms have to match.
+    let written = run_with_input(&format!("false\nx = source(\"{path}\")\nputs $x:repr\n"));
+    assert_eq!(String::from_utf8_lossy(&written.stdout), "status(1)\n");
+
+    // A command's argument list, and a function's — the two places a call
+    // evaluates arguments.
+    let command = run_with_input(&format!("x = puts(false(), source(\"{path}\"))\n"));
+    assert_eq!(
+        String::from_utf8_lossy(&command.stdout),
+        "1 1\n",
+        "{}",
+        String::from_utf8_lossy(&command.stderr)
+    );
+
+    let function = run_with_input(&format!(
+        "func show(_a, b) {{ puts $b:repr }}\nshow(false(), source(\"{path}\"))\n"
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&function.stdout),
+        "status(1)\n",
+        "{}",
+        String::from_utf8_lossy(&function.stderr)
+    );
+
+    // And a written command's own words, where the status standing before the
+    // stage — `true` here — must not be what the second word sees.
+    let words = run_with_input(&format!(
+        "true\n/bin/echo false() source(\"{path}\"):repr\n"
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&words.stdout),
+        "1 status(1)\n",
+        "{}",
+        String::from_utf8_lossy(&words.stderr)
+    );
+
+    // Only a sibling that *runs* something moves it. `status(N)` builds a status
+    // where `re("x")` builds a regex — naming one is not leaving one — so a
+    // constructor between the two does not wipe what the first left.
+    let constructed = run_with_input(&format!(
+        "x = puts(false(), status(0), source(\"{path}\"))\n"
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&constructed.stdout),
+        "1 0 1\n",
+        "{}",
+        String::from_utf8_lossy(&constructed.stderr)
+    );
+}
+
+#[test]
+fn an_assignment_condition_branches_on_a_bound_status() {
+    // A status is the other value-level failure, so it answers here as it does
+    // when it *is* the condition — a nonzero one takes `else` — while `""`, `[]`
+    // and `0` are still present-and-bound, since only `false` is absent.
+    let out = run_with_input(
+        "if s = status(5) { puts success } else { puts \"failure with $s:repr\" }\n\
+         if z = status(0) { puts \"success with $z:repr\" } else { puts failure }\n\
+         if c = sh(\"-c\", \"exit 5\") { puts success } else { puts \"command $c:repr\" }\n\
+         if e = \"\" { puts bound-empty }\n\
+         if n = 0 { puts bound-zero }\n\
+         if b = false { puts bad } else { puts absent }\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "failure with status(5)\nsuccess with status(0)\ncommand status(5)\n\
+         bound-empty\nbound-zero\nabsent\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_background_launch_with_no_handle_yields_a_status() {
+    // Inside a fork there is no job table entry to hand back, so the launch's
+    // own status stands in — as a `Status`, so `if $j` is the condition it is
+    // for a handle rather than the type error a bare int would be.
+    let out = run_with_input("fork { j = sleep 0 &\n puts $j:repr\n if $j { puts ok } }\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "status(0)\nok\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_control_keyword_has_no_call_spelling() {
+    // `return(5)` is not a call: routed to the command dispatch it would build a
+    // `return` with none of the inside-a-function validation the control arm does,
+    // which at top level has nowhere to go. It reports and the script carries on.
+    // `:capture` reaches the same names by a second route, so it is checked too:
+    // classified as a command there, the keyword would be *run* and reach the
+    // same unreachable arm.
+    //
+    // (`not(true)` is in neither set: `not` is a unary operator in value
+    // position, so it is parsed rather than looked up.)
+    for source in [
+        "x = return(5)\n",
+        "x = fail(5)\n",
+        "x = break(1)\n",
+        "x = return(5):capture\n",
+        "x = fail(5):capture\n",
+    ] {
+        let out = run_with_input(&format!("{source}puts after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("is syntax, not a command"),
+            "{source}: {stderr}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{source}");
+    }
+}
+
+#[test]
+fn the_status_command_form_reads_its_operand_as_a_value() {
+    // Both spellings see the operand's **type**, so neither builds a status out of
+    // a string: argv text re-typed after expansion is exactly what the value path
+    // exists to prevent.
+    for source in [
+        "code = \"5\"\nstatus $code\n",
+        "code = \"5\"\nx = status($code)\n",
+    ] {
+        let out = run_with_input(&format!("{source}puts after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("the code must be an integer, not a string"),
+            "{source}: {stderr}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{source}");
+    }
+
+    // A bound integer works through either spelling, and leaves the same value.
+    let bound = run_with_input("code = 5\nstatus $code\nputs \"st=$sh.status\"\n");
+    assert_eq!(String::from_utf8_lossy(&bound.stdout), "st=5\n");
+
+    // It writes nothing and answers with a value, so the positions that would
+    // discard that value say so rather than quietly running.
+    for (source, message) in [
+        ("status 5 | cat\n", "status: cannot be used in a pipeline"),
+        (
+            "status 5 > out\n",
+            "status: cannot be redirected or backgrounded",
+        ),
+    ] {
+        let out = run_with_input(&format!("{source}puts after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source}: {stderr}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("after"),
+            "{source}: after did not run"
+        );
+    }
+}
+
+#[test]
+fn the_status_command_form_answers_the_builtin_words() {
+    // The typed path `status` takes in command position runs in front of the
+    // generic builtin option handling, so it has to read `--help` and `--`
+    // itself — `help status` lists `--help`, and a builtin that documents a flag
+    // it then treats as an operand is the table lying about its own surface.
+    let help = run_with_input("status --help\n");
+    let printed = String::from_utf8_lossy(&help.stdout);
+    assert!(printed.contains("Usage: status CODE"), "{printed}");
+    assert!(printed.contains("--help  Print help"), "{printed}");
+    assert_eq!(String::from_utf8_lossy(&help.stderr), "");
+
+    // A written `--` ends the options and is taken out of the way rather than
+    // counted as an argument of its own.
+    let terminated = run_with_input("status -- 5\nputs $sh.status:repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&terminated.stdout),
+        "status(5)\n",
+        "{}",
+        String::from_utf8_lossy(&terminated.stderr)
+    );
+
+    // Past the terminator `--help` is an operand, and a flag is not a code.
+    let past = run_with_input("status -- --help\nputs after\n");
+    assert!(
+        String::from_utf8_lossy(&past.stderr).contains("the code must be an integer, not a flag"),
+        "{}",
+        String::from_utf8_lossy(&past.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&past.stdout), "after\n");
+}
+
+#[test]
+fn a_capture_record_carries_the_status_rather_than_failing() {
+    // `:capture` asks for a call's channels, so a nonzero result is *data* in the
+    // record rather than a failure of the statement that took it — the same answer
+    // whether the callee was a command, a function, or the constructor. That is
+    // what keeps `$r.status` the place the failure lives, and why the assignment
+    // does not lend it to the statement the way a `$(…)` tail does.
+    for source in [
+        "r = status(5):capture\n",
+        "r = false():capture\n",
+        "func f() { return status 5 }\nr = f():capture\n",
+    ] {
+        let out = run_with_input(&format!(
+            "{source}puts $sh.status:repr\nputs $r.status:code\nr2 = $r\n"
+        ));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next(), Some("status(0)"), "{source}: {stdout}");
+        assert_ne!(lines.next(), Some("0"), "{source}: {stdout}");
+    }
+
+    // So the record's own failure does not run an `||` fallback: the capture
+    // succeeded at capturing.
+    let fallback = run_with_input("r = status(5):capture || puts fallback\nputs $r.status:code\n");
+    assert_eq!(String::from_utf8_lossy(&fallback.stdout), "5\n");
 }
 
 #[test]
@@ -14632,16 +15305,16 @@ fn only_a_lone_numeral_becomes_a_value() {
     assert_eq!(String::from_utf8_lossy(&word.stdout), "true false\n");
 
     // The program is still reachable the way `./42` is — by a spelling that is not a
-    // lone bare word.
+    // lone bare word. `$sh.status` is a `Status`, so that is what the body yields.
     let program = run_with_input("func t() { command -- true\n $sh.status }\nputs t():repr\n");
-    assert_eq!(String::from_utf8_lossy(&program.stdout), "0\n");
+    assert_eq!(String::from_utf8_lossy(&program.stdout), "status(0)\n");
 
     // And a bare word that names a command and is *not* a literal still runs: its
-    // output streams and a function body's result is its status, which is exactly
-    // what `true` did before it became a literal.
+    // output streams and a function body's result is its status **as a value**,
+    // which is exactly what `true` did before it became a literal.
     let ran = run_with_input("func p() { pwd }\nv = p()\nputs \"v=$v:repr\"\n");
     let ran = String::from_utf8_lossy(&ran.stdout);
-    assert!(ran.ends_with("v=0\n"), "{ran:?}");
+    assert!(ran.ends_with("v=status(0)\n"), "{ran:?}");
     assert!(ran.starts_with('/'), "pwd should have streamed: {ran:?}");
 
     // mesh has no float literals, so `3.5` is still just a word — and still a
@@ -15909,12 +16582,13 @@ fn an_integer_result_does_not_become_the_exit_status() {
     // and leaves the exit status at 0. `fail` is what names a status.
     let out = run_with_input("func n() { return 3 }\nn()\n");
     assert_eq!(out.status.code(), Some(0));
-    // In *command* mode the status channel reaches the shell. A value call reads
-    // the value channel instead, so it reports `false`'s status of 1.
+    // `fail` names a status through either spelling: in command mode it reaches
+    // the shell directly, and a value call reads the `Status(3)` it left, whose
+    // own projection is that same 3.
     let failed = run_with_input("func n() { fail 3 }\nn\n");
     assert_eq!(failed.status.code(), Some(3));
     let called = run_with_input("func n() { fail 3 }\nn()\n");
-    assert_eq!(called.status.code(), Some(1));
+    assert_eq!(called.status.code(), Some(3));
 }
 
 #[test]
@@ -16414,9 +17088,10 @@ fn calling_a_value_that_is_not_a_function_is_a_loud_error() {
         ("y = $nope(1)\n", "nope: unbound variable"),
         // A *bare* name still means the function store, not a variable: a lambda
         // needs the `$`, since a bare word is a literal string everywhere else.
+        // So this is a command lookup, and reports what a bare `double` reports.
         (
             "double = func(x) { $x * 2 }\ny = double(5)\n",
-            "double: a command has no return value",
+            "command not found: double",
         ),
     ] {
         let out = run_with_input(&format!("{src}puts after\n"));
@@ -16453,9 +17128,9 @@ fn capture_returns_a_record_of_every_channel() {
          puts \"err=[$r.err]\"\n",
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // `fail` fills the status channel and leaves `false` — mesh's "no result" — in
-    // the value channel.
-    assert!(stdout.contains("v=false s=7"), "{stdout:?}");
+    // `fail` names the status and leaves it as the value too, so the record's two
+    // result fields agree — one channel read two ways, both rendering the number.
+    assert!(stdout.contains("v=7 s=7"), "{stdout:?}");
     // Raw, as written: no trailing-newline trim, unlike `$(…)`, so the record bakes
     // in no split policy.
     assert!(stdout.contains("out=[to-out\n]"), "{stdout:?}");
@@ -16487,10 +17162,9 @@ fn capture_works_on_a_lambda_and_reads_a_captured_field() {
 }
 
 #[test]
-fn capturing_an_external_gives_every_channel_but_the_value() {
-    // The one case where a value call on a command is allowed: it asks for the
-    // channel record, not a return value the command has not got. A nonzero exit is
-    // the answer, not a failure.
+fn capturing_an_external_gives_every_channel() {
+    // A command's `.value` is the `Status` it left, so the record has the same
+    // shape whatever was called. A nonzero exit is the answer, not a failure.
     let out = run_with_input(
         "ok = echo(hello):capture\n\
          bad = false():capture\n\
@@ -16502,15 +17176,15 @@ fn capturing_an_external_gives_every_channel_but_the_value() {
     );
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 
-    // `.value` does not exist for an external, so reading it is a loud
-    // no-such-field — and the script recovers.
-    let missing = run_with_input("r = echo(x):capture\nputs $r.value\nputs after\n");
-    assert!(
-        String::from_utf8_lossy(&missing.stderr).contains("no `value` in this map"),
-        "{:?}",
-        missing.stderr
+    // `.value` is always present — the fixed shape — and holds the same code
+    // `.status` does, since the two are one channel read two ways.
+    let value =
+        run_with_input("r = false():capture\nputs \"$r.value:repr $r.status:repr\"\nputs after\n");
+    assert!(value.stderr.is_empty(), "{:?}", value.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&value.stdout),
+        "status(1) status(1)\nafter\n"
     );
-    assert_eq!(String::from_utf8_lossy(&missing.stdout), "after\n");
 }
 
 #[test]
@@ -16811,8 +17485,6 @@ fn value_call_errors_recover_and_run_the_next_command() {
     // Each bad value call is a recoverable runtime error; the following command
     // still runs.
     for (src, needle) in [
-        // An external command has no return value.
-        ("y = grep(foo)\n", "no return value"),
         // An unknown option name.
         (
             "func f(target, --force) { return $target }\nz = f(x, nope: 1)\n",
@@ -19885,32 +20557,56 @@ fn a_function_reference_resolves_when_it_is_called() {
     );
 }
 
-/// "Is this name resolvable" and "does calling it yield a value" are different
-/// questions, and the errors say which one failed. A builtin and an external are
-/// both perfectly good references that simply have nothing to return — the split
-/// is *returns a value* vs. *runs for effect*, not builtin vs. external.
+/// A reference is a name, so calling one for a value asks what the written call
+/// asks — and **every call yields a value**: a command's is the `Status` it left.
+/// Only a name that resolves to nothing is still a failure.
 #[test]
-fn a_function_reference_in_a_value_slot_needs_something_that_returns() {
-    for (source, message) in [
-        // An effect-only builtin: the same wording a written `puts(1 + 2)` gives.
-        (
-            "xs = [a]\ny = $xs:map(&puts)\n",
-            "puts: a command has no return value",
-        ),
-        // An external, which has no return value at all. `sh` rather than a
-        // prettier name because this has to be a command that really is on `PATH`.
-        ("f = &sh\nputs $f(a)\n", "sh: a command has no return value"),
-        // Resolving to nothing is the separate failure, and names the reference.
-        (
-            "f = &no-such-name-here\nputs $f(a)\n",
-            "&no-such-name-here: no builtin, function, or command with that name",
-        ),
-    ] {
-        let out = run_with_input(source);
-        assert!(!out.status.success(), "{source}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains(message), "{source} gave {stderr}");
-    }
+fn a_function_reference_in_a_value_slot_yields_a_command_status() {
+    // An effect-only builtin runs and leaves `Status(0)`, exactly as a written
+    // `puts(1 + 2)` does. Not *useful* — a list of statuses says nothing — but the
+    // diagnostic that used to catch it is the stated cost of every call having a
+    // value.
+    let mapped = run_with_input("xs = [a]\ny = $xs:map(&puts)\nputs $y:repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&mapped.stdout),
+        "a\n[status(0)]\n",
+        "{}",
+        String::from_utf8_lossy(&mapped.stderr)
+    );
+
+    // An external the same way. `sh` rather than a prettier name because this has
+    // to be a command that really is on `PATH`.
+    let external = run_with_input("f = &sh\nv = $f(\"-c\", \"exit 3\")\nputs $v:repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&external.stdout),
+        "status(3)\n",
+        "{}",
+        String::from_utf8_lossy(&external.stderr)
+    );
+
+    // A reference is an ordinary call, so it both reads and publishes the
+    // standing status: the second `:map` here sees what the first one left,
+    // where a hard-coded `0` would have hidden it.
+    let published = run_with_input(
+        "xs = [x]\nys = $xs:map(&false):map(func(_x) { $sh.status })\nputs $ys:repr\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&published.stdout),
+        "[status(1)]\n",
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+
+    // Resolving to nothing is the failure that remains, and it names the
+    // reference rather than the call.
+    let unresolved = run_with_input("f = &no-such-name-here\nputs $f(a)\n");
+    assert!(!unresolved.status.success());
+    assert!(
+        String::from_utf8_lossy(&unresolved.stderr)
+            .contains("&no-such-name-here: no builtin, function, or command with that name"),
+        "{}",
+        String::from_utf8_lossy(&unresolved.stderr)
+    );
 }
 
 /// A reference skips command position's keyword step, so a keyword names nothing
@@ -20041,9 +20737,10 @@ fn a_function_reference_to_gets_reads_a_line() {
 }
 
 /// The higher-order path has an element in hand rather than an argument list, and
-/// a value call reads its own arguments — so only a declared `func` can be applied
-/// per element. The three failures there are distinct, and each says which one it
-/// is rather than borrowing another's wording.
+/// a value call reads its own arguments — so a value-call builtin still cannot be
+/// applied per element. A **command** can, yielding its status; a name that
+/// resolves to nothing is the other failure. Each says which one it is rather than
+/// borrowing the other's wording.
 #[test]
 fn a_function_reference_applied_per_element_needs_a_function() {
     for (source, message) in [
@@ -20053,12 +20750,7 @@ fn a_function_reference_applied_per_element_needs_a_function() {
             "xs = [\"*.md\"]\ny = $xs:map(&glob)\n",
             "&glob: a value call cannot be applied per element",
         ),
-        // A command: no value to give at all, which is the other failure.
-        (
-            "xs = [a]\ny = $xs:map(&puts)\n",
-            "puts: a command has no return value",
-        ),
-        // And a name that resolves to nothing is the third.
+        // And a name that resolves to nothing is the other.
         (
             "xs = [a]\ny = $xs:map(&no-such-name-here)\n",
             "&no-such-name-here: no builtin, function, or command with that name",
@@ -20126,10 +20818,15 @@ fn a_function_reference_captures_like_the_name_it_stands_for() {
         String::from_utf8_lossy(&external.stderr)
     );
 
-    // A command's record has no `.value` to read, through a reference as much as
-    // through the name.
-    let no_value = run_with_input("f = &puts\nr = $f(\"hi\"):capture\nputs $r.value\n");
-    assert!(!no_value.status.success());
+    // A command's `.value` is the `Status` it left, through a reference as much as
+    // through the name — the record's shape does not depend on what was called.
+    let command_value = run_with_input("f = &puts\nr = $f(\"hi\"):capture\nputs $r.value:repr\n");
+    assert_eq!(
+        String::from_utf8_lossy(&command_value.stdout),
+        "status(0)\n",
+        "{}",
+        String::from_utf8_lossy(&command_value.stderr)
+    );
 
     // `:capture` is defined over the **whole** invocation, so a computed callee is
     // evaluated inside it just as an argument is: what the callee printed on its
@@ -24346,9 +25043,12 @@ fn a_command_line_that_parses_as_an_expression_is_still_a_command() {
     assert_eq!(String::from_utf8_lossy(&spaced.stdout), "3\nafter\n");
     assert!(spaced.stderr.is_empty(), "{:?}", spaced.stderr);
 
-    let attached = run_with_input("r = puts(1 + 2)\nputs after\n");
-    assert!(
-        String::from_utf8_lossy(&attached.stderr).contains("a command has no return value"),
+    // The attached form calls the builtin — it prints, and binds the `Status` it
+    // left, where the spaced form passed `(1 + 2)` as an argument.
+    let attached = run_with_input("r = puts(1 + 2)\nputs $r:repr\nputs after\n");
+    assert_eq!(
+        String::from_utf8_lossy(&attached.stdout),
+        "3\nstatus(0)\nafter\n",
         "attached `(` should be a call on the command: {:?}",
         attached.stderr
     );
@@ -26045,13 +26745,18 @@ fn sh_status_is_the_last_commands_exit_status() {
     let out = run_with_input("puts $sh.status\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
 
-    // Readable everywhere a value is: interpolation, comparison, a guard.
+    // Readable everywhere a value is: interpolation, comparison, a guard. It is a
+    // `Status`, so the comparison is against another `Status` — `== 1` is
+    // cross-type and silently false, which is the stated cost of typing it — and
+    // the short spelling is the condition itself.
     let out = run_with_input("false\nputs \"code $sh.status\"\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "code 1\n");
-    let out = run_with_input("false\nif $sh.status == 1 { puts caught }\n");
+    let out = run_with_input("false\nif $sh.status == status(1) { puts caught }\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "caught\n");
-    let out = run_with_input("false\nputs guarded if $sh.status != 0\n");
+    let out = run_with_input("false\nputs guarded if not $sh.status\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "guarded\n");
+    let out = run_with_input("true\nputs ok if $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
 #[test]
@@ -26080,9 +26785,11 @@ fn sh_pipestatus_breaks_a_pipeline_down_by_stage() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "2 0\n");
 
+    // Each entry is a `Status`, so the failing stages are the ones the condition
+    // rule calls false — `$c != 0` would be cross-type and select every stage.
     let out = run_with_input(
         "sh -c 'exit 3' | sh -c 'exit 0' | sh -c 'exit 7'\n\
-         bad = $sh.pipestatus:filter(func(c) { $c != 0 })\nputs ...$bad\n",
+         bad = $sh.pipestatus:filter(func(c) { not $c })\nputs ...$bad\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "3 7\n");
 
@@ -27150,7 +27857,7 @@ fn unset_removes_a_binding_rather_than_emptying_it() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
 
     // Blocks open no scope, so a binding made inside one is unset from outside.
-    let out = run_with_input("if true { y = 1 }\nunset y\nputs gone if $sh.status == 0\n");
+    let out = run_with_input("if true { y = 1 }\nunset y\nputs gone if $sh.status\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "gone\n");
 }
 

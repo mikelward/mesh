@@ -794,6 +794,12 @@ pub enum Executable {
     Control {
         kind: ControlKind,
         value: Option<Expr>,
+        /// The channel word written after `return`, or `None` where none was —
+        /// see [`Channel`]. `None` rather than `Some(Channel::Value)` for a bare
+        /// `return X` because the two differ in what they *require*: a written
+        /// channel word owes an operand, where a bare `return` may have none.
+        /// Always `None` for the other three kinds, which take no channel word.
+        channel: Option<Channel>,
         guard: Option<Guard>,
     },
     Expression {
@@ -874,6 +880,31 @@ pub enum BindingPattern {
     Ignore,
     Rest(String),
     List(Vec<BindingPattern>),
+}
+
+/// Which channel `return`'s operand fills.
+///
+/// The **channel words** are `status` and `value`, recognized only directly after
+/// `return` (`DESIGN.md` §"Open questions", the status decision). That is not an
+/// exception to the mode rule: `return` is a control keyword rather than a call
+/// site, and `fail 5` / `exit 5` / `break` already carry their own small grammars.
+///
+/// They are positional and reserve nothing — an **attached `(` is a call, never a
+/// channel word**, so `return value 5` is the channel word while `return value(5)`
+/// calls whatever `value` names. That is the discrimination `f arg` vs `f(arg)`
+/// already draws, reused as a one-token lookahead, and it is what keeps `func
+/// value` legal. It falls out the same way for `status`: `return status(5)` is a
+/// plain call to the builtin, which is *why* it and `return status 5` agree
+/// without a special case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// `return X` and `return value X` — the operand *is* the value. Bare
+    /// `return 5` means this, and does not warn: `func f() { 5 }` and `func f() {
+    /// return 5 }` have to be the same thing.
+    Value,
+    /// `return status N` — sugar for `return status(N)`, so the operand is the
+    /// code and the value is the `Status` it names.
+    Status,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4787,13 +4818,66 @@ impl Parser<'_> {
             self.take_word("continue");
             ControlKind::Continue
         };
+        // Only `return` takes a channel word, and only directly after it.
+        let channel = if kind == ControlKind::Return {
+            self.channel_word()
+        } else {
+            None
+        };
         let value = if self.at_command_end() || self.word("if") || self.word("unless") {
+            // A channel word names a channel and still owes an operand — either
+            // word, since a written `return value` that behaved like a bare
+            // `return` would silently hand back the previous result. Neither
+            // binds the string it used to.
+            match channel {
+                Some(Channel::Status) => {
+                    return Err(
+                        self.error(ParseErrorKind::Expected("a status code after `status`"))
+                    );
+                }
+                Some(Channel::Value) => {
+                    return Err(self.error(ParseErrorKind::Expected("a value after `value`")));
+                }
+                None => {}
+            }
             None
         } else {
             Some(self.expression()?)
         };
         let guard = self.guard()?;
-        Ok(Executable::Control { kind, value, guard })
+        Ok(Executable::Control {
+            kind,
+            value,
+            channel,
+            guard,
+        })
+    }
+
+    /// The channel word directly after `return`, consumed if there is one.
+    ///
+    /// A word with an **attached `(`** is a call and never a channel word, which
+    /// is the whole of the ambiguity rule: `return value(5)` calls `value`, and
+    /// `return status(5)` calls the builtin. See [`Channel`].
+    fn channel_word(&mut self) -> Option<Channel> {
+        for (word, channel) in [("status", Channel::Status), ("value", Channel::Value)] {
+            if self.word(word) && !self.call_paren_follows(1) {
+                self.position += 1;
+                return Some(channel);
+            }
+        }
+        None
+    }
+
+    /// Is the token `offset` ahead a `(` **abutting** the token before it — the
+    /// signal that separates a call from a word followed by a group?
+    fn call_paren_follows(&self, offset: usize) -> bool {
+        let (Some(previous), Some(token)) = (
+            self.tokens.get(self.position + offset - 1),
+            self.tokens.get(self.position + offset),
+        ) else {
+            return false;
+        };
+        matches!(token.value, TokenKind::LParen) && token.span.start == previous.span.end
     }
 
     /// Counted like [`Parser::primary`], and separately from it, because a
@@ -7432,6 +7516,7 @@ const MODIFIER_NAMES: &[&str] = &[
     "bool",
     "capture",
     "captures",
+    "code",
     "ctime",
     "d",
     "dedup",

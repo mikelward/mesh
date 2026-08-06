@@ -293,6 +293,9 @@ fn serialize(key: &str, value: Value) -> Result<String, String> {
         Value::Styled(styled) => styled.text,
         Value::Integer(number) => number.to_string(),
         Value::Boolean(flag) => flag.to_string(),
+        // Decimal, beside `int`: a status wraps a number and the byte boundary is
+        // where the type stops mattering.
+        Value::Status(code) => code.to_string(),
         // The environment carries bytes and a flag has them, so it crosses as
         // the word it was written with -- the argv rule, one boundary over.
         Value::Flag(flag) => flag.text(),
@@ -336,6 +339,9 @@ fn join_path(key: &str, entries: Vec<Value>) -> Result<String, String> {
             Value::String(text) => parts.push(text),
             Value::Integer(number) => parts.push(number.to_string()),
             Value::Boolean(flag) => parts.push(flag.to_string()),
+            // Decimal, exactly as the top level of this function renders one:
+            // a status has the same canonical byte form an int has.
+            Value::Status(code) => parts.push(code.to_string()),
             // A flag crosses as the word it was written with, exactly as it does
             // at the top level of this same function -- and as it did before it
             // was a type, when `--foo` in a path list was simply a string.
