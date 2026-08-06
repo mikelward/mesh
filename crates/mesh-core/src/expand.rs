@@ -458,11 +458,37 @@ pub fn written_of(word: &Word, vars: &Vars) -> Written {
             None => return Written::Data,
         },
     };
+    written_of_value(&value)
+}
+
+/// The mark a value carries when it stands as a call argument of its own.
+fn written_of_value(value: &Value) -> Written {
     match value {
         Value::Flag(_) => Written::Flag,
         Value::FlagTerminator => Written::Terminator,
         _ => Written::Data,
     }
+}
+
+/// The marks a **spread** word contributes, one per element — `None` when the
+/// word is not a spread.
+///
+/// `...$args` promotes every element to a call argument of its own, so each
+/// element is at the top level [`Written`] asks about and answers for itself.
+/// Asking the word instead says `Data`, which is right for the list and wrong
+/// for what the spread just made of it: `w --help` reaching
+/// `wrapper func w(...args) { puts ...$args }` has to arrive at `puts` as the
+/// flag it was written as. An **unspread** collection is still displayed data —
+/// `[--help]` keeps its flag one element down, which is what [`written_of`]
+/// says of it. Raised in review.
+pub fn spread_written(word: &Word, vars: &Vars) -> Option<Vec<Written>> {
+    let vref = spread_var(word)?;
+    // Anything other than a list is an error the caller's own expansion
+    // reports; this only classifies, so it declines rather than guessing.
+    let Ok(Value::List(values)) = resolve_value(vref, vars) else {
+        return None;
+    };
+    Some(values.iter().map(written_of_value).collect())
 }
 
 pub fn expand(words: Vec<Word>, vars: &Vars) -> Result<Vec<String>, ExpandError> {

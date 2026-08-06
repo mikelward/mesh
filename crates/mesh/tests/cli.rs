@@ -29748,3 +29748,32 @@ fn a_stored_stage_keeps_the_options_its_call_site_wrote() {
     );
 }
 
+/// A spread promotes each element to a call argument of its own, so each one
+/// answers the written-option question for itself. Marking every entry from the
+/// containing list said `Data` for all of them, and a forwarding wrapper lost the
+/// flag and the terminator it was handed: `w --help` printed `--help` instead of
+/// reaching the callee's help.
+#[test]
+fn a_spread_element_carries_the_option_it_was_written_as() {
+    let wrapper = "wrapper func w(...args) { puts ...$args }\n";
+    assert!(
+        String::from_utf8_lossy(&run_with_input(&format!("{wrapper}w --help\n")).stdout)
+            .contains("Usage: puts"),
+    );
+    // The terminator travels the same way, so the operand it protects is printed
+    // rather than the help it would otherwise ask for.
+    assert_eq!(
+        String::from_utf8_lossy(&run_with_input(&format!("{wrapper}w -- --help\n")).stdout),
+        "--help\n"
+    );
+    // Ordinary elements are unaffected, and an *unspread* collection is still
+    // data being displayed — the flag in it is one element down.
+    assert_eq!(
+        String::from_utf8_lossy(&run_with_input(&format!("{wrapper}w a b\n")).stdout),
+        "a b\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_with_input("x = [--help]\nputs $x\n").stdout),
+        "--help\n"
+    );
+}
