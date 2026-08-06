@@ -294,6 +294,11 @@ pub enum ParseErrorKind {
     /// `_ = value` — the discard used as a place. It is a *pattern element*, so it
     /// has a position to discard only inside one.
     DiscardAssignment,
+    /// An assignment reaching *into* an environment entry — `$env.PATH[0] = …`,
+    /// `$env.HOME.x = …`. What a write replaces is the entry, so the place is the
+    /// entry itself; the pair is the reference as written and the entry it reaches
+    /// into.
+    EnvEntryPlace(String, String),
     /// A quoted command after `alias NAME =` — `alias ll = 'ls -l'`. bash needs
     /// the quotes because its alias body is a *string*; mesh's is real syntax,
     /// so they turn the command into one word naming no program.
@@ -475,6 +480,12 @@ impl std::fmt::Display for ParseError {
                 "syntax error: `_` discards a position and binds nothing, so there is \
                  nothing to assign to; name it, or drop the `_ =` to run the value for \
                  its effect"
+            ),
+            ParseErrorKind::EnvEntryPlace(reference, entry) => write!(
+                f,
+                "syntax error: `{reference}` is not somewhere to assign; a write \
+                 replaces the whole environment entry, so assign `{entry}` — read it, \
+                 change what you want, and write it back"
             ),
             ParseErrorKind::QuotedAliasCommand(text) => write!(
                 f,
@@ -3005,6 +3016,14 @@ impl Parser<'_> {
             }
             self.position = assignment_start;
         }
+        // After `env_target`, which claims every `$env` place it recognizes, so what
+        // is left here is a reference reaching past one — and only when an
+        // assignment follows, leaving `puts $env.PATH[0]` the read it already is.
+        if let Some((reference, entry)) = self.env_reach()
+            && self.assignment_follows(1)
+        {
+            return Err(self.error(ParseErrorKind::EnvEntryPlace(reference, entry)));
+        }
         if let Some(target) = self.member_target() {
             if matches!(
                 self.peek().map(|token| &token.value),
@@ -4319,6 +4338,82 @@ impl Parser<'_> {
         };
         self.next();
         Some(key)
+    }
+
+    /// An `$env` reference that reaches **into** an entry — `$env.PATH[0]`,
+    /// `$env.HOME.x`, `$env[$k][0]` — as the text written and the entry under it.
+    ///
+    /// `env_target` above declines these, since what a write replaces is a whole
+    /// entry, and `member_target` below excludes `$env` outright. So the word fell
+    /// through to an ordinary expression and the complaint landed on the `=` as
+    /// `expected a statement separator`, naming neither the entry nor the rule —
+    /// the same shape of complaint `member_target` already answers for `$sh`.
+    ///
+    /// Only an *access* counts. A trailing modifier (`$env.PATH:upper = …`) names a
+    /// derived value rather than a place, which is the wider complaint every
+    /// `$xs:dedup = …` shares, and a slice (`$env[1..2]`) names a copy of a run of
+    /// entries rather than one entry to point at.
+    fn env_reach(&self) -> Option<(String, String)> {
+        let TokenKind::Word(word) = &self.peek()?.value else {
+            return None;
+        };
+        let [
+            WordPiece::Variable {
+                name,
+                quote: QuoteMode::Bare,
+            },
+        ] = word.pieces.as_slice()
+        else {
+            return None;
+        };
+        let braced = name
+            .strip_prefix("${")
+            .and_then(|value| value.strip_suffix('}'));
+        let rest = braced
+            .or_else(|| name.strip_prefix('$'))?
+            .strip_prefix("env")?;
+        let (access, after) = if let Some(member) = rest.strip_prefix('.') {
+            let end = member.find(['.', '[', ':']).unwrap_or(member.len());
+            if !valid_name(&member[..end]) {
+                return None;
+            }
+            (format!(".{}", &member[..end]), &member[end..])
+        } else if rest.starts_with('[') {
+            let end = subscript_end(rest)?;
+            if rest[1..end - 1].contains("..") {
+                return None;
+            }
+            (rest[..end].to_owned(), &rest[end..])
+        } else {
+            return None;
+        };
+        if !after.starts_with(['.', '[']) {
+            return None;
+        }
+        // Walk what is left the way `member_target` does, so a `:` *anywhere* past
+        // the entry declines rather than only one written directly after it. The
+        // braced spelling is why this has to be structural: `${env.PATH[0]:upper}`
+        // is one word whose text carries the whole chain, where the unbraced
+        // `$env.PATH[0]:upper` arrives as separate pieces and never matched above —
+        // so without the walk the two spellings of one reference disagreed.
+        let mut rest = after;
+        while !rest.is_empty() {
+            if rest.starts_with('[') {
+                rest = &rest[subscript_end(rest)?..];
+                continue;
+            }
+            let member = rest.strip_prefix('.')?;
+            let end = member.find(['.', '[', ':']).unwrap_or(member.len());
+            rest = &member[end..];
+        }
+        // Spelled the way the reference was, so the advice can be pasted over what
+        // is written rather than translated first.
+        let entry = if braced.is_some() {
+            format!("${{env{access}}}")
+        } else {
+            format!("$env{access}")
+        };
+        Some((name.clone(), entry))
     }
 
     /// A `$name.member` / `$name[index]` **place** for an assignment, handed on as
