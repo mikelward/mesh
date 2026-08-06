@@ -5565,6 +5565,66 @@ command's lifetime, `wait` only **observes** a job someone else started.
       a shell where `timeout` prefixes a stage and `time` prefixes a pipeline
       would be arbitrary. Whichever way this goes, both follow it.
 
+- [ ] **A command that daemonizes still outlives `timeout`.** A `SIGTERM`
+      handler that forks a child which calls `setsid()` puts that child in a
+      session and group created *during* the grace, so it is in no snapshot and
+      no group the sweep can name. Reproduced 10/10 with a C handler; a `sh`
+      trap doing the same loses the race and dies, which is why it reads as
+      intermittent from the shell.
+
+      Two more limits belong with it, for the same reason and with the same
+      answer. A group made and orphaned inside one rescan interval is missed,
+      because polling samples rather than observes. And the sweep's ownership
+      check is a snapshot read before a `kill`: if the last member exits in
+      between, the id is free and could in principle name a new group by the
+      time the signal lands. The same reuse can happen *earlier* — a group that
+      empties during the grace frees its id, and a stranger can take it, make a
+      group of it and leave peers behind. That one is not closed either.
+      Watching for the empty moment across the grace's rescans was tried and
+      reverted: it cost the escaped-survivor case — a certain, reproducible
+      failure traded for a narrow one — which CI caught and the local suite did
+      not. Nothing in userspace closes that — `pidfd` names a
+      process, not a group — so every `kill(-pgid)` in every shell's job control
+      carries it.
+
+      One more sits beside them. A group `kill` reports success once it has
+      signalled a single permitted member, so a group holding both an ordinary
+      child and one that has changed credentials returns zero while the second
+      is untouched. Checking the group afterwards is the obvious answer and the
+      wrong one: `SIGKILL` is not synchronous and a killed member answers the
+      probe until it is reaped, so the check fires on every ordinary expiry —
+      measured, five times out of five. Telling a dying member from a live one
+      needs process *state* carried out of the enumeration on all three
+      platforms, which is its own change.
+
+      And one about the table rather than the groups in it. An enumeration can
+      omit a process outright instead of failing to inspect it: Linux
+      `hidepid=2` drops the whole `/proc` directory of a process this user may
+      not see, and FreeBSD's `security.bsd.see_other_uids=0` does the same to
+      `KERN_PROC_ALL`. There is then no row for `unreadable` to count, so a
+      short table reads as a complete one. Half of this is closed — a process
+      this run *recorded* and can no longer see is asked about directly, and
+      only `ESRCH` is taken for gone, so concealment is told from exit and
+      counted. The timed child gets the same treatment at snapshot time, where
+      its absence is proof rather than inference: this process forked it and has
+      not reaped it, so the pid cannot have been recycled. What stays open is a
+      descendant *born* concealed — forked by a privileged helper that had
+      already changed credentials — which appears in no scan and was never
+      recorded, so there is nothing to ask about. Detecting the mount option
+      instead was considered and rejected: it is a property of the system rather
+      than of this run, so it would say "possibly degraded" on every expiry on
+      such a host while saying nothing about whether anything of this run's was
+      actually hidden.
+
+      Not a gap in the sweep — a limit of every snapshot-based approach, and the
+      same one `timeout(1)` has. Re-scanning during the grace does not close it:
+      the child detaches in microseconds and its parent exits immediately, so
+      there is no moment at which it is both traceable and still ours. Closing
+      it properly needs a different mechanism that keeps a name on descendants
+      the process table cannot: a cgroup, or `PR_SET_CHILD_SUBREAPER` so
+      re-parented descendants come back as this shell's own children. Both are
+      Linux-only and neither belongs in the enumeration — a separate change.
+
 - [ ] **`timeout`'s signal and escalation should be the caller's choice.** On
       expiry it sends `SIGTERM` to the timed group, gives it 200ms, and `SIGKILL`s
       what is left. `timeout(1)` splits those into `-s` and `--kill-after`, and
@@ -5576,32 +5636,48 @@ command's lifetime, `wait` only **observes** a job someone else started.
       default for something whose point is to come back, but the 200ms and the
       signal are both guesses that belong to the caller.
 
-- [ ] **A nested `timeout`'s group escapes the outer one's escalation, and no
-      arrangement of process groups fixes it.** `timeout 100ms timeout 30s
-      sh -c 'trap "" TERM; sleep 1; …'` reports `124` and the command runs on:
-      each bounded run makes its own group, so the outer expiry kills the inner
-      *supervisor*, whose handler forwards `TERM` and dies — and the trapping
-      command survives in a group the outer supervisor cannot name. Its drain
-      finds the outer group empty and stops there.
+- [x] **A nested `timeout`'s group escapes the outer one's escalation.**
+      `timeout 100ms timeout 30s sh -c 'trap "" TERM; sleep 1; …'` reported
+      `124` and the command ran on: each bounded run makes its own group, so the
+      outer expiry killed the inner *supervisor*, whose handler forwarded `TERM`
+      and died — and the trapping command survived in a group the outer drain
+      could not name.
 
-      Both ways of rearranging the groups trade one leak for the other, which is
-      why this is written down rather than patched again:
+      **Closed**, by enumerating the process tree beside the group rather than
+      instead of it. The entry above used to say the tree could *replace* the
+      group and delete the signal handoff with it; that was wrong, and the
+      reason is worth keeping: a descendant that double-forks re-parents to
+      init, and re-parenting does not change a process group, so the group still
+      catches what ancestry has already lost. The two reach different things and
+      both are needed.
 
-      - **Nested groups** (today) — the outer cannot reach the inner group, so
-        the *outer* limit leaks when the inner command refuses to stop.
-      - **One shared group** for every level — the outer reaches everything, but
-        the inner supervisor is then *inside* the group it must kill. It can
-        exclude itself from the broadcast by ignoring the signal, but not from
-        the emptiness test that decides whether to escalate, so the *inner*
-        limit leaks instead.
+      The snapshot is taken **before** anything is signalled, because the parent
+      links that name those processes are destroyed by the signalling itself —
+      by the time the inner supervisor has died there is no path from the outer
+      child down to the survivor.
 
-      The real answer is to stop asking a process group to mean "the tree this
-      command started" and enumerate the tree: `/proc` on Linux, `sysctl`
-      `KERN_PROC_ALL` on macOS and FreeBSD. That also removes the whole signal
-      handoff — `exec::TimedGroup` exists only because the timed command sits
-      outside the job's signal domain — so it is a simplification rather than
-      another mechanism. It is a separate change: process enumeration is a new
-      platform surface, and every target has to grow it at once.
+      Nothing is signalled *from* the snapshot. The handoff already carries the
+      request down through nested supervisors, and asking again from here
+      delivered it twice — standard signals coalesce only while pending, so a
+      handler that already ran sees the second as fresh. What the handoff cannot
+      do is insist, because the supervisor that would have escalated is itself
+      dying, so the snapshot supplies only the `SIGKILL` sweep after the grace.
+
+      The sweep names **groups**, not pids, and dates each one by its *leader*:
+      a group id is the leader's pid, so a live process wearing it that began at
+      a different moment is somebody else's. Asking instead that a snapshotted
+      process still be a member is the obvious check and the wrong one — the
+      members are exactly what the grace was spent persuading to leave, and the
+      escaped child the sweep exists to reach was born after the snapshot. That
+      version passed locally and failed on CI, where the trapping shell exits a
+      little sooner.
+
+      `mesh-platform` grew the enumeration — `/proc` on Linux, `libproc` on
+      macOS (`libc` does not expose `kinfo_proc` there at all), `sysctl`
+      `KERN_PROC_ALL` on FreeBSD. Only Linux is tested; the other two are
+      compile-checked against their targets, which is tolerable because the walk
+      is *harmless* when wrong rather than dangerous: nothing is reachable from
+      this process's own child through parent links that are absent or nonsense.
 
 - [x] **`timeout` in a pipeline stage loses value fidelity.** A pipeline stage
       resolved its command from argv, where a list has already been flattened,

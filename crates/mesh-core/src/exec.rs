@@ -2937,6 +2937,15 @@ unsafe fn forward_to_timed_group(signal: libc::c_int) {
 /// the whole promise of the builtin at a prompt is that it comes back.
 const TIMED_GROUP_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// How often the grace is interrupted to look for a group made during it.
+///
+/// Short enough that a supervisor which creates a group and exits inside one
+/// interval is the exception rather than the rule, long enough that a nested
+/// expiry costs a handful of passes over the process table rather than a spin.
+/// Polling cannot make it airtight — `TODO.md` carries the mechanisms that
+/// would.
+const TIMED_GROUP_RESCAN: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// End the run the limit ran out on: ask the group to go, then insist.
 ///
 /// The `SIGTERM` is a request, and a request has two ways of going unanswered.
@@ -2952,6 +2961,64 @@ const TIMED_GROUP_GRACE: std::time::Duration = std::time::Duration::from_millis(
 /// *again* still ends: the escalation cannot be refused, and only the reap that
 /// follows it is unbounded.
 fn end_timed_run(pid: libc::pid_t, own_group: bool) {
+    // Taken **before** anything is signalled, and that order is the whole point:
+    // the parent links that name these processes are destroyed by the kill
+    // itself. A nested `timeout` puts its own command in a group this process
+    // cannot name, and once the supervisor between them dies there is no
+    // ancestry left to find the survivors by.
+    //
+    // Nothing is signalled *from* it. The snapshot exists only to learn which
+    // process groups belong to this run, so the escalation below has something
+    // to name; the request itself travels the way it always has.
+    // The high-water mark of entries no scan in this expiry could inspect. One
+    // of them can be this run's own — a command is free to exec a privileged
+    // helper and change its credentials, at which point it stops being readable
+    // while remaining a descendant — so a `124` implying the limit reached
+    // everything would be a claim this run cannot support.
+    let mut hidden = 0;
+    let tree = if own_group {
+        // Reported rather than swallowed. An unreadable process table is not
+        // "this command had no descendants" — it means the limit falls back to
+        // the process group alone, which cannot reach a nested `timeout`'s own
+        // group, and the `124` that follows would otherwise claim an
+        // enforcement that did not happen.
+        match mesh_platform::descendants(pid) {
+            Ok(read) => {
+                // Carried rather than reported here: the rescans and the final
+                // read can each turn up entries this one did not, so the whole
+                // expiry is judged together and spoken about once.
+                // An enumeration can omit a process outright rather than fail to
+                // inspect it — under Linux `hidepid=2` the whole directory of a
+                // process this user may not see is absent from `/proc`, so a
+                // command that execs a privileged helper and changes credentials
+                // leaves no row for `unreadable` to count. The timed child is
+                // the one case where its absence proves that: this process
+                // forked it and has not reaped it, so the pid cannot have been
+                // recycled and the process must still be there.
+                //
+                // Combined with `max` and not added, for the reason the rescans
+                // use `max`: under `hidepid=1` the child's directory is listed
+                // and its `stat` refused, so it is *already* in `unreadable` and
+                // also missing from the tree. Summing would report one hidden
+                // process as two.
+                let missing = usize::from(!read.processes.iter().any(|entry| entry.pid == pid));
+                hidden = read.unreadable.max(missing);
+                read.processes
+            }
+            Err(err) => {
+                note!(
+                    "mesh: timeout: cannot read the process table ({err}); a nested timeout's command may outlive this limit"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    // After the enumeration, not before it: reading the process table can cost a
+    // material part of the grace on a host with a large one, and the grace is a
+    // promise to the *command* — the time it gets to leave on its own, measured
+    // from being asked.
     let deadline = std::time::Instant::now() + TIMED_GROUP_GRACE;
     // SAFETY: scalar arguments naming this process's own child, and the negated
     // form only where `setpgid` made it a leader.
@@ -2964,9 +3031,508 @@ fn end_timed_run(pid: libc::pid_t, own_group: bool) {
     if own_group {
         drain_timed_group(pid, deadline);
     }
+    hidden = hidden.max(kill_stray_groups(&tree, pid, deadline));
+    if hidden > 0 {
+        note!(
+            "mesh: timeout: {hidden} processes could not be inspected; a nested timeout's command may outlive this limit"
+        );
+    }
     // Nothing left can refuse, so this one waits as long as it needs to and the
     // child is reaped rather than left a zombie.
     let _ = wait_for_job(pid, OnInterrupt::Resume, None);
+}
+
+/// `SIGKILL` the groups under this run that the group kill above could not name.
+///
+/// Only the escalation, never the request: a nested supervisor forwards the
+/// `SIGTERM` to its own group on its way out (see [`hand_off_timed_group`]), so
+/// asking again from here would deliver the same request twice — standard
+/// signals coalesce only while pending, and a handler that already ran sees the
+/// second one as a fresh request. What the handoff *cannot* do is insist,
+/// because the supervisor that would have escalated is itself dying. That is
+/// the gap this closes.
+///
+/// Groups rather than pids, and that is what makes it hold. A `SIGTERM` handler
+/// is free to double-fork, and the moment the intervening child exits the
+/// survivor is reparented to init — no ancestry left to find it by, at which
+/// point a walk over remembered parents has already lost. `fork` does not change
+/// the process group, and neither does reparenting, so the survivor is still a
+/// member of a group this run recorded.
+///
+/// The grace is waited out *here* as well as in [`drain_timed_group`], and that
+/// is not belt and braces. `drain_timed_group` returns as soon as the **timed**
+/// group is empty, which a nested supervisor makes happen almost at once — it
+/// forwards the request and exits. Sweeping straight afterwards gave the nested
+/// command no grace at all: a handler that runs immediately got in, while a
+/// shell that defers its trap until the running command finishes was killed
+/// before it ever acted on the request. The command a nested `timeout` bounds
+/// gets the same chance to leave on its own as any other.
+fn kill_stray_groups(
+    tree: &[mesh_platform::Process],
+    own: libc::pid_t,
+    deadline: std::time::Instant,
+) -> usize {
+    if tree.is_empty() {
+        return 0;
+    }
+    // Returned rather than reported here, so one expiry produces one line
+    // however many scans it took.
+    let mut hidden = 0;
+    // Whether any scan came back short. A short table cannot be used to conclude
+    // that there is nothing left to wait for.
+    let mut partial = false;
+    let mut tree = tree.to_vec();
+    // Seeded with the snapshot rather than left empty. If the very first rescan
+    // fails there is otherwise nothing to compute the pending groups from, so
+    // the grace below is skipped entirely and the command is killed moments
+    // after being asked — the failure costing the *command* its time rather than
+    // costing this run its discovery.
+    let mut latest = tree.clone();
+    // Group ids the last scan proved are worn by something alive that it could
+    // not show. Carried alongside `latest`, since a group is only this run's own
+    // if its leader can be dated, and these are exactly the ones that cannot.
+    let mut hiding: Vec<libc::pid_t> = Vec::new();
+    // The previous scan, so a newcomer must appear in two consecutive reads
+    // before it is adopted. One read is not a moment — a parent can be read,
+    // its pid reused, and a stranger's child read later in the same scan — and
+    // the loop is already re-reading, so the confirmation costs an interval
+    // rather than another pass over the table.
+    let mut before: Option<Vec<mesh_platform::Process>> = None;
+    loop {
+        match mesh_platform::processes() {
+            Ok(read) => {
+                hidden = hidden.max(read.unreadable);
+                partial |= read.unreadable > 0;
+                let table = read.processes;
+                let agreed = match &before {
+                    Some(earlier) => mesh_platform::agreed(earlier, &table),
+                    None => Vec::new(),
+                };
+                before = Some(table.clone());
+                let table = agreed;
+                // Discovery, not signalling. A supervisor caught mid-start can
+                // put its command in a *new* group after the snapshot was taken
+                // but before the request reaches it, and that group is in no
+                // list this run holds. It is an ordinary descendant while its
+                // parent lives, so the grace is spent watching for it rather
+                // than only waiting it out.
+                follow_new_descendants(&mut tree, &table);
+                // Once nothing recorded is still running, nothing recorded can
+                // become a parent, so no later scan could find anything new.
+                // A *complete* table saying nothing recorded is alive means
+                // discovery is genuinely over. A partial one says only that
+                // this scan could not see them: a process that changed
+                // credentials is hidden, not gone, and treating that as
+                // finished ends both the discovery and the grace early — the
+                // second being the command's, not this run's, to lose.
+                let seen_now = before.as_deref().unwrap_or(&table);
+                let discoverable = tree.iter().any(|entry| is_live(entry, seen_now));
+                // A recorded process missing from the table has almost always
+                // exited, which is the ordinary case and says nothing. But an
+                // enumeration can also omit one outright — `hidepid=2` drops the
+                // whole `/proc` directory of a process this user may not see, so
+                // a descendant that changes credentials mid-run vanishes with
+                // nothing left for `unreadable` to count. The kernel tells the
+                // two apart where the table cannot: only `ESRCH` means gone.
+                let concealed: Vec<libc::pid_t> = vanished(&tree, seen_now)
+                    .into_iter()
+                    .filter(|pid| still_there(*pid))
+                    .collect();
+                // The larger of the two, never their sum. A recorded descendant
+                // whose `stat` was refused rather than omitted is already in
+                // `read.unreadable` *and* missing from the table, so under
+                // `hidepid=1` it lands in both counts; adding them would name
+                // one process twice. There is no pid list to subtract with —
+                // the platforms report a count — so the overlap is absorbed by
+                // taking the larger, which is exact whenever one set contains
+                // the other and never overstates when it does not.
+                hidden = hidden.max(read.unreadable).max(concealed.len());
+                partial |= !concealed.is_empty();
+                let complete = read.unreadable == 0 && concealed.is_empty();
+                latest = seen_now.to_vec();
+                hiding = concealed;
+                if !discoverable && complete {
+                    break;
+                }
+            }
+            Err(err) => {
+                // Not swallowed by the loop condition: a scan this run could not
+                // make is a window it did not watch, and a group made and
+                // orphaned inside it outlives the limit while `124` says
+                // otherwise.
+                note!(
+                    "mesh: timeout: cannot read the process table ({err}); a group made while this limit expired may outlive it"
+                );
+                // A scan that could not be made is a scan that showed nothing,
+                // which is the same standing as one that came back short: it is
+                // no basis for concluding there is nothing left to wait for. The
+                // grace belongs to the *command*, and the run losing its sight
+                // is not a reason to take it away — without this the wait below
+                // is skipped whenever the pending list happens to be empty, and
+                // a group discovered by the final reads is killed on the instant
+                // rather than after the 200ms it was promised.
+                partial = true;
+                break;
+            }
+        }
+        let next = std::time::Instant::now() + TIMED_GROUP_RESCAN;
+        if next >= deadline {
+            break;
+        }
+        // Bounded on purpose. Nothing here is this process's child, so no
+        // `SIGCHLD` announces a group appearing or emptying, and waiting on the
+        // deadline alone is one long sleep with no scan inside it — a group made
+        // and orphaned during that sleep is unreachable by the time it ends.
+        reaper::wait_for_change_until(next);
+    }
+    // Leaving the loop early ends *discovery*, not the grace. A command whose
+    // recorded ancestors have all been reaped is exactly the double-fork
+    // survivor this exists to reach, and it is owed the rest of the time it was
+    // promised to leave on its own before anything insists.
+    // The same scan in both roles: `latest` is a raw reading, which is weaker
+    // evidence than the final call may act on, and nothing here does — this list
+    // decides only how long to wait.
+    let pending = groups_to_sweep(&tree, &latest, &latest, own, &hiding);
+    while (!pending.is_empty() || partial)
+        && std::time::Instant::now() < deadline
+        && (partial || pending.iter().any(group_is_alive))
+    {
+        if !reaper::wait_for_change_until(deadline) {
+            break;
+        }
+    }
+    // Re-read rather than reusing a table from the loop: the grace has just
+    // given every pid in it time to be reaped and handed to somebody else. A
+    // table that cannot be read is no excuse to guess — without one there is no
+    // way to show a group is this run's own, and killing one that is not is the
+    // worse outcome by far.
+    let (table, shown) = match (mesh_platform::processes(), mesh_platform::processes()) {
+        (Ok(read), Ok(again)) => {
+            // What gets a `SIGKILL` comes from the rows the two reads *agree*
+            // on, because that is an identity claim and one read cannot support
+            // it. Whether a scan was shown a pid is a different question, and
+            // agreement is the wrong instrument for it — see [`Settled`]. The
+            // grace loop above asks visibility of its raw scan; this is its twin.
+            let settled = settled(read, again);
+            hidden = hidden.max(settled.unreadable);
+            (settled.agreed, settled.shown)
+        }
+        (Err(err), _) | (_, Err(err)) => {
+            note!(
+                "mesh: timeout: cannot read the process table ({err}); a nested timeout's command may outlive this limit"
+            );
+            return hidden;
+        }
+    };
+    follow_new_descendants(&mut tree, &table);
+    // Asked again here, and not only in the loop above: a recorded member can
+    // change credentials after the last rescan and before these reads, and then
+    // both of them omit it while reporting nothing unreadable. Its group looks
+    // uninhabited, so the sweep passes over it, and without this the `124` would
+    // go out with no hint that anything was missed.
+    //
+    // Counted, never swept. Naming a group on the strength of a member no table
+    // shows would be killing on weaker evidence than the ownership check demands
+    // — the one mistake here that costs somebody else's processes rather than
+    // this run's own survivor.
+    let concealed: Vec<libc::pid_t> = vanished(&tree, &shown)
+        .into_iter()
+        .filter(|pid| still_there(*pid))
+        .collect();
+    hidden = hidden.max(concealed.len());
+    for group in groups_to_sweep(&tree, &table, &shown, own, &concealed) {
+        // SAFETY: a group id `groups_to_sweep` has confirmed is led by a
+        // process this run snapshotted and is not wearing somebody else's.
+        if unsafe { libc::kill(-group, libc::SIGKILL) } != 0 {
+            let err = std::io::Error::last_os_error();
+            // The group emptied between the table and this call — the outcome
+            // that was wanted, reached without help.
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            // Anything else means the escalation did not happen. `SIGKILL`
+            // cannot be refused by the target, so a failure here is the shell
+            // being unable to *reach* it — a command that changed credentials,
+            // say — and the `124` about to be reported would otherwise present
+            // an unenforced limit as a finished run.
+            note!(
+                "mesh: timeout: cannot end the timed command's process group ({err}); it may still be running"
+            );
+        }
+    }
+    hidden
+}
+
+/// What two consecutive readings of the process table settle on.
+///
+/// The three answers are kept together because picking the wrong one of them for
+/// a question is how this went wrong twice: `agreed` is an *identity* claim,
+/// `shown` is a *visibility* claim, and they are not interchangeable.
+struct Settled {
+    /// The rows both reads support — what may be acted on.
+    agreed: Vec<mesh_platform::Process>,
+    /// The worse of the two blind spots.
+    unreadable: usize,
+    /// Every pid the **later** read reported, whoever was wearing it.
+    shown: Vec<mesh_platform::Process>,
+}
+
+/// Reconcile two consecutive readings of the process table.
+///
+/// Two reads for the same reason `descendants` takes two — a single walk of
+/// `/proc` can pair a stale parent with a stranger's child, and `agreed` decides
+/// what gets a `SIGKILL`. `read` is the earlier of the pair.
+///
+/// `shown` is the later read alone, and neither the union nor the earlier one.
+/// The union answers "was this pid ever reported", which is the wrong question:
+/// a pid visible in the first read and hidden by the second is concealed *now*,
+/// and calling it shown withdraws the veto that keeps the sweep off a group it
+/// can no longer identify. The earlier read alone is wrong in the other
+/// direction, calling a pid concealed when the latest look plainly had it.
+fn settled(read: mesh_platform::Table, again: mesh_platform::Table) -> Settled {
+    Settled {
+        agreed: mesh_platform::agreed(&read.processes, &again.processes),
+        unreadable: read.unreadable.max(again.unreadable),
+        shown: again.processes,
+    }
+}
+
+/// Add anything descended from a process already in `tree`, to a fixpoint.
+///
+/// Discovery only — nothing is signalled from what this finds. It exists for the
+/// group a supervisor creates *after* the snapshot: caught between being
+/// enumerated and being asked to stop, it can still put its command in a group
+/// of its own, and the sweep needs the leader on record or it will not touch it.
+///
+/// This is ancestry, so it loses to a deliberate double fork — that is what the
+/// process group is for, and why the sweep names groups rather than what this
+/// returns.
+fn follow_new_descendants(
+    tree: &mut Vec<mesh_platform::Process>,
+    table: &[mesh_platform::Process],
+) {
+    loop {
+        let found: Vec<mesh_platform::Process> = table
+            .iter()
+            .filter(|entry| {
+                // Already recorded in this very group: nothing new to say.
+                let recorded = tree.iter().any(|seen| {
+                    seen.pid == entry.pid
+                        && seen.started == entry.started
+                        && seen.group == entry.group
+                });
+                if recorded {
+                    return false;
+                }
+                // The same process in a *different* group. A `setpgid` in a
+                // handler makes a known non-leader into the leader of a new
+                // group, and recording only the group it left means the one it
+                // now leads is never swept. Its provenance was settled when it
+                // was first recorded, so it is not re-vouched for here — by now
+                // its parent is very likely dead, which is exactly the state
+                // this run creates and must not be punished for.
+                if tree
+                    .iter()
+                    .any(|seen| seen.pid == entry.pid && seen.started == entry.started)
+                {
+                    return true;
+                }
+                // Genuinely new, so it needs a parent that is still *this*
+                // process, not merely something wearing its number. A pid freed
+                // during the grace can be handed to somebody else, and that
+                // stranger's children are not this run's — adopting one that
+                // leads a group would put the group on the sweep's list with an
+                // identity freshly recorded from the stranger.
+                tree.iter().any(|seen| {
+                    seen.pid == entry.parent
+                        && is_live(seen, table)
+                        // A process cannot predate its own parent, so a child
+                        // recorded as starting first is not this parent's
+                        // however well the numbers line up.
+                        && entry.started >= seen.started
+                })
+            })
+            .copied()
+            .collect();
+        if found.is_empty() {
+            return;
+        }
+        tree.extend(found);
+    }
+}
+
+/// Whether a process group still has members.
+fn group_is_alive(group: &libc::pid_t) -> bool {
+    // SAFETY: signal 0 is the existence test and delivers nothing. A pid is not
+    // recycled while it is still a group id with members, so this is either the
+    // group asked about or nothing at all.
+    if unsafe { libc::kill(-group, 0) } == 0 {
+        return true;
+    }
+    // Only `ESRCH` says the group is gone. `EPERM` says the opposite — it is
+    // there and this process may not signal it, which is a member that has
+    // changed credentials rather than an empty group. Reading that as death
+    // ends the grace early and skips the escalation that might yet land.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// The distinct pids this run recorded that a reading of the table does not
+/// report at all.
+///
+/// By **pid**, deliberately, where every other check here goes by identity. The
+/// question is not "is the process this run recorded still running" — that is
+/// [`is_live`], and a recycled pid rightly fails it. It is "did this scan show
+/// this pid", which is what separates a process the enumeration omitted from one
+/// it simply no longer has. A pid that has been handed to somebody else *is*
+/// reported, so nothing was concealed and there is nothing to warn about; going
+/// by identity there would call every visible replacement a hidden process and
+/// mark the scan short for the rest of the run.
+///
+/// Distinct, because `tree` holds *rows*, not processes: a `setpgid` records the
+/// same process again under its new group, and a recycled pid can be recorded
+/// twice over. Counting rows would report one missing process as several, which
+/// is the figure the user is shown for how far the limit fell short.
+fn vanished(tree: &[mesh_platform::Process], seen: &[mesh_platform::Process]) -> Vec<libc::pid_t> {
+    let mut gone: Vec<libc::pid_t> = tree
+        .iter()
+        .map(|entry| entry.pid)
+        .filter(|pid| !seen.iter().any(|shown| shown.pid == *pid))
+        .collect();
+    gone.sort_unstable();
+    gone.dedup();
+    gone
+}
+
+/// Whether a pid still names a process, for a row the table did not report.
+///
+/// Asked only about a process this run recorded and can no longer see, to tell
+/// "it exited" from "this scan was not shown it". A pid recycled inside the
+/// grace could answer for somebody else, but not misleadingly here: a
+/// replacement this user *can* see would have appeared in the table, and the
+/// question is only asked of rows that did not.
+fn still_there(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 performs the existence and permission checks and
+    // delivers nothing.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    // `EPERM` is a process this run may not signal — still there, and the very
+    // case an enumeration is liable to have hidden.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Whether a recorded process is still the process that was recorded.
+fn is_live(seen: &mesh_platform::Process, table: &[mesh_platform::Process]) -> bool {
+    table
+        .iter()
+        .any(|live| live.pid == seen.pid && live.started == seen.started)
+}
+
+/// Which of a snapshot's process groups this run may `SIGKILL`.
+///
+/// Split out from the killing because the decision is the whole of it, and
+/// getting it wrong is not a missed survivor but somebody else's processes.
+///
+/// A group qualifies only when its **leader** was snapshotted. A group id is
+/// the leader's pid, which is what lets a live process wearing that id be dated:
+/// one that began at a different moment is somebody else's, and the id has been
+/// recycled. A leader that is simply gone is fine — a pid is not recycled while
+/// it is still a group id with members, so a group that is non-empty and has no
+/// impostor at its id is this run's own.
+///
+/// Requiring the leader is the point, not a detail. A descendant is free to
+/// `setpgid` into a group that already existed — the shell's own, say — and that
+/// group's leader is nowhere in this run's ancestry. Vouching for it by "some
+/// process I snapshotted is a member" would then hand back a group id whose
+/// other members are the shell and its peers, and the sweep would kill all of
+/// them. Missing a survivor is the cost of getting this wrong in the safe
+/// direction, and it is the one to pay.
+fn groups_to_sweep(
+    tree: &[mesh_platform::Process],
+    now: &[mesh_platform::Process],
+    shown: &[mesh_platform::Process],
+    own: libc::pid_t,
+    concealed: &[libc::pid_t],
+) -> Vec<libc::pid_t> {
+    // The timed group has already had [`drain_timed_group`], so it is not this
+    // one's to kill again.
+    let mut seen = vec![own];
+    let mut sweep = Vec::new();
+    for process in tree {
+        if seen.contains(&process.group) {
+            continue;
+        }
+        seen.push(process.group);
+        // A group whose id names a process this scan was not shown is not one
+        // this run can claim. `recycled` below has no row to date against and
+        // falls back on "a pid is not reissued while it is still a group id with
+        // members" — true of a leader that has *gone*, and false of one that is
+        // merely hidden. The probe that fills this list is the evidence telling
+        // those apart: it has established the id names something alive that no
+        // table will identify. A stranger who took the freed id, made a group of
+        // it and left visible peers in it satisfies every other test here, so
+        // without this the sweep `SIGKILL`s somebody else's processes — the one
+        // failure that costs more than the survivor this feature exists to
+        // catch.
+        if concealed.contains(&process.group) {
+            continue;
+        }
+        // A recorded entry wearing the group's number is not evidence that this
+        // run ever *led* that group — only a recorded **leader** is, and a
+        // leader is a process whose own pid is the group id. Without that, a
+        // stale non-leader whose number was later reused by a stranger who made
+        // a group of it would vouch for somebody else's group, and the sweep
+        // would kill its members.
+        let led_here =
+            |seen: &mesh_platform::Process| seen.pid == process.group && seen.group == seen.pid;
+        if !tree.iter().any(led_here) {
+            continue;
+        }
+        // Asked of whoever wears the id *now*, against every generation of it
+        // this run recorded — the tree can hold two, since a pid freed during
+        // the grace can be reused by a descendant. The id has been recycled
+        // only when the live holder matches none of them. A leader that is
+        // simply gone is not recycled: a pid is not reissued while it is still
+        // a group id with members.
+        //
+        // Asked of *both* readings, and that asymmetry is the point. `now` is
+        // what may be acted on — two reads agreeing, because authorizing a
+        // `SIGKILL` needs evidence one scan cannot give. `shown` is the latest
+        // raw scan, and a single sighting of a stranger wearing the id is
+        // plenty to *refuse*: a veto only ever prevents a kill, so it may run on
+        // evidence too thin to license one. Without it a leader hidden from the
+        // first final read and visible in the second is dropped by agreement,
+        // leaving no holder to date and the fallback below authorizing the kill.
+        let wearer = |table: &[mesh_platform::Process]| {
+            match table.iter().find(|live| live.pid == process.group) {
+                Some(live) => !tree
+                    .iter()
+                    .any(|seen| led_here(seen) && seen.started == live.started),
+                // No live holder of the id, so there is nothing to date against
+                // the recorded leader. What keeps the group this run's own is
+                // that a pid is not reissued while it is still a group id *with
+                // members* — which holds only while the group has been non-empty
+                // throughout. If it emptied and the number was taken by a
+                // stranger who made a group of it, this cannot tell. `TODO.md`
+                // carries that limit: watching for the empty moment across the
+                // grace was tried and cost the escaped-survivor case, which is a
+                // certain failure traded for a narrow one.
+                None => false,
+            }
+        };
+        let recycled = wearer(now) || wearer(shown);
+        // An empty group is not merely pointless to signal, it is dangerous to
+        // name: with no members left the id is free, and between this table and
+        // the `kill` it can be handed to a group belonging to somebody else.
+        // Requiring a *current* member costs nothing real — an empty group has
+        // nothing to escalate against — and any member will do, since the whole
+        // point of the sweep is the survivor that was never recorded.
+        let inhabited = now.iter().any(|live| live.group == process.group);
+        if !recycled && inhabited {
+            sweep.push(process.group);
+        }
+    }
+    sweep
 }
 
 /// Make sure a timed group is actually gone.
@@ -4282,10 +4848,516 @@ pub(crate) fn spawn_error_code(name: &str, err: &std::io::Error) -> u8 {
 mod tests {
     use super::{
         Job, JobState, JobTable, NextIn, Outcome, RedirKind, RedirTarget, Redirection,
-        SigintCatcher, initial_stdin, restore_job_signals, restore_terminal_modes, run,
-        set_foreground_group, shell_stdin_is_terminal, terminal_fd, terminal_modes,
-        with_redirections,
+        SigintCatcher, follow_new_descendants, groups_to_sweep, initial_stdin, restore_job_signals,
+        restore_terminal_modes, run, set_foreground_group, settled, shell_stdin_is_terminal,
+        still_there, terminal_fd, terminal_modes, vanished, with_redirections,
     };
+
+    /// One row of a process table, for the sweep's decision tests.
+    fn entry(
+        pid: libc::pid_t,
+        parent: libc::pid_t,
+        group: libc::pid_t,
+        started: u64,
+    ) -> mesh_platform::Process {
+        mesh_platform::Process {
+            pid,
+            parent,
+            group,
+            started,
+        }
+    }
+
+    /// One reading of the process table, for the sweep's decision tests.
+    fn table(processes: &[mesh_platform::Process], unreadable: usize) -> mesh_platform::Table {
+        mesh_platform::Table {
+            processes: processes.to_vec(),
+            unreadable,
+        }
+    }
+
+    /// A group made after the snapshot is found while its parent still lives.
+    ///
+    /// This is the interleaving where a supervisor is enumerated but has not yet
+    /// put its command in a group of its own: without the re-walk the sweep has
+    /// no record of that group's leader and will not touch it.
+    #[test]
+    fn a_group_made_after_the_snapshot_is_discovered() {
+        // The snapshot caught only the supervisor, 20.
+        let mut tree = vec![entry(10, 1, 10, 100), entry(20, 10, 20, 200)];
+        // By the time the table is re-read it has forked 30, which leads a group
+        // of its own, and 30 has a child of its own again.
+        let table = [
+            entry(10, 1, 10, 100),
+            entry(20, 10, 20, 200),
+            entry(30, 20, 30, 300),
+            entry(31, 30, 30, 310),
+        ];
+        follow_new_descendants(&mut tree, &table);
+        let found: Vec<libc::pid_t> = tree.iter().map(|entry| entry.pid).collect();
+        assert_eq!(
+            found,
+            vec![10, 20, 30, 31],
+            "a chain is followed to its end"
+        );
+        assert_eq!(
+            groups_to_sweep(&tree, &table, &table, 10, &[]),
+            vec![20, 30]
+        );
+    }
+
+    /// A stale non-leader does not vouch for a stranger's group.
+    ///
+    /// The sequence: a recorded non-leader exits, an unrelated process reuses
+    /// its number and makes a group of it, a descendant of this run joins that
+    /// group, and the unrelated leader then exits leaving its own peers behind.
+    /// Accepting any recorded entry with the group's number as proof this run
+    /// led it would sweep those peers.
+    #[test]
+    fn a_stale_non_leader_does_not_vouch_for_a_strangers_group() {
+        // 21 was recorded as an ordinary member of the timed group, never a
+        // leader, and 30 is a descendant that has joined group 21.
+        let tree = [
+            entry(10, 1, 10, 100),
+            entry(21, 10, 10, 210),
+            entry(30, 10, 21, 300),
+        ];
+        // 21 has since exited; a stranger reused the number, led a group of it,
+        // and has itself gone — leaving its own peers 22 and 23 behind. No live
+        // process wears 21, so nothing marks the id recycled either.
+        let now = [
+            entry(10, 1, 10, 100),
+            entry(22, 1, 21, 800),
+            entry(23, 1, 21, 810),
+        ];
+        assert!(
+            !groups_to_sweep(&tree, &now, &now, 10, &[]).contains(&21),
+            "a group this run never led was named for the sweep"
+        );
+    }
+
+    /// A group with no members left is not named for the sweep.
+    ///
+    /// With nothing in it the id is free, and between this table and the `kill`
+    /// it can be handed to a group belonging to somebody else — so a group that
+    /// has already emptied is skipped rather than signalled into the void.
+    #[test]
+    fn an_empty_group_is_not_swept() {
+        let tree = [entry(10, 1, 10, 100), entry(20, 10, 20, 200)];
+        // Group 20 has emptied: nothing in the current table belongs to it, and
+        // its leader has not been replaced by an impostor either.
+        let now = [entry(10, 1, 10, 100)];
+        assert!(groups_to_sweep(&tree, &now, &now, 10, &[]).is_empty());
+    }
+
+    /// A pid the table shows is not a pid the table is hiding, whoever holds it.
+    ///
+    /// The recorded process has exited and its pid has gone to somebody
+    /// unrelated who is plainly visible. Asking whether the *identity* is still
+    /// live says no — correctly, for every other question here — but the
+    /// question this one asks is whether the scan was shown the pid at all, and
+    /// it was. Going by identity marks the scan short and warns about a hidden
+    /// process on a run where nothing was hidden.
+    #[test]
+    fn a_visible_replacement_is_not_a_concealed_process() {
+        let tree = [entry(10, 1, 10, 100), entry(20, 10, 20, 200)];
+        // 20 has gone and an unrelated process wears its pid, in plain sight.
+        let seen = [entry(10, 1, 10, 100), entry(20, 1, 20, 900)];
+        assert!(
+            vanished(&tree, &seen).is_empty(),
+            "a pid the table reported was counted as one it withheld"
+        );
+    }
+
+    /// A pid whose holder changed between two scans was still *shown* by both.
+    ///
+    /// Agreement drops it — the two reads disagree about who it is, which is
+    /// exactly what agreement is for when the question is identity. Visibility
+    /// is not that question. Asking it of the agreed rows calls a plainly
+    /// reported pid concealed, which overstates the count and, because the same
+    /// set vetoes the sweep, spares a group that should have been taken.
+    #[test]
+    fn a_pid_the_later_scan_reported_is_visible_even_when_the_reads_disagree() {
+        let tree = [entry(10, 1, 10, 100), entry(20, 10, 20, 200)];
+        let read = table(&[entry(10, 1, 10, 100), entry(20, 10, 20, 200)], 0);
+        // Same pid, a different process by the second read.
+        let again = table(&[entry(10, 1, 10, 100), entry(20, 1, 20, 900)], 0);
+        let settled = settled(read, again);
+        assert!(
+            vanished(&tree, &settled.agreed).contains(&20),
+            "the case is only interesting if agreement drops the row"
+        );
+        assert!(
+            vanished(&tree, &settled.shown).is_empty(),
+            "a pid the latest scan reported was treated as one it withheld"
+        );
+    }
+
+    /// Visibility is the *latest* scan's answer, not "ever seen".
+    ///
+    /// A pid can be reported by the first final read and hidden by the second —
+    /// a stranger holding a reused id who changes credentials in between. It is
+    /// concealed *now*, and that is what matters: agreement has already dropped
+    /// its row, so `groups_to_sweep` has no leader to date and falls back to
+    /// treating the id as this run's own. If visible peers are left in the
+    /// group, the veto is the only thing standing between the sweep and a
+    /// stranger's processes — and taking the union of both reads withdraws it,
+    /// because the earlier read did once show the pid.
+    #[test]
+    fn a_pid_hidden_by_the_later_scan_is_concealed_though_the_earlier_showed_it() {
+        let tree = [entry(10, 1, 10, 100), entry(20, 10, 20, 200)];
+        let read = table(
+            &[
+                entry(10, 1, 10, 100),
+                entry(20, 10, 20, 200),
+                entry(21, 20, 20, 210),
+            ],
+            0,
+        );
+        // Pid 20 has gone out of sight; a peer of its group is still visible.
+        let again = table(&[entry(10, 1, 10, 100), entry(21, 20, 20, 210)], 0);
+        let mut union = read.processes.clone();
+        union.extend(again.processes.clone());
+        assert!(
+            !vanished(&tree, &union).contains(&20),
+            "the case is only interesting if the union misses the transition"
+        );
+        let settled = settled(read, again);
+        assert!(
+            vanished(&tree, &settled.shown).contains(&20),
+            "a pid the latest scan withheld was taken as shown"
+        );
+    }
+
+    /// One missing process is one missing process, however many rows name it.
+    ///
+    /// `tree` grows a second row for a process that changes group, so a
+    /// descendant that `setpgid`s and then goes out of sight is recorded twice
+    /// and would be counted twice — and the count is what the user is told about
+    /// how far the limit fell short.
+    #[test]
+    fn a_process_recorded_under_two_groups_goes_missing_once() {
+        let tree = [
+            entry(10, 1, 10, 100),
+            // 20 under the group it started in and the one it moved to.
+            entry(20, 10, 10, 200),
+            entry(20, 10, 20, 200),
+        ];
+        let seen = [entry(10, 1, 10, 100)];
+        assert_eq!(
+            vanished(&tree, &seen),
+            vec![20],
+            "one process was reported missing more than once"
+        );
+    }
+
+    /// A process that has been reaped is not mistaken for a hidden one.
+    ///
+    /// The whole worth of this check is the distinction: a recorded process
+    /// missing from the table has almost always exited, and calling that
+    /// "concealed" would put the degraded-enforcement warning on every ordinary
+    /// expiry — something else is always dying. Only `ESRCH` means gone, and it
+    /// arrives only once the process has been *reaped*: a zombie is still there
+    /// and still signalable.
+    #[test]
+    fn a_process_that_has_been_reaped_is_not_mistaken_for_a_hidden_one() {
+        // SAFETY: the child leaves immediately through `_exit`, running no
+        // destructor this process still owns.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // SAFETY: leaving without unwinding.
+            unsafe { libc::_exit(0) };
+        }
+        assert!(still_there(child), "a live child was taken for gone");
+        // SAFETY: waiting on this process's own child; the status is not read.
+        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        assert!(
+            !still_there(child),
+            "a reaped child was taken for one the table was hiding"
+        );
+    }
+
+    /// A recycled parent pid does not adopt a stranger's children.
+    ///
+    /// The dangerous shape: a recorded process exits during the grace, its pid
+    /// is handed to somebody unrelated, and that stranger has a child of its
+    /// own which leads a group. Matching the parent by number alone pulls the
+    /// child into the tree, records its group leader from the live table — so
+    /// the identity checks out — and the sweep `SIGKILL`s a group belonging to
+    /// nobody in this run.
+    #[test]
+    fn a_recycled_parent_pid_does_not_adopt_a_strangers_children() {
+        let mut tree = vec![entry(10, 1, 10, 100), entry(20, 10, 20, 200)];
+        // 20's pid is now worn by an unrelated process that started later, and
+        // 21 is its child, leading a group of its own.
+        let table = [
+            entry(10, 1, 10, 100),
+            entry(20, 1, 20, 999),
+            entry(21, 20, 21, 1000),
+        ];
+        follow_new_descendants(&mut tree, &table);
+        let found: Vec<libc::pid_t> = tree.iter().map(|entry| entry.pid).collect();
+        assert_eq!(found, vec![10, 20], "a stranger's child was adopted");
+        assert!(
+            !groups_to_sweep(&tree, &table, &table, 10, &[]).contains(&21),
+            "a group belonging to nobody in this run was swept"
+        );
+    }
+
+    /// Two reads agree on identity, and the later one supplies the group.
+    ///
+    /// A process may change its group between the two scans, and that is the
+    /// change the sweep exists to notice. Confirming the process and then acting
+    /// on the group it has just left is the failure this pins — which is a
+    /// property of how the pair is combined, not of either read, so it is
+    /// `settled` under test rather than `confirmed` on its own.
+    #[test]
+    fn agreement_keeps_the_later_reading_of_a_group() {
+        let read = table(&[entry(10, 1, 10, 100), entry(21, 10, 10, 210)], 0);
+        // Same process, now leading a group of its own.
+        let again = table(&[entry(10, 1, 10, 100), entry(21, 10, 21, 210)], 0);
+        let settled = settled(read, again);
+        assert!(
+            settled
+                .agreed
+                .iter()
+                .any(|seen| seen.pid == 21 && seen.group == 21),
+            "the group the process has just left was kept"
+        );
+    }
+
+    /// A blind spot in either read is carried, not averaged away.
+    ///
+    /// `unreadable` is what the caller reports to the user as "this limit is
+    /// weaker than it claims". Taking it from one read alone would let the other
+    /// read's hidden processes go unmentioned.
+    #[test]
+    fn a_blind_spot_in_either_read_is_carried() {
+        let rows = [entry(10, 1, 10, 100)];
+        let earlier_short = settled(table(&rows, 3), table(&rows, 0));
+        assert_eq!(
+            earlier_short.unreadable, 3,
+            "the earlier read's blind spot was dropped"
+        );
+        let later_short = settled(table(&rows, 0), table(&rows, 2));
+        assert_eq!(
+            later_short.unreadable, 2,
+            "the later read's blind spot was dropped"
+        );
+    }
+
+    /// A recorded process that changes its own group is recorded again.
+    ///
+    /// `setpgid(0, 0)` in a `SIGTERM` handler makes a known non-leader into the
+    /// leader of a brand new group. Skipping it because its identity is already
+    /// known leaves the tree holding only the group it left, so the group it now
+    /// leads is never named for the sweep and outlives the limit.
+    #[test]
+    fn a_process_that_changes_group_is_recorded_again() {
+        let mut tree = vec![
+            entry(10, 1, 10, 100),
+            entry(20, 10, 20, 200),
+            entry(21, 20, 20, 210),
+        ];
+        // 21 is the same process — same pid, same start — now leading group 21.
+        let table = [
+            entry(10, 1, 10, 100),
+            entry(20, 10, 20, 200),
+            entry(21, 20, 21, 210),
+        ];
+        follow_new_descendants(&mut tree, &table);
+        assert!(
+            tree.iter().any(|seen| seen.pid == 21 && seen.group == 21),
+            "the new group was never recorded"
+        );
+        assert!(
+            groups_to_sweep(&tree, &table, &table, 10, &[]).contains(&21),
+            "the group it now leads was not named for the sweep"
+        );
+        // The row for the group it left survives, since that is still evidence.
+        assert!(tree.iter().any(|seen| seen.pid == 21 && seen.group == 20));
+    }
+
+    /// A pid reused by a genuine descendant is still followed.
+    ///
+    /// A recorded process exits during the grace and its number is handed to a
+    /// new child of another recorded parent that is still alive. Skipping on the
+    /// number alone threw that child away, so a group it went on to lead was
+    /// never recorded and never swept.
+    #[test]
+    fn a_reused_pid_that_is_a_real_descendant_is_still_followed() {
+        // 21 was recorded under 20 and has since exited.
+        let mut tree = vec![
+            entry(10, 1, 10, 100),
+            entry(20, 10, 20, 200),
+            entry(21, 20, 20, 210),
+        ];
+        // Its number now belongs to a *new* child of 20, which is still alive,
+        // and that child leads a group of its own.
+        let table = [
+            entry(10, 1, 10, 100),
+            entry(20, 10, 20, 200),
+            entry(21, 20, 21, 900),
+        ];
+        follow_new_descendants(&mut tree, &table);
+        assert!(
+            tree.iter()
+                .any(|seen| seen.pid == 21 && seen.started == 900),
+            "the reused pid's new occupant was discarded"
+        );
+        assert!(
+            groups_to_sweep(&tree, &table, &table, 10, &[]).contains(&21),
+            "the group it leads was never recorded"
+        );
+        // The old generation is kept too: it is still the evidence for group 20.
+        assert!(
+            tree.iter()
+                .any(|seen| seen.pid == 21 && seen.started == 210)
+        );
+    }
+
+    /// The re-walk goes down from what is already known and never up.
+    #[test]
+    fn the_re_walk_does_not_reach_outside_this_run() {
+        let mut tree = vec![entry(20, 10, 20, 200)];
+        // 10 is the parent of 20 and 11 is its sibling; neither descends from
+        // anything in the tree, so neither is reachable.
+        let table = [
+            entry(10, 1, 10, 100),
+            entry(11, 10, 10, 110),
+            entry(20, 10, 20, 200),
+        ];
+        follow_new_descendants(&mut tree, &table);
+        let found: Vec<libc::pid_t> = tree.iter().map(|entry| entry.pid).collect();
+        assert_eq!(found, vec![20]);
+    }
+
+    /// A group whose leader this run snapshotted is swept, and the timed group
+    /// is not — it has already been drained.
+    ///
+    /// 10 is the timed group's leader and 20 leads a nested one, which is the
+    /// case the sweep exists for: the supervisor between them is gone, so
+    /// nothing else can name 20.
+    #[test]
+    fn the_sweep_takes_a_nested_group_and_leaves_the_timed_one() {
+        let tree = [
+            entry(10, 1, 10, 100),
+            entry(20, 10, 20, 200),
+            entry(21, 20, 20, 210),
+        ];
+        assert_eq!(groups_to_sweep(&tree, &tree, &tree, 10, &[]), vec![20]);
+    }
+
+    /// A leader that has already gone still vouches for its group.
+    ///
+    /// This is the ordinary case rather than an edge one: the leader dies to the
+    /// same signal the grace is spent on, and the child the sweep is chasing was
+    /// born after the snapshot. Requiring a *surviving* member instead left the
+    /// group unswept, which passed locally and failed on CI.
+    #[test]
+    fn a_group_whose_leader_has_gone_is_still_swept() {
+        let tree = [entry(10, 1, 10, 100), entry(20, 10, 20, 200)];
+        // Only an escapee born after the snapshot is left in group 20.
+        let now = [entry(10, 1, 10, 100), entry(30, 1, 20, 300)];
+        assert_eq!(groups_to_sweep(&tree, &now, &now, 10, &[]), vec![20]);
+    }
+
+    /// A leader that is merely *hidden* vouches for nothing.
+    ///
+    /// The table above cannot tell "the leader has gone" from "the leader is
+    /// there and this scan was not shown it", and it treats both as not
+    /// recycled — safe for the first, since a pid is not reissued while it is
+    /// still a group id with members, and wrong for the second. The dangerous
+    /// shape: the recorded group empties, a stranger who has changed credentials
+    /// takes the freed id and makes a group of it, and leaves visible peers
+    /// behind. A recorded leader, no contradicting row, a current member — every
+    /// other test here passes, and the sweep kills processes belonging to
+    /// somebody else. The probe is what separates the two, so a group id it has
+    /// shown to be alive-but-unidentifiable is left alone.
+    #[test]
+    fn a_group_whose_leader_is_only_hidden_is_left_alone() {
+        let tree = [entry(10, 1, 10, 100), entry(20, 10, 20, 200)];
+        // Pid 20 is absent from the table and 21 is a visible member of group
+        // 20 — the shape that otherwise passes every check.
+        let now = [entry(10, 1, 10, 100), entry(21, 1, 20, 300)];
+        assert_eq!(
+            groups_to_sweep(&tree, &now, &now, 10, &[]),
+            vec![20],
+            "the case is only interesting if it would otherwise be swept"
+        );
+        assert!(
+            groups_to_sweep(&tree, &now, &now, 10, &[20]).is_empty(),
+            "a group whose leader could not be identified was swept"
+        );
+    }
+
+    /// A stranger on the id vetoes the group even when only one scan saw them.
+    ///
+    /// The mirror of the concealment case, and it fails the other way round: the
+    /// stranger leading the reused id is hidden from the first final read and
+    /// visible in the second, so agreement drops the row, nothing is concealed —
+    /// the latest scan did show the pid — and the recycling check finds no
+    /// holder to date. Its `None => false` fallback then authorizes a `SIGKILL`
+    /// on somebody else's group, on the strength of peers that agreement kept.
+    ///
+    /// A veto may run on thinner evidence than an authorization, because it can
+    /// only ever prevent a kill. One sighting of a stranger wearing the id is
+    /// enough to refuse; it would not be enough to act.
+    #[test]
+    fn a_stranger_seen_on_the_id_by_one_scan_is_enough_to_refuse() {
+        let tree = [entry(10, 1, 10, 100), entry(20, 10, 20, 200)];
+        // Both reads hold the peers, so agreement keeps them; only the later
+        // read holds the stranger leading 20, so agreement drops it.
+        let agreed = [entry(10, 1, 10, 100), entry(21, 20, 20, 210)];
+        let shown = [
+            entry(10, 1, 10, 100),
+            entry(20, 1, 20, 900),
+            entry(21, 20, 20, 210),
+        ];
+        assert_eq!(
+            groups_to_sweep(&tree, &agreed, &agreed, 10, &[]),
+            vec![20],
+            "the case is only interesting if it would otherwise be swept"
+        );
+        assert!(
+            groups_to_sweep(&tree, &agreed, &shown, 10, &[]).is_empty(),
+            "a group the latest scan showed a stranger leading was swept"
+        );
+    }
+
+    /// A group id worn by a process that started at a different moment has been
+    /// recycled, and is somebody else's.
+    #[test]
+    fn a_recycled_group_id_is_left_alone() {
+        let tree = [entry(10, 1, 10, 100), entry(20, 10, 20, 200)];
+        let now = [entry(10, 1, 10, 100), entry(20, 1, 20, 999)];
+        assert!(groups_to_sweep(&tree, &now, &now, 10, &[]).is_empty());
+    }
+
+    /// A group this run only *joined* is never swept.
+    ///
+    /// A descendant is free to `setpgid` into a group that already existed --
+    /// the shell's own, say -- whose leader is nowhere in this run's ancestry.
+    /// Vouching for it by "a process I snapshotted is a member" would hand back
+    /// a group id whose other members are the shell and its peers, and the
+    /// sweep would kill all of them.
+    #[test]
+    fn a_group_this_run_merely_joined_is_never_swept() {
+        // 7 leads a group this run did not make; 21 is a descendant that joined
+        // it, and 8 is an unrelated peer already there.
+        let tree = [entry(10, 1, 10, 100), entry(21, 10, 7, 210)];
+        let now = [
+            entry(7, 1, 7, 70),
+            entry(8, 7, 7, 80),
+            entry(10, 1, 10, 100),
+            entry(21, 10, 7, 210),
+        ];
+        assert!(
+            groups_to_sweep(&tree, &now, &now, 10, &[]).is_empty(),
+            "swept a group led from outside this run"
+        );
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A resume that cannot be signalled leaves the job where it was.
