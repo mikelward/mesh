@@ -1183,6 +1183,18 @@ number, so dropping them makes the test *always* false.
   space" rule is general — every punctuation operator collides with something
   in filenames.)
 
+  **In front of a command, the spelling is open.** All three examples above are
+  *statements*, and as statements they are consistent with the rest of the language:
+  they need glob-led classification and list difference, both unbuilt but both
+  tracked. Put one after a command, though, and [arithmetic](#arithmetic) decides
+  the other way — operators between argv words are deliberately not operators — so
+  `puts *.txt - *.bak` prints `a.txt b.txt - c.bak d.bak`, expanding both globs and
+  passing the dash along. Value contexts are fine (`x = *.txt - *.bak` and
+  `for f in (* - *.bak)` both reach evaluation), so what has no spelling is the
+  interactive case, `rm * - *.bak`. Which spelling it should get — parens, an
+  argv-position operator, zsh's unspaced `*~*.bak`, or a `not:` qualifier — is an
+  [open question](#open-questions).
+
 - **Braces** — kept (`*.{jpg,png}`); universally understood.
 - **ksh extended globs** (`!(…)`, `@(…)`, `+(…)`) — **dropped.** Cryptic, and
   their jobs are covered by braces + exclusion.
@@ -1363,6 +1375,21 @@ is why `[a b c] - [b]` reaches evaluation and the glob form does not. Making the
 headline spelling work therefore means teaching that classification about a
 glob-led expression, not only implementing the list operation; inside parentheses
 the question does not arise. Raised in review on mikelward/mesh#341.
+
+**Argument position is a second gap, and a quieter one.** The classification above
+fixes the statement, and a value context needs nothing beyond the operation itself —
+`x = *.txt - *.bak` and `for f in (* - *.bak)` both reach evaluation and stop at the
+`expected integer` that says list difference is unbuilt. Neither reaches
+`rm * - *.bak`, where by the *where arithmetic happens* rule above the dash is an
+argv word and not an operator at all. That form is the one that does not report:
+`puts *.txt - *.bak` prints `a.txt b.txt - c.bak d.bak` and `/bin/echo *(f) - *.tmp`
+passes the dash through, so a wrong answer arrives wearing the shape of a right one
+where the statement forms at least fail loudly. Nor does the
+parenthesized form reach an external command yet: `/bin/echo (*.txt)` reports
+``a list needs `...` to become command arguments``, and the `...` it names,
+`/bin/echo ...(*.txt)`, is itself a syntax error — the `CommandItem::Value` spread
+gap tracked with `ls ...glob($p)`. Builtins are unaffected, `puts (*.txt)` taking
+the list directly. The candidates are laid out in [Open questions](#open-questions).
 
 What keeps all of this off kebab-case names is the
 [operators-need-spaces](#globbing) rule: `a-b` is one name, `a - b` is the
@@ -5790,9 +5817,12 @@ to avoid" rather than promising the latter as done.
   buys discoverability without spending the name — see
   [Reference](docs/REFERENCE.md#commands). `echo` stays unintercepted so an
   external `echo -n` keeps working.
-- **Exclusion `~` alias** — resolved by elimination: `~` / `!~` is now the
-  **pattern-match** operator ([Tests and comparisons](#tests-and-comparisons)),
-  so glob exclusion keeps the spaced infix `-` only.
+- **Exclusion `~` alias** — the *spaced* alias was resolved by elimination: `~` /
+  `!~` is the **pattern-match** operator ([Tests and comparisons](#tests-and-comparisons)),
+  so a spaced `~` between two globs cannot also mean exclusion. zsh's **unspaced**
+  `*~*.bak` is a different spelling and is not settled by that, which is why the
+  question is reopened below as *Exclusion in argument position* — where the
+  spaced infix `-` turns out not to work at all.
 - **String modifier set** — `:replaceall` (global substitution) with decided but
   lower-priority anchored/removal kin (`:replacestart` / `:replaceend` /
   `:stripstart` / `:stripend`, plus `:trimstart` / `:trimend` for whitespace).
@@ -6303,6 +6333,127 @@ remain under-specified.
   Spread-of-expression only ever accepts programs that are errors today; it
   is not on the critical path for this question either way, and it should be
   decided on the two entries it closes rather than as an answer here.
+- **Exclusion in argument position — open; leaning a `not:` qualifier beside the
+  operator.** [Globbing](#globbing) spells exclusion as a spaced infix `-`, and as
+  an operator that is right: a glob is [eager](#globbing), so exclusion is list
+  difference and needs no glob-specific meaning. Its examples are *statements*, and
+  they will work as written once glob-led classification and list difference land —
+  both tracked. What the design never spells is exclusion **in front of a command**,
+  which is where anyone would actually type it, and [arithmetic](#arithmetic) rules
+  the operator out there deliberately: operators between argv words are not
+  operators, so `find . -exec grep foo {} +` keeps working and
+  `mycmd $file + $other` does not become a type error. So the open question is
+  narrow — not which operator, but what `rm` and `ls` get:
+
+  ```mesh
+  rm * - *.bak         # today: rm is handed a literal `-` and every .bak right back
+  rm ...(* - *.bak)    # what the arithmetic rule allows — and an external needs the spread
+  rm *(not: *.bak)     # a qualifier: one word, so it needs neither
+  ```
+
+  Six facts constrain the choice, each checked against `main` rather than assumed:
+
+  - **Only the argument-position form is inert; the others report.** As a statement,
+    `*.txt - *.bak` says `command not found: a.txt` (the classification gap above),
+    and in a value context `x = *.txt - *.bak` says `expected integer` (list
+    difference unbuilt) — both loud. Put a command in front and it goes quiet:
+    `puts *.txt - *.bak` prints `a.txt b.txt - c.bak d.bak` and
+    `/bin/echo *(f) - *.tmp` passes the dash through, so the `.bak` files come back
+    rather than being removed. That asymmetry is the whole problem — the one form
+    with no diagnostic is the one people type.
+  - **The parenthesized form does not reach an external command yet.**
+    `/bin/echo (*.txt)` reports ``a list needs `...` to become command arguments``,
+    and the spelling it points at, `/bin/echo ...(*.txt)`, is itself a syntax error:
+    `CommandItem::Value` has no spread variant, the same gap already tracked for
+    `ls ...glob($p)` and `puts ...$x:split(":")`. Note what closing that gap buys:
+    it makes `rm ...(* - *.bak)` *parse*, not `rm (* - *.bak)` work — a
+    parenthesized list is one list-valued argument either way, so the spread is
+    part of this candidate's spelling rather than a temporary workaround. So it is
+    not self-contained, and the case people care about is behind another open
+    entry. A builtin is unaffected: `puts (*.txt)` takes the list directly.
+  - **List difference is unbuilt, so nothing is written against either spelling.**
+    `([a b c] - [b])` and `(*.txt - *.bak)` both answer `expected integer`; `-`
+    evaluates for integers only. Whatever is decided is a first implementation
+    rather than a migration, and it is additive to the operator rather than a
+    replacement for it: §Globbing's statement examples stand under every candidate
+    here, since none of them touches what `-` means in a value context.
+  - **A qualified glob is one word, and one word reaches argv.** `/bin/echo *(d)`
+    prints the directory and `*(f)` omits it, in front of an external, with no
+    parens and no spread — the type qualifiers are implemented (`TODO.md` said
+    otherwise; that entry was stale). The `:`-modifier form does *not* have this
+    property: `puts *:f` in the same position is an ordinary glob word that matches
+    nothing, and only `(*:f)` filters. Of the predicates, the **boolean** ones are
+    built and filter correctly (`*(x)`, `*(f, exec: true)`, and `*(f, empty: false)`
+    picking out the one non-empty file); it is the **comparisons** that are not, so
+    `*(f, size > 1M)` is a syntax error naming the accepted set. `not` is refused by
+    that same message, so a `not:` option would accept text that is an error today
+    rather than change what any program means.
+  - **`~` mid-word is inert text, so zsh's spelling is available — at a price.**
+    `puts x~y` prints `x~y` and `puts a*~/tmp` globs without home-expanding, because
+    `+ - * / % ~` are tokens **only with a boundary on each side** (`GRAMMAR.md`
+    §Words). Taking `*~*.bak` means carving `~` out of that rule — the rule that
+    keeps `a-b` one kebab-case name and `--flag=x` one argument. And `*~` matches
+    `foo.txt~` today, so the `rm *~` backup idiom is a working program that the zsh
+    reading turns into an exclusion with an empty right-hand side.
+  - **Spacing would then decide the result type, silently.** With `f = a.txt`,
+    `($f ~ *.bak)` is `false` — a bool from the match operator — and `($f~*.bak)`
+    is the empty list. Neither errors. Everywhere else in mesh the unspaced reading
+    of an operator character is inert filename text; this would make it a second
+    operator with a different type. In argument position the spaced form is not the
+    match operator at all: `puts * ~ *.bak` home-expands the bare tilde and prints a
+    home path in the middle of the file list.
+
+  | Candidate | For | Against |
+  | --- | --- | --- |
+  | **A `not:` glob qualifier** — `rm *(not: *.bak)` | Reaches argument position by fact 4, with no new character, no lexer change and no spread. It is the option grammar that already exists, ANDed with the others (`*(f, not: *.tmp)`), and exclusion genuinely *is* a filter, which is what a qualifier names. Additive: `not` is a syntax error today. And it is one of the two **pattern-level** candidates, so it *could* **prune** — `**/*.js(not: **/node_modules)` skipping the subtree instead of walking it and subtracting after, which is the `.gitignore` case and the one place the operator is not merely longer but slower. (The unspaced `~` shares this; the operator forms do not, since `-` is handed two already-expanded lists. See both rows.) | Two spellings for one idea: a list you already hold is not a glob, so `$paths - $skip` still wants the operator, and the qualifier does not apply to it. It would also be the first qualifier that touches no filesystem, softening the "these qualifiers are expansion-only" line — though that section's own frame is "the glob's argument list", and a name is as much a property of a candidate as its size. Leaves a name to pick and a plural form to settle (`not: *.bak\|*.tmp` or `not: [*.bak *.tmp]`). On the name, `not` is the weakest of the three: it is already a live prefix operator — `if not false { … }` — so it would carry two unrelated jobs, negating a command's status and excluding paths from a match. Nothing is ambiguous, the two sitting in different grammar positions, but the reader meets one word meaning two things; `skip:` and `except:` carry no other job. Written up as `not:` throughout below because it is the spelling this was raised under, not because the name is settled. **And the pruning is not free with the qualifier** — `expand_word` takes every result from `glob_matches` and applies qualifiers afterwards with `retain`, which is the same after-the-walk shape the *Fuse `**:files` into the match* entry records for all three existing filter paths. Rejecting a directory before recursing needs a traversal mesh does not have, so pruning is an argument for where this belongs, not a property it arrives with. **And it needs a semantic, not just a faster walk** — two pieces of one, both checked against the matcher. First, the exclusion has to name the subtree *root*: `node_modules ~ **/node_modules/**` is `false` (only descendants match) while `node_modules ~ **/node_modules` is `true`, so a predicate handed the operator's own `**/node_modules/**` keeps the directory and has nothing to prune on. Second — and this is the part that makes it a new evaluation model rather than a filter — **the directory it must reject is not one of the pattern's candidates.** `**/*.js` yields `node_modules/pkg/index.js` and `src/a.js`; the directory `node_modules` never appears, since bare `**` yields directories and `**/*` yields both, but neither is what a `.js` pattern asks for. So the exclusion has to be evaluated against the intermediate directories the *walk visits*, not against the candidates the pattern *produces*, and "a rejected directory takes its subtree with it" has to be defined on top — post-walk it would drop a directory entry, when it appears at all, and leave every file under it. That is `.gitignore`'s rule, and it is the part to cost. |
+  | **Parens, operator unchanged** — `rm ...(* - *.bak)` | No new syntax at all, and the [Binary `-`](#arithmetic) argument stands as written: one operator dispatching on operand type. Covers lists and globs with one spelling, and a builtin needs no spread at all — `puts (* - *.bak)` works the moment list difference is built. | The external case needs the **spread**, not just the parens: a parenthesized list is one list-valued argument, so `rm (* - *.bak)` hits ``a list needs `...` to become command arguments`` however much of it is implemented, and closing the `CommandItem::Value` gap (fact 2) makes `rm ...(* - *.bak)` parse rather than making the bare parens work. That is five characters and a nesting level around what zsh writes as one, on something typed interactively — and it is behind another open entry, for *the* case: `rm`, `ls`, `cp`. It also leaves fact 1 standing: `rm * - *.bak` goes on quietly not excluding. |
+  | `-` as an operator **between argv words** | The Globbing examples work exactly as written, and it is the spelling a reader already expects from that section. | Reverses the arithmetic decision for one operator and not the rest, so `-` would bind between argv words while `+ * / %` do not. A dash is also the worst character to pick for it: every option starts with one, a lone `-` means stdin to dozens of commands (`cat -`, `diff - file`), and the words either side of it are exactly where option parsing already looks. |
+  | zsh's unspaced `~` — `rm *~*.bak` | One word, so it reaches argument position like a qualifier does, and it is muscle memory for zsh users. It can desugar to the same list difference, being a spelling that binds inside a word rather than a second meaning for the operator — but desugaring is a choice, not a limit: because `~` binds *inside the glob word*, the whole exclusion reaches the matcher as one pattern, so this form can prune exactly as the qualifier can, on the same terms (a traversal that rejects a directory before descending, plus testing the exclusion against directories the walk *visits* rather than the candidates the pattern *produces*). The pruning argument therefore does not separate these two candidates; it separates both of them from the operator forms. | Costs the boundary-on-each-side rule, spacing then picks between two operators with different result types and neither spelling errors (facts 5, 6), and `rm *~` stops meaning what it means today. Third job for a character that already carries home expansion and matching; zsh itself keeps it behind `extendedglob`. |
+  | `^`-prefixed negation (zsh's `^*.bak`) | Shortest for the whole-pattern case, and unspaced, so it reaches argv too. | Does not compose — `*.js ^node_modules/**` is two words, i.e. an argv operator again in disguise — and `^` is the character [arithmetic](#arithmetic) is already holding for a future bitwise use. ksh's `!(…)` is the same job and is [dropped](#globbing). |
+  | **Report the argv-position dash** (compatible with any of the above) | Fact 1 is silent today. A bare `-` between two glob words is almost certainly meant as exclusion, and naming it — with the chosen spelling in the message — turns the wrong answer into a diagnostic. | Decides nothing on its own, and it is **not** free: an unquoted `-` between two globs is accepted and passed through today, so reporting it rejects a program that runs — §Globbing's "quote it as `'-'`" is a convention, not something enforced. The narrowness is therefore load-bearing: too wide and it reports a legitimate stdin operand or separator, too narrow and it misses the case it was written for. |
+
+  Leaning: **a `not:` qualifier for globs, the operator kept for lists, and the
+  argv dash reported** — which is one candidate plus the null one, the same shape
+  the flag-forwarding question landed on. The duplication objection is the honest
+  cost, and it is smaller than it looks: the two forms answer different questions
+  (a filter the glob applies to its own candidates, versus a set operation on values
+  you already hold), which is the same split `:files` and `(f)` already live with.
+  The pruning that makes the first one worth having is a traversal change *and* a
+  semantic on top, and should be costed as both — the walk is the same work the
+  `**:files` fusion entry describes, and the semantic is that the exclusion is
+  tested against the directories the walk *visits* rather than the candidates the
+  pattern *produces*, with a rejected directory taking its subtree with it. That is
+  `.gitignore`'s rule rather than a filter's, and it is a different evaluation model
+  from every qualifier mesh has: `exec:` and `empty:` ask a question about a path
+  that is already a result. Neither piece is a side effect of adding an option, and
+  the second is the one that decides what the feature *is*.
+
+  **Pruning does not pick between the two pattern-level candidates**, though — the
+  unspaced `~` binds inside the glob word, so its exclusion reaches the matcher as
+  one pattern too and could prune on exactly those terms. What pruning separates is
+  the pattern-level pair from the operator forms, where `-` is handed two lists that
+  have already been expanded and there is nothing left to skip. So it argues for
+  *where* exclusion belongs, not for which of the two spellings gets it; the case for
+  the qualifier over `~` rests on facts 5 and 6 — the lexer rule, `rm *~`, and the
+  silent type flip — rather than on this.
+
+  Only two of the six are strictly additive: `not:` accepts text that is a syntax
+  error today, and parens accept an operation that is unbuilt. Every other
+  candidate takes something back, in descending order of cost. An argv-position `-`
+  retires the bare dash operand outright. The unspaced `~` retires `rm *~` and makes
+  a dropped space change a result's type. `^` spends a character that is ordinary
+  glob text today, so a pattern for a literal `^`-leading name stops meaning that —
+  a rare filename rather than a live idiom, but not nothing. And the report,
+  narrowest of the four, still rejects a program that runs: the unquoted dash is
+  accepted today, so "already quoted per §Globbing" describes the convention and not
+  the implementation.
+
+  That last one is worth making on its own merits — fact 1 is a wrong answer nobody
+  is told about — but it has to be argued as a behavior change rather than counted
+  as free, and its blast radius is whatever the narrowing rule turns out to be. The
+  qualifier is the only piece here that costs nothing to take now, which is why it
+  leads the leaning; the report is a second decision, and the operator question can
+  stay where it is either way.
 
 ## Name
 
