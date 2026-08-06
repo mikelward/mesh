@@ -283,10 +283,11 @@ raw. The parser does not interpret body contents.
 source          = statement-list EOS ;
 statement-list  = NL* ( statement ( separator statement )* separator? )? ;
 statement       = and-or ;
-separator       = ";" ( NL terminator* )?     # a second `;` may not directly follow
-                | NL terminator*
+separator       = separator-run
                 | background ;
-background      = "&" terminator* ;           # backgrounds what precedes it, and separates
+background      = "&" separator-run? ;        # backgrounds what precedes it, and separates
+separator-run   = NL+ ( ";" NL* )?            # one `;` at most — a second commands nothing
+                | ";" NL* ;
 terminator      = ";" | NL ;
 
 and-or          = executable ( ( "&&" | "||" ) NL* executable )* ;
@@ -333,11 +334,14 @@ but a leading `;` (`; puts x`) and a repeated one (`puts x;; puts y`) are
 errors, as is running two statements together with no separator at all. One
 trailing separator is allowed. A statement's status is the last thing it ran.
 
-The repeated-separator rule is narrow: only a `;` **directly** after the
-statement's own `;` is refused. A newline breaks the run, so `puts x;` ⏎
-`;; puts y` parses where the one-line `puts x;; puts y` does not. A
-**backgrounding `&` is the exception** outright — it swallows any run of
-terminators after it, so `puts x &;; puts y` parses too.
+The repeated-separator rule reads the **whole run**: what separates two
+statements is one `;` and any newlines around it, so a second `;` anywhere in
+that run is refused — `puts x;; puts y`, `puts x` ⏎ `;; puts y` and `puts x;` ⏎
+`; puts y` alike. Only the count matters, not the layout, so one `;` still
+separates from anywhere in the run: `puts x` ⏎ `; puts y` parses. A backgrounding
+`&` separates on its own and the run after it may still hold its one `;`, which
+is what keeps `puts x &; puts y` — but `puts x &;; puts y` is the same error as
+the rest.
 
 An `env-prefix` value is whatever **abuts** the operator, parsed as a value
 expression rather than only as a word, so `A=[1] cmd` and

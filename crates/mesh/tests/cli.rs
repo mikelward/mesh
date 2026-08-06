@@ -979,6 +979,70 @@ fn one_trailing_semicolon_is_allowed() {
     assert!(out.stderr.is_empty());
 }
 
+/// A whole script as one source, which `run_with_input` cannot give: stdin is
+/// parsed a line at a time, so a run of terminators spanning a newline never
+/// reaches the parser as one run there.
+fn run_command_line(script: &str) -> Output {
+    mesh_command().arg("-c").arg(script).output().expect("mesh")
+}
+
+/// The run of terminators between two statements separates them, and one `;`
+/// does that — the newlines around it are layout. A second has nothing between
+/// the two to separate, wherever in the run it is written.
+#[test]
+fn a_second_semicolon_in_a_terminator_run_is_an_empty_command() {
+    for script in [
+        "puts x;; puts y",
+        "puts x\n;; puts y",
+        "puts x;\n;; puts y",
+        "puts x;\n; puts y",
+        "puts x\n;\n; puts y",
+        "puts x &;; puts y",
+        "if true { puts x;\n; puts y }",
+    ] {
+        let out = run_command_line(script);
+        assert_eq!(out.status.code(), Some(2), "{script:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("syntax error: empty command"),
+            "{script:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty(), "{script:?}");
+    }
+}
+
+/// The other half of the same rule: one `;` still separates from anywhere in the
+/// run, so a newline before it is layout rather than a second separator.
+#[test]
+fn one_semicolon_separates_from_anywhere_in_the_run() {
+    for script in [
+        "puts x; puts y",
+        "puts x;\nputs y",
+        "puts x\n; puts y",
+        "puts x\n;\nputs y",
+        "puts x;\n\nputs y",
+    ] {
+        let out = run_command_line(script);
+        assert_eq!(out.status.code(), Some(0), "{script:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "x\ny\n", "{script:?}");
+        assert!(out.stderr.is_empty(), "{script:?}");
+    }
+}
+
+/// A backgrounding `&` separates on its own, and the one `;` a run may hold is
+/// still allowed after it — `cmd &; next` is a shape real scripts write. The
+/// second `;` is what the run refuses, which the error test above pins.
+#[test]
+fn a_backgrounded_statement_still_takes_one_semicolon() {
+    let out = run_command_line("true &; puts done");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("done"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn a_sequence_reports_the_last_commands_status() {
     // `true && false` short-circuits to false's status (1); a following `;`

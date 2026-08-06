@@ -109,6 +109,18 @@ Delete an entry once you have agreed with it or reversed it.
       which was stranger. The alternative was refusing the bare-text case
       outright. *Reversible:* a refusal narrows, and nothing shipped depends on
       either reading.
+- [ ] **The repeated-`;` check was widened to the whole run, not dropped.** The
+      parser-asymmetry entry offered both; widening keeps the `an empty command`
+      error the suite already pins and only adds the shapes that were slipping
+      through a one-token lookahead, where dropping it would have retired a loud
+      error for a typo. Two shapes stay accepted deliberately: `puts x` ⏎
+      `; puts y`, because the rule reads how many `;` a run holds rather than
+      where they sit, and `cmd &; next`, which the suite itself writes — bash
+      refuses both, and matching bash there would have been a third, wider
+      decision. *Reversible:* dropping the check later accepts strictly more, so
+      nothing written against the widened rule breaks; the two accepted shapes
+      are the ones that would cost a fix to reverse, which is why they were left
+      as they were.
 - [ ] **`:url` accepts a relative path and absolutizes it**, rather than refusing
       one and telling the writer to make it absolute first. The alternative was
       the safer default: refusing accepts strictly less, so widening later is a
@@ -6528,12 +6540,19 @@ a one-line edit. Every claim below was checked against the built shell.
       signature rule the line break was hiding; `func f(x` ⏎ `, y = 2)` shows
       the fix.)
 
-- [ ] **A repeated `;` is refused by a check that only looks one token ahead.**
-      `Parser::source` tests `same(Semi) && tokens[position + 1] is Semi` once,
-      right after the statement, and then lets `terminators()` swallow any run.
-      So `puts x;; puts y` is `an empty command` while `puts x;` ⏎ `;; puts y`
-      is fine. The narrow rule is hard to state as anything but "what the code
-      happens to do"; either check the whole run or drop the check.
+- [x] **A repeated `;` is refused by a check that only looks one token ahead.**
+      `Parser::source` tested `same(Semi) && tokens[position + 1] is Semi` once,
+      right after the statement, and then let `terminators()` swallow any run.
+      So `puts x;; puts y` was `an empty command` while `puts x;` ⏎ `;; puts y`
+      was fine. Fixed by checking the whole run: `Parser::separator` counts the
+      `;` in the terminator run and refuses the second, so the layout around it
+      no longer changes the answer. What separates two statements is one `;`
+      and the newlines around it, which leaves `puts x` ⏎ `; puts y` parsing —
+      the count is what the rule reads, not where in the run the `;` sits. A
+      backgrounding `&` separates on its own and its run may still hold one
+      `;` (`cmd &; next`, which the suite itself writes); `cmd &;; next` joins
+      the refusal. `GRAMMAR.md`'s separator production and its two paragraphs
+      updated to match.
 
 - [ ] **`$env.PATH[0] = …` reports `expected a statement separator`.** Not a
       target (an env entry is bytes, with nothing inside to reach into), so it
