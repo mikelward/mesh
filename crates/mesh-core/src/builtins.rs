@@ -447,6 +447,14 @@ const SYNTAX: &[(&[&str], &str, &str)] = &[
         "not $x",
         "Negate a value; `and` and `or` join two",
     ),
+    // The booleans are words rather than punctuation, so `help true` has to answer
+    // — and answering "not a builtin or a keyword" about a word the parser reads
+    // as a value is the same falsehood `fail` used to be told about.
+    (
+        &["true", "false"],
+        "true · false",
+        "The booleans; a bare one is the value, not a command",
+    ),
     (
         &["func"],
         "func NAME(PARAMS) { … }",
@@ -517,6 +525,15 @@ pub(crate) enum Claim {
     /// a command-position `style …` is still a lookup that reports `command not
     /// found`, so it is not a command keyword either.
     ValueCall,
+    /// A **literal**: `true` and `false` are the booleans in every position a
+    /// statement is read (`docs/DESIGN.md` §"Bare words and quoted values"), so a
+    /// bare one is a value and never reaches the program of that name.
+    ///
+    /// Like [`Claim::Command`] in that command position is settled before any
+    /// lookup, and unlike it in what the word means there: a value rather than a
+    /// construct. `type` keeps them apart for that reason — calling `true` a shell
+    /// keyword would name the wrong thing — while both stop a `func` of the name.
+    Literal,
 }
 
 /// Every word the parser reserves, and what it claims.
@@ -558,6 +575,11 @@ pub(crate) const RESERVED_WORDS: &[(&str, Claim)] = &[
     ("with", Claim::Contextual),
     ("and", Claim::Contextual),
     ("or", Claim::Contextual),
+    // Not keywords and not calls: the parser reads a lone bare one as the boolean
+    // (`parser::boolean_literal`), so `if true` forks nothing and `type true` must
+    // not report the program that spelling no longer reaches.
+    ("true", Claim::Literal),
+    ("false", Claim::Literal),
     ("re", Claim::ValueCall),
     ("style", Claim::ValueCall),
     ("link", Claim::ValueCall),
@@ -596,6 +618,15 @@ pub(crate) fn is_command_keyword(name: &str) -> bool {
 /// Is `name` a built-in value call? The parser refuses these as function names.
 pub(crate) fn is_value_call(name: &str) -> bool {
     claim_of(name) == Some(Claim::ValueCall)
+}
+
+/// Is a bare `name` a literal — one of the booleans? See [`Claim::Literal`].
+///
+/// Asked where "what does a bare one do" is the question and the answer is
+/// neither a lookup nor a construct: `type` reports the value, and a definition
+/// of the name is refused because nothing could ever reach it.
+pub(crate) fn is_literal(name: &str) -> bool {
+    claim_of(name) == Some(Claim::Literal)
 }
 
 /// Builtins that answer to the **call** spelling as well as the command one, so
@@ -1481,8 +1512,8 @@ mod tests {
     }
     use super::{
         Claim, Decoration, RESERVED_WORDS, SYNTAX, TABLE, Value, base64, help, is_builtin,
-        is_command_keyword, is_value_call, name_of, names, overview, path_line, reads_options,
-        rename_note, rendered_for_output, syntax_help, syntax_words, usage_options,
+        is_command_keyword, is_literal, is_value_call, name_of, names, overview, path_line,
+        reads_options, rename_note, rendered_for_output, syntax_help, syntax_words, usage_options,
     };
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
@@ -2019,6 +2050,29 @@ mod tests {
         for (word, claim) in RESERVED_WORDS {
             assert_eq!(is_command_keyword(word), *claim == Claim::Command, "{word}");
             assert_eq!(is_value_call(word), *claim == Claim::ValueCall, "{word}");
+            assert_eq!(is_literal(word), *claim == Claim::Literal, "{word}");
+        }
+    }
+
+    #[test]
+    fn the_literal_rows_are_the_words_the_parser_reads_as_booleans() {
+        // The table decides what `type` reports and what `func` refuses, so a word
+        // claimed here that the parser does not read as a value would refuse a
+        // definition that works — and one the parser reads and the table misses is
+        // the silently dead `func true()` this pair of rows exists to stop.
+        for (word, claim) in RESERVED_WORDS {
+            assert_eq!(
+                *claim == Claim::Literal,
+                crate::parser::boolean_literal(word).is_some(),
+                "{word}"
+            );
+        }
+        for spelling in ["true", "false"] {
+            assert!(is_literal(spelling), "{spelling}");
+            assert!(!is_command_keyword(spelling), "{spelling}");
+            assert!(!is_value_call(spelling), "{spelling}");
+            // Not a builtin, so the two lookups cannot disagree about it.
+            assert!(!is_builtin(spelling), "{spelling}");
         }
     }
 

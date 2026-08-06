@@ -62,6 +62,16 @@ enum Finding {
     /// group answers "what runs when I type this" — a contextual word is an
     /// ordinary command word, and a legal function name besides.
     Syntax { form: &'static str, keyword: bool },
+    /// A **boolean literal** — `true` / `false`, which the parser reads as the
+    /// value in every position, so a bare one is settled before any lookup and
+    /// never reaches the program of that name.
+    ///
+    /// Its own kind rather than a `Syntax` row, because this is the one question
+    /// `type` exists to answer and "a shell keyword" would answer it with the
+    /// wrong thing: the word is a value, not a construct. Reporting the program
+    /// was worse still — `/usr/bin/true` is a resolution a bare `true` cannot
+    /// perform, and `type` is asked precisely when the reader does not know that.
+    Literal { form: &'static str },
     /// A builtin, carrying its usage line.
     Builtin(&'static str),
     /// A defined function, carrying its reconstructed signature.
@@ -243,7 +253,11 @@ pub(crate) fn type_of(args: &[String], funcs: &Funcs, vars: &Vars) -> u8 {
 /// bindings.
 fn word(finding: &Finding) -> &'static [u8] {
     match finding {
-        Finding::Syntax { .. } => b"keyword",
+        // A literal has no bash token of its own — bash has no literals in command
+        // position — and `keyword` is the one that says what a guard needs to hear:
+        // mesh owns the name, so nothing a script defines will answer to it. The
+        // same fallback a value call already takes.
+        Finding::Syntax { .. } | Finding::Literal { .. } => b"keyword",
         Finding::Builtin(_) => b"builtin",
         Finding::Function(_) => b"function",
         Finding::External(_) | Finding::File(_) => b"file",
@@ -347,13 +361,23 @@ fn look_up(name: &str, funcs: &Funcs, vars: &Vars) -> Found {
     // shadowing a `func fork()` that is what would actually run. It still gets
     // described, from the side, because "`fork` is also the subshell keyword" is
     // worth knowing; it just is not the answer to "what runs".
+    //
+    // A **literal** joins the race for the same reason a command keyword does, and
+    // it is the whole answer where it applies: `true` is the boolean before any
+    // lookup happens, so the `/usr/bin/true` this used to report is a resolution a
+    // bare one cannot perform. The program stays in the report under `-a`, since
+    // `./true` and `command -- true` still reach it.
     if let Some(form) = builtins::syntax_form(name) {
-        let keyword = builtins::is_command_keyword(name);
-        let finding = Finding::Syntax { form, keyword };
-        if keyword {
-            found.commands.push(finding);
+        if builtins::is_literal(name) {
+            found.commands.push(Finding::Literal { form });
         } else {
-            found.separate.push(finding);
+            let keyword = builtins::is_command_keyword(name);
+            let finding = Finding::Syntax { form, keyword };
+            if keyword {
+                found.commands.push(finding);
+            } else {
+                found.separate.push(finding);
+            }
         }
     }
     // A word with a `/` in it is a **path**, not a name — that is how command
@@ -596,6 +620,7 @@ fn line(name: &str, finding: &Finding, out: &mut Vec<u8>) {
     out.extend_from_slice(b" is ");
     match finding {
         Finding::Syntax { .. } => out.extend_from_slice(b"a shell keyword"),
+        Finding::Literal { .. } => out.extend_from_slice(b"a boolean literal"),
         Finding::Builtin(_) => out.extend_from_slice(b"a shell builtin"),
         Finding::Function(_) => out.extend_from_slice(b"a function"),
         Finding::External(path) => out.extend_from_slice(path.as_os_str().as_bytes()),
@@ -609,7 +634,7 @@ fn line(name: &str, finding: &Finding, out: &mut Vec<u8>) {
     }
     out.push(b'\n');
     let detail = match finding {
-        Finding::Syntax { form, .. } => Some(*form),
+        Finding::Syntax { form, .. } | Finding::Literal { form } => Some(*form),
         Finding::Builtin(usage) => Some(*usage),
         Finding::Function(signature) => Some(signature.as_str()),
         Finding::Variable { detail, .. } | Finding::Environment { detail } => Some(detail.as_str()),
@@ -673,6 +698,25 @@ mod tests {
         assert!(
             rendered("unless", &found, false)
                 .starts_with("unless is a shell keyword\n    cmd if COND")
+        );
+    }
+
+    /// A literal is not a keyword, and the sentence has to say which it is: `type`
+    /// is asked exactly when the reader does not know that a bare `true` never
+    /// reaches `/usr/bin/true`. The program is still in the report, under it.
+    #[test]
+    fn names_a_boolean_literal_above_the_program_it_shadows() {
+        let found = look_up("true", &Funcs::new(), &Vars::new());
+        let all = rendered("true", &found, true);
+        assert!(
+            all.starts_with("true is a boolean literal\n    true · false\n"),
+            "{all}"
+        );
+        // The winner alone, without `--all` — the program it shadows is not the
+        // answer to "what runs".
+        assert_eq!(
+            rendered("true", &found, false),
+            "true is a boolean literal\n    true · false\n"
         );
     }
 
