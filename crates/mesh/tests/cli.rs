@@ -14547,12 +14547,14 @@ fn a_composed_option_name_is_data_not_an_option() {
         run_with_input("func f(target, --force) { puts \"$target/$force\" }\nf(prod, --force)\n");
     assert_eq!(String::from_utf8_lossy(&literal.stdout), "prod/true\n");
 
+    // `:repr` rather than a bare spread: `puts` declares no options, so a flag
+    // reaching it as a call argument reports rather than printing.
     let terminator = run_with_input(
-        "func f(--force, ...rest) { puts \"force=$force\"\n puts ...$rest }\nf(--, --force)\n",
+        "func f(--force, ...rest) { puts \"force=$force\"\n puts $rest:repr }\nf(--, --force)\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&terminator.stdout),
-        "force=false\n--force\n"
+        "force=false\n[--force]\n"
     );
 }
 
@@ -14607,7 +14609,9 @@ fn a_chain_on_an_attached_value_transforms_the_value_not_the_name() {
 
     // The re-anchored parse is the word's, not the call's, so an assignment
     // agrees with the call spelling: the name survives untransformed.
-    let bound = run_with_input("w = v7\nx = --tag=$w:upper\nputs $x\n");
+    // Quoted, since a bare `$x` holding a flag is an option `puts` does not
+    // declare; the interpolation asks for its text.
+    let bound = run_with_input("w = v7\nx = --tag=$w:upper\nputs \"$x\"\n");
     assert_eq!(String::from_utf8_lossy(&bound.stdout), "--tag=V7\n");
 
     // A chain that leaves the value a list is still refused — the chain changes
@@ -14909,11 +14913,11 @@ fn a_value_call_honors_the_option_terminator_and_scans_spread_elements() {
     // A bare `--` ends option parsing inside a value call too, so a following
     // `--force` reaches the rest parameter as data instead of setting the switch.
     let terminated = run_with_input(
-        "func f(--force, ...rest) { puts \"force=$force\"\n puts ...$rest }\nx = f(--, --force)\n",
+        "func f(--force, ...rest) { puts \"force=$force\"\n puts $rest:repr }\nx = f(--, --force)\n",
     );
     assert_eq!(
         String::from_utf8_lossy(&terminated.stdout),
-        "force=false\n--force\n"
+        "force=false\n[--force]\n"
     );
     assert!(terminated.stderr.is_empty(), "{:?}", terminated.stderr);
 
@@ -16788,7 +16792,7 @@ fn a_wrapper_func_still_binds_its_positionals() {
     // Disabling flag parsing is not disabling the signature: arity still holds,
     // and a leading positional still binds before the rest collects.
     let out = run_with_input(
-        "wrapper func g(first, ...rest) { puts $first\nputs $rest:repr }\ng --a --b c\n",
+        "wrapper func g(first, ...rest) { puts \"$first\"\nputs $rest:repr }\ng --a --b c\n",
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "--a\n[--b, 'c']\n");
     let short = run_with_input("wrapper func g(a, b) { puts ok }\ng only\nputs after\n");
@@ -16873,8 +16877,8 @@ fn a_malformed_wrapper_header_quarantines_its_body() {
 fn a_multiline_wrapper_body_still_reads_to_its_close() {
     // The counterpart: a well-formed wrapper written across lines must keep
     // buffering rather than dispatching at the first newline.
-    let out = run_with_input("wrapper func g(...xs) {\nputs ok ...$xs\n}\ng --a b\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok --a b\n");
+    let out = run_with_input("wrapper func g(...xs) {\nputs ok $xs:repr\n}\ng --a b\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok [--a, 'b']\n");
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 }
 
@@ -16896,10 +16900,12 @@ fn an_alias_is_a_wrapper_func_that_forwards() {
     // The whole feature in one line: `alias co = …` is sugar for the wrapper you
     // would otherwise write out, so it takes arguments and forwards flags.
     // `--color=never` names no parameter of the generated `co(...args)`, so a
-    // plain `func` would have rejected it here. (`puts` reads the `--` itself,
-    // so the terminator is left out of this one — `a_wrapper_func_forwards_the
-    // _terminator_too` covers it on the underlying form.)
-    let out = run_with_input("alias g = puts grep\ng --color=never x\n");
+    // plain `func` would have rejected it here. An **external** is what it
+    // forwards to: a flag reaching an external is bytes, while a builtin with no
+    // options of its own reports one — so `puts` would answer for itself rather
+    // than show the forwarding. (`a_wrapper_func_forwards_the_terminator_too`
+    // covers the terminator on the underlying form.)
+    let out = run_with_input("alias g = /bin/echo grep\ng --color=never x\n");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "grep --color=never x\n"
@@ -17085,10 +17091,15 @@ fn a_switch_given_a_value_is_an_error() {
 #[test]
 fn the_terminator_sends_flag_like_tokens_to_the_rest() {
     let out = run_with_input(
-        "func f(--force, ...rest) { puts $force\n  puts ...$rest }\nf -- --force a\n",
+        "func f(--force, ...rest) { puts $force\n  puts $rest:repr }\nf -- --force a\n",
     );
-    // `--` ends flag parsing: `--force` and `a` become rest elements.
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "false\n--force a\n");
+    // `--` ends flag parsing: `--force` and `a` become rest elements. Read back
+    // with `:repr`, since spreading them into `puts` would offer it an option it
+    // does not declare.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "false\n[--force, 'a']\n"
+    );
 }
 
 #[test]
@@ -27666,7 +27677,10 @@ fn folding_the_sign_claims_literals_and_nothing_else() {
         ("x = - 0", "0"),
         ("x = - 5", "-5"),
     ] {
-        let out = run_with_input(&format!("{source}\nputs $x\n"));
+        // Interpolated, because one row (`--5`) folds to a **flag**, and a flag
+        // handed to `puts` as a call argument is an option it does not declare.
+        // `"$x"` asks every row for its text, which is what this table compares.
+        let out = run_with_input(&format!("{source}\nputs \"$x\"\n"));
         assert!(
             out.status.success(),
             "{source:?} failed: {}",
@@ -29776,4 +29790,110 @@ fn a_spread_element_carries_the_option_it_was_written_as() {
         String::from_utf8_lossy(&run_with_input("x = [--help]\nputs $x\n").stdout),
         "--help\n"
     );
+}
+
+/// A builtin with no options of its own reports a flag rather than printing it —
+/// the last of the four symptoms the argv marks were built for. `puts` declares
+/// none, so a flag in the call is an option it cannot match, which is the answer a
+/// `func` with no such parameter already gives (`DESIGN.md` §"One flag rule").
+/// `puts $x` is genuinely ambiguous between *print this* and *pass this option*,
+/// and refusing beats guessing.
+#[test]
+fn a_builtin_with_no_options_reports_a_flag_rather_than_printing_it() {
+    // Written at the call, and arriving in a variable: the mark asks the value,
+    // so both answer the same.
+    for source in ["puts --force\n", "x = --force\nputs $x\n"] {
+        let out = run_with_input(&format!("{source}puts after\n"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("puts: unknown flag `--force`"),
+            "{source}: {stderr}"
+        );
+        // Recoverable, like any other usage error: the next statement still runs.
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n", "{source}");
+    }
+
+    // The three ways to say "print it" all still print. `--` is the one the
+    // diagnostic names, and the other two are what the design offers for a value.
+    for source in [
+        "puts -- --force",
+        "x = --force\nputs \"$x\"",
+        "x = --force\nputs $x:repr",
+    ] {
+        let out = run_with_input(&format!("{source}\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "--force\n",
+            "{source}"
+        );
+        assert!(out.stderr.is_empty(), "{source}: {:?}", out.stderr);
+    }
+
+    // Help is still claimed before the refusal can see the flag, and a word the
+    // terminator protects is still the operand it was protected as — the order
+    // that backed the earlier attempt out.
+    assert!(String::from_utf8_lossy(&run_with_input("puts --help\n").stdout).contains("Usage:"));
+    assert_eq!(
+        String::from_utf8_lossy(&run_with_input("puts -- --help\n").stdout),
+        "--help\n"
+    );
+
+    // A flag *inside* a collection is data being displayed, not an option: the
+    // mark asks the word's own value, and this one is a list.
+    assert_eq!(
+        String::from_utf8_lossy(&run_with_input("x = [--force]\nputs $x\n").stdout),
+        "--force\n"
+    );
+
+    // A builtin that reads options of its own is untouched — it decides for
+    // itself what its options are.
+    let reads_options = run_with_input("type --quiet puts\nputs done\n");
+    assert_eq!(String::from_utf8_lossy(&reads_options.stdout), "done\n");
+    assert!(
+        reads_options.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&reads_options.stderr)
+    );
+
+    // Every path that re-dispatches a builtin answers the same. A refusal that
+    // varied by execution context would accept, somewhere, precisely the call it
+    // exists to reject — a stage, a bound, and a captured call each rebuilt argv
+    // from bytes at one point. Raised in review as a P1.
+    for source in [
+        "x = --force\nputs $x | cat",
+        "puts --force &\nwait",
+        "timeout 5s puts --force",
+        "timeout 5s puts --force | cat",
+        "timeout 5s puts --force &\nwait",
+        "timeout 5s timeout 3s puts --force",
+        "x = puts(--force):capture",
+        "x = $(puts --force)",
+    ] {
+        let out = run_with_input(&format!("{source}\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("puts: unknown flag `--force`"),
+            "{source}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("--force"),
+            "{source} printed the flag: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    // The bound changes nothing about what the wrapped command reads, in the
+    // other direction too: the spellings that worked still work under it.
+    assert!(
+        String::from_utf8_lossy(&run_with_input("timeout 5s puts --help\n").stdout)
+            .contains("Usage:")
+    );
+    for source in ["timeout 5s puts -- --force", "timeout 5s puts \"--force\""] {
+        let out = run_with_input(&format!("{source}\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "--force\n",
+            "{source}"
+        );
+    }
 }

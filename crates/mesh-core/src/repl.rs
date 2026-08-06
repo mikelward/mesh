@@ -6109,23 +6109,37 @@ fn run_command_in_capture(
     shell: &mut Shell,
 ) -> Result<Option<u8>, Step> {
     {
-        let mut words = vec![name.to_string()];
+        // The command's own word is never an option to itself, and each argument
+        // is asked its **value** — the same question `expand::written_of` asks of
+        // a word, one step later, since here the value exists before argv does.
+        // Without it a captured call re-derived its options from the rendered
+        // bytes, and `puts(--force):capture` quietly captured `--force`.
+        let mut argv = Argv::data(vec![name.to_string()]);
+        let mut push = |texts: Vec<String>, written| {
+            for text in texts {
+                argv.push(text, written);
+            }
+        };
         for argument in arguments {
             match argument {
                 parser::Argument::Positional(expression) => {
                     let Some(value) = eval_operand(expression, last, in_function, shell)? else {
                         return Ok(None);
                     };
-                    words.extend(capture_argument_words(&value, name)?);
+                    let written = expand::written_of_value(&value);
+                    push(capture_argument_words(&value, name)?, written);
                 }
                 parser::Argument::Spread(expression) => {
                     let Some(value) = eval_operand(expression, last, in_function, shell)? else {
                         return Ok(None);
                     };
                     match value {
+                        // A spread promotes each element to an argument of its
+                        // own, so each answers for itself — as it does for a word.
                         Value::List(values) => {
                             for value in &values {
-                                words.extend(capture_argument_words(value, name)?);
+                                let written = expand::written_of_value(value);
+                                push(capture_argument_words(value, name)?, written);
                             }
                         }
                         _ => {
@@ -6150,7 +6164,7 @@ fn run_command_in_capture(
         // An argument that failed did so with its diagnostic on the captured stderr;
         // re-reporting it is `capture_call`'s job, on the one path both kinds of
         // failure now share.
-        match run_expanded(Argv::data(words), last, shell) {
+        match run_expanded(argv, last, shell) {
             Step::Continue(status) => Ok(Some(status)),
             // `exit` leaves the shell rather than reporting a status into a record.
             step => Err(step),
@@ -7521,11 +7535,23 @@ enum StageBody {
         /// Outermost first — `timeout 5s timeout 3s cmd` is two bounds around
         /// one command, each its own fork.
         limits: Vec<std::time::Duration>,
-        /// The wrapped command's typed arguments when it is a function, whose
-        /// name is then the stage's only word. `None` when the stage's words are
-        /// the command, as they are for [`Self::Builtin`].
-        call: Option<Vec<(Value, bool)>>,
+        /// The wrapped command, in the form that runs it.
+        body: BoundedBody,
     },
+}
+
+/// The command a bounded stage wraps, once it is resolved.
+///
+/// Both arms carry what running them needs, rather than reading it back off
+/// `exec::Cmd.words`: a function keeps its typed arguments, and argv keeps the
+/// marks its call site wrote — `timeout 5s puts --force | cat` has to answer as
+/// the unwrapped `puts --force` does.
+enum BoundedBody {
+    Function {
+        name: String,
+        args: Vec<(Value, bool)>,
+    },
+    Argv(Argv),
 }
 
 /// The word a compound stage is listed and reported under — its leading keyword,
@@ -7639,7 +7665,9 @@ fn run_stages(
             StageBody::External => false,
             // The bound changes nothing about *what* the stage runs, so it
             // answers exactly as the unbounded form does.
-            StageBody::Bounded { call, .. } => call.is_some() || cmd.words == ["jobs"],
+            StageBody::Bounded { body, .. } => {
+                matches!(body, BoundedBody::Function { .. }) || cmd.words == ["jobs"]
+            }
         })
     {
         jobs.reap();
@@ -7765,9 +7793,7 @@ fn run_stage_in_shell(
             }
         }
         StageBody::External => unreachable!("an external stage has no in-shell body"),
-        StageBody::Bounded { limits, call } => {
-            bounded_chain(limits, &cmd.words, call.clone(), last, shell)
-        }
+        StageBody::Bounded { limits, body } => bounded_chain(limits, body, last, shell),
         // The words are expanded **here**, in the stage's own process, which is the
         // whole point of deferring them: a `$(…)` or a call in one runs where its
         // effects belong. What they come to decides how the stage ends — as a
@@ -8060,6 +8086,18 @@ impl Argv {
     /// The marks from `at` onward, for a caller that also slices `words`.
     fn written_from(&self, at: usize) -> &[expand::Written] {
         &self.written[at.min(self.written.len())..]
+    }
+
+    /// The argv from `at` onward, marks and all — for a prefix builtin that
+    /// re-dispatches what follows it (`timeout 5s puts --force`). Slicing only
+    /// `words` there drops the marks, and the command behind the prefix then
+    /// answers differently from the same command written alone.
+    fn slice_from(&self, at: usize) -> Self {
+        let at = at.min(self.words.len());
+        Self {
+            words: self.words[at..].to_vec(),
+            written: self.written[at..].to_vec(),
+        }
     }
 }
 
@@ -8848,10 +8886,12 @@ fn expand_bounded(
         note!("mesh: timeout: expected a command to run");
         return Err(Step::Error(2));
     }
-    let (words, call) = match expand_stage(command, decoration, last, in_function, shell)? {
+    let (words, body) = match expand_stage(command, decoration, last, in_function, shell)? {
         // Only the name goes into the words a job listing echoes back: the
         // arguments are typed values, as they are for any other stage.
-        Expanded::Function { name, args } => (vec![name], Some(args)),
+        Expanded::Function { name, args } => {
+            (vec![name.clone()], BoundedBody::Function { name, args })
+        }
         Expanded::Return(_) => {
             note!("mesh: {}", context.returning());
             return Err(Step::Error(2));
@@ -8865,10 +8905,12 @@ fn expand_bounded(
                 note!("mesh: timeout: expected a command to run");
                 return Err(Step::Error(2));
             }
-            (argv.words, None)
+            // The words a job listing shows and the argv the body runs are the
+            // same bytes; only the body needs the marks beside them.
+            (argv.words.clone(), BoundedBody::Argv(argv))
         }
     };
-    Ok((words, StageBody::Bounded { limits, call }))
+    Ok((words, StageBody::Bounded { limits, body }))
 }
 
 /// Apply a stage's bounds from the outside in, one fork each, and run the
@@ -8880,30 +8922,25 @@ fn expand_bounded(
 /// refuses to stop.
 fn bounded_chain(
     limits: &[std::time::Duration],
-    words: &[String],
-    call: Option<Vec<(Value, bool)>>,
+    body: &BoundedBody,
     last: u8,
     shell: &mut Shell,
 ) -> Step {
     let Some((limit, rest)) = limits.split_first() else {
-        return Step::Continue(bounded_body(words, call, last, shell));
+        return Step::Continue(bounded_body(body, last, shell));
     };
     bounded_run(*limit, shell, |shell| {
-        bounded_chain(rest, words, call, last, shell).status()
+        bounded_chain(rest, body, last, shell).status()
     })
 }
 
 /// The wrapped command once it is resolved: a function call keeps its typed
-/// arguments, and anything else runs from its words.
-fn bounded_body(
-    words: &[String],
-    call: Option<Vec<(Value, bool)>>,
-    last: u8,
-    shell: &mut Shell,
-) -> u8 {
-    match call {
-        Some(args) => dispatch_function_call(&words[0], args, shell),
-        None => run_expanded(Argv::data(words.to_vec()), last, shell),
+/// arguments, and anything else runs from its argv — marks included, so the
+/// bound changes nothing about what the command reads.
+fn bounded_body(body: &BoundedBody, last: u8, shell: &mut Shell) -> u8 {
+    match body {
+        BoundedBody::Function { name, args } => dispatch_function_call(name, args.clone(), shell),
+        BoundedBody::Argv(argv) => run_expanded(argv.clone(), last, shell),
     }
     .status()
 }
@@ -8918,9 +8955,10 @@ fn bounded_body(
 /// accepted by one and refused by the other with 125.
 ///
 /// What it cannot do is keep *value fidelity*, since argv is where a list has
-/// already been flattened.
-fn run_bounded_argv(args: &[String], last: u8, shell: &mut Shell) -> Step {
-    let Some((limit, command)) = args.split_first() else {
+/// already been flattened. It does keep the **marks**, so the wrapped command
+/// reads the options its call site wrote.
+fn run_bounded_argv(args: Argv, last: u8, shell: &mut Shell) -> Step {
+    let Some((limit, _)) = args.words.split_first() else {
         note!("mesh: timeout: expected a duration and a command");
         return Step::Error(2);
     };
@@ -8937,13 +8975,13 @@ fn run_bounded_argv(args: &[String], last: u8, shell: &mut Shell) -> Step {
         note!("mesh: timeout: not a duration: {limit}");
         return Step::Error(2);
     };
+    let command = args.slice_from(1);
     if command.is_empty() {
         note!("mesh: timeout: expected a command to run");
         return Step::Error(2);
     }
-    let command = command.to_vec();
     bounded_run(limit, shell, move |shell| {
-        run_expanded(Argv::data(command), last, shell).status()
+        run_expanded(command, last, shell).status()
     })
 }
 
@@ -9041,7 +9079,9 @@ fn run_expanded(mut argv: Argv, last: u8, shell: &mut Shell) -> Step {
         return run_exec(&words[1..], shell);
     }
     if words[0] == "timeout" {
-        return run_bounded_argv(&words[1..], last, shell);
+        // The marks travel past the prefix: what `timeout` wraps must mean the
+        // same thing it means written alone.
+        return run_bounded_argv(argv.slice_from(1), last, shell);
     }
     if builtins::is_builtin(&argv.words[0]) {
         // Asked of the **marks**, not the characters. Reading argv text made a
@@ -9063,19 +9103,41 @@ fn run_expanded(mut argv: Argv, last: u8, shell: &mut Shell) -> Step {
         if help {
             return Step::Continue(builtins::print_help(&argv.words[0]));
         }
-        // For a builtin with no options of its own the terminator has to be
-        // **taken out of the way**, exactly as `call_func` does when binding a
-        // function's arguments — left in, `puts -- --help` wrote `-- --help`.
-        //
-        // A builtin that *does* read options keeps it, because only that builtin
-        // knows where its options end. Removing it here would undo the very thing
-        // it was written for — `kill -- -9 %1` would send SIGKILL rather than look
-        // for a job named `-9`, and `prompt -- --reset` would reset instead of
-        // setting that text.
-        if !builtins::reads_options(&argv.words[0])
-            && let Some(at) = terminator
-        {
-            argv.remove(at + 1);
+        if !builtins::reads_options(&argv.words[0]) {
+            // A builtin with no options of its own has none to match, so a written
+            // flag is a mistake rather than data — the answer a `func` with no such
+            // parameter already gives, and the builtin principle says a builtin is
+            // not a third kind of command (`DESIGN.md` §"One flag rule"). It is the
+            // type earning its keep: `puts $x` genuinely is ambiguous between
+            // *print this* and *pass this option*, and refusing beats guessing.
+            //
+            // Asked only of the words **before** the terminator, and only after
+            // help has been claimed above. That order is what backed the earlier
+            // attempt out: a refusal in `output_words` swallowed `puts --help` and
+            // fired on the `--help` that `puts -- --help` had explicitly protected.
+            if let Some(at) = argv
+                .written_from(1)
+                .iter()
+                .take(terminator.unwrap_or(usize::MAX))
+                .position(|written| *written == expand::Written::Flag)
+            {
+                let name = &argv.words[0];
+                let flag = &argv.words[at + 1];
+                note!("mesh: {name}: unknown flag `{flag}`; `{name} -- {flag}` passes it as data");
+                return Step::Error(2);
+            }
+            // The terminator has to be **taken out of the way**, exactly as
+            // `call_func` does when binding a function's arguments — left in,
+            // `puts -- --help` wrote `-- --help`.
+            //
+            // A builtin that *does* read options keeps it, because only that
+            // builtin knows where its options end. Removing it here would undo the
+            // very thing it was written for — `kill -- -9 %1` would send SIGKILL
+            // rather than look for a job named `-9`, and `prompt -- --reset` would
+            // reset instead of setting that text.
+            if let Some(at) = terminator {
+                argv.remove(at + 1);
+            }
         }
     }
     let words = &mut argv.words;
