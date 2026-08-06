@@ -419,7 +419,7 @@ apart from a `WORD`:
 binding         = pattern-binding | member-binding | env-binding ;
 pattern-binding = pattern "=" assignment-value | name "+=" value-expression ;
 member-binding  = member-target ( "=" | "+=" ) value-expression ;
-env-binding     = env-target ( "=" | "+=" ) value-expression ;
+env-binding     = ( env-target | env-element-target ) ( "=" | "+=" ) value-expression ;
 assignment-value
                 = value-expression | background-job ;
 background-job  = pipeline "&" ;
@@ -432,9 +432,13 @@ list-pattern-item
 member-target   = "$" root access+            # `$m.key`, `$xs[0]`, `$m.rows[1].name`
                 | "${" root access+ "}" ;     # `${m.a} = 2`, `${xs[0]} += 2`
 root            = name ;                      # never `env` — see `env-target`
-env-target      = "$env." name | "${env." name "}"
-                | "$env[" key-subscript "]"   # a computed key, resolved at run time
-                | "${env[" key-subscript "]}" ;
+env-target      = "$env" env-entry | "${env" env-entry "}" ;
+env-entry       = "." name
+                | "[" key-subscript "]" ;     # a computed key, resolved at run time
+env-element-target                            # `$env.PATH[0]`, `${env[$k][1]}`
+                = "$env" env-entry index-subscript+
+                | "${env" env-entry index-subscript+ "}" ;
+index-subscript = "[" subscript "]" ;
 key-subscript   = signed-integer | name | "$" name | quoted-string ;   # no range
 ```
 
@@ -447,20 +451,30 @@ syntax error about places rather than a command.
 
 The two are disjoint, and `env` is spelled out separately because the rules
 differ. A `member-target` chains freely — `$m.rows[1].name` is a place — while
-an `env-target` takes **exactly one** access, an entry being the smallest thing
-the environment has. `$env.PATH[0] = …` is therefore not a target at all: it
-falls through to an ordinary expression, which is where its error comes from.
+`$env` reaches an entry and then only *indexes*: an entry is the smallest thing
+the environment has, and a `.member` under one is refused in the grammar because
+no entry is ever a map, whatever its name.
 
 Both targets take the braced spelling as well as the bare one, since the braces
 are stripped before the accesses are walked: `${m.a} = 2` and `${env[$k]} += x`
 are the same places `$m.a` and `$env[$k]` are.
 
-An `env-target` takes **exactly one** access, since a bare `$env` names the whole
-table and an entry is bytes with nothing inside it to reach into: `$env.PATH[0]`
-and `$env.PATH:dedup` are not places. Its subscript is a `key-subscript` rather
-than a full one, so `$env[0..2] = x` is out: a slice names a copy of a run of
-entries, not somewhere to store one. A key naming a computed entry rides along
+An `env-target` names a whole entry, and a bare `$env` is the table rather than
+one of them, so it takes exactly one access. Its subscript is a `key-subscript`
+rather than a full one, so `$env[0..2] = x` is out: a slice names a copy of a run
+of entries, not somewhere to store one. A key naming a computed entry rides along
 as text, since which entry it names is a run-time question.
+
+An `env-element-target` reaches one further, into the **value** an entry reads
+as: the path-type names are lists, so `$env.PATH[0] = /z` replaces one directory.
+It is a whole-entry write underneath — the entry is read, the element changed,
+and the whole thing serialized back — which is why it is spelled here rather than
+folded into `member-target`, and why `+=` on one appends to the *element*.
+Whether a name is path-type is not a question the grammar can answer, so
+`$env.HOME[0] = x` parses and the run time reports it, the way the matching read
+already does. A modifier ends any of this: it names a derived value, so
+`$env.PATH:dedup = …` and `${env.PATH[0]:upper} = …` are syntax errors about
+places rather than about the environment.
 
 In a `list-pattern`, names bind by position, `_` discards, and at most one `...`
 rest binding is permitted; items are not recursively patterns. The rest need not

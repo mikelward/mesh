@@ -21767,6 +21767,153 @@ fn path_type_env_entries_are_lists() {
     );
 }
 
+/// The middle of the round trip a path-type entry already had both ends of: it
+/// reads as a list and takes one on the way back, so writing one element is the
+/// `p = $env.PATH; $p[0] = …; $env.PATH = $p` temporary spelled in one statement.
+#[test]
+fn an_element_of_a_path_type_env_entry_can_be_assigned() {
+    let out = run_with_input(
+        "$env.CDPATH = \"/a:/b:/c\"\n\
+         $env.CDPATH[0] = /z\n\
+         $env.CDPATH[-1] += x\n\
+         puts ...$env.CDPATH\n\
+         n = CDPATH\n\
+         $env[$n][1] = /q\n\
+         puts ...$env.CDPATH\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "/z /b /cx\n/z /q /cx\n"
+    );
+    assert!(out.stderr.is_empty());
+}
+
+/// Written back as bytes, not kept as a list in the shell — so a child sees the
+/// joined value, which is the whole point of writing to `$env` rather than a
+/// binding.
+#[test]
+fn an_assigned_path_element_reaches_a_child() {
+    let out = run_with_input("$env.CDPATH = \"/a:/b\"\n$env.CDPATH[0] = /z\n/usr/bin/env\n");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("CDPATH=/z:/b"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// Bytes a mesh string cannot hold survive an element write, wherever they are.
+///
+/// The list an entry reads as is decoded lossily — a mesh string is UTF-8, an
+/// environment value is arbitrary bytes — so serializing the whole list back would
+/// rewrite a component as U+FFFD and break a `PATH` entry that had been resolving
+/// fine. From review, in two rounds: the untouched component first, then the
+/// appended-to one, which is the case the equality check missed.
+/// `append_bytes` avoids the same corruption one operation over by never decoding.
+#[test]
+fn an_element_write_leaves_non_utf8_components_alone() {
+    // `\xff` is not valid UTF-8 in any position, so the entry cannot round-trip
+    // through a string.
+    fn cdpath_after(script: &str) -> Vec<u8> {
+        let mut command = mesh_command();
+        command.env("CDPATH", std::ffi::OsStr::from_bytes(b"/a:\xff/b"));
+        command
+            .arg("-c")
+            .arg(format!("{script}; /usr/bin/env"))
+            .stdin(Stdio::null());
+        let out = command.output().expect("mesh");
+        out.stdout
+            .split(|byte| *byte == b'\n')
+            .find(|line| line.starts_with(b"CDPATH="))
+            .expect("CDPATH in the child's environment")
+            .to_vec()
+    }
+
+    for (script, expected) in [
+        // Changing its neighbor leaves it alone.
+        ("$env.CDPATH[0] = /z", b"CDPATH=/z:\xff/b".to_vec()),
+        // Appending to its neighbor does too — `+=` reaches the same write back.
+        ("$env.CDPATH[0] += /x", b"CDPATH=/a/x:\xff/b".to_vec()),
+        // Appending to the broken component keeps its bytes and adds the text: the
+        // value `write_at` appended to was the lossy decoding, so the result starts
+        // with it and only the addition is new.
+        ("$env.CDPATH[1] += /x", b"CDPATH=/a:\xff/b/x".to_vec()),
+        // Replacing it outright is the one case the bytes do not survive, which is
+        // what replacing means.
+        ("$env.CDPATH[1] = /z", b"CDPATH=/a:/z".to_vec()),
+        // And an assignment is an assignment even when it reads back as what was
+        // already there: writing the replacement text the component *displays* as
+        // writes those bytes, exactly as the whole-entry `$env.CDPATH = …` would.
+        // This is why the component that was written has to be known rather than
+        // deduced from the text.
+        (
+            "$env.CDPATH[1] = \"\\u{FFFD}/b\"",
+            b"CDPATH=/a:\xef\xbf\xbd/b".to_vec(),
+        ),
+        (
+            "$env.CDPATH[1] = \"\\u{FFFD}/b/c\"",
+            b"CDPATH=/a:\xef\xbf\xbd/b/c".to_vec(),
+        ),
+    ] {
+        let line = cdpath_after(script);
+        assert_eq!(
+            line,
+            expected,
+            "{script}: {} vs {}",
+            String::from_utf8_lossy(&line),
+            String::from_utf8_lossy(&expected)
+        );
+    }
+}
+
+/// What the entry cannot answer, it says at run time — the read's own wording,
+/// since the write reaches the value through the same typing. Only what no entry
+/// could ever answer stays a syntax error, which
+/// `reaching_into_an_env_entry_to_assign_names_the_entry` covers.
+#[test]
+fn an_indexed_env_write_the_entry_cannot_answer_reports_at_run_time() {
+    // Not a path-type name, so it reads as a string and there is no element.
+    let out =
+        run_with_input("$env.MESH_TEST_S = \"/a:/b\"\n$env.MESH_TEST_S[0] = /z\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot assign into a string"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Out of range, as it is for any list.
+    let out = run_with_input("$env.CDPATH = /a\n$env.CDPATH[9] = /z\nputs $env.CDPATH[0]\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/a\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("list index out of range"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Nothing there to change, reported the way reading it is.
+    let out = run_with_input("unset $env.CDPATH\n$env.CDPATH[0] = /z\nputs after\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "after\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("$env.CDPATH: not set"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A computed key naming something the process environment cannot hold is
+    // answered by the name check, not by the read — reading one of those says "not
+    // set", which reports an absence where no such entry could exist. Whole-entry
+    // writes reach the check because nothing reads first; from review.
+    for (source, problem) in [
+        ("n = \"A=B\"\n$env[$n][0] = x\n", "cannot contain `=`"),
+        ("n = \"\"\n$env[$n][0] = x\n", "cannot be empty"),
+    ] {
+        let out = run_with_input(source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(problem), "{source}: {stderr}");
+        assert!(!stderr.contains("not set"), "{source}: {stderr}");
+    }
+}
+
 #[test]
 fn appending_to_path_adds_an_entry_and_children_see_the_joined_value() {
     let dir = fresh_dir("env_path_append");
@@ -21835,9 +21982,15 @@ fn a_joined_list_crosses_into_a_plain_env_entry() {
 
 #[test]
 fn only_a_plain_env_member_is_an_assignment_target() {
-    // An index or a modifier describes a derived value, not a place, so these
-    // stay expressions and fail as such rather than silently assigning.
-    for source in ["$env.PATH[0] = x\n", "$env.PATH:dedup = x\n", "$env = x\n"] {
+    // A member under an entry or a modifier describes something that is not a
+    // place, so these stay expressions and fail as such rather than silently
+    // assigning. (An *index* is a place — see
+    // `an_element_of_a_path_type_env_entry_can_be_assigned`.)
+    for source in [
+        "$env.PATH.inner = x\n",
+        "$env.PATH:dedup = x\n",
+        "$env = x\n",
+    ] {
         let out = run_with_input(source);
         assert_eq!(out.status.code(), Some(2), "{source}");
     }
@@ -21847,18 +22000,25 @@ fn only_a_plain_env_member_is_an_assignment_target() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
-/// Refusing it is right; refusing it as `expected a statement separator` was not,
-/// since the complaint landed on the `=` and named neither the entry nor the rule.
-/// A write replaces a whole entry, so the entry is the place — and the message
-/// says which one, in the spelling the reference was written in.
+/// A `.member` under an entry is the half no value can answer: no entry is ever a
+/// map, whatever its name, so it is settled in the grammar rather than left to run
+/// time. Refusing it is right; refusing it as `expected a statement separator` was
+/// not, since the complaint landed on the `=` and named neither the entry nor the
+/// rule. The message names the entry a write replaces, in the spelling the
+/// reference was written in.
+///
+/// A *subscript* is the other half, and it is a real place — the entry answers it
+/// when the entry is a list. See
+/// `an_indexed_env_write_the_entry_cannot_answer_reports_at_run_time` for what
+/// happens when it is not.
 #[test]
 fn reaching_into_an_env_entry_to_assign_names_the_entry() {
     for (source, entry) in [
-        ("$env.PATH[0] = x\n", "$env.PATH"),
         ("$env.HOME.inner = x\n", "$env.HOME"),
-        ("$env.PATH[0] += x\n", "$env.PATH"),
-        ("$env[\"PATH\"][0] = x\n", "$env[\"PATH\"]"),
-        ("${env.PATH[0]} = x\n", "${env.PATH}"),
+        ("$env.HOME.inner += x\n", "$env.HOME"),
+        ("$env.PATH[0].inner = x\n", "$env.PATH"),
+        ("$env[\"PATH\"].inner = x\n", "$env[\"PATH\"]"),
+        ("${env.HOME.inner} = x\n", "${env.HOME}"),
     ] {
         let out = run_with_input(source);
         assert_eq!(out.status.code(), Some(2), "{source}");
@@ -22047,9 +22207,11 @@ fn member_assignment_leaves_the_reserved_namespaces_alone() {
     let env = run_with_input("$env.MESH_TEST_M = hello\nputs $env.MESH_TEST_M\n");
     assert_eq!(String::from_utf8_lossy(&env.stdout), "hello\n");
 
-    // Unchanged from before: an index or modifier on `$env` is not an assignment
-    // target, and the message for one comes from parsing it as an expression.
-    for source in ["$env.PATH[0] = x\n", "$env.PATH:dedup = x\n"] {
+    // Unchanged from before: a modifier or a `.member` under an entry is not an
+    // assignment target. (An index is, but through the environment's own write
+    // rather than by becoming an ordinary place — see
+    // `an_element_of_a_path_type_env_entry_can_be_assigned`.)
+    for source in ["$env.PATH.inner = x\n", "$env.PATH:dedup = x\n"] {
         let out = run_with_input(source);
         assert_eq!(out.status.code(), Some(2), "{source}");
     }
@@ -23796,7 +23958,7 @@ fn a_value_that_is_the_whole_statement_is_still_a_value() {
 
     // A derived value is not a place, and saying so is a *syntax* error — not an
     // attempt to run a command named by the value.
-    for source in ["xs = [1 2]\n$xs:dedup = 9\n", "$env.PATH[0] = x\n"] {
+    for source in ["xs = [1 2]\n$xs:dedup = 9\n", "$env.PATH:dedup = x\n"] {
         let out = run_with_input(source);
         assert_eq!(out.status.code(), Some(2), "{source}");
     }
@@ -28139,18 +28301,20 @@ fn an_impossible_environment_name_is_reported_rather_than_hit() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
 }
 
-/// One access, and only one. A second access or a modifier describes a derived
-/// value rather than a place: what a write replaces is the whole entry, whatever
-/// the read side makes of it — so these stay the syntax errors they already were.
-/// What the second access reports is
-/// `reaching_into_an_env_entry_to_assign_names_the_entry`; here it is only that it
-/// is still refused.
+/// What the grammar still settles on its own. A modifier or a slice describes a
+/// derived value rather than a place, a bare `$env` is the namespace rather than
+/// an entry, and a `.member` under an entry is something no entry could ever be.
+///
+/// `unset` is here rather than beside the write because it did not follow: an
+/// indexed *assignment* became a write (`an_element_of_a_path_type_env_entry_can_be_assigned`),
+/// while `unset $env.PATH[0]` stays refused — removing a name and shortening a
+/// list are different operations, and `unset` on `$env` means the first.
 #[test]
 fn only_a_single_env_access_is_a_place() {
     for source in [
-        "$env.PATH[0] = /x\n",
+        "$env.PATH.inner = /x\n",
         "$env.PATH:dedup = [/x]\n",
-        "n = FOO\n$env[$n][0] = x\n",
+        "n = FOO\n$env[$n].inner = x\n",
         "$env[0..2] = x\n",
         "$env = [A: 1]\n",
         "unset $env\n",
