@@ -6518,16 +6518,64 @@ of each PR had landed by another route, but these pieces had not.
         crossing a hook is the first thing to suspect, and `QUIET` is 10s, so a
         code-150 failure means a full ten seconds of silence rather than a near
         miss.
-- [ ] **Unit tests write to the real `$HOME/.cache`.** Found while chasing the
-      above, and unrelated to any of them. Nothing in the suite sets
-      `XDG_CACHE_HOME`, so `cache_directory` (`completion.rs:1051`) falls back to
-      `$HOME/.cache/mesh/completions` and the completion tests leave `.spec` files
+- [x] **Unit tests wrote to the real `$HOME/.cache`.** Found while chasing the
+      above, and unrelated to any of them. Nothing in the suite set
+      `XDG_CACHE_HOME`, so `cache_directory` fell back to
+      `$HOME/.cache/mesh/completions` and the completion tests left `.spec` files
       in the developer's own cache — 147 of them on this machine. They are keyed by
       a hash of the executable's path, which for these tests contains the process
       id, so a reused pid could match a stale entry; the stored fingerprint
-      (mtime and size) saves it in practice, which is luck rather than isolation.
-      The fix is to point `XDG_CACHE_HOME` at a temporary directory for the test
-      run.
+      (mtime and size) saved it in practice, which was luck rather than isolation.
+
+      Fixed by pointing both directories at a home of the test process's own
+      (`completion.rs`'s `test_home`, `mesh-test-home-<pid>` under the temp
+      directory) under `#[cfg(test)]`. `curated_directory` went with it: nothing
+      wrote there, but a curated lookup was reading whatever the developer's
+      `~/.local/share` held, so what a test saw depended on the machine.
+
+      Redirected in the function rather than by setting `XDG_CACHE_HOME` for the
+      run: the tests share one process and run in parallel, so `set_var` races
+      with every other thread reading the environment, and a harness wrapper would
+      not cover a bare `cargo test`. The integration tests were checked and are
+      not affected — they run the binary non-interactively, where no completion
+      cache is built. Pinned by
+      `the_default_completion_directories_stay_out_of_the_real_home`, which
+      asserts both directories are under the temp directory, neither is under
+      `$HOME`, and each is creatable — `CompletionCache::write` gives up quietly
+      on a directory it cannot make, so a prefix check alone would pass with the
+      cache silently disabled.
+
+      Review turned up a second way to land in the wrong place: `env::temp_dir`
+      answers with an **empty** path under `TMPDIR=`, so joining onto it gives a
+      relative path and the artifacts appear in the checkout. `test_temp_root`
+      takes the platform default for an empty or relative setting, the answer
+      `crates/mesh/tests/transcripts.rs` already gives the empty case. The
+      module's own `fresh_temp_dir` had the same flaw, and
+      `a_man_that_renders_nothing_useful_yields_no_spec` failed outright under
+      `TMPDIR=` because of it — fixed with the same helper, so the crate's tests
+      now pass with `TMPDIR` empty and leave nothing behind.
+
+- [ ] **Test temp roots are derived from the pid, not created privately.** Raised
+      by review on the cache-isolation change above, and declined *there* because
+      it is not that change's to make: `temp_dir().join(name-<pid>)` is what ten
+      or so sites across `completion.rs`, `exec.rs`, `whence.rs`, `expand.rs`,
+      `repl.rs`, `cli.rs` and `docs.rs` already do, so adopting a private
+      atomically-created root in one helper would leave it the odd one out while
+      changing nothing about the exposure.
+
+      The concern is real as far as it goes: on a shared `/tmp`, a recycled pid
+      could name a directory another user left behind, `create_dir_all` answers
+      `Ok` for one that already exists whoever owns it, and a planted symlink
+      could redirect a write. What it costs is a test quietly losing the thing it
+      meant to exercise — the isolation test now writes a file rather than only
+      creating the directory, which catches exactly that, but the other sites have
+      no such check.
+
+      Worth doing as one sweep if it is worth doing at all: a shared helper that
+      creates a fresh private directory (`mkdtemp`-style, or a counter plus a
+      create-new that fails on collision) and hands it to every test that wants
+      scratch space. Not urgent — the threat model is a hostile local user on a
+      shared machine, and the failure is a confusing test rather than a shell bug.
 - [ ] **Math at the prompt.** The goal (mikelward): type `1 + 2` at the prompt and
       get `3`, so the shell is usable as a calculator without `expr`, `bc`, or
       `$((…))`. Not supported today, and deliberately not part of #215 — recorded
