@@ -2976,7 +2976,7 @@ Thirty findings from porting a ~1800-line bash/zsh config to mesh
 language. Each is worked around in that config, so none of them blocks a port —
 what an entry records is what the workaround *costs*, which is what decides
 whether the edge is worth closing. The numbering is the PR's, so a finding can be
-matched back to the discussion. Nineteen have since been fixed; two are tracked
+matched back to the discussion. Twenty-five have since been fixed; two are tracked
 elsewhere in this file and are cross-referenced rather than restated. Every entry
 was re-checked against `main` rather than taken from the PR text.
 
@@ -5006,7 +5006,7 @@ thing a reader takes on trust.*
       belongs to the **condition** only — a plain `x = false` statement still
       reports `0`, so a following `&&` is not silently skipped.
       `repl.rs` `condition_status`; `docs/REFERENCE.md` §Conditionals.
-- [ ] **26. No `eval` and no dynamically-named `func`**, so "define one function
+- [x] **26. No `eval` and no dynamically-named `func`**, so "define one function
       per name in this list" — what a VCS-subcommand loop and an ssh-host alias
       loop both do — has to write a file and source it.
 
@@ -5019,23 +5019,35 @@ thing a reader takes on trust.*
       itself was. `$n:upper` works today, since there the modifier belongs to
       the reference inside one word.
 
-      **Half done: `alias $name = …`.** The *name* may now be a word evaluated
+      Writing that file is what the workaround costs, and the cost is not the
+      writing: it turns a private in-memory definition into **shared mutable
+      state on disk**, so the port had to handle a concurrent second shell, a
+      partial write, a stale generation, an unreadable input, a directory sitting
+      at the target path, and a 0600 file mode for definitions derived from an
+      ssh config — none of which `eval` has.
+
+      **Done in two steps.** `alias $name = …` made the *name* a word evaluated
       where the definition runs, so `for name in $names { alias $name = git }`
-      defines one alias per name with nothing on disk. What it does not do is
-      bake a value into the **body**: an alias body is syntax evaluated at call
-      time, like the `wrapper func` body it desugars to, so `alias $name = ssh-to
-      $name` reads `$name` when the alias *runs* and finds nothing. Both loops
-      this entry names put the value in the body — `command vcs add`, `ssh-to
-      host1` — so both still write a file. Settling that is what closes this:
-      either an alias bakes its body's interpolations at the definition (a
-      semantic change to every alias, and `alias gh = grep "$env.HOME/.history"`
-      would freeze `$HOME`), or a separate spelling says which pieces to bake. That turns a private
-      in-memory definition into **shared mutable state on disk**: the port had to
-      handle a concurrent second shell, a partial write, a stale generation, an
-      unreadable input, a directory sitting at the target path, and a 0600 file
-      mode for definitions derived from an ssh config — none of which `eval` has.
-      A `func` bound to a computed name, or a way to define into the function
-      table from a value, would retire all of it.
+      defines one alias per name with nothing on disk. What that left was the
+      **body**: an alias body is syntax evaluated at call time, like the `wrapper
+      func` body it desugars to, so `alias $name = ssh-to $name` read `$name`
+      when the alias *ran* and found nothing — and both loops this entry names
+      put the value in the body (`command vcs add`, `ssh-to host1`), so both
+      still wrote a file.
+
+      **`with (…)` on a definition** closes it: `alias $h with ($h) = ssh-to $h`
+      and `func name(…) with (…) { … }` read the named values where the
+      definition runs and bake them in, which is what the lambda capture list
+      already meant. The alternative — an alias baking its body's interpolations
+      implicitly — was rejected as a semantic change to every alias already
+      written (`alias gh = grep "$env.HOME/.history"` would freeze `$HOME`) with
+      no way to opt out. Neither loop writes a file now.
+
+      **What is still open** is the residue rather than the edge: a `func` cannot
+      take a computed name (only `alias` does, deliberately — a `func` body can
+      refer to itself by name), and the quoted-name-with-modifier spelling above
+      is unchanged. Defining into the function table from a *value* remains the
+      general answer and remains unbuilt.
 - [x] **27. Three separate rules decide what can be a function name, and only one
       of them is a runtime error.** A leading underscore is a syntax error
       (`expected a name`, so `_exit` became `safe-exit`), a dot is a syntax error
@@ -5393,7 +5405,10 @@ not.
 ## Beyond M3 — Lambda capture (`with (…)`) and the `for` binder
 
 Decided in design discussion; see `docs/DESIGN.md` §"Calling for a value, and
-lambdas". Both landed.
+lambdas". Both landed, and the list has since been extended to **definitions** —
+`func name(…) with (…) { … }` and `alias NAME with (…) = COMMAND`, which is what
+closed rough edge 26's remaining half (baking a value into a definition's body).
+`FuncDef` carries the resolved pairs and both call forms bind them.
 
 - [x] **A lambda captures by an explicit list — `func(_p) with ($_want) { … }`.**
       *(landed — `Expr::Lambda` carries a `captures` list, `Callable::Lambda` the

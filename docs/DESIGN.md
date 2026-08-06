@@ -3698,6 +3698,27 @@ mesh has nothing else like." A capture list is not that closure — it captures 
 not scopes — so the flag decision keeps its ground rather than losing it: a *value*
 should not carry unevaluated work, and that is now the only argument it needs.
 
+**The same list goes on a definition** *(decided — `func name(…) with (…) { … }` and
+`alias NAME with (…) = COMMAND`)*. A `func` or `alias` body is syntax evaluated at call
+time, so a definition written in a loop cannot bake that pass's value — the loop that
+wants one alias per host reads `$h` when the alias *runs* and finds nothing, and the
+only way out was to generate a file and source it. That is the second half of the "no
+`eval`, no dynamically-named `func`" edge, the half `alias $name = …` left open when it
+made the *name* computable but not the body.
+
+The capture list already means precisely the right thing, so this is a spelling
+decision rather than a semantic one: the names are read where the definition runs and
+copied into the stored function, and bound into the fresh call scope beside the
+parameters. Nothing about an existing definition changes, because a definition with no
+list captures nothing and reads its names late exactly as before.
+
+The alternative was making an alias bake its body's interpolations *implicitly*. That
+is a semantic change to every alias already written — `alias gh = grep "$env.HOME/.history"`
+would freeze `$HOME` at definition — and it offers no way to say "not this one," where
+an explicit list is opt-in per definition and reuses a rule readers already know. On an
+`alias` the list goes **before the `=`**, because after the `=` every word belongs to
+the command being aliased; on a `func` it sits where a lambda's does.
+
 *Open — capturing under another name.* The list above captures a name as itself. The
 obvious extension is `with (_w = $_want)`, letting the body use a shorter name or
 capture a computed value, which would also make the list read like the `with FOO=1`

@@ -19923,6 +19923,150 @@ fn a_capture_list_does_not_disturb_the_with_block() {
     assert_eq!(String::from_utf8_lossy(&wrapped.stdout), "12\n");
 }
 
+/// A **definition** takes the same list, and that is what lets a loop define one
+/// alias per name with the value baked in — `TODO.md` rough edge 26, where both
+/// loops that wanted it (a VCS subcommand per name, an ssh host per alias) had to
+/// write a file and source it because an alias body is syntax read at call time.
+#[test]
+fn a_definition_bakes_what_its_capture_list_names() {
+    // The motivating loop: without the list, `$h` is read when the alias *runs*
+    // and is unbound by then.
+    let aliases = run_with_input(
+        "for h in [host1 host2] { alias $h with ($h) = puts ssh-to $h }\n\
+         host1\n\
+         host2\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&aliases.stdout),
+        "ssh-to host1\nssh-to host2\n"
+    );
+
+    // A named `func` takes it in the lambda's position, after the parameters.
+    let baked = run_with_input("x = 1\nfunc show() with ($x) { puts $x }\nx = 2\nshow\n");
+    assert_eq!(String::from_utf8_lossy(&baked.stdout), "1\n");
+
+    // Without a list the read is late, exactly as before — the list is opt-in and
+    // changes no definition that does not carry one.
+    let late = run_with_input("x = 1\nfunc show() { puts $x }\nx = 2\nshow\n");
+    assert_eq!(String::from_utf8_lossy(&late.stdout), "2\n");
+}
+
+/// Every call form binds the same captures. A definition that baked a value must
+/// not depend on how it is *found*, and the three forms reach the body through
+/// three different functions — `call_func`, `call_func_for_value`, and the `&name`
+/// branch of `call_callable_for_value`.
+#[test]
+fn a_captured_definition_binds_however_it_is_called() {
+    let out = run_with_input(
+        "n = 20\n\
+         func twice() with ($n) { return ($n * 2) }\n\
+         n = 0\n\
+         twice\n\
+         puts (twice())\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "40\n");
+
+    // Applied per element through a reference. This one bound only the argument,
+    // so the body read the *current* `n` and the same function quietly gave a
+    // different answer depending on which spelling reached it.
+    let referenced = run_with_input(
+        "n = 10\n\
+         func add(x) with ($n) { return ($x + $n) }\n\
+         n = 100\n\
+         puts (add(1))\n\
+         puts ([1 2]:map(&add))\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&referenced.stdout), "11\n11\n12\n");
+
+    // The sharper form of the same bug: capture a binding that no longer exists
+    // by the time the reference is applied. Reading late here is not a wrong
+    // answer but an unbound-variable error.
+    let gone = run_with_input(
+        "for i in [5] { func plus(x) with ($i) { return ($x + $i) } }\n\
+         puts ([1 2]:map(&plus))\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&gone.stdout), "6\n7\n");
+}
+
+/// What a definition's list refuses. The unbound read is at the definition —
+/// before any call, which is the point of capturing eagerly — and the rest are at
+/// parse time, the same answers the lambda's list gives.
+#[test]
+fn a_definitions_capture_list_refuses_what_it_cannot_bind() {
+    // Reported at the definition, and the definition does not happen — a function
+    // whose captures could not be read must not be left half-built and callable.
+    let unbound = run_with_input("alias broken with ($nope) = puts $nope\nbroken\n");
+    assert!(!unbound.status.success());
+    let stderr = String::from_utf8_lossy(&unbound.stderr);
+    assert!(stderr.contains("nope: unbound variable"), "{stderr}");
+    assert!(stderr.contains("command not found: broken"), "{stderr}");
+
+    for (source, message) in [
+        // `args` is the rest parameter the alias desugaring synthesizes, so
+        // capturing it is the collision a written `wrapper func` would report.
+        (
+            "args = 1\nalias a with ($args) = puts x\n",
+            "`$args` is both captured and a parameter",
+        ),
+        (
+            "n = 1\nfunc f(n) with ($n) { puts $n }\n",
+            "`$n` is both captured and a parameter",
+        ),
+        (
+            "n = 1\nfunc f() with ($n, $n) { puts $n }\n",
+            "`$n` is captured twice",
+        ),
+        (
+            "func f() with (n) { puts x }\n",
+            "a captured variable, as `$name`",
+        ),
+    ] {
+        let out = run_with_input(source);
+        assert!(!out.status.success(), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(message), "{source} gave {stderr}");
+    }
+}
+
+/// The shape check that claims the `alias` word has to look past the list, or a
+/// definition that bakes a value falls through to `command not found: alias`. A
+/// list left open mid-line is *incomplete* rather than unclaimed, which is what
+/// lets a line-at-a-time reader buffer a wrapped one.
+#[test]
+fn an_alias_capture_list_may_wrap_and_does_not_unclaim_the_word() {
+    let wrapped = run_with_input("n = 7\nalias show with (\n  $n,\n) = puts n is $n\nshow\n");
+    assert_eq!(String::from_utf8_lossy(&wrapped.stdout), "n is 7\n");
+
+    // The newline the grammar allows between `with` and `(`. The lookahead has to
+    // read the shape exactly as `capture_list` will, or the line parses as an
+    // ordinary command and the `($x) = …` line becomes a second, unrelated syntax
+    // error — which is what a narrower lookahead did here.
+    let split = run_with_input("n = 7\nalias show with\n($n) = puts n is $n\nshow\n");
+    assert_eq!(String::from_utf8_lossy(&split.stdout), "n is 7\n");
+
+    // Same shape, whole-source rather than line-at-a-time: the two readers reach
+    // this check with different tokens in hand — a real newline token here, and
+    // nothing at all over stdin — so both are asserted.
+    let file = fresh_dir("alias_capture_split").join("s.mesh");
+    std::fs::write(&file, "n = 7\nalias show with\n($n) = puts n is $n\nshow\n")
+        .expect("write script");
+    let script = run_script_with_stdin(&file, isolated_config_home(), b"");
+    assert_eq!(String::from_utf8_lossy(&script.stdout), "n is 7\n");
+
+    // The readings `alias` already had are untouched: no `=` follows, so none of
+    // these is a definition.
+    let bare = run_with_input("alias\n");
+    assert!(
+        String::from_utf8_lossy(&bare.stderr).contains("command not found: alias"),
+        "{}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+
+    // An alias *named* `with`, which the lookahead must not mistake for a list.
+    let named = run_with_input("alias with = puts named\nwith\n");
+    assert_eq!(String::from_utf8_lossy(&named.stdout), "named\n");
+}
+
 /// A hook slot takes `&name` beside the bare word it already took: a reference
 /// *is* a name, and the late binding it means is the lookup a hook already did
 /// when the event fired. A lambda still has no name to register.
