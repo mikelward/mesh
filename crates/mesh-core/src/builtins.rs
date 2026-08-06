@@ -26,9 +26,13 @@ const TABLE: &[(&str, &str)] = &[
     ("puts [ARG ...]", "Render the arguments, then a newline"),
     ("print [ARG ...]", "As `puts`, with no trailing newline"),
     // Two spellings on one line — the only builtin with both, and `·` is what the
-    // `SYNTAX` rows already use to separate them. Neither is a token starting with
-    // `-`, so `reads_options` still reads this as a builtin with no options.
-    ("gets [VAR] · gets()", "Read one line from stdin"),
+    // `SYNTAX` rows already use to separate them. `--nulls` is written into both,
+    // since the value form takes it too and a usage that showed it on one would
+    // describe the other as the spelling that cannot read a `-print0` stream.
+    (
+        "gets [--nulls] [VAR] · gets([--nulls])",
+        "Read one line from stdin, or a NUL-terminated item",
+    ),
     ("clip [TEXT ...]", "Copy text to the terminal's clipboard"),
     ("notify [TEXT ...]", "Raise a desktop notification"),
     ("exit [N]", "Leave the shell"),
@@ -1948,6 +1952,57 @@ mod tests {
         }
         assert!(reads_options("kill"));
         assert_eq!(usage_options("kill [-SIGNAL] JOB|PID ...").count(), 0);
+    }
+
+    #[test]
+    fn the_reference_sorts_the_builtins_by_who_owns_the_terminator() {
+        // `docs/REFERENCE.md` splits the builtins into the ones that end their own
+        // options at `--` and the ones the terminator is stripped for. Nothing tied
+        // that prose to `reads_options`, so it went stale the moment `gets` declared
+        // `--nulls` — teaching the wrong parsing rule for the builtin that had just
+        // changed sides. The owners side is checked for completeness, not just for
+        // accuracy: a builtin with options that is named in neither list leaves the
+        // reader to guess, which is how `exec` sat unlisted.
+        const REFERENCE: &str = include_str!("../../../docs/REFERENCE.md");
+        let paragraph = REFERENCE
+            .split("Which command consumes it depends on which has options to end.")
+            .nth(1)
+            .expect("REFERENCE.md says who consumes the terminator");
+        let (none, rest) = paragraph
+            .split_once("have none of their own")
+            .expect("the sentence naming the builtins with no options");
+        let (owners, _) = rest
+            .split_once("do, so each ends its own options at")
+            .expect("the sentence naming the builtins that end their own");
+
+        // The names are the backticked words, in a sentence that holds nothing else.
+        fn named(text: &str) -> Vec<&str> {
+            text.split('`').skip(1).step_by(2).collect()
+        }
+
+        for name in named(none) {
+            assert!(names().any(|n| n == name), "{name} is not a builtin");
+            assert!(
+                !reads_options(name),
+                "REFERENCE.md says {name} has no options, but it reads them"
+            );
+        }
+        let owners = named(owners);
+        for &name in &owners {
+            assert!(names().any(|n| n == name), "{name} is not a builtin");
+            assert!(
+                reads_options(name),
+                "REFERENCE.md says {name} ends its own options, but it has none"
+            );
+        }
+        for (usage, _) in TABLE {
+            let name = name_of(usage);
+            assert_eq!(
+                reads_options(name),
+                owners.contains(&name),
+                "{name} reads options iff REFERENCE.md lists it as ending its own"
+            );
+        }
     }
 
     #[test]

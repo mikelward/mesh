@@ -29478,6 +29478,123 @@ fn the_gets_value_form_takes_no_arguments() {
     assert!(!out.status.success());
 }
 
+/// `--nulls` reads a NUL-terminated item instead of a line, which is what a
+/// `find -print0` stream needs: a newline inside a name is data there, and a line
+/// read tears the name in half.
+#[test]
+fn gets_reads_a_nul_terminated_item() {
+    // Both spellings, since the value form is the composable one and the command
+    // form is the one a `while` condition uses.
+    for source in [
+        "while name = gets(--nulls) { puts \"[$name]\" }\n",
+        "while gets --nulls name { puts \"[$name]\" }\n",
+    ] {
+        let out = run_source_with_stdin(source, b"a b.txt\0c\nd.txt\0");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "[a b.txt]\n[c\nd.txt]\n",
+            "{source}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The generated `--help` names the flag on **both** spellings. Written on the
+/// command form alone, it advertised the value form as the one that cannot read a
+/// `-print0` stream — backwards, since that is the composable spelling. Raised in
+/// review.
+#[test]
+fn gets_help_offers_the_flag_on_both_spellings() {
+    let out = run_with_input("gets --help\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Usage: gets [--nulls] [VAR] · gets([--nulls])"),
+        "{stdout:?}"
+    );
+}
+
+/// A NUL item read off the session's own stdin advances the line counter by the
+/// newlines it actually swallowed. Counting it as one line puts every later
+/// diagnostic too far up the stream; counting it as none puts them too far down.
+/// Raised in review, where the second was what this shipped with first.
+#[test]
+fn a_nul_item_counts_the_lines_it_consumes() {
+    // The item is `a\nb`, so it eats the two newlines between `gets` and the bad
+    // line — which is physical line 3, where `x = ` sits after the NUL.
+    let piped = run_with_bytes(b"gets --nulls item\na\nb\0x = \n");
+    assert_eq!(
+        String::from_utf8_lossy(&piped.stderr),
+        "mesh: stdin:3:5: syntax error: expected a value expression\n"
+    );
+
+    // The line read alongside it, unchanged: one line in, one line counted.
+    let lines = run_with_bytes(b"gets item\na\nx = \n");
+    assert_eq!(
+        String::from_utf8_lossy(&lines.stderr),
+        "mesh: stdin:3:5: syntax error: expected a value expression\n"
+    );
+}
+
+/// The flag is read off the **written** marks, so a value that merely spells one
+/// is data. Matching the rendered text instead made `gets $flag` start a NUL read
+/// — blocking to end of input — where it should report an unusable name.
+#[test]
+fn a_computed_nulls_argument_is_data_not_a_flag() {
+    let out = run_source_with_stdin("f = \"--nulls\"\ngets $f\n", b"a\0b\0");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("`--nulls` is not a variable name"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let quoted = run_source_with_stdin("gets \"--nulls\"\n", b"a\0b\0");
+    assert!(
+        String::from_utf8_lossy(&quoted.stderr).contains("`--nulls` is not a variable name"),
+        "{}",
+        String::from_utf8_lossy(&quoted.stderr)
+    );
+}
+
+/// Declaring an option moved `gets` into the set of builtins that keep their own
+/// terminator, so it has to consume one — the generic layer removes it only for
+/// builtins that read no options. Without this, `gets -- name` reported "takes at
+/// most one variable name" for what is one operand.
+#[test]
+fn gets_consumes_its_own_terminator() {
+    let out = run_source_with_stdin("gets -- name\nputs \"[$name]\"\n", b"hi\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[hi]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The delimiter is a **terminator**: a final item with no trailing NUL is still
+/// an item, exactly as a file's last line without a newline is.
+#[test]
+fn a_nul_read_takes_a_final_item_with_no_terminator() {
+    let out = run_source_with_stdin("while n = gets(--nulls) { puts \"[$n]\" }\n", b"a\0b");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[a]\n[b]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A line read must not swallow a NUL stream's newlines, and a NUL read must not
+/// stop at one — the two are separate settings on the same reader.
+#[test]
+fn a_line_read_is_unchanged_by_the_nul_flag_existing() {
+    let out = run_source_with_stdin("while l = gets() { puts \"[$l]\" }\n", b"x\ny\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[x]\n[y]\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `gets():capture` records the **call**. Routing it to the command path instead
 /// would run the other spelling — consuming a line and handing back a record with
 /// no `.value` holding it.

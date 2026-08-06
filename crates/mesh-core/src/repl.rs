@@ -806,7 +806,37 @@ fn run_config_file(path: &Path, last: u8, shell: &mut Shell) -> Step {
 /// which is the "skip a line" spelling. The value form `gets()` is
 /// [`eval_gets`], and both spellings read through [`read_gets_line`] so they
 /// cannot disagree about what a line, an ending, or a failure is.
-fn gets(args: &[String], shell: &mut Shell) -> Step {
+fn gets(args: &[String], written: &[expand::Written], shell: &mut Shell) -> Step {
+    // Read off the **written** marks, not the rendered text. A builtin that
+    // declares options is handed its argv with the marks intact and parses them
+    // itself, which is what tells `gets --nulls` from a `gets $flag` whose value
+    // happens to spell one: the second is data, and reading it as an option would
+    // block on a NUL stream instead of reporting an unusable variable name.
+    //
+    // The terminator is this builtin's to consume for the same reason -- the
+    // generic layer removes it only for builtins that read no options, since only
+    // the builtin knows where its own options end.
+    let mut delimiter = Delimiter::Newline;
+    let mut operands: Vec<&String> = Vec::new();
+    let mut ended = false;
+    for (index, argument) in args.iter().enumerate() {
+        let mark = written.get(index).copied().unwrap_or(expand::Written::Data);
+        if ended || mark == expand::Written::Data {
+            operands.push(argument);
+            continue;
+        }
+        match mark {
+            expand::Written::Terminator => ended = true,
+            expand::Written::Flag if argument == "--nulls" => delimiter = Delimiter::Nul,
+            _ => {
+                let name = &args[index];
+                note!("mesh: gets: unknown flag `{name}`; `gets -- {name}` passes it as data");
+                return Step::Error(2);
+            }
+        }
+    }
+    let args: Vec<String> = operands.into_iter().cloned().collect();
+    let args = args.as_slice();
     let name = match args {
         [] => None,
         [name] => Some(name.as_str()),
@@ -830,7 +860,7 @@ fn gets(args: &[String], shell: &mut Shell) -> Step {
             return Step::Error(2);
         }
     }
-    match read_gets_line(shell) {
+    match read_gets_item(shell, delimiter) {
         LineRead::Line(text) => {
             if let Some(name) = name {
                 shell.vars.set_value(name, Value::String(text));
@@ -887,14 +917,35 @@ enum LineRead {
 /// `gets line` reports a status and is what a `while` condition wants when the
 /// line is all you need, and neither is a rewrite of the other in the `if`/`while`
 /// position where mesh usually declines a second spelling.
-fn eval_gets(arguments: &[parser::Argument], shell: &mut Shell) -> Result<Value, Step> {
-    if !arguments.is_empty() {
+fn eval_gets(
+    arguments: &[parser::Argument],
+    last: u8,
+    in_function: bool,
+    shell: &mut Shell,
+) -> Result<Value, Step> {
+    // `gets(--nulls)` is the one thing the value form takes. It is not an
+    // *argument* -- the binding is still the assignment this sits in -- it is the
+    // same flag the command form reads, and leaving it out here would make the
+    // composable spelling the one that cannot read a `-print0` stream.
+    let mut delimiter = Delimiter::Newline;
+    for argument in arguments {
+        // A written `--nulls` reaches a call as a `Flag` *value* in positional
+        // position, which is the same word the command form reads -- so the two
+        // spellings stay one spelling.
+        if let parser::Argument::Positional(expression) = argument
+            && let Value::Flag(flag) = eval_expr(expression, last, in_function, shell)?
+            && flag.name == "nulls"
+            && flag.value.is_none()
+        {
+            delimiter = Delimiter::Nul;
+            continue;
+        }
         return runtime_error(
-            "gets() takes no arguments; the value form yields the line, so bind it with \
-             `line = gets()`",
+            "gets() takes no arguments beyond `--nulls`; the value form yields the line, \
+             so bind it with `line = gets()`",
         );
     }
-    match read_gets_line(shell) {
+    match read_gets_item(shell, delimiter) {
         LineRead::Line(text) => Ok(Value::String(text)),
         LineRead::End => Ok(Value::Boolean(false)),
         LineRead::Interrupted => {
@@ -908,8 +959,29 @@ fn eval_gets(arguments: &[parser::Argument], shell: &mut Shell) -> Result<Value,
     }
 }
 
-/// Read one line from descriptor 0 for either `gets` spelling.
-fn read_gets_line(shell: &mut Shell) -> LineRead {
+/// What ends one `gets` read.
+///
+/// A NUL cannot be written as a string escape -- it crosses neither `execve` nor
+/// the environment, which is why `\0` is not in the escape set -- so the
+/// separator is named rather than passed. `--nulls` is the name the `:nulls`
+/// family already uses for it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delimiter {
+    Newline,
+    Nul,
+}
+
+impl Delimiter {
+    fn byte(self) -> u8 {
+        match self {
+            Delimiter::Newline => b'\n',
+            Delimiter::Nul => 0,
+        }
+    }
+}
+
+/// Read one item from descriptor 0 for either `gets` spelling.
+fn read_gets_item(shell: &mut Shell, delimiter: Delimiter) -> LineRead {
     let mut line = Vec::new();
     // Descriptor 0 directly, not `io::stdin()`: that handle buffers, so it would
     // read past the newline and the bytes it swallowed would never reach whatever
@@ -923,7 +995,7 @@ fn read_gets_line(shell: &mut Shell) -> LineRead {
     // did nothing here and the next line typed was swallowed as this read's input.
     let (read, interrupted) = exec::interruptible(|| {
         let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
-        read_line(&mut *stdin, &mut line, false)
+        read_line(&mut *stdin, &mut line, false, delimiter.byte())
     });
     if interrupted {
         return LineRead::Interrupted;
@@ -946,10 +1018,17 @@ fn read_gets_line(shell: &mut Shell) -> LineRead {
     // `gets x << END`, whose body the reader already counted as part of this
     // unit. Reading a file is not reading the session, and counting the heredoc
     // twice is worse than not counting it at all.
+    //
+    // By the newlines actually consumed, not by one: a NUL-delimited item may
+    // hold any number of them, and a line read holds exactly the one it stops
+    // at. Counting a NUL item as a single line puts every later diagnostic too
+    // far up the stream, and counting it as none puts them too far down.
     if exec::stdin_is_the_shells() {
-        shell.vars.count_stdin_line();
+        for _ in line.iter().filter(|byte| **byte == b'\n') {
+            shell.vars.count_stdin_line();
+        }
     }
-    if line.last() == Some(&b'\n') {
+    if line.last() == Some(&delimiter.byte()) {
         line.pop();
     }
     // **Strict**, not lossy. `gets` reads data in, so it follows the capture —
@@ -4812,7 +4891,7 @@ fn call_named_for_value(
         return eval_glob(arguments, last, in_function, shell);
     }
     if name == "gets" {
-        return eval_gets(arguments, shell);
+        return eval_gets(arguments, last, in_function, shell);
     }
     if let Some(filter) = entry_filter(name) {
         return eval_directory_entries(name, filter, arguments, last, in_function, shell);
@@ -9281,7 +9360,10 @@ fn run_expanded(mut argv: Argv, last: u8, shell: &mut Shell) -> Step {
         "source" => return source_file(&words[1..], last, shell),
         // `gets` binds a variable in *this* shell, so like `source` it cannot go
         // through `builtins::dispatch`, which sees only words and a status.
-        "gets" => return gets(&words[1..], shell),
+        "gets" => {
+            let written = argv.written_from(1).to_vec();
+            return gets(&argv.words[1..], &written, shell);
+        }
         // `whence` reads this shell's functions and bindings, which `builtins::dispatch`
         // is handed none of.
         "type" => return Step::Continue(whence::type_of(&words[1..], &shell.funcs, &shell.vars)),
@@ -13609,7 +13691,7 @@ fn run_piped(options: &StartupOptions) -> ExitCode {
 
     loop {
         line.clear();
-        match read_line(&mut *stdin, &mut line, true) {
+        match read_line(&mut *stdin, &mut line, true, b'\n') {
             Ok(0) => break, // EOF
             Ok(_) => {}
             Err(err) => {
@@ -13687,6 +13769,7 @@ fn read_line(
     reader: &mut impl Read,
     out: &mut Vec<u8>,
     retry_on_signal: bool,
+    delimiter: u8,
 ) -> io::Result<usize> {
     let mut byte = [0u8; 1];
     loop {
@@ -13694,7 +13777,7 @@ fn read_line(
             Ok(0) => break, // EOF
             Ok(_) => {
                 out.push(byte[0]);
-                if byte[0] == b'\n' {
+                if byte[0] == delimiter {
                     break;
                 }
             }
