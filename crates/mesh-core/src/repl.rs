@@ -6150,7 +6150,7 @@ fn run_command_in_capture(
         // An argument that failed did so with its diagnostic on the captured stderr;
         // re-reporting it is `capture_call`'s job, on the one path both kinds of
         // failure now share.
-        match run_expanded(words, last, shell) {
+        match run_expanded(Argv::data(words), last, shell) {
             Step::Continue(status) => Ok(Some(status)),
             // `exit` leaves the shell rather than reporting a status into a record.
             step => Err(step),
@@ -7294,7 +7294,7 @@ fn run_single(
     // `&` needs is the program itself, not a shell that goes on to run it.
     let external = external_stage(&argv);
     let builtin = external.is_none();
-    let argv = external.unwrap_or(argv);
+    let argv = external.map_or(argv, Argv::data);
     let opened = match expand_redirs(redirs, last, in_function, shell) {
         Ok(redirs) => redirs,
         Err(step) => return step,
@@ -7313,7 +7313,7 @@ fn run_single(
     // resolved above, where its arguments keep their types.)
     Step::Continue(run_stages(
         vec![exec::Cmd {
-            words: argv,
+            words: argv.words,
             redirs: opened,
             pipe_stderr: false,
             in_shell: builtin,
@@ -7752,7 +7752,9 @@ fn run_stage_in_shell(
             if redirection_only_exec(&cmd.words) && !cmd.redirs.is_empty() {
                 Step::Continue(0)
             } else {
-                run_expanded(cmd.words.clone(), last, shell)
+                // A stored stage lost its marks at the `exec::Cmd` boundary; see
+                // `Argv::data`.
+                run_expanded(Argv::data(cmd.words.clone()), last, shell)
             }
         }
         StageBody::External => unreachable!("an external stage has no in-shell body"),
@@ -7902,7 +7904,7 @@ fn expand_eager_stage(
             // rather than a forked shell that runs it.
             match external_stage(&argv) {
                 Some(program) => (program, StageBody::External),
-                None => (argv, StageBody::Builtin),
+                None => (argv.words, StageBody::Builtin),
             }
         }
     };
@@ -8010,6 +8012,56 @@ fn one_word(text: &str) -> parser::Word {
 /// Run one command with no redirections: classify it as an assignment or a
 /// command and act. `last` is the previous status (the default for a bare `exit`
 /// or `return`).
+/// argv, with what each entry **was** before it became bytes.
+///
+/// The text alone cannot say whether `--` was the terminator or a string that
+/// spells it, so a builtin re-reading the characters answers by what the value
+/// happened to render to — which is how `puts "--"` came to print nothing and
+/// `x = [--help]; puts $x` came to print `puts`'s help. The mark travels beside
+/// the text so the question is *was this written as an option*.
+///
+/// Derefs to `[String]`, so every site that only reads argv is unchanged, and
+/// **builtins keep taking `&[String]`** — the marks are consumed in
+/// `run_expanded` and go no further.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Argv {
+    words: Vec<String>,
+    written: Vec<expand::Written>,
+}
+
+impl Argv {
+    /// argv that never had call-site information — re-dispatch from a place that
+    /// holds only strings. Everything is data, which is the honest answer: the
+    /// distinction was lost before this point, not decided against.
+    fn data(words: Vec<String>) -> Self {
+        let written = vec![expand::Written::Data; words.len()];
+        Self { words, written }
+    }
+
+    fn push(&mut self, word: String, written: expand::Written) {
+        self.words.push(word);
+        self.written.push(written);
+    }
+
+    fn remove(&mut self, at: usize) {
+        self.words.remove(at);
+        self.written.remove(at);
+    }
+
+    /// The marks from `at` onward, for a caller that also slices `words`.
+    fn written_from(&self, at: usize) -> &[expand::Written] {
+        &self.written[at.min(self.written.len())..]
+    }
+}
+
+impl std::ops::Deref for Argv {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.words
+    }
+}
+
 /// What a stage's words came to, once the command they name is known.
 enum Expanded {
     /// An in-shell **function** and its typed arguments. Resolved here because a
@@ -8028,7 +8080,7 @@ enum Expanded {
     /// `fail`, whose operand is typed the same way `return`'s is.
     Fail(Vec<(Value, bool)>),
     /// argv for a builtin or an external program.
-    Argv(Vec<String>),
+    Argv(Argv),
 }
 
 /// Expand a stage's words into the form its command takes.
@@ -8063,10 +8115,12 @@ fn expand_stage(
     shell: &mut Shell,
 ) -> Result<Expanded, Step> {
     let Some((first, rest)) = words.split_first() else {
-        return Ok(Expanded::Argv(Vec::new()));
+        return Ok(Expanded::Argv(Argv::default()));
     };
     let head = expansion_word(first, last, in_function, shell)?;
-    let mut argv = expand::expand(vec![head], &shell.vars).map_err(runtime_message)?;
+    // The command's own word is never an option to itself, so the head is data
+    // however it is spelled.
+    let mut argv = Argv::data(expand::expand(vec![head], &shell.vars).map_err(runtime_message)?);
     // A word that expanded to several (a glob) or to none names no command; those
     // fall through to the plain argv rule, which reports what is wrong with them.
     let name = (argv.len() == 1).then(|| argv[0].clone());
@@ -8119,7 +8173,12 @@ fn expand_stage(
     }
     for word in rest {
         let word = expansion_word(word, last, in_function, shell)?;
-        argv.extend(stage_argument(&word, name.as_deref(), decoration, shell)?);
+        // Asked of the word before it is rendered, since that is the only moment
+        // the distinction still exists.
+        let written = expand::written_of(&word, &shell.vars);
+        for text in stage_argument(&word, name.as_deref(), decoration, shell)? {
+            argv.push(text, written);
+        }
     }
     Ok(Expanded::Argv(argv))
 }
@@ -8780,7 +8839,7 @@ fn expand_bounded(
                 note!("mesh: timeout: expected a command to run");
                 return Err(Step::Error(2));
             }
-            (argv, None)
+            (argv.words, None)
         }
     };
     Ok((words, StageBody::Bounded { limits, call }))
@@ -8818,7 +8877,7 @@ fn bounded_body(
 ) -> u8 {
     match call {
         Some(args) => dispatch_function_call(&words[0], args, shell),
-        None => run_expanded(words.to_vec(), last, shell),
+        None => run_expanded(Argv::data(words.to_vec()), last, shell),
     }
     .status()
 }
@@ -8858,7 +8917,7 @@ fn run_bounded_argv(args: &[String], last: u8, shell: &mut Shell) -> Step {
     }
     let command = command.to_vec();
     bounded_run(limit, shell, move |shell| {
-        run_expanded(command, last, shell).status()
+        run_expanded(Argv::data(command), last, shell).status()
     })
 }
 
@@ -8913,7 +8972,8 @@ fn bounded_run(
     }
 }
 
-fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
+fn run_expanded(mut argv: Argv, last: u8, shell: &mut Shell) -> Step {
+    let words = &mut argv.words;
     if words.is_empty() {
         // A command whose words all expanded away (e.g. a glob with no
         // matches) is an empty-list result — status 0 per `DESIGN.md`.
@@ -8957,27 +9017,42 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     if words[0] == "timeout" {
         return run_bounded_argv(&words[1..], last, shell);
     }
-    if builtins::is_builtin(&words[0]) {
-        if auto_help_requested_strings(&words[1..]) {
-            return Step::Continue(builtins::print_help(&words[0]));
+    if builtins::is_builtin(&argv.words[0]) {
+        // Asked of the **marks**, not the characters. Reading argv text made a
+        // rendered value indistinguishable from a written option, so `puts "--"`
+        // had its string eaten and `x = [--help]; puts $x` printed puts's own
+        // help — the round trip through bytes deciding what the line meant.
+        let terminator = argv
+            .written_from(1)
+            .iter()
+            .position(|written| *written == expand::Written::Terminator);
+        // A written `--help` before any terminator is the auto-help request; one
+        // after it is the callee's operand, which is the whole reason `--` is
+        // offered as the escape.
+        let help = argv.words[1..]
+            .iter()
+            .zip(argv.written_from(1))
+            .take(terminator.unwrap_or(usize::MAX))
+            .any(|(word, written)| *written == expand::Written::Flag && word == "--help");
+        if help {
+            return Step::Continue(builtins::print_help(&argv.words[0]));
         }
-        // `--` ended the search above; for a builtin with no options of its own it
-        // now has to be **taken out of the way**, exactly as `call_func` does when
-        // binding a function's arguments. Left in, the terminator `DESIGN.md` offers
-        // as the escape from auto-help stopped the detection and was then printed:
-        // `puts -- --help` wrote `-- --help`.
+        // For a builtin with no options of its own the terminator has to be
+        // **taken out of the way**, exactly as `call_func` does when binding a
+        // function's arguments — left in, `puts -- --help` wrote `-- --help`.
         //
         // A builtin that *does* read options keeps it, because only that builtin
-        // knows where its options end. Removing it here would undo the very thing it
-        // was written for — `kill -- -9 %1` would send SIGKILL rather than look for a
-        // job named `-9`, and `prompt -- --reset` would reset instead of setting that
-        // text.
-        if !builtins::reads_options(&words[0])
-            && let Some(at) = words.iter().skip(1).position(|word| word == "--")
+        // knows where its options end. Removing it here would undo the very thing
+        // it was written for — `kill -- -9 %1` would send SIGKILL rather than look
+        // for a job named `-9`, and `prompt -- --reset` would reset instead of
+        // setting that text.
+        if !builtins::reads_options(&argv.words[0])
+            && let Some(at) = terminator
         {
-            words.remove(at + 1);
+            argv.remove(at + 1);
         }
     }
+    let words = &mut argv.words;
     match words[0].as_str() {
         "prompt" => return configure_prompt(&words[1..], shell),
         "on" => return configure_hook(&words[1..], shell),
@@ -9034,10 +9109,10 @@ fn run_expanded(mut words: Vec<String>, last: u8, shell: &mut Shell) -> Step {
     }
     // Command resolution: builtins, then external (a function was already
     // resolved above).
-    match builtins::dispatch(&words, last) {
+    match builtins::dispatch(words, last) {
         Some(Builtin::Exit(code)) => Step::Exit(code),
         Some(Builtin::Status(code)) => Step::Continue(code),
-        None => Step::Continue(exec::run(&words, &mut shell.jobs)),
+        None => Step::Continue(exec::run(words, &mut shell.jobs)),
     }
 }
 
@@ -9103,12 +9178,6 @@ fn auto_help_requested(args: &[(Value, bool)]) -> bool {
         // reached here through the call-site scan.
         .take_while(|arg| !matches!(arg, Value::FlagTerminator))
         .any(is_help)
-}
-
-fn auto_help_requested_strings(args: &[String]) -> bool {
-    args.iter()
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| arg == "--help")
 }
 
 fn configure_prompt(args: &[String], shell: &mut Shell) -> Step {

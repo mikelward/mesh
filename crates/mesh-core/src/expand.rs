@@ -423,6 +423,48 @@ impl std::fmt::Display for ExpandError {
 
 /// Expand each word into zero or more argument strings (the external-argv rule:
 /// a bare list value is an error — spread or join it).
+/// What a word **was**, for an argv entry that has already lost the distinction.
+///
+/// argv is bytes, so `--` written as the terminator and `"--"` written as a
+/// string arrive identical — and a builtin that re-reads the characters cannot
+/// tell them apart. Carried beside the text so the question a builtin asks is
+/// *was this written as an option* rather than *does this read like one*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written {
+    /// Ordinary data, whatever characters it happens to spell.
+    Data,
+    /// A `Flag` value at the **top level** of this word. A flag *inside* a
+    /// collection is data being displayed, which is why this asks about the
+    /// word's own value rather than about anything it renders.
+    Flag,
+    /// A `FlagTerminator` value, likewise top level.
+    Terminator,
+}
+
+/// Whether this word denotes a written option, for [`Written`].
+///
+/// Asked of the **value**, not the characters, so it answers the same way for
+/// `--force` written at the call and for `$x` holding one written elsewhere —
+/// which is the whole point of the type. `"--force"` is a string and answers
+/// `Data`, and so does `[--force]`, whose flag is one element down.
+pub fn written_of(word: &Word, vars: &Vars) -> Written {
+    let value = match whole_value(word, vars) {
+        Some(Ok(value)) => value,
+        // An expansion error is reported by the caller doing the real work; this
+        // only classifies, so it declines rather than guessing.
+        Some(Err(_)) => return Written::Data,
+        None => match scalar_literal(word) {
+            Some(value) => value,
+            None => return Written::Data,
+        },
+    };
+    match value {
+        Value::Flag(_) => Written::Flag,
+        Value::FlagTerminator => Written::Terminator,
+        _ => Written::Data,
+    }
+}
+
 pub fn expand(words: Vec<Word>, vars: &Vars) -> Result<Vec<String>, ExpandError> {
     let mut out = Vec::new();
     for word in words {

@@ -29578,3 +29578,60 @@ fn a_composed_payload_that_globs_still_binds_its_option() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A builtin decides `--help` and the terminator by what the call site **wrote**,
+/// not by what the argv text happens to spell. Reading the characters made a
+/// rendered value indistinguishable from a written option, so a string that read
+/// `--` was eaten and a list element that read `--help` printed puts's own help.
+#[test]
+fn a_builtin_reads_written_options_rather_than_rendered_text() {
+    // A string is data however it spells itself, on both checks.
+    assert_eq!(
+        String::from_utf8_lossy(&run_with_input("puts \"--\"\n").stdout),
+        "--\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_with_input("x = \"--help\"\nputs $x\n").stdout),
+        "--help\n"
+    );
+
+    // A flag *inside* a collection is data being displayed — the mark asks about
+    // the word's own value, so an element one level down never decides the call.
+    for source in ["x = [--help]\nputs $x", "x = [--]\nputs $x"] {
+        let out = run_with_input(&format!("{source}\n"));
+        let expected = if source.contains("--help") {
+            "--help\n"
+        } else {
+            "--\n"
+        };
+        assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{source}");
+    }
+
+    // And the written spellings all keep working: help is claimed, the terminator
+    // is consumed, and a word after it is the operand it was protected as.
+    assert!(String::from_utf8_lossy(&run_with_input("puts --help\n").stdout).contains("Usage:"));
+    assert_eq!(
+        String::from_utf8_lossy(&run_with_input("puts -- --help\n").stdout),
+        "--help\n"
+    );
+
+    // Under `timeout` too, which re-enters with the wrapped command's tokens, so
+    // the marks are built against `puts` rather than against `timeout`.
+    assert_eq!(
+        String::from_utf8_lossy(&run_with_input("timeout 5s puts \"--\"\n").stdout),
+        "--\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_with_input("timeout 5s puts -- --help\n").stdout),
+        "--help\n"
+    );
+
+    // A builtin that reads its own options keeps its terminator, since only it
+    // knows where its options end.
+    let killed = run_with_input("kill -- -9 %1\n");
+    assert!(
+        String::from_utf8_lossy(&killed.stderr).contains("-9"),
+        "{:?}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+}
