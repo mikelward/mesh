@@ -16889,6 +16889,53 @@ fn a_reserved_name_cannot_be_a_function() {
     }
 }
 
+/// A boolean literal cannot be a function name. `func true() { … }` used to be
+/// accepted in silence and was dead on arrival: `true` is the value in every
+/// position, so nothing in command position could ever resolve to the definition.
+/// The refusal is the parser's answer to the same question `func if()` deserves.
+#[test]
+fn a_boolean_literal_cannot_be_a_function_or_an_alias() {
+    for name in ["true", "false"] {
+        // Every binding form that reaches command lookup: a plain `func`, a
+        // `wrapper func`, a written `alias`, and an `alias` whose name is computed
+        // — a name read at run time is not a way around the naming rules.
+        for source in [
+            format!("func {name}() {{ puts x }}\n"),
+            format!("wrapper func {name}(...args) {{ puts x }}\n"),
+            format!("alias {name} = puts wrapped\n"),
+            format!("n = {name}\nalias $n = puts wrapped\n"),
+        ] {
+            let out = run_with_input(&source);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(&format!("`{name}` is a boolean literal")),
+                "{source}: {stderr}"
+            );
+            assert!(out.stdout.is_empty(), "{source}: {:?}", out.stdout);
+        }
+    }
+    // The definition is refused, and the literal reading is untouched by having
+    // been asked for — the reading that made the definition unreachable.
+    let out = run_with_input("func true() { puts x }\nif true { puts literal }\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "literal\n");
+}
+
+/// A **binding** named `true` stays legal, and the difference is reachability
+/// rather than the word: bindings are their own namespace, so `$true` reads what
+/// was bound and nothing about the literal is in its way. Only the forms that go
+/// through command lookup — where the literal wins before any lookup happens — are
+/// dead on arrival, and only those are refused.
+#[test]
+fn a_binding_may_still_be_named_for_a_boolean() {
+    let out = run_with_input(
+        "true = 5\nputs $true\n\
+         func f(false) { puts $false }\nf 6\n\
+         for true in [7] { puts $true }\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n6\n7\n");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+}
+
 #[test]
 fn an_optional_positional_defaults_when_omitted() {
     let out = run_with_input(
@@ -17234,17 +17281,22 @@ fn a_self_naming_alias_reaches_the_program() {
     // `alias grep = grep --color=auto` is the commonest alias there is, and a
     // literal desugaring would recurse forever, so a leading word equal to the
     // alias's own name is emitted as `command NAME`.
-    let out = run_with_input("alias true = true\ntrue\nputs $sh.status\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+    //
+    // Written with `echo`, whose output is the proof the program ran. This asked
+    // about `true` before, which command position never reaches — it is the
+    // boolean literal — so the escape could have been missing entirely and the
+    // status would still have been `0`.
+    let out = run_with_input("alias echo = echo\necho hi\nputs $sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n0\n");
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
     // Quoting is not part of the question: a quoted command head still resolves
     // functions, so a bare-text-only check here recursed to the stack limit.
     for source in [
-        "alias true = \"true\"\ntrue\nputs ok\n",
-        "alias true = 'true'\ntrue\nputs ok\n",
+        "alias echo = \"echo\"\necho hi\nputs ok\n",
+        "alias echo = 'echo'\necho hi\nputs ok\n",
     ] {
         let quoted = run_with_input(source);
-        assert_eq!(String::from_utf8_lossy(&quoted.stdout), "ok\n");
+        assert_eq!(String::from_utf8_lossy(&quoted.stdout), "hi\nok\n");
         assert!(quoted.stderr.is_empty(), "{:?}", quoted.stderr);
     }
     // Only the *first* word: a later occurrence is an ordinary argument.
@@ -17369,9 +17421,11 @@ fn a_computed_alias_naming_its_own_command_reaches_the_program() {
     // The self-naming escape the parser applies to a written name has to reach a
     // computed one too, and cannot be applied where the parser sits: the name is
     // not known until the definition runs. Without it this recurses to the stack
-    // limit instead of running `true`.
-    let out = run_with_input("n = true\nalias $n = true\ntrue\nputs status=$sh.status\n");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "status=0\n");
+    // limit instead of running `echo` — whose output is the proof it ran, where
+    // the `true` this used to ask about was the boolean literal and never reached
+    // the alias at all.
+    let out = run_with_input("n = echo\nalias $n = echo\necho hi\nputs status=$sh.status\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\nstatus=0\n");
     assert!(out.stderr.is_empty(), "{:?}", out.stderr);
 }
 
