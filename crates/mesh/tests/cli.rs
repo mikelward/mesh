@@ -8222,6 +8222,24 @@ fn suspending_a_timed_job_suspends_the_command_it_represents() {
     // decoration: a `sleep` keeps *expiring* while its process is stopped, so a
     // timed command resumes and finishes at once, leaving nothing to suspend a
     // second time. The command here can only make progress by running.
+    //
+    // The **stop landing** is a marker too, and used not to be. The release file
+    // was written straight after `kill -TSTP` with nothing confirming the stop
+    // had arrived, so the command could consume it in that gap and the run failed
+    // with `first=stopped during=true` — the state right, the command having
+    // moved anyway. Rare, because the gap and the command's 0.02s poll are the
+    // same order, which is exactly what makes it a race rather than a bug.
+    //
+    // So the release now waits on the job's own state, polled with a bound: a
+    // regression fails with the state it saw instead of hanging. The state is
+    // read into `st1` / `st2` *before* the release rather than after the window,
+    // so exhausting the bound reports the `running` it actually released against
+    // — read afterwards, a stop landing late during the window would print
+    // `stopped` and the run would pass having proved nothing.
+    //
+    // What is left is one observation window measuring one thing — a correctly
+    // stopped command cannot touch a file written after it stopped, while one
+    // still running notices within a poll, and 0.2s is ten of those.
     let dir = fresh_dir("timeout_suspended");
     let started = dir.join("started");
     let (release_one, done_one) = (dir.join("release-1"), dir.join("done-1"));
@@ -8235,15 +8253,21 @@ fn suspending_a_timed_job_suspends_the_command_it_represents() {
          while [ ! -e {release_two} ]; do sleep 0.02; done; echo x > {done_two}' &\n\
          while $s:exists == false {{ sleep 0.02 }}\n\
          kill -TSTP %1\n\
+         n = 0\n\
+         while $sh.jobs[1].state != stopped and $n < 500 {{ sleep 0.02; n = $n + 1 }}\n\
+         st1 = $sh.jobs[1].state\n\
          puts x > {release_one}\n\
-         sleep 0.3\n\
-         puts first=$sh.jobs[1].state during=$d1:exists\n\
+         sleep 0.2\n\
+         puts first=$st1 during=$d1:exists\n\
          kill -CONT %1\n\
          while $d1:exists == false {{ sleep 0.02 }}\n\
          kill -TSTP %1\n\
+         n = 0\n\
+         while $sh.jobs[1].state != stopped and $n < 500 {{ sleep 0.02; n = $n + 1 }}\n\
+         st2 = $sh.jobs[1].state\n\
          puts x > {release_two}\n\
-         sleep 0.3\n\
-         puts second=$sh.jobs[1].state during=$d2:exists\n\
+         sleep 0.2\n\
+         puts second=$st2 during=$d2:exists\n\
          kill -CONT %1\n\
          wait 1\n\
          puts after=$d2:exists\n",
