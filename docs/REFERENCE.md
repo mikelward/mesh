@@ -3181,7 +3181,8 @@ That is what keeps a lambda written in the body from closing over one shared slo
 and seeing only its final value — the footgun Go fixed in 1.22 and JavaScript fixed
 with `let`, both in the loop rather than in the closure. A body that wants the
 value takes it explicitly, and gets that pass's:
-`func() with ($x) { … }` (see [Functions](#functions)).
+`func() with ($x) { … }` — and a `func` or `alias` *definition* in the body takes
+the same list, for the same reason (see [Functions](#functions)).
 
 Globs, ranges, `$sh.args` and any bound list are already lists and are
 unaffected — a glob is a list however many paths it matched.
@@ -3706,6 +3707,23 @@ The same is true of a builtin (`puts hi | tr a-z A-Z`, `puts hi &`).
 
     Capturing under another name (`with (w = $want)`) is not built; `DESIGN.md`
     records it as the open extension.
+
+    - **A definition takes the same list.** `func name(…) with (…) { … }` puts it
+      where a lambda does, after the parameters; `alias NAME with (…) = COMMAND`
+      puts it **before the `=`**, since after the `=` every word belongs to the
+      command being aliased. Everything above holds unchanged — read where the
+      definition runs, copied, loud on an unbound name, one binding per name — and
+      the list is what lets a loop define one alias per name with that pass's value
+      baked in:
+
+      ```mesh
+      for h in $hosts { alias $h with ($h) = ssh-to $h }
+      ```
+
+      Without the list a body's names are read when the definition is **called**,
+      which is unchanged for every definition that carries no list. On an `alias`
+      the name that cannot be captured is `$args`, the rest parameter the
+      desugaring synthesizes.
   - **A global binding is visible to the body**, which is what lets a lambda
     recurse: `fact = func(n) { if $n == 0 { return 1 }\n return $n * $fact($n - 1) }`.
   - **No text form.** A function value is the one value that cannot be bytes, so a

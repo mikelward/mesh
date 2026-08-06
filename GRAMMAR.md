@@ -540,8 +540,8 @@ binds a variable named `global`.
 ### Definitions
 
 ```ebnf
-definition      = "wrapper"? "func" definition-name parameter-list NL* block
-                | "alias" alias-name "=" NL* alias-command ;
+definition      = "wrapper"? "func" definition-name parameter-list capture-list? NL* block
+                | "alias" alias-name capture-list? "=" NL* alias-command ;
 definition-name = bare-WORD ;                 # unjudged here; checked when it runs
 alias-name      = definition-name
                 | computed-name ;             # a word holding an interpolation
@@ -595,6 +595,17 @@ in it is a `definition-name` and the paragraph above governs it unchanged, so
 `alias "foo" = …` is still `expected a name` while `alias "$x" = …` is a name
 built at the definition. What comes back is judged by the same runtime rules a
 written name is; only `alias` takes one, `func` does not.
+
+A **`capture-list` on a definition** is the same list a lambda takes, in the same
+words, and means the same thing: the names are read where the definition *runs*
+and copied into the stored function, so a definition written in a loop keeps that
+pass's values. Without one a body reads its names when it is *called*, which is
+unchanged — the list is opt-in, and every definition that predates it behaves as
+it did. On an `alias` it sits **before the `=`**, because after the `=` every word
+belongs to the command being aliased and a trailing list would be arguments to
+that. A name in both the capture list and the parameter list is refused, on a
+definition as on a lambda; for an `alias` that means `$args`, the rest parameter
+the desugaring synthesizes.
 
 `alias NAME = command` is sugar for the `wrapper func` that forwards `...args`;
 a **command head** equal to the alias's own name is emitted as `command NAME`, so

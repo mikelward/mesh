@@ -518,7 +518,7 @@ impl std::fmt::Display for ParseError {
             }
             ParseErrorKind::CaptureShadowsParameter(name) => write!(
                 f,
-                "syntax error: `${name}` is both captured and a parameter; a lambda \
+                "syntax error: `${name}` is both captured and a parameter; a call \
                  binds each name once"
             ),
             ParseErrorKind::DuplicateParameter(name) => {
@@ -733,6 +733,13 @@ pub enum Executable {
         /// there than the generated file it replaces.
         computed_name: Option<Word>,
         parameters: Vec<Param>,
+        /// `with ($x)` on a **definition** — the same list a lambda takes, in the
+        /// same words, read where the definition runs and copied into the stored
+        /// function. It is what lets a definition in a loop bake that pass's
+        /// value: an `alias`/`func` body is otherwise syntax evaluated at call
+        /// time, so `alias $n = ssh-to $n` reads `$n` when the alias *runs* and
+        /// finds nothing.
+        captures: Vec<Spanned<String>>,
         body: Source,
         /// `wrapper func name(…) { … }` — the function parses no flags of its
         /// own, so every argument reaches its positionals and `...rest`
@@ -3713,6 +3720,51 @@ impl Parser<'_> {
             end = next.span.end;
             index += 1;
         }
+        // A `with (…)` list sits between the name and the `=`, so the shape check
+        // has to look past it or a definition that bakes a value falls through to
+        // `command not found: alias`. Running out of tokens *inside* the list is
+        // claimed rather than declined: that is the wrapped-over-lines case, and
+        // `alias_def` reports it as incomplete so the reader asks for the rest.
+        //
+        // Newlines are skipped between `with` and `(` because
+        // [`capture_list`](Self::capture_list) skips them there — a lookahead that
+        // reads the shape more narrowly than the parser will is how `fork\n{ … }`
+        // once became a command and then a syntax error.
+        if matches!(
+            self.tokens.get(index).map(|t| &t.value),
+            Some(TokenKind::Word(word)) if word.is_bare_text("with")
+        ) {
+            let mut ahead = index + 1;
+            while matches!(
+                self.tokens.get(ahead).map(|t| &t.value),
+                Some(TokenKind::Newline)
+            ) {
+                ahead += 1;
+            }
+            // Out of tokens right after `with` is the same wrapped case one token
+            // earlier — the line-at-a-time reader has only `alias NAME with` so
+            // far. Declining here would let that parse as an ordinary command and
+            // the reader would never ask for the `(…)`, which is exactly how the
+            // lambda spelling already behaves: `g = func() with` is incomplete.
+            if ahead >= self.tokens.len() {
+                return true;
+            }
+            if matches!(
+                self.tokens.get(ahead).map(|t| &t.value),
+                Some(TokenKind::LParen)
+            ) {
+                index = ahead + 1;
+                loop {
+                    let Some(token) = self.tokens.get(index) else {
+                        return true;
+                    };
+                    index += 1;
+                    if matches!(token.value, TokenKind::RParen) {
+                        break;
+                    }
+                }
+            }
+        }
         matches!(
             self.tokens.get(index).map(|t| &t.value),
             Some(TokenKind::Equal)
@@ -3746,6 +3798,15 @@ impl Parser<'_> {
         // and reports them the same way: read here, judged where the definition
         // runs.
         let (name, computed_name) = self.alias_name()?;
+        // Before the `=`, because after it every word belongs to the command being
+        // aliased — a trailing list would be arguments to *that*, not a capture.
+        // Checked against the forwarded rest the desugaring synthesizes, so
+        // `with ($args)` is the same duplicate it would be on a `wrapper func`.
+        let parameters = vec![Param {
+            name: ALIAS_REST.to_owned(),
+            kind: ParamKind::Rest,
+        }];
+        let captures = self.capture_list_beside(&parameters)?;
         self.expect(&TokenKind::Equal, "`=`")?;
         self.newlines();
         let mut command = self.command()?;
@@ -3806,10 +3867,8 @@ impl Parser<'_> {
         Ok(Executable::Function {
             name,
             computed_name,
-            parameters: vec![Param {
-                name: ALIAS_REST.to_owned(),
-                kind: ParamKind::Rest,
-            }],
+            parameters,
+            captures,
             body: Source {
                 statements: vec![Statement {
                     and_or: AndOr {
@@ -3842,12 +3901,14 @@ impl Parser<'_> {
         if wrapper && let Some(flag) = parameters.iter().find(|p| p.kind.is_option()) {
             return Err(self.error(ParseErrorKind::WrapperDeclaresFlag(flag.name.clone())));
         }
+        let captures = self.capture_list_beside(&parameters)?;
         self.newlines();
         let body = self.block()?;
         Ok(Executable::Function {
             name,
             computed_name: None,
             parameters,
+            captures,
             body,
             wrapper,
         })
@@ -5739,19 +5800,7 @@ impl Parser<'_> {
         {
             self.take_word("func");
             let parameters = self.parameters()?;
-            let captures = self.capture_list()?;
-            // Both bind into the same fresh scope, so a name in both is the
-            // duplicate a repeated parameter already is — caught here rather than
-            // at the call, since the two lists are in hand together.
-            if let Some(clash) = captures
-                .iter()
-                .find(|capture| parameters.iter().any(|param| param.name == capture.value))
-            {
-                return Err(ParseError {
-                    kind: ParseErrorKind::CaptureShadowsParameter(clash.value.clone()),
-                    span: clash.span.clone(),
-                });
-            }
+            let captures = self.capture_list_beside(&parameters)?;
             self.newlines();
             let body = self.block()?;
             return Ok(Expr::Lambda {
@@ -7200,6 +7249,30 @@ impl Parser<'_> {
     /// name, or capturing a computed value — is the obvious extension and is left
     /// unbuilt (`DESIGN.md` records it as open), so a `=` in here is refused rather
     /// than half-read.
+    /// [`capture_list`](Self::capture_list) plus the collision check against the
+    /// parameters it sits beside. Both bind into the same fresh scope, so a name in
+    /// both is the duplicate a repeated parameter already is — caught here rather
+    /// than at the call, since the two lists are in hand together.
+    ///
+    /// Shared by the lambda and the two definition forms so the three cannot drift
+    /// into disagreeing about what a capture may be named.
+    fn capture_list_beside(
+        &mut self,
+        parameters: &[Param],
+    ) -> Result<Vec<Spanned<String>>, ParseError> {
+        let captures = self.capture_list()?;
+        if let Some(clash) = captures
+            .iter()
+            .find(|capture| parameters.iter().any(|param| param.name == capture.value))
+        {
+            return Err(ParseError {
+                kind: ParseErrorKind::CaptureShadowsParameter(clash.value.clone()),
+                span: clash.span.clone(),
+            });
+        }
+        Ok(captures)
+    }
+
     fn capture_list(&mut self) -> Result<Vec<Spanned<String>>, ParseError> {
         if !self.word("with") {
             return Ok(Vec::new());
@@ -7607,6 +7680,7 @@ mod tests {
             name,
             computed_name,
             parameters,
+            captures,
             body,
             wrapper,
         } = &sugar.statements[0].and_or.first
@@ -7615,6 +7689,9 @@ mod tests {
         };
         assert!(wrapper);
         assert_eq!(name, "co");
+        // Sugar for the hand-written form, which has no list either unless one is
+        // written: `alias` does not bake anything on its own.
+        assert!(captures.is_empty());
         assert_eq!(parameters.len(), 1);
         assert_eq!(parameters[0].name, ALIAS_REST);
         assert_eq!(parameters[0].kind, ParamKind::Rest);

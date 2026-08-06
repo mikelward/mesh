@@ -697,6 +697,7 @@ mod tests {
                     },
                 ],
                 body: body(),
+                captures: Vec::new(),
                 wrapper: false,
             },
         );
@@ -914,6 +915,7 @@ mod tests {
             FuncDef {
                 params: Vec::new(),
                 body: body(),
+                captures: Vec::new(),
                 wrapper: false,
             },
         );

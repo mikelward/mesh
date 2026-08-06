@@ -8,11 +8,19 @@
 use std::collections::HashMap;
 
 use crate::parser::{Param, ParamKind, Source};
+use crate::vars::Value;
 
 /// A defined function: its parameters and parsed body.
 pub struct FuncDef {
     pub params: Vec<Param>,
     pub body: Source,
+    /// What the definition's `with (…)` list named, read where the definition ran
+    /// and copied in. Bound into the fresh call scope beside the parameters, so a
+    /// body sees the value the *definition* saw rather than whatever the name holds
+    /// when the call happens — which is what lets a definition inside a loop bake
+    /// that pass's value. Empty for a definition with no list, which is every
+    /// definition that predates one.
+    pub captures: Vec<(String, Value)>,
     /// Defined as `wrapper func` — it parses no flags of its own, so every
     /// argument reaches its positionals and `...rest` verbatim and `--help` is
     /// forwarded rather than answered here.
@@ -126,6 +134,7 @@ mod tests {
                 statements: Vec::new(),
                 span: 0..0,
             },
+            captures: Vec::new(),
             wrapper,
         }
     }

@@ -1847,6 +1847,7 @@ fn run_executable(
             name,
             computed_name,
             parameters,
+            captures,
             body,
             wrapper,
         } => {
@@ -1885,6 +1886,17 @@ fn run_executable(
                 note!("mesh: func: {reason}");
                 return Step::Error(2);
             }
+            // Read here, in the frame that wrote the definition, exactly as a
+            // lambda's list is — and loud here for the same reason: this frame can
+            // still explain the name, where the call cannot.
+            let mut captured = Vec::with_capacity(captures.len());
+            for capture in captures {
+                let Some(value) = shell.vars.get(&capture.value) else {
+                    note!("mesh: {}: unbound variable", capture.value);
+                    return Step::Error(1);
+                };
+                captured.push((capture.value.clone(), value.clone()));
+            }
             // Parameter names are already validated (distinct, not `env`) by the
             // parser's `parameters()`.
             shell.funcs.define(
@@ -1892,6 +1904,7 @@ fn run_executable(
                 FuncDef {
                     params: parameters.clone(),
                     body,
+                    captures: captured,
                     wrapper: *wrapper,
                 },
             );
@@ -10191,8 +10204,8 @@ fn make_fail(args: Vec<(Value, bool)>) -> Step {
 /// arrives intact as a list value); a bad argument count or flag is a recoverable
 /// error.
 fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &mut Shell) -> Step {
-    let (params, body) = match shell.funcs.get(name) {
-        Some(def) => (def.params.clone(), def.body.clone()),
+    let (params, body, captured) = match shell.funcs.get(name) {
+        Some(def) => (def.params.clone(), def.body.clone(), def.captures.clone()),
         None => {
             return Step::Continue(exec::run(&[name.to_string()], &mut shell.jobs));
         }
@@ -10211,6 +10224,10 @@ fn call_func(name: &str, args: Vec<(Value, bool)>, flags_enabled: bool, shell: &
     let caller_result = std::mem::replace(&mut shell.result, Value::String(String::new()));
     let caller_produced = std::mem::replace(&mut shell.produced, Produced::Status);
     shell.vars.push_scope();
+    // Before the arguments, though nothing can collide — the parser refuses a
+    // capture that repeats a parameter — so that a default expression evaluated
+    // during binding sees the captured values too.
+    bind_captured(&captured, shell);
     let bound = bind_arguments(name, &params, args, flags_enabled, shell);
     // A default that ran `break`/`continue` (already reported as outside a loop)
     // may have left `shell.control` set; clear it so it neither short-circuits the
@@ -10306,21 +10323,24 @@ fn call_func_for_value(
     in_function: bool,
     shell: &mut Shell,
 ) -> Result<Value, Step> {
-    let Some((params, body, wrapper)) = shell
-        .funcs
-        .get(name)
-        .map(|def| (def.params.clone(), def.body.clone(), def.wrapper))
-    else {
+    let Some((params, body, captured, wrapper)) = shell.funcs.get(name).map(|def| {
+        (
+            def.params.clone(),
+            def.body.clone(),
+            def.captures.clone(),
+            def.wrapper,
+        )
+    }) else {
         unreachable!("call_func_for_value is only reached for a declared function");
     };
     // A `wrapper func` parses no flags of its own in either call form, so the
     // value spelling forwards `--flag` verbatim just as command position does.
-    // A declared `func` captures nothing: only a lambda has a `with (…)` list, and
-    // a named function's body reads its own locals and the session.
+    // The captures are the definition's, so both call forms bind the same ones: a
+    // definition that baked a loop's value must not depend on how it is called.
     call_signature_for_value(
         name,
         &params,
-        &[],
+        &captured,
         &body,
         arguments,
         !wrapper,
@@ -10521,10 +10541,10 @@ fn call_callable_for_value(
         // reads its own argument list and there is none here, and a command — an
         // external or an effect-only builtin — has no value to give at all; the two
         // are different failures and say so separately.
-        let Some((params, body)) = shell
+        let Some((params, body, captured)) = shell
             .funcs
             .get(referenced)
-            .map(|def| (def.params.clone(), def.body.clone()))
+            .map(|def| (def.params.clone(), def.body.clone(), def.captures.clone()))
         else {
             return runtime_error(
                 if builtins::is_value_call(referenced)
@@ -10543,7 +10563,13 @@ fn call_callable_for_value(
             &body,
             caller_result,
             caller_produced,
-            |shell| bind_arguments(referenced, &params, vec![(argument, false)], false, shell),
+            |shell| {
+                // The definition's captures, like every other way of reaching this
+                // body: which call form found the function must not decide whether
+                // the values it baked are the ones it sees.
+                bind_captured(&captured, shell);
+                bind_arguments(referenced, &params, vec![(argument, false)], false, shell)
+            },
             shell,
         );
     }
