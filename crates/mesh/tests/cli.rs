@@ -29699,3 +29699,52 @@ fn a_builtin_reads_written_options_rather_than_rendered_text() {
         String::from_utf8_lossy(&killed.stderr)
     );
 }
+
+/// A piped or backgrounded builtin reads the same written options an unpiped one
+/// does. Its argv is stored on the way to the fork, and storing only the *bytes*
+/// left the marks behind: `puts --help | cat` printed `--help` instead of the
+/// help, and `puts -- --help | cat` wrote the terminator out.
+#[test]
+fn a_stored_stage_keeps_the_options_its_call_site_wrote() {
+    // Help is claimed in a stage exactly as it is at the prompt.
+    assert!(
+        String::from_utf8_lossy(&run_with_input("puts --help | cat\n").stdout).contains("Usage:")
+    );
+    // And the terminator is consumed there, so the operand it protects is all
+    // that gets printed.
+    assert_eq!(
+        String::from_utf8_lossy(&run_with_input("puts -- --help | cat\n").stdout),
+        "--help\n"
+    );
+    // The other direction still holds too: rendered text that reads like an
+    // option is data, wherever the builtin runs.
+    for source in ["puts \"--\" | cat", "x = [--help]\nputs $x | cat"] {
+        let out = run_with_input(&format!("{source}\n"));
+        let expected = if source.contains("--help") {
+            "--help\n"
+        } else {
+            "--\n"
+        };
+        assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{source}");
+    }
+
+    // Backgrounding stores the stage the same way, so it answers the same.
+    let background = run_with_input("puts --help &\nwait\n");
+    assert!(
+        String::from_utf8_lossy(&background.stdout).contains("Usage:"),
+        "{:?}",
+        String::from_utf8_lossy(&background.stdout)
+    );
+    let protected = run_with_input("puts -- --help &\nwait\n");
+    assert!(
+        String::from_utf8_lossy(&protected.stdout).contains("--help"),
+        "{:?}",
+        String::from_utf8_lossy(&protected.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&protected.stdout).contains("Usage:"),
+        "{:?}",
+        String::from_utf8_lossy(&protected.stdout)
+    );
+}
+
