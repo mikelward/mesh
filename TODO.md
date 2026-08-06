@@ -3718,27 +3718,32 @@ thing a reader takes on trust.*
          `['--', --x]` -- a string next to a flag. That reads as an
          inconsistency and is really just the terminator type being unbuilt.
 
-- [ ] **A composed payload's shape error masks the option error.** With
+- [x] **A composed payload's shape error masked the option error.** With
       `func f(--force, ...rest)` and `xs = [a b]`, both `f --bogus=$xs` and
-      `f --force=$xs` report ``an option's value must be one string, not a
+      `f --force=$xs` reported ``an option's value must be one string, not a
       list``, where the more actionable answers are *unknown flag* and *a switch
       takes no value*. The value-call binder deliberately resolves the written
-      flag first for exactly this reason (`repl.rs`, `evaluate_value_arguments`),
-      but a composed flag is refused at construction and never reaches it.
-      Raised by Codex on #415.
+      flag first for exactly this reason, but a composed flag was refused at
+      construction and never reached it. Raised by Codex on #415.
 
-      Not fixed there because both ways out cost something already argued for.
-      Letting the flag error win means constructing a `Flag` whose payload has
-      no text form -- the shape that produced the `unreachable!()` panic in
-      `FlagValue::text()` -- and moving the check to the bind would take the
-      `x = --tag=$xs` diagnostic off the assignment that made the mistake, which
-      is where the entry above says it belongs. Getting both needs the callee's
-      signature at construction time, and expansion deliberately does not have
-      it: that is the same coupling the wrapper fix in this file just removed.
+      **Fixed by the shape this entry predicted**, without moving the check:
+      `ExpandError::OptionPayload` carries the flag's *name* beside the message,
+      and both call paths resolve it against the callee's signature before
+      reporting. So the assignment keeps its early diagnostic -- `x = --tag=$xs`
+      is not a call and has no signature to ask -- while a call gets the better
+      answer in both spellings.
 
-      The likely shape: carry the flag's name on the payload-shape error, and
-      have the two call paths resolve the written flag before reporting it, so
-      the assignment keeps its early diagnostic and a call gets the better one.
+      Two limits fell out of doing it, both of them the right answer rather than
+      compromises. Past a `--` the word is an operand, so the signature is not
+      consulted: `f -- --bogus=$xs` reports the payload, since the call never
+      offered `--bogus` as a flag. And a `wrapper func` declares no flags at all,
+      so there is nothing to resolve against and the payload keeps the whole
+      diagnostic.
+
+      The value path needed `eval_scalar` split out of `eval_expr`, since the
+      expansion error had to arrive *unreported* for the caller to answer it.
+      That split is worth knowing about on its own: it is the seam for any other
+      caller that knows more than expansion does.
 
 - [ ] **Make a builtin work the way a function does, not its own way.**
       *Standing principle, from the repo owner: a builtin behaves the same as a

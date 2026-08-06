@@ -370,6 +370,15 @@ pub enum ExpandError {
     /// diagnostic rather than a category, because the argv rules read better named
     /// ("a list needs `...`") than classified, and there is no variable to name.
     ArgumentValue(String),
+    /// A written `--name=` whose attached value is not one scalar. Carries the
+    /// **flag's name** rather than only the message, because a call has a better
+    /// answer available: `f --bogus=$xs` is an unknown flag before it is a bad
+    /// payload, and only the callee's signature can say so. Expansion does not
+    /// know the callee, so it names the flag and lets the call ask.
+    OptionPayload {
+        flag: String,
+        kind: String,
+    },
     IndexOutOfRange {
         name: String,
         index: i64,
@@ -401,6 +410,9 @@ impl std::fmt::Display for ExpandError {
             }
             ExpandError::NotAList(n) => write!(f, "${n}: cannot index a string value"),
             ExpandError::ArgumentValue(message) => write!(f, "{message}"),
+            ExpandError::OptionPayload { kind, .. } => {
+                write!(f, "an option's value must be one string, not {kind}")
+            }
             ExpandError::IndexOutOfRange { name, index } => {
                 write!(f, "${name}[{index}]: list index out of range")
             }
@@ -467,18 +479,21 @@ pub fn expand_call_values(
             // this path removes: the payload is a `Value` and `$w` is a `Value`.
             let payload = composed_payload(&word, vars)?;
             // An option's value is **one scalar**, and this is where that is
-            // now checked: typed flags move the test from the call site to the
-            // construction site, and moving a validation must not weaken it.
-            // The diagnostic points at the line that made the mistake, which is
-            // the whole reason the payload is captured here.
+            // checked: a `Flag` may not hold a payload with no text form, since
+            // the type is what the rest of the shell trusts. The diagnostic
+            // points at the line that made the mistake, which is why the payload
+            // is captured here rather than at the bind.
+            //
+            // It carries the flag's name so a *call* can answer better — see
+            // [`ExpandError::OptionPayload`].
             if !matches!(
                 payload,
                 Value::String(_) | Value::Styled(_) | Value::Integer(_) | Value::Boolean(_)
             ) {
-                return Err(ExpandError::ArgumentValue(format!(
-                    "an option's value must be one string, not {}",
-                    value_kind(&payload)
-                )));
+                return Err(ExpandError::OptionPayload {
+                    flag: name,
+                    kind: value_kind(&payload).to_owned(),
+                });
             }
             out.push((
                 Value::Flag(crate::vars::FlagValue {
