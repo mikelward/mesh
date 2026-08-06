@@ -2265,10 +2265,19 @@ designed, and the cross-references say where the fuller note lives.
       are wrong in exactly the same way. There is no working way to list hidden
       entries today. Pre-existing and shared, but the `glob` family makes it easy
       to reach for.
-- [ ] **The qualifier argument list.** `*(f)`, `*(size > 1M)` and
-      `glob("*", type: file)` — the ANDed predicate options — are unimplemented;
-      the type half is reachable through the `:files` / `:dirs` modifiers and the
-      `files()` / `dirs()` wrappers, the size/age/`exec`/`empty` half not at all.
+- [ ] **The qualifier argument list — types and boolean predicates landed; the
+      comparisons did not.** `*(f)` and `*(d)` work, including in front of an
+      external command (`/bin/echo *(d)` prints the directory, `*(f)` omits it), so
+      this entry's earlier claim that the type half was reachable only through
+      `:files` / `dirs()` is out of date. The boolean predicates are built too and
+      filter correctly: `*(x)`, `*(f, exec: true)`, and `*(f, empty: false)`
+      picking out the one non-empty file. What is still unimplemented is the
+      **comparison** half — `*(f, size > 1M)` is a syntax error naming the accepted
+      set — and the named-argument spelling `glob("*", type: file)`. Note the
+      `:`-modifier form does
+      **not** share the qualifier's reach into argument position — `puts *:f` there
+      is an ordinary glob word matching nothing, and only `(*:f)` filters — which
+      is a live argument in *Exclusion in argument position* below.
 
 ## Beyond M3 — `command` ✅ (landed)
 
@@ -7291,6 +7300,70 @@ a one-line edit. Every claim below was checked against the built shell.
         meaning, and the parse never forks: `-` always reads as binary minus and
         only evaluation asks what it was handed. The modifier form and the
         parenthesis-only form are both unnecessary.
+
+        **What it settled was the operator, not the spelling in argument
+        position** — see the entry below, which is the part that stayed open.
+  - [ ] **Exclusion in argument position.** `DESIGN.md` §"Globbing" spells
+        exclusion as the operator, and its examples are *statements*, which work
+        as written once glob-led classification and list difference land. What is
+        missing is exclusion **in front of a command**, where §"Arithmetic"
+        deliberately rules the operator out: `puts *.txt - *.bak` prints
+        `a.txt b.txt - c.bak d.bak`, passing the dash along with no error to say
+        nothing was excluded — the one form of the three that fails quietly, since
+        the statement says `command not found: a.txt` and a value context says
+        `expected integer`. The parenthesized form does not reach an external
+        command either: ``a list needs `...` to become command arguments``, and
+        `...(…)` is the `CommandItem::Value` spread gap tracked above — closing
+        that gap makes `rm ...(* - *.bak)` parse rather than making the bare
+        parens work, so the spread belongs to that candidate's spelling.
+
+        **The candidates are written up in `docs/DESIGN.md`** beside the other
+        open language questions — a `not:` qualifier, parens with the operator
+        unchanged, an argv-position `-`, zsh's unspaced `*~*.bak`, a `^` prefix,
+        and reporting the argv dash — each with what it buys and costs, and the
+        six checked facts that constrain the choice. Leaning there: the `not:`
+        qualifier for globs, the operator kept for lists, and the dash reported
+        as a separate decision. Decide it there; this entry is the pointer.
+
+        **The qualifier's name is open, and `not` is the weakest candidate for
+        it** — `not` is already a live prefix operator (`if not false { … }`), so
+        `not:` would carry two unrelated jobs. Different grammar positions, so no
+        ambiguity, but `skip:` and `except:` carry no other job. Written up as
+        `not:` because that is the spelling it was raised under.
+
+        **Pruning belongs to both pattern-level candidates, not just the
+        qualifier** — the unspaced `~` binds inside the glob word, so its exclusion
+        reaches the matcher as one pattern and could prune on the same terms. It
+        separates the pattern-level pair from the operator forms, where `-` is
+        handed two already-expanded lists, rather than picking between the two.
+
+        **And for either of them it is a traversal change and a semantic, not a
+        parser one.** `expand_word` takes every result from
+        `glob_matches` and applies qualifiers afterwards with `retain`, the same
+        after-the-walk shape *Fuse `**:files` into the match* records for all three
+        filter paths, so skipping a subtree needs a walk that can reject a directory
+        before recursing. Cost that with that entry. The semantic is separate and
+        decides what the feature is. The exclusion has to name the subtree
+        **root** — `node_modules ~ **/node_modules/**` is `false` (only descendants
+        match) where `node_modules ~ **/node_modules` is `true` — and the directory
+        it rejects is **not one of the pattern's candidates**: `**/*.js` yields
+        `node_modules/pkg/index.js` and `src/a.js` and never the directory, since
+        bare `**` yields directories and `**/*` yields both. So the spelling is
+        `**/*.js(not: **/node_modules)`, and the predicate has to be tested against
+        the directories the walk *visits* rather than the candidates the pattern
+        *produces*, with a rejected directory taking its subtree with it. That is a
+        different evaluation model from `exec:` / `empty:`, which ask about a path
+        that is already a result; post-walk this would drop a directory entry, where
+        one appears at all, and leave every file under it.
+
+        *Two of the candidates are not reversible:* an argv-position `-` retires
+        the bare dash operand, and the unspaced `~` retires `rm *~` (verified: it
+        matches `foo.txt~` today) while making a dropped space change a result's
+        type — `($f ~ *.bak)` is `false`, `($f~*.bak)` is the empty list, neither
+        an error. `^` and the diagnostic are cheaper but not free either; only the
+        qualifier and the parens are strictly additive. None of the six touches
+        what `-` means in a value context, so §"Globbing"'s statement examples
+        stand whatever is decided.
   - [ ] **Implement floats.** The model is decided — see §"Floats" under
         *Arithmetic* in `DESIGN.md`. `f64`; `/` unchanged on two integers, so no
         `//`; widen on mixed arithmetic but **compare exactly**, never through an
