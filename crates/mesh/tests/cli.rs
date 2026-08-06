@@ -9782,18 +9782,36 @@ fn an_inherited_sigchld_ignore_does_not_hang_the_shell() {
     // kernel, so no transition ever reaches the store — and a wait still told the
     // pid is owned then waits for news that cannot come.
     //
-    // Installing the handler used to sit *after* the pipe, so a failed `pipe`
-    // returned early and left the inherited ignore in place. `mesh -c true` hung
-    // outright. The disposition is now set first and unconditionally: losing the
-    // pipe costs a slower wait, losing this costs every wait there is.
+    // *Historically*: installing the handler sat after a self-pipe, so a failed
+    // `pipe` returned early and left the inherited ignore in place, and
+    // `mesh -c true` hung outright. The pipe is gone — `reaper` wakes a waiter
+    // with `pthread_kill` now — but the lesson it left is the shape of this
+    // test: the disposition is set first and unconditionally, so a startup step
+    // that cannot run must not be able to take it down with it.
+    //
+    // Hence the descriptor limit, low enough that anything wanting a spare one
+    // at startup fails.
     let out = run_with_sigchld_ignored(4, "true");
     assert!(out.status.success(), "{:?}", out.status);
 
-    // And with room for the pipe, so the ignore is the only thing wrong: the
-    // status still has to come back, which is what proves the child was waited
-    // for rather than auto-reaped behind the shell's back.
+    // And with room to spare, so the ignore is the only thing wrong: the status
+    // still has to come back, which is what proves the child was waited for
+    // rather than auto-reaped behind the shell's back.
     let out = run_with_sigchld_ignored(64, "sh -c \"exit 7\"");
     assert_eq!(out.status.code(), Some(7), "{:?}", out.status);
+
+    // Every wait path, not the simple one alone. Auto-reaping makes `waitpid`
+    // fail with `ECHILD` for a child that exited perfectly well, so a pipeline
+    // and a `fork` block reported 1 after doing their work correctly — the
+    // output arrived and the status did not. Both are checked here because a
+    // regression could reach one and not the other: they are different waits.
+    let out = run_with_sigchld_ignored(64, "puts hi | cat");
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+
+    let out = run_with_sigchld_ignored(64, "fork { puts inside }");
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "inside\n");
 }
 
 #[test]

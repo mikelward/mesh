@@ -6367,17 +6367,27 @@ of each PR had landed by another route, but these pieces had not.
       like `global` / `unset` — `fork` leads a statement only when a `{` follows, so
       a command of that name stays reachable — and the fork/wait itself reuses the
       status conventions `wait_for_job` already encodes rather than restating them.
-- [ ] **An inherited `SIGCHLD` of `SIG_IGN` loses every exit status.** A process
+- [x] **An inherited `SIGCHLD` of `SIG_IGN` loses every exit status.** A process
       started with `SIGCHLD` ignored has its children auto-reaped, so `waitpid`
-      fails with `ECHILD` for a child that exited perfectly well, and mesh inherits
-      that disposition rather than resetting it. Every wait path is affected, not
-      one: launched that way, `true` reports status 1, `puts hi | cat` reports 1
-      after printing `hi`, and `fork { puts inside }` reports 1 after printing
-      `inside`. Reproduced by exec'ing mesh from a parent that sets
-      `SIGCHLD` to `SIG_IGN`. The fix is at startup — a shell owns its own
-      disposition for `SIGCHLD` the way it owns the terminal signals, so reset it
-      to `SIG_DFL` before the first child rather than teaching each wait site to
-      read `ECHILD` as success, which cannot recover the status anyway.
+      fails with `ECHILD` for a child that exited perfectly well, and mesh
+      inherited that disposition rather than resetting it. Every wait path was
+      affected, not one: launched that way, `true` reported status 1,
+      `puts hi | cat` reported 1 after printing `hi`, and `fork { puts inside }`
+      reported 1 after printing `inside`.
+
+      **Already fixed when this was re-checked**, by `reaper::install`: the
+      `sigaction` it sets at startup replaces whatever disposition was inherited,
+      which is the reset this entry asked for — a shell owns `SIGCHLD` the way it
+      owns the terminal signals. It does two unconditional things and nothing that
+      can fail first: installs the handler, then unblocks the signal, since an
+      inherited *mask* is no more the shell's to keep than an inherited
+      disposition. Its doc comment states both.
+
+      Verified by exec'ing mesh from a parent that sets `SIGCHLD` to `SIG_IGN`:
+      all three shapes report 0. `an_inherited_sigchld_ignore_does_not_hang_the_shell`
+      had pinned the simple wait and an external's status; the pipeline and the
+      `fork` block are added to it, since they are different waits and a
+      regression could reach one without the other.
 - [ ] **Forking while the capture readers are running.** Every fork in the shell
       runs interpreter code in the child before any `exec` — a pipeline or background
       stage at `exec.rs:413`, a `fork` block at `exec.rs:1360` — and under `$(…)` or
