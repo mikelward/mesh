@@ -1134,7 +1134,10 @@ failure rather than contradicting it. Two cases:
     that name. `type true` reports `true is a boolean literal` and resolves; the
     program is what `-a` shows under it, and what `type ./true` and `type -P true`
     answer with, since `./true` and `command -- true` still reach it. Not a
-    keyword: the word is a value, not a construct.
+    keyword: the word is a value, not a construct. `func true() { … }` and
+    `alias true = …` are refused for the same reason `func if()` would be — the
+    definition could never be reached — while `true = 5` is fine, because a
+    binding is read as `$true` and nothing shadows it there.
   - **Contextual** — `fork` is the subshell keyword only before a block, `unless`
     is a postfix guard only *after* a statement, and `and` / `or` / `in` join
     values. A bare one is an ordinary command word, so `unless` on its own is
@@ -3417,11 +3420,12 @@ greet world          # -> hi, world
 ```
 
 - **Name.** An ordinary name — a letter or `_`, then letters, digits, `_` and
-  single `-`s — that is not already taken. Five words are:
+  single `-`s — that is not already taken. Six kinds are:
 
   | Refused | Why |
   | --- | --- |
   | a reserved word or builtin (`return`, `puts`, `cd`) | it resolves first, so the definition could never be reached |
+  | a **boolean literal** (`true`, `false`) | the parser reads a bare one as the value, so command position never reaches a definition of the name at all |
   | a built-in **value call** (`re`, `style`, `link`, `glob`, `files`, `dirs`) | the opposite problem: `re(x)` always builds a regex, so the function would be reachable as a command and never as a call |
   | anything containing a `.` (`a.b`) | a dot is member access, so a dotted name has no call spelling |
   | the bare `_` | it is the discard |

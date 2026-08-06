@@ -1389,6 +1389,9 @@ const INHERITED_RESERVED_NAMES: &[&str] = &["func", "return", "fail", "not"];
 ///
 /// - a **reserved word** or **builtin** resolves first, so the definition could
 ///   never be reached;
+/// - a **literal** — `true` / `false` — is read as the boolean in every position,
+///   so the definition could never be reached either, and by a rule no lookup is
+///   even consulted for;
 /// - a **built-in value call** is the opposite problem — `re(x)` always builds a
 ///   regex, so such a function would be reachable as a command and never as a
 ///   call;
@@ -1400,6 +1403,16 @@ fn definition_name_problem(name: &str) -> Option<String> {
     if INHERITED_RESERVED_NAMES.contains(&name) || builtins::is_builtin(name) {
         return Some(format!(
             "`{name}` is a reserved name and cannot be a function name"
+        ));
+    }
+    // Named separately from the reserved words above because the reason differs and
+    // the message has to say which one it is: `true` is not a construct that wins
+    // command position, it is a value the parser reads instead of ever asking what
+    // the word names. Both leave a definition dead on arrival, which is what a
+    // silent `func true() { … }` used to be.
+    if builtins::is_literal(name) {
+        return Some(format!(
+            "`{name}` is a boolean literal and cannot be a function name"
         ));
     }
     if parser::value_builtin(name) {
