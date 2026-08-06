@@ -1723,6 +1723,28 @@ fn run_executable(
                 Err(step) => step,
             }
         }
+        // `$env.PATH[0] = …`. Global for the same reason a whole-entry write is,
+        // and a read-modify-write because that is what the boundary allows: the
+        // entry crosses as bytes, so the element is changed in the value the entry
+        // reads as and the whole thing is serialized back.
+        EnvMemberAssignment {
+            target,
+            append,
+            value,
+        } => {
+            let evaluated = eval_operand_of(value, last, in_function, shell);
+            match evaluated {
+                // As for an ordinary assignment: a right-hand side that raised
+                // `break`/`continue` produced no value, so leave the entry alone.
+                Ok(_) if shell.control.is_some() => Step::Continue(last),
+                Ok(evaluated_value) => {
+                    let captured = capture_status_of(value, shell);
+                    assign_into_env_member(target, evaluated_value, *append, shell)
+                        .map_or_else(runtime_message, |()| Step::Continue(captured))
+                }
+                Err(step) => step,
+            }
+        }
         MemberAssignment {
             target,
             append,
@@ -1928,7 +1950,7 @@ fn not_backgroundable(node: &parser::Executable) -> Option<&'static str> {
         Expression { .. } => "an expression",
         Assignment { .. } => "an assignment",
         Unset { .. } => "an `unset`",
-        EnvAssignment { .. } => "an environment assignment",
+        EnvAssignment { .. } | EnvMemberAssignment { .. } => "an environment assignment",
         MemberAssignment { .. } => "an assignment",
         Function { .. } => "a function definition",
         If(_) => "an `if`",
@@ -3561,6 +3583,58 @@ fn assign_into_member(
     shell.vars.update(&root, global, |root| {
         write_at(root, &steps, value, append, target)
     })
+}
+
+/// `$env.PATH[0] = …` — write into the value an entry reads as, then serialize the
+/// whole entry back.
+///
+/// The environment holds bytes, so there is nothing to write *into* in place: the
+/// element lives in the list `typed` builds for a path-type name, which exists
+/// only for as long as the read. This does the round trip
+/// `p = $env.PATH; $p[0] = …; $env.PATH = $p` in one statement, and inherits its
+/// answers from the two halves rather than inventing any — a name that is not
+/// path-type reads as a string, and `write_at` refuses to assign into one with the
+/// message every other bad place gets.
+///
+/// The entry is written only once the element write has succeeded, so a failed
+/// path leaves the environment as it was — the same property `Vars::update` gives
+/// a member write on a binding. The write back goes through
+/// [`environ::write_element`] rather than [`environ::write`], so a component this
+/// edit did not touch keeps its exact bytes even when they are not UTF-8.
+fn assign_into_env_member(
+    target: &str,
+    value: Value,
+    append: bool,
+    shell: &mut Shell,
+) -> Result<(), String> {
+    let (_, steps) = resolve_path(target, "assign to", &shell.vars)?;
+    let (entry, rest) = steps
+        .split_first()
+        .expect("the parser required two accesses");
+    let (PathStep::Member(key) | PathStep::Subscript(key)) = entry;
+    // Before the read, not after it: a computed key can name something the process
+    // environment cannot hold, and reading one of those answers "not set" — an
+    // absence, where the real answer is that no such entry could exist. A whole-entry
+    // write says so because nothing reads first.
+    environ::check_name(key)?;
+    // The read's own absence message: a write into an entry that is not there has
+    // nothing to change, and saying so the way `$env.NOPE` already does keeps one
+    // wording for one condition.
+    let mut current = environ::read(key).ok_or_else(|| format!("$env.{key}: not set"))?;
+    // Which component the write lands on, resolved *before* it happens, because
+    // afterwards nothing distinguishes an element that was assigned what it already
+    // read as from one nobody touched. The only shape that can succeed is one
+    // subscript into the list a path-type entry reads as — anything deeper reaches
+    // into a string — so anything else leaves the write back nothing to reason about
+    // and it falls through to the plain serialization.
+    let touched = match (&current, rest) {
+        (Value::List(values), [PathStep::Subscript(index)]) => {
+            Some(list_offset(values.len(), index, target)?)
+        }
+        _ => None,
+    };
+    write_at(&mut current, rest, value, append, target)?;
+    environ::write_element(key, current, touched, append)
 }
 
 /// `$sh.options.KEY = …`, `$sh.<event>.NAME = …` — the writable corners of the

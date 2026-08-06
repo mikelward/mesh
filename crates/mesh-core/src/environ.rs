@@ -144,6 +144,83 @@ pub(crate) fn write(key: &str, value: Value, append: bool) -> Result<(), String>
     } else {
         OsString::from(serialize(key, value)?)
     };
+    set(key, value)
+}
+
+/// Write `key` back after the element at `touched` changed, keeping every other
+/// component byte-exact.
+///
+/// The list a path-type entry reads as is lossy: [`typed`] decodes with
+/// `to_string_lossy`, since a mesh string is UTF-8 while an environment value is
+/// arbitrary bytes. Serializing that whole list back would rewrite a component
+/// nobody touched as U+FFFD — quietly breaking, say, a non-UTF-8 `PATH` component
+/// that had been resolving fine, which is the corruption [`append_bytes`] avoids
+/// one operation over by never decoding at all. An element write cannot avoid
+/// decoding, because the element it changes *is* a mesh value, so it writes back
+/// only the component it was told about and puts the original bytes under the rest.
+///
+/// Which component that is has to be **told**, not inferred: a value that reads
+/// the same as what was there says nothing about whether it was written. Deducing
+/// it from the text would mean an `=` that deliberately assigns a component the
+/// replacement text it currently displays silently kept the invalid bytes instead.
+/// `append` is the second half of the same point — `write_at` appends to the lossy
+/// decoding, so the original bytes carry there and only the addition is new.
+///
+/// `touched` is `None` when the shape was not one this can reason about, which
+/// leaves the plain serialization as the only answer.
+pub(crate) fn write_element(
+    key: &str,
+    edited: Value,
+    touched: Option<usize>,
+    append: bool,
+) -> Result<(), String> {
+    check_key(key)?;
+    let (Value::List(components), Some(touched), Some(raw)) = (&edited, touched, env::var_os(key))
+    else {
+        return write(key, edited, false);
+    };
+    let raw = raw.into_vec();
+    let original: Vec<&[u8]> = raw.split(|byte| *byte == PATH_SEPARATOR as u8).collect();
+    // A component was added or removed, so a position no longer names the same one
+    // and there is nothing to carry over.
+    if original.len() != components.len() {
+        return write(key, edited, false);
+    }
+    let mut bytes = Vec::with_capacity(raw.len());
+    for (index, (before, after)) in original.iter().zip(components).enumerate() {
+        if index > 0 {
+            bytes.push(PATH_SEPARATOR as u8);
+        }
+        if index != touched {
+            // Decoded on the way in and never written, so the bytes it decoded from
+            // are what it still is.
+            bytes.extend_from_slice(before);
+            continue;
+        }
+        // One component at a time, so this is `join_path`'s element rule rather than
+        // its joining: a nested value is refused here exactly as it is in a
+        // whole-entry write.
+        let text = join_path(key, vec![after.clone()])?;
+        match append
+            .then(|| text.strip_prefix(String::from_utf8_lossy(before).as_ref()))
+            .flatten()
+        {
+            // What was there plus what `+=` added, with the original bytes for the
+            // part that only ever existed as a decoding.
+            Some(addition) => {
+                bytes.extend_from_slice(before);
+                bytes.extend_from_slice(addition.as_bytes());
+            }
+            // An assignment says what the component is, whatever it looks like next
+            // to what was there.
+            None => bytes.extend_from_slice(text.as_bytes()),
+        }
+    }
+    set(key, OsString::from_vec(bytes))
+}
+
+/// The bytes are settled; put them in the process environment.
+fn set(key: &str, value: OsString) -> Result<(), String> {
     if value.as_bytes().contains(&0) {
         return Err(format!(
             "$env.{key}: an environment value cannot contain a NUL byte"
@@ -154,6 +231,15 @@ pub(crate) fn write(key: &str, value: Value, append: bool) -> Result<(), String>
     // when it updates `$env.PWD`.
     unsafe { env::set_var(key, value) };
     Ok(())
+}
+
+/// Is `key` a name the process environment can hold?
+///
+/// Exposed so a read-modify-write can ask *before* it reads: the read of an
+/// impossible name answers "not set", which would report an absence where the real
+/// answer is that no such entry could exist.
+pub(crate) fn check_name(key: &str) -> Result<(), String> {
+    check_key(key)
 }
 
 /// Remove `$env.KEY` from the process environment, so children stop inheriting it.

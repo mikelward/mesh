@@ -2185,7 +2185,18 @@ $env.PATH = $env.PATH:dedup   # drop duplicates
 $env.PATH = $env.PATH:prepend(/opt/bin):dedup   # both, in one statement
 puts $env.PATH[0]
 puts $env.PATH:len
+$env.PATH[0] = /opt/bin       # replace one entry, in place
 ```
+
+An **element** of one is a place, so the last line needs no temporary. It is a
+whole-entry write underneath — the entry is read, the element changed, and the
+whole list joined back — so a child sees the new value the way it sees any other
+environment write, and `+=` there appends to the element rather than to the list
+(`$env.PATH[0] += /bin` makes the first entry `/opt/bin/bin`). Only path-type
+names have elements: `$env.HOME[0] = /x` reports that there is nothing to index,
+the same way reading `$env.HOME[0]` does. `unset` does not follow — dropping one
+directory is not what removing an entry means, so `unset $env.PATH[0]` is
+refused.
 
 The set is fixed for now: `PATH`, `MANPATH`, `CDPATH`, `INFOPATH`,
 `LD_LIBRARY_PATH`, and `PYTHONPATH`. (`export --list NAME`, which would opt an
@@ -2225,16 +2236,16 @@ Four rules, all of them POSIX's:
 `$env.CDPATH` is in the environment, so a child process inherits it — a mesh
 script, and a `bash` or `zsh` started from here, all search the same path.
 
-An `$env` target takes **exactly one access**: a member (`$env.KEY`) or a
-subscript (`$env[$name]`). Any name you can read you can also assign, including a
-kebab name like `$env.MY-VAR`. `$env.PATH[0] = …`, `$env.PATH:dedup = …`, and
+An `$env` target names a whole entry with **one access**: a member (`$env.KEY`) or
+a subscript (`$env[$name]`). Any name you can read you can also assign, including a
+kebab name like `$env.MY-VAR`. Past that, only an **index** goes further, and only
+into a path-type entry, which is the element write above (`$env.PATH[0] = …`); a
+`.member` under an entry (`$env.HOME.x = …`) is a syntax error naming the entry a
+write would replace, since no entry is ever a map. `$env.PATH:dedup = …` and
 `$env[0..2] = …` describe derived values rather than places, so they are syntax
-errors. (An ordinary map or list **does** take a write further in — see
-[Member assignment](#member-assignment) — but `$env` holds bytes rather than typed
-values, so there is nothing inside an entry to reach into.) Of the other spellings,
-only `export --list NAME` is still unimplemented; `export`, `with`, and the
-`NAME=value` command prefix take a spelled-out name only, since each is a header
-whose names are read at parse time.
+errors about places. Of the other spellings, only `export --list NAME` is still
+unimplemented; `export`, `with`, and the `NAME=value` command prefix take a
+spelled-out name only, since each is a header whose names are read at parse time.
 
 `+=` works on the raw bytes already in the environment, so a value that is not
 valid UTF-8 survives being appended to. Reading such a value into mesh still

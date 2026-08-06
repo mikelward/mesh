@@ -605,6 +605,22 @@ pub enum EnvKey {
     Computed(String),
 }
 
+/// What an `$env` reference reaching past its entry can mean, from
+/// [`Parser::env_reach`].
+///
+/// The split is whether the *value* could answer it. A subscript can — a
+/// path-type entry is a list — and which names those are is not something the
+/// parser knows, so it becomes a write and the runtime answers. A `.member`
+/// cannot: no entry is ever a map, whatever its name, so it is settled here.
+enum EnvReach {
+    /// Every access under the entry is a subscript: the raw reference text, for
+    /// [`Executable::EnvMemberAssignment`].
+    Indexed(String),
+    /// A `.member` under the entry: the reference as written, and the entry it
+    /// reaches into, for [`ParseErrorKind::EnvEntryPlace`].
+    Member(String, String),
+}
+
 /// One thing an `unset` names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnsetTarget {
@@ -658,6 +674,25 @@ pub enum Executable {
     /// write reaches the real environment so children inherit it.
     EnvAssignment {
         key: EnvKey,
+        append: bool,
+        value: Expr,
+    },
+    /// `$env.PATH[0] = value` — a write *into* a path-type entry, which reads as a
+    /// list (`environ::PATH_VARS`). The entry is still what crosses the boundary:
+    /// the write reads it, changes the element, and serializes the whole thing
+    /// back, which is the round trip `p = $env.PATH; $p[0] = …; $env.PATH = $p`
+    /// spelled in one statement.
+    ///
+    /// Subscripts only. A `.member` past the entry is refused in the grammar
+    /// ([`ParseErrorKind::EnvEntryPlace`]), since no entry is ever a map, while an
+    /// index can only be answered by the value: whether a name is path-type is not
+    /// something the parser knows, and `$env[$k][0]` does not even name the entry
+    /// until it runs.
+    EnvMemberAssignment {
+        /// The raw reference text, split into the entry and the accesses under it
+        /// by the expansion layer — the same path parser reads and member writes
+        /// use.
+        target: String,
         append: bool,
         value: Expr,
     },
@@ -3019,10 +3054,27 @@ impl Parser<'_> {
         // After `env_target`, which claims every `$env` place it recognizes, so what
         // is left here is a reference reaching past one — and only when an
         // assignment follows, leaving `puts $env.PATH[0]` the read it already is.
-        if let Some((reference, entry)) = self.env_reach()
+        if let Some(reach) = self.env_reach()
             && self.assignment_follows(1)
         {
-            return Err(self.error(ParseErrorKind::EnvEntryPlace(reference, entry)));
+            match reach {
+                EnvReach::Member(reference, entry) => {
+                    return Err(self.error(ParseErrorKind::EnvEntryPlace(reference, entry)));
+                }
+                EnvReach::Indexed(target) => {
+                    self.next();
+                    let append = self.eat(&TokenKind::PlusEqual).is_some();
+                    if !append {
+                        self.expect(&TokenKind::Equal, "`=`")?;
+                    }
+                    let value = self.expression()?;
+                    return Ok(negate(Executable::EnvMemberAssignment {
+                        target,
+                        append,
+                        value,
+                    }));
+                }
+            }
         }
         if let Some(target) = self.member_target() {
             if matches!(
@@ -4341,19 +4393,21 @@ impl Parser<'_> {
     }
 
     /// An `$env` reference that reaches **into** an entry — `$env.PATH[0]`,
-    /// `$env.HOME.x`, `$env[$k][0]` — as the text written and the entry under it.
+    /// `$env.HOME.x`, `$env[$k][0]` — told apart by whether the value could
+    /// possibly answer it.
     ///
-    /// `env_target` above declines these, since what a write replaces is a whole
-    /// entry, and `member_target` below excludes `$env` outright. So the word fell
-    /// through to an ordinary expression and the complaint landed on the `=` as
-    /// `expected a statement separator`, naming neither the entry nor the rule —
-    /// the same shape of complaint `member_target` already answers for `$sh`.
+    /// `env_target` above claims the single-access places, since what a write
+    /// normally replaces is a whole entry, and `member_target` below excludes
+    /// `$env` outright. So a reference past the entry fell through to an ordinary
+    /// expression and the complaint landed on the `=` as `expected a statement
+    /// separator`, naming neither the entry nor the rule — the same shape of
+    /// complaint `member_target` already answers for `$sh`.
     ///
-    /// Only an *access* counts. A trailing modifier (`$env.PATH:upper = …`) names a
-    /// derived value rather than a place, which is the wider complaint every
-    /// `$xs:dedup = …` shares, and a slice (`$env[1..2]`) names a copy of a run of
-    /// entries rather than one entry to point at.
-    fn env_reach(&self) -> Option<(String, String)> {
+    /// Only an *access* counts either way. A trailing modifier (`$env.PATH:upper =
+    /// …`) names a derived value rather than a place, which is the wider complaint
+    /// every `$xs:dedup = …` shares, and a slice (`$env[1..2]`) names a copy of a
+    /// run of entries rather than one entry to point at.
+    fn env_reach(&self) -> Option<EnvReach> {
         let TokenKind::Word(word) = &self.peek()?.value else {
             return None;
         };
@@ -4396,6 +4450,11 @@ impl Parser<'_> {
         // is one word whose text carries the whole chain, where the unbraced
         // `$env.PATH[0]:upper` arrives as separate pieces and never matched above —
         // so without the walk the two spellings of one reference disagreed.
+        //
+        // The walk also answers which kind of reach this is: an entry is never a
+        // map, so a `.member` under one cannot be answered by any value and is
+        // settled here, while a subscript is a question only the entry can answer.
+        let mut indexed = true;
         let mut rest = after;
         while !rest.is_empty() {
             if rest.starts_with('[') {
@@ -4403,8 +4462,12 @@ impl Parser<'_> {
                 continue;
             }
             let member = rest.strip_prefix('.')?;
+            indexed = false;
             let end = member.find(['.', '[', ':']).unwrap_or(member.len());
             rest = &member[end..];
+        }
+        if indexed {
+            return Some(EnvReach::Indexed(name.clone()));
         }
         // Spelled the way the reference was, so the advice can be pasted over what
         // is written rather than translated first.
@@ -4413,7 +4476,7 @@ impl Parser<'_> {
         } else {
             format!("$env{access}")
         };
-        Some((name.clone(), entry))
+        Some(EnvReach::Member(name.clone(), entry))
     }
 
     /// A `$name.member` / `$name[index]` **place** for an assignment, handed on as
