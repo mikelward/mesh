@@ -7365,14 +7365,33 @@ a one-line edit. Every claim below was checked against the built shell.
       case deserve to work unannotated? Every route out is that same character
       in a different position.
 
+      **The candidates are written up in `docs/DESIGN.md`** beside the other
+      open language questions — keeping the terminator, letting a spread pass
+      flags as data, an implicit terminator (command-wide, or builtins only),
+      a diagnostic-only change, and spread-of-expression at a command
+      boundary — each with what it buys and costs, and the four facts that
+      constrain the choice, including that `wrapper func` already binds a
+      flag positionally where a plain `func` refuses. Note the last candidate
+      is the same `CommandItem::Value` gap as *The spread of an argument-taking
+      modifier at a command boundary* and *A spread value call at a command
+      boundary* above, so it should be decided with those rather than here.
+      Leaning there: keep the terminator and improve the diagnostic. Decide it
+      there; this entry is the pointer.
+
       Either way, `docs/REFERENCE.md`'s alias bullet should show the
       definition-side spelling — it follows from the desugaring it already
       documents, but a user meets it as an `unknown flag` report rather than
       as a deduction.
 
-      *Reversible:* accepting more later is safe — nothing depends on the
-      refusal firing — but each escape added is a spelling that has to keep
-      working, so widening is easier to do than to undo.
+      *Two of the candidates are not reversible and not additive:* the
+      refusal reports and skips the body, so an implicit terminator means a
+      call that errors today runs tomorrow — `func f(a) { … }` given
+      `f --frce` never enters `f`, where it would bind `a = --frce` and run
+      it, silently succeeding with a value nobody checked. Making a spread
+      mean data is the same shape one step over. The other two — a better
+      diagnostic, and spread-of-expression, which only ever accepts programs
+      that are errors today — change no accepted behavior and stay available
+      whatever is decided.
 
 ## Icebox / decide later
 

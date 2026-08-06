@@ -6048,6 +6048,91 @@ remain under-specified.
   | `is CMD` | Shortest, reads as English. | `is quiet ssh-add -L` scans as "is quiet" — it collides with the modifier following it — and `is` is wanted for type tests and the if-binding. |
   | `not not CMD` | No new name at all. | Does not work (above), and two negations to express a *conversion* reads worse than one word that names it. |
   | `$?(CMD)` | Bracketed sibling of `$(…)` — bytes vs status — and works in `return` position with no grammar change. | Spends a sigil where a word will do, now that `not` shows a prefix word already reaches the block tail. |
+- **Flag forwarding into an option-less command — open; leaning keep the
+  terminator.** A command that declares no matching option *reports* a flag
+  handed to it rather than printing or passing it, so a wrapper that forwards
+  arguments which might include a flag has to say `--` in its definition:
+
+  ```mesh
+  func show(...rest) { puts -- ...$rest }      # prints; without the `--` it reports
+  alias co = puts checkout --                  # `co --force x` → checkout --force x
+  ```
+
+  The rule itself is settled — a builtin is not a third kind of command, and
+  `puts $x` is genuinely ambiguous between *print this* and *pass this option*.
+  What is open is whether that `--` is an acceptable standing cost, or whether
+  the forwarding case deserves to work unannotated. Four facts constrain the
+  choice, each checked against `main` rather than assumed:
+
+  - **It is 12 of the 22 builtins, not a `puts` quirk.** Of the table in
+    `crates/mesh-core/src/builtins.rs`, thirteen declare no option — but
+    *twelve* refuse a flag: `cd`, `pwd`, `puts`, `print`, `clip`, `notify`,
+    `exit`, `fg`, `bg`, `jobs`, `source`, `help`. Nine own their option
+    parsing and decide for themselves: `gets`, `wait`, `disown`, `kill`,
+    `prompt`, `on`, `command`, `exec`, `type` — `gets` among them, reporting
+    its own unknown flag in wording identical to the general one, so it looks
+    from outside like a refusal it does not go through.
+
+    `timeout` is the thirteenth, and it belongs in neither column: its
+    operands are a duration and *a command*, so a flag in the first position
+    is a bad duration (`timeout --force …`) and one in the second is a
+    command name (`timeout 5s --force` → `command not found: --force`). The
+    generic refusal never runs for it; a flag *behind* the command reaches
+    that command, which is why `timeout 5s puts --force` is refused by
+    `puts`. Counting it in would overstate the surface this question is
+    about.
+  - **A `func` answers identically — but a `wrapper func` does not.**
+    `func f(a) { puts $a }` with `f --force` reports `unknown flag`, so this
+    is not a rule about builtins that a plain `func` happens to share. The
+    exception is the form built for forwarding: `wrapper func f(a) { … }`
+    parses no flags, so `f --force` binds `a` and runs the body. That is why
+    an alias — which desugars to exactly this — reports at the *target* and
+    not at the call: `alias co = puts checkout` lets `--force` through `co`
+    and `puts` refuses it. So the language already has a command form that
+    doesn't refuse, which is the honest state of the "one rule" claim: two
+    of the three forms refuse, and the third exists because forwarding
+    needed one that doesn't.
+  - **The mark decides, not the spelling.** `x = --force; puts $x` reports;
+    `x = "--force"; puts $x` prints; `x = [--force]; puts $x` prints, because
+    a flag inside a collection is data one element down.
+  - **A spread already carries marks, and forwarding depends on it.**
+    `func g(...r) { f ...$r }` with `f` declaring `--tag`: `g -- --tag=x` binds
+    `tag=x`, while the same text arriving as a string element
+    (`args = ["--tag=x"]; f ...$args`) is data and lands as a positional. So
+    the marks surviving a spread is what makes wrapper forwarding work at all
+    — it is not an obstacle to it.
+
+  | Candidate | For | Against |
+  | --- | --- | --- |
+  | **Keep the terminator** | One rule wherever a command parses its own options — the exception, `wrapper func`, is written at the definition and exists to forward, so it is a declared opt-out rather than a hole. The escape is already spelled, already documented, and costs nothing at runtime: the `--` is removed before dispatch, so calls carrying no flag are unaffected. | You learn it by hitting the error: a forwarding definition looks correct until the day a caller passes a flag. |
+  | A spread passes flags as data | `puts ...$rest` is the common forwarding shape and would just work, and `[--force]` printing gives "a collection being emptied is data" a precedent. | Breaks fact 4 — `g -- --tag=x` forwarding into a `func` that declares `--tag` binds it *because* the spread keeps the mark. Making a spread mean data would retire the working case to fix the reporting one. |
+  | Implicit terminator when the command declares no options — **applied to every command**, `func` included | `puts --force` prints, `func f(a)` takes `f --force` as a positional, the question disappears with no new spelling, and every form then behaves as `wrapper func` already does. | It is the refusal, deleted. Wherever the rule fires today it fires because nothing there can match the flag, which is exactly the set this would silence: `func f(a)` called as `f --frce` reports `unknown flag` now and would bind `a = --frce` instead. That is the guess between *pass this option* and *pass this text* that the rule exists not to make, and the caller who meant an option learns about it downstream rather than at the call. |
+  | Implicit terminator for **builtins only** | Smaller blast radius; the option-less builtins are the shapes people actually forward into. And by fact 2 the language already tolerates a non-refusing form — `wrapper func` — so a second one is not the precedent it looks like. | A plain `func` with no such parameter would go on refusing, so the two disagree on identical-looking calls. Weaker than it first reads, given `wrapper func`, but the difference is that `wrapper` is *written* at the definition: you can see which reading you get. A builtins-only rule is invisible at the call. |
+  | Diagnostic only | Cheapest, and it decides nothing. The message already names `puts -- --force`; it could name the forwarding spelling too, since a caller who hit this from inside a wrapper needs `puts -- ...$rest` rather than the scalar escape. | Changes how fast the cost is learned, not what it is. And the improvement has to be **unconditional**, which is a weaker message than a targeted one: by the time the refusal runs, a spread-delivered flag is indistinguishable from a written one — `expand::Written` is `Data`/`Flag`/`Terminator` with no provenance, and `Argv` keeps only the words and those marks, so nothing records that an element arrived via `...$rest`. Naming the forwarding form only when it applies would mean carrying a spread-origin bit through expansion, which is real work for a message. |
+  | **Spread of an expression** at a command boundary, `...$r:map(func(e) { "$e" })` | The conversion itself already exists, for a list of strings and flags: quoting is the scalar half (`x = --force; puts "$x"` prints `--force`, one of the three ways `docs/REFERENCE.md` lists) and `:map` distributes it — `x = $r:map(func(e) { "$e" }); puts ...$x` prints `a --force b`, leaving plain strings unchanged. What the direct form needs is not a flag feature at all: `CommandItem::Value` has no spread variant, which is the *same* gap already tracked for `puts ...$x:split(":")` and `ls ...glob($p)` — all three give the identical syntax error. So this is the one candidate that pays for itself elsewhere, closing two open entries as a side effect, and it is compatible: it accepts programs that are errors today and retires nothing. | Correspondingly not the small change the "just a spelling" reading suggests — it is the general spread-of-expression feature, with a parser change behind it. And for *this* question it is not even a substitute, let alone a shorter one. Quoting each element replaces it with a string, so the forwarded list arrives stripped of every type it carried, and a **collection** does not survive at all: for `s("a", [1 2], "b")`, `puts -- ...$r` renders the list where `$r:map(func(e) { "$e" })` fails with `$e: list value needs \`...\` in command arguments`. So it converts flags at the cost of everything else a rest list can hold, where the terminator preserves all of it — and it is written per call site, and longer than the `--`. Judge it on the two entries it closes, not on this one. Not a use of `:flag`, which runs the other way and is the identity on a flag. |
+
+  Leaning: **keep the terminator and improve the diagnostic**, which is one
+  candidate plus the null one — and the compatibility argument reaches only
+  half the table, so it should be said where it applies rather than as a
+  blanket.
+
+  Two of the candidates change what accepted programs do. The refusal reports
+  and *skips the body*, so under an implicit terminator a call that errors
+  today runs tomorrow: `func f(a) { … }` given `f --frce` never enters `f`,
+  where it would bind `a = --frce` and run it — silently, succeeding with a
+  value nobody checked. Making a spread mean data is the same shape one step
+  over, retiring the forwarding case fact 4 describes. Both are behavior
+  changes to existing programs, not additions to them, and neither can be
+  undone once written against.
+
+  The other two are compatible and cost nothing to defer, so both stay
+  available whatever is decided — which is the actual reason to take the
+  diagnostic now and leave the rest open. A better diagnostic changes no
+  accepted behavior at all; it just has to say both escapes unconditionally,
+  since the refusal cannot see whether the flag came through a spread.
+  Spread-of-expression only ever accepts programs that are errors today; it
+  is not on the critical path for this question either way, and it should be
+  decided on the two entries it closes rather than as an answer here.
 
 ## Name
 
