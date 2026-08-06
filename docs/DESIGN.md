@@ -3168,7 +3168,9 @@ Rules:
   ran — results in the **empty string with status `0`**, the same "nothing
   produced, nothing failed" answer a no-`else` `if` gives; there is no null to
   invent.
-- **Value and status are separate channels** *(decided; shipped)*. A function has
+- **Value and status are separate channels** *(shipped — but
+  [reopened](#open-questions): whether the status should go back to being a
+  projection of the value, so `return 0` succeeds and `return 1` fails)*. A function has
   three outputs, not two: the **bytes** it writes to stdout, the **value** it
   returns, and its **exit status**. `return` fills the value channel; `fail`
   fills the status channel. Neither is derived from the other:
@@ -3211,7 +3213,10 @@ Rules:
   both "the number five" and "exit code 5" — conflates two unrelated things and
   makes every integer-returning function a landmine. The nullable `false | T`
   encoding is a real and useful duality and is kept; an integer's coincidental
-  resemblance to a status is not.)*
+  resemblance to a status is not. **This is the argument now under review** — see
+  [Open questions](#open-questions), where the counter is that the derived status
+  only surfaces where the value was being discarded anyway, while the cost of
+  separating them is that `return 1` succeeds.)*
 - **Output is stdout.** Independently of its result, whatever a `func` writes to
   stdout *is* its output stream, exactly like an external command, so functions
   compose in byte-stream pipes with everything else.
@@ -6027,7 +6032,151 @@ remain under-specified.
   **user-facing** `try` / `catch` or `?(…)` capture for channel-2 errors with no
   soft twin, or ship only the boundary-catch + soft twins for the MVP (leaning: no
   user catch in the MVP).
-- **A status-to-bool word — open; leaning `ok`.** A predicate whose condition is a
+- **Status as a projection of the value — reopened; leaning restore it, with an
+  escape hatch.** [Value and status are separate channels](#functions) is marked
+  *decided; shipped*, and the objection it records is that deriving one from the
+  other "makes every integer-returning function a landmine." Reopened on the
+  report that the separation is **too complicated for what it buys**, with the
+  shell reflex as the motivating case:
+
+  ```mesh
+  func f() { return 0 }
+  if f { puts true }                          # want: true
+
+  func g() { return 1 }
+  if g { puts true } else { puts false }      # want: false
+  ```
+
+  Today the second prints **`true`**. `return 0` and `return 1` are both
+  successes, because only `false` fails — so the two spellings of failure
+  disagree (`return false` fails, `return 1` does not) and `return` cannot
+  **name** a status. Bare `return` does *propagate* one (the row above: it carries
+  the last status, so `func g() { sh -c "exit 3"; return }` reports 3); what has no
+  spelling is choosing the code an operand-bearing `return` leaves.
+
+  Seven facts constrain the choice, each checked against `main` (`88fa209`) rather
+  than assumed:
+
+  - **The projection is still there; it lost one arm.** `status_of`
+    (`crates/mesh-core/src/repl.rs`) maps `false` → `1` and everything else → `0`.
+    Restoring the old model is restoring `Value::Integer(n) => n.rem_euclid(256)`,
+    dropped in `0b107f6`. This is not a new mechanism, it is a one-arm revert plus
+    whatever fallout the arm has.
+  - **The landmine is real and a test caught it once.** `$x:split("-"):len || puts
+    three` fired *because* a length of 3 read as a failing status (`0b107f6`). Any
+    restoration re-arms exactly that case.
+  - **The value channel is unaffected either way.** Under the projection
+    `return 5` still binds `5` at `n = f()`; the derived status mostly shows up
+    where the value was being discarded anyway — bare command position, `&&` /
+    `||`, `$sh.status`. That narrows the blast radius considerably and is the
+    strongest argument for restoring it.
+  - **`:capture` is the exception, and it is an API.** A
+    [capture record](#calling-for-a-value-and-lambdas) reports `.value` and
+    `.status` *together*, and `capture_call` derives that status through the same
+    `status_of` (`crates/mesh-core/src/repl.rs`), so restoring the arm changes
+    records that keep their value: `func f() { return 3 }; f():capture` reports
+    `value=3 status=0` today and would report `value=3 status=3`. Any restoration
+    has to say what a capture record means for an int — the one place the two
+    channels are read side by side, where a derived status is most visibly
+    redundant with the value sitting next to it.
+  - **`source` is a second API affected.** `return` at the top level of a
+    [sourced file](#startup-and-invocation) is a shipped contract, and
+    `make_return` derives its code through the same `status_of` before
+    `run_sourced_text` publishes it as the `source` command's status. So a file
+    containing `return 3` leaves status `0` today and would leave `3` after the
+    revert. Together with `:capture` that makes three fallout sites, not one:
+    the arm is small, its reach is not.
+  - **Position already decides which channel is read.** `if f() { … }` on an int
+    errors (*an int is not a condition*) while `if f { … }` reads the status —
+    true today, and true under the projection. So the projection does **not**
+    create a value-position/status-position disagreement: the value position
+    refuses to branch at all. The inversion only appears once a comparison is
+    written to read the int back as data (`if v = f(); $v != 0`, option E), where
+    `0` is the false-ish one and `if f` treats that same `0` as true. Narrow, but
+    it is the shape the [truthiness rule](#conditionals-if-is-an-expression) spent
+    its budget removing, so E buys its escape hatch at that price.
+  - **`0`–`255` is the whole status range.** `return 256` would be
+    indistinguishable from `return 0`, and `return -1` from `return 255`, because
+    a status is 8-bit and the value channel is not.
+  - **`if v = f(); $v != 0 { … }` does not parse** — `syntax error: expected {`.
+    The [if-binding](#conditionals-if-is-an-expression) has only the
+    `if lhs = rhs { … }` form, which tests presence-and-fit, not an arbitrary
+    condition over the bound value.
+
+  | Option | `return N` | For | Against |
+  | --- | --- | --- | --- |
+  | **A. Restore the full projection** | value `N`, status `N` mod 256 | Matches the POSIX-shell reflex (sh/bash/zsh — though *not* the rich-value shells: nushell and PowerShell both return `1` as data); `return 0` / `return 1` do the obvious thing; removes the `return false` / `return 1` asymmetry | Re-arms the `:len` case above — `count \|\| warn` fires on a *non-empty* result; `return 256` ≡ `return 0`; changes `:capture` records and the status of a sourced `return N` |
+  | **B. Keep the channels, close the known gaps** | value `N`, status `0` | No landmine; `fail` already names statuses; status quo plus [`ok`](#open-questions) and the `not` fix | Leaves `return 1` succeeding — does not answer the report |
+  | **C. Project a distinct status *type*** | value `N`, status `0`; `fail N` / a `status` value projects | Total and unambiguous — no type collision to arbitrate | `return 1` still succeeds, exactly as today — an int operand cannot name a status, so the asymmetry the report is about survives |
+  | **D. Narrow projection — only `0` and `1`** | `0`/`1` project; other ints are data | Covers the literals people actually write | Worse than uniform: a count of 1 fails while a count of 3 succeeds |
+  | **E. A + the Go-shaped `if init; cond`** | as A | Gives the landmine a *spelling* rather than a warning — `if v = f(); $v != 0 { … }` reads the int back as data | New grammar; does nothing for `&&` / `\|\|` chains |
+
+  **`fail` survives option A** — it is not made redundant by it. `fail N` leaves
+  the value `false` where `return N` leaves the integer `N`, so even with equal
+  statuses the two stay distinguishable at a value call and at
+  `f():capture`'s `.value`. "Fail with code N and produce no result" would still
+  need its own verb unless A also proposed changing `fail`'s value semantics,
+  which it does not.
+
+  **Leaning: A with E.** The POSIX reflex is the one mesh's users arrive with,
+  and it fires constantly; the collision is mostly
+  confined to positions that were throwing the value away regardless; the
+  residuals are the `||` chain, the capture record, and the status of a sourced
+  `return N` — three cases that argue for B, none of which E covers, since the
+  Go-shaped `if` only helps where an int is being read back as data. The two
+  API changes are the harder half: a `||` chain is code someone writes, but
+  `:capture` and `source` are contracts already shipped.
+
+  **The *status-to-bool word* below is independent of this choice** — neither
+  option subsumes it. A function ending in a command already propagates that
+  command's status without consulting `status_of` (`func p() { /bin/false }; p`
+  leaves `1` today), so the arm changes nothing there; and `return CMD` does not
+  run a command under either model — `return /bin/false` yields the *string*
+  `"/bin/false"`, since a bare word in value position is a literal. What `ok` is
+  for is producing a **bool** a value call can read, and that need is identical
+  before and after.
+
+  Two adjacent questions from the same report, both answered against `main`:
+
+  - **`match f() { … }` works and needs nothing.** It matches on the **value** —
+    `func f() { return 7 }; match f() { 7 => … }` takes the `7` arm. `match` is a
+    value construct, so it reads the value channel, which is right under either
+    model. (`switch` is not a mesh keyword; `match` was
+    [decided](#matching-match) and `switch` explicitly declined.)
+  - **`match f { … }` is a trap.** A bare word in expression position is a
+    [string literal](#variables-and-assignment), so the subject is the string
+    `"f"` — the function never runs and the arm falls to `_`. Same shape as
+    `x = greet` binding `"greet"`, but here nothing forces the parens, so it is
+    silent. Worth a diagnostic: a `match` subject that is a bare word naming a
+    function in scope almost certainly meant `f()`.
+- **Is `f()` the right call spelling, or would `(f)` be? — open; leaning keep
+  `f()`, question the comma instead.** `f()` is forced today because a bare word
+  on an RHS is a [literal string](#variables-and-assignment) (`x = greet` binds
+  `"greet"`), so reaching a function's value needs a marker; `(f)` is plain
+  grouping and evaluates to the string `"f"` on `main`.
+
+  | Option | For | Against |
+  | --- | --- | --- |
+  | **Keep `f()`** | The universal call spelling (Python, JS, Rust, Go); the name stays attached to its arguments; chains cleanly (`f(x):capture`, `load-env($path)`); parens keep meaning grouping | A *call's* arguments are written two ways depending on mode — `f(a, b)` against `f a b` — which is the split worth questioning (the comma itself is shared with modifiers and glob qualifiers, so it is not unique to calls) |
+  | `(f arg)` | Unifies the argument grammar *for calls* — `f arg` runs it, `$(f arg)` takes the bytes, `(f arg)` takes the value, all space-separated — so `--flag` becomes the one option spelling | `(f)` collides with grouping a bare-word string, needing a "bare word at the head of parens is a call" rule; `("f")` becomes the only way to group a literal; unfamiliar outside Lisp/Tcl; **does not remove comma grammar from the language** |
+
+  The bracket is not the questionable part — `f()` earns its keep from the
+  string-literal rule alone. What is worth revisiting is the **comma**: `f(a, b)`
+  against `f a b` is the only place mesh writes the *same* arguments two ways, and
+  `(f arg)` is the coherent endpoint if that ever goes.
+
+  That endpoint is narrower than it first looks. Comma-separated parenthesized
+  arguments are not exclusive to value calls — [modifiers](#modifiers) specify
+  the same grammar (`:get(EDITOR, vim)`, `:split(":")`), explicitly "like a value
+  call," and glob qualifiers follow it. So `(f arg)` would remove the *function-call*
+  instance of the comma, not the comma from the language, and it would cost the
+  consistency the modifier rule currently borrows from the call syntax — which
+  weakens the main argument for making the switch at all.
+- **A status-to-bool word — open; leaning `ok`.** *(Independent of the
+  [projection question](#open-questions) above — a command-tailed function already
+  propagates its status either way, and `return CMD` runs nothing under either
+  model, so this word is needed identically whichever way that lands.)* A
+  predicate whose condition is a
   *value* collapses to `return $cond`, because
   [value and status are separate channels](#functions) and `return expr` fails only
   on `false`. A predicate whose condition is a **command** has no such spelling and
