@@ -429,8 +429,9 @@ list-pattern    = "[" NL* ( list-pattern-item ","? NL* )* "]" ;
 list-pattern-item
                 = name | "_" | "..." name ;
 
-member-target   = "$" root access+            # `$m.key`, `$xs[0]`, `$m.rows[1].name`
-                | "${" root access+ "}" ;     # `${m.a} = 2`, `${xs[0]} += 2`
+member-target   = "$" root place-access+      # `$m.key`, `$xs[0]`, `$m.rows[1].name`
+                | "${" root place-access+ "}" ;   # `${m.a} = 2`, `${xs[0]} += 2`
+place-access    = "." name | index-subscript ;    # an `access` whose subscript is no range
 root            = name ;                      # never `env` — see `env-target`
 env-target      = "$env" env-entry | "${env" env-entry "}" ;
 env-entry       = "." name
@@ -438,7 +439,7 @@ env-entry       = "." name
 env-element-target                            # `$env.PATH[0]`, `${env[$k][1]}`
                 = "$env" env-entry index-subscript+
                 | "${env" env-entry index-subscript+ "}" ;
-index-subscript = "[" subscript "]" ;
+index-subscript = "[" key-subscript "]" ;     # no range: a slice is not a place
 key-subscript   = signed-integer | name | "$" name | quoted-string ;   # no range
 ```
 
@@ -448,6 +449,18 @@ to append to, so `+=` there requires a plain name. A `member-target` writes
 *into* a bound collection rather than rebinding the name; an `env-target` writes
 the process environment. A modifier is not a place, so `$xs:dedup = …` is a
 syntax error about places rather than a command.
+
+Neither is a **slice**: it names a copy of a run of elements rather than somewhere
+to store one, so `$xs[0..1] = …`, `$m.rows[1..] += …` and `$env[0..2] = …` are
+syntax errors, on every target and under `global` alike — and so is
+`unset $xs[0..1]`, since `unset-target` takes the same `place-access`. Refusing
+them here rather than where the write happens is what keeps an assignment's
+right-hand side from running first: `$xs[0..1] = $(cmd)` does not run `cmd`. A
+slice is told from a key by the same `..` in the subscript text that a *read*
+uses, so one classification serves both, including its edge: a quoted key
+containing `..` is a slice to either, and neither can spell it. The run-time
+refusal stays for what the grammar cannot see, since a computed subscript
+(`$xs[$i] = …`) is not a range until it is evaluated.
 
 The two are disjoint, and `env` is spelled out separately because the rules
 differ. A `member-target` chains freely — `$m.rows[1].name` is a place — while

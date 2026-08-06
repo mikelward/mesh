@@ -2085,9 +2085,13 @@ func rename(new) { global $config.name = $new }   # write the outer binding
 ```
 
 A **place** is a member or an index. A modifier is not (`$xs:dedup = …` is a
-syntax error, as it already was), nor is a slice — `$xs[0..2] = …` names a copy of
-a run of elements, and a length-changing assignment has no defined meaning yet.
-`$env` and `$sh` keep their own handling: see [The environment](#the-environment).
+syntax error), nor is a slice — `$xs[0..2] = …` names a copy of a run of elements,
+and a length-changing assignment has no defined meaning yet. Both are refused
+while the line is *read*, so the value on the right never runs: `$xs[0..2] = $(cmd)`
+does not run `cmd`. A computed index is the exception the grammar cannot see —
+`$xs[$i] = …` is not known to be a range until `$i` is evaluated — so that one is
+still reported by the write itself, after the value has been produced. `$env` and
+`$sh` keep their own handling: see [The environment](#the-environment).
 
 Two rules are worth stating outright, because both are choices:
 

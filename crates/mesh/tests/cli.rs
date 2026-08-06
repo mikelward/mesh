@@ -22036,16 +22036,14 @@ fn reaching_into_an_env_entry_to_assign_names_the_entry() {
 
     // Only an *access* is claimed. A trailing modifier names a derived value, which
     // is the complaint every `$xs:dedup = …` shares rather than an environment
-    // rule, and a slice names a copy of a run of entries rather than one entry to
-    // point at — both keep the wider message.
+    // rule, so it keeps the wider message.
     //
-    // The braced modifier spellings are the ones to keep an eye on: braces make the
-    // whole chain one word, so the `:` has to be found by walking the accesses. The
+    // The braced spellings are the ones to keep an eye on: braces make the whole
+    // chain one word, so the `:` has to be found by walking the accesses. The
     // unbraced spelling arrives as separate pieces and never reaches the walk, and
     // the two spellings of one reference have to answer alike.
     for source in [
         "$env.PATH:upper = x\n",
-        "$env[1..2] = x\n",
         "${env.PATH[0]:upper} = x\n",
         "$env.PATH[0]:upper = x\n",
         "${env.PATH[0].a:upper} = x\n",
@@ -22057,6 +22055,18 @@ fn reaching_into_an_env_entry_to_assign_names_the_entry() {
             "{source}"
         );
     }
+
+    // A slice is not an entry to point at either, but it has its own refusal now —
+    // one shared with every other target, so it names the slice rather than an
+    // entry. See `a_slice_is_refused_before_its_right_hand_side_runs`.
+    let out = run_with_input("$env[1..2] = x\n");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`$env[1..2]` is not somewhere to assign"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("a slice names a copy"), "{stderr}");
 
     // And only an assignment. The same reference is a working *read* — a
     // path-typed entry is a list — which the refusal must not touch.
@@ -22173,10 +22183,12 @@ fn a_member_assignment_fails_loud_rather_than_creating_structure() {
             "xs = [1 2]\n$xs.key = 1\n",
             "$xs.key: a list has no `key` member",
         ),
-        // A slice names a copy of a run of elements, not a place.
+        // A slice names a copy of a run of elements, not a place — and unlike the
+        // rest of these, it is answered in the grammar, so the right-hand side
+        // never runs. See `a_slice_is_refused_before_its_right_hand_side_runs`.
         (
             "xs = [1 2 3]\n$xs[0..2] = 9\n",
-            "$xs[0..2]: cannot assign to a slice",
+            "`$xs[0..2]` is not somewhere to assign",
         ),
         ("$nope.key = 1\n", "nope: unbound variable"),
         // `+=` type rules are the whole-variable ones, because both go through
@@ -22197,6 +22209,84 @@ fn a_member_assignment_fails_loud_rather_than_creating_structure() {
     let broke =
         run_with_input("m = [a: 1]\nfor i in [1] { $m.a = (if true { break }) }\nputs $m.a\n");
     assert_eq!(String::from_utf8_lossy(&broke.stdout), "1\n");
+}
+
+/// A slice is refused by the **grammar** wherever a place is wanted, so the value
+/// an assignment was carrying never runs.
+///
+/// `resolve_path` has always refused one, but it got there after
+/// `eval_operand_of` had evaluated the right-hand side — so `$xs[0..1] = $(rm …)`
+/// did the work and reported the refusal afterwards. Raised by review on the
+/// `$env.PATH[0]` write, where the same shape appears; the binding path had it
+/// too, which is why both are checked here, and `unset` after them.
+#[test]
+fn a_slice_is_refused_before_its_right_hand_side_runs() {
+    let dir = fresh_dir("slice_place");
+    let setup = "xs = [1 2 3]\nm = [rows: [1 2]]\n$env.CDPATH = \"/a:/b\"\nglobal g = [1 2]\n";
+    for (index, place) in [
+        "$xs[0..1]",
+        "$xs[1..]",
+        "${xs[0..1]}",
+        "$m.rows[0..1]",
+        "$env.CDPATH[0..2]",
+        "global $g[0..1]",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A distinct marker per case, so one leaking cannot be masked by another.
+        for operator in ["=", "+="] {
+            let marker = dir.join(format!("ran{index}{}", operator.len()));
+            let out = run_with_input(&format!(
+                "{setup}{place} {operator} $(/usr/bin/touch {})\n",
+                marker.display()
+            ));
+            assert_eq!(out.status.code(), Some(2), "{place} {operator}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("is not somewhere to assign"),
+                "{place} {operator}: {stderr}"
+            );
+            assert!(
+                !marker.exists(),
+                "{place} {operator}: the right-hand side ran"
+            );
+        }
+    }
+
+    // `unset` names a place too, and one rule about places answers in one layer —
+    // the grammar for a write and the run time for a removal is the split this
+    // closes. There is no right-hand side to protect here; the verb is what
+    // changes. From review.
+    for source in [
+        "xs = [1 2 3]\nunset $xs[0..1]\n",
+        "global g = [1 2]\nglobal unset $g[0..1]\n",
+        "m = [rows: [1 2]]\nunset $m.rows[1..]\n",
+    ] {
+        let out = run_with_input(source);
+        assert_eq!(out.status.code(), Some(2), "{source}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("is not somewhere to unset"),
+            "{source}: {stderr}"
+        );
+        assert!(
+            stderr.contains("so unset one index at a time"),
+            "{source}: {stderr}"
+        );
+    }
+
+    // The single-index removals it sits next to are untouched.
+    let out = run_with_input("xs = [1 2 3]\nunset $xs[0]\nputs ...$xs\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2 3\n");
+    assert!(out.stderr.is_empty());
+
+    // A modifier is the wider "a derived value is not a place" complaint rather
+    // than this one, and reading a slice is untouched — only using one as a place
+    // is refused.
+    let out = run_with_input("xs = [1 2 3]\nputs ...$xs[0..2]\nputs ...$xs[1..]\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1 2\n2 3\n");
+    assert!(out.stderr.is_empty());
 }
 
 /// The reserved namespaces keep the handling they had: `$env.KEY` is still the
@@ -22419,9 +22509,11 @@ fn unsetting_a_missing_element_is_a_loud_error() {
             "xs = [1 2]\nunset $xs[9]\n",
             "$xs[9]: list index out of range",
         ),
+        // Unlike the rest of these, answered in the grammar rather than by the
+        // value — see `a_slice_is_refused_before_its_right_hand_side_runs`.
         (
             "xs = [1 2 3]\nunset $xs[0..2]\n",
-            "$xs[0..2]: cannot unset a slice",
+            "`$xs[0..2]` is not somewhere to unset",
         ),
         (
             "s = \"t\"\nunset $s.k\n",

@@ -299,6 +299,12 @@ pub enum ParseErrorKind {
     /// entry itself; the pair is the reference as written and the entry it reaches
     /// into.
     EnvEntryPlace(String, String),
+    /// A **slice** used as a place — `$xs[0..1] = …`, `$env.PATH[1..] += …`,
+    /// `unset $xs[0..1]`. A slice names a copy of a run of elements rather than
+    /// somewhere to store one, and answering that here is what keeps an
+    /// assignment's right-hand side from running first. The verb is the operation
+    /// that wanted the place, as `resolve_path` carries one for the same reason.
+    SlicePlace(String, &'static str),
     /// A quoted command after `alias NAME =` — `alias ll = 'ls -l'`. bash needs
     /// the quotes because its alias body is a *string*; mesh's is real syntax,
     /// so they turn the command into one word naming no program.
@@ -480,6 +486,11 @@ impl std::fmt::Display for ParseError {
                 "syntax error: `_` discards a position and binds nothing, so there is \
                  nothing to assign to; name it, or drop the `_ =` to run the value for \
                  its effect"
+            ),
+            ParseErrorKind::SlicePlace(reference, verb) => write!(
+                f,
+                "syntax error: `{reference}` is not somewhere to {verb}; a slice \
+                 names a copy of a run of elements, so {verb} one index at a time"
             ),
             ParseErrorKind::EnvEntryPlace(reference, entry) => write!(
                 f,
@@ -3051,6 +3062,14 @@ impl Parser<'_> {
             }
             self.position = assignment_start;
         }
+        // Ahead of both place parsers, since a slice is not one for either of them,
+        // and ahead of the value the assignment carries — refusing it here is what
+        // keeps that value from running first.
+        if let Some(reference) = self.slice_place()
+            && self.assignment_follows(1)
+        {
+            return Err(self.error(ParseErrorKind::SlicePlace(reference, "assign")));
+        }
         // After `env_target`, which claims every `$env` place it recognizes, so what
         // is left here is a reference reaching past one — and only when an
         // assignment follows, leaving `puts $env.PATH[0]` the read it already is.
@@ -4390,6 +4409,56 @@ impl Parser<'_> {
         };
         self.next();
         Some(key)
+    }
+
+    /// A reference whose accesses include a **range** subscript — `$xs[0..1]`,
+    /// `$m.rows[1..].name`, `$env.PATH[0..2]` — as the text written.
+    ///
+    /// `resolve_path` has always refused a slice as a place, since it names a copy
+    /// of a run of elements rather than somewhere to store one. What it could not
+    /// do is refuse it *before* the right-hand side ran: the statement was built,
+    /// the value evaluated, and only then did the walk reach the range — so
+    /// `$xs[0..1] = $(rm -rf …)` did the work and reported the refusal afterwards.
+    ///
+    /// A slice is told from a key by the same `..` in the subscript text that
+    /// `expansion_variable` uses, so one classification serves the read and the
+    /// refusal — including its edge, a quoted key containing `..`, which the read
+    /// side cannot spell either. The run-time check stays regardless: a computed
+    /// subscript is not a range until it is evaluated.
+    fn slice_place(&self) -> Option<String> {
+        let TokenKind::Word(word) = &self.peek()?.value else {
+            return None;
+        };
+        let [
+            WordPiece::Variable {
+                name,
+                quote: QuoteMode::Bare,
+            },
+        ] = word.pieces.as_slice()
+        else {
+            return None;
+        };
+        let inner = name
+            .strip_prefix("${")
+            .and_then(|value| value.strip_suffix('}'))
+            .or_else(|| name.strip_prefix('$'))?;
+        let mut rest = &inner[inner.find(['.', '[', ':']).unwrap_or(inner.len())..];
+        while !rest.is_empty() {
+            if rest.starts_with('[') {
+                let end = subscript_end(rest)?;
+                if rest[1..end - 1].contains("..") {
+                    return Some(name.clone());
+                }
+                rest = &rest[end..];
+                continue;
+            }
+            // A `:` here is a modifier, which is the wider "a derived value is not a
+            // place" complaint rather than this one.
+            let member = rest.strip_prefix('.')?;
+            let end = member.find(['.', '[', ':']).unwrap_or(member.len());
+            rest = &member[end..];
+        }
+        None
     }
 
     /// An `$env` reference that reaches **into** an entry — `$env.PATH[0]`,
@@ -6545,6 +6614,14 @@ impl Parser<'_> {
         // `global $m.key = …` writes *into* the global binding rather than rebinding
         // the name — the escape hatch a local-by-default member write needs, so a
         // function can modify a caller's collection instead of shadowing it.
+        //
+        // A slice is refused first here as it is in statement position: `global`
+        // changes which binding is written, not what counts as a place.
+        if let Some(reference) = self.slice_place()
+            && self.assignment_follows(1)
+        {
+            return Err(self.error(ParseErrorKind::SlicePlace(reference, "assign")));
+        }
         let member_start = self.position;
         if let Some(target) = self.member_target() {
             if self.assignment_follows(0) {
@@ -6657,6 +6734,13 @@ impl Parser<'_> {
                 // bytes in the process, so removing one is `environ`'s job rather
                 // than a walk into a bound collection.
                 targets.push(UnsetTarget::Env(key));
+            } else if let Some(reference) = self.slice_place() {
+                // A slice is no more a place to remove from than one to write to,
+                // and `member_target` below would take it. There is no right-hand
+                // side to protect here — the point is that one rule about places
+                // answers in one layer, rather than the grammar for a write and the
+                // run time for a removal.
+                return Err(self.error(ParseErrorKind::SlicePlace(reference, "unset")));
             } else if let Some(target) = self.member_target() {
                 targets.push(UnsetTarget::Member(target));
             } else {
