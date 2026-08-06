@@ -1585,7 +1585,7 @@ and a notice without its hook is the one thing `jobdone` is meant to rule out.
 
 ```mesh
 func job-finished(id, cmd, status) {
-  if $status != 0 {
+  if not $status {
     puts "job $id failed ($status): $cmd"
   }
 }
@@ -1713,7 +1713,7 @@ and filters like anything else:
 ```mesh
 p = $sh.pipestatus
 puts $p:len $p[0]
-bad = $p:filter(func(c) { $c != 0 })
+bad = $p:filter(func(c) { not $c })
 ```
 
 That capture-first habit matters: **reading either entry is itself a command**,

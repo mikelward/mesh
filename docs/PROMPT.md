@@ -40,7 +40,7 @@ $sh.postexec.record-time = func(cmd, status, elapsed) { global _cmd_time = $elap
 
 # how the last command went: an error in red, or a slow time in yellow (else nothing)
 $sh.prompt.status = func() {
-  if $sh.status != 0      { style("✗ ${sh.status}", fg: red) }
+  if not $sh.status       { style("✗ ${sh.status}", fg: red) }
   else if $_cmd_time > 1s { style("took $_cmd_time", fg: yellow) }
 }
 

@@ -1771,9 +1771,14 @@ top-level is **yours**; the built-ins hang off two reserved roots:
   component is meaningful (`PATH=/usr/bin:` means "…and the cwd") and a
   split→join round-trip must be byte-faithful.
 - **`$sh`** — everything else the shell owns, **flat**: runtime values —
-  **`$sh.status`** (last exit, int `0`–`255`, the readable replacement for `$?`),
-  **`$sh.pipestatus`** (a **list** of the last pipeline's stage statuses, where
-  real lists beat bash's `PIPESTATUS`), `$sh.pid` / `$sh.ppid` (own and parent PID,
+  **`$sh.status`** (last exit, the readable replacement for `$?` — an int `0`–`255`
+  today, becoming a **`Status`** value under the
+  [status decision](#open-questions). Note that under that decision's
+  type-strict comparison ruling `$sh.status == 0` is **`false`** — write
+  `$sh.status == status(0)` or `$sh.status:code == 0`, and see the cross-type
+  comparison TODO, which this is the sharpest instance of),
+  **`$sh.pipestatus`** (a **list** of the last pipeline's stage statuses — of
+  `Status` under that same decision — where real lists beat bash's `PIPESTATUS`), `$sh.pid` / `$sh.ppid` (own and parent PID,
   bash's `$$` / `$PPID`), `$sh.uid` (effective user id), `$sh.version`, `$sh.options`,
   `$sh.interactive`, the **stream handles** `$sh.stdin` / `$sh.stdout` / `$sh.stderr`
   (each with a `:tty` test — the `test -t N` replacement), **`$sh.jobs`** (the live
@@ -2709,6 +2714,7 @@ error**:
 | **list** | **error** — spread or `:join` | *not* a separator problem here (see above): a **nested** element has no argv form, and implicitly flattening the flat case would make a line's meaning depend on run-time contents |
 | **map** | **error** — render it explicitly | here the guess is real — `--k=v` vs `--k v` vs `k=v` are all plausible and mesh will not pick |
 | Duration | its canonical spelling (`3s`, `1m30s`) | it has a canonical form |
+| `Status` (under the [status decision](#open-questions)) | decimal digits — `cmd status(5)` passes `5` | it wraps an integer, so decimal is canonical exactly as for an int; the type governs projection and dispatch, not the byte form |
 | **Instant / regex / stream handle** | **error** — no canonical byte form | an Instant needs `:iso`/`:epoch`/`:format`; a regex (it carries flags) and a stream handle have no byte form at all |
 
 String interpolation uses this same rendering table, and reaches the same verdict
@@ -3168,22 +3174,31 @@ Rules:
   ran — results in the **empty string with status `0`**, the same "nothing
   produced, nothing failed" answer a no-`else` `if` gives; there is no null to
   invent.
-- **Value and status are separate channels** *(shipped — but
-  [reopened](#open-questions): whether the status should go back to being a
-  projection of the value, so `return 0` succeeds and `return 1` fails)*. A function has
+- **Value and status are separate channels** *(shipped — and
+  [revised](#open-questions): the channels collapse into one once a **status is a
+  value**. `status(N)` is an ordinary builtin — so `status 5`
+  bare and `status(5)` in an expression are its two spellings, by the usual
+  mode rule — and bare `return X` keeps meaning the value `X`. What follows
+  describes the shipped two-channel behavior, which the revision leaves intact
+  except that `fail N` becomes sugar for `return status(N)`.)* A function has
   three outputs, not two: the **bytes** it writes to stdout, the **value** it
   returns, and its **exit status**. `return` fills the value channel; `fail`
   fills the status channel. Neither is derived from the other:
 
   | Form | Value | Status |
   | --- | --- | --- |
-  | body ends in a command | none | the command's own |
-  | `return $v` | `$v` | `0` — or `1` when `$v` is `false` |
+  | body ends in a command | `Status(n)` — that command's status *as a value*, under the [status decision](#open-questions); today a value call sees a bare int here, which is a defect | the command's own |
+  | `return $v` | `$v` | `0` — or `1` when `$v` is `false`; or `n` when `$v` is a `Status(n)`, under the [status decision](#open-questions) |
   | `return true` / `return false` | the bool | `0` / `1` |
   | bare `return` | the result so far | the **last** status |
-  | `fail` / `fail 123` | `false` | `1` / `123` |
+  | `fail` / `fail 123` | `false` *(→ `Status(1)` / `Status(123)` once the [status decision](#open-questions) lands)* | `1` / `123` |
 
-  **Only `false` fails.** `false` is mesh's "no result" — what `gets()` yields at
+  **Only `false` fails** *(and, under the [status decision](#open-questions), a
+  `Status(n)` — which projects to its own `n`, so `fail 123` and
+  `return status 123` both leave 123. The invariant below is otherwise unchanged:
+  what that decision adds is a second value that can carry a failure, not a
+  reason for any other value to.)* `false` is mesh's "no result" — what `gets()`
+  yields at
   EOF, what a failing predicate returns, what `if x = f() { … }` tests for — so it
   is the one value whose status is worth reporting as nonzero. Every other value
   *is* a result, and producing a result is success, which is why `return 5` carries
@@ -3213,10 +3228,11 @@ Rules:
   both "the number five" and "exit code 5" — conflates two unrelated things and
   makes every integer-returning function a landmine. The nullable `false | T`
   encoding is a real and useful duality and is kept; an integer's coincidental
-  resemblance to a status is not. **This is the argument now under review** — see
-  [Open questions](#open-questions), where the counter is that the derived status
-  only surfaces where the value was being discarded anyway, while the cost of
-  separating them is that `return 1` succeeds.)*
+  resemblance to a status is not. **This argument was reviewed and holds** — see
+  [Open questions](#open-questions). The review's conclusion is that the missing
+  piece was never a second channel but a *spelling*: with `status(N)` as a value,
+  `status 5` and `return status(5)` name a status explicitly, and `return 1` can
+  go on meaning the integer one.)*
 - **Output is stdout.** Independently of its result, whatever a `func` writes to
   stdout *is* its output stream, exactly like an external command, so functions
   compose in byte-stream pipes with everything else.
@@ -3464,14 +3480,22 @@ Rules:
   `f(…):capture` runs the call and returns a **record of every channel**: `.value`
   (the return value), `.out` and `.err` (its stdout / stderr, as **raw byte-strings**
   — split them with the usual [`:lines`](#modifiers) / `:split` / `:nulls` modifiers
-  as needed, so the record bakes in no split policy), and `.status` (the exit **int**;
-  *TODO — a richer status value if one is wanted later*). Read them with ordinary field
+  as needed, so the record bakes in no split policy), and `.status` (the exit
+  **int** — becoming a **`Status`** under the [status decision](#open-questions),
+  which is the "richer status value" this line used to leave as a TODO. It has to
+  move with `$sh.status`: `.status` is the *only* result channel for an external
+  capture, so leaving it an int would make `return $r.status` forward a failure as
+  successful data — the very bug that decision types `$sh.status` to prevent). Read them with ordinary field
   access — `r = f(x):capture` binds `r`, then `$r.value` / `$r.out:lines` read it. It is an
   *invocation-level* modifier, not a plain value [modifier](#modifiers) — it has to
   wrap execution, since by the time a value modifier saw the return value the stdout
   would already have streamed away, the same reason `$(…)` is a wrapper rather than a
   postfix. The **same `cmd(…):capture` spelling works on an external** — and is the
-  single exception to the value-call error below: a bare `grep(foo)` errors because it
+  single exception to the value-call error below *(which the
+  [status decision](#open-questions) removes: an external's result **is** a
+  `Status`, so `grep(foo)` returns `Status(1)` rather than erroring, and `f` /
+  `$(f)` / `f()` come to mean the same three things for an external as for a
+  function)*: a bare `grep(foo)` errors **today** because it
   asks for a return value the command lacks, but `grep(foo):capture` asks for the
   channel record, so it is allowed and comes back the same **minus `.value`** (there
   is none — accessing it is a loud no-such-field error). External captures accept
@@ -3558,18 +3582,35 @@ registered as `&git-info` picks up a redefined `git-info` on the next prompt.
 
 **Whether the reference is legal and what the *call* yields are separate questions.**
 `&name` is well-formed for anything the callable path above resolves — any builtin,
-`func`, or external — but not everything it resolves *returns* something. **Externals
-have no return value** (above), and neither do the **effect-only builtins**: `r =
-puts(1 + 2)` already reports `a command has no return value`, so `&puts` is no more
-usable in a value slot than `&grep` is. What divides the callables is therefore not
-builtin-versus-external but **returns a value versus runs for effect**.
+`func`, or external. *Today* not everything it resolves *returns* something:
+externals have no return value, and neither do the **effect-only builtins**, so
+`r = puts(1 + 2)` reports `a command has no return value` and `&puts` is no more
+usable in a value slot than `&grep` is — the division being **returns a value
+versus runs for effect** rather than builtin-versus-external.
+
+*(The [status decision](#open-questions) removes that division: every call yields
+a value, and a command-shaped one yields a `Status`, so `puts(1 + 2)` binds
+`Status(0)` and `&puts` becomes usable in a value slot. The cost is a lost
+diagnostic — using `puts` for its value is a real mistake and the error caught
+it — accepted because the alternative is carving effect-only builtins out of
+"every call yields a value," which would put the null back that the decision
+exists to remove.)*
 
 A reference to an effect-only callable is fine in a slot that calls its handler for
-**effect** (a `$sh.preprompt` entry, a `$sh.signal.<NAME>` handler) and fails *when
-called* in a slot that needs a **value** (`:map`, a prompt segment that must return a
-piece). That failure is about the call producing nothing to use, not about the
-reference being ill-formed, and it lands at call time for the same reason the
-bare-`grep(foo)` error does.
+**effect** (a `$sh.preprompt` entry, a `$sh.signal.<NAME>` handler) and, *today*,
+fails *when called* in a slot that needs a **value** (`:map`, a prompt segment that
+must return a piece). That failure is about the call producing nothing to use, not
+about the reference being ill-formed, and it lands at call time for the same reason
+the bare-`grep(foo)` error does.
+
+*(Under the [status decision](#open-questions) that second half goes away with
+the rest of the division: the call yields `Status(0)`, so `:map(&puts)` produces
+a list of statuses and a prompt segment gets a piece rendering as `0`. Neither
+is *useful*, and both are still mistakes — but they are mistakes the value
+system no longer has a way to catch, which is the diagnostic cost the decision
+accepts above rather than a second rule. What stays is the slot's own
+requirement: a segment that must return a **string** still refuses a `Status` on
+its own terms, not on "the call produced nothing.")*
 
 Late *dispatch* does not by itself decide whether a slot may hold a reference to a name
 that does not exist **yet**. Command position accepts one — `func f { g }` resolves `g`
@@ -3779,7 +3820,10 @@ Decisions:
 - **The condition is a bool or a command — and nothing else** *(decided;
   shipped)*. A boolean value (`$root`, a comparison like `$n > 0`, a `:has` test)
   branches on its truth; a bare command branches on its **exit status** (`0` →
-  true), preserving the `if grep -q foo file { … }` reflex. Every other type is a
+  true), preserving the `if grep -q foo file { … }` reflex. *(Under the
+  [status decision](#open-questions) a **`Status`** joins them, true iff its code
+  is `0` — not a new truthiness, but the command arm's own subject named as a
+  value, so `if grep(foo) { … }` and the bare form ask one question.)* Every other type is a
   **loud error** naming the comparison to write instead. The [predicate
   vocabulary](#requirements-carried-over-from-existing-configs) splits across
   both: the session predicates (`connected-remotely`, `inside-project`, …) are
@@ -3817,7 +3861,9 @@ Decisions:
   they are boolean operators rather than a second truthiness system.
 - **An assignment may *be* the condition** — `if lhs = rhs { … }`, the `if let`
   shape. The condition is true iff the RHS is **truthy** (a `false` / failed
-  command / nonzero int fails it) **and** its shape **fits** `lhs`; on true the
+  command / nonzero `Status` fails it — *a nonzero **int** does not, under the
+  [status decision](#open-questions), since `return 5` is data with status `0`*)
+  **and** its shape **fits** `lhs`; on true the
   names bind for the block, on false it skips and binds nothing. `lhs` may be a
   name (always fits) or a `[…]` [destructuring](#destructuring) pattern, so
   `if [one two] = $s:match(/…/) { … }` and `if line = gets() { … }` both test-and-bind
@@ -4082,14 +4128,21 @@ settled and one stays open:
    tracked there (see [Functions](#functions) and the value-production item in
    [Open questions](#open-questions)). Whatever `func` does, arms do.
 
-**Explored, kept the settled model — `0` = success is correct** *(not a change)*. The
-exploration questioned `int → status` — a bare int read as an exit code rather than data,
-its truthiness following the status view, not the number. Resolution: **keep it.**
-External commands exit `0` for success with no typed value to consult, so for `if X { }`
-to mean "did X succeed" whether `X` is `grep -q …` or a mesh function, a function's
-`0`/success must be truthy too — that interchangeability is the point, and it just works.
-The residual (an int whose masked status is nonzero can't be returned as successful data)
-is narrow and accepted. Two live scraps this left, both pointed at their canonical homes:
+**`int → status` is gone — superseded twice over.** This paragraph used to record
+"keep it": a bare int read as an exit code rather than data, its truthiness following the
+status view rather than the number. That is **no longer true of the implementation or of
+the design.** `0b107f6` dropped the `Integer` arm from `status_of`, so a returned int has
+projected to status `0` since; and the [status decision](#open-questions) settles the
+question deliberately, giving a status its own type and spelling (`status(N)`,
+`return status N`) so that `return 5` is the integer five, successfully, with no residual
+about "an int whose masked status is nonzero."
+
+What the old paragraph got right is worth keeping, because it is the reason the
+projection stays *total* rather than being abolished: external commands exit `0` for
+success with no typed value to consult, so for `if X { … }` to mean "did X succeed"
+whether `X` is `grep -q …` or a mesh function, success must be truthy on both sides. That
+interchangeability is preserved — it is just carried by `Status` and `false` now, rather
+than by every integer. Two live scraps this left, both pointed at their canonical homes:
 
 - **Empty `""` / `[]` truthiness** — **closed** by
   [condition truthiness](#conditionals-if-is-an-expression) settling as *no truthy
@@ -4201,11 +4254,13 @@ auto-bind (see [Matching](#matching-match)) — so `~` stays a pure predicate.
 mesh keeps **two distinct failure channels** and deliberately does not merge them
 the way bash does (into "empty string, exit 1"):
 
-- **Value-level failure** — a `false`, a nonzero `int`, or a command's exit
-  status. This is *not* an interruption: it is a **value** you branch on (`if`,
+- **Value-level failure** — a `false`, a nonzero **`Status`**, or a command's exit
+  status. *(It was "a nonzero `int`" before the
+  [status decision](#open-questions); an int is data now, and a status has its own
+  type.)* This is *not* an interruption: it is a **value** you branch on (`if`,
   `while`, `&&` / `||`, `and` / `or` / `not`). It is the whole of the
   [result/status model](#functions) — failure here is signalled by a `false` /
-  nonzero-int / command-status, **never** by the *shape* of a value.
+  nonzero `Status` / command-status, **never** by the *shape* of a value.
 - **Errors ("fail loud")** — a value the code *required* is absent or ill-typed:
   a destructure length mismatch (`[a b c] = two_items`), an out-of-range index
   (`$xs[99]`), a bare [`:match`](#destructuring) miss, undecodable text where text
@@ -4564,7 +4619,10 @@ $sh.jobs:values:filter(func(j) { $j.state == running })
 ```
 
 `state` is `running` / `stopped` / `done`; `status` fills in when a job finishes
-(the same 8-bit view as [`$sh.status`](#variables-and-assignment)).
+— a **`Status`**, for the same reason `$sh.status` is one (see the [status
+decision](#open-questions)): `wait $j; return $j.status` is the natural way to
+forward a job's failure, and an int there forwards the *number*, successfully.
+It is `""` until the job finishes, which is the empty-value rule, not a null.
 
 **`&` backgrounds and yields a job handle.** `j = make -j8 &` binds the record,
 so `$j.pid` is mesh's replacement for bash's `$!` and `$j` is the thing you
@@ -4593,7 +4651,9 @@ the finished job's record carries its final `status` at that point before leavin
 `$sh.jobs`.
 
 A **`jobdone` hook** fires alongside that notice, once per finished job, taking
-`id`, `command`, and `status` — see `docs/REFERENCE.md`. It runs where the notice
+`id`, `command`, and `status` — a **`Status`**, per the [status
+decision](#open-questions), so `if not $status { … }` is the test rather than
+`$status != 0` — see `docs/REFERENCE.md`. It runs where the notice
 is printed rather than the instant the job ends, so it carries the same timing:
 a job that finishes while a line is being typed is reported once that line is
 submitted.
@@ -5278,7 +5338,8 @@ worth it to keep higher-order user functions first-class.
 **Event hooks** run for effect at named events, in symmetric `pre`/`post` pairs
 plus the singletons — `preprompt` (before each prompt), the command pair
 **`preexec`** (before a command runs, given the command line) / **`postexec`**
-(after it finishes, given the command, its **exit status**, and **duration**),
+(after it finishes, given the command, its **exit status** — a
+[`Status`](#open-questions), like every status channel — and **duration**),
 the directory pair **`precd`** (before the cwd changes, still in the old dir,
 given the target) / **`postcd`** (after, now in the new dir, given the previous
 dir), and `exit`:
@@ -5417,7 +5478,7 @@ tears down what it set up, and a script cleaning up after itself is that case as
 much as an interactive session is, so tying it to the prompt loop would miss the
 half that needs it most. It is handed the status the shell is leaving with (the
 argument to `exit N`, or the last command's status otherwise) — bash's `$?`
-inside a `trap … EXIT`. A `fork { … }` subshell leaving is *not* the session
+inside a `trap … EXIT`, and a [`Status`](#open-questions) like the rest. A `fork { … }` subshell leaving is *not* the session
 ending and runs no handler.
 
 *(TODO — **exiting because of a signal**. bash runs its EXIT trap for the
@@ -6032,8 +6093,10 @@ remain under-specified.
   **user-facing** `try` / `catch` or `?(…)` capture for channel-2 errors with no
   soft twin, or ship only the boundary-catch + soft twins for the MVP (leaning: no
   user catch in the MVP).
-- **Status as a projection of the value — reopened; leaning restore it, with an
-  escape hatch.** [Value and status are separate channels](#functions) is marked
+- **Status as a projection of the value — reopened, then decided: `status` becomes
+  a *value*.** *(Resolution at the end of this entry; the exploration that led
+  there is kept because it is what rules the alternatives out.)*
+  [Value and status are separate channels](#functions) is marked
   *decided; shipped*, and the objection it records is that deriving one from the
   other "makes every integer-returning function a landmine." Reopened on the
   report that the separation is **too complicated for what it buys**, with the
@@ -6118,23 +6181,553 @@ remain under-specified.
   need its own verb unless A also proposed changing `fail`'s value semantics,
   which it does not.
 
-  **Leaning: A with E.** The POSIX reflex is the one mesh's users arrive with,
-  and it fires constantly; the collision is mostly
-  confined to positions that were throwing the value away regardless; the
-  residuals are the `||` chain, the capture record, and the status of a sourced
-  `return N` — three cases that argue for B, none of which E covers, since the
-  Go-shaped `if` only helps where an int is being read back as data. The two
-  API changes are the harder half: a `||` chain is code someone writes, but
-  `:capture` and `source` are contracts already shipped.
+  **A and E were the leaning, and are now declined.** The POSIX reflex is real,
+  but the counterexample is a one-liner nobody would call exotic:
 
-  **The *status-to-bool word* below is independent of this choice** — neither
-  option subsumes it. A function ending in a command already propagates that
-  command's status without consulting `status_of` (`func p() { /bin/false }; p`
-  leaves `1` today), so the arm changes nothing there; and `return CMD` does not
-  run a command under either model — `return /bin/false` yields the *string*
-  `"/bin/false"`, since a bare word in value position is a literal. What `ok` is
-  for is producing a **bool** a value call can read, and that need is identical
-  before and after.
+  ```mesh
+  func g(_n) { $_n + 1 }
+  g 1                    # value 2 — and under A, status 2, i.e. a failed command
+  ```
+
+  Any function that computes a number and is also run bare fails whenever the
+  number is nonzero. That is the `:len` case again, arriving through arithmetic
+  rather than a modifier, and it is enough on its own — it is a defect in the
+  *design*, not a migration cost. The knock-on effects on `||` chains,
+  `:capture` and sourced `return N` are further evidence of the same thing
+  rather than separate objections; that two of them touch already-written code
+  is beside the point while the language has no users.
+
+  ### Decision: a status is a value, so naming one needs no new syntax
+
+  What the reopening actually surfaced is that the two channels were never the
+  problem — the problem is that **a status has no spelling**, so `return`'s
+  operand has to be read as one by type. Give it a spelling and the channels
+  collapse into one without any of A's fallout.
+
+  - **`status(N)` is a builtin returning a `Status` value.** It is an ordinary
+    value: bindable, passable, returnable. `file-not-found = status(5)` then
+    `return $file-not-found` works, which is the case that settles this as a
+    *type* rather than as syntax.
+  - **`return status N` is syntax, and sugar for `return status(N)`.** Both ship
+    in the MVP: the builtin is the mechanism, the channel word is the spelling.
+    `status` and `value` are **channel words** recognized only directly after
+    `return`, which is not an exception to the
+    [mode rule](#calling-for-a-value-and-lambdas) — `return` is not a call site,
+    it is a control keyword, and mesh's control keywords already carry their own
+    small grammars (`fail 5`, `exit 5`, `break`). A channel word belongs to that
+    family.
+
+    The **channel words** are positional, so they reserve nothing on their own:
+    `return status` with no operand is an error naming the missing code, rather
+    than the string `"status"` it binds today.
+
+    **But `status` the builtin does take the name.** Builtins are already
+    reserved against `func` — `func puts` is refused today with *"`puts` is a
+    reserved name and cannot be a function name"* — so adding `status(N)` makes
+    `func status` illegal by the existing rule, with no special case needed. That
+    is the price of the builtin, and it is worth stating plainly rather than
+    leaving as an open question: a fairly ordinary word leaves the user's
+    namespace. (`value` is a channel word only, with no builtin behind it, so
+    `func value` stays legal.)
+
+    **An attached `(` is a call, never a channel word** — the lookahead rule
+    that keeps `func value` legal from making `return value(5)` ambiguous. On
+    its face that line reads two ways: the channel word applied to a
+    parenthesized `5`, or a call to the user's `value`. It is the **call**, and
+    the discrimination is one mesh already trains everywhere else — `f arg` and
+    `f(arg)` are different things, separated by exactly that attached paren.
+    (Not the [mode rule](#calling-for-a-value-and-lambdas) itself, since
+    `return` is no call site; the same *shape*, reused as a one-token
+    lookahead.) So:
+
+    ```mesh
+    return value 5      # channel word — the value 5
+    return value(5)     # a call to whatever `value` names; an error if nothing does
+    ```
+
+    Reserving `value` would also close the ambiguity, and is declined: the
+    lookahead costs one token and takes no name. It falls out consistently on
+    the other side too — `return status(5)` is likewise a plain call, to the
+    builtin, which is *why* it and `return status 5` agree without a special
+    case. The two spellings coincide there only because a builtin backs the
+    name; nothing requires that of `value`, and adding an identity `value(X)`
+    builtin to force the symmetry would buy nothing and cost the name.
+  - **`status(N)` takes `0`–`255` and errors outside it.** `fail` already sets
+    the precedent — `fail 300` and `fail 0` both fail with *"status must be
+    between 1 and 255"* — so construction **rejects** rather than normalizing.
+    Silent truncation is exactly the `return 256` ≡ `return 0` trap this entry
+    declines elsewhere. `status(0)` is legal where `fail 0` is not: zero is a
+    perfectly good status to name, while a `fail` that succeeds is a mistake.
+  - **Bare `return X` means the value `X`, and does not warn.** This is the
+    load-bearing rule. `func f() { 5 }` and `func f() { return 5 }` must be the
+    same thing, so if bare `return 5` meant a status, writing `return` in front of
+    a tail expression would silently change its meaning — the exact trap being
+    removed.
+
+    **`return value X` is the explicit spelling of the same thing**, carrying no
+    semantics of its own. It costs nothing as a channel word — there is no
+    `value(…)` builtin to squat the name — so it is kept for the reader who wants
+    to say it out loud, while `return status` is the half that does the work.
+
+    **And `return 5` does not warn.** A diagnostic is justified where a spelling
+    is *ambiguous*, and after the channel words each spelling says what it is.
+    Warning would also have to fire on `func f() { 5 }` to be consistent, since
+    it is the same program, and it would fire on the common case — returning a
+    count, a port, an index — which is how a diagnostic gets trained away. mesh
+    has no advisory-warning precedent either; its diagnostics are errors that
+    name the fix. The residual cost is accepted and stated rather than papered
+    over: someone arriving from bash writes `return 1` for failure and gets
+    success.
+  - **`$sh.status` stays a projection, now a total one**: `Status(n)` → `n`,
+    `false` → `1`, `true` → `0`, everything else → `0`. That is
+    `status_of` (`crates/mesh-core/src/repl.rs`, today
+    `u8::from(matches!(value, Value::Boolean(false)))`) plus a `Status` arm —
+    still no `Integer` arm, which is what keeps `g 1` above succeeding.
+  - **`fail N` survives as a *validating* wrapper** over `return status(N)` — not
+    exact sugar, and the difference is load-bearing. `status(N)` accepts `0`,
+    since naming a zero status is reasonable; `fail 0` is refused, since a `fail`
+    that succeeds is always a mistake. So `fail` is `return status(N)` **plus the
+    constraint `N ≥ 1`**, and calling it plain sugar would silently delete that
+    diagnostic. It stops being a separate *mechanism* while keeping its own
+    precondition.
+
+  | written | value | `$sh.status` |
+  | --- | --- | --- |
+  | `return 5` / `return value 5`, or tail expression `5` | `5` | `0` |
+  | `return status 5` ≡ `return status(5)`, or tail `status 5` | `Status(5)` | `5` |
+  | `fail 5` — now sugar for the same | `Status(5)` | `5` |
+  | `return false` | `false` | `1` |
+  | `return` (bare) | result so far | last status |
+
+  #### Match arms: what the channel words cannot reach
+
+  The two [arm forms](#matching-match) are affected in opposite ways, and only
+  one of them is a problem. All of the following measured on `main`.
+
+  - **`=> value` needs no change.** A bare word is a scalar literal, so
+    `match $v { a => markdown }` binds `"markdown"`. That is right and stays.
+    The consequence is that this form can *never* be reached by a channel word:
+    `=> status 5` is not a `return`, so there is nothing to attach the word to.
+    If an arm is ever to yield a status **as the match's value**, the only
+    possible spelling is the value form, `=> status(5)`.
+  - **`=> { block }` already leaks a status as data, and that is the real
+    problem.** In expression position an arm ending in a command yields that
+    command's status as a bare **int**:
+
+    ```mesh
+    x = match $v { a => { /bin/false } }   # x is the int 1
+    puts ($x + 1)                          # 2 — arithmetic on an exit status
+    ```
+
+    That is the command-tail defect reached through an arm, and the rule below
+    settles it the same way: the arm yields `Status(1)`, so `$x + 1` becomes a
+    type error rather than `2`. Arms were already documented to yield a command's
+    status in expression position — what was wrong is only that they yielded it as
+    a bare **int**.
+  - **`fail` in an arm unwinds the whole function, not the arm.** `func f() { …
+    match $v { a => { fail 2 } }; puts after }` never reaches `after`, and `f`
+    leaves status 2. So `fail N` and `return status N` are **function-level
+    verbs**: neither can let an arm *yield* a failure while the function
+    continues.
+  - **The builtin closes exactly that gap, and this is why both spellings ship.**
+    `status 5` in a block arm is an ordinary call in command position, so it
+    evaluates rather than unwinding:
+
+    ```mesh
+    x = match $kind {
+      missing => { status 5 }     # yields Status(5) — the arm produces it
+      _       => { status 0 }
+    }
+    ```
+
+    The `=> value` form is served the same way, by `=> status(5)`. So the channel
+    word serves `func` bodies and the builtin serves arms; neither covers both,
+    which is the argument for having them together rather than in sequence.
+
+    **Both arm spellings work, and both are kept.** `=> status(5)` and
+    `=> { status 5 }` yield the same `Status(5)`, and neither needs a rule of its
+    own to do so — the first is an ordinary value call, the second an ordinary
+    command-position call at a block's tail. That is the same two-spelling
+    pattern mesh already has for `f arg` / `f(arg)` and `--flag` / `flag: true`,
+    so it is consistency rather than redundancy; a `status` that had needed a
+    carve-out to work in an arm would have been the warning sign. The value form
+    is strictly more general, since it also fits the `=> value` arm where no
+    block exists.
+  - **A bare inner call discards the callee's value, and should keep doing so.**
+    `func outer() { inner }` does not reach `inner`'s `42`. That is the
+    [mode rule](#calling-for-a-value-and-lambdas) working as designed: `inner`
+    runs it, `inner()` reaches its value. Forwarding the value instead would make
+    bare command position mean something different for a mesh function than for
+    an external, which is the uniformity this entry is trying to protect. What it
+    yields *instead* is `Status(0)` per the rule below — not the bare int `0` it
+    produces today.
+
+  **`Status` follows the existing cross-type comparison rules, whatever they are.**
+  No exception is carved for it. Measured on `main`, those rules are asymmetric:
+
+  ```mesh
+  1 == "1"    # false — silently
+  1 > "1"     # error: comparison requires two integers or two strings
+  ```
+
+  So `status(0) == 0` is **`false`**, `$s > 1` is an **error**, and
+  `match f() { 0 => … }` never matches a `Status` — that arm is silently dead.
+  The spellings that work are `$s == status(0)` and **`$s:code`** for the integer
+  (`$s:code == 0`, `$s:code > 1`). Arithmetic stays refused.
+
+  This is deliberately *not* the ergonomic choice, and the cost is real: a
+  `$sh.status == 0` written out of shell reflex is always false and says nothing.
+  Two earlier drafts of this entry tried to fix that locally — first by erroring
+  on `Status`-vs-int, then by making them compare equal — and both were wrong for
+  the same reason. **The problem is not about `Status`.** `1 == "1"` being
+  silently false is the identical trap, this document already calls it "a trap
+  those quotes are all that hold shut," and `1 == 1.0` is a third instance where
+  the [`:repr`](#modifiers) rationale and the implementation *disagree about the
+  answer*. A special case for one new type would paper over one corner of a
+  general defect and make the language less predictable in the process.
+
+  It also removes a cost that the compare-equal draft carried: `Value`'s
+  hand-written `PartialEq` and `Hash` have nothing to reconcile when no
+  equivalence is claimed, so `:dedup` needs no special handling.
+
+  *TODO — cross-type comparison wants one pass over all types, not per-type
+  patches.* The questions to settle together: whether cross-type `==` stays
+  silently `false` or becomes an error naming the fix (`if 0` already sets the
+  loud precedent for conditions); why ordering errors where equality does not;
+  whether numeric types compare across (`1 == 1.0`) and which of the document or
+  the implementation is right about it; and where `Status` lands once those are
+  answered. Whatever equality ends up doing, arms do.
+
+  **Rendering is the bare number** — `status(5)` displays as `5`. A "`status 5`"
+  rendering was considered on the grounds that `5` is confusable with the
+  integer, and rejected: mesh **already** loses type at the byte boundary for
+  every value, since the int `5` and the string `"5"` both render `5`. The
+  confusion this entry removes is in the language, not in the text, so a status
+  needs no special treatment on the way out. "status 5" phrasing belongs to a
+  diagnostic's formatter, not to the value.
+
+  **[`:repr`](#modifiers) gives `status(5)`, and that is forced rather than
+  chosen.** Its contract is round-trip — *parsing the result yields the same
+  value, and of the same type* — so `5` is inadmissible there, since it would
+  read back as the integer. It is the same rule that writes a string as `'42'`
+  rather than `42`. `status 5` fails it too, being the command-position spelling
+  rather than a value literal. So display and `:repr` diverge here exactly as
+  they already do for `42` / `'42'`, by a rule that predates this decision.
+
+  Argv and interpolation take the same verdict, and `Status` is listed in the
+  [byte-boundary table](#spread--flattening) beside `int` for it:
+  `cmd status(5)` passes `5`. Nothing here is left to the implementer.
+
+  *(The display form is listed under **Still open** below; `:repr` and argv are
+  both pinned and are not part of that question.)*
+
+  **`$sh.status` is itself a `Status`, not an int.** The first draft of this
+  entry kept it an int on the grounds that prompts and existing configuration
+  would be untouched — a compatibility argument, and worth nothing while the
+  language has no users. The long-term answer is the consistent one, and there is
+  a concrete reason beyond tidiness:
+
+  ```mesh
+  func wrapper() { some-cmd; return $sh.status }
+  ```
+
+  Forwarding the last status is a natural thing to write, and with `$sh.status`
+  an **int** it returns the *number*, successfully — the exact failure this entry
+  exists to remove, sitting at the likeliest place to meet it. As a `Status` it
+  forwards correctly, and a prompt segment still prints `5` by the rendering rule
+  above. What it *does* cost is `$sh.status == 0`, which goes silently false
+  under the comparison ruling below — the spelling becomes `if $sh.status { … }`,
+  or `== status(0)` where a comparison is really wanted. That is the trade taken
+  knowingly, not a case where nothing argues the other way.
+  **`$sh.pipestatus`** becomes a list of `Status` for the same reason.
+
+  #### A `Status` is a condition — naming what was already allowed
+
+  [Condition truthiness](#conditionals-if-is-an-expression) admits "a bool or a
+  command — and nothing else," so as written this decision would make
+  `if $sh.status { … }` a **loud error**, a `Status` being neither. That is
+  incoherent, and the rule needs a third arm:
+
+  ```mesh
+  if grep -q foo file { … }   # allowed: a command, branched on its status
+  if grep(foo) { … }          # the same status, now named as a value
+  ```
+
+  A command is admitted in a condition *precisely because* its result is a
+  status. Once a status is a first-class value those two lines are the same
+  question, and refusing the second would split the uniformity this decision
+  exists to create. So **a `Status` is a condition, true iff its code is `0`.**
+
+  This is not a truthiness exception. The truthiness rule's point is that no
+  value is *coerced* into a truth — an int, a string, a list have no truth to
+  read. A `Status` is different in kind: success and failure are the whole of
+  what it encodes, exactly as for a `bool`. Admitting it names something the
+  rule already permitted through the command arm rather than widening what
+  counts as true.
+
+  It also matters ergonomically, and repays part of what the comparison ruling
+  costs: with `$sh.status == 0` silently false, `if $sh.status { … }` is the
+  natural short spelling for "did that work," and without this arm there would
+  be no short spelling at all — only `$sh.status == status(0)` or
+  `$sh.status:code == 0`.
+
+  **`and` / `or` / `not` follow automatically**, and that is forced rather than
+  chosen: they are documented to "ask the same question and refuse the same
+  values" as a condition, being boolean operators rather than a second
+  truthiness system. Since `if` now admits a `Status`, so do they — `status(1)
+  or true` is well-formed. Leaving it open would contradict a rule the document
+  already states by reference.
+
+  **`&&` / `||` need no rule at all**, which is worth saying since their absence
+  here reads as an omission next to `and` / `or` / `not`. They are the *command*
+  chains, branching on exit status rather than on a value, and every statement
+  already has a status — a bare `status(1)` leaves `1` through the projection
+  above, so `status(1) || puts fallback` runs the fallback with nothing added.
+  The two kinds stay [separate](#tests-and-comparisons) exactly as before; this
+  decision touches only the value side.
+
+  One consequence this entry does *not* decide: whether **`exit`** accepts a
+  `Status` beside the int it takes today, since `exit $sh.status` becomes the
+  obvious way to leave with the last status.
+
+  #### "No value" stops existing, which is what unifies the rest
+
+  `val = f()` has to do *something* for any `f`, and mesh has no null type to
+  reach for. Today it does four different things, measured on `main`:
+
+  | case | `val = f()` |
+  | --- | --- |
+  | `func e() { }` — empty body | `""`, per *"there is no null to invent"* above |
+  | `func p() { /bin/false }` — command tail | the **int** `1` |
+  | `grep(zzz)` — external value call | **error**: *a command has no return value* |
+  | `grep(zzz):capture` | `.value` is **absent from the record** |
+
+  Four answers to one question. The `Status` type collapses them, because a
+  command's result is not *missing* — it is **how the command went**:
+
+  - **Every call yields a value.** There is no valueless call and therefore no
+    null to invent.
+  - **For anything command-shaped, that value is a `Status`.** A command tail
+    yields `Status(n)`; `func p() { /bin/false }; p()` is `Status(1)`, not the
+    int `1` and not nothing.
+  - **`grep(zzz)` returns `Status(1)` instead of erroring**, so `f` / `$(f)` /
+    `f()` finally mean the same three things for an external as for a function —
+    the uniformity goal this whole area is chasing. This is why "do externals
+    gain `f()`?" is **not** an optional extra: it is forced by every call having
+    a value.
+  - **`:capture`'s `.value` is always present**, so the record has a fixed shape
+    rather than one that depends on what was called.
+  - **An empty body still yields `""`.** Nothing ran, so there is no status to
+    report, and the existing answer stands unchanged.
+
+  That also retires a naming problem: `.value` on a capture record and the value
+  `return value X` fills stop being two ideas that happen to share a word. They
+  are the same channel, read two ways.
+
+  *(Honest history: an earlier draft asserted the command-tail change on the
+  weak grounds that it "types an int correctly," was rightly challenged — an
+  external genuinely has no mesh value of its own — and was withdrawn. It returns
+  here on the stronger footing that a call with no value is unrepresentable
+  without a null. The bug was always the **int**, not the existence of a value.)*
+
+  [Match arms](#matching-match) were already documented to yield a command's
+  status in expression position, so they agree with the command-tail rule
+  without changing. The [function table](#functions) had a third answer —
+  "none" for a command-tailed body — and this entry updates that row to
+  `Status(n)` rather than leaving the document holding two.
+
+  **What changes, as an implementation checklist.** Not a compatibility
+  analysis — the language has no users, nothing here is owed backward
+  compatibility, and "is this additive?" is the wrong question to judge a design
+  by. What follows is simply the list of places that have to move, and the places
+  worth re-reading afterwards to confirm the result is coherent.
+
+  `return` itself is unaffected: `func f() { return 3 }; f():capture` reports
+  `value=3 status=0` before and after — the same *code*, though `.status` holds
+  it as a `Status` per the typing below — and a sourced `return 3` still leaves `0`
+  — `return status 3` there is new reach rather than a change. Everything that
+  *does* move is below; an implementation that does only part of it leaves the
+  document's rules disagreeing with each other, which is the failure this list
+  exists to prevent.
+
+  **New surface:** the `status(N)` builtin, the `Status` value type with its
+  `:code` modifier and its `:repr`, the `status` / `value` channel words after
+  `return` with the attached-`(` lookahead, and `Status` as a third arm of the
+  condition rule (which `and` / `or` / `not` inherit).
+
+  - **`fail N`** leaves `Status(N)` where it leaves `false` today, since it
+    becomes a wrapper over `return status(N)`. Only the value moves: the `N ≥ 1`
+    check it validates is unchanged, so no program that ran before stops running.
+    This is the one value change the decision actually makes, and it is
+    deliberate content rather than fallout.
+  - **Every status channel becomes a `Status`** rather than an int, for the
+    forwarding reason given above — the type lands on all of them or on none,
+    since one left an int is one more place a handler forwarding it reports
+    success. Enumerated, so the list can be checked rather than trusted:
+
+    | channel | where |
+    | --- | --- |
+    | `$sh.status`, `$sh.pipestatus` | [`$sh`](#variables-and-assignment) |
+    | `:capture`'s `.status` | [the capture record](#calling-for-a-value-and-lambdas) |
+    | a finished job's `$j.status` | [job control](#job-control) |
+    | **`jobdone`**'s third argument | [job control](#job-control) |
+    | **`postexec`**'s second argument | [event hooks](#hooks-and-the-prompt) |
+    | the **`exit`** hook's argument | [event hooks](#hooks-and-the-prompt) |
+
+    The three **hook arguments** are the easiest to miss and the worst to leave
+    behind: a handler is exactly where someone writes `if $status != 0`, and an
+    int there both mis-forwards and — under the comparison ruling below — makes
+    that test *always true*. The shipped examples were written that way, so this
+    entry updates them: `docs/PROMPT.md`'s status line, `docs/REFERENCE.md`'s
+    `jobdone` handler, and `docs/COMPARISON.md`'s syntax sample now read the
+    `Status` directly (`if not $status { … }`, `if $sh.status { … }`) instead of
+    comparing against `0`. That they get *shorter* is the condition rule paying
+    for the comparison ruling, in the three places a reader meets first.
+
+  - **Every call yields a value, so the evaluator stops erroring** in the three
+    places it does today. `grep(zzz)` returns `Status(1)` instead of *a command
+    has no return value*; `puts(1 + 2)` binds `Status(0)` instead of the same
+    error; and a command-tailed body yields `Status(n)` where a value call
+    currently sees a bare int. These are the substance of ["no value" stops
+    existing](#open-questions) above, not separate cleanups — an implementation
+    that adds the `Status` type and the channel words but leaves these on the
+    old contract has the type without the unification it exists for.
+  - **A capture record's `.value` is always present**, including for an
+    external, where it is absent today. That is what gives the record a fixed
+    shape rather than one that depends on what was called, and it follows from
+    the bullet above rather than being an extra decision.
+
+  The command-tail *bug* — `p():capture` reporting `value=1 status=0` while bare
+  `p` leaves `$sh.status` 1 — is listed under the defects above and wants fixing
+  either way. What the decision adds is the **type**: once fixed, the value is
+  `Status(1)`, not the int `1`.
+
+  Checked against `main` (`199d4ef`): `status` is a free name — `func status(_n)
+  { $_n }` defines and calls cleanly — so the builtin needs no keyword and the
+  channel word needs no reservation. `return status 5` is a syntax error today
+  and `return status` binds the **string** `"status"`, which is exactly why the
+  channel word needs parser support rather than falling out of existing rules.
+
+  **It does not do the motivating example, and that is intended.** `func g()
+  { return 1 }; if g` takes the *true* branch, because `1` is data; the failing
+  spellings are `return status 1` (≡ `return status(1)`) and `return false`. The report that opened this
+  entry asked for the opposite, and the reversal is deliberate — `g 1` above is
+  the reason.
+
+  #### `.value` and `.status` now say the same thing — TODO
+
+  For anything command-shaped or status-returning, a [capture
+  record](#calling-for-a-value-and-lambdas)'s two result fields carry the same
+  information:
+
+  ```mesh
+  func f() { return status 3 }
+  r = f():capture     # .value = Status(3)   .status = Status(3)
+  grep(zzz):capture   # .value = Status(1)   .status = Status(1)
+  ```
+
+  The invariant that makes the redundancy safe is that **`.status` is exactly
+  the `Status` whose code is `status_of(.value)`** — a derived view, never an
+  independent channel, the same projection `$sh.status` uses. The wrapping is
+  load-bearing rather than pedantic: `status_of` yields the bare **`u8` code**
+  (`Status(3)` → `3`), so reading the invariant as plain equality would type
+  `.status` as an int and reinstate the forwarding bug the typing exists to
+  prevent. `status_of` stays the code extractor — it is what the OS is handed on
+  exit — and the *fields* hold `status(status_of(v))`. The defect recorded above (`value=1` beside
+  `status=0`) is precisely those two disagreeing, which the invariant forbids.
+
+  **`.status` is a `Status`**, for the same reason `$sh.status` is: it holds a
+  status. An earlier draft of this paragraph hesitated over that, on the grounds
+  that `$r.status == 0` then reads silently false under type-strict comparison —
+  but that objection applies **identically to `$sh.status`**, which the entry
+  types without hesitation, so using it to block one field and not the other was
+  simply inconsistent. The `== 0` reflex failing is a consequence of the
+  comparison ruling and hits every status-holding thing uniformly; it belongs to
+  the cross-type TODO, not to this field.
+
+  What remains genuinely worth flagging is the ergonomic risk you would expect: a
+  reader reaches for `.value` expecting data and finds a status, or checks
+  `.status` when the result they wanted is in `.value`. The two fields are one
+  channel with two views, not two answers, and the record's documentation should
+  say so plainly rather than listing them as peers.
+
+  #### Still open
+
+  Everything below is genuinely undecided. None of it blocks the syntax or the
+  builtin, and each is cheap to change later; they are listed together so they
+  are visible rather than scattered through the prose above.
+
+  - **The display form.** `status(5)` shows as `5` for now. `status 5` and
+    `status(5)` stay defensible for `puts` and want re-testing once statuses are
+    printed in anger — prompts, diagnostics, logs — where a bare `5` may read as
+    noise. Pinned either way: `:repr` is `status(5)` by round-trip, and argv is
+    `5` by the byte-boundary table.
+  - **Cross-type comparison across the whole language**, of which `Status` is
+    now just one instance — see the TODO above. Whether `$r.status == 0` and
+    `$sh.status == 0` work at all hangs on it — both read false today under the
+    ruling, uniformly. `$sh.status == 0` being silently
+    false is the sharp end of it, and it is inherited rather than introduced
+    here.
+  - **What else a `Status` carries.** `:code` gives the integer. Whether it
+    also gets a bool view — and how that relates to the [`ok`](#open-questions)
+    status-to-bool word below — is unsettled.
+  - **Reserved names in general.** `status` becomes reserved automatically, which
+    is accepted — but every builtin consumes an ordinary English word, and
+    `status` is a good example of how ordinary. Whether that stays a flat
+    reservation or gains an escape (a namespace, a shadowing rule, an explicit
+    `builtin` prefix) is its own pass.
+
+  Two **defects** were found while checking this entry. Neither is created by the
+  decision and both are fixable independently: `1 == 1.0` is `false` on `main`
+  while the [`:repr`](#modifiers) rationale asserts it is true, and `p():capture`
+  reports `value=1 status=0` for a function whose command tail failed while bare
+  `p` leaves `$sh.status` 1.
+
+  #### Settled along the way
+
+  - **Should `return` evaluate its operand as a command line** — so that
+    `return status 5` runs `status 5` — rather than as a value expression?
+    *Declined.* `return`'s operand is value context, where a bare word is a
+    [string literal](#variables-and-assignment); that is the same rule that makes
+    `x = greet` bind `"greet"` and that pins `=> markdown` to the string
+    `"markdown"` in [match arms](#matching-match). Flipping it would make
+    `return markdown` a command lookup and `return some-file.txt` an attempt to
+    execute a filename. The parens already distinguish the two, so nothing is
+    gained for the cost.
+  - **Does `status` need reserving?** No special case — builtins are already
+    refused as `func` names, so `func status` becomes illegal the moment the
+    builtin exists, and the repo owner has accepted that. (The general question
+    is listed above as still open.)
+  - **Does a `Status` render to bytes?** Yes, as decimal digits, and it has a row
+    in the [byte-boundary table](#spread--flattening) beside `int`: `cmd
+    status(5)` passes `5`. It wraps an integer, so decimal is canonical exactly
+    as for an int; the type governs projection and dispatch, not the byte form.
+    Handle-like variants with no byte form (`Stream`, `Job`) were the alternative
+    model and do not fit — a status has an obvious number.
+
+  **The *status-to-bool word* below is largely subsumed** — though not by the
+  projection question, which is what an earlier draft of this paragraph claimed.
+  It is subsumed by the two rules above: a command-tailed function now returns
+  `Status(n)`, and a `Status` is a condition, so the case `ok` was invented for
+  writes itself:
+
+  ```mesh
+  func inside-project() { git rev-parse --git-dir }   # returns Status(n)
+  if inside-project { … }                            # works — command position
+  if inside-project() { … }                           # works — Status is a condition
+  ```
+
+  What `ok` was for was a predicate whose condition is a **command**, which had
+  no spelling and had to write out `if … { return true } / return false`. That
+  branch is now unnecessary.
+
+  What survives is narrower still, now that `and` / `or` / `not` admit a
+  `Status` as well: storing, negating and combining all work without a bool. So
+  `ok` is left wanting a **bool specifically** — for an API that demands one, or
+  for a reader who prefers `true` to `Status(0)` — which is a preference rather
+  than a gap. *(`return
+  CMD` remains unrelated either way: `return /bin/false` yields the string
+  `"/bin/false"`, since a bare word in value position is a literal.)*
 
   Two adjacent questions from the same report, both answered against `main`:
 
@@ -6172,10 +6765,13 @@ remain under-specified.
   instance of the comma, not the comma from the language, and it would cost the
   consistency the modifier rule currently borrows from the call syntax — which
   weakens the main argument for making the switch at all.
-- **A status-to-bool word — open; leaning `ok`.** *(Independent of the
-  [projection question](#open-questions) above — a command-tailed function already
-  propagates its status either way, and `return CMD` runs nothing under either
-  model, so this word is needed identically whichever way that lands.)* A
+- **A status-to-bool word — open; leaning `ok`, but much reduced.** *(The
+  [status decision](#open-questions) above shrinks this from a gap to a
+  convenience: a command-tailed function returns `Status(n)` and a `Status` is a
+  condition, so a command-conditioned predicate no longer needs the written-out
+  branch. `and` / `or` / `not` admit a `Status` too, so storing, negating and
+  combining need no bool either. What is left is wanting a **bool**
+  specifically, which is a preference rather than a gap.)* A
   predicate whose condition is a
   *value* collapses to `return $cond`, because
   [value and status are separate channels](#functions) and `return expr` fails only
