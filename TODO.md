@@ -4957,7 +4957,28 @@ thing a reader takes on trust.*
       `repl.rs` `condition_status`; `docs/REFERENCE.md` §Conditionals.
 - [ ] **26. No `eval` and no dynamically-named `func`**, so "define one function
       per name in this list" — what a VCS-subcommand loop and an ssh-host alias
-      loop both do — has to write a file and source it. That turns a private
+      loop both do — has to write a file and source it.
+
+      A **quoted name with a trailing modifier** is not accepted: `alias
+      "$n":upper = …` keeps `:upper` as text and reports `foo:upper` is not a
+      name. In every other position that spelling is a *value expression* --
+      `puts "$n":upper` prints `FOO` because the argument is parsed as one, not
+      as a word -- so accepting it in the name slot means the slot taking an
+      expression rather than a word, which is a wider change than the name
+      itself was. `$n:upper` works today, since there the modifier belongs to
+      the reference inside one word.
+
+      **Half done: `alias $name = …`.** The *name* may now be a word evaluated
+      where the definition runs, so `for name in $names { alias $name = git }`
+      defines one alias per name with nothing on disk. What it does not do is
+      bake a value into the **body**: an alias body is syntax evaluated at call
+      time, like the `wrapper func` body it desugars to, so `alias $name = ssh-to
+      $name` reads `$name` when the alias *runs* and finds nothing. Both loops
+      this entry names put the value in the body — `command vcs add`, `ssh-to
+      host1` — so both still write a file. Settling that is what closes this:
+      either an alias bakes its body's interpolations at the definition (a
+      semantic change to every alias, and `alias gh = grep "$env.HOME/.history"`
+      would freeze `$HOME`), or a separate spelling says which pieces to bake. That turns a private
       in-memory definition into **shared mutable state on disk**: the port had to
       handle a concurrent second shell, a partial write, a stale generation, an
       unreadable input, a directory sitting at the target path, and a 0600 file

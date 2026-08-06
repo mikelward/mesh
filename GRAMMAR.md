@@ -528,8 +528,11 @@ binds a variable named `global`.
 
 ```ebnf
 definition      = "wrapper"? "func" definition-name parameter-list NL* block
-                | "alias" definition-name "=" NL* alias-command ;
+                | "alias" alias-name "=" NL* alias-command ;
 definition-name = bare-WORD ;                 # unjudged here; checked when it runs
+alias-name      = definition-name
+                | computed-name ;             # a word holding an interpolation
+computed-name   = WORD ;                      # quoted or not; read where it runs
 alias-command   = env-prefix* redirection* command-word command-item* ;  # no guard
 parameter-list  = "(" NL* ( parameter ( NL* "," NL* parameter )* NL* )? ")" ;
 parameter       = name                        # required positional
@@ -567,9 +570,24 @@ for the job and treats `=` as ordinary text, so `func a=b()` reports at its own
 definition. And a **quoted** name is still `expected a name`, that being a rule
 about a name being a name rather than about which names are taken.
 
+An **alias may be named by a word instead**, and that is the one place a quoted
+word reaches a definition: a `computed-name` is any word carrying an
+interpolation — `$name`, `"${prefix}-st"`, `"${f()}"` — and it is evaluated where
+the definition runs rather than read as text here. A `WORD`, so a modifier
+belongs to the reference inside it (`$n:upper` is one word and applies); a
+modifier written after a *closing quote* — `"$n":upper` — is a value expression
+everywhere else in the language, and the name slot does not take one, so it
+stays the text `foo:upper` and is refused as a name. `TODO.md` carries it. A word with nothing computed
+in it is a `definition-name` and the paragraph above governs it unchanged, so
+`alias "foo" = …` is still `expected a name` while `alias "$x" = …` is a name
+built at the definition. What comes back is judged by the same runtime rules a
+written name is; only `alias` takes one, `func` does not.
+
 `alias NAME = command` is sugar for the `wrapper func` that forwards `...args`;
-a first word equal to the alias's own name is emitted as `command NAME`, so a
-self-naming alias reaches the program rather than recursing. Its right-hand side
+a **command head** equal to the alias's own name is emitted as `command NAME`, so
+a self-naming alias reaches the program rather than recursing. The head is the
+first item that is not a redirection, since one may be written in front of the
+command it belongs to (`alias e = > /dev/null e hi`). Its right-hand side
 is a plain command: a postfix guard is refused (`alias a = puts x if true` is an
 error) and belongs in a `wrapper func` body instead. A **quoted multiword first
 word** is refused too — `alias ll = 'ls -l'` is the bash reflex, and here the
