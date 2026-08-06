@@ -8185,8 +8185,25 @@ fn expand_stage(
         // Asked of the word before it is rendered, since that is the only moment
         // the distinction still exists.
         let written = expand::written_of(&word, &shell.vars);
-        for text in stage_argument(&word, name.as_deref(), decoration, shell)? {
-            argv.push(text, written);
+        // A spread answers per element, since each one becomes a call argument of
+        // its own — see `expand::spread_written`.
+        let spread = expand::spread_written(&word, &shell.vars);
+        let texts = stage_argument(&word, name.as_deref(), decoration, shell)?;
+        // One element renders to one entry, so the counts agree — compared rather
+        // than assumed because the three renderers above answer independently, and
+        // a word whose entries cannot be lined up with its elements is data rather
+        // than syntax.
+        match spread {
+            Some(marks) if marks.len() == texts.len() => {
+                for (text, written) in texts.into_iter().zip(marks) {
+                    argv.push(text, written);
+                }
+            }
+            _ => {
+                for text in texts {
+                    argv.push(text, written);
+                }
+            }
         }
     }
     Ok(Expanded::Argv(argv))

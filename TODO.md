@@ -3667,6 +3667,16 @@ thing a reader takes on trust.*
       deferred path never lost them: it re-expands in its own fork and hands
       `run_expanded` the real `Argv`.
 
+- [x] **A spread's elements were marked from the list they traveled in.** *Fixed:
+      `expand::spread_written` asks each element for itself.* `...$args` promotes
+      every element to a call argument of its own, so each is at the top level the
+      mark asks about -- but one mark was taken per *word*, which said `Data` for
+      the whole spread. A forwarding wrapper lost what it was handed:
+      `wrapper func w(...args) { puts ...$args }` printed `--help` for `w --help`
+      and `-- --help` for `w -- --help`. An **unspread** collection is unchanged
+      and still displayed data, since its flag is one element down. Raised in
+      review as a P1.
+
 - [x] **Sizing the terminator-value fix: two options, needs a decision.**
       *Decided by the repo owner: widen the argv type, "that sounds more
       structurally correct". Built -- `expand::Written` and `Argv`. Two gaps
