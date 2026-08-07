@@ -286,6 +286,11 @@ mesh$ <strong>puts $sh.status ...$sh.pipestatus</strong>
 Read them in **one** command when you want both: reading either is itself a
 command, so a first `puts` would replace what a second one reports.
 
+Because a status is a value, it travels: `exit status $sh.status` leaves the
+shell with the one the last command left, and `exit 3` is the same thing written
+out. `:code` gives the integer when you need to compare against a number, since
+a status compares only with another status.
+
 `not` in front of a command inverts what it reports:
 
 <pre>
@@ -797,8 +802,9 @@ Ada Grace Hopper
 </pre>
 
 When a false value-producing `if` has no `else`, it yields the empty string.
-Only the selected body runs. A condition can be a command/function status or a
-value expression such as `$answer == 42`.
+Only the selected body runs. A condition is a **bool, a status, or a command** —
+`$answer == 42` yields a bool, a command or function is read by the status it
+leaves, and `$sh.status` is that status held as a value.
 
 List patterns can test a shape and bind its pieces at the same time. `_` ignores
 one element and `...rest` captures any number of middle elements. A mismatch in
@@ -838,9 +844,10 @@ list element, for example `for [key value] in $pairs { ... }`.
 
 ## Repeating with `while` and `loop`
 
-`while` tests before each pass, taking the same two condition forms `if` does —
-a value's truthiness or a command's exit status. `loop` repeats until something
-breaks out:
+`while` tests before each pass, taking the same condition forms `if` does — a
+bool, a status, or a command. There is no truthiness to fall back on: `while
+$xs:len` is refused, and `while $xs:len > 0` is what you write. `loop` repeats
+until something breaks out:
 
 <!-- no-run: loops until a deploy that never happens -->
 <pre>
