@@ -7252,26 +7252,19 @@ of each PR had landed by another route, but these pieces had not.
       length-prefixing so a grandchild holding the write end open cannot hang the
       read. Decide before `fork func`, since a value call on one is the case that
       needs it.
-- [ ] **Two modifier tables, one of them quietly stale.** *(Stale as written:
-      `lexer.rs` no longer exists, so `lexer::Modifier` is gone. The live pair is
-      now `parser::MODIFIER_NAMES` and `expand::Modifier`, and the reservation
-      change raised the stakes — `MODIFIER_NAMES` decides a **syntax error**, so a
-      name implemented but missing from it would be refused outright. Checked: no
-      implemented modifier is missing from it today. Re-scope or close.)*
-      `lexer::Modifier`
-      (`lexer.rs:36`) and `expand::Modifier` (`expand.rs:27`) are separate enums
-      with separate `from_name` tables, and the lexer's has not been extended
-      since the initial path set: `Keys`, `Values`, `Int`, `Type`, `Exists`,
-      `Read`, `Write`, `Files`, `Dirs`, `Links`, `Exec`, `Tty`, and `Repr` — 13
-      names — exist only in `expand`. Nothing is broken for the shell, because a
-      name the lexer does not know ends its modifier scan and the parser's postfix
-      path handles it; that is how `:keys` has always worked. But
-      `lexer::split_line` is `pub`, so a consumer tokenizing with it sees
-      `$x:keys` as `$x` followed by literal `:keys`, and the two tables have to be
-      remembered together every time a modifier is added. Fix by having the lexer
-      defer to `expand::Modifier::from_name` — one table — rather than by adding
-      13 entries to a second one. Raised by Codex review on #223 against `:repr`,
-      which is consistent with the other twelve rather than a new instance.
+- [x] **Two modifier tables, one of them quietly stale.** Raised by Codex review
+      on #223 against `:repr`. The pair it named is gone twice over: `lexer.rs` no
+      longer exists, so `lexer::Modifier` went with it, and the live pair —
+      `parser::MODIFIER_NAMES` and `expand::Modifier` — has been merged the way the
+      original entry asked, by having the second table *defer to* the first rather
+      than by copying names into it. `expand::NAMED_MODIFIERS` is now the one table
+      for the argument-free family, a `&[(&str, Modifier)]` walked as well as
+      looked up; `parser::modifier_name` asks it, and `MODIFIER_NAMES` keeps only
+      what that enum does not hold — the argument-taking family, the regex flags,
+      the time family — so the two sets are disjoint by construction rather than by
+      memory. `the_two_modifier_tables_do_not_overlap` fails if a name is ever
+      listed in both, and `recognizes_the_documented_modifier_vocabulary` now runs
+      over the union rather than half of it.
 - [ ] **The rest of `fork` isolation.** Two pieces of the `DESIGN.md` cluster are
       still open. **`fork func name(params) { … }`**, a func whose *body* is a
       subshell, needs a decision first: a subshell returns only bytes, so what does
