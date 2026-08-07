@@ -2069,12 +2069,24 @@ designed, and the cross-references say where the fuller note lives.
       regex plumbing is in place; what is missing is returning the groups rather
       than a boolean. Decide what a non-match yields (`false`, so `if [k v] =` is
       the soft form) and whether group 0 leads the list.
-- [ ] **The spread of an argument-taking modifier at a command boundary.**
-      `puts ...$x:split(":")` is still a syntax error. `CommandItem::Value` has
+- [x] **The spread of an argument-taking modifier at a command boundary.**
+      *(Built.)* `puts ...$x:split(":")` was a syntax error. `CommandItem::Value` had
       no spread variant — `UnaryOp::Spread` is produced by the parser and
       consumed by nothing — so routing the run through the expression parser
       would pass one list where the reader asked for its elements. Deliberately
-      left loud rather than made silently wrong; bind it first for now.
+      left loud rather than made silently wrong.
+      *Built by giving the item the marker rather than the expression:*
+      `CommandItem::Value` carries `spread: bool`, `value_argument_starts` asks its
+      question one token past a `...` (by moving the cursor, so there is no second
+      copy of the rules), and `expand_stage` gives a spread item the leading
+      `Text("...")` piece — the shape `expand::spread_of` already matches, which is
+      the same route `...$xs` has always taken. **Found building it:** the missing
+      half had already landed with the declared-modifier work, where a spread word
+      gained the ability to carry an already-resolved value (`expand::Spread`).
+      Two neighbors changed with it, both for the better: `...$(cmd)` now reports
+      `value is not a list` rather than a syntax error about attached text, and
+      `...$x:words` takes the value path it should always have taken instead of
+      working by accident through the word path.
 - [x] **`gets` returns the line, so `while line = gets()` works** *(landed)* —
       the value form `DESIGN.md` §"Builtins" specifies, which is the part that
       composes:

@@ -2395,7 +2395,7 @@ fn carries_a_value(
     // perfectly well.
     redirects
         && (items.iter().any(|item| match item {
-            parser::CommandItem::Value(_) => true,
+            parser::CommandItem::Value { .. } => true,
             parser::CommandItem::Word(word) => word_carries_a_value(&word.value, shell),
             parser::CommandItem::Redirect { target, body, .. } => {
                 word_carries_a_value(&target.value, shell)
@@ -3611,11 +3611,23 @@ fn run_ast_pipeline(
                 // thing and expand by the same rule. Evaluating it is the job of
                 // whoever expands that word, which is what puts it in word order —
                 // a call in one argument cannot change what an earlier word read.
-                parser::CommandItem::Value(expression) => words.push(parser::Word {
-                    pieces: vec![parser::WordPiece::Value {
-                        expression: Box::new(expression.clone()),
-                        quote: parser::QuoteMode::Bare,
-                    }],
+                parser::CommandItem::Value { expression, spread } => words.push(parser::Word {
+                    // A spread keeps its `...` as the leading text piece, which is
+                    // the shape `expand::spread_of` already matches — the same one
+                    // `...$xs` has always had. So `...$x:split(":")` reaches the
+                    // spread by the route a plain reference does, rather than by a
+                    // second one that could disagree with it.
+                    pieces: spread
+                        .then(|| parser::WordPiece::Text {
+                            text: "...".to_string(),
+                            quote: parser::QuoteMode::Bare,
+                        })
+                        .into_iter()
+                        .chain([parser::WordPiece::Value {
+                            expression: Box::new(expression.clone()),
+                            quote: parser::QuoteMode::Bare,
+                        }])
+                        .collect(),
                     qualifiers: None,
                 }),
                 parser::CommandItem::Redirect {
@@ -13498,7 +13510,9 @@ fn command_words(line: &str) -> Option<Vec<String>> {
             parser::CommandItem::Word(word) => line.get(word.span.clone()).map(str::to_owned),
             // A value argument is source text like a word, and this reads the line
             // for completion rather than running anything, so its span serves.
-            parser::CommandItem::Value(value) => line.get(value.span.clone()).map(str::to_owned),
+            parser::CommandItem::Value { expression, .. } => {
+                line.get(expression.span.clone()).map(str::to_owned)
+            }
             parser::CommandItem::Redirect { .. } => None,
         })
         .collect();
