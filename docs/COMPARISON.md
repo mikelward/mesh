@@ -567,10 +567,13 @@ mesh goes further than the POSIX shells in two places:
   pipeline yields a structured `pipeline-error` value holding both exceptions,
   which is more than a status list: each carries its command, exit status, and
   stack trace.
-- **There are no truthy values.** A condition is a bool or a command, and
-  nothing else. `if $xs:len` is refused, naming `if $xs:len > 0` as the fix —
+- **There are no truthy values.** A condition is a bool, a status, or a command,
+  and nothing else. `if $xs:len` is refused, naming `if $xs:len > 0` as the fix —
   where bash's `[ $x ]` and fish's `test` both quietly answer a question you did
-  not ask.
+  not ask. A status is admitted because success and failure are the whole of what
+  it encodes, which is what a command in a condition was already being read for —
+  not an exception to the rule but the same rule, since `$sh.status` *is* what
+  the command left.
 
 ## Syntax
 

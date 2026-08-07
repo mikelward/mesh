@@ -73,7 +73,9 @@ $sh.prompt.char = func() { "❯ " }
 - **Empty pieces vanish.** A piece with nothing to show returns `""` and its whole
   line disappears — the branch off a repo, the timer after a fast command, the error
   after a success — with no `if`-guards wrapped around your layout.
-- **You read real values, not scraped text.** `$sh.status` is the last exit code,
+- **You read real values, not scraped text.** `$sh.status` is the last status —
+  a value of its own type, so `if not $sh.status` is the test and `:code` is the
+  integer —
   `$sh.jobs` is the live job table, and `postexec` hands you a command's runtime —
   so the jobs line is `$sh.jobs:values:map(…)`, never a parse of `jobs` output.
 - **Side effects stay in hooks.** Timing here — or a background `git fetch` on `cd`
