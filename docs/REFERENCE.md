@@ -3224,9 +3224,21 @@ spaced = "555-1234" ~ /\d{3} - \d{4}/:x     # true — `:x` ignores the spacing
 compiled = re("\\d{3} - \\d{4}"):x
 ```
 
-Only a **flag** chain keeps a literal a pattern. `/a/:upper` is the string `/A/`,
-which is what it means everywhere else, and reading it as a regex would both
-change that and fail — `:upper` is not a flag.
+A `/…/` in a match slot is a **pattern**, and a `:name` after it is the ordinary
+chain on that pattern whatever the name is — shape decides, not vocabulary. So
+`/a/:upper` reports that `:upper` is not valid for a regex rather than quietly
+becoming the string `/A/`, and a name that is no flag at all gets the flag
+vocabulary: `` `:g` is not a regex flag ``. Both land when the chain runs, where
+the subject is known to be a pattern.
+
+`:x` is the exception to "applied afterwards", because it decides whether the
+pattern text is *valid* at all: the **leading run** of flags is folded into the
+literal before it compiles, so `/foo#(/:x` reads `#` as a comment introducer and
+works. The run closes at the first link that is not a flag, which is how far the
+text still belongs to the literal — `/foo#(/:upper:x` fails the way
+`re("foo#(")` fails, and `/foo#(/:x:upper` is the fix. Past the run a flag is the
+ordinary chain link it already was, so `$r:x` on a pattern in a variable is
+unchanged.
 
 Use `re(STRING)` to compile a regex for reuse or to build one from a value, and
 `re(STRING, literal: true)` to quote regex metacharacters and match the supplied

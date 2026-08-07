@@ -5444,8 +5444,8 @@ and leaves the structural waste in place.
 
 Decided in design discussion; see `docs/DESIGN.md` §"Modifiers".
 
-**Declaring a modifier and applying one are both built.** What remains here is the
-regex-literal flag suffix and the attached-parentheses reading, each below. The
+**Declaring a modifier, applying one, and the regex-literal flag suffix are all
+built.** What remains here is the attached-parentheses reading, below. The
 `source` boundary that an earlier revision blocked
 this on is **not reached** — that block came from a load-time check being unable to see
 a sourced library's modifiers, and resolution now happens at call time. The one
@@ -5532,8 +5532,8 @@ spelling.)
             is that a spread word can now carry an already-evaluated value
             (`expand::Spread`), which nothing else spells — `...$(…)` is still a
             syntax error.
-    - [ ] **The regex-literal flag suffix opens with the rest — a flag *is* a
-          modifier.** Its subject is a pattern and its result is a pattern, which is
+    - [x] **The regex-literal flag suffix opens with the rest — a flag *is* a
+          modifier.** *(Built.)* Its subject is a pattern and its result is a pattern, which is
           what `docs/DESIGN.md` already settled, and the shipped tables already agree:
           all eight flag names (`i`, `ignorecase`, `m`, `multiline`, `s`, `dotall`,
           `x`, `extended`) are in `MODIFIER_NAMES`, and *applying* one already goes
@@ -5547,7 +5547,10 @@ spelling.)
           parser-side: `Parser::regex_literal` stops consulting either table, so `/…/`
           in a match slot is a pattern value and the `:name` chain after it is the
           ordinary postfix loop, applied by the code that already handles it.
-          - [ ] **Keep the flag diagnostic, at its new site.** `` `:g` is not a regex
+          - [x] **Keep the flag diagnostic, at its new site.** *(Built —
+                `parser::unknown_regex_flag_message`, given as a step's
+                `regex_message`. `ParseErrorKind::UnknownRegexFlag` is gone, and
+                with it the arm that let it claim the statement.)* `` `:g` is not a regex
                 flag `` names the flag vocabulary, and `crates/mesh/tests/cli.rs` pins
                 it for the assignment, detached and bare-condition forms. Moving to run
                 time gives it *better* grounds — the subject is known to be a pattern
@@ -5555,7 +5558,10 @@ spelling.)
                 text, instead of falling back to the generic unknown-modifier message.
                 The flag list stays closed: a built-in modifier name cannot be
                 redeclared.
-          - [ ] **What it costs: `/a/:upper` stops meaning the string.** A name the
+          - [x] **What it costs: `/a/:upper` stops meaning the string.** *(Done —
+                `became_regex` traverses any modifier rather than only a flag, and
+                `a_bare_word_in_a_replace_pattern_stays_the_string_it_looks_like`
+                records the corner going.)* A name the
                 parser knows is a modifier but not a flag currently makes it *decline*
                 the regex reading and fall back to the string one, which is why
                 `puts "/A/":replaceall(/a/:upper, X)` prints `X`
@@ -5567,8 +5573,11 @@ spelling.)
                 `:ident`-is-always-a-modifier rules out one level up.
                 A string subject keeps its own error: `"x":i` is a flag without a
                 pattern.
-          - [ ] **Compile the literal after its chain is known — `:x` is
-                construction-time.** A parse-affecting flag decides whether the pattern
+          - [x] **Compile the literal after its chain is known — `:x` is
+                construction-time.** *(Built — `Expr::Regex` carries `extended`,
+                set from the leading run of flags and applied before the compile.
+                `a_parse_affecting_flag_is_folded_into_the_literal` fails before
+                and passes after.)* A parse-affecting flag decides whether the pattern
                 text is *valid*, so `/foo#(/:x` must compile once in extended mode
                 rather than compile and then be modified; `docs/DESIGN.md` says so
                 already, beside `re($x, extended: true)`. `eval_expr` compiles
@@ -5579,7 +5588,7 @@ spelling.)
                 preserve: fold the **leading run** of parse-affecting flags into
                 construction, then compile, then run the rest of the chain.
                 A test for `/foo#(/:x` fails before and passes after.
-                - [ ] **Only the leading run folds — and past it nothing changes.**
+                - [x] **Only the leading run folds — and past it nothing changes.**
                       The window closes at the first modifier that is not a flag,
                       because that is how far the text still belongs to the literal.
                       After it, a flag on a pattern value is the ordinary dispatch it

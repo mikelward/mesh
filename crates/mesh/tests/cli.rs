@@ -23174,9 +23174,11 @@ fn tilde_matches_regexes_and_globs() {
 /// not the string path's "not a modifier" — whose quote-the-word advice would
 /// turn the pattern into text.
 ///
-/// A link that is a real modifier (`:upper`) is not this error: the literal
-/// reading declines and the string one stands, whose own report
-/// (`modifier :upper is not valid for a regex`) is pinned elsewhere.
+/// Said when the chain runs, on better grounds than the parser had: the subject
+/// *is* a pattern there rather than guessed from syntax, and the flag list is
+/// still closed, since a built-in modifier name cannot be redeclared. A link that
+/// is a real modifier (`:upper`) gets its own report
+/// (`modifier :upper is not valid for a regex`), pinned elsewhere.
 #[test]
 fn an_unknown_regex_flag_names_the_flag_vocabulary() {
     let out = run_with_input("x = abc ~ /a/:i:g\n");
@@ -23184,6 +23186,15 @@ fn an_unknown_regex_flag_names_the_flag_vocabulary() {
     assert!(stderr.contains("`:g` is not a regex flag"), "{stderr}");
     assert!(stderr.contains(":ignorecase"), "{stderr}");
     assert!(!out.status.success());
+
+    // The same words for a pattern that reached a variable, which is where the
+    // parser never had a say at all.
+    let variable = run_with_input("r = re(\"a\")\nx = abc ~ $r:g\n");
+    assert!(
+        String::from_utf8_lossy(&variable.stderr).contains("`:g` is not a regex flag"),
+        "{}",
+        String::from_utf8_lossy(&variable.stderr)
+    );
 
     // Detached, `:g` is not a chain link — the statement grammar reports the
     // leftover token, not a flag slot nobody wrote.
@@ -23195,13 +23206,52 @@ fn an_unknown_regex_flag_names_the_flag_vocabulary() {
     );
     assert!(!out.status.success());
 
-    // A bare condition is not assignment-only territory: the value-vs-command
-    // probe keeps the flag error rather than handing the statement to a
-    // command reading that fails on the same token with the quoting advice.
-    let out = run_with_input("if abc ~ /a/:g { puts x }\n");
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    // A **quoted** subject keeps the pattern reading in a condition, so the same
+    // words arrive there. A *bare*-word subject is a different question and not
+    // this one: `if abc ~ /a/ { … }` reads `abc` as a command and always has, so
+    // `:i` in that position already reported as a modifier on a string before the
+    // flag check moved. The parse-time error hid that by claiming the statement;
+    // it is not something to reproduce.
+    let condition = run_with_input("if \"abc\" ~ /a/:g { puts x }\n");
+    let stderr = String::from_utf8_lossy(&condition.stderr);
     assert!(stderr.contains("`:g` is not a regex flag"), "{stderr}");
-    assert!(!out.status.success());
+    assert!(!condition.status.success());
+}
+
+/// A **parse-affecting** flag is construction-time: `:x` decides whether the
+/// pattern text is valid, so a literal has to be built with it rather than built
+/// and then modified.
+///
+/// `re($x, extended: true)` exists on the constructor side for the same reason.
+/// The literal compiled eagerly and the flag was applied after, so `/foo#(/:x`
+/// reported `invalid regex` for text that is perfectly good under `:x`.
+#[test]
+fn a_parse_affecting_flag_is_folded_into_the_literal() {
+    // `#` introduces a comment under `:x`, so this text only compiles with it.
+    let out = run_with_input("if \"foo\" ~ /foo#(/:x { puts yes }\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "yes\n");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Only the **leading run** of flags folds, and it closes at the first link
+    // that is not one — because that is how far the text still belongs to the
+    // literal. The constraint is on construction, not on chain position, so
+    // `/foo#(/:foo:x` fails the way `re("foo#(")` fails and `/foo#(/:x:foo` is
+    // the fix. No ordering rule is added and `:x` is never retroactive.
+    let late = run_with_input("if \"foo\" ~ /foo#(/:upper:x { puts yes }\n");
+    assert!(
+        String::from_utf8_lossy(&late.stderr).contains("invalid regex"),
+        "{}",
+        String::from_utf8_lossy(&late.stderr)
+    );
+
+    // Past the run, a flag on a pattern value is the ordinary dispatch it already
+    // is — `$r:x` keeps working, and `:x` on a path is still the executable filter.
+    let value = run_with_input("r = re(\"a b\")\nif \"ab\" ~ $r:x { puts yes }\n");
+    assert_eq!(String::from_utf8_lossy(&value.stdout), "yes\n");
 }
 
 /// A literal holds the characters a regex is **made of**, which are the same
@@ -30690,26 +30740,33 @@ puts "abc":replaceend(c, "X")
 puts "Ab":replaceall(/a/:i, x)
 puts "Ab":replacestart(/a/:i, x)
 puts "aB":replaceend(/b/:i, x)
-puts "/A/":replaceall(/a/:upper, X)
-puts "/a/":replaceall(/a/:lower, X)
 "#,
     );
-    // A **flagged** literal converts: `/a/:i` is the regex wrapped in its flag
+    // A literal with a chain on it converts: `/a/:i` is the regex wrapped in its
     // chain, so a check that only looked at the top of the converted tree
     // restored the word and left `:i` applied to a string.
-    //
-    // The last two do **not**. Traversal stops at anything that is not a regex
-    // flag, because `/a/:upper` is the ordinary string expression `/A/`
-    // everywhere else — reading it as a regex would both change its meaning and
-    // fail, since `:upper` is not a flag.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "Xbc\nXbc\nabX\nxb\nxb\nax\nX\nX\n"
+        "Xbc\nXbc\nabX\nxb\nxb\nax\n"
     );
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+
+    // What that costs: `/a/:upper` used to *decline* the regex reading and fall
+    // back to the string `/A/`, so this printed `X`. The parser was answering
+    // from vocabulary a question the shape already answers — `/…/` in a match slot
+    // is a pattern — so `:upper` now reports against one. `DESIGN.md` §"Modifiers"
+    // records the corner going.
+    let declined = run_with_input("puts \"/A/\":replaceall(/a/:upper, X)\n");
+    assert_eq!(String::from_utf8_lossy(&declined.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&declined.stderr)
+            .contains("modifier :upper is not valid for a regex"),
+        "{}",
+        String::from_utf8_lossy(&declined.stderr)
     );
 }
 

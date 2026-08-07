@@ -4620,8 +4620,13 @@ fn eval_expr(
     }
     match expr {
         E::Scalar(word) => eval_scalar(word, last, in_function, shell)?.map_err(runtime_message),
-        E::Regex(pattern) => {
-            let value = RegexValue::new(pattern.clone());
+        E::Regex { pattern, extended } => {
+            let mut value = RegexValue::new(pattern.clone());
+            // Before the compile, never after: `:x` turns `#` into a comment
+            // introducer, so text that only parses under it has to be built with
+            // it. The chain's own `:x` runs again on the way out and finds it
+            // already set.
+            value.ignore_whitespace = *extended;
             compile_regex(&value).map_err(runtime_message)?;
             Ok(Value::Regex(value))
         }
@@ -5867,7 +5872,10 @@ fn modifier_step(name: &str) -> expand::ModifierStep {
         None if !parser::is_builtin_modifier(name) => expand::ModifierStep::Unavailable {
             name: name.to_string(),
             message: parser::unknown_modifier_message(name),
-            regex_message: parser::unknown_modifier_message(name),
+            // A **pattern** hears about flags instead. The parser used to give
+            // this for `/a/:g`, guessing the subject from syntax; here the subject
+            // is known to be one, which is the better ground the move buys.
+            regex_message: parser::unknown_regex_flag_message(name),
         },
         None => expand::ModifierStep::Unavailable {
             name: name.to_string(),
@@ -7138,7 +7146,7 @@ fn capture_status_of(expr: &parser::Expr, shell: &Shell) -> u8 {
 /// this is concerned, so a new expression kind defaults to "assume it runs".
 fn runs_nothing(expr: &parser::Expr) -> bool {
     match expr {
-        parser::Expr::Regex(_) | parser::Expr::Glob(_) => true,
+        parser::Expr::Regex { .. } | parser::Expr::Glob(_) => true,
         // A reference is a pure read *unless* its chain names a modifier the
         // vocabulary does not hold — a declared one runs a body. Asked here as
         // well as at the tail, since an argument runs after the subject and would
